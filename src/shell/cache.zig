@@ -1,0 +1,500 @@
+//! B1 classification: SHELL. Disk persistence — the store snapshot and
+//! the auth session, across runs. This file resolves paths, opens fds,
+//! and moves bytes ATOMICALLY (write-then-rename); what the bytes MEAN is
+//! sealed inside core/snapshot.zig (D1/D3). All file I/O rides the
+//! kernel-stable syscall surface (caution 1a).
+//!
+//! Failure doctrine (E4): a cache that is missing, stale, torn, or
+//! corrupt is not an error — it is a cold start. Load returns null;
+//! save returns false; the app proceeds either way.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const builtin = @import("builtin");
+const linux = std.os.linux;
+const is_windows = builtin.os.tag == .windows;
+const is_darwin = builtin.os.tag.isDarwin();
+
+/// Darwin file primitives, self-declared from libSystem (same doctrine
+/// as k32 below). `open` is declared VARIADIC because it is variadic in
+/// C — Apple's arm64 ABI passes variadic arguments on the stack, so a
+/// flattened three-argument declaration would corrupt the mode.
+const dc = struct {
+    // Not a record: an extern-fn namespace (no fields). A1/A7 do not apply.
+    extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
+    extern "c" fn read(fd: c_int, buf: [*]u8, n: usize) isize;
+    extern "c" fn write(fd: c_int, buf: [*]const u8, n: usize) isize;
+    extern "c" fn close(fd: c_int) c_int;
+    extern "c" fn rename(old: [*:0]const u8, new: [*:0]const u8) c_int;
+    extern "c" fn mkdir(path: [*:0]const u8, mode: u16) c_int;
+    const O_RDONLY: c_int = 0;
+    const O_WRONLY: c_int = 1;
+    const O_CREAT: c_int = 0x200;
+    const O_TRUNC: c_int = 0x400;
+};
+
+/// Windows file primitives (kernel32) — the OS ABI, the same doctrine as
+/// the Linux syscall surface below. Namespaced to keep symbols tidy.
+const k32 = struct {
+    // Not a record: an extern-fn namespace (no fields). A1/A7 do not apply.
+
+    extern "kernel32" fn CreateFileW(name: [*:0]const u16, access: u32, share: u32, sec: ?*anyopaque, disp: u32, flags: u32, template: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn ReadFile(h: *anyopaque, buf: [*]u8, n: u32, read: *u32, ov: ?*anyopaque) callconv(.winapi) i32;
+    extern "kernel32" fn WriteFile(h: *anyopaque, buf: [*]const u8, n: u32, written: *u32, ov: ?*anyopaque) callconv(.winapi) i32;
+    extern "kernel32" fn CloseHandle(h: *anyopaque) callconv(.winapi) i32;
+    extern "kernel32" fn MoveFileExW(from: [*:0]const u16, to: [*:0]const u16, flags: u32) callconv(.winapi) i32;
+    extern "kernel32" fn CreateDirectoryW(path: [*:0]const u16, sec: ?*anyopaque) callconv(.winapi) i32;
+    const generic_read: u32 = 0x8000_0000;
+    const generic_write: u32 = 0x4000_0000;
+    const share_read: u32 = 1;
+    const open_existing: u32 = 3;
+    const create_always: u32 = 2;
+    const attr_normal: u32 = 0x80;
+    const movefile_replace: u32 = 1;
+    const invalid_handle: usize = std.math.maxInt(usize);
+};
+
+fn utf16Path(buf: *[520]u16, path: []const u8) ?[:0]const u16 {
+    if (path.len == 0) return null;
+    const n = std.unicode.utf8ToUtf16Le(buf[0 .. buf.len - 1], path) catch return null;
+    buf[n] = 0;
+    return buf[0..n :0];
+}
+
+fn winOpen(path: []const u8, write: bool) ?*anyopaque {
+    var w: [520]u16 = undefined;
+    const wp = utf16Path(&w, path) orelse return null;
+    const h = k32.CreateFileW(
+        wp.ptr,
+        if (write) k32.generic_write else k32.generic_read,
+        k32.share_read,
+        null,
+        if (write) k32.create_always else k32.open_existing,
+        k32.attr_normal,
+        null,
+    );
+    if (h == null or @intFromPtr(h.?) == k32.invalid_handle) return null;
+    return h.?;
+}
+const snapshot = @import("../core/snapshot.zig");
+const feed = @import("../core/feed.zig");
+const auth = @import("auth.zig");
+
+const store_file = "store.zat";
+const session_file = "session.zat";
+const max_file_bytes = 64 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// Paths
+// ---------------------------------------------------------------------------
+
+/// Resolve (and create) the cache directory: ZAT_CACHE_DIR, else
+/// $XDG_CACHE_HOME/zat, else $HOME/.cache/zat. Null when no home exists —
+/// the app then simply runs cacheless.
+pub fn cacheDir(buf: []u8, environ: ?*const std.process.Environ.Map) ?[]const u8 {
+    const env = environ orelse return null;
+    const dir: []const u8 = blk: {
+        if (env.get("ZAT_CACHE_DIR")) |explicit| {
+            break :blk std.fmt.bufPrint(buf, "{s}", .{explicit}) catch return null;
+        }
+        if (comptime is_darwin) {
+            if (env.get("HOME")) |home| {
+                break :blk std.fmt.bufPrint(buf, "{s}/Library/Caches/zat", .{home}) catch return null;
+            }
+            return null;
+        }
+        if (comptime is_windows) {
+            if (env.get("LOCALAPPDATA")) |base| {
+                break :blk std.fmt.bufPrint(buf, "{s}\\zat", .{base}) catch return null;
+            }
+            return null;
+        }
+        if (env.get("XDG_CACHE_HOME")) |xdg| {
+            break :blk std.fmt.bufPrint(buf, "{s}/zat", .{xdg}) catch return null;
+        }
+        if (env.get("HOME")) |home| {
+            const parent = std.fmt.bufPrint(buf, "{s}/.cache", .{home}) catch return null;
+            mkdir(parent); // best effort; usually exists
+            break :blk std.fmt.bufPrint(buf, "{s}/.cache/zat", .{home}) catch return null;
+        }
+        return null;
+    };
+    mkdir(dir);
+    return dir;
+}
+
+fn mkdir(path: []const u8) void {
+    if (comptime is_darwin) {
+        var z: [512]u8 = undefined;
+        const zp = zPath(&z, path) orelse return;
+        _ = dc.mkdir(zp, 0o700); // EEXIST and friends are fine (E4)
+        return;
+    }
+    if (comptime is_windows) {
+        var w: [520]u16 = undefined;
+        const wp = utf16Path(&w, path) orelse return;
+        _ = k32.CreateDirectoryW(wp.ptr, null); // ALREADY_EXISTS is fine (E4)
+        return;
+    }
+    var z: [512]u8 = undefined;
+    const zp = zPath(&z, path) orelse return;
+    _ = linux.mkdir(zp, 0o700); // EEXIST and friends are fine (E4)
+}
+
+fn zPath(buf: *[512]u8, path: []const u8) ?[*:0]const u8 {
+    if (path.len == 0 or path.len >= buf.len) return null;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    return buf[0..path.len :0].ptr;
+}
+
+fn joinFile(buf: []u8, dir: []const u8, name: []const u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "{s}/{s}", .{ dir, name }) catch null;
+}
+
+// ---------------------------------------------------------------------------
+// Kernel-surface file primitives
+// ---------------------------------------------------------------------------
+
+fn readFileAlloc(gpa: Allocator, path: []const u8) ?[]u8 {
+    if (comptime is_darwin) {
+        var z: [512]u8 = undefined;
+        const zp = zPath(&z, path) orelse return null;
+        const fd = dc.open(zp, dc.O_RDONLY);
+        if (fd < 0) return null;
+        defer _ = dc.close(fd);
+        var out: std.ArrayList(u8) = .empty;
+        var chunk: [64 * 1024]u8 = undefined;
+        while (true) {
+            const got = dc.read(fd, &chunk, chunk.len);
+            if (got < 0) {
+                out.deinit(gpa);
+                return null;
+            }
+            if (got == 0) break;
+            const g: usize = @intCast(got);
+            if (out.items.len + g > max_file_bytes) {
+                out.deinit(gpa);
+                return null;
+            }
+            out.appendSlice(gpa, chunk[0..g]) catch {
+                out.deinit(gpa);
+                return null;
+            };
+        }
+        return out.toOwnedSlice(gpa) catch {
+            out.deinit(gpa);
+            return null;
+        };
+    }
+    if (comptime is_windows) {
+        const h = winOpen(path, false) orelse return null;
+        defer _ = k32.CloseHandle(h);
+        var out: std.ArrayList(u8) = .empty;
+        var chunk: [64 * 1024]u8 = undefined;
+        while (true) {
+            var got: u32 = 0;
+            if (k32.ReadFile(h, &chunk, chunk.len, &got, null) == 0) {
+                out.deinit(gpa);
+                return null;
+            }
+            if (got == 0) break;
+            if (out.items.len + got > max_file_bytes) {
+                out.deinit(gpa);
+                return null;
+            }
+            out.appendSlice(gpa, chunk[0..got]) catch {
+                out.deinit(gpa);
+                return null;
+            };
+        }
+        return out.toOwnedSlice(gpa) catch {
+            out.deinit(gpa);
+            return null;
+        };
+    }
+    var z: [512]u8 = undefined;
+    const zp = zPath(&z, path) orelse return null;
+    const open_rc = linux.open(zp, .{ .ACCMODE = .RDONLY }, 0);
+    const fd_signed: isize = @bitCast(open_rc);
+    if (fd_signed < 0) return null;
+    const fd: i32 = @intCast(fd_signed);
+    defer _ = linux.close(fd);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var chunk: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n_rc = linux.read(fd, &chunk, chunk.len);
+        const n_signed: isize = @bitCast(n_rc);
+        if (n_signed < 0) {
+            out.deinit(gpa);
+            return null;
+        }
+        if (n_signed == 0) break;
+        if (out.items.len + @as(usize, @intCast(n_signed)) > max_file_bytes) {
+            out.deinit(gpa);
+            return null;
+        }
+        out.appendSlice(gpa, chunk[0..@intCast(n_signed)]) catch {
+            out.deinit(gpa);
+            return null;
+        };
+    }
+    // toOwnedSlice: the returned slice's length must equal the allocation
+    // the caller will free — items.len under a larger capacity is a lie
+    // the leak detector rightly aborts on.
+    return out.toOwnedSlice(gpa) catch {
+        out.deinit(gpa);
+        return null;
+    };
+}
+
+fn writeFileAtomic(path: []const u8, bytes: []const u8, mode: u32) bool {
+    var tmp_buf: [512]u8 = undefined;
+    const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path}) catch return false;
+    if (comptime is_darwin) {
+        var zt: [512]u8 = undefined;
+        var zf: [512]u8 = undefined;
+        const tmp_z = zPath(&zt, tmp) orelse return false;
+        const final_z = zPath(&zf, path) orelse return false;
+        const fd = dc.open(tmp_z, dc.O_WRONLY | dc.O_CREAT | dc.O_TRUNC, @as(c_int, @intCast(mode)));
+        if (fd < 0) return false;
+        var sent: usize = 0;
+        while (sent < bytes.len) {
+            const wrote = dc.write(fd, bytes.ptr + sent, bytes.len - sent);
+            if (wrote <= 0) {
+                _ = dc.close(fd);
+                return false;
+            }
+            sent += @intCast(wrote);
+        }
+        if (dc.close(fd) != 0) return false;
+        return dc.rename(tmp_z, final_z) == 0;
+    }
+    if (comptime is_windows) {
+        // `mode` is POSIX semantics; Windows files inherit directory ACLs.
+        // Tightening session.zat with an explicit ACL is the recorded
+        // hardening follow-up for the Windows port.
+        const h = winOpen(tmp, true) orelse return false;
+        var sent: usize = 0;
+        while (sent < bytes.len) {
+            var wrote: u32 = 0;
+            const n: u32 = @intCast(@min(bytes.len - sent, std.math.maxInt(u32)));
+            if (k32.WriteFile(h, bytes.ptr + sent, n, &wrote, null) == 0 or wrote == 0) {
+                _ = k32.CloseHandle(h);
+                return false;
+            }
+            sent += wrote;
+        }
+        _ = k32.CloseHandle(h);
+        var wt: [520]u16 = undefined;
+        var wf: [520]u16 = undefined;
+        const tmp_w = utf16Path(&wt, tmp) orelse return false;
+        const final_w = utf16Path(&wf, path) orelse return false;
+        return k32.MoveFileExW(tmp_w.ptr, final_w.ptr, k32.movefile_replace) != 0;
+    }
+    var z_tmp: [512]u8 = undefined;
+    const zp_tmp = zPath(&z_tmp, tmp) orelse return false;
+
+    const open_rc = linux.open(zp_tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, mode);
+    const fd_signed: isize = @bitCast(open_rc);
+    if (fd_signed < 0) return false;
+    const fd: i32 = @intCast(fd_signed);
+
+    var written: usize = 0;
+    while (written < bytes.len) {
+        const n_rc = linux.write(fd, bytes.ptr + written, bytes.len - written);
+        const n_signed: isize = @bitCast(n_rc);
+        if (n_signed <= 0) {
+            _ = linux.close(fd);
+            return false;
+        }
+        written += @intCast(n_signed);
+    }
+    _ = linux.close(fd);
+
+    var z_final: [512]u8 = undefined;
+    const zp_final = zPath(&z_final, path) orelse return false;
+    return linux.rename(zp_tmp, zp_final) == 0;
+}
+
+// ---------------------------------------------------------------------------
+// The store snapshot
+// ---------------------------------------------------------------------------
+
+pub fn loadStoreAt(gpa: Allocator, path: []const u8) ?feed.Store {
+    const bytes = readFileAlloc(gpa, path) orelse return null;
+    defer gpa.free(bytes);
+    return snapshot.decode(gpa, bytes) catch null;
+}
+
+pub fn saveStoreAt(gpa: Allocator, path: []const u8, store: *const feed.Store) bool {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const image = snapshot.encode(arena_state.allocator(), store) catch return false;
+    return writeFileAtomic(path, image, 0o644);
+}
+
+pub fn loadStore(gpa: Allocator, environ: ?*const std.process.Environ.Map) ?feed.Store {
+    var dir_buf: [512]u8 = undefined;
+    var path_buf: [512]u8 = undefined;
+    const dir = cacheDir(&dir_buf, environ) orelse return null;
+    const path = joinFile(&path_buf, dir, store_file) orelse return null;
+    return loadStoreAt(gpa, path);
+}
+
+pub fn saveStore(gpa: Allocator, environ: ?*const std.process.Environ.Map, store: *const feed.Store) bool {
+    var dir_buf: [512]u8 = undefined;
+    var path_buf: [512]u8 = undefined;
+    const dir = cacheDir(&dir_buf, environ) orelse return false;
+    const path = joinFile(&path_buf, dir, store_file) orelse return false;
+    return saveStoreAt(gpa, path, store);
+}
+
+// ---------------------------------------------------------------------------
+// The session — five strings behind 0600
+// ---------------------------------------------------------------------------
+
+const session_magic = [4]u8{ 'Z', 'A', 'T', 'S' };
+const session_version: u16 = 1;
+
+pub fn saveSessionAt(gpa: Allocator, path: []const u8, session: *const auth.Session) bool {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var out: std.ArrayList(u8) = .empty;
+    out.appendSlice(arena, &session_magic) catch return false;
+    out.appendSlice(arena, std.mem.asBytes(&session_version)) catch return false;
+    inline for (.{ session.did, session.handle, session.pds_url, session.access_jwt, session.refresh_jwt }) |field| {
+        const len: u32 = @intCast(field.len);
+        out.appendSlice(arena, std.mem.asBytes(&len)) catch return false;
+        out.appendSlice(arena, field) catch return false;
+    }
+    return writeFileAtomic(path, out.items, 0o600);
+}
+
+/// Loaded strings are gpa-owned; release with `freeSession`.
+pub fn loadSessionAt(gpa: Allocator, path: []const u8) ?auth.Session {
+    const bytes = readFileAlloc(gpa, path) orelse return null;
+    defer gpa.free(bytes);
+    if (bytes.len < 6 or !std.mem.eql(u8, bytes[0..4], &session_magic)) return null;
+    if (std.mem.bytesToValue(u16, bytes[4..6]) != session_version) return null;
+
+    var fields: [5][]const u8 = undefined;
+    var at: usize = 6;
+    var loaded: usize = 0;
+    errdefer for (fields[0..loaded]) |f| gpa.free(f);
+    for (&fields) |*field| {
+        if (bytes.len - at < 4) {
+            for (fields[0..loaded]) |f| gpa.free(f);
+            return null;
+        }
+        const len = std.mem.bytesToValue(u32, bytes[at..][0..4]);
+        at += 4;
+        if (bytes.len - at < len) {
+            for (fields[0..loaded]) |f| gpa.free(f);
+            return null;
+        }
+        field.* = gpa.dupe(u8, bytes[at .. at + len]) catch {
+            for (fields[0..loaded]) |f| gpa.free(f);
+            return null;
+        };
+        loaded += 1;
+        at += len;
+    }
+    if (at != bytes.len) {
+        for (fields) |f| gpa.free(f);
+        return null;
+    }
+    return .{
+        .did = fields[0],
+        .handle = fields[1],
+        .pds_url = fields[2],
+        .access_jwt = fields[3],
+        .refresh_jwt = fields[4],
+    };
+}
+
+pub fn freeSession(gpa: Allocator, session: *const auth.Session) void {
+    gpa.free(session.did);
+    gpa.free(session.handle);
+    gpa.free(session.pds_url);
+    gpa.free(session.access_jwt);
+    gpa.free(session.refresh_jwt);
+}
+
+pub fn sessionPath(buf: []u8, environ: ?*const std.process.Environ.Map) ?[]const u8 {
+    var dir_buf: [512]u8 = undefined;
+    const dir = cacheDir(&dir_buf, environ) orelse return null;
+    return joinFile(buf, dir, session_file);
+}
+
+// ---------------------------------------------------------------------------
+// Tests (C6) — real files under /tmp, cleaned up
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+fn tmpPath(buf: []u8, comptime name: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "/tmp/zat-test-{d}-" ++ name, .{linux.getpid()}) catch unreachable;
+}
+
+fn unlink(path: []const u8) void {
+    var z: [512]u8 = undefined;
+    const zp = zPath(&z, path) orelse return;
+    _ = linux.unlink(zp);
+}
+
+test "cache: store snapshot survives the disk; corruption is a cold start" {
+    const gpa = testing.allocator; // C6
+    var path_buf: [128]u8 = undefined;
+    const path = tmpPath(&path_buf, "store");
+    defer unlink(path);
+
+    var store: feed.Store = .{};
+    defer feed.deinitStore(gpa, &store);
+    _ = try feed.ingestPage(gpa, &store, feed.fixture_page);
+
+    try testing.expect(saveStoreAt(gpa, path, &store));
+    var loaded = loadStoreAt(gpa, path) orelse return error.TestUnexpectedResult;
+    defer feed.deinitStore(gpa, &loaded);
+    try testing.expectEqual(store.feed.len, loaded.feed.len);
+    try testing.expectEqualStrings(feed.nextCursor(&store), feed.nextCursor(&loaded));
+
+    // Corruption is refused quietly.
+    try testing.expect(writeFileAtomic(path, "not a snapshot", 0o644));
+    try testing.expectEqual(@as(?feed.Store, null), loadStoreAt(gpa, path));
+
+    // Absence is a cold start.
+    unlink(path);
+    try testing.expectEqual(@as(?feed.Store, null), loadStoreAt(gpa, path));
+}
+
+test "cache: session round-trips behind 0600 and frees clean" {
+    const gpa = testing.allocator; // C6
+    var path_buf: [128]u8 = undefined;
+    const path = tmpPath(&path_buf, "session");
+    defer unlink(path);
+
+    const session = auth.Session{
+        .did = "did:plc:cccccccccccccccccccccccc",
+        .handle = "carol.test",
+        .pds_url = "https://pds.example",
+        .access_jwt = "access-token",
+        .refresh_jwt = "refresh-token",
+    };
+    try testing.expect(saveSessionAt(gpa, path, &session));
+
+    const loaded = loadSessionAt(gpa, path) orelse return error.TestUnexpectedResult;
+    defer freeSession(gpa, &loaded);
+    try testing.expectEqualStrings(session.did, loaded.did);
+    try testing.expectEqualStrings(session.refresh_jwt, loaded.refresh_jwt);
+
+    // 0600: the kernel agrees (statx is this snapshot's stat surface).
+    var z: [512]u8 = undefined;
+    var stx: linux.Statx = undefined;
+    const stat_rc = linux.statx(linux.AT.FDCWD, zPath(&z, path).?, 0, .{ .MODE = true }, &stx);
+    try testing.expect(stat_rc == 0);
+    try testing.expectEqual(@as(u16, 0o600), stx.mode & 0o777);
+}
