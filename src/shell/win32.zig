@@ -6,7 +6,7 @@
 //! shell/native.zig can select it by OS and nothing above notices (D1).
 //!
 //! Division of meaning: key semantics are pure tables in core/win32.zig
-//! (tested on any host); the rasterizer is the shared core/pixel.zig;
+//! (tested on any host); the rasterizer is the shared layout/raster/text core stack;
 //! this file owns only the OS choreography — class registration, the
 //! window procedure, the message pump, and the DIB blit (B3).
 //!
@@ -19,8 +19,10 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const pixel = @import("../core/pixel.zig");
-const font = @import("../core/font.zig");
+const layout = @import("../core/layout.zig");
+const raster = @import("../core/raster.zig");
+const text_core = @import("../core/text.zig");
+const text = text_core;
 const keys = @import("../core/win32.zig");
 const tui = @import("../core/tui.zig");
 
@@ -136,6 +138,7 @@ extern "user32" fn DispatchMessageW(lpMsg: *const MSG) callconv(.winapi) LRESULT
 extern "user32" fn MsgWaitForMultipleObjects(nCount: u32, pHandles: ?*const anyopaque, fWaitAll: i32, dwMilliseconds: u32, dwWakeMask: u32) callconv(.winapi) u32;
 extern "user32" fn ValidateRect(hWnd: HWND, lpRect: ?*const RECT) callconv(.winapi) i32;
 extern "user32" fn GetDC(hWnd: HWND) callconv(.winapi) HDC;
+extern "user32" fn ScreenToClient(hWnd: HWND, lpPoint: *POINT) callconv(.winapi) i32;
 extern "user32" fn ReleaseDC(hWnd: HWND, hDC: HDC) callconv(.winapi) i32;
 extern "gdi32" fn StretchDIBits(
     hdc: HDC,
@@ -171,6 +174,17 @@ const wm_close: u32 = 0x0010;
 const wm_erasebkgnd: u32 = 0x0014;
 const wm_keydown: u32 = 0x0100;
 const wm_char: u32 = 0x0102;
+const wm_mousemove: u32 = 0x0200;
+const wm_lbuttondown: u32 = 0x0201;
+const wm_lbuttonup: u32 = 0x0202;
+const wm_rbuttondown: u32 = 0x0204;
+const wm_rbuttonup: u32 = 0x0205;
+const wm_mbuttondown: u32 = 0x0207;
+const wm_mbuttonup: u32 = 0x0208;
+const wm_mousewheel: u32 = 0x020A;
+/// Mouse-message modifier bits in wParam's low word (MK_*).
+const mk_shift: usize = 0x0004;
+const mk_control: usize = 0x0008;
 
 // ---------------------------------------------------------------------------
 // The window — same surface as shell/window.zig
@@ -188,13 +202,21 @@ pub const OpenError = error{
 pub const Window = struct {
     gpa: Allocator,
     hwnd: HWND,
-    fb: pixel.Framebuffer,
+    fb: raster.Framebuffer,
+    /// Per-frame draw list — opaque transport between the layout and
+    /// raster cores; never inspected here (B5/D3).
+    draw_list: raster.DrawList,
     cols: u16,
     rows: u16,
     /// Terminal bytes the window procedure has produced since the last
     /// pump; drained into the caller's buffer (the same hand-off shape
     /// as the X11 pump).
     queue: std.ArrayList(u8),
+    /// Pointer events the procedure has produced since the last pump,
+    /// drained the same way. A3 exception: flat 8-byte InputEvent
+    /// records, consumed whole and in order by the core — see the X11
+    /// pump's note for the full reasoning.
+    pointer_queue: std.ArrayList(layout.InputEvent),
     closed: bool,
     resized: bool,
     exposed: bool,
@@ -216,6 +238,11 @@ pub const PumpResult = struct {
     /// Input bytes lost since the last pump (allocation failure in the
     /// window procedure). Zero in healthy operation.
     dropped: u32 = 0,
+    /// Parity with the X11 backend's error-packet report; there is no X
+    /// server here, so it is always zero. Exists so the Backend seam in
+    /// shell/tui.zig reads one shape on every OS (the native.zig
+    /// same-surface contract).
+    x_error: u8 = 0,
 };
 
 const class_name = std.unicode.utf8ToUtf16LeStringLiteral("zatWindow");
@@ -244,8 +271,8 @@ pub fn open(
         return error.ConnectFailed;
     }
 
-    const width: i32 = @as(i32, cols) * @as(i32, @intCast(font.glyph_w));
-    const height: i32 = @as(i32, rows) * @as(i32, @intCast(font.glyph_h));
+    const width: i32 = @as(i32, cols) * @as(i32, @intCast(text.cell_w));
+    const height: i32 = @as(i32, rows) * @as(i32, @intCast(text.cell_h));
     var frame: RECT = .{ .left = 0, .top = 0, .right = width, .bottom = height };
     _ = AdjustWindowRect(&frame, ws_overlappedwindow, 0);
 
@@ -274,6 +301,8 @@ pub fn open(
         .gpa = gpa,
         .hwnd = hwnd,
         .fb = .{},
+        .draw_list = .empty,
+        .pointer_queue = .empty,
         .cols = cols,
         .rows = rows,
         .queue = .empty,
@@ -283,9 +312,11 @@ pub fn open(
         .pending_high = 0,
         .dropped = 0,
     };
-    // A burst of typing should never need the allocator mid-callback.
+    // A burst of typing or dragging should never need the allocator
+    // mid-callback.
     window.queue.ensureTotalCapacity(gpa, 256) catch return error.OutOfMemory;
-    pixel.resize(gpa, &window.fb, @intCast(width), @intCast(height)) catch return error.OutOfMemory;
+    window.pointer_queue.ensureTotalCapacity(gpa, 256) catch return error.OutOfMemory;
+    raster.resize(gpa, &window.fb, @intCast(width), @intCast(height), layout.palette_bg) catch return error.OutOfMemory;
     _ = SetWindowLongPtrW(hwnd, gwlp_userdata, @bitCast(@intFromPtr(window)));
     return window;
 }
@@ -295,7 +326,9 @@ pub fn close(window: *Window) void {
     _ = SetWindowLongPtrW(window.hwnd, gwlp_userdata, 0);
     _ = DestroyWindow(window.hwnd);
     window.queue.deinit(gpa);
-    pixel.deinit(gpa, &window.fb);
+    window.pointer_queue.deinit(gpa);
+    window.draw_list.deinit(gpa);
+    raster.deinit(gpa, &window.fb);
     gpa.destroy(window);
 }
 
@@ -320,9 +353,9 @@ fn wndProc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) callconv(.winap
                 // Allocation inside the procedure is same-thread (the pump
                 // dispatches us); a failed resize keeps the old buffer and
                 // the next WM_SIZE retries (E4).
-                pixel.resize(window.gpa, &window.fb, w, h) catch return 0;
-                window.cols = @intCast(@max(20, w / font.glyph_w));
-                window.rows = @intCast(@max(5, h / font.glyph_h));
+                raster.resize(window.gpa, &window.fb, w, h, layout.palette_bg) catch return 0;
+                window.cols = @intCast(@max(20, w / text.cell_w));
+                window.rows = @intCast(@max(5, h / text.cell_h));
                 window.resized = true;
             }
             return 0;
@@ -351,9 +384,75 @@ fn wndProc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) callconv(.winap
             };
             return 0;
         },
+        wm_mousemove, wm_lbuttondown, wm_lbuttonup, wm_rbuttondown, wm_rbuttonup, wm_mbuttondown, wm_mbuttonup => {
+            // Client coordinates ride lParam as two signed shorts; clamp
+            // negatives to the edge (capture can report outside the
+            // client area), same policy as the X11 leg. Modifiers are
+            // translated INTO the X11 mask positions the InputEvent
+            // contract fixes (layout.InputEvent doc).
+            const lx: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lparam)))));
+            const ly: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lparam)) >> 16)));
+            const kind: layout.InputEvent.Kind = switch (msg) {
+                wm_mousemove => .move,
+                wm_lbuttondown, wm_rbuttondown, wm_mbuttondown => .button_down,
+                else => .button_up,
+            };
+            const button: u8 = switch (msg) {
+                wm_lbuttondown, wm_lbuttonup => 1,
+                wm_mbuttondown, wm_mbuttonup => 2,
+                wm_rbuttondown, wm_rbuttonup => 3,
+                else => 0,
+            };
+            window.pointer_queue.append(window.gpa, .{
+                .x = if (lx < 0) 0 else @intCast(lx),
+                .y = if (ly < 0) 0 else @intCast(ly),
+                .kind = kind,
+                .button = button,
+                .mods = win32Mods(wparam),
+                ._pad = 0,
+            }) catch {
+                window.dropped +%= 1; // counted, not silent
+            };
+            return 0;
+        },
+        wm_mousewheel => {
+            // Wheel coordinates are SCREEN space (the one mouse message
+            // that differs); convert to client space before queueing.
+            // HIWORD(wParam) is a signed delta in multiples of 120:
+            // positive = away from the user = wheel up = button 4.
+            const delta: i16 = @bitCast(@as(u16, @truncate(wparam >> 16)));
+            if (delta == 0) return 0;
+            var pt: POINT = .{
+                .x = @as(i16, @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lparam)))))),
+                .y = @as(i16, @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lparam)) >> 16)))),
+            };
+            _ = ScreenToClient(hwnd, &pt);
+            window.pointer_queue.append(window.gpa, .{
+                .x = if (pt.x < 0) 0 else @intCast(@min(pt.x, std.math.maxInt(u16))),
+                .y = if (pt.y < 0) 0 else @intCast(@min(pt.y, std.math.maxInt(u16))),
+                .kind = .wheel,
+                .button = if (delta > 0) 4 else 5,
+                .mods = win32Mods(wparam),
+                ._pad = 0,
+            }) catch {
+                window.dropped +%= 1; // counted, not silent
+            };
+            return 0;
+        },
         wm_destroy => return 0,
         else => return DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+/// MK_* (mouse-message wParam bits) -> the X11 mask positions the
+/// InputEvent contract fixes. Alt does not ride mouse wParams on Win32;
+/// it would need GetKeyState — added when a screen actually wants
+/// alt-click (F4: no speculative machinery).
+fn win32Mods(wparam: WPARAM) u8 {
+    var mods: u8 = 0;
+    if (wparam & mk_shift != 0) mods |= layout.InputEvent.mod_shift;
+    if (wparam & mk_control != 0) mods |= layout.InputEvent.mod_control;
+    return mods;
 }
 
 /// Bounded wait, then drain the message queue; the procedure above fills
@@ -364,6 +463,7 @@ pub fn pump(
     timeout_ms: i32,
     gpa: Allocator,
     out: *std.ArrayList(u8),
+    events: *std.ArrayList(layout.InputEvent),
 ) error{ OutOfMemory, ProtocolError }!PumpResult {
     const wait: u32 = if (timeout_ms > 0) @intCast(timeout_ms) else 0;
     _ = MsgWaitForMultipleObjects(0, null, 0, wait, qs_allinput);
@@ -378,6 +478,10 @@ pub fn pump(
         try out.appendSlice(gpa, window.queue.items);
         window.queue.clearRetainingCapacity();
     }
+    if (window.pointer_queue.items.len > 0) {
+        try events.appendSlice(gpa, window.pointer_queue.items);
+        window.pointer_queue.clearRetainingCapacity();
+    }
     const result: PumpResult = .{
         .exposed = window.exposed,
         .resized = window.resized,
@@ -391,7 +495,27 @@ pub fn pump(
 }
 
 pub fn present(window: *Window, surface: *const tui.Surface) error{ OutOfMemory, ProtocolError }!void {
-    pixel.rasterize(surface, &window.fb);
+    // The Phase-5 seam (GUI roadmap §2): pure layout builds the draw
+    // list, pure raster paints it, and only the blit below is shell.
+    try layout.fromSurface(window.gpa, &window.draw_list, surface);
+    try raster.paint(window.gpa, null, window.draw_list.slice(), &window.fb, layout.palette_bg);
+    try blit(window);
+}
+
+/// The modern pixel path — paint the caller's list, then blit. Mirrors
+/// the X11 backend's surface (native.zig same-shape contract).
+pub fn presentDrawList(
+    window: *Window,
+    gpa: Allocator,
+    engine: *text_core.Engine,
+    list: raster.DrawList.Slice,
+    clear: u32,
+) error{ OutOfMemory, ProtocolError }!void {
+    try raster.paint(gpa, engine, list, &window.fb, clear);
+    try blit(window);
+}
+
+pub fn blit(window: *Window) error{ OutOfMemory, ProtocolError }!void {
     const fb = &window.fb;
     if (fb.width == 0 or fb.height == 0) return;
 

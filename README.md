@@ -60,7 +60,17 @@ zig build test       # offline unit tests — leak-checked (C6), deterministic
 zig build test-live  # network smoke tests — hits the real network on purpose
 zig build bench      # the G1 performance ledger (core transforms, measured)
 zig build guards     # A7: every struct guarded or waived — also runs inside `zig build test`
+zig build clean      # wipe the local build cache (.zig-cache) + zig-out
 ```
+
+> **On the build cache growing:** `.zig-cache/` ballooning during heavy
+> testing is expected, not a bug. Zig keeps content-hashed compiled
+> artifacts so incremental rebuilds are fast, and it cannot auto-delete
+> old variants (it has no way to know you won't switch back to a target
+> or mode). Across a session that cross-compiles several targets — and
+> with the fonts embedded into every binary variant — it accumulates.
+> `zig build clean` clears it in one command. The cache never enters git
+> (`.gitignore` covers it), so this is purely local disk.
 
 `l` and `b` are toggles: pressing on an already-liked/boosted post
 unlikes/unboosts it — optimistic, reverted if the server refuses. Items

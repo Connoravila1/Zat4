@@ -83,6 +83,37 @@ pub fn actionFor(event: tui.InputEvent) Action {
     };
 }
 
+/// The inverse of actionFor's char bindings: the byte a pointer hit
+/// must inject so a click and a key run the IDENTICAL dispatch path
+/// (GUI roadmap §3.2 — "click 'like' and press 'l' reach the same core
+/// function"; this map is the no-second-path guarantee, round-trip
+/// tested below so the two can never drift).
+pub fn keyFor(action: Action) ?u8 {
+    return switch (action) {
+        .like => 'l',
+        .repost => 'b',
+        .reply => 'R',
+        .new_post => 'n',
+        .follow => 'f',
+        .profile => 'p',
+        .toggle_reveal => 'x',
+        .refresh => 'r',
+        .load_more => ' ',
+        .go_top => 'g',
+        .go_bottom => 'G',
+        else => null,
+    };
+}
+
+test "keyFor round-trips through actionFor: clicks and keys cannot drift" {
+    inline for (@typeInfo(Action).@"enum".fields) |f| {
+        const action: Action = @enumFromInt(f.value);
+        if (keyFor(action)) |byte| {
+            try std.testing.expectEqual(action, actionFor(.{ .char = byte }));
+        }
+    }
+}
+
 /// What a key means inside the composer. ctrl-d sends (end of input);
 /// ESC or ctrl-c backs out with the draft intact for this session.
 pub const ComposeAction = union(enum) {

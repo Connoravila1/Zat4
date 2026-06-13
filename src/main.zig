@@ -290,11 +290,16 @@ test {
     _ = @import("core/moderation.zig");
     _ = @import("core/tui.zig");
     _ = @import("core/timeline_ui.zig");
+    _ = @import("core/field.zig");
+    _ = @import("core/effect.zig");
+    _ = @import("core/field_ui.zig");
     _ = @import("core/compose.zig");
     _ = @import("core/websocket.zig");
     _ = @import("core/jetstream.zig");
     _ = @import("core/snapshot.zig");
-    _ = @import("core/pixel.zig");
+    _ = @import("core/layout.zig");
+    _ = @import("core/raster.zig");
+    _ = @import("core/text.zig");
     _ = @import("core/x11.zig");
     _ = @import("core/win32.zig");
     _ = @import("core/textinput.zig");

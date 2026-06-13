@@ -87,3 +87,48 @@ test "live: stream TLS leg — handshake with a real endpoint, first bytes read"
     try std.testing.expect(n > 0);
     try std.testing.expect(std.mem.startsWith(u8, buf[0..n], "HTTP/1.1"));
 }
+
+const window_shell = @import("shell/window.zig");
+const tui_core = @import("core/tui.zig");
+const layout_core = @import("core/layout.zig");
+
+test "live: X11 open->present->pump->close against a REAL server, error channel silent" {
+    // The lesson of the black-window session (SESSION_FINDINGS §3.7):
+    // the loopback fake proves the protocol bytes; only a real server
+    // proves the server accepts them. This drives the whole carved
+    // pipeline (layout -> raster -> blit) through an actual X server and
+    // asserts the one channel Bug 4 hid in — the error packet stream —
+    // stays silent for every presented frame.
+    //
+    // Gated on the environment, not on getenv (the 0.16 test runner has
+    // no environment capability, per the note above): it dials the
+    // conventional socket of display :99 directly. No server listening
+    // -> ConnectFailed -> skip. Run one with:  Xvfb :99 -ac &
+    const gpa = std.testing.allocator; // C6
+    const win = window_shell.openAt(gpa, "/tmp/.X11-unix/X99", "", "", "zat live smoke", 40, 12) catch |err| switch (err) {
+        error.ConnectFailed => return error.SkipZigTest,
+        else => return err,
+    };
+    defer window_shell.close(win);
+
+    var surface: tui_core.Surface = .{};
+    defer tui_core.deinitSurface(gpa, &surface);
+    try tui_core.resizeSurface(gpa, &surface, win.cols, win.rows);
+    _ = tui_core.putText(&surface, 0, 0, .{ .fg = .cyan, .bold = true }, "zat live smoke");
+    _ = tui_core.putText(&surface, 0, 1, .{ .fg = .red, .inverse = true }, "inverse");
+    _ = tui_core.putText(&surface, 0, 2, .{ .dim = true }, "dim row");
+
+    // Several present/pump round trips: a rejected blit's error packet
+    // needs a pump to be read, so one frame would prove too little.
+    var pumped_bytes: std.ArrayList(u8) = .empty;
+    defer pumped_bytes.deinit(gpa);
+    var pointer_events: std.ArrayList(layout_core.InputEvent) = .empty;
+    defer pointer_events.deinit(gpa);
+    var frame: usize = 0;
+    while (frame < 5) : (frame += 1) {
+        try window_shell.present(win, &surface);
+        const pumped = try window_shell.pump(win, 50, gpa, &pumped_bytes, &pointer_events);
+        try std.testing.expectEqual(@as(u8, 0), pumped.x_error);
+        if (pumped.closed) return error.TestUnexpectedServerHangup;
+    }
+}

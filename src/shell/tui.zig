@@ -29,6 +29,12 @@ const feed_shell = @import("feed.zig");
 const stream_shell = @import("stream.zig");
 const cache_shell = @import("cache.zig");
 const window_shell = @import("native.zig");
+const layout_core = @import("../core/layout.zig");
+const raster_core = @import("../core/raster.zig");
+const text_core = @import("../core/text.zig");
+const field_core = @import("../core/field.zig");
+const field_ui = @import("../core/field_ui.zig");
+const effect_core = @import("../core/effect.zig");
 const clock_shell = @import("clock.zig");
 const write = @import("write.zig");
 const auth = @import("auth.zig");
@@ -240,6 +246,35 @@ pub fn run(
     const input_idle_gate_nanos: u64 = 600 * std.time.ns_per_ms;
     var last_input_nanos: u64 = 0;
 
+    // ---- the modern window path (GUI roadmap 5.2/5.5/5.6, §7 amendment) --
+    // The proportional engine and pixel view state exist only for the
+    // window backend. A failed font init degrades to the cell renderer
+    // (E2: a plainer window, never a dead one) — paintFrame() checks.
+    var engine: ?text_core.Engine = null;
+    defer if (engine) |*e| text_core.deinitEngine(gpa, e);
+    if (backend == .window) engine = text_core.initEngine() catch null;
+    // The glyph-field cutover (GLYPH_FIELD_SYSTEM_DESIGN G.0): the
+    // window renders the feed as a live simulated mono grid. All of
+    // this exists only when the font engine came up (E2: otherwise the
+    // cell fallback still runs — a plainer window, never a dead one).
+    var gfield: field_core.Field = .{};
+    defer field_core.deinit(gpa, &gfield);
+    var gparticles: field_core.ParticleList = .empty;
+    defer gparticles.deinit(gpa);
+    var gactive: effect_core.ActiveList = .empty;
+    defer gactive.deinit(gpa);
+    var gdraw: raster_core.DrawList = .empty;
+    defer gdraw.deinit(gpa);
+    var ghr: field_ui.HitList = .empty;
+    defer ghr.deinit(gpa);
+    var ghearts: field_ui.HeartList = .empty;
+    defer ghearts.deinit(gpa);
+    var gview: field_ui.ViewState = .{};
+    var gspawn: std.ArrayList(field_core.SpawnEvent) = .empty;
+    defer gspawn.deinit(gpa);
+    var glast_nanos: u64 = 0;
+    var gzoom: f32 = 1.0; // user text-scaling factor (+/- keys)
+
     main_loop: while (true) {
         _ = frame_arena.reset(.retain_capacity); // C3: one arena per frame
         const arena = frame_arena.allocator();
@@ -311,6 +346,7 @@ pub fn run(
                         // later as a configurable behavior.)
                         state.selected = 0;
                         state.scroll_top = 0;
+                        gview.scroll_rows = 0;
                         status = "live: new post";
                     }
                 },
@@ -349,6 +385,7 @@ pub fn run(
                 .ok => |stats| if (stats.items_added > 0) {
                     state.selected = 0;
                     state.scroll_top = 0;
+                    gview.scroll_rows = 0;
                     status = std.fmt.bufPrint(&status_buf, "+{d} new", .{stats.items_added}) catch "new posts";
                 },
                 .failed => {}, // a refused poll is silent; the next tick retries
@@ -359,12 +396,63 @@ pub fn run(
         }
 
         const items = try feed_core.buildTimeline(arena, store);
+        // pix exists exactly when a window backend has a live engine; the
+        // composer and profile screens stay on the cell path this cut
+        // (their pixel port is the recorded next slice).
+        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom } else null;
         switch (mode) {
-            .timeline => timeline_ui.buildFrame(&next, items, &state, revealed.items, now, session.handle, status),
-            .compose => timeline_ui.buildComposeFrame(&next, compose_buf.items, reply_handle, status),
-            .profile => timeline_ui.buildProfileFrame(&next, profile_info orelse .{}, status),
+            .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, &state, revealed.items, now, session.handle, status),
+            .compose => {
+                if (pix) |g| switch (backend) {
+                    .window => |win| {
+                        // Glyph-field composer (matches the timeline look).
+                        const cell = cellSize(win.fb.width, gzoom);
+                        const cols: u16 = @intCast(@max(16, win.fb.width / cell.w));
+                        const rows: u16 = @intCast(@max(6, win.fb.height / cell.h));
+                        if (gfield.cols != cols or gfield.rows != rows) {
+                            field_core.deinit(gpa, &gfield);
+                            try field_core.init(gpa, &gfield, cols, rows);
+                        }
+                        const cc = timeline_ui.countCodepoints(compose_buf.items);
+                        const cursor = field_ui.buildCompose(&gfield, compose_buf.items, reply_handle, cc, status);
+                        try field_core.compose(gpa, &gfield, gparticles.slice(), .{ .x = @floatFromInt(cols / 2), .y = @floatFromInt(rows / 3), .radius = @floatFromInt(cols), .ambient = 0.7 }, cell.w, cell.h, &gdraw);
+                        // The cursor: a filled block at the insertion cell.
+                        try gdraw.append(gpa, .{ .rect = .{ .x = @intCast(@min(cursor.x * cell.w, 32767)), .y = @intCast(@min(cursor.y * cell.h, 32767)), .w = cell.w, .h = cell.h, .color = 0x886CA8FF, .radius = 0 } });
+                        window_shell.presentDrawList(win, gpa, g.engine, gdraw.slice(), 0xFF0E1116) catch {};
+                    },
+                    .terminal => {
+                        timeline_ui.buildComposeFrame(&next, compose_buf.items, reply_handle, status);
+                        try present(gpa, out, arena, &prev, &next, backend);
+                    },
+                } else {
+                    timeline_ui.buildComposeFrame(&next, compose_buf.items, reply_handle, status);
+                    try present(gpa, out, arena, &prev, &next, backend);
+                }
+            },
+            .profile => {
+                if (pix) |g| switch (backend) {
+                    .window => |win| {
+                        const cell = cellSize(win.fb.width, gzoom);
+                        const cols: u16 = @intCast(@max(16, win.fb.width / cell.w));
+                        const rows: u16 = @intCast(@max(6, win.fb.height / cell.h));
+                        if (gfield.cols != cols or gfield.rows != rows) {
+                            field_core.deinit(gpa, &gfield);
+                            try field_core.init(gpa, &gfield, cols, rows);
+                        }
+                        field_ui.buildProfile(&gfield, profile_info orelse .{}, status);
+                        try field_core.compose(gpa, &gfield, gparticles.slice(), .{ .x = @floatFromInt(cols / 2), .y = @floatFromInt(rows / 3), .radius = @floatFromInt(cols), .ambient = 0.7 }, cell.w, cell.h, &gdraw);
+                        window_shell.presentDrawList(win, gpa, g.engine, gdraw.slice(), 0xFF0E1116) catch {};
+                    },
+                    .terminal => {
+                        timeline_ui.buildProfileFrame(&next, profile_info orelse .{}, status);
+                        try present(gpa, out, arena, &prev, &next, backend);
+                    },
+                } else {
+                    timeline_ui.buildProfileFrame(&next, profile_info orelse .{}, status);
+                    try present(gpa, out, arena, &prev, &next, backend);
+                }
+            },
         }
-        try present(gpa, out, arena, &prev, &next, backend);
 
         // Wait for input; the timeout re-renders so relative ages stay
         // honest on an idle screen. 500 ms: the mailbox drains and
@@ -391,7 +479,23 @@ pub fn run(
                 // re-render lap (E2: a window hiccup is not a crash).
                 var pumped_bytes: std.ArrayList(u8) = .empty;
                 defer pumped_bytes.deinit(gpa);
-                const pumped = window_shell.pump(win, 500, gpa, &pumped_bytes) catch {
+                // Cut 5.1: the pointer channel arrives but is not yet
+                // consumed — hit-testing lands in 5.2 (GUI roadmap §7).
+                // Drained per lap so a motion flood never accumulates.
+                var pointer_events: std.ArrayList(layout_core.InputEvent) = .empty;
+                defer pointer_events.deinit(gpa);
+                // The field animates only while it has live work — a
+                // playing effect or particles in flight. When it does,
+                // pump at frame cadence (~16 ms) so the loop ticks the
+                // simulation forward each lap; when the screen is static,
+                // block the full idle interval so a still timeline costs
+                // ZERO CPU (the project's no-wasted-cycles ethos, and the
+                // laptop's battery). The next lap's paintFrame is what
+                // advances the sim — a short pump returning no input still
+                // yields one animation frame.
+                const animating = engine != null and (gactive.len > 0 or gparticles.len > 0);
+                const pump_ms: i32 = if (animating) 16 else 500;
+                const pumped = window_shell.pump(win, pump_ms, gpa, &pumped_bytes, &pointer_events) catch {
                     status = "window error";
                     continue;
                 };
@@ -415,11 +519,85 @@ pub fn run(
                 // blit the server already threw away. (E2: a repaint request
                 // is folded into the loop's own re-render lap.)
                 if (pumped.exposed or pumped.resized) {
-                    try present(gpa, out, arena, &prev, &next, backend);
+                    if (mode == .timeline) {
+                        try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, &state, revealed.items, now, session.handle, status);
+                    } else {
+                        try present(gpa, out, arena, &prev, &next, backend);
+                    }
                 }
+                // ---- the mouse becomes the app (5.2): consume the channel.
+                // Wheel scrolls the pixel viewport; motion drives hover;
+                // a click selects its card, and an action zone injects the
+                // SAME byte the bound key sends, so the dispatch below is
+                // the one and only path (timeline_ui.keyFor — round-trip
+                // tested against actionFor). Hit rects are last frame's:
+                // immediate-mode's standard one-frame contract.
+                if (mode == .timeline) if (pix) |g| {
+                    // Pointer coords are PIXELS; the grid thinks in cells.
+                    // Use the SAME zoom-derived cell size the renderer
+                    // used, so clicks land on the cell under the cursor at
+                    // any zoom. Convert once, then everything is cell-space.
+                    const pcell = cellSize(win.fb.width, g.zoom.*);
+                    for (pointer_events.items) |pev| {
+                        const cx: u16 = pev.x / pcell.w;
+                        const cy: u16 = pev.y / pcell.h;
+                        switch (pev.kind) {
+                            .wheel => {
+                                const delta: i32 = if (pev.button == 5) 3 else -3;
+                                g.view.scroll_rows += delta;
+                                // Keep any playing effect anchored to its
+                                // post: scrolling moves content by `delta`
+                                // rows, so shift active effect origins by
+                                // the same amount and they ride the scroll
+                                // instead of detaching. (The plan for
+                                // animation-during-scroll: the heart burst
+                                // is pinned to the post's cell, re-derived
+                                // as the view moves — here via the scroll
+                                // delta, the one scroll source.)
+                                effect_core.shiftY(g.active, -delta);
+                            },
+                            .move => g.view.hover = if (field_ui.hitTest(cx, cy, g.hr.slice())) |hit| hit.target else field_ui.no_target,
+                            .button_down => if (pev.button == 1) {
+                                if (field_ui.hitTest(cx, cy, g.hr.slice())) |hit| {
+                                    if (hit.target != field_ui.no_target and hit.target < items.len) state.selected = hit.target;
+                                    // Fire the effect for this action AT
+                                    // its origin (the like glyph), so the
+                                    // heart blooms on the tapped counter.
+                                    // The like recipe depends on whether
+                                    // this is a like or an UNLIKE — read
+                                    // the item's current state, the same
+                                    // flag the toggle dispatch will flip.
+                                    if (hit.target < items.len) fireEffect(gpa, g, hit, items[hit.target]);
+                                    // The action byte runs the SAME key
+                                    // dispatch (keyFor↔actionFor), which
+                                    // already toggles like/unlike on the
+                                    // viewer's current state — so a click
+                                    // on a liked post unlikes it, exactly
+                                    // as the 'l' key does.
+                                    if (hit.action != .none) if (timeline_ui.keyFor(hit.action)) |byte| {
+                                        try pumped_bytes.append(gpa, byte);
+                                    };
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                    if (pointer_events.items.len > 0) last_input_nanos = clock_shell.monotonicNanos();
+                };
                 n = @min(pumped_bytes.items.len, in_buf.len);
                 @memcpy(in_buf[0..n], pumped_bytes.items[0..n]);
-                if (n == 0) continue;
+                // No input this lap: normally idle back to the top. But
+                // if the field is mid-animation, fall through to repaint
+                // so the simulation advances a frame (the dynamic pump
+                // above kept this lap short precisely for this). The
+                // expose/resize repaint already ran above; this is the
+                // steady animation tick.
+                if (n == 0) {
+                    if (mode == .timeline and engine != null and (gactive.len > 0 or gparticles.len > 0)) {
+                        try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, &state, revealed.items, now, session.handle, status);
+                    }
+                    continue;
+                }
                 last_input_nanos = clock_shell.monotonicNanos();
             },
         }
@@ -440,12 +618,33 @@ pub fn run(
                 continue;
             }
 
+            // Zoom (text scaling) is a window-render concern, so it is
+            // handled here in the shell, before the core action dispatch
+            // — the pure timeline_ui need not learn about pixel cells
+            // (B2/D3), the same way wheel-scroll lives in the pointer
+            // block, not the core Action enum. '+'/'=' grow the text,
+            // '-'/'_' shrink it; only meaningful in the window (the
+            // terminal has no pixel cells), so gated on an engine.
+            if (engine != null) if (decoded.event == .char) {
+                const zc = decoded.event.char;
+                if (zc == '+' or zc == '=') {
+                    gzoom = std.math.clamp(gzoom + 0.15, zoom_min, zoom_max);
+                    status = "zoom in";
+                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, &state, revealed.items, now, session.handle, status);
+                    continue;
+                } else if (zc == '-' or zc == '_') {
+                    gzoom = std.math.clamp(gzoom - 0.15, zoom_min, zoom_max);
+                    status = "zoom out";
+                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, &state, revealed.items, now, session.handle, status);
+                    continue;
+                }
+            };
+
             switch (timeline_ui.actionFor(decoded.event)) {
                 .quit => break :main_loop,
                 .refresh => {
                     status = "refreshing...";
-                    timeline_ui.buildFrame(&next, items, &state, revealed.items, now, session.handle, status);
-                    try present(gpa, out, arena, &prev, &next, backend);
+                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, &state, revealed.items, now, session.handle, status);
 
                     const outcome = feed_shell.refreshTimeline(gpa, arena, io, environ, session, store, 30) catch |err| switch (err) {
                         error.OutOfMemory => return err,
@@ -462,6 +661,7 @@ pub fn run(
                                 // still preserve the reading position.)
                                 state.selected = 0;
                                 state.scroll_top = 0;
+                                gview.scroll_rows = 0;
                             }
                             break :blk if (stats.items_added == 0)
                                 "no new posts"
@@ -485,8 +685,7 @@ pub fn run(
                     }
                     // Paint the wait before paying it.
                     status = "loading...";
-                    timeline_ui.buildFrame(&next, items, &state, revealed.items, now, session.handle, status);
-                    try present(gpa, out, arena, &prev, &next, backend);
+                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, &state, revealed.items, now, session.handle, status);
 
                     const outcome = feed_shell.loadTimelinePage(gpa, arena, io, environ, session, store, 30) catch |err| switch (err) {
                         error.OutOfMemory => return err,
@@ -512,20 +711,19 @@ pub fn run(
                     }
                 },
                 .like => if (items.len > 0) {
-                    const r = try engageSelected(.like, gpa, arena, io, environ, session, store, items[state.selected], &state, revealed.items, now, out, &prev, &next, backend, &status_buf);
+                    const r = try engageSelected(.like, gpa, arena, io, environ, session, store, items[state.selected], &state, revealed.items, now, out, &prev, &next, backend, pix, &status_buf);
                     if (r.status.len > 0) status = r.status;
                     if (r.skip_rest) continue;
                 },
                 .repost => if (items.len > 0) {
-                    const r = try engageSelected(.repost, gpa, arena, io, environ, session, store, items[state.selected], &state, revealed.items, now, out, &prev, &next, backend, &status_buf);
+                    const r = try engageSelected(.repost, gpa, arena, io, environ, session, store, items[state.selected], &state, revealed.items, now, out, &prev, &next, backend, pix, &status_buf);
                     if (r.status.len > 0) status = r.status;
                     if (r.skip_rest) continue;
                 },
                 .profile => if (items.len > 0) {
                     const item = items[state.selected];
                     status = "loading profile...";
-                    timeline_ui.buildFrame(&next, items, &state, revealed.items, now, session.handle, status);
-                    try present(gpa, out, arena, &prev, &next, backend);
+                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, &state, revealed.items, now, session.handle, status);
                     const outcome = auth.query(gpa, arena, io, environ, session, lexicon.method.get_profile, &.{
                         .{ .name = "actor", .value = item.author_handle },
                     }, lexicon.ProfileViewDetailed) catch |err| switch (err) {
@@ -580,8 +778,7 @@ pub fn run(
                     const did = feed_core.authorDidForCid(store, item.cid);
                     if (did.len > 0) {
                         status = "following...";
-                        timeline_ui.buildFrame(&next, items, &state, revealed.items, now, session.handle, status);
-                        try present(gpa, out, arena, &prev, &next, backend);
+                        try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, &state, revealed.items, now, session.handle, status);
                         const outcome = write.followAccount(gpa, arena, io, environ, session, did, now) catch |err| switch (err) {
                             error.OutOfMemory => return err,
                             else => {
@@ -624,7 +821,16 @@ pub fn run(
                     status = "";
                     mode = .compose;
                 },
-                else => |action| timeline_ui.applyAction(&state, action, items.len),
+                else => |action| {
+                    timeline_ui.applyAction(&state, action, items.len);
+                    switch (action) {
+                        // Key navigation scrolls the pixel viewport to the
+                        // cursor; wheel reading never does (one-shot flag,
+                        // consumed by buildTimeline).
+                        .move_up, .move_down, .page_up, .page_down, .go_top, .go_bottom => gview.ensure_selected = true,
+                        else => {},
+                    }
+                },
             }
         }
     }
@@ -795,6 +1001,61 @@ const EngageResult = struct {
     skip_rest: bool = false,
 };
 
+/// Pump a short, capped burst of glyph-field animation frames before a
+/// blocking network call. THE FIX for the multi-second effect delay: a
+/// like/unlike fires its effect instantly, but the engagement's network
+/// write (write.likePost et al.) is SYNCHRONOUS on this thread — so
+/// without this, the loop cannot render a single animation frame until
+/// the round-trip returns, and the burst appears frozen mid-flight.
+/// Here we drive the WHOLE animation to completion (the heart fills,
+/// pops, sparks, and settles) BEFORE the network call, so the burst is
+/// smooth and never pauses partway. The like count is already bumped
+/// optimistically, so starting the network call ~0.8 s later is
+/// invisible to the user. The network remains the conceded bottleneck;
+/// the fully robust cure is threading the write off this thread (the
+/// firehose mailbox pattern), but running the animation to completion
+/// here removes the visible pause entirely. The resting hearts of OTHER
+/// posts are redrawn each frame too, so the screen stays whole.
+fn animateBeforeBlock(gpa: Allocator, win: anytype, g: Grid, zoom: f32) void {
+    const cell = cellSize(win.fb.width, zoom);
+    // Run to completion (cap is a safety bound, not the target): once the
+    // effect and its particles have settled, stop.
+    const max_frames: usize = 90; // ~1.5 s ceiling; the break ends it sooner
+    var i: usize = 0;
+    while (i < max_frames) : (i += 1) {
+        if (g.active.len == 0 and g.particles.len == 0) break;
+        effect_core.advance(gpa, g.active, g.field, 1.0 / 60.0, g.spawn_buf) catch break;
+        field_core.step(gpa, g.field, g.particles, g.spawn_buf.items, 1.0 / 60.0, sim_rng.random()) catch break;
+        const cols = g.field.cols;
+        const rows = g.field.rows;
+        const light: field_core.Light = .{ .x = @floatFromInt(cols / 2), .y = @floatFromInt(rows / 3), .radius = @floatFromInt(cols), .ambient = 0.64 };
+        field_core.compose(gpa, g.field, g.particles.slice(), light, cell.w, cell.h, g.draw) catch break;
+        // Redraw the OTHER posts' resting hearts (the animating one is
+        // suppressed by cell match — composeEffects draws it). Without
+        // this they would blink out for the animation's duration.
+        const hxs = g.hearts.slice().items(.x);
+        const hys = g.hearts.slice().items(.y);
+        const hlk = g.hearts.slice().items(.liked);
+        const axs = g.active.slice().items(.x);
+        const ays = g.active.slice().items(.y);
+        for (hxs, hys, hlk) |hxc, hyc, lk| {
+            var animating = false;
+            for (axs, ays) |axc, ayc| {
+                if (axc == hxc and ayc == hyc) {
+                    animating = true;
+                    break;
+                }
+            }
+            if (!animating) effect_core.composeStaticHeart(gpa, lk, hxc, hyc, cell.w, cell.h, g.draw) catch {};
+        }
+        effect_core.composeEffects(gpa, g.active.slice(), cell.w, cell.h, g.draw) catch break;
+        window_shell.presentDrawList(win, gpa, g.engine, g.draw.slice(), 0xFF0E1116) catch break;
+        // ~16 ms/frame so the animation plays at roughly 60fps wall-clock,
+        // perceptible and smooth rather than a blur.
+        clock_shell.sleepMillis(16);
+    }
+}
+
 fn engageSelected(
     kind: Engagement,
     gpa: Allocator,
@@ -811,6 +1072,7 @@ fn engageSelected(
     prev: *tui.Surface,
     next: *tui.Surface,
     backend: Backend,
+    pix: ?Grid,
     status_buf: []u8,
 ) !EngageResult {
     const applied = switch (kind) {
@@ -842,8 +1104,13 @@ fn engageSelected(
             @memcpy(record_uri, borrowed);
 
             const fresh = try feed_core.buildTimeline(arena, store);
-            timeline_ui.buildFrame(next, fresh, state, revealed_cids, now, session.handle, if (kind == .like) "unliking..." else "unboosting...");
-            try present(gpa, out, arena, prev, next, backend);
+            try paintFrame(gpa, out, arena, prev, next, backend, pix, fresh, state, revealed_cids, now, session.handle, if (kind == .like) "unliking..." else "unboosting...");
+            // Show the effect's burst before the blocking network call
+            // (else it appears frozen for the round-trip). Window only.
+            if (pix) |g| switch (backend) {
+                .window => |win| animateBeforeBlock(gpa, win, g, g.zoom.*),
+                .terminal => {},
+            };
 
             const undo_call = switch (kind) {
                 .like => write.unlikePost(gpa, arena, io, environ, session, record_uri),
@@ -873,8 +1140,13 @@ fn engageSelected(
     // Optimistic first: the bumped count paints now; the server call
     // follows; a refusal reverts.
     const fresh = try feed_core.buildTimeline(arena, store);
-    timeline_ui.buildFrame(next, fresh, state, revealed_cids, now, session.handle, if (kind == .like) "liking..." else "boosting...");
-    try present(gpa, out, arena, prev, next, backend);
+    try paintFrame(gpa, out, arena, prev, next, backend, pix, fresh, state, revealed_cids, now, session.handle, if (kind == .like) "liking..." else "boosting...");
+    // Show the effect's burst before the blocking network call (else it
+    // appears frozen for the round-trip). Window only.
+    if (pix) |g| switch (backend) {
+        .window => |win| animateBeforeBlock(gpa, win, g, g.zoom.*),
+        .terminal => {},
+    };
 
     const call = switch (kind) {
         .like => write.likePost(gpa, arena, io, environ, session, item.uri, item.cid, now),
@@ -910,6 +1182,197 @@ fn revertEngagement(kind: Engagement, store: *feed_core.Store, cid: []const u8) 
         .like => feed_core.revertLike(store, cid),
         .repost => feed_core.revertRepost(store, cid),
     }
+}
+
+/// The pixel path's working set, threaded as one explicit handle
+/// (house style: plain pointers, no hidden state). A7.2: cold struct,
+/// size guard waived — one per run(), stack-only.
+/// The live glyph-field state for the window — the cutover's working
+/// set (GLYPH_FIELD_SYSTEM_DESIGN G.0), threaded as one handle (house
+/// style: plain pointers, no hidden state). A7.2: cold struct, waived —
+/// one per run(). The font engine renders the mono cells; the field IS
+/// the UI (every glyph a physics cell); active are the playing effects;
+/// particles the transient agents; hr the click map; view the
+/// scroll/selection; spawn_buf scratch for the events effects emit.
+const Grid = struct {
+    engine: *text_core.Engine,
+    field: *field_core.Field,
+    particles: *field_core.ParticleList,
+    active: *effect_core.ActiveList,
+    draw: *raster_core.DrawList,
+    hr: *field_ui.HitList,
+    hearts: *field_ui.HeartList,
+    view: *field_ui.ViewState,
+    spawn_buf: *std.ArrayList(field_core.SpawnEvent),
+    /// Monotonic clock of the previous frame, for dt injection (B4 —
+    /// the one time source). 0 until the first frame.
+    last_nanos: *u64,
+    /// User zoom factor for the glyph cell size (text scaling). 1.0 is
+    /// the base size; '+'/'-' adjust it, clamped to [zoom_min, zoom_max].
+    /// Shared so paintFrame and the pointer hit-test derive the SAME cell
+    /// size from it.
+    zoom: *f32,
+};
+
+/// THE single source of truth for the glyph cell size. Two facts drive
+/// it: (1) the cell HEIGHT is the pixel size the font rasterizes at, and
+/// (2) the cell WIDTH must equal the font's real glyph ADVANCE at that
+/// height — JetBrains Mono advances ~0.46× its pixel height (measured),
+/// so a cell any wider than that floats each glyph in empty space (the
+/// "F e l i c i a" wide-spacing bug). We therefore pick a target glyph
+/// HEIGHT from the window width and set the width to the true advance.
+/// A bigger window → taller glyphs → larger text, at a roughly constant
+/// column count. The engine caches per px (text.glyph keys on px).
+///
+/// The advance ratio is a stable font constant, so the pure cellSize can
+/// hold it without calling the engine (B2 preserved). It is asserted
+/// against the real metric in a shell test so it cannot silently drift.
+const glyph_advance_ratio: f32 = 0.46; // measured: advance(M)/px for JetBrains Mono
+/// Target columns the window aims to show at zoom 1.0 — cells scale so
+/// roughly this many fit, so widening the window scales text UP rather
+/// than packing in more small cells. [TUNE].
+const target_cols: f32 = 70;
+/// Glyph-height bounds (px): legible when small, dense enough for the
+/// physics when large. [TUNE].
+const glyph_h_min: f32 = 14;
+const glyph_h_max: f32 = 40;
+/// Zoom multiplies the window-derived size. [TUNE].
+const zoom_min: f32 = 0.6;
+const zoom_max: f32 = 2.2;
+
+/// Derive the integer cell size from the WINDOW width and the user zoom.
+/// Pure; the single place the (window,zoom)→pixels mapping lives, so the
+/// render path, the pointer hit-test, and the grid-dimension math can
+/// never disagree (all call it with the same window width).
+fn cellSize(win_w: u32, zoom: f32) struct { w: u16, h: u16 } {
+    const z = std.math.clamp(zoom, zoom_min, zoom_max);
+    // Width that fits target_cols across the window, zoomed. That width is
+    // a glyph ADVANCE; convert it to the glyph HEIGHT the font needs, clamp
+    // the height to legible bounds, then set width back to the true advance
+    // at that height — so the cell and the glyph are exactly the same width.
+    const fitted_w = (@as(f32, @floatFromInt(@max(1, win_w))) / target_cols) * z;
+    const h = std.math.clamp(fitted_w / glyph_advance_ratio, glyph_h_min, glyph_h_max);
+    const w = h * glyph_advance_ratio;
+    return .{
+        .w = @max(1, @as(u16, @intFromFloat(@round(w)))),
+        .h = @max(1, @as(u16, @intFromFloat(@round(h)))),
+    };
+}
+
+/// The simulation's injected RNG. Seeded once; the field's evolution is
+/// deterministic given the seed + the dt sequence (B2). A process-
+/// lifetime source is fine here — it is the SHELL's injected randomness,
+/// not core state; the core never reaches for it, the shell hands it in
+/// at the one call site below (B4).
+var sim_rng = std.Random.DefaultPrng.init(0x7A74_2026);
+
+/// Render the timeline. The window earns the LIVING GLYPH FIELD (G.0):
+/// the feed is laid out into a mono grid, effects advance, particles
+/// integrate, and compose maps the whole simulation to pixels — every
+/// frame a pure transform with dt injected from the monotonic clock
+/// (B4). Everything else (terminal, or a window whose font engine
+/// failed) keeps the cell frame + diff/present pair. ONE funnel, so
+/// interim status flashes render through the same path (D6).
+fn paintFrame(
+    gpa: Allocator,
+    out: *std.Io.Writer,
+    arena: Allocator,
+    prev: *tui.Surface,
+    next: *tui.Surface,
+    backend: Backend,
+    pix: ?Grid,
+    items: []const feed_core.TimelineItem,
+    state: *timeline_ui.UiState,
+    revealed: []const []const u8,
+    now: i64,
+    account_handle: []const u8,
+    status: []const u8,
+) !void {
+    if (pix) |g| switch (backend) {
+        .window => |win| {
+            if (items.len > 0 and state.selected >= items.len) state.selected = @intCast(items.len - 1);
+            // Cell size scales with the user zoom; the grid reflows to
+            // fill the window at whatever size results. The font engine
+            // rasterizes at the derived pixel height (cached per-size).
+            const cell = cellSize(win.fb.width, g.zoom.*);
+            const cols: u16 = @intCast(@max(24, win.fb.width / cell.w));
+            const rows: u16 = @intCast(@max(8, win.fb.height / cell.h));
+            // (Re)size the field to the window. Cheap; the perturb grid
+            // is wiped on resize (transient by design, §7).
+            if (g.field.cols != cols or g.field.rows != rows) {
+                field_core.deinit(gpa, g.field);
+                try field_core.init(gpa, g.field, cols, rows);
+            }
+            // dt from the monotonic clock — the one time source (B4).
+            const t = clock_shell.monotonicNanos();
+            var dt: f32 = if (g.last_nanos.* == 0) 1.0 / 60.0 else @as(f32, @floatFromInt(t -| g.last_nanos.*)) / 1_000_000_000.0;
+            g.last_nanos.* = t;
+            if (dt > 0.1) dt = 0.1; // a long stall integrates one capped step, not a leap
+            if (dt <= 0) dt = 1.0 / 60.0;
+
+            // The pipeline, in order: 1. layout writes the content grid
+            // + hit rects (perturb persists). 2. effects paint their
+            // current stage and emit any spawns. 3. physics integrates
+            // particles + cells. 4. compose maps it all to pixels.
+            _ = try field_ui.build(g.field, g.hr, g.hearts, items, state.selected, g.view, revealed, now, account_handle, status, gpa);
+            try effect_core.advance(gpa, g.active, g.field, dt, g.spawn_buf);
+            try field_core.step(gpa, g.field, g.particles, g.spawn_buf.items, dt, sim_rng.random());
+            const light: field_core.Light = .{
+                .x = @floatFromInt(cols / 2),
+                .y = @floatFromInt(rows / 3),
+                .radius = @floatFromInt(cols),
+                .ambient = 0.64,
+            };
+            try field_core.compose(gpa, g.field, g.particles.slice(), light, cell.w, cell.h, g.draw);
+            // The resting like-button hearts: draw each post's heart sprite
+            // at its reserved cell — EXCEPT any whose cell has a live effect
+            // (that heart is being animated by composeEffects; drawing both
+            // would double it). The button and its burst are one heart.
+            {
+                const hxs = g.hearts.slice().items(.x);
+                const hys = g.hearts.slice().items(.y);
+                const hliked = g.hearts.slice().items(.liked);
+                const axs = g.active.slice().items(.x);
+                const ays = g.active.slice().items(.y);
+                for (hxs, hys, hliked) |hxc, hyc, lk| {
+                    var animating = false;
+                    for (axs, ays) |axc, ayc| {
+                        if (axc == hxc and ayc == hyc) {
+                            animating = true;
+                            break;
+                        }
+                    }
+                    if (!animating) try effect_core.composeStaticHeart(gpa, lk, hxc, hyc, cell.w, cell.h, g.draw);
+                }
+            }
+            // Fine-resolution effect overlays (the animating heart) draw
+            // on top at their own sub-cell pitch.
+            try effect_core.composeEffects(gpa, g.active.slice(), cell.w, cell.h, g.draw);
+            window_shell.presentDrawList(win, gpa, g.engine, g.draw.slice(), 0xFF0E1116) catch {}; // E2: a lost blit is the next frame's problem
+            return;
+        },
+        .terminal => {},
+    };
+    timeline_ui.buildFrame(next, items, state, revealed, now, account_handle, status);
+    try present(gpa, out, arena, prev, next, backend);
+}
+
+/// Choose and fire the glyph-field effect for a click, AT the hit's
+/// recorded origin (the like glyph's centre), so the animation blooms
+/// exactly where the eye is. This is the one place the app maps a
+/// user action to a recipe — change a row here, or pass a different
+/// `scale`, and the feel changes app-wide (the owner's context dial).
+/// A like on an already-liked post is an UNLIKE: the cooler recipe.
+fn fireEffect(gpa: Allocator, g: Grid, hit: field_ui.Hit, item: feed_core.TimelineItem) void {
+    const recipe: *const effect_core.Recipe = switch (hit.action) {
+        .like => if (item.item_flags.viewer_liked) &effect_core.unlike_heart else &effect_core.like_heart,
+        .repost => &effect_core.boost,
+        else => return, // other actions get no field effect (yet)
+    };
+    // scale = 1.0 is the recipe as authored; a louder milestone or a
+    // quieter dense-feed pass is a different number here. errors are
+    // swallowed: a missed effect must never break the click (E4).
+    effect_core.trigger(gpa, g.active, recipe, hit.fx, hit.fy, 1.0) catch {};
 }
 
 fn present(

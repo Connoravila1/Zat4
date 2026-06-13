@@ -25,6 +25,9 @@ pub const atom_wm_name: u32 = 39;
 
 pub const event_mask_key_press: u32 = 0x0000_0001;
 pub const event_mask_key_release: u32 = 0x0000_0002;
+pub const event_mask_button_press: u32 = 0x0000_0004;
+pub const event_mask_button_release: u32 = 0x0000_0008;
+pub const event_mask_pointer_motion: u32 = 0x0000_0040;
 pub const event_mask_exposure: u32 = 0x0000_8000;
 pub const event_mask_structure: u32 = 0x0002_0000;
 
@@ -336,6 +339,9 @@ pub const EventKind = enum(u8) {
     err,
     key_press,
     key_release,
+    button_press,
+    button_release,
+    motion,
     expose,
     configure,
     client_delete,
@@ -343,8 +349,12 @@ pub const EventKind = enum(u8) {
 
 /// The parsed event as plain data (A1): `detail`/`state` carry keycode
 /// and modifier mask for keys, `w`/`h` the new size for configure,
-/// `data` the error code for errors. Hot — events arrive in quantity and
-/// are decoded in a loop.
+/// `data` the error code for errors. Pointer events (Phase 5.1) reuse
+/// the same seats: `detail` = button (1 left, 2 middle, 3 right,
+/// 4/5 wheel), `state` = the KEYBUTMASK, `w`/`h` = event-x/event-y in
+/// window pixels — the 12-byte budget holds with zero growth. Hot —
+/// events arrive in quantity (drags especially) and are decoded in a
+/// loop.
 pub const Event = struct {
     kind: EventKind,
     detail: u8,
@@ -383,6 +393,30 @@ pub fn parseEvent(bytes: *const [32]u8, wm_protocols: u32, wm_delete: u32) Event
             .h = 0,
             .data = 0,
         },
+        // Pointer events share the key-event layout (X11 §events):
+        // [1]=detail(button), [24..26]=event-x INT16, [26..28]=event-y
+        // INT16, [28..30]=state. Coordinates are SIGNED on the wire (a
+        // grab can report the pointer outside the window); zat clamps
+        // negatives to the window edge — off-window positions carry no
+        // meaning for hit-testing, and the clamp keeps the Event record
+        // unsigned and 12 bytes (E4: the odd case defined out of
+        // existence, not an error path).
+        4, 5 => return .{
+            .kind = if (code == 4) .button_press else .button_release,
+            .detail = bytes[1],
+            .state = get16(bytes, 28),
+            .w = eventCoord(bytes, 24),
+            .h = eventCoord(bytes, 26),
+            .data = 0,
+        },
+        6 => return .{
+            .kind = .motion,
+            .detail = 0,
+            .state = get16(bytes, 28),
+            .w = eventCoord(bytes, 24),
+            .h = eventCoord(bytes, 26),
+            .data = 0,
+        },
         12 => return .{ .kind = .expose, .detail = 0, .state = 0, .w = 0, .h = 0, .data = 0 },
         22 => return .{ .kind = .configure, .detail = 0, .state = 0, .w = get16(bytes, 20), .h = get16(bytes, 22), .data = 0 },
         33 => {
@@ -393,6 +427,13 @@ pub fn parseEvent(bytes: *const [32]u8, wm_protocols: u32, wm_delete: u32) Event
         },
         else => return none,
     }
+}
+
+/// event-x/event-y are INT16 on the wire; negative means "outside the
+/// window" (pointer grabs). Clamp to 0 — see the parseEvent note.
+fn eventCoord(bytes: *const [32]u8, at: usize) u16 {
+    const v: i16 = @bitCast(get16(bytes, at));
+    return if (v < 0) 0 else @intCast(v);
 }
 
 // ---------------------------------------------------------------------------
@@ -587,6 +628,66 @@ test "x11: events parse to flat records" {
     put32(&raw, 8, 100);
     put32(&raw, 12, 101);
     try testing.expectEqual(EventKind.client_delete, parseEvent(&raw, 100, 101).kind);
+}
+
+test "x11: pointer events parse with pinned offsets (golden bytes)" {
+    // SESSION_FINDINGS §3.5: wire parsers get golden-byte tests with
+    // pinned offsets from day one. Every offset below is the X11
+    // protocol's, written as a literal — if the parser drifts from the
+    // spec, this fails, not a real server at runtime.
+    var raw = [_]u8{0} ** 32;
+
+    // ButtonPress: left button at (300, 142), shift held.
+    raw[0] = 4;
+    raw[1] = 1; // detail = button 1 (left)
+    put16(&raw, 24, 300); // event-x
+    put16(&raw, 26, 142); // event-y
+    put16(&raw, 28, shift_mask); // state
+    const press = parseEvent(&raw, 100, 101);
+    try testing.expectEqual(EventKind.button_press, press.kind);
+    try testing.expectEqual(@as(u8, 1), press.detail);
+    try testing.expectEqual(@as(u16, 300), press.w);
+    try testing.expectEqual(@as(u16, 142), press.h);
+    try testing.expect(press.state & shift_mask != 0);
+
+    // ButtonRelease: wheel-down (button 5) — same layout, code 5.
+    @memset(&raw, 0);
+    raw[0] = 5;
+    raw[1] = 5;
+    put16(&raw, 24, 8);
+    put16(&raw, 26, 16);
+    const release = parseEvent(&raw, 100, 101);
+    try testing.expectEqual(EventKind.button_release, release.kind);
+    try testing.expectEqual(@as(u8, 5), release.detail);
+
+    // MotionNotify with control held.
+    @memset(&raw, 0);
+    raw[0] = 6;
+    put16(&raw, 24, 511);
+    put16(&raw, 26, 0);
+    put16(&raw, 28, control_mask);
+    const move = parseEvent(&raw, 100, 101);
+    try testing.expectEqual(EventKind.motion, move.kind);
+    try testing.expectEqual(@as(u16, 511), move.w);
+    try testing.expectEqual(@as(u16, 0), move.h);
+    try testing.expect(move.state & control_mask != 0);
+
+    // Negative event-x (pointer dragged outside the window during a
+    // grab): INT16 on the wire, clamped to the edge, never wrapped.
+    @memset(&raw, 0);
+    raw[0] = 6;
+    put16(&raw, 24, @bitCast(@as(i16, -7)));
+    put16(&raw, 26, 9);
+    const outside = parseEvent(&raw, 100, 101);
+    try testing.expectEqual(@as(u16, 0), outside.w);
+    try testing.expectEqual(@as(u16, 9), outside.h);
+
+    // The send-event flag (top bit of the code) must not change parsing.
+    @memset(&raw, 0);
+    raw[0] = 4 | 0x80;
+    raw[1] = 3;
+    put16(&raw, 24, 10);
+    try testing.expectEqual(EventKind.button_press, parseEvent(&raw, 100, 101).kind);
 }
 
 test "x11: keysym resolution and terminal bytes" {

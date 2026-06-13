@@ -23,8 +23,10 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const pixel = @import("../core/pixel.zig");
-const font = @import("../core/font.zig");
+const layout = @import("../core/layout.zig");
+const raster = @import("../core/raster.zig");
+const text_core = @import("../core/text.zig");
+const text = text_core;
 const tui = @import("../core/tui.zig");
 const keys = @import("../core/appkit.zig");
 const textinput = @import("../core/textinput.zig");
@@ -45,10 +47,23 @@ pub const PumpResult = struct {
     /// Parity with the Win32 backend; this pump propagates allocation
     /// failure instead of dropping, so it is always zero here.
     dropped: u32 = 0,
+    /// Parity with the X11 backend's error-packet report; there is no X
+    /// server here, so it is always zero. Exists so the Backend seam in
+    /// shell/tui.zig reads one shape on every OS (the native.zig
+    /// same-surface contract).
+    x_error: u8 = 0,
 };
 
 const Id = ?*anyopaque;
 const Sel = ?*anyopaque;
+
+/// CGPoint: two contiguous CGFloats, returned by value from
+/// locationInWindow (register-class on both supported arches).
+const CGPoint = extern struct {
+    // A7.2 (FFI): layout is the OS ABI's, not ours; waived.
+    x: f64,
+    y: f64,
+};
 
 /// CGRect, flattened: { origin, size } is four contiguous CGFloats.
 /// Passed BY VALUE only (initWithContentRect:...), never returned.
@@ -121,6 +136,19 @@ fn sendF64Arg(o: *const Objc, self: Id, sel: Sel, v: f64) Id {
     return @as(F, @ptrCast(@alignCast(o.msgSend)))(self, sel, v);
 }
 
+fn sendF64ret(o: *const Objc, self: Id, sel: Sel) f64 {
+    const F = *const fn (Id, Sel) callconv(.c) f64;
+    return @as(F, @ptrCast(@alignCast(o.msgSend)))(self, sel);
+}
+
+/// CGPoint return: two doubles come back in registers on both arm64
+/// (v0/v1) and x86_64 (xmm0/xmm1), so this is plain objc_msgSend — the
+/// module's "no objc_msgSend_stret" doctrine (header) still holds.
+fn sendPointRet(o: *const Objc, self: Id, sel: Sel) CGPoint {
+    const F = *const fn (Id, Sel) callconv(.c) CGPoint;
+    return @as(F, @ptrCast(@alignCast(o.msgSend)))(self, sel);
+}
+
 fn sendU16At(o: *const Objc, self: Id, sel: Sel, i: u64) u16 {
     const F = *const fn (Id, Sel, u64) callconv(.c) u16;
     return @as(F, @ptrCast(@alignCast(o.msgSend)))(self, sel, i);
@@ -163,10 +191,16 @@ pub const Window = struct {
     sel_char_at: Sel,
     sel_is_visible: Sel,
     sel_set_contents: Sel,
+    sel_location: Sel,
+    sel_scroll_dy: Sel,
+    sel_mod_flags: Sel,
     sel_date_with: Sel,
     sel_distant_past: Sel,
     sel_close: Sel,
-    fb: pixel.Framebuffer,
+    fb: raster.Framebuffer,
+    /// Per-frame draw list — opaque transport between the layout and
+    /// raster cores; never inspected here (B5/D3).
+    draw_list: raster.DrawList,
     /// Fixed at open (v1: no live resize) — the tui reads these for its
     /// surface size, same as the X11 and Win32 Windows.
     cols: u16,
@@ -216,8 +250,8 @@ pub fn open(
     _ = sendI64Arg(&o, app, o.selReg("setActivationPolicy:"), 0); // Regular: dock icon, key window
     _ = send0(&o, app, o.selReg("finishLaunching"));
 
-    const w_px: f64 = @floatFromInt(@as(u32, cols) * font.glyph_w);
-    const h_px: f64 = @floatFromInt(@as(u32, rows) * font.glyph_h);
+    const w_px: f64 = @floatFromInt(@as(u32, cols) * text.cell_w);
+    const h_px: f64 = @floatFromInt(@as(u32, rows) * text.cell_h);
     const win_cls = o.getClass("NSWindow") orelse return error.SetupRefused;
     const win_alloc = send0(&o, win_cls, sel_alloc) orelse return error.SetupRefused;
     // styleMask 1|2|4 = Titled|Closable|Miniaturizable — Resizable (8) is
@@ -240,6 +274,9 @@ pub fn open(
     _ = send1(&o, win, o.selReg("setTitle:"), title_ns);
     const mode_str = sendStr(&o, send0(&o, str_cls, sel_alloc), sel_init_utf8, "kCFRunLoopDefaultMode") orelse return error.SetupRefused;
 
+    // NSWindow delivers mouseMoved only on request (drags arrive
+    // regardless); Phase 5.1 wants the full pointer stream.
+    _ = sendBoolArg(&o, win, o.selReg("setAcceptsMouseMovedEvents:"), 1);
     _ = send1(&o, win, o.selReg("makeKeyAndOrderFront:"), null);
     _ = sendBoolArg(&o, app, o.selReg("activateIgnoringOtherApps:"), 1);
 
@@ -272,16 +309,20 @@ pub fn open(
         .sel_char_at = o.selReg("characterAtIndex:"),
         .sel_is_visible = o.selReg("isVisible"),
         .sel_set_contents = o.selReg("setContents:"),
+        .sel_location = o.selReg("locationInWindow"),
+        .sel_scroll_dy = o.selReg("scrollingDeltaY"),
+        .sel_mod_flags = o.selReg("modifierFlags"),
         .sel_date_with = o.selReg("dateWithTimeIntervalSinceNow:"),
         .sel_distant_past = o.selReg("distantPast"),
         .sel_close = o.selReg("close"),
         .fb = .{},
+        .draw_list = .empty,
         .cols = cols,
         .rows = rows,
         .pending_high = 0,
         .first_pump = true,
     };
-    pixel.resize(gpa, &window.fb, @as(u32, cols) * font.glyph_w, @as(u32, rows) * font.glyph_h) catch return error.OutOfMemory;
+    raster.resize(gpa, &window.fb, @as(u32, cols) * text.cell_w, @as(u32, rows) * text.cell_h, layout.palette_bg) catch return error.OutOfMemory;
     return window;
 }
 
@@ -289,7 +330,8 @@ pub fn close(window: *Window) void {
     const o = &window.objc;
     _ = send0(o, window.window, window.sel_close);
     o.CGColorSpaceRelease(window.colorspace);
-    pixel.deinit(window.gpa, &window.fb);
+    window.draw_list.deinit(window.gpa);
+    raster.deinit(window.gpa, &window.fb);
     const gpa = window.gpa;
     gpa.destroy(window);
 }
@@ -301,9 +343,10 @@ pub fn close(window: *Window) void {
 /// dragging keep working without a delegate.
 pub fn pump(
     window: *Window,
-    timeout_ms: u32,
+    timeout_ms: i32, // matches the X11/Win32 legs (shared boundary type, D4)
     gpa: Allocator,
     out: *std.ArrayList(u8),
+    events: *std.ArrayList(layout.InputEvent),
 ) error{OutOfMemory}!PumpResult {
     const o = &window.objc;
     const pool = send0(o, send0(o, window.pool_cls, window.sel_alloc), window.sel_init);
@@ -315,12 +358,66 @@ pub fn pump(
         result.exposed = true; // first paint, same contract as Expose/WM_PAINT
     }
 
-    const secs: f64 = @as(f64, @floatFromInt(timeout_ms)) / 1000.0;
+    const secs: f64 = @as(f64, @floatFromInt(@max(0, timeout_ms))) / 1000.0;
     var date: Id = sendF64Arg(o, window.ns_date_cls, window.sel_date_with, secs);
     while (true) {
         const ev = sendNext(o, window.app, window.sel_next_event, std.math.maxInt(u64), date, window.mode_str, 1);
         if (ev == null) break;
-        if (sendU64ret(o, ev, window.sel_type) == 10) { // NSEventTypeKeyDown
+        const ev_type = sendU64ret(o, ev, window.sel_type);
+        switch (ev_type) {
+            // NSEventType: 1/2 left down/up, 3/4 right down/up, 25/26
+            // other(middle) down/up, 5 moved, 6/7/27 dragged, 22 wheel.
+            1, 2, 3, 4, 25, 26, 5, 6, 7, 27, 22 => {
+                // locationInWindow is bottom-left-origin points; our
+                // pixel space is top-left. The content rect was created
+                // at exactly fb.width x fb.height points (v1: fixed
+                // size, no Retina scaling of the layer's logical size),
+                // so points map 1:1 onto framebuffer pixels and the
+                // flip is height - y.
+                const loc = sendPointRet(o, ev, window.sel_location);
+                const fx: f64 = @max(0, @min(loc.x, @as(f64, @floatFromInt(window.fb.width)) - 1));
+                const flipped: f64 = @as(f64, @floatFromInt(window.fb.height)) - loc.y;
+                const fy: f64 = @max(0, @min(flipped, @as(f64, @floatFromInt(window.fb.height)) - 1));
+                const flags = sendU64ret(o, ev, window.sel_mod_flags);
+                var mods: u8 = 0;
+                if (flags & (1 << 17) != 0) mods |= layout.InputEvent.mod_shift;
+                if (flags & (1 << 18) != 0) mods |= layout.InputEvent.mod_control;
+                if (flags & (1 << 19) != 0) mods |= layout.InputEvent.mod_alt;
+                const kind: layout.InputEvent.Kind = switch (ev_type) {
+                    1, 3, 25 => .button_down,
+                    2, 4, 26 => .button_up,
+                    22 => .wheel,
+                    else => .move, // 5 moved, 6/7/27 dragged
+                };
+                var button: u8 = switch (ev_type) {
+                    1, 2 => 1,
+                    25, 26 => 2,
+                    3, 4 => 3,
+                    else => 0,
+                };
+                var emit = true;
+                if (ev_type == 22) {
+                    const dy = sendF64ret(o, ev, window.sel_scroll_dy);
+                    if (dy > 0) {
+                        button = 4; // away from the user = up
+                    } else if (dy < 0) {
+                        button = 5;
+                    } else {
+                        emit = false; // horizontal-only tick; dropped like X buttons 6/7
+                    }
+                }
+                if (emit) try events.append(gpa, .{
+                    .x = @intFromFloat(fx),
+                    .y = @intFromFloat(fy),
+                    .kind = kind,
+                    .button = button,
+                    .mods = mods,
+                    ._pad = 0,
+                });
+            },
+            else => {},
+        }
+        if (ev_type == 10) { // NSEventTypeKeyDown
             const chars = send0(o, ev, window.sel_chars_ig);
             if (chars != null) {
                 const len = sendU64ret(o, chars, window.sel_length);
@@ -355,7 +452,27 @@ pub fn pump(
 /// the layer's contents. bitmapInfo 0x2006 = ByteOrder32Little |
 /// AlphaNoneSkipFirst — exactly our 0xAARRGGBB words in memory.
 pub fn present(window: *Window, surface: *const tui.Surface) error{ OutOfMemory, ProtocolError }!void {
-    pixel.rasterize(surface, &window.fb);
+    // The Phase-5 seam (GUI roadmap §2): pure layout builds the draw
+    // list, pure raster paints it, and only the blit below is shell.
+    try layout.fromSurface(window.gpa, &window.draw_list, surface);
+    try raster.paint(window.gpa, null, window.draw_list.slice(), &window.fb, layout.palette_bg);
+    try blit(window);
+}
+
+/// The modern pixel path — paint the caller's list, then blit. Mirrors
+/// the X11 backend's surface (native.zig same-shape contract).
+pub fn presentDrawList(
+    window: *Window,
+    gpa: Allocator,
+    engine: *text_core.Engine,
+    list: raster.DrawList.Slice,
+    clear: u32,
+) error{ OutOfMemory, ProtocolError }!void {
+    try raster.paint(gpa, engine, list, &window.fb, clear);
+    try blit(window);
+}
+
+pub fn blit(window: *Window) error{ OutOfMemory, ProtocolError }!void {
     const o = &window.objc;
     const byte_len: isize = @intCast(window.fb.pixels.len * 4);
     const data = o.CFDataCreate(null, @ptrCast(window.fb.pixels.ptr), byte_len) orelse return error.OutOfMemory;

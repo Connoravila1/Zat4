@@ -1,7 +1,7 @@
 //! B1 classification: SHELL. The window — a hand-rolled X11 client over
 //! the Unix socket, zero dependencies (F1/F2: X11 is a socket protocol;
 //! we speak it the way we speak WebSocket). Every byte's MEANING lives
-//! in core/x11.zig and core/pixel.zig; this file owns the fd, the
+//! in core/x11.zig and the layout/raster/text cores; this file owns the fd, the
 //! Xauthority cookie, the open/reply choreography, the event pump, and
 //! the PutImage blits — I/O and nothing else (B3, D1).
 //!
@@ -14,8 +14,10 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const linux = std.os.linux;
 const x11 = @import("../core/x11.zig");
-const pixel = @import("../core/pixel.zig");
-const font = @import("../core/font.zig");
+const layout = @import("../core/layout.zig");
+const raster = @import("../core/raster.zig");
+const text_core = @import("../core/text.zig");
+const text = text_core; // cell metrics alias (cols/rows derivation)
 const tui = @import("../core/tui.zig");
 
 pub const OpenError = error{
@@ -41,9 +43,12 @@ pub const Window = struct {
     min_keycode: u8,
     syms_per_keycode: u8,
     keysyms: []u32,
-    /// The pixels (gpa-owned via pixel.resize) and the cell geometry the
-    /// surface should be built at.
-    fb: pixel.Framebuffer,
+    /// The pixels (gpa-owned via raster.resize), the per-frame draw list
+    /// (held as opaque transport between the layout and raster cores —
+    /// never inspected here, B5/D3), and the cell geometry the surface
+    /// should be built at.
+    fb: raster.Framebuffer,
+    draw_list: raster.DrawList,
     cols: u16,
     rows: u16,
     /// Partial-frame carry between pumps: X events are 32 bytes, reads
@@ -287,10 +292,12 @@ pub fn openAt(
 
     // --- create, decorate, wire the close button, map ---
     const mask = x11.event_mask_key_press | x11.event_mask_key_release |
+        x11.event_mask_button_press | x11.event_mask_button_release |
+        x11.event_mask_pointer_motion |
         x11.event_mask_exposure | x11.event_mask_structure;
-    const width = @as(u16, @intCast(@min(@as(u32, cols) * font.glyph_w, 16380)));
-    const height = @as(u16, @intCast(@min(@as(u32, rows) * font.glyph_h, 16380)));
-    try writeAll(fd, x11.createWindow(&req_buf, wid, setup.root_window, width, height, pixel.palette_bg, mask));
+    const width = @as(u16, @intCast(@min(@as(u32, cols) * text.cell_w, 16380)));
+    const height = @as(u16, @intCast(@min(@as(u32, rows) * text.cell_h, 16380)));
+    try writeAll(fd, x11.createWindow(&req_buf, wid, setup.root_window, width, height, layout.palette_bg, mask));
     try writeAll(fd, x11.changePropertyString(&req_buf, wid, x11.atom_wm_name, title));
 
     try writeAll(fd, x11.internAtom(&req_buf, "WM_PROTOCOLS"));
@@ -332,6 +339,7 @@ pub fn openAt(
         .syms_per_keycode = per,
         .keysyms = keysyms,
         .fb = .{},
+        .draw_list = .empty,
         .cols = cols,
         .rows = rows,
         .carry = undefined,
@@ -340,7 +348,7 @@ pub fn openAt(
         .swap_row = &.{},
         .x_error_reported = false,
     };
-    pixel.resize(gpa, &window.fb, width, height) catch return error.OutOfMemory;
+    raster.resize(gpa, &window.fb, width, height, layout.palette_bg) catch return error.OutOfMemory;
     return window;
 }
 
@@ -362,7 +370,8 @@ pub fn close(window: *Window) void {
     _ = linux.close(window.fd);
     gpa.free(window.keysyms);
     if (window.swap_row.len > 0) gpa.free(window.swap_row);
-    pixel.deinit(gpa, &window.fb);
+    window.draw_list.deinit(gpa);
+    raster.deinit(gpa, &window.fb);
     gpa.destroy(window);
 }
 
@@ -379,6 +388,12 @@ pub fn pump(
     timeout_ms: i32,
     gpa: Allocator,
     out: *std.ArrayList(u8),
+    // A3 exception: a flat list of the 8-byte InputEvent, not SoA — the
+    // consumer (layout's hit-testing) reads every field of each event
+    // whole and in order, the record is one machine word, and a frame
+    // carries tens of events; parallel field arrays would add growth
+    // sites for no locality win. (GUI roadmap §3.1: "a flat slice".)
+    events: *std.ArrayList(layout.InputEvent),
 ) error{ OutOfMemory, ProtocolError }!PumpResult {
     var result: PumpResult = .{};
     var fds = [_]linux.pollfd{.{ .fd = window.fd, .events = linux.POLL.IN, .revents = 0 }};
@@ -425,12 +440,47 @@ pub fn pump(
                 const len = x11.keyBytes(sym, ctrl, &key_buf);
                 if (len > 0) try out.appendSlice(gpa, key_buf[0..len]);
             },
+            // Pointer events become the OS-agnostic InputEvent and ride
+            // their own channel; key bytes keep the terminal channel.
+            // Wheel arrives as X buttons 4/5 (press only — the paired
+            // release carries nothing and is dropped, as are horizontal
+            // wheel buttons 6/7 until a screen wants them).
+            .button_press, .button_release => {
+                const mods: u8 = @truncate(event.state);
+                switch (event.detail) {
+                    1, 2, 3 => try events.append(gpa, .{
+                        .x = event.w,
+                        .y = event.h,
+                        .kind = if (event.kind == .button_press) .button_down else .button_up,
+                        .button = event.detail,
+                        .mods = mods,
+                        ._pad = 0,
+                    }),
+                    4, 5 => if (event.kind == .button_press) try events.append(gpa, .{
+                        .x = event.w,
+                        .y = event.h,
+                        .kind = .wheel,
+                        .button = event.detail,
+                        .mods = mods,
+                        ._pad = 0,
+                    }),
+                    else => {},
+                }
+            },
+            .motion => try events.append(gpa, .{
+                .x = event.w,
+                .y = event.h,
+                .kind = .move,
+                .button = 0,
+                .mods = @truncate(event.state),
+                ._pad = 0,
+            }),
             .expose => result.exposed = true,
             .configure => {
                 if (event.w != window.fb.width or event.h != window.fb.height) {
-                    pixel.resize(window.gpa, &window.fb, event.w, event.h) catch return error.OutOfMemory;
-                    window.cols = @intCast(@max(20, event.w / font.glyph_w));
-                    window.rows = @intCast(@max(5, event.h / font.glyph_h));
+                    raster.resize(window.gpa, &window.fb, event.w, event.h, layout.palette_bg) catch return error.OutOfMemory;
+                    window.cols = @intCast(@max(20, event.w / text.cell_w));
+                    window.rows = @intCast(@max(5, event.h / text.cell_h));
                     result.resized = true;
                 }
             },
@@ -447,12 +497,12 @@ pub fn pump(
                 if (!window.x_error_reported) {
                     window.x_error_reported = true;
                     var msg: [128]u8 = undefined;
-                    const text = std.fmt.bufPrint(
+                    const line = std.fmt.bufPrint(
                         &msg,
                         "zat: X error code {d}, opcode {d}, badid 0x{x}\n",
                         .{ event.detail, event.state, event.data },
                     ) catch "zat: X error (fmt)\n";
-                    _ = linux.write(2, text.ptr, text.len);
+                    _ = linux.write(2, line.ptr, line.len);
                 }
             },
             .key_release, .none => {},
@@ -466,7 +516,29 @@ pub fn pump(
 // ---------------------------------------------------------------------------
 
 pub fn present(window: *Window, surface: *const tui.Surface) error{ OutOfMemory, ProtocolError }!void {
-    pixel.rasterize(surface, &window.fb);
+    // The Phase-5 seam (GUI roadmap §2): pure layout builds the draw
+    // list, pure raster paints it, and only the blit below is shell.
+    try layout.fromSurface(window.gpa, &window.draw_list, surface);
+    try raster.paint(window.gpa, null, window.draw_list.slice(), &window.fb, layout.palette_bg);
+    try blit(window);
+}
+
+/// The modern pixel path (timeline): the caller laid out and owns the
+/// list; this paints it with the proportional engine and blits — the
+/// same boundary discipline as present(), one screen richer.
+pub fn presentDrawList(
+    window: *Window,
+    gpa: Allocator,
+    engine: *text_core.Engine,
+    list: raster.DrawList.Slice,
+    clear: u32,
+) error{ OutOfMemory, ProtocolError }!void {
+    try raster.paint(gpa, engine, list, &window.fb, clear);
+    try blit(window);
+}
+
+/// PutImage the current framebuffer, chunked under the request ceiling.
+pub fn blit(window: *Window) error{ OutOfMemory, ProtocolError }!void {
     const fb = &window.fb;
     if (fb.width == 0 or fb.height == 0) return;
     const width: u16 = @intCast(fb.width);
@@ -650,6 +722,36 @@ fn serveFakeX(listen_fd: i32, result: *FakeResult) void {
     event[0] = 2; // KeyPress
     event[1] = 'q'; // identity mapping makes keycode 'q' the keysym 'q'
     writeAll(fd, &event) catch return;
+
+    // --- the pointer battery: spec-exact 32-byte events (strict double) ---
+    @memset(&event, 0);
+    event[0] = 6; // MotionNotify at (33, 17)
+    put16(&event, 24, 33);
+    put16(&event, 26, 17);
+    writeAll(fd, &event) catch return;
+    @memset(&event, 0);
+    event[0] = 4; // ButtonPress: left at (40, 12), shift held
+    event[1] = 1;
+    put16(&event, 24, 40);
+    put16(&event, 26, 12);
+    put16(&event, 28, 0x0001); // shift
+    writeAll(fd, &event) catch return;
+    @memset(&event, 0);
+    event[0] = 5; // ButtonRelease: left at (40, 12)
+    event[1] = 1;
+    put16(&event, 24, 40);
+    put16(&event, 26, 12);
+    writeAll(fd, &event) catch return;
+    @memset(&event, 0);
+    event[0] = 4; // ButtonPress: wheel-up (button 4) at (5, 6)
+    event[1] = 4;
+    put16(&event, 24, 5);
+    put16(&event, 26, 6);
+    writeAll(fd, &event) catch return;
+    @memset(&event, 0);
+    event[0] = 5; // ButtonRelease: wheel-up pair — must be DROPPED
+    event[1] = 4;
+    writeAll(fd, &event) catch return;
     result.stage = 3;
 
     // --- expect at least one PutImage and record its first pixel ---
@@ -725,10 +827,12 @@ test "window loopback: fake X server — open, a key becomes 'q', a blit lands, 
     // Pump until the fake server's KeyPress arrives as the byte 'q'.
     var keys: std.ArrayList(u8) = .empty;
     defer keys.deinit(gpa);
+    var pointer_events: std.ArrayList(layout.InputEvent) = .empty;
+    defer pointer_events.deinit(gpa);
     var waited: u32 = 0;
     var exposed = false;
     while (waited < 8000 and std.mem.indexOfScalar(u8, keys.items, 'q') == null) {
-        const pumped = try pump(window, 50, gpa, &keys);
+        const pumped = try pump(window, 50, gpa, &keys, &pointer_events);
         exposed = exposed or pumped.exposed;
         waited += 50;
     }
@@ -750,7 +854,7 @@ test "window loopback: fake X server — open, a key becomes 'q', a blit lands, 
     var closed = false;
     waited = 0;
     while (waited < 8000 and !closed) {
-        const pumped = try pump(window, 50, gpa, &keys);
+        const pumped = try pump(window, 50, gpa, &keys, &pointer_events);
         closed = pumped.closed;
         waited += 50;
     }
@@ -759,11 +863,27 @@ test "window loopback: fake X server — open, a key becomes 'q', a blit lands, 
         .{ result.stage, result.ok_setup, result.saw_create, result.put_width, result.finished, keys.items.len },
     );
     try testing.expect(closed);
+
+    // The pointer battery, translated: motion, left down (shifted),
+    // left up, one wheel-up — and the wheel's release pair dropped.
+    try testing.expectEqual(@as(usize, 4), pointer_events.items.len);
+    const ev = pointer_events.items;
+    try testing.expectEqual(layout.InputEvent.Kind.move, ev[0].kind);
+    try testing.expectEqual(@as(u16, 33), ev[0].x);
+    try testing.expectEqual(@as(u16, 17), ev[0].y);
+    try testing.expectEqual(layout.InputEvent.Kind.button_down, ev[1].kind);
+    try testing.expectEqual(@as(u8, 1), ev[1].button);
+    try testing.expectEqual(@as(u16, 40), ev[1].x);
+    try testing.expect(ev[1].mods & layout.InputEvent.mod_shift != 0);
+    try testing.expectEqual(layout.InputEvent.Kind.button_up, ev[2].kind);
+    try testing.expectEqual(layout.InputEvent.Kind.wheel, ev[3].kind);
+    try testing.expectEqual(@as(u8, 4), ev[3].button);
+
     try testing.expect(result.ok_setup);
     try testing.expect(result.saw_create);
     try testing.expect(result.finished);
     try testing.expectEqual(@as(u16, 64), result.put_width); // 8 cols × 8 px
     // 'A' row 0 is blank in the font: the first blitted pixel is the
     // background — the palette, observed on the wire.
-    try testing.expectEqual(pixel.palette_bg, result.first_pixel);
+    try testing.expectEqual(layout.palette_bg, result.first_pixel);
 }
