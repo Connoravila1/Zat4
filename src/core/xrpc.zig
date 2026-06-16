@@ -58,7 +58,7 @@ pub fn buildQueryUrl(
     return out.toOwnedSlice() catch return error.OutOfMemory;
 }
 
-/// NSIDs are dot-separated reverse-DNS names (`app.bsky.actor.getProfile`):
+/// NSIDs are dot-separated reverse-DNS names (`app.zat4.actor.getProfile`):
 /// ASCII letters, digits, dots, hyphens. Anything else does not belong in a
 /// URL path we build.
 fn validateNsid(nsid: []const u8) error{InvalidNsid}!void {
@@ -173,13 +173,13 @@ const lexicon = @import("lexicon.zig");
 
 test "query URL: NSID path, multiple params, reserved characters escaped" {
     const gpa = testing.allocator;
-    const url = try buildQueryUrl(gpa, "https://public.api.bsky.app", "app.bsky.actor.getProfile", &.{
+    const url = try buildQueryUrl(gpa, "https://public.api.bsky.app", "app.zat4.actor.getProfile", &.{
         .{ .name = "actor", .value = "did:plc:z72i7hdynmk6r22z27h6tvur" },
         .{ .name = "q", .value = "two words&more=trouble" },
     });
     defer gpa.free(url);
     try testing.expectEqualStrings(
-        "https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile" ++
+        "https://public.api.bsky.app/xrpc/app.zat4.actor.getProfile" ++
             "?actor=did%3Aplc%3Az72i7hdynmk6r22z27h6tvur" ++
             "&q=two%20words%26more%3Dtrouble",
         url,

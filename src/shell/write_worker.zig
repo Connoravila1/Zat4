@@ -1,0 +1,396 @@
+//! B1 classification: SHELL. The **write worker** — the same actor pattern
+//! the firehose (stream.zig) already proves: it runs on its OWN thread,
+//! owns its own arena (C4), and talks to the UI ONLY by plain-data
+//! messages through two mailboxes (E1) — a REQUEST inbox (UI → worker)
+//! and a RESULT outbox (worker → UI). It fails alone (E2): a network
+//! error becomes a result message, never a crash, never a blocked UI.
+//!
+//! WHY THIS EXISTS: a like/unlike/repost is a network round-trip. Done
+//! inline on the render thread it FREEZES the whole UI — scrolling, the
+//! firehose, and any animation — for the server's reply (100–500ms). That
+//! freeze is the mid-animation lag. Moving the write here means the UI
+//! thread only drops a request and returns; the main loop keeps running,
+//! so animations play smoothly as the pure per-frame transform the
+//! glyph-field design intends, and the optimistic count is reverted later
+//! (by a result message) only if the server refuses.
+//!
+//! Wire/HTTP knowledge stays in write.zig and auth.zig (D3); this file
+//! only moves request/result VALUES across the thread boundary and calls
+//! the existing write functions.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const auth = @import("auth.zig");
+const write = @import("write.zig");
+const clock = @import("clock.zig");
+
+// ---------------------------------------------------------------------------
+// The messages — plain data, the only thing that crosses the boundary (E1)
+// ---------------------------------------------------------------------------
+
+/// What kind of write the UI is asking for. The strings each request
+/// carries are gpa-owned COPIES made at enqueue time (the call site's
+/// arena does not outlive the request), freed by the worker after use.
+pub const Request = struct {
+    // A7.2: cold struct, size guard waived — write requests exist at human
+    // action rates (a few in flight at most), carry slices (variable size,
+    // not a packable hot record), and are drained in a short batch, never
+    // a hot loop. The exact-byte guard is for tightly-packed hot structs.
+    kind: Kind,
+    /// The post's CID — carried through untouched so the RESULT can be
+    /// matched back to the right post for an optimistic revert. Owned copy.
+    cid: []const u8,
+    /// For a create (like/repost): the subject post uri + cid. For a
+    /// delete (unlike/unrepost): `record_uri` holds the like/repost record
+    /// to remove and the subject fields are empty. Owned copies.
+    subject_uri: []const u8,
+    subject_cid: []const u8,
+    record_uri: []const u8,
+    /// Creation time for the record (createdAt). Captured on the UI thread
+    /// so the worker reads no clock of its own for this value.
+    now: i64,
+
+    pub const Kind = enum(u8) { like, unlike, repost, unrepost };
+};
+
+/// What the worker reports back. `cid` matches the request's post so the
+/// UI can find it; `outcome` says whether to keep or revert the optimism.
+pub const Result = struct {
+    // A7.2: cold struct, size guard waived — same as Request: human-rate
+    // volume, slice-carrying, short-batch drained, not a hot record.
+    kind: Request.Kind,
+    cid: []const u8, // owned copy; the UI frees after handling
+    /// The record uri this request acted on — carried back so a REFUSED
+    /// unlike/unrepost can restore the like/repost record (revertUnlike
+    /// needs it). Empty for create kinds, whose revert needs only the cid.
+    /// Owned copy.
+    revert_uri: []const u8,
+    outcome: Outcome,
+
+    pub const Outcome = union(enum) {
+        ok,
+        /// The server refused (e.g. auth/validation). status+code are owned.
+        refused: struct { status: u16, code: []const u8 },
+        /// A transport/local failure (the error name, owned copy).
+        net_error: []const u8,
+    };
+};
+
+fn freeRequest(gpa: Allocator, r: Request) void {
+    gpa.free(r.cid);
+    gpa.free(r.subject_uri);
+    gpa.free(r.subject_cid);
+    gpa.free(r.record_uri);
+}
+
+pub fn freeResult(gpa: Allocator, r: Result) void {
+    gpa.free(r.cid);
+    gpa.free(r.revert_uri);
+    switch (r.outcome) {
+        .refused => |f| gpa.free(f.code),
+        .net_error => |name| gpa.free(name),
+        .ok => {},
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A mailbox of T — the spinlock-guarded hand-off, same shape as stream.zig
+// ---------------------------------------------------------------------------
+
+/// A7.2: cold struct, size guard waived — two per worker, the cross-thread seam.
+fn Mailbox(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        // Spinlock not mutex, deliberately (stream.zig's reasoning): two
+        // threads, tiny critical sections, human-rate contention, and
+        // std.atomic is stable across 0.16-dev snapshots.
+        locked: std.atomic.Value(bool) = .init(false),
+        items: std.ArrayList(T) = .empty,
+
+        fn acquire(b: *Self) void {
+            while (b.locked.swap(true, .acquire)) std.atomic.spinLoopHint();
+        }
+        fn release(b: *Self) void {
+            b.locked.store(false, .release);
+        }
+        fn push(b: *Self, gpa: Allocator, item: T) bool {
+            b.acquire();
+            defer b.release();
+            b.items.append(gpa, item) catch return false;
+            return true;
+        }
+        /// Move all pending items into `out`; caller owns them now.
+        pub fn drain(b: *Self, gpa: Allocator, out: *std.ArrayList(T)) error{OutOfMemory}!void {
+            b.acquire();
+            defer b.release();
+            try out.appendSlice(gpa, b.items.items);
+            b.items.clearRetainingCapacity();
+        }
+        fn count(b: *Self) usize {
+            b.acquire();
+            defer b.release();
+            return b.items.items.len;
+        }
+        /// Free the backing array. The OWNER of the mailbox calls this
+        /// (the run loop declares them on its stack); the worker only
+        /// pushes/drains. Any items still queued are the caller's to free
+        /// first (the worker's shutdown drains+frees them before this).
+        pub fn deinit(b: *Self, gpa: Allocator) void {
+            b.items.deinit(gpa);
+        }
+    };
+}
+
+pub const RequestBox = Mailbox(Request);
+pub const ResultBox = Mailbox(Result);
+
+// ---------------------------------------------------------------------------
+// The worker
+// ---------------------------------------------------------------------------
+
+pub const Worker = struct {
+    // A7.2: cold struct, size guard waived — exactly one per session.
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    session: *auth.Session,
+    inbox: *RequestBox,
+    outbox: *ResultBox,
+    thread: std.Thread,
+    stop: std.atomic.Value(bool),
+};
+
+/// Enqueue a write request from the UI thread. Copies every string into
+/// gpa (the worker outlives the caller's arena), so the caller may free
+/// its originals immediately. Returns false only on OOM (the optimistic
+/// state then simply never reconciles — the next manual action will).
+pub fn submit(
+    worker: *Worker,
+    kind: Request.Kind,
+    cid: []const u8,
+    subject_uri: []const u8,
+    subject_cid: []const u8,
+    record_uri: []const u8,
+    now: i64,
+) bool {
+    const gpa = worker.gpa;
+    const cid_c = gpa.dupe(u8, cid) catch return false;
+    const su_c = gpa.dupe(u8, subject_uri) catch {
+        gpa.free(cid_c);
+        return false;
+    };
+    const sc_c = gpa.dupe(u8, subject_cid) catch {
+        gpa.free(cid_c);
+        gpa.free(su_c);
+        return false;
+    };
+    const ru_c = gpa.dupe(u8, record_uri) catch {
+        gpa.free(cid_c);
+        gpa.free(su_c);
+        gpa.free(sc_c);
+        return false;
+    };
+    const req: Request = .{
+        .kind = kind,
+        .cid = cid_c,
+        .subject_uri = su_c,
+        .subject_cid = sc_c,
+        .record_uri = ru_c,
+        .now = now,
+    };
+    if (!worker.inbox.push(gpa, req)) {
+        freeRequest(gpa, req);
+        return false;
+    }
+    return true;
+}
+
+pub fn start(
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    session: *auth.Session,
+    inbox: *RequestBox,
+    outbox: *ResultBox,
+) !*Worker {
+    const worker = try gpa.create(Worker);
+    worker.* = .{
+        .gpa = gpa,
+        .io = io,
+        .environ = environ,
+        .session = session,
+        .inbox = inbox,
+        .outbox = outbox,
+        .thread = undefined,
+        .stop = .init(false),
+    };
+    worker.thread = try std.Thread.spawn(.{}, threadMain, .{worker});
+    return worker;
+}
+
+/// Signal stop and join. The thread checks `stop` between requests and on
+/// its idle wakeups, so it exits within one poll interval. Deterministic
+/// teardown (C5): any requests still queued are drained and freed.
+pub fn shutdown(worker: *Worker) void {
+    worker.stop.store(true, .release);
+    worker.thread.join();
+    const gpa = worker.gpa;
+    // Drain any leftovers in both boxes so nothing leaks (C6).
+    var pending: std.ArrayList(Request) = .empty;
+    defer pending.deinit(gpa);
+    worker.inbox.drain(gpa, &pending) catch {};
+    for (pending.items) |req| freeRequest(gpa, req);
+    var done: std.ArrayList(Result) = .empty;
+    defer done.deinit(gpa);
+    worker.outbox.drain(gpa, &done) catch {};
+    for (done.items) |res| freeResult(gpa, res);
+    gpa.destroy(worker);
+}
+
+fn threadMain(worker: *Worker) void {
+    const gpa = worker.gpa;
+    var batch: std.ArrayList(Request) = .empty;
+    defer batch.deinit(gpa);
+    while (!worker.stop.load(.acquire)) {
+        batch.clearRetainingCapacity();
+        worker.inbox.drain(gpa, &batch) catch {
+            // OOM draining: back off and retry; nothing is lost (the items
+            // remain in the inbox).
+            clock.sleepMillis(20);
+            continue;
+        };
+        if (batch.items.len == 0) {
+            // Idle: poll. Human action rates make a short poll plenty
+            // responsive while costing nothing measurable.
+            clock.sleepMillis(15);
+            continue;
+        }
+        for (batch.items, 0..) |req, i| {
+            if (worker.stop.load(.acquire)) {
+                // Stop was signalled mid-batch: free THIS and every
+                // remaining unprocessed request (their strings are owned),
+                // then exit. Without this the tail of the batch would leak,
+                // since these were already drained out of the inbox and so
+                // shutdown's inbox-drain will not see them.
+                for (batch.items[i..]) |leftover| freeRequest(gpa, leftover);
+                return;
+            }
+            processOne(worker, req);
+            freeRequest(gpa, req);
+        }
+    }
+}
+
+fn processOne(worker: *Worker, req: Request) void {
+    const gpa = worker.gpa;
+    // Per-request arena (C3): the write call allocates request/response
+    // bodies; we free them wholesale here.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const call = switch (req.kind) {
+        .like => write.likePost(gpa, arena, worker.io, worker.environ, worker.session, req.subject_uri, req.subject_cid, req.now),
+        .repost => write.repostPost(gpa, arena, worker.io, worker.environ, worker.session, req.subject_uri, req.subject_cid, req.now),
+        .unlike => write.unlikePost(gpa, arena, worker.io, worker.environ, worker.session, req.record_uri),
+        .unrepost => write.unrepostPost(gpa, arena, worker.io, worker.environ, worker.session, req.record_uri),
+    };
+
+    const outcome: Result.Outcome = if (call) |wo| switch (wo) {
+        .ok => .ok,
+        .failed => |f| .{ .refused = .{
+            .status = f.status,
+            .code = gpa.dupe(u8, f.code) catch "",
+        } },
+    } else |err| .{ .net_error = gpa.dupe(u8, @errorName(err)) catch "error" };
+
+    const cid_copy = gpa.dupe(u8, req.cid) catch {
+        // If even the cid copy fails, drop the result; the optimistic
+        // state stays (a benign over-count until the next refresh).
+        if (outcome == .refused) gpa.free(outcome.refused.code);
+        if (outcome == .net_error) gpa.free(outcome.net_error);
+        return;
+    };
+    const revert_copy = gpa.dupe(u8, req.record_uri) catch {
+        gpa.free(cid_copy);
+        if (outcome == .refused) gpa.free(outcome.refused.code);
+        if (outcome == .net_error) gpa.free(outcome.net_error);
+        return;
+    };
+    const result: Result = .{ .kind = req.kind, .cid = cid_copy, .revert_uri = revert_copy, .outcome = outcome };
+    if (!worker.outbox.push(gpa, result)) freeResult(gpa, result);
+}
+
+// ---------------------------------------------------------------------------
+// Tests (C6) — the mailbox hand-off and message hygiene, no network
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "mailbox: push then drain moves every item and clears" {
+    const gpa = testing.allocator;
+    var box: RequestBox = .{};
+    defer box.items.deinit(gpa);
+
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        const req: Request = .{
+            .kind = .like,
+            .cid = try gpa.dupe(u8, "cidX"),
+            .subject_uri = try gpa.dupe(u8, "at://uri"),
+            .subject_cid = try gpa.dupe(u8, "scid"),
+            .record_uri = try gpa.dupe(u8, ""),
+            .now = 0,
+        };
+        try testing.expect(box.push(gpa, req));
+    }
+    try testing.expectEqual(@as(usize, 3), box.count());
+
+    var out: std.ArrayList(Request) = .empty;
+    defer out.deinit(gpa);
+    try box.drain(gpa, &out);
+    try testing.expectEqual(@as(usize, 3), out.items.len);
+    try testing.expectEqual(@as(usize, 0), box.count()); // drained
+    for (out.items) |req| freeRequest(gpa, req);
+}
+
+test "mailbox deinit frees the backing array (the leak the smoke test caught)" {
+    const gpa = testing.allocator;
+    // Push items, drain some, leave some — then deinit must free the
+    // backing ArrayList itself, not just the items. The leak detector
+    // (C6) fails this test if deinit forgets the backing store.
+    var box: ResultBox = .{};
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        const r: Result = .{ .kind = .like, .cid = try gpa.dupe(u8, "c"), .revert_uri = try gpa.dupe(u8, ""), .outcome = .ok };
+        try testing.expect(box.push(gpa, r));
+    }
+    // Drain three (caller frees them), leaving two in the box.
+    var out: std.ArrayList(Result) = .empty;
+    defer out.deinit(gpa);
+    try box.drain(gpa, &out);
+    for (out.items) |r| freeResult(gpa, r);
+    // The box is now empty of items but its backing array is still
+    // allocated; free the two we left by re-pushing then draining is not
+    // needed — drain already emptied it. deinit frees the backing store.
+    box.deinit(gpa);
+}
+
+test "result hygiene: every outcome variant frees without leak" {
+    const gpa = testing.allocator;
+    // ok
+    {
+        const r: Result = .{ .kind = .like, .cid = try gpa.dupe(u8, "c"), .revert_uri = try gpa.dupe(u8, ""), .outcome = .ok };
+        freeResult(gpa, r);
+    }
+    // refused
+    {
+        const r: Result = .{ .kind = .unlike, .cid = try gpa.dupe(u8, "c"), .revert_uri = try gpa.dupe(u8, "at://like"), .outcome = .{ .refused = .{ .status = 400, .code = try gpa.dupe(u8, "BadRequest") } } };
+        freeResult(gpa, r);
+    }
+    // net_error
+    {
+        const r: Result = .{ .kind = .repost, .cid = try gpa.dupe(u8, "c"), .revert_uri = try gpa.dupe(u8, ""), .outcome = .{ .net_error = try gpa.dupe(u8, "ConnectionRefused") } };
+        freeResult(gpa, r);
+    }
+}

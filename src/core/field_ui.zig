@@ -132,6 +132,29 @@ pub const Metrics = struct {
     content_rows: u32,
 };
 
+/// A horizontal column band: the left origin and width, in grid cells.
+/// The center feed renders into one of these instead of assuming it owns
+/// the whole field (SHELL_LAYOUT_ROADMAP S.0) — the seam that lets the
+/// same `build` fill a sub-width column. A7.2: cold, passed by value, one
+/// per pane per frame; never held in a hot loop.
+pub const Band = struct {
+    x0: u16,
+    w: u16,
+};
+
+/// Pane widths for the three-column shell, as a config VALUE (the
+/// roadmap's §0 commitment 1: layout is a pure function of data + dims,
+/// pane widths as config, never cached). Center width is whatever is left
+/// after the two rails and the two divider seams. A7.2: cold config, one
+/// per shell, never in a hot loop — size guard waived by rule.
+pub const PaneConfig = struct {
+    nav_w: u16 = 22,
+    sidebar_w: u16 = 28,
+    /// Below this total width the shell collapses to center-only — an
+    /// ordinary result (E4), not an error.
+    min_three_col_w: u16 = 80,
+};
+
 const header_rows: u16 = 2;
 
 /// How many grid rows one post occupies, given the wrap width. Pure;
@@ -194,6 +217,12 @@ fn sub(x: u16, n: u16) u16 {
 /// wholesale) and the view's scroll (clamped + one-shot ensure-visible).
 /// The perturb grid is LEFT ALONE — physics persists across relayout by
 /// living in screen space (design §7).
+///
+/// This is the full-field entry point: it clears the content grid and
+/// renders the feed across the whole width, exactly as before. It now
+/// delegates to `buildBand` (the seam, SHELL_LAYOUT_ROADMAP S.0) with a
+/// band spanning the entire field, so every existing caller and golden
+/// test is byte-for-byte unchanged.
 pub fn build(
     f: *field.Field,
     hr: *HitList,
@@ -207,28 +236,54 @@ pub fn build(
     status: []const u8,
     gpa: Allocator,
 ) error{OutOfMemory}!Metrics {
-    // Clear content only (perturb persists — §7).
+    // Clear content only (perturb persists — §7). The banded builder does
+    // NOT clear, so the shell can paint multiple bands into one grid; the
+    // full-field path clears here, once, then fills the whole width.
     @memset(f.content, field.ContentCell.empty);
     hr.clearRetainingCapacity();
     hearts.clearRetainingCapacity();
+    return buildBand(f, .{ .x0 = 0, .w = f.cols }, hr, hearts, items, selected, view, revealed, now, account_handle, status, gpa);
+}
 
-    const cols = f.cols;
+/// Render the feed into one column `band` of the content grid. Pure (B2):
+/// same (band, items, selection, scroll, dims) ⇒ same cells + same hit
+/// rects within the band. Does NOT clear the grid or the hit list — the
+/// caller owns that, so the shell can compose this band beside a nav rail
+/// and a sidebar in the same frame (SHELL_LAYOUT_ROADMAP S.0/S.1). All
+/// horizontal positions are derived from `band.x0`/`band.w`; the grid's
+/// true stride (f.cols) is untouched, so cells land in the right column.
+pub fn buildBand(
+    f: *field.Field,
+    band: Band,
+    hr: *HitList,
+    hearts: *HeartList,
+    items: []const feed.TimelineItem,
+    selected: u32,
+    view: *ViewState,
+    revealed: []const []const u8,
+    now: i64,
+    account_handle: []const u8,
+    status: []const u8,
+    gpa: Allocator,
+) error{OutOfMemory}!Metrics {
     const rows = f.rows;
-    if (cols < 24 or rows < 6) return .{ .content_rows = 0 };
+    if (band.w < 24 or rows < 6) return .{ .content_rows = 0 };
 
     const margin: u16 = 2;
-    const text_w: u16 = cols - margin * 2;
+    const left: u16 = band.x0 + margin; // content's left column in the band
+    const right: u16 = band.x0 + band.w; // right clip / right-anchored origin
+    const text_w: u16 = band.w - margin * 2;
 
     // ---- header (fixed; never scrolls, never moves under physics) ----
-    writeFixed(f, margin, 0, col_accent, "zat");
+    writeFixed(f, left, 0, col_accent, "zat");
     if (account_handle.len > 0) {
         var hb: [96]u8 = undefined;
         const h = std.fmt.bufPrint(&hb, "@{s}", .{account_handle}) catch "@";
-        writeFixed(f, margin + 4, 0, col_dim, h);
+        writeFixed(f, left + 4, 0, col_dim, h);
     }
     var tally_buf: [24]u8 = undefined;
     const tally = std.fmt.bufPrint(&tally_buf, "{d} posts", .{items.len}) catch "";
-    if (tally.len < cols) writeFixed(f, cols - margin - @as(u16, @intCast(tally.len)), 0, col_faint, tally);
+    if (band.x0 + tally.len < right) writeFixed(f, right - margin - @as(u16, @intCast(tally.len)), 0, col_faint, tally);
     fixedDivider(f, 1, col_faint, '=');
 
     // ---- measure pass: heights, selection position, total extent ----
@@ -258,7 +313,7 @@ pub fn build(
     const scroll = view.scroll_rows;
 
     if (items.len == 0) {
-        writeText(f, margin, rows / 2, col_dim, "timeline is empty - press r to refresh");
+        writeText(f, left, rows / 2, col_dim, "timeline is empty - press r to refresh");
         return .{ .content_rows = content_rows };
     }
 
@@ -275,27 +330,27 @@ pub fn build(
         const body_col: u8 = if (is_sel) col_ink else col_dim;
 
         // Whole-card hit (select); its effect origin is the card centre.
-        appendHit(gpa, hr, margin, card_top, text_w, ch, .none, i, cols, rows, header_rows, @intCast(margin + text_w / 2), card_top + @divTrunc(ch, 2));
+        appendHit(gpa, hr, left, card_top, text_w, ch, .none, i, right, rows, header_rows, @intCast(left + text_w / 2), card_top + @divTrunc(ch, 2));
 
         var row = card_top;
         if (moderation.verdictFor(item.label_flags) == .hide and !isRevealed(revealed, item.cid)) {
             var hb: [128]u8 = undefined;
             const label = std.fmt.bufPrint(&hb, "hidden: {s} - click to show", .{moderation.reasonFor(item.label_flags)}) catch "hidden - click to show";
-            putRow(f, margin, row + 1, col_faint, label, cols, rows);
-            appendHit(gpa, hr, margin, card_top, text_w, ch, .toggle_reveal, i, cols, rows, header_rows, 0, 0);
+            putRow(f, left, row + 1, col_faint, label, right, rows);
+            appendHit(gpa, hr, left, card_top, text_w, ch, .toggle_reveal, i, right, rows, header_rows, 0, 0);
             continue;
         }
 
-        // Selection marker in the left margin.
+        // Selection marker at the band's left edge.
         if (is_sel) {
             var r = card_top;
-            while (r < card_top + ch - 1) : (r += 1) putCell(f, 0, r, col_accent, '|', cols, rows, .{ .fixed = true });
+            while (r < card_top + ch - 1) : (r += 1) putCell(f, band.x0, r, col_accent, '|', right, rows, .{ .fixed = true });
         }
 
         if (item.reposted_by_handle.len > 0) {
             var rb: [128]u8 = undefined;
             const line = std.fmt.bufPrint(&rb, "reposted by @{s}", .{item.reposted_by_handle}) catch "reposted";
-            putRow(f, margin, row, col_boost, line, cols, rows);
+            putRow(f, left, row, col_boost, line, right, rows);
             row += 1;
         }
 
@@ -306,17 +361,17 @@ pub fn build(
                 std.fmt.bufPrint(&nb, "{s} @{s}", .{ item.author_display_name, item.author_handle }) catch item.author_handle
             else
                 std.fmt.bufPrint(&nb, "@{s}", .{item.author_handle}) catch "@";
-            putRow(f, margin, row, if (is_sel) col_accent else col_ink, name, cols, rows);
+            putRow(f, left, row, if (is_sel) col_accent else col_ink, name, right, rows);
             var ab: [16]u8 = undefined;
             const age = timeline_ui.formatAge(&ab, now, item.created_at);
-            if (age.len + margin < cols) putRow(f, cols - margin - @as(u16, @intCast(age.len)), row, col_faint, age, cols, rows);
+            if (band.x0 + age.len + margin < right) putRow(f, right - margin - @as(u16, @intCast(age.len)), row, col_faint, age, right, rows);
             row += 1;
         }
 
         if (item.replying_to_handle.len > 0) {
             var rb: [128]u8 = undefined;
             const line = std.fmt.bufPrint(&rb, "replying to @{s}", .{item.replying_to_handle}) catch "replying";
-            putRow(f, margin, row, col_faint, line, cols, rows);
+            putRow(f, left, row, col_faint, line, right, rows);
             row += 1;
         }
 
@@ -328,7 +383,7 @@ pub fn build(
             } else while (rest.len > 0) {
                 const n = wrapOne(rest, text_w);
                 const line = std.mem.trimEnd(u8, rest[0..n], "\n");
-                putRow(f, margin, row, body_col, line, cols, rows);
+                putRow(f, left, row, body_col, line, right, rows);
                 row += 1;
                 rest = rest[@max(n, 1)..];
             }
@@ -343,7 +398,7 @@ pub fn build(
         // the heart's own cell, not the card centre.
         {
             const zrow: i32 = row;
-            var x = margin;
+            var x = left;
             const liked = item.item_flags.viewer_liked;
             const heart_w = effect.inlineHeartCellW();
 
@@ -358,31 +413,38 @@ pub fn build(
             // The like count, after the heart.
             var lb: [24]u8 = undefined;
             const like_s = std.fmt.bufPrint(&lb, "{d}", .{item.like_count}) catch "0";
-            putRow(f, x, zrow, if (liked) col_like else col_dim, like_s, cols, rows);
+            putRow(f, x, zrow, if (liked) col_like else col_dim, like_s, right, rows);
             // Hit target spans the heart AND its count, so the whole
             // affordance is clickable, but anchored on the heart. Effect
             // origin is the heart cell → the burst happens at the button.
+            // Height is 2, not 1: the heart sprite is centred on this row but
+            // drawn ~1.4 cell-rows tall, so its bottom spills ~0.4 of a row
+            // into the cell below. With a 1-row target those clicks landed
+            // just under the rect and silently missed ("sometimes a click
+            // doesn't like"). The row directly below is the seam divider,
+            // which carries no other affordance, so claiming it for the heart
+            // costs nothing and makes the visible heart fully clickable.
             const target_w: u16 = heart_w + 1 + @as(u16, @intCast(like_s.len)) + 1;
-            appendHit(gpa, hr, margin, zrow, target_w, 1, .like, i, cols, rows, header_rows, heart_cx, heart_cy);
+            appendHit(gpa, hr, left, zrow, target_w, 2, .like, i, right, rows, header_rows, heart_cx, heart_cy);
             x += @intCast(like_s.len + 3);
 
             var bb: [32]u8 = undefined;
             const boost_s = std.fmt.bufPrint(&bb, "rt {d}", .{item.repost_count}) catch "rt";
-            putRow(f, x, zrow, if (item.item_flags.viewer_reposted) col_boost else col_dim, boost_s, cols, rows);
-            appendHit(gpa, hr, sub(x, 2), zrow, @intCast(boost_s.len + 4), 1, .repost, i, cols, rows, header_rows, x, zrow);
+            putRow(f, x, zrow, if (item.item_flags.viewer_reposted) col_boost else col_dim, boost_s, right, rows);
+            appendHit(gpa, hr, sub(x, 2), zrow, @intCast(boost_s.len + 4), 1, .repost, i, right, rows, header_rows, x, zrow);
             x += @intCast(boost_s.len + 3);
 
             var pb: [32]u8 = undefined;
             const reply_s = std.fmt.bufPrint(&pb, "re {d}", .{item.reply_count}) catch "re";
-            putRow(f, x, zrow, col_dim, reply_s, cols, rows);
-            appendHit(gpa, hr, sub(x, 2), zrow, @intCast(reply_s.len + 4), 1, .reply, i, cols, rows, header_rows, x, zrow);
+            putRow(f, x, zrow, col_dim, reply_s, right, rows);
+            appendHit(gpa, hr, sub(x, 2), zrow, @intCast(reply_s.len + 4), 1, .reply, i, right, rows, header_rows, x, zrow);
             row += 1;
         }
 
         // Seam divider between cards (scatter-able scenery).
         if (row >= header_rows and row < rows) {
-            var dx: u16 = margin;
-            while (dx < cols - margin) : (dx += 1) putCell(f, dx, row, col_faint, '-', cols, rows, .{ .divider = true });
+            var dx: u16 = left;
+            while (dx < right - margin) : (dx += 1) putCell(f, dx, row, col_faint, '-', right, rows, .{ .divider = true });
         }
     }
 
@@ -391,19 +453,199 @@ pub fn build(
         const ly: i32 = @as(i32, @intCast(content_rows - 1)) - scroll;
         if (ly >= header_rows and ly < rows) {
             const label = "load older posts";
-            const lx: u16 = if (label.len < cols) @intCast((cols - label.len) / 2) else margin;
-            putRow(f, lx, ly, col_faint, label, cols, rows);
-            appendHit(gpa, hr, margin, ly, text_w, 1, .load_more, no_target, cols, rows, header_rows, 0, 0);
+            const lx: u16 = if (label.len < band.w) band.x0 + @as(u16, @intCast((band.w - label.len) / 2)) else left;
+            putRow(f, lx, ly, col_faint, label, right, rows);
+            appendHit(gpa, hr, left, ly, text_w, 1, .load_more, no_target, right, rows, header_rows, 0, 0);
         }
     }
 
     // Status pill text, bottom-right (chrome — fixed).
-    if (status.len > 0 and status.len + margin < cols) {
-        writeFixed(f, cols - margin - @as(u16, @intCast(status.len)), rows - 1, col_accent, status);
+    if (status.len > 0 and band.x0 + status.len + margin < right) {
+        writeFixed(f, right - margin - @as(u16, @intCast(status.len)), rows - 1, col_accent, status);
     }
 
     return .{ .content_rows = content_rows };
 }
+
+// ---------------------------------------------------------------------------
+// The three-column shell (SHELL_LAYOUT_ROADMAP S.1–S.3). One pure carve
+// over the field, plus two rail helpers. No new module (F4): this is the
+// same kind of work `buildBand` does — a transform filling the grid. The
+// look is the renderer's sealed decision (D1); a layout change is one
+// vertical slice (D6).
+// ---------------------------------------------------------------------------
+
+/// Carve the field into nav rail · center feed · sidebar and fill each.
+/// Pure (B2): same (items, selection, scroll, dims, config) ⇒ same grid +
+/// same hit rects. Clears the grid and hit/heart lists once, writes the
+/// two vertical divider seams as fixed scenery, delegates the center to
+/// `buildBand`, and the rails to the helpers below. Below the config's
+/// three-column threshold it collapses to the full-width feed — an
+/// ordinary result (E4), not an error.
+///
+/// The seam columns are `fixed` (physics treats them as immovable
+/// scenery, GLYPH_FIELD §4), so the rails read as separated panes that
+/// the simulation still flows around.
+pub fn layoutShell(
+    f: *field.Field,
+    cfg: PaneConfig,
+    hr: *HitList,
+    hearts: *HeartList,
+    items: []const feed.TimelineItem,
+    selected: u32,
+    view: *ViewState,
+    revealed: []const []const u8,
+    now: i64,
+    account_handle: []const u8,
+    status: []const u8,
+    gpa: Allocator,
+) error{OutOfMemory}!Metrics {
+    @memset(f.content, field.ContentCell.empty);
+    hr.clearRetainingCapacity();
+    hearts.clearRetainingCapacity();
+
+    const cols = f.cols;
+
+    // Collapse to center-only when too narrow to seat three columns plus
+    // their seams and gutters (E4: an ordinary result, the narrow layout).
+    if (cols < cfg.min_three_col_w) {
+        return buildBand(f, .{ .x0 = 0, .w = cols }, hr, hearts, items, selected, view, revealed, now, account_handle, status, gpa);
+    }
+
+    // Three bands: [nav][seam][center][seam][sidebar]. The two seams take
+    // one column each; the center is whatever remains.
+    const nav_w = cfg.nav_w;
+    const side_w = cfg.sidebar_w;
+    const seam_l: u16 = nav_w; // first divider column
+    const center_x: u16 = nav_w + 1;
+    const center_w: u16 = cols - nav_w - side_w - 2; // minus two seam cols
+    const seam_r: u16 = center_x + center_w; // second divider column
+    const side_x: u16 = seam_r + 1;
+
+    // The two vertical seams as fixed/divider scenery.
+    seamColumn(f, seam_l, col_faint, '|');
+    seamColumn(f, seam_r, col_faint, '|');
+
+    // Left rail and right sidebar (static glyph panes for now).
+    layoutNavRail(gpa, f, .{ .x0 = 0, .w = nav_w }, hr, account_handle);
+    layoutSidebar(f, .{ .x0 = side_x, .w = side_w });
+
+    // Center feed: the same `buildBand`, now inset between the seams.
+    return buildBand(f, .{ .x0 = center_x, .w = center_w }, hr, hearts, items, selected, view, revealed, now, account_handle, status, gpa);
+}
+
+/// One full-height vertical divider seam at column `x` (fixed scenery).
+fn seamColumn(f: *field.Field, x: u16, fg: u8, glyph: u8) void {
+    if (x >= f.cols) return;
+    var y: u16 = 0;
+    while (y < f.rows) : (y += 1) {
+        f.content[field.index(f, x, y)] = .{ .glyph = glyph, .fg = fg, .flags = .{ .fixed = true, .divider = true } };
+    }
+}
+
+/// The left nav rail (S.2): wordmark, a column of destinations, and a
+/// compose affordance — each interactive row pushes a `HitRect` carrying
+/// a nav action, so the rail inherits hit-testing and the simulation for
+/// free. Destinations with no screen yet emit a nav action that resolves
+/// to a no-op click until Phase D wires it (timeline_ui.keyFor returns
+/// null for those); Home/Profile/Compose emit the real refresh/profile/
+/// new_post verbs and work today.
+fn layoutNavRail(
+    gpa: Allocator,
+    f: *field.Field,
+    band: Band,
+    hr: *HitList,
+    account_handle: []const u8,
+) void {
+    const margin: u16 = 2;
+    const left: u16 = band.x0 + margin;
+    const right: u16 = band.x0 + band.w;
+    const rows = f.rows;
+
+    // Wordmark header, aligned with the feed's (fixed chrome).
+    writeFixed(f, left, 0, col_accent, "zat4");
+
+    // The destination list. Each row is (glyph label, action). Real verbs
+    // (refresh/profile/new_post) work now; nav_* are stubs until Phase D.
+    const Dest = struct { label: []const u8, action: timeline_ui.Action };
+    const dests = [_]Dest{
+        .{ .label = "home", .action = .refresh },
+        .{ .label = "explore", .action = .nav_explore },
+        .{ .label = "notifications", .action = .nav_notifications },
+        .{ .label = "chat", .action = .nav_chat },
+        .{ .label = "feeds", .action = .nav_feeds },
+        .{ .label = "lists", .action = .nav_lists },
+        .{ .label = "profile", .action = .profile },
+        .{ .label = "settings", .action = .nav_settings },
+    };
+
+    var y: u16 = 3;
+    for (dests) |d| {
+        if (y >= rows - 2) break; // keep clear of the compose row + footer
+        // Inactive destinations sit at `dim`, not `ink`: in a minimal dark
+        // shell the rail recedes so the centre feed carries the eye. The
+        // accent is reserved for the compose affordance below.
+        putRow(f, left, y, col_dim, d.label, right, rows);
+        appendHit(gpa, hr, band.x0, y, band.w, 1, d.action, no_target, right, rows, header_rows, left, y);
+        y += 1;
+    }
+
+    // Compose affordance, pinned near the bottom of the rail.
+    if (rows >= 4) {
+        const cy: u16 = rows - 2;
+        putRow(f, left, cy, col_accent, "+ new post", right, rows);
+        appendHit(gpa, hr, band.x0, cy, band.w, 1, .new_post, no_target, right, rows, header_rows, left, cy);
+    }
+
+    // Signed-in handle at the very bottom (fixed chrome), if known.
+    if (account_handle.len > 0 and rows >= 2) {
+        var hb: [96]u8 = undefined;
+        const h = std.fmt.bufPrint(&hb, "@{s}", .{account_handle}) catch "@";
+        writeFixed(f, left, rows - 1, col_faint, h);
+    }
+}
+
+/// The right sidebar (S.3): a search row, a stubbed feed list, and a
+/// stubbed trending block. Deliberately static and data-free (F4) —
+/// trending has no clean data source decided yet, so it is placeholder
+/// glyphs until a real source emerges. No hit rects: nothing here is
+/// wired to act on yet.
+fn layoutSidebar(f: *field.Field, band: Band) void {
+    const margin: u16 = 2;
+    const left: u16 = band.x0 + margin;
+    const right: u16 = band.x0 + band.w;
+    const rows = f.rows;
+    if (band.w < 8 or rows < 6) return;
+
+    // Search sits in the reserved header band as fixed chrome (putRow
+    // declines rows 0–1 by design, so the search label uses writeFixed).
+    writeFixed(f, left, 0, col_dim, "search");
+
+    var y: u16 = 3;
+    if (y < rows) {
+        putRow(f, left, y, col_faint, "your feeds", right, rows);
+        y += 1;
+    }
+    const feeds = [_][]const u8{ "- discover", "- following", "- science" };
+    for (feeds) |label| {
+        if (y >= rows - 1) break;
+        putRow(f, left, y, col_dim, label, right, rows);
+        y += 1;
+    }
+
+    y += 1;
+    if (y < rows) {
+        putRow(f, left, y, col_faint, "trending", right, rows);
+        y += 1;
+    }
+    const trends = [_][]const u8{ "#zig", "#atproto", "#zat4" };
+    for (trends) |label| {
+        if (y >= rows - 1) break;
+        putRow(f, left, y, col_dim, label, right, rows);
+        y += 1;
+    }
+}
+
 
 /// Where the text cursor sits, in grid cells — returned by buildCompose
 /// so the shell can draw the blinking block at the insertion point.
@@ -882,4 +1124,123 @@ test "buildProfile: header, handle, following marker, and counts render" {
         if (c >= '0' and c <= '9') has_digit = true;
     }
     try testing.expect(has_digit);
+}
+
+// ---------------------------------------------------------------------------
+// Shell carve golden tests (SHELL_LAYOUT_ROADMAP S.4). Pin the three-band
+// structure for a known (items, dims, config): the seams land where the
+// config says, the nav rail is present and clickable with the right
+// actions, the sidebar stubs render, and the feed is inset — not at
+// column 0. Consistent with the headless field tests above (no window).
+// ---------------------------------------------------------------------------
+
+test "layoutShell: three bands, fixed seams, inset feed, clickable nav rail" {
+    const gpa = testing.allocator; // C6
+    var f: field.Field = .{};
+    try field.init(gpa, &f, 120, 30);
+    defer field.deinit(gpa, &f);
+    var hr: HitList = .empty;
+    defer hr.deinit(gpa);
+    var hearts: HeartList = .empty;
+    defer hearts.deinit(gpa);
+
+    const items = [_]feed.TimelineItem{
+        .{ .uri = "at://1", .cid = "c1", .author_handle = "alice.test", .author_display_name = "Alice", .reposted_by_handle = "", .replying_to_handle = "", .text = "a post in the centre column", .created_at = 1_700_000_000, .like_count = 3, .repost_count = 1, .reply_count = 0, .quote_count = 0, .label_flags = .{}, .item_flags = .{} },
+    };
+    const cfg: PaneConfig = .{};
+    var view: ViewState = .{};
+    _ = try layoutShell(&f, cfg, &hr, &hearts, &items, 0, &view, &.{}, 1_700_000_500, "me.test", "live", gpa);
+
+    // Seam columns: nav_w and nav_w+1+center_w, both fixed dividers.
+    const center_w: u16 = 120 - cfg.nav_w - cfg.sidebar_w - 2;
+    const seam_l: u16 = cfg.nav_w;
+    const seam_r: u16 = cfg.nav_w + 1 + center_w;
+    try testing.expect(f.content[field.index(&f, seam_l, 5)].flags.fixed);
+    try testing.expect(f.content[field.index(&f, seam_l, 5)].flags.divider);
+    try testing.expect(f.content[field.index(&f, seam_r, 5)].flags.fixed);
+
+    // The nav rail wordmark sits at the rail's left inset (col 2), fixed.
+    try testing.expectEqual(@as(u8, 'z'), f.content[field.index(&f, 2, 0)].glyph);
+    try testing.expect(f.content[field.index(&f, 2, 0)].flags.fixed);
+
+    // The centre feed is INSET: column 0 of the feed body is past the
+    // left seam, so the feed's first body glyph is not in the nav band.
+    // The feed header wordmark now lives at center_x + margin, not col 2.
+    const center_x: u16 = cfg.nav_w + 1;
+    try testing.expectEqual(@as(u8, 'z'), f.content[field.index(&f, center_x + 2, 0)].glyph);
+
+    // The rail pushed clickable destination zones: at least the real
+    // verbs (refresh = home, profile, new_post = compose) are present,
+    // and every rail zone targets no_target (nav is not a per-post act).
+    var saw_home = false;
+    var saw_profile = false;
+    var saw_compose = false;
+    var saw_stub = false;
+    const acts = hr.slice().items(.action);
+    const xs = hr.slice().items(.x);
+    const tgs = hr.slice().items(.target);
+    for (acts, xs, tgs) |a, zx, tg| {
+        // Rail zones live in the nav band (x < seam_l).
+        if (zx >= seam_l) continue;
+        const action: timeline_ui.Action = @enumFromInt(a);
+        switch (action) {
+            .refresh => saw_home = true,
+            .profile => saw_profile = true,
+            .new_post => saw_compose = true,
+            .nav_explore, .nav_notifications, .nav_chat, .nav_feeds, .nav_lists, .nav_settings => saw_stub = true,
+            else => {},
+        }
+        // No rail destination is a per-post target.
+        try testing.expectEqual(no_target, tg);
+    }
+    try testing.expect(saw_home);
+    try testing.expect(saw_profile);
+    try testing.expect(saw_compose);
+    try testing.expect(saw_stub);
+
+    // The sidebar rendered a stub: the "trending" label appears somewhere
+    // in the right band.
+    const side_x: u16 = seam_r + 1;
+    var saw_trending = false;
+    var ry: u16 = 0;
+    while (ry < 30) : (ry += 1) {
+        if (f.content[field.index(&f, side_x + 2, ry)].glyph == 't') {
+            // Cheap check: a 't' starting a band-local row; the full word
+            // is asserted by reading the run.
+            var word: [8]u8 = undefined;
+            var k: u16 = 0;
+            while (k < 8 and side_x + 2 + k < 120) : (k += 1) word[k] = f.content[field.index(&f, side_x + 2 + k, ry)].glyph;
+            if (std.mem.eql(u8, word[0..8], "trending")) saw_trending = true;
+        }
+    }
+    try testing.expect(saw_trending);
+}
+
+test "layoutShell: collapses to a full-width feed below the threshold (E4)" {
+    const gpa = testing.allocator; // C6
+    var f: field.Field = .{};
+    try field.init(gpa, &f, 60, 20); // < min_three_col_w
+    defer field.deinit(gpa, &f);
+    var hr: HitList = .empty;
+    defer hr.deinit(gpa);
+    var hearts: HeartList = .empty;
+    defer hearts.deinit(gpa);
+
+    const items = [_]feed.TimelineItem{
+        .{ .uri = "at://1", .cid = "c1", .author_handle = "alice.test", .author_display_name = "", .reposted_by_handle = "", .replying_to_handle = "", .text = "narrow", .created_at = 0, .like_count = 0, .repost_count = 0, .reply_count = 0, .quote_count = 0, .label_flags = .{}, .item_flags = .{} },
+    };
+    var view: ViewState = .{};
+    _ = try layoutShell(&f, .{}, &hr, &hearts, &items, 0, &view, &.{}, 100, "me.test", "", gpa);
+
+    // No left seam: there is no fixed divider sitting at the nav_w column,
+    // because the narrow layout is the full-width feed (an ordinary
+    // result, E4). The feed wordmark is at the usual col 2.
+    try testing.expectEqual(@as(u8, 'z'), f.content[field.index(&f, 2, 0)].glyph);
+    var any_vertical_seam = false;
+    var ry: u16 = 3;
+    while (ry < 20) : (ry += 1) {
+        const c = f.content[field.index(&f, 22, ry)]; // default nav_w
+        if (c.flags.fixed and c.flags.divider and c.glyph == '|') any_vertical_seam = true;
+    }
+    try testing.expect(!any_vertical_seam);
 }

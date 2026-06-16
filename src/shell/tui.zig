@@ -34,12 +34,28 @@ const raster_core = @import("../core/raster.zig");
 const text_core = @import("../core/text.zig");
 const field_core = @import("../core/field.zig");
 const field_ui = @import("../core/field_ui.zig");
+const feed_view = @import("../core/feed_view.zig");
 const effect_core = @import("../core/effect.zig");
 const clock_shell = @import("clock.zig");
 const write = @import("write.zig");
+const write_worker = @import("write_worker.zig");
 const auth = @import("auth.zig");
 const lexicon = @import("../core/lexicon.zig");
 const moderation = @import("../core/moderation.zig");
+
+/// DIAGNOSTIC flag (temporary): when true, `fireEngageEffect` prints one
+/// stderr line per effect actually fired, so the fire count of a single click
+/// can be read on the real machine (there is no live GUI to watch in the
+/// build/test environment). Compile-time, so it is free when false and breaks
+/// no rule — it is not a mutable global and not a getenv (which 0.16 lacks).
+/// Set to false to silence once the question of "how many effects fire?" is
+/// settled.
+const debug_effects = true;
+// G1/G2: flip to true to print per-phase wall-clock every frame — build
+// (compose + content layout) vs present (raster.paint + blit) — so the
+// burst cost is MEASURED on the real machine, not guessed, before any
+// optimization. Zero cost when false (the branch folds away).
+const debug_frame_timing = false;
 
 /// Run the timeline screen until the user quits. The store may arrive
 /// empty; `r` loads pages. Network calls happen inline between frames —
@@ -111,6 +127,7 @@ pub fn run(
     io: std.Io,
     environ: ?*const std.process.Environ.Map,
     session: *auth.Session,
+    appview_url: []const u8,
     store: *feed_core.Store,
     backend: Backend,
 ) !void {
@@ -218,6 +235,22 @@ pub fn run(
     var subscribed_authors: usize = 0;
     var live_start_attempted = false;
 
+    // The WRITE WORKER (mirror of the firehose): like/unlike/repost network
+    // calls run on this worker's own thread so the UI loop never blocks on
+    // a write. The UI submits a plain-data request and returns immediately;
+    // the worker posts a result back, drained each loop iteration below,
+    // and only a server REFUSAL reverts the optimistic state. This is what
+    // makes animations smooth — the main loop keeps running every frame
+    // while the network call is in flight on another thread.
+    var write_in: write_worker.RequestBox = .{};
+    defer write_in.deinit(gpa);
+    var write_out: write_worker.ResultBox = .{};
+    defer write_out.deinit(gpa);
+    const writer: ?*write_worker.Worker = write_worker.start(gpa, io, environ, session, &write_in, &write_out) catch null;
+    defer if (writer) |w| write_worker.shutdown(w);
+    var write_results: std.ArrayList(write_worker.Result) = .empty;
+    defer write_results.deinit(gpa);
+
     // Auto-refresh: the reliable live path. The Jetstream subsystem stays
     // wired (it proves the firehose engineering), but the VISIBLE feed is
     // kept current by re-running the same getTimeline refresh `r` does, on a
@@ -274,6 +307,13 @@ pub fn run(
     defer gspawn.deinit(gpa);
     var glast_nanos: u64 = 0;
     var gzoom: f32 = 1.0; // user text-scaling factor (+/- keys)
+    // cut 5.6 premium feed: pixel scroll offset (≤0 scrolls the stack up),
+    // its clamp bound (total content height), and the per-frame button hit
+    // regions the pointer handler tests in pixels.
+    var gscroll_px: i32 = 0;
+    var gcontent_h: i32 = 0;
+    var gregions: feed_view.Regions = .empty;
+    defer gregions.deinit(gpa);
 
     main_loop: while (true) {
         _ = frame_arena.reset(.retain_capacity); // C3: one arena per frame
@@ -353,14 +393,27 @@ pub fn run(
             }
         }
 
-        // The author table grew (a fetch or a live reply taught us someone
-        // new): widen the live subscription to match.
-        if (live_stream) |live| {
-            if (store.authors.len > subscribed_authors) {
-                const fresh = try composeSubscription(arena, session.did, store, 255);
-                try stream_shell.updateDids(live, fresh);
-                subscribed_authors = store.authors.len;
+        // Drain write-worker results (the non-blocking like/unlike/repost
+        // replies). On OK, nothing to do — the optimistic state already
+        // shows the right thing. On a refusal or network error, REVERT the
+        // optimism so the count returns to truth. This runs every loop
+        // iteration, off the network thread, so the UI never blocked on the
+        // write — the whole point of the worker.
+        write_results.clearRetainingCapacity();
+        try write_out.drain(gpa, &write_results);
+        for (write_results.items) |res| {
+            switch (res.outcome) {
+                .ok => {},
+                .refused => |f| {
+                    revertWrite(res.kind, gpa, store, res.cid, res.revert_uri) catch {};
+                    status = std.fmt.bufPrint(&status_buf, "refused: {d} {s}", .{ f.status, f.code }) catch "refused";
+                },
+                .net_error => |name| {
+                    revertWrite(res.kind, gpa, store, res.cid, res.revert_uri) catch {};
+                    status = std.fmt.bufPrint(&status_buf, "network error: {s}", .{name}) catch "network error";
+                },
             }
+            write_worker.freeResult(gpa, res);
         }
 
         // Auto-refresh tick: in timeline mode, once the interval has elapsed
@@ -374,7 +427,7 @@ pub fn run(
             clock_shell.monotonicNanos() -| last_input_nanos >= input_idle_gate_nanos)
         {
             last_auto_refresh = now;
-            const outcome = feed_shell.refreshTimeline(gpa, arena, io, environ, session, store, 30) catch |err| switch (err) {
+            const outcome = feed_shell.refreshTimeline(gpa, arena, io, environ, session, appview_url, store, 30) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => blk: {
                     status = "auto-refresh: network error"; // contained
@@ -399,7 +452,7 @@ pub fn run(
         // pix exists exactly when a window backend has a live engine; the
         // composer and profile screens stay on the cell path this cut
         // (their pixel port is the recorded next slice).
-        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom } else null;
+        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions } else null;
         switch (mode) {
             .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, &state, revealed.items, now, session.handle, status),
             .compose => {
@@ -416,9 +469,11 @@ pub fn run(
                         const cc = timeline_ui.countCodepoints(compose_buf.items);
                         const cursor = field_ui.buildCompose(&gfield, compose_buf.items, reply_handle, cc, status);
                         try field_core.compose(gpa, &gfield, gparticles.slice(), .{ .x = @floatFromInt(cols / 2), .y = @floatFromInt(rows / 3), .radius = @floatFromInt(cols), .ambient = 0.7 }, cell.w, cell.h, &gdraw);
-                        // The cursor: a filled block at the insertion cell.
-                        try gdraw.append(gpa, .{ .rect = .{ .x = @intCast(@min(cursor.x * cell.w, 32767)), .y = @intCast(@min(cursor.y * cell.h, 32767)), .w = cell.w, .h = cell.h, .color = 0x886CA8FF, .radius = 0 } });
-                        window_shell.presentDrawList(win, gpa, g.engine, gdraw.slice(), 0xFF0E1116) catch {};
+                        // The cursor: a filled block at the insertion cell,
+                        // tinted with the app accent (alpha-blended) rather
+                        // than a stray literal — one look, one source.
+                        try gdraw.append(gpa, .{ .rect = .{ .x = @intCast(@min(cursor.x * cell.w, 32767)), .y = @intCast(@min(cursor.y * cell.h, 32767)), .w = cell.w, .h = cell.h, .color = 0x88000000 | (field_core.palette[field_ui.col_accent] & 0x00FFFFFF), .radius = 0 } });
+                        window_shell.presentDrawList(win, gpa, g.engine, gdraw.slice(), field_core.background) catch {};
                     },
                     .terminal => {
                         timeline_ui.buildComposeFrame(&next, compose_buf.items, reply_handle, status);
@@ -441,7 +496,7 @@ pub fn run(
                         }
                         field_ui.buildProfile(&gfield, profile_info orelse .{}, status);
                         try field_core.compose(gpa, &gfield, gparticles.slice(), .{ .x = @floatFromInt(cols / 2), .y = @floatFromInt(rows / 3), .radius = @floatFromInt(cols), .ambient = 0.7 }, cell.w, cell.h, &gdraw);
-                        window_shell.presentDrawList(win, gpa, g.engine, gdraw.slice(), 0xFF0E1116) catch {};
+                        window_shell.presentDrawList(win, gpa, g.engine, gdraw.slice(), field_core.background) catch {};
                     },
                     .terminal => {
                         timeline_ui.buildProfileFrame(&next, profile_info orelse .{}, status);
@@ -545,35 +600,45 @@ pub fn run(
                             .wheel => {
                                 const delta: i32 = if (pev.button == 5) 3 else -3;
                                 g.view.scroll_rows += delta;
-                                // Keep any playing effect anchored to its
-                                // post: scrolling moves content by `delta`
-                                // rows, so shift active effect origins by
-                                // the same amount and they ride the scroll
-                                // instead of detaching. (The plan for
-                                // animation-during-scroll: the heart burst
-                                // is pinned to the post's cell, re-derived
-                                // as the view moves — here via the scroll
-                                // delta, the one scroll source.)
+                                // cut 5.6: the premium feed scrolls in PIXELS.
+                                // Wheel down (button 5) moves content up, so the
+                                // offset goes more negative; clamp so you cannot
+                                // scroll past the ends (top = 0, bottom exposes
+                                // the last post + a little breathing room).
+                                g.scroll.* -= delta * 28;
+                                const win_h: i32 = @intCast(win.fb.height);
+                                const min_scroll: i32 = @min(0, win_h - g.content_h.* - 24);
+                                g.scroll.* = @max(min_scroll, @min(0, g.scroll.*));
                                 effect_core.shiftY(g.active, -delta);
                             },
                             .move => g.view.hover = if (field_ui.hitTest(cx, cy, g.hr.slice())) |hit| hit.target else field_ui.no_target,
                             .button_down => if (pev.button == 1) {
-                                if (field_ui.hitTest(cx, cy, g.hr.slice())) |hit| {
+                                // cut 5.6: premium buttons are hit-tested in
+                                // PIXELS against the regions the feed emitted
+                                // this frame. A like/repost tap injects the field
+                                // effect at the tapped cell, so the burst blooms
+                                // right at the icon. (Persisting the toggle +
+                                // the network write is the next slice; the
+                                // delightful burst lands now.) If nothing premium
+                                // is hit, fall through to the legacy hit rects.
+                                if (feed_view.hitTest(g.regions.items, pev.x, pev.y)) |hit| {
+                                    if (hit.post < items.len) state.selected = hit.post;
+                                    const recipe: ?*const effect_core.Recipe = switch (hit.kind) {
+                                        .like => &effect_core.like_heart,
+                                        .repost => &effect_core.boost,
+                                        .reply => null,
+                                    };
+                                    if (recipe) |rc| {
+                                        const fcols = g.field.cols;
+                                        const frows = g.field.rows;
+                                        if (fcols > 0 and frows > 0) {
+                                            const tx: u16 = @min(cx, fcols - 1);
+                                            const ty: u16 = @min(cy, frows - 1);
+                                            effect_core.trigger(gpa, g.active, rc, tx, ty, 1.0) catch {};
+                                        }
+                                    }
+                                } else if (field_ui.hitTest(cx, cy, g.hr.slice())) |hit| {
                                     if (hit.target != field_ui.no_target and hit.target < items.len) state.selected = hit.target;
-                                    // Fire the effect for this action AT
-                                    // its origin (the like glyph), so the
-                                    // heart blooms on the tapped counter.
-                                    // The like recipe depends on whether
-                                    // this is a like or an UNLIKE — read
-                                    // the item's current state, the same
-                                    // flag the toggle dispatch will flip.
-                                    if (hit.target < items.len) fireEffect(gpa, g, hit, items[hit.target]);
-                                    // The action byte runs the SAME key
-                                    // dispatch (keyFor↔actionFor), which
-                                    // already toggles like/unlike on the
-                                    // viewer's current state — so a click
-                                    // on a liked post unlikes it, exactly
-                                    // as the 'l' key does.
                                     if (hit.action != .none) if (timeline_ui.keyFor(hit.action)) |byte| {
                                         try pumped_bytes.append(gpa, byte);
                                     };
@@ -586,18 +651,15 @@ pub fn run(
                 };
                 n = @min(pumped_bytes.items.len, in_buf.len);
                 @memcpy(in_buf[0..n], pumped_bytes.items[0..n]);
-                // No input this lap: normally idle back to the top. But
-                // if the field is mid-animation, fall through to repaint
-                // so the simulation advances a frame (the dynamic pump
-                // above kept this lap short precisely for this). The
-                // expose/resize repaint already ran above; this is the
-                // steady animation tick.
-                if (n == 0) {
-                    if (mode == .timeline and engine != null and (gactive.len > 0 or gparticles.len > 0)) {
-                        try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, &state, revealed.items, now, session.handle, status);
-                    }
-                    continue;
-                }
+                // No input this lap: idle back to the top. The top-of-loop
+                // paintFrame is the ONE place the sim advances — it runs every
+                // lap, and the dynamic pump above already set this lap's length
+                // to the frame cadence while animating, so looping back yields
+                // exactly one animation frame. (A second paint here was
+                // redundant: it re-ran the whole pipeline with ~0 dt, doing the
+                // CPU work of a frame the top-of-loop paint repeats next lap —
+                // pure waste on the render thread. One paint per lap.)
+                if (n == 0) continue;
                 last_input_nanos = clock_shell.monotonicNanos();
             },
         }
@@ -646,7 +708,7 @@ pub fn run(
                     status = "refreshing...";
                     try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, &state, revealed.items, now, session.handle, status);
 
-                    const outcome = feed_shell.refreshTimeline(gpa, arena, io, environ, session, store, 30) catch |err| switch (err) {
+                    const outcome = feed_shell.refreshTimeline(gpa, arena, io, environ, session, appview_url, store, 30) catch |err| switch (err) {
                         error.OutOfMemory => return err,
                         else => {
                             status = "network error"; // contained (E2)
@@ -687,7 +749,7 @@ pub fn run(
                     status = "loading...";
                     try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, &state, revealed.items, now, session.handle, status);
 
-                    const outcome = feed_shell.loadTimelinePage(gpa, arena, io, environ, session, store, 30) catch |err| switch (err) {
+                    const outcome = feed_shell.loadTimelinePage(gpa, arena, io, environ, session, appview_url, store, 30) catch |err| switch (err) {
                         error.OutOfMemory => return err,
                         else => {
                             // Contained: the feed fetch failing is a status
@@ -711,12 +773,12 @@ pub fn run(
                     }
                 },
                 .like => if (items.len > 0) {
-                    const r = try engageSelected(.like, gpa, arena, io, environ, session, store, items[state.selected], &state, revealed.items, now, out, &prev, &next, backend, pix, &status_buf);
+                    const r = try engageSelected(.like, gpa, arena, session, store, items[state.selected], state.selected, &state, revealed.items, now, out, &prev, &next, backend, pix, writer);
                     if (r.status.len > 0) status = r.status;
                     if (r.skip_rest) continue;
                 },
                 .repost => if (items.len > 0) {
-                    const r = try engageSelected(.repost, gpa, arena, io, environ, session, store, items[state.selected], &state, revealed.items, now, out, &prev, &next, backend, pix, &status_buf);
+                    const r = try engageSelected(.repost, gpa, arena, session, store, items[state.selected], state.selected, &state, revealed.items, now, out, &prev, &next, backend, pix, writer);
                     if (r.status.len > 0) status = r.status;
                     if (r.skip_rest) continue;
                 },
@@ -724,7 +786,7 @@ pub fn run(
                     const item = items[state.selected];
                     status = "loading profile...";
                     try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, &state, revealed.items, now, session.handle, status);
-                    const outcome = auth.query(gpa, arena, io, environ, session, lexicon.method.get_profile, &.{
+                    const outcome = auth.queryHost(gpa, arena, io, environ, session, appview_url, lexicon.method.get_profile, &.{
                         .{ .name = "actor", .value = item.author_handle },
                     }, lexicon.ProfileViewDetailed) catch |err| switch (err) {
                         error.OutOfMemory => return err,
@@ -1001,70 +1063,14 @@ const EngageResult = struct {
     skip_rest: bool = false,
 };
 
-/// Pump a short, capped burst of glyph-field animation frames before a
-/// blocking network call. THE FIX for the multi-second effect delay: a
-/// like/unlike fires its effect instantly, but the engagement's network
-/// write (write.likePost et al.) is SYNCHRONOUS on this thread — so
-/// without this, the loop cannot render a single animation frame until
-/// the round-trip returns, and the burst appears frozen mid-flight.
-/// Here we drive the WHOLE animation to completion (the heart fills,
-/// pops, sparks, and settles) BEFORE the network call, so the burst is
-/// smooth and never pauses partway. The like count is already bumped
-/// optimistically, so starting the network call ~0.8 s later is
-/// invisible to the user. The network remains the conceded bottleneck;
-/// the fully robust cure is threading the write off this thread (the
-/// firehose mailbox pattern), but running the animation to completion
-/// here removes the visible pause entirely. The resting hearts of OTHER
-/// posts are redrawn each frame too, so the screen stays whole.
-fn animateBeforeBlock(gpa: Allocator, win: anytype, g: Grid, zoom: f32) void {
-    const cell = cellSize(win.fb.width, zoom);
-    // Run to completion (cap is a safety bound, not the target): once the
-    // effect and its particles have settled, stop.
-    const max_frames: usize = 90; // ~1.5 s ceiling; the break ends it sooner
-    var i: usize = 0;
-    while (i < max_frames) : (i += 1) {
-        if (g.active.len == 0 and g.particles.len == 0) break;
-        effect_core.advance(gpa, g.active, g.field, 1.0 / 60.0, g.spawn_buf) catch break;
-        field_core.step(gpa, g.field, g.particles, g.spawn_buf.items, 1.0 / 60.0, sim_rng.random()) catch break;
-        const cols = g.field.cols;
-        const rows = g.field.rows;
-        const light: field_core.Light = .{ .x = @floatFromInt(cols / 2), .y = @floatFromInt(rows / 3), .radius = @floatFromInt(cols), .ambient = 0.64 };
-        field_core.compose(gpa, g.field, g.particles.slice(), light, cell.w, cell.h, g.draw) catch break;
-        // Redraw the OTHER posts' resting hearts (the animating one is
-        // suppressed by cell match — composeEffects draws it). Without
-        // this they would blink out for the animation's duration.
-        const hxs = g.hearts.slice().items(.x);
-        const hys = g.hearts.slice().items(.y);
-        const hlk = g.hearts.slice().items(.liked);
-        const axs = g.active.slice().items(.x);
-        const ays = g.active.slice().items(.y);
-        for (hxs, hys, hlk) |hxc, hyc, lk| {
-            var animating = false;
-            for (axs, ays) |axc, ayc| {
-                if (axc == hxc and ayc == hyc) {
-                    animating = true;
-                    break;
-                }
-            }
-            if (!animating) effect_core.composeStaticHeart(gpa, lk, hxc, hyc, cell.w, cell.h, g.draw) catch {};
-        }
-        effect_core.composeEffects(gpa, g.active.slice(), cell.w, cell.h, g.draw) catch break;
-        window_shell.presentDrawList(win, gpa, g.engine, g.draw.slice(), 0xFF0E1116) catch break;
-        // ~16 ms/frame so the animation plays at roughly 60fps wall-clock,
-        // perceptible and smooth rather than a blur.
-        clock_shell.sleepMillis(16);
-    }
-}
-
 fn engageSelected(
     kind: Engagement,
     gpa: Allocator,
     arena: Allocator,
-    io: std.Io,
-    environ: ?*const std.process.Environ.Map,
     session: *auth.Session,
     store: *feed_core.Store,
     item: feed_core.TimelineItem,
+    target: u32,
     state: *timeline_ui.UiState,
     revealed_cids: []const []const u8,
     now: i64,
@@ -1073,7 +1079,7 @@ fn engageSelected(
     next: *tui.Surface,
     backend: Backend,
     pix: ?Grid,
-    status_buf: []u8,
+    writer: ?*write_worker.Worker,
 ) !EngageResult {
     const applied = switch (kind) {
         .like => feed_core.applyLike(store, item.cid),
@@ -1105,71 +1111,54 @@ fn engageSelected(
 
             const fresh = try feed_core.buildTimeline(arena, store);
             try paintFrame(gpa, out, arena, prev, next, backend, pix, fresh, state, revealed_cids, now, session.handle, if (kind == .like) "unliking..." else "unboosting...");
-            // Show the effect's burst before the blocking network call
-            // (else it appears frozen for the round-trip). Window only.
-            if (pix) |g| switch (backend) {
-                .window => |win| animateBeforeBlock(gpa, win, g, g.zoom.*),
-                .terminal => {},
-            };
-
-            const undo_call = switch (kind) {
-                .like => write.unlikePost(gpa, arena, io, environ, session, record_uri),
-                .repost => write.unrepostPost(gpa, arena, io, environ, session, record_uri),
-            };
-            const undo = undo_call catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => {
+            // Fire the drain effect at the post's heart cell (state is now
+            // DISENGAGED → the cooler recipe). One trigger, derived from the
+            // actual transition — no click-path race.
+            if (pix) |g| fireEngageEffect(gpa, g, kind, target, false);
+            // SUBMIT the delete to the write worker and RETURN — the UI loop
+            // keeps running, the drain animation plays smoothly every frame,
+            // and the worker's result (drained later) reverts only on a
+            // refusal. If the worker is unavailable (start failed) or its
+            // queue is full, fall back to reverting now so state stays true.
+            if (writer) |w| {
+                if (!write_worker.submit(w, if (kind == .like) .unlike else .unrepost, item.cid, "", "", record_uri, now)) {
                     try revertDisengage(kind, gpa, store, item.cid, record_uri);
-                    return .{ .status = "network error", .skip_rest = true };
-                },
-            };
-            switch (undo) {
-                .ok => return .{ .status = if (kind == .like) "unliked" else "unboosted" },
-                .failed => |failure| {
-                    try revertDisengage(kind, gpa, store, item.cid, record_uri);
-                    return .{ .status = std.fmt.bufPrint(status_buf, "refused: {d} {s}", .{
-                        failure.status, failure.code,
-                    }) catch "refused" };
-                },
+                    return .{ .status = "busy, try again" };
+                }
+                return .{ .status = if (kind == .like) "unliking..." else "unboosting..." };
+            } else {
+                try revertDisengage(kind, gpa, store, item.cid, record_uri);
+                return .{ .status = "write unavailable" };
             }
         },
         .unknown => return .{ .status = "" },
         .applied => {},
     }
 
-    // Optimistic first: the bumped count paints now; the server call
-    // follows; a refusal reverts.
+    // Optimistic first: the bumped count paints now; the worker call
+    // follows on its own thread; a refusal reverts (drained in the loop).
     const fresh = try feed_core.buildTimeline(arena, store);
     try paintFrame(gpa, out, arena, prev, next, backend, pix, fresh, state, revealed_cids, now, session.handle, if (kind == .like) "liking..." else "boosting...");
-    // Show the effect's burst before the blocking network call (else it
-    // appears frozen for the round-trip). Window only.
-    if (pix) |g| switch (backend) {
-        .window => |win| animateBeforeBlock(gpa, win, g, g.zoom.*),
-        .terminal => {},
-    };
-
-    const call = switch (kind) {
-        .like => write.likePost(gpa, arena, io, environ, session, item.uri, item.cid, now),
-        .repost => write.repostPost(gpa, arena, io, environ, session, item.uri, item.cid, now),
-    };
-    const outcome = call catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => {
+    // Fire the like/boost burst at the post's heart cell (state is now
+    // ENGAGED). One trigger derived from the transition.
+    if (pix) |g| fireEngageEffect(gpa, g, kind, target, true);
+    // SUBMIT the create to the worker and RETURN immediately — no blocking
+    // network call on the render thread, so the burst animation plays
+    // smoothly in the main loop. The worker posts its result back; only a
+    // refusal reverts the optimistic count.
+    if (writer) |w| {
+        if (!write_worker.submit(w, if (kind == .like) .like else .repost, item.cid, item.uri, item.cid, "", now)) {
             revertEngagement(kind, store, item.cid);
-            return .{ .status = "network error", .skip_rest = true };
-        },
-    };
-    switch (outcome) {
-        .ok => return .{ .status = if (kind == .like) "liked" else "boosted" },
-        .failed => |failure| {
-            revertEngagement(kind, store, item.cid);
-            return .{ .status = std.fmt.bufPrint(status_buf, "refused: {d} {s}", .{
-                failure.status, failure.code,
-            }) catch "refused" };
-        },
+            return .{ .status = "busy, try again" };
+        }
+        return .{ .status = if (kind == .like) "liking..." else "boosting..." };
+    } else {
+        revertEngagement(kind, store, item.cid);
+        return .{ .status = "write unavailable" };
     }
 }
 
+// (legacy synchronous engage path removed — the worker handles writes now)
 fn revertDisengage(kind: Engagement, gpa: Allocator, store: *feed_core.Store, cid: []const u8, uri: []const u8) error{OutOfMemory}!void {
     switch (kind) {
         .like => try feed_core.revertUnlike(gpa, store, cid, uri),
@@ -1177,12 +1166,32 @@ fn revertDisengage(kind: Engagement, gpa: Allocator, store: *feed_core.Store, ci
     }
 }
 
+/// Undo the optimistic state for a write the worker reported as refused
+/// or failed. A refused CREATE (like/repost) is undone by removing the
+/// optimistic engagement (cid only). A refused DELETE (unlike/unrepost)
+/// is undone by RESTORING the engagement, which needs the original record
+/// uri the request carried back (revert_uri). Matches by CID; if the post
+/// has scrolled out of the store, the revert is a no-op (the lookup
+/// misses) — benign, the next refresh reconciles.
+fn revertWrite(kind: write_worker.Request.Kind, gpa: Allocator, store: *feed_core.Store, cid: []const u8, revert_uri: []const u8) error{OutOfMemory}!void {
+    switch (kind) {
+        .like => feed_core.revertLike(store, cid),
+        .repost => feed_core.revertRepost(store, cid),
+        .unlike => try feed_core.revertUnlike(gpa, store, cid, revert_uri),
+        .unrepost => try feed_core.revertUnrepost(gpa, store, cid, revert_uri),
+    }
+}
+
+/// Undo an optimistic like/repost (the CREATE direction) — used on the
+/// submit-failure fallback in engageSelected when the worker queue is
+/// full or unavailable. Removing the engagement needs only the CID.
 fn revertEngagement(kind: Engagement, store: *feed_core.Store, cid: []const u8) void {
     switch (kind) {
         .like => feed_core.revertLike(store, cid),
         .repost => feed_core.revertRepost(store, cid),
     }
 }
+
 
 /// The pixel path's working set, threaded as one explicit handle
 /// (house style: plain pointers, no hidden state). A7.2: cold struct,
@@ -1212,6 +1221,11 @@ const Grid = struct {
     /// Shared so paintFrame and the pointer hit-test derive the SAME cell
     /// size from it.
     zoom: *f32,
+    /// cut 5.6: premium feed pixel scroll, its content-height clamp bound,
+    /// and the latest frame's button hit regions (pixel-space).
+    scroll: *i32,
+    content_h: *i32,
+    regions: *feed_view.Regions,
 };
 
 /// THE single source of truth for the glyph cell size. Two facts drive
@@ -1273,6 +1287,17 @@ var sim_rng = std.Random.DefaultPrng.init(0x7A74_2026);
 /// (B4). Everything else (terminal, or a window whose font engine
 /// failed) keeps the cell frame + diff/present pair. ONE funnel, so
 /// interim status flashes render through the same path (D6).
+// Placeholder feed content for the cut-5.6 premium base. The next slice
+// replaces this with a pure transform from the real `items` timeline
+// (B5: plain values in, PostView out). Cold data, no size guard needed
+// (A7.2: a fixed handful, never the bulk store).
+const premium_sample = [_]feed_view.PostView{
+    .{ .name = "Mara Vesper", .handle = "@mara.zat", .age = "2m", .initial = 'M', .tint = 0xFFCAA3A8, .liked = true, .boosted = false, .reply = 6, .boost = 9, .like = 48, .body = "the whole point of a small network is that you can actually read the room. ten thousand strangers isn't a room, it's weather." },
+    .{ .name = "field notes", .handle = "@fieldnotes.zat", .age = "14m", .initial = 'f', .tint = 0xFF9FC7A0, .liked = false, .boosted = true, .reply = 12, .boost = 31, .like = 121, .body = "shipped the lighting pass tonight. the letters catch the light now, and the whole field moves when you touch it." },
+    .{ .name = "Okonkwo", .handle = "@oko.zat", .age = "1h", .initial = 'O', .tint = 0xFFE0C074, .liked = false, .boosted = false, .reply = 24, .boost = 18, .like = 73, .body = "monospace is the most honest a feed can be. same column, same weight, nobody shouts louder by being wider." },
+    .{ .name = "lune", .handle = "@lune.zat", .age = "3h", .initial = 'l', .tint = 0xFFA9B6D6, .liked = false, .boosted = false, .reply = 3, .boost = 7, .like = 39, .body = "woke up to the field still drifting where i left it. it kept the light on." },
+};
+
 fn paintFrame(
     gpa: Allocator,
     out: *std.Io.Writer,
@@ -1314,41 +1339,60 @@ fn paintFrame(
             // + hit rects (perturb persists). 2. effects paint their
             // current stage and emit any spawns. 3. physics integrates
             // particles + cells. 4. compose maps it all to pixels.
-            _ = try field_ui.build(g.field, g.hr, g.hearts, items, state.selected, g.view, revealed, now, account_handle, status, gpa);
+            //
+            // Step 1 is now the three-column shell carve (nav · feed ·
+            // sidebar), which delegates the centre band to the same feed
+            // builder and collapses to the full-width feed when the window
+            // is too narrow (SHELL_LAYOUT_ROADMAP). Pane widths are a cold
+            // config value (A7.2) held here, the one seat a settings screen
+            // will later write — no config plumbing built before it is used
+            // (F4).
+            const t_start = if (debug_frame_timing) clock_shell.monotonicNanos() else 0;
+            const pane_cfg: field_ui.PaneConfig = .{};
+            _ = try field_ui.layoutShell(g.field, pane_cfg, g.hr, g.hearts, items, state.selected, g.view, revealed, now, account_handle, status, gpa);
+            // cut 5.6: replace the old cell-grid feed text with the static
+            // ambient glyph texture — the premium feed_view layer draws the
+            // real content on top. layoutShell still runs so the hit rects and
+            // heart slots are ready for the input slice (buttons), but its
+            // content is overwritten here.
+            field_core.fillAmbient(g.field);
             try effect_core.advance(gpa, g.active, g.field, dt, g.spawn_buf);
             try field_core.step(gpa, g.field, g.particles, g.spawn_buf.items, dt, sim_rng.random());
             const light: field_core.Light = .{
                 .x = @floatFromInt(cols / 2),
-                .y = @floatFromInt(rows / 3),
+                .y = @floatFromInt(rows / 4),
                 .radius = @floatFromInt(cols),
-                .ambient = 0.64,
+                .ambient = 0.30, // dim so the field recedes and pools at the light — dark cells
+                // starve so the light pools through the material (mockup look)
             };
             try field_core.compose(gpa, g.field, g.particles.slice(), light, cell.w, cell.h, g.draw);
-            // The resting like-button hearts: draw each post's heart sprite
-            // at its reserved cell — EXCEPT any whose cell has a live effect
-            // (that heart is being animated by composeEffects; drawing both
-            // would double it). The button and its burst are one heart.
-            {
-                const hxs = g.hearts.slice().items(.x);
-                const hys = g.hearts.slice().items(.y);
-                const hliked = g.hearts.slice().items(.liked);
-                const axs = g.active.slice().items(.x);
-                const ays = g.active.slice().items(.y);
-                for (hxs, hys, hliked) |hxc, hyc, lk| {
-                    var animating = false;
-                    for (axs, ays) |axc, ayc| {
-                        if (axc == hxc and ayc == hyc) {
-                            animating = true;
-                            break;
-                        }
-                    }
-                    if (!animating) try effect_core.composeStaticHeart(gpa, lk, hxc, hyc, cell.w, cell.h, g.draw);
-                }
-            }
-            // Fine-resolution effect overlays (the animating heart) draw
-            // on top at their own sub-cell pitch.
+            // The animating heart burst still composes (when an effect is
+            // live); the OLD resting heart sprites are gone — the premium
+            // layer owns the heart icons now.
             try effect_core.composeEffects(gpa, g.active.slice(), cell.w, cell.h, g.draw);
-            window_shell.presentDrawList(win, gpa, g.engine, g.draw.slice(), 0xFF0E1116) catch {}; // E2: a lost blit is the next frame's problem
+            const t_built = if (debug_frame_timing) clock_shell.monotonicNanos() else 0;
+            // cut 5.6: the premium content layer (avatars, type hierarchy,
+            // engagement row, dividers) painted OVER the field as proportional
+            // items, now fed by the REAL timeline via a pure transform (B5).
+            // Falls back to placeholder content only while the timeline is
+            // empty (initial load) so the screen is never blank. Buttons are
+            // inert by design until the input slice lands.
+            const feed_posts: []const feed_view.PostView = if (items.len == 0)
+                premium_sample[0..]
+            else
+                feed_view.fromTimeline(arena, items, now) catch premium_sample[0..];
+            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions) catch g.content_h.*;
+            const t_layout = if (debug_frame_timing) clock_shell.monotonicNanos() else 0;
+            window_shell.presentDrawList(win, gpa, g.engine, g.draw.slice(), field_core.background) catch {}; // E2: a lost blit is the next frame's problem
+            if (debug_frame_timing) {
+                const t_end = clock_shell.monotonicNanos();
+                const us = struct {
+                    fn d(a: i128, b: i128) i64 {
+                        return @intCast(@divTrunc(b - a, 1000));
+                    }
+                };
+                std.debug.print("[zat frame] field+effects {d}us · content {d}us · present(paint+blit) {d}us · items {d} · effects {d}\n", .{ us.d(t_start, t_built), us.d(t_built, t_layout), us.d(t_layout, t_end), g.draw.len, g.active.len });
+            }
             return;
         },
         .terminal => {},
@@ -1357,22 +1401,47 @@ fn paintFrame(
     try present(gpa, out, arena, prev, next, backend);
 }
 
-/// Choose and fire the glyph-field effect for a click, AT the hit's
-/// recorded origin (the like glyph's centre), so the animation blooms
-/// exactly where the eye is. This is the one place the app maps a
-/// user action to a recipe — change a row here, or pass a different
-/// `scale`, and the feel changes app-wide (the owner's context dial).
-/// A like on an already-liked post is an UNLIKE: the cooler recipe.
-fn fireEffect(gpa: Allocator, g: Grid, hit: field_ui.Hit, item: feed_core.TimelineItem) void {
-    const recipe: *const effect_core.Recipe = switch (hit.action) {
-        .like => if (item.item_flags.viewer_liked) &effect_core.unlike_heart else &effect_core.like_heart,
+/// Fire the field effect for an engagement transition at the post's heart
+/// cell — the ONE place an engagement maps to a recipe, derived from the
+/// transition itself (liking vs unliking), not from a separate click
+/// handler that could race the toggle. `now_liked` is the state AFTER the
+/// toggle: true ⇒ a like burst, false ⇒ the unlike drain. The heart cell
+/// is found from the frame's heart slots by the post's index. Errors are
+/// swallowed: a missed effect must never break the action (E4).
+fn fireEngageEffect(gpa: Allocator, g: Grid, kind: Engagement, target: u32, now_liked: bool) void {
+    const recipe: *const effect_core.Recipe = switch (kind) {
+        .like => if (now_liked) &effect_core.like_heart else &effect_core.unlike_heart,
         .repost => &effect_core.boost,
-        else => return, // other actions get no field effect (yet)
     };
-    // scale = 1.0 is the recipe as authored; a louder milestone or a
-    // quieter dense-feed pass is a different number here. errors are
-    // swallowed: a missed effect must never break the click (E4).
-    effect_core.trigger(gpa, g.active, recipe, hit.fx, hit.fy, 1.0) catch {};
+    // Locate the heart cell for this post in the current frame's slots.
+    const txs = g.hearts.slice().items(.target);
+    const hxs = g.hearts.slice().items(.x);
+    const hys = g.hearts.slice().items(.y);
+    for (txs, hxs, hys) |tg, hx, hy| {
+        if (tg == target) {
+            effect_core.trigger(gpa, g.active, recipe, hx, hy, 1.0) catch {};
+            // DIAGNOSTIC (temporary, shell-side I/O is allowed): when
+            // `debug_effects` is true, every effect actually fired prints one
+            // stderr line, so a single click that should fire ONE effect can
+            // be checked against what really happens on the real machine —
+            // there is no live GUI here to watch (G2: profile the affected
+            // hardware, don't guess). A compile-time const, not a global var
+            // and not a 0.16-absent getenv: zero cost when false, and it
+            // obeys the project's no-globals/capability rules. One unlike
+            // click should print exactly one `unlike(drain)`. Two lines — or
+            // an `unlike` then a `like` — means the toggle is firing more than
+            // once (a click-path bug); exactly one means the trigger is fine
+            // and any visual doubling is in the renderer.
+            if (debug_effects) {
+                const name = switch (kind) {
+                    .like => if (now_liked) "like(fill)" else "unlike(drain)",
+                    .repost => "boost",
+                };
+                std.debug.print("[zat] fired {s} at cell ({d},{d}); active effects now = {d}\n", .{ name, hx, hy, g.active.len });
+            }
+            return;
+        }
+    }
 }
 
 fn present(

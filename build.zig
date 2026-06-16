@@ -38,10 +38,39 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the Phase-0 demo (live HTTPS GET -> typed struct)");
     run_step.dependOn(&run_cmd.step);
 
+    // The standalone Zat4 AppView (STANDALONE_ROADMAP Phase C). A separate,
+    // headless binary — no font engine, no window — so it cross-compiles
+    // cleanly to the deployment box (e.g. aarch64-linux for a Hetzner CAX
+    // ARM box): `zig build -Dtarget=aarch64-linux appview`.
+    const appview_mod = b.createModule(.{
+        .root_source_file = b.path("src/appview_main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const appview_exe = b.addExecutable(.{
+        .name = "zat4-appview",
+        .root_module = appview_mod,
+    });
+    b.installArtifact(appview_exe);
+    const appview_run = b.addRunArtifact(appview_exe);
+    appview_run.step.dependOn(b.getInstallStep());
+    if (b.args) |args| appview_run.addArgs(args);
+    const appview_step = b.step("appview", "Run the Zat4 AppView (ingest stdin -> serve)");
+    appview_step.dependOn(&appview_run.step);
+
+    // The AppView's own offline test target, leak-checked (C6).
+    const appview_tests = b.addTest(.{ .root_module = appview_mod });
+    const run_appview_tests = b.addRunArtifact(appview_tests);
+    const appview_test_step = b.step("test-appview", "Run the AppView's offline unit tests (leak-checked)");
+    appview_test_step.dependOn(&run_appview_tests.step);
+
     const unit_tests = b.addTest(.{ .root_module = exe_mod });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run offline unit tests (leak-checked)");
     test_step.dependOn(&run_unit_tests.step);
+    // The AppView's tests ride the default test step too, so `zig build test`
+    // covers the whole project including Phase C.
+    test_step.dependOn(&run_appview_tests.step);
 
     const live_mod = b.createModule(.{
         .root_source_file = b.path("src/live_tests.zig"),
@@ -85,6 +114,55 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run the G1 performance ledger (core transforms: wall-clock + bytes-per-record)");
     bench_step.dependOn(&run_bench.step);
 
+    // Headless visual preview of the premium feed (cut 5.6): render the
+    // real core path into a framebuffer and dump a PPM. A picture is the
+    // only honest review of a visual pass, and the loopback tests cannot
+    // provide one. Font engine wired; no window, no socket.
+    const preview_mod = b.createModule(.{
+        .root_source_file = b.path("src/preview.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addFontEngine(b, preview_mod);
+    const preview_exe = b.addExecutable(.{ .name = "zat-preview", .root_module = preview_mod });
+    const run_preview = b.addRunArtifact(preview_exe);
+    if (b.args) |args| run_preview.addArgs(args);
+    const preview_step = b.step("preview", "Render the premium feed to /tmp/zat_preview.ppm (headless)");
+    preview_step.dependOn(&run_preview.step);
+
+    // GPU smoke test (Phase 6 foundation): bring up an EGL/GLES2 context on
+    // the real X11 window and clear it. EGL/GLESv2 are dlopen'd at RUNTIME, so
+    // the build links only libc (via the font engine) — no -dev packages, no
+    // vendored package. Cannot run in CI/sandbox (needs a display+GPU).
+    const gpu_mod = b.createModule(.{
+        .root_source_file = b.path("src/gpu_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addFontEngine(b, gpu_mod);
+    const gpu_exe = b.addExecutable(.{ .name = "zat-gpu-smoke", .root_module = gpu_mod });
+    const run_gpu = b.addRunArtifact(gpu_exe);
+    if (b.args) |args| run_gpu.addArgs(args);
+    const gpu_step = b.step("gpu-smoke", "Bring up an EGL/GLES context on the window and clear it (GPU smoke test)");
+    gpu_step.dependOn(&run_gpu.step);
+
+    // GPU preview (Phase 6.1): render the SAME draw list as `zig build
+    // preview` — static ambient field + premium feed — through the GPU
+    // renderer on the real window, to confirm parity with the software path.
+    // Same dependency posture as gpu-smoke (EGL/GLESv2 dlopen'd; links libc
+    // via the font engine). Needs a display+GPU.
+    const gpu_preview_mod = b.createModule(.{
+        .root_source_file = b.path("src/gpu_preview.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addFontEngine(b, gpu_preview_mod);
+    const gpu_preview_exe = b.addExecutable(.{ .name = "zat-gpu-preview", .root_module = gpu_preview_mod });
+    const run_gpu_preview = b.addRunArtifact(gpu_preview_exe);
+    if (b.args) |args| run_gpu_preview.addArgs(args);
+    const gpu_preview_step = b.step("gpu-preview", "Render the premium feed through the GPU on the real window (Phase 6.1 parity)");
+    gpu_preview_step.dependOn(&run_gpu_preview.step);
+
     // Convenience: wipe the local build cache. The cache GROWING is
     // correct, not a bug — Zig keeps content-hashed artifacts so
     // incremental rebuilds are fast, and it cannot auto-delete old
@@ -121,6 +199,11 @@ fn addFontEngine(b: *std.Build, mod: *std.Build.Module) void {
     // exactly the ringfenced font decision the GUI roadmap §4 promised.
     mod.addImport("font_regular_ttf", b.createModule(.{ .root_source_file = b.path("assets/JetBrainsMono-Regular.ttf") }));
     mod.addImport("font_semibold_ttf", b.createModule(.{ .root_source_file = b.path("assets/JetBrainsMono-SemiBold.ttf") }));
+    // The credential generator's root word list rides as a byte module the
+    // same way the fonts do, so core/credential.zig can @embedFile it and
+    // split it into the comptime pool. PUBLIC by design (entropy is in the
+    // pick, not the list — CREDENTIAL_GEN_DESIGN §0).
+    mod.addImport("roots_4096_txt", b.createModule(.{ .root_source_file = b.path("assets/roots_4096.txt") }));
     mod.addIncludePath(b.path("vendor"));
     mod.addCSourceFile(.{
         .file = b.path("vendor/stb_impl.c"),

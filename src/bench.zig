@@ -36,7 +36,7 @@ pub fn main() !void {
         var text_buf: [128]u8 = undefined;
         const did = std.fmt.bufPrint(&did_buf, "did:plc:bench{d:0>6}aaaaaaaaaaa", .{i % authors_n}) catch unreachable;
         const cid = std.fmt.bufPrint(&cid_buf, "bafyreibench{d:0>10}", .{i}) catch unreachable;
-        const uri = std.fmt.bufPrint(&uri_buf, "at://{s}/app.bsky.feed.post/{d}", .{ did, i }) catch unreachable;
+        const uri = std.fmt.bufPrint(&uri_buf, "at://{s}/app.zat4.feed.post/{d}", .{ did, i }) catch unreachable;
         const text = std.fmt.bufPrint(&text_buf, "post {d}: a line of ordinary timeline text, long enough to wrap once on a narrow surface", .{i}) catch unreachable;
         _ = try feed.ingestLivePost(gpa, &store, .{
             .did = did,
@@ -199,6 +199,63 @@ pub fn main() !void {
         p("  pixel timeline 1280x800  cold {d:>6} us, steady {d:>6} us/frame ({d} cards, {d} hit zones)\n", .{ cold_ns / 1_000, warm_ns / 1_000, cards.len, hr.len });
     }
 
+    // ---- the blit damage decision (the render-path cure): the window
+    // loop's per-frame cost is dominated NOT by paint (~1 ms above) but by
+    // the PutImage that ships the framebuffer over the X socket. A full
+    // frame at 1280x800 is ~4 MB; the heart animation changes only a few
+    // rows. raster.damageBand finds that band so blit() sends just it. This
+    // measures the band scan itself and the bytes it saves — the number
+    // behind "the animation stopped stuttering and clicks stopped dropping."
+    {
+        const w: u32 = 1280;
+        const h: u32 = 800;
+        const shadow = try gpa.alloc(u32, w * h);
+        defer gpa.free(shadow);
+        const frame = try gpa.alloc(u32, w * h);
+        defer gpa.free(frame);
+        @memset(shadow, 0xFF0E1116);
+        @memcpy(frame, shadow);
+
+        // The unchanged-frame case: the heart resting, or any static frame.
+        // Proving "no change" means comparing every row (there is no row to
+        // early-out on), so this scan is ~full-frame — but it is cheap local
+        // memcmp that NEVER blocks, and it lets blit() skip the socket write
+        // entirely. That is the trade: ~0.35 ms of CPU to avoid a 4 MB
+        // blocking PutImage. The number is printed so the trade is honest.
+        const reps: usize = 200;
+        var t_same = clock.monotonicNanos();
+        var sink_same: usize = 0;
+        for (0..reps) |_| {
+            if (raster.damageBand(shadow, frame, w, h)) |_| sink_same += 1;
+        }
+        const same_ns = (clock.monotonicNanos() - t_same) / reps;
+
+        // A heart-sized change: ~3 cell-rows of pixels in one band, the
+        // realistic per-frame delta of the animating heart.
+        const band_top: u32 = 360;
+        const band_rows: u32 = 60; // ~3 rows at a typical cell height
+        var r: u32 = band_top;
+        while (r < band_top + band_rows) : (r += 1) {
+            var c: u32 = 40;
+            while (c < 120) : (c += 1) frame[r * w + c] = 0xFFE0245E; // heart red
+        }
+        t_same = clock.monotonicNanos();
+        var first: u32 = 0;
+        var last: u32 = 0;
+        for (0..reps) |_| {
+            const band = raster.damageBand(shadow, frame, w, h).?;
+            first = band.first;
+            last = band.last;
+        }
+        const change_ns = (clock.monotonicNanos() - t_same) / reps;
+
+        const full_bytes: usize = w * h * 4;
+        const band_bytes: usize = @as(usize, (last - first + 1)) * w * 4;
+        p("  blit damage 1280x800     scan unchanged {d:>4} ns, scan changed {d:>5} ns/frame\n", .{ same_ns, change_ns });
+        p("                           band rows {d} -> blit {d} KB vs full {d} KB ({d}x less over the socket)\n", .{ last - first + 1, band_bytes / 1024, full_bytes / 1024, full_bytes / @max(band_bytes, 1) });
+        if (sink_same != 0) p("", .{}); // keep sink_same observed
+    }
+
     // ---- the glyph-field frame (G.0): the FULL per-frame cost the
     // wired window loop pays — build + effect.advance + field.step +
     // compose. Measured idle (a static grid, the common case the
@@ -222,6 +279,8 @@ pub fn main() !void {
         defer fdl.deinit(gpa);
         var fhr: field_ui.HitList = .empty;
         defer fhr.deinit(gpa);
+        var fht: field_ui.HeartList = .empty;
+        defer fht.deinit(gpa);
         var spawn: std.ArrayList(fieldm.SpawnEvent) = .empty;
         defer spawn.deinit(gpa);
         var fview: field_ui.ViewState = .{};
@@ -248,11 +307,14 @@ pub fn main() !void {
         const dt: f32 = 1.0 / 60.0;
 
         const frame = struct {
-            fn run(g: std.mem.Allocator, fl: *fieldm.Field, pt: *fieldm.ParticleList, ac: *effect.ActiveList, hr2: *field_ui.HitList, vw: *field_ui.ViewState, sb: *std.ArrayList(fieldm.SpawnEvent), dl2: *raster.DrawList, its: []const feed.TimelineItem, lt: fieldm.Light, d: f32, r: std.Random) !void {
-                _ = try field_ui.build(fl, hr2, its, 0, vw, &.{}, 1_700_000_500, "bench.bsky.social", "live", g);
+            fn run(g: std.mem.Allocator, fl: *fieldm.Field, pt: *fieldm.ParticleList, ac: *effect.ActiveList, hr2: *field_ui.HitList, ht2: *field_ui.HeartList, vw: *field_ui.ViewState, sb: *std.ArrayList(fieldm.SpawnEvent), dl2: *raster.DrawList, its: []const feed.TimelineItem, lt: fieldm.Light, d: f32, r: std.Random) !void {
+                _ = try field_ui.build(fl, hr2, ht2, its, 0, vw, &.{}, 1_700_000_500, "bench.bsky.social", "live", g);
                 try effect.advance(g, ac, fl, d, sb);
                 try fieldm.step(g, fl, pt, sb.items, d, r);
                 try fieldm.compose(g, fl, pt.slice(), lt, 9, 17, dl2);
+                // The effect render (heart glyphs + ring) is part of every
+                // animated frame — measure it, do not assume it is free.
+                try effect.composeEffects(g, ac.slice(), 9, 17, dl2);
             }
         }.run;
 
@@ -261,7 +323,7 @@ pub fn main() !void {
         // floor whenever ANY animation is live, so it must be cheap.
         var n: usize = 0;
         const idle_t0 = clock.monotonicNanos();
-        while (n < 200) : (n += 1) try frame(gpa, &fld, &parts, &acts, &fhr, &fview, &spawn, &fdl, &fitems, light, dt, frng.random());
+        while (n < 200) : (n += 1) try frame(gpa, &fld, &parts, &acts, &fhr, &fht, &fview, &spawn, &fdl, &fitems, light, dt, frng.random());
         const idle_ns = (clock.monotonicNanos() - idle_t0) / 200;
 
         // Saturated: several effects firing + their particle output in
@@ -269,8 +331,84 @@ pub fn main() !void {
         for (0..6) |k| effect.trigger(gpa, &acts, &effect.like_heart, @intCast(20 + k * 15), @intCast(8 + k * 4), 1.0) catch {};
         n = 0;
         const busy_t0 = clock.monotonicNanos();
-        while (n < 200) : (n += 1) try frame(gpa, &fld, &parts, &acts, &fhr, &fview, &spawn, &fdl, &fitems, light, dt, frng.random());
+        while (n < 200) : (n += 1) try frame(gpa, &fld, &parts, &acts, &fhr, &fht, &fview, &spawn, &fdl, &fitems, light, dt, frng.random());
         const busy_ns = (clock.monotonicNanos() - busy_t0) / 200;
         p("  glyph field {d}x{d}      idle {d:>6} us, saturated {d:>6} us/frame ({d} cells; {d} particles live)\n", .{ cols, rows, idle_ns / 1_000, busy_ns / 1_000, @as(u32, cols) * rows, parts.len });
+
+        // PER-FRAME PEAK over ONE like effect's whole lifetime. The averaged
+        // numbers above hide the burst: an effect lasts ~0.82 s but the bench
+        // loop runs 3.3 s, so ~150 idle frames wash the peak out (that is why
+        // "saturated" can report 0 particles). What actually matters for
+        // smoothness is the WORST single frame, and where the changed-pixel
+        // band peaks — the blit cost the dirty-band path must carry. Measured,
+        // not averaged. (G1; this is the tripwire that would have caught the
+        // averaging flaw.)
+        {
+            var engine2 = try text_engine.initEngine();
+            defer text_engine.deinitEngine(gpa, &engine2);
+            const pw: u32 = cols * 9;
+            const ph: u32 = rows * 17;
+            var fb2: raster.Framebuffer = .{};
+            defer raster.deinit(gpa, &fb2);
+            try raster.resize(gpa, &fb2, pw, ph, 0xFF0E1116);
+            const shadow2 = try gpa.alloc(u32, pw * ph);
+            defer gpa.free(shadow2);
+            @memcpy(shadow2, fb2.pixels);
+
+            var fld2: fieldm.Field = .{};
+            try fieldm.init(gpa, &fld2, cols, rows);
+            defer fieldm.deinit(gpa, &fld2);
+            var parts2: fieldm.ParticleList = .empty;
+            defer parts2.deinit(gpa);
+            var acts2: effect.ActiveList = .empty;
+            defer acts2.deinit(gpa);
+            var dl2: raster.DrawList = .empty;
+            defer dl2.deinit(gpa);
+            var hr2b: field_ui.HitList = .empty;
+            defer hr2b.deinit(gpa);
+            var ht2b: field_ui.HeartList = .empty;
+            defer ht2b.deinit(gpa);
+            var spawn2: std.ArrayList(fieldm.SpawnEvent) = .empty;
+            defer spawn2.deinit(gpa);
+            var vw2: field_ui.ViewState = .{};
+            var rng2 = std.Random.DefaultPrng.init(7);
+
+            // Prime: paint ONE static frame (the resting feed) into the shadow
+            // first, so the band below measures the effect's INCREMENTAL change
+            // against an already-drawn feed — exactly what the live loop blits
+            // mid-animation. Without this, frame 0 diffs against a blank shadow
+            // and reports a full-frame "change" (the whole feed appearing),
+            // which is the one-time first-paint, not the animation.
+            _ = try field_ui.build(&fld2, &hr2b, &ht2b, &fitems, 0, &vw2, &.{}, 1_700_000_500, "bench.bsky.social", "live", gpa);
+            try fieldm.step(gpa, &fld2, &parts2, &.{}, dt, rng2.random());
+            const light0: fieldm.Light = .{ .x = 70, .y = 14, .radius = 140, .ambient = 0.64 };
+            try fieldm.compose(gpa, &fld2, parts2.slice(), light0, 9, 17, &dl2);
+            try raster.paint(gpa, &engine2, dl2.slice(), &fb2, 0xFF0E1116);
+            @memcpy(shadow2, fb2.pixels);
+
+            effect.trigger(gpa, &acts2, &effect.like_heart, 20, 12, 1.0) catch {};
+            const life = effect.like_heart.lifetime();
+            const frames: usize = @intFromFloat(@ceil((life + 0.15) / dt));
+            var peak_compute: u64 = 0;
+            var peak_band: u32 = 0;
+            var fr: usize = 0;
+            while (fr < frames) : (fr += 1) {
+                const c0 = clock.monotonicNanos();
+                _ = try field_ui.build(&fld2, &hr2b, &ht2b, &fitems, 0, &vw2, &.{}, 1_700_000_500, "bench.bsky.social", "live", gpa);
+                try effect.advance(gpa, &acts2, &fld2, dt, &spawn2);
+                try fieldm.step(gpa, &fld2, &parts2, spawn2.items, dt, rng2.random());
+                const light2: fieldm.Light = .{ .x = 70, .y = 14, .radius = 140, .ambient = 0.64 };
+                try fieldm.compose(gpa, &fld2, parts2.slice(), light2, 9, 17, &dl2);
+                try effect.composeEffects(gpa, acts2.slice(), 9, 17, &dl2);
+                const compute_ns = clock.monotonicNanos() - c0;
+                try raster.paint(gpa, &engine2, dl2.slice(), &fb2, 0xFF0E1116);
+                const band = raster.damageBand(shadow2, fb2.pixels, pw, ph);
+                const rows_changed: u32 = if (band) |b| b.last - b.first + 1 else 0;
+                @memcpy(shadow2, fb2.pixels);
+                if (compute_ns > peak_compute) peak_compute = compute_ns;
+                if (rows_changed > peak_band) peak_band = rows_changed;
+            }
+            p("  like effect peak ({d:.2}s)  worst-frame compute {d} us, peak band {d}/{d} rows ({d} KB blit)\n", .{ life, peak_compute / 1000, peak_band, ph, peak_band * pw * 4 / 1024 });
+        }
     }
 }

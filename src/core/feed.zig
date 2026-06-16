@@ -993,7 +993,7 @@ pub const fixture_page = lexicon.TimelinePage{
         .{ .post = alice_post_1 },
         .{
             .post = .{
-                .uri = "at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/app.bsky.feed.post/3kbob1",
+                .uri = "at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/app.zat4.feed.post/3kbob1",
                 .cid = "bafyreibob1",
                 .author = bob,
                 .record = .{ .text = "replying to alice", .createdAt = "2026-01-02T04:00:00Z" },
@@ -1006,7 +1006,7 @@ pub const fixture_page = lexicon.TimelinePage{
         },
         .{
             .post = .{
-                .uri = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/3kali2",
+                .uri = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.zat4.feed.post/3kali2",
                 .cid = "bafyreialice2",
                 .author = alice,
                 .record = .{ .text = "alice's second post", .createdAt = "2026-01-02T05:00:00Z" },
@@ -1030,7 +1030,7 @@ const bob = lexicon.ProfileViewBasic{
     .handle = "bob.test",
 };
 const alice_post_1 = lexicon.PostView{
-    .uri = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/3kali1",
+    .uri = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.zat4.feed.post/3kali1",
     .cid = "bafyreialice1",
     .author = alice,
     .record = .{ .text = "first post", .createdAt = "2026-01-02T03:04:05.678Z" },
@@ -1081,7 +1081,7 @@ test "disengage: unlike hands out the record uri once, revert restores it" {
 
     // Seed what a wire viewer would have delivered for post 0, with a
     // deterministic count so the saturating math is observable.
-    const seeded = "at://did:plc:alice/app.bsky.feed.like/3ktest";
+    const seeded = "at://did:plc:alice/app.zat4.feed.like/3ktest";
     store.liked.set(0);
     store.like_uris.items[0] = try appendString(gpa, &store, seeded);
     store.posts.items(.like_count)[0] = 5;
@@ -1142,7 +1142,7 @@ test "ingest: a second page deduplicates across pages by CID (A8)" {
             .{ .post = alice_post_1 }, // resident already
             .{
                 .post = .{
-                    .uri = "at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/app.bsky.feed.post/3kbob2",
+                    .uri = "at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/app.zat4.feed.post/3kbob2",
                     .cid = "bafyreibob2",
                     .author = bob,
                     .record = .{ .text = "fresh post", .createdAt = "2026-01-03T00:00:00Z" },
@@ -1231,7 +1231,7 @@ test "ingest: a malformed createdAt degrades one post, not the page" {
 
     const page = lexicon.TimelinePage{ .feed = &.{.{
         .post = .{
-            .uri = "at://x/app.bsky.feed.post/1",
+            .uri = "at://x/app.zat4.feed.post/1",
             .cid = "bafyreibadclock",
             .author = alice,
             .record = .{ .text = "bad clock", .createdAt = "garbage" },
@@ -1249,7 +1249,7 @@ test "ingest: labels become out-of-band flags on the resident post" {
 
     const page = lexicon.TimelinePage{ .feed = &.{.{
         .post = .{
-            .uri = "at://x/app.bsky.feed.post/9",
+            .uri = "at://x/app.zat4.feed.post/9",
             .cid = "bafyreilabeled",
             .author = alice,
             .record = .{ .text = "flagged", .createdAt = "2026-01-02T03:04:05Z" },
@@ -1325,7 +1325,7 @@ test "reconcile: a fresh page overwrites counts and viewer state on dedup (A8 bo
                 .author = alice,
                 .record = alice_post_1.record,
                 .likeCount = 9, // server truth, includes our like by now
-                .viewer = .{ .like = "at://did:plc:carol/app.bsky.feed.like/3xyz" },
+                .viewer = .{ .like = "at://did:plc:carol/app.zat4.feed.like/3xyz" },
             },
         }},
     };
@@ -1366,7 +1366,7 @@ test "live ingest: prepends, dedups by cid, links replies, did fallback handle" 
     const added = try ingestLivePost(gpa, &store, .{
         .did = "did:plc:nnnnnnnnnnnnnnnnnnnnnnnn",
         .handle = "",
-        .uri = "at://did:plc:nnnnnnnnnnnnnnnnnnnnnnnn/app.bsky.feed.post/3klive1",
+        .uri = "at://did:plc:nnnnnnnnnnnnnnnnnnnnnnnn/app.zat4.feed.post/3klive1",
         .cid = "bafyreilivenew",
         .text = "fresh off the wire",
         .reply_parent_cid = "bafyreialice1",
@@ -1413,13 +1413,13 @@ test "refresh ingest: new rows prepend in order, cursor untouched, rows dedup by
         .cursor = "must-not-replace",
         .feed = &.{
             .{ .post = .{
-                .uri = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/3knewest",
+                .uri = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.zat4.feed.post/3knewest",
                 .cid = "bafyreinewest",
                 .author = .{ .did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", .handle = "alice.test" },
                 .record = .{ .text = "the newest post", .createdAt = "2026-01-03T00:00:00Z" },
             } },
             .{ .post = .{
-                .uri = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/1",
+                .uri = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.zat4.feed.post/1",
                 .cid = "bafyreialice1",
                 .author = .{ .did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", .handle = "alice.test" },
                 .record = .{ .text = "first", .createdAt = "2026-01-01T00:00:00Z" },
@@ -1451,7 +1451,7 @@ test "regression: like+unlike a live-ingested post does not overrun like_uris" {
     const r = try ingestLivePost(gpa, &store, .{
         .did = "did:plc:test",
         .handle = "alice.test",
-        .uri = "at://did:plc:test/app.bsky.feed.post/abc",
+        .uri = "at://did:plc:test/app.zat4.feed.post/abc",
         .cid = "bafyLIVE1",
         .text = "live post",
         .reply_parent_cid = "",

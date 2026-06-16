@@ -1,0 +1,35 @@
+[Unit]
+# The Zat4 AppView (Phase C, Cut 1). Ingests a snapshot of app.zat4.* events
+# from /var/lib/zat4/events.jsonl on start, then serves the read query surface
+# on loopback :2584. Reachable from your laptop via an SSH tunnel; nothing is
+# exposed on the public network (Cut 1 has no auth yet — see APPVIEW_SETUP.md).
+Description=Zat4 AppView (ingest snapshot, serve timelines on 127.0.0.1:2584)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The snapshot the AppView ingests on start. Replace with your own event file;
+# re-running `systemctl restart zat4-appview` re-ingests it.
+StandardInput=file:/var/lib/zat4/events.jsonl
+ExecStart=/usr/local/bin/zat4-appview --port 2584
+
+# Restart on crash, with a small backoff (E2: a fallen process comes back).
+Restart=on-failure
+RestartSec=3
+
+# Least privilege: run as a dedicated unprivileged user, with the filesystem
+# locked down. Create the user once with:
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin zat4
+User=zat4
+Group=zat4
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# The AppView writes nothing to disk in Cut 1 (in-memory index), so it needs
+# no writable paths. If a future on-disk store lands, add it here:
+#   ReadWritePaths=/var/lib/zat4
+
+[Install]
+WantedBy=multi-user.target

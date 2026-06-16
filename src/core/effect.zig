@@ -201,6 +201,17 @@ pub const Stage = struct {
 pub const Recipe = struct {
     stencil: ?Stencil = null,
     stages: []const Stage,
+    /// Whether this effect DRAINS the heart (unlike) rather than fills it
+    /// (like). This is a property of the whole effect, not of any one stage:
+    /// an unlike drains through ALL its stages (the heart empties, then stays
+    /// empty while the glow cools). Deriving "draining" from a per-stage
+    /// sweep was the bug behind "the unlike unfills, then refills, then
+    /// unfills" — only the first stage carried the top-down sweep, so the
+    /// second (fade) stage was treated as a fill and snapped the heart back to
+    /// full. The intent lives here, on the recipe, read once per stage so
+    /// every stage of a draining effect agrees. [TUNE: false = a filling
+    /// effect like the heart-pop; true = a draining one like the unlike.]
+    drains: bool = false,
 
     /// Total seconds the effect runs — the sum of its stages. Pure.
     pub fn lifetime(r: Recipe) f32 {
@@ -226,7 +237,10 @@ pub const like_heart = Recipe{
         // pop around the button, not across the whole post. [TUNE]
         .{ .kind = .emit, .duration = 0.0, .emit_kind = .burst, .emit_count = 14, .emit_energy = 34, .emit_palette = 0 },
         .{ .kind = .shockwave, .duration = 0.16, .push = 2.2, .color = 4 },
-        .{ .kind = .fade, .duration = 0.40, .glow = 210 },
+        // Comedown: glow eases out and the heart settles to its resting
+        // filled state. Kept SHORT so the effect ENDS cleanly instead of
+        // dragging — the burst's energy should resolve, not dribble. [TUNE]
+        .{ .kind = .fade, .duration = 0.26, .glow = 210 },
     },
 };
 
@@ -234,9 +248,14 @@ pub const like_heart = Recipe{
 /// burst — the visual inverse of a like, same machinery.
 pub const unlike_heart = Recipe{
     .stencil = heart_inline,
+    .drains = true, // the heart empties and STAYS empty through every stage
     .stages = &.{
         .{ .kind = .glow_ramp, .duration = 0.30, .glow = 90, .sweep = .top_down, .color = 5 },
-        .{ .kind = .fade, .duration = 0.40, .glow = 90 },
+        // The drain already lands the heart on its empty resting outline, so
+        // this is just a short settle before the effect releases — kept brief
+        // so the unlike CONCLUDES at the drain instead of holding empty for a
+        // dead beat. [TUNE]
+        .{ .kind = .fade, .duration = 0.12, .glow = 90 },
     },
 };
 
@@ -400,7 +419,7 @@ pub fn advance(
                 // stage's rule, evaluated at progress t.
                 const t: f32 = if (stage.duration > 0) @min(1.0, stage_t.* / stage.duration) else 1.0;
                 if (a_recipe.stencil) |stencil| {
-                    applyStage(f, stencil, a_x, a_y, stage, t, a_scale);
+                    applyStage(f, stencil, a_x, a_y, stage, t, a_scale, a_recipe.drains);
                 }
 
                 // Advance the clock; roll to the next stage at the edge.
@@ -484,6 +503,36 @@ pub fn stamp(f: *field.Field, stencil: Stencil, cx: u16, cy: u16, color: u8) voi
     }
 }
 
+/// Ease a 0→1 progress so motion has a DEFINED, immediate onset and a FLUID
+/// settle: fast off the mark (the like/unlike registers the instant it starts)
+/// then decelerating into its final value (no mechanical linear crawl, no
+/// abrupt stop). easeOutQuad: 1-(1-t)². Pure.
+fn easeOut(t: f32) f32 {
+    const u = 1.0 - t;
+    return 1.0 - u * u;
+}
+
+/// The heart's fill fraction (0=empty, 1=full) at stage progress `t`, given
+/// whether the effect FILLS (like) or DRAINS (unlike). Pure and total over
+/// every StageKind, so it is checkable in isolation — this is the rule that
+/// was wrong (a draining effect's fade stage snapped the heart back to full),
+/// so it is pulled out and tested directly. Fill and drain are exact
+/// inverses about the SAME eased progress: a fill rises 0→1 during its
+/// glow_ramp then HOLDS at 1 through hold/emit/shockwave/fade (the heart stays
+/// liked); a drain falls 1→0 during its glow_ramp then HOLDS at 0 (stays
+/// unliked while the glow cools). The hold-after-ramp is the no-refill fix;
+/// the eased ramp is the fluid-yet-defined onset. B2.
+fn heartFill(draining: bool, kind: StageKind, t: f32) f32 {
+    const p = easeOut(t); // shared eased progress → symmetric fill/drain
+    return if (draining) switch (kind) {
+        .glow_ramp => 1.0 - p, // drain full → empty (fast onset, eased settle)
+        .hold, .emit, .shockwave, .fade => 0.0, // stay empty (never refill)
+    } else switch (kind) {
+        .glow_ramp => p, // fill empty → full (fast onset, eased settle)
+        .hold, .emit, .shockwave, .fade => 1.0, // stay full
+    };
+}
+
 /// Render every active effect's FINE-resolution stencil directly into
 /// the draw list, at its own sub-cell pixel pitch — this is the
 /// variable-resolution path (the detailed upright heart). Called after
@@ -521,13 +570,8 @@ pub fn composeEffects(
         // glows down; UNLIKING drains the fill back out (the power-down).
         const dur = if (stage.duration > 0) stage.duration else 0.0001;
         const t: f32 = @min(1.0, stage_t / dur);
-        const draining = stage.sweep == .top_down; // unlike recipe uses top_down
-        const fill: f32 = if (draining)
-            (1.0 - t) // drain 1 → 0 over the stage (HTML unlike)
-        else switch (stage.kind) {
-            .glow_ramp => t, // fill 0 → 1 bottom-up
-            .hold, .emit, .shockwave, .fade => 1.0,
-        };
+        const draining = recipe.drains;
+        const fill: f32 = heartFill(draining, stage.kind, t);
         // Settling glow: bright at the pop, easing to the resting level.
         const glow: f32 = switch (stage.kind) {
             .shockwave => 0.45,
@@ -663,17 +707,24 @@ fn drawHeartGlyphs(
         for (brow, 0..) |ink, rx| {
             if (ink == 0) continue;
             const lit = @as(f32, @floatFromInt(ry)) >= fill_row;
-            var glyph: u8 = heart_ramp[3]; // dim outline default
-            var color: u32 = 0xFF36406E; // cool slate (HTML rgb(54,64,110))
+            var glyph: u8 = 0;
+            var color: u32 = 0;
             if (lit) {
-                // Brightness: base + settling glow + a subtle horizontal
-                // shimmer so the filled body is not flat (HTML dEdge feel).
-                const edge: f32 = @as(f32, @floatFromInt(@min(rx, heart_cols - rx))) / @as(f32, heart_cols);
-                var b: f32 = 0.55 + glow + edge * 0.25;
+                // Filled: brightness-picked density glyph, warm colour.
+                const edge_f: f32 = @as(f32, @floatFromInt(@min(rx, heart_cols - rx))) / @as(f32, heart_cols);
+                var b: f32 = 0.55 + glow + edge_f * 0.25;
                 b = std.math.clamp(b, 0.0, 1.0);
                 const idx: usize = @max(3, @as(usize, @intFromFloat(@round(b * @as(f32, heart_ramp.len - 1)))));
                 glyph = heart_ramp[@min(idx, heart_ramp.len - 1)];
                 color = heartColor(b);
+            } else if (heartEdge(rx, ry)) {
+                // UNFILLED but on the silhouette EDGE: draw a clear outline
+                // glyph so the empty heart reads as a hollow heart, not a
+                // faint smudge. Interior unfilled cells are left dark.
+                glyph = '*';
+                color = 0xFF7A86B0; // a brighter slate than the old dim fill
+            } else {
+                continue; // interior empty cell: nothing
             }
             const gx = origin_x + @as(i32, @intCast(rx)) * tile_w;
             const gy = origin_y + @as(i32, @intCast(ry)) * tile_h;
@@ -687,6 +738,22 @@ fn drawHeartGlyphs(
             } });
         }
     }
+}
+
+/// Is heart cell (rx,ry) on the silhouette edge? True when any orthogonal
+/// neighbour is off-grid or not part of the heart. Used to draw the
+/// unfilled heart as a hollow OUTLINE rather than a dim solid smudge.
+fn heartEdge(rx: usize, ry: usize) bool {
+    const rxi: i32 = @intCast(rx);
+    const ryi: i32 = @intCast(ry);
+    const deltas = [_][2]i32{ .{ 0, -1 }, .{ 0, 1 }, .{ -1, 0 }, .{ 1, 0 } };
+    for (deltas) |d| {
+        const nx = rxi + d[0];
+        const ny = ryi + d[1];
+        if (nx < 0 or ny < 0 or ny >= @as(i32, @intCast(heart_rows)) or nx >= @as(i32, @intCast(heart_cols))) return true;
+        if (heart_bitmap[@intCast(ny)][@intCast(nx)] == 0) return true;
+    }
+    return false;
 }
 
 /// The number of timeline cells the inline heart reserves horizontally,
@@ -738,12 +805,12 @@ pub fn composeStaticHeart(
 /// cell's lit-ness is a function of its position and `t`, so the light
 /// sweeps as t grows. No frame is stored; the sweep EMERGES from the
 /// rule meeting the clock.
-fn applyStage(f: *field.Field, stencil: Stencil, cx: u16, cy: u16, stage: Stage, t: f32, scale_q8: u16) void {
+fn applyStage(f: *field.Field, stencil: Stencil, cx: u16, cy: u16, stage: Stage, t: f32, scale_q8: u16, draining: bool) void {
     // Fine-resolution shapes (scale > 1) are drawn by composeEffects at
     // their own pitch; here we only drive the COARSE-footprint physics
     // so the burst still shoves neighbours and the cells still glow.
     if (stencil.scale > 1) {
-        applyCoarseFootprint(f, stencil, cx, cy, stage, t, scale_q8);
+        applyCoarseFootprint(f, stencil, cx, cy, stage, t, scale_q8, draining);
         return;
     }
     const ox: i32 = @as(i32, cx) - stencil.w / 2;
@@ -814,7 +881,7 @@ fn clampFp(v: f32) i8 {
 /// detailed glyphs are drawn by composeEffects. Mirrors applyStage's
 /// per-cell rules but over the coarse footprint, using each cell's
 /// position within the block for the sweep.
-fn applyCoarseFootprint(f: *field.Field, stencil: Stencil, cx: u16, cy: u16, stage: Stage, t: f32, scale_q8: u16) void {
+fn applyCoarseFootprint(f: *field.Field, stencil: Stencil, cx: u16, cy: u16, stage: Stage, t: f32, scale_q8: u16, draining: bool) void {
     const fw: i32 = @max(1, @divTrunc(@as(i32, stencil.w), @as(i32, stencil.scale)));
     const fh: i32 = @max(1, @divTrunc(@as(i32, stencil.h), @as(i32, stencil.scale)));
     var ry: i32 = 0;
@@ -836,7 +903,13 @@ fn applyCoarseFootprint(f: *field.Field, stencil: Stencil, cx: u16, cy: u16, sta
             };
             const p = &f.perturb[at];
             switch (stage.kind) {
-                .glow_ramp => if (t >= pos) {
+                // A DRAINING effect (unlike) cools — it must NOT add glow to
+                // the cells under the heart. Lighting the footprint up while
+                // the fine heart drains made the cell background swell red to
+                // a peak and fade, which read AS a refill: the "unfills, fills
+                // again, unfills" report. An unlike only drains; it does not
+                // glow. (A fill — like/boost — keeps the warming glow.)
+                .glow_ramp => if (!draining and t >= pos) {
                     const g: u16 = @as(u16, p.glow) + stage.glow / 6;
                     p.glow = @intCast(@min(g, stage.glow));
                     p.flags |= field.Perturb.flag_active;
@@ -863,7 +936,9 @@ fn applyCoarseFootprint(f: *field.Field, stencil: Stencil, cx: u16, cy: u16, sta
 test "guards and lifetimes: the authoring records are exactly sized" {
     try testing.expectEqual(@as(usize, 24), @sizeOf(Active));
     // The heart's staged lifetime is the sum of its stages — a pure fact.
-    try testing.expectApproxEqAbs(@as(f32, 0.82), like_heart.lifetime(), 0.001);
+    // 0.22 ramp + 0.04 hold + 0 emit + 0.16 shockwave + 0.26 fade (the fade
+    // was tightened from 0.40 for a defined, non-dragging finish).
+    try testing.expectApproxEqAbs(@as(f32, 0.68), like_heart.lifetime(), 0.001);
     // The heart is now an upright, detailed, fine-resolution silhouette.
     try testing.expect(heart.scale == 2);
     try testing.expect(heart.w > 20 and heart.h > 15); // dense, not a sparse outline
@@ -939,6 +1014,44 @@ test "emit stage fires exactly one spawn, scaled by context intensity" {
     try testing.expectEqual(@as(usize, 0), active.len);
 }
 
+test "heartFill: a draining effect never refills (the unlike-then-refill bug)" {
+    // Filling: rises during the ramp, then holds full through every later
+    // stage — the heart stays liked.
+    try testing.expectApproxEqAbs(@as(f32, 0.0), heartFill(false, .glow_ramp, 0.0), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), heartFill(false, .glow_ramp, 1.0), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), heartFill(false, .fade, 0.0), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), heartFill(false, .fade, 1.0), 1e-6);
+
+    // Draining: falls during the ramp, then holds EMPTY through the fade.
+    // The bug was the fade reporting 1.0 (full) — pin it at 0.0 forever.
+    try testing.expectApproxEqAbs(@as(f32, 1.0), heartFill(true, .glow_ramp, 0.0), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.0), heartFill(true, .glow_ramp, 1.0), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.0), heartFill(true, .fade, 0.0), 1e-6); // was 1.0 — the refill
+    try testing.expectApproxEqAbs(@as(f32, 0.0), heartFill(true, .fade, 1.0), 1e-6);
+
+    // The unlike recipe must be flagged draining, or the rule above never
+    // engages (defends the recipe wiring, not just the math).
+    try testing.expect(unlike_heart.drains);
+    try testing.expect(!like_heart.drains);
+
+    // DEFINED onset: the eased ramp is AHEAD of a linear crawl early on, so a
+    // like visibly fills (and an unlike visibly empties) the instant it starts.
+    try testing.expect(heartFill(false, .glow_ramp, 0.1) > 0.1); // fill leads linear
+    try testing.expect(heartFill(true, .glow_ramp, 0.1) < 0.9); // drain leads linear
+
+    // The fill is monotonic non-increasing across the unlike's whole
+    // timeline — it must never go UP frame to frame (no refill anywhere).
+    var prev: f32 = 1.0;
+    for (unlike_heart.stages) |stage| {
+        var tt: f32 = 0;
+        while (tt <= 1.0) : (tt += 0.1) {
+            const fillv = heartFill(true, stage.kind, tt);
+            try testing.expect(fillv <= prev + 1e-6);
+            prev = fillv;
+        }
+    }
+}
+
 test "the full like-heart runs through every stage and self-culls" {
     const gpa = testing.allocator;
     var f: field.Field = .{};
@@ -985,7 +1098,9 @@ test "many simultaneous effects coexist and each completes independently" {
 
     const dt: f32 = 1.0 / 60.0;
     var n: usize = 0;
-    const longest = like_heart.lifetime();
+    // Run past whichever of the four lives longest — do NOT assume it is the
+    // like (tightening the like's fade made the boost the longest).
+    const longest = @max(@max(like_heart.lifetime(), unlike_heart.lifetime()), @max(boost.lifetime(), new_post.lifetime()));
     while (n < @as(usize, @intFromFloat(longest / dt)) + 4) : (n += 1) {
         try advance(gpa, &active, &f, dt, &events);
     }

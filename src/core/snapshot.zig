@@ -294,7 +294,7 @@ fn populatedStore(gpa: Allocator) !feed.Store {
     _ = try feed.ingestLivePost(gpa, &store, .{
         .did = "did:plc:nnnnnnnnnnnnnnnnnnnnnnnn",
         .handle = "",
-        .uri = "at://did:plc:nnnnnnnnnnnnnnnnnnnnnnnn/app.bsky.feed.post/3snap",
+        .uri = "at://did:plc:nnnnnnnnnnnnnnnnnnnnnnnn/app.zat4.feed.post/3snap",
         .cid = "bafyreisnaplive",
         .text = "survives the disk",
         .reply_parent_cid = "bafyreialice1",
@@ -337,7 +337,7 @@ test "snapshot: a populated store round-trips exactly" {
     const dup = try feed.ingestLivePost(gpa, &loaded, .{
         .did = "did:plc:nnnnnnnnnnnnnnnnnnnnnnnn",
         .handle = "",
-        .uri = "at://did:plc:nnnnnnnnnnnnnnnnnnnnnnnn/app.bsky.feed.post/3snap",
+        .uri = "at://did:plc:nnnnnnnnnnnnnnnnnnnnnnnn/app.zat4.feed.post/3snap",
         .cid = "bafyreisnaplive",
         .text = "survives the disk",
         .reply_parent_cid = "",

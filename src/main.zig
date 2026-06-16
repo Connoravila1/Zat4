@@ -1,7 +1,7 @@
 //! B1 classification: SHELL. Program entry — wires the process allocator and
-//! Io capability, then runs the current-frontier demo. Phase 2: resolve a
-//! handle, then fetch its profile over XRPC and decode into a typed lexicon
-//! record.
+//! Io capability, then runs the interactive client. Resolves a handle to an
+//! identity, then (with credentials) logs in to the user's own PDS and runs
+//! the timeline screen, which reads from the Zat4 AppView (ZAT4_APPVIEW).
 //!
 //! Usage:  zat [handle]        (default handle: bsky.app)
 //!
@@ -11,19 +11,14 @@
 
 const std = @import("std");
 const identity = @import("shell/identity.zig");
-const xrpc = @import("shell/xrpc.zig");
 const auth = @import("shell/auth.zig");
 const feed_shell = @import("shell/feed.zig");
 const feed_core = @import("core/feed.zig");
 const shell_tui = @import("shell/tui.zig");
 const cache_shell = @import("shell/cache.zig");
+const config = @import("shell/config.zig");
 const window_shell = @import("shell/native.zig");
 const lexicon = @import("core/lexicon.zig");
-
-/// The public AppView for unauthenticated reads. A demo choice made HERE,
-/// by the caller — the xrpc module is host-agnostic, so the decentralized
-/// "host is never hardcoded" property survives in every module below main.
-const public_appview = "https://public.api.bsky.app";
 
 /// Trim display text to `max` bytes without splitting a UTF-8 sequence.
 fn truncate(text: []const u8, max: usize) []const u8 {
@@ -97,40 +92,18 @@ pub fn main(init: std.process.Init) !void {
     , .{ id.handle, id.did, id.pds_url, id.signing_key_multibase });
     try out.flush();
 
-    const outcome = try xrpc.query(arena, io, init.environ_map, public_appview, lexicon.method.get_profile, &.{
-        .{ .name = "actor", .value = id.did },
-    }, lexicon.ProfileViewDetailed, .{});
-
-    switch (outcome) {
-        .ok => |profile| try out.print(
-            \\profile via XRPC (Phase 2)
-            \\  display name: {s}
-            \\  followers:    {d}
-            \\  following:    {d}
-            \\  posts:        {d}
-            \\
-        , .{
-            profile.displayName orelse "(none)",
-            profile.followersCount,
-            profile.followsCount,
-            profile.postsCount,
-        }),
-        .failed => |failure| {
-            try out.print("xrpc refused: status {d} {s}: {s}\n", .{
-                failure.status, failure.code, failure.message,
-            });
-            try out.flush();
-            return error.ProfileFetchFailed;
-        },
-    }
-    try out.flush();
-
     // Phase 3 demo, gated on credentials in the environment (capability-
     // passed — 0.16 has no global getenv, fittingly for this project):
     //   ZAT_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx zat your.handle
     // ZAT_IDENTIFIER overrides the login identifier if it differs from the
     // resolved handle.
     const env = init.environ_map;
+
+    // Phase B: the one endpoint-config seat. Reads (timeline, profile) go to
+    // the Zat4 AppView at this URL; writes/auth stay on the user's own PDS.
+    // Defaults to a loopback stub; ZAT4_APPVIEW overrides it (a Hetzner box
+    // is an env change, never a recompile).
+    const endpoints = config.fromEnv(env);
 
     // Phase 8: a cached session (a 0600 file) skips the login round-trip
     // for the screen — deleting the file IS the logout. The print demo
@@ -150,7 +123,7 @@ pub fn main(init: std.process.Init) !void {
                 defer _ = cache_shell.saveStore(gpa, env, &store); // E4
                 const opened = try openBackend(gpa, env, out, window_mode);
                 defer if (opened.win) |w| window_shell.close(w);
-                shell_tui.run(gpa, io, env, &session, &store, opened.backend) catch |err| switch (err) {
+                shell_tui.run(gpa, io, env, &session, endpoints.appview_url, &store, opened.backend) catch |err| switch (err) {
                     error.NotATerminal => {
                         try out.print("--tui needs an interactive terminal (a real stdin/stdout tty)\n", .{});
                         try out.flush();
@@ -191,7 +164,7 @@ pub fn main(init: std.process.Init) !void {
                     };
                     const opened = try openBackend(gpa, env, out, window_mode);
                     defer if (opened.win) |w| window_shell.close(w);
-                    shell_tui.run(gpa, io, env, &session, &store, opened.backend) catch |err| switch (err) {
+                    shell_tui.run(gpa, io, env, &session, endpoints.appview_url, &store, opened.backend) catch |err| switch (err) {
                         error.NotATerminal => {
                             try out.print("--tui needs an interactive terminal (a real stdin/stdout tty)\n", .{});
                             try out.flush();
@@ -228,7 +201,7 @@ pub fn main(init: std.process.Init) !void {
                 var page: u32 = 0;
                 while (page < 2) : (page += 1) {
                     if (page > 0 and feed_core.nextCursor(&store).len == 0) break;
-                    const loaded = try feed_shell.loadTimelinePage(gpa, arena, io, env, &session, &store, 25);
+                    const loaded = try feed_shell.loadTimelinePage(gpa, arena, io, env, &session, endpoints.appview_url, &store, 25);
                     switch (loaded) {
                         .failed => |failure| {
                             try out.print("getTimeline refused: status {d} {s}: {s}\n", .{
@@ -287,6 +260,7 @@ test {
     _ = @import("shell/xrpc.zig");
     _ = @import("shell/auth.zig");
     _ = @import("core/feed.zig");
+    _ = @import("core/appview.zig");
     _ = @import("core/moderation.zig");
     _ = @import("core/tui.zig");
     _ = @import("core/timeline_ui.zig");
@@ -300,15 +274,27 @@ test {
     _ = @import("core/layout.zig");
     _ = @import("core/raster.zig");
     _ = @import("core/text.zig");
+    _ = @import("core/atlas.zig");
+    _ = @import("core/glyph_field.zig");
     _ = @import("core/x11.zig");
     _ = @import("core/win32.zig");
     _ = @import("core/textinput.zig");
     _ = @import("core/appkit.zig");
     _ = @import("shell/cache.zig");
+    _ = @import("shell/config.zig");
+    _ = @import("shell/appview_ingest.zig");
+    _ = @import("shell/appview_serve.zig");
     _ = @import("shell/clock.zig");
     _ = @import("shell/window.zig");
     _ = @import("shell/stream.zig");
     _ = @import("shell/write.zig");
+    _ = @import("shell/write_worker.zig");
+    _ = @import("core/pow.zig");
+    _ = @import("shell/pow.zig");
+    _ = @import("core/credential.zig");
+    _ = @import("shell/credential.zig");
+    _ = @import("core/membership.zig");
+    _ = @import("shell/membership.zig");
     _ = @import("shell/feed.zig");
     _ = @import("shell/tui.zig");
 }

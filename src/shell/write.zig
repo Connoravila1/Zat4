@@ -19,6 +19,8 @@ const xrpc = @import("xrpc.zig");
 const compose = @import("../core/compose.zig");
 const feed_core = @import("../core/feed.zig");
 const lexicon = @import("../core/lexicon.zig");
+const pow = @import("../core/pow.zig");
+const pow_shell = @import("pow.zig");
 
 /// What a write resolves to: the created record's (uri, cid) — slices
 /// owned by the caller's arena — or the server's refusal.
@@ -90,6 +92,23 @@ pub fn createPost(
         } else null,
         .facets = if (facets.len > 0) facets else null,
     };
+
+    // ── Volume tax (ANTIBOT Layer 4): pay the memory-hard PoW before the
+    // post goes out. Standardized to one easy difficulty for the prototype
+    // (DESIGN §6.1 calibration deferred). The work is bound to THIS post's
+    // content via the seed, so it cannot be precomputed and reused.
+    //
+    // PROTOTYPE SCOPE: this is a CLIENT-SIDE SELF-IMPOSED tax — no server
+    // issues or verifies the challenge yet (DESIGN §5 integration deferred),
+    // so it proves the mechanism end-to-end in the app but is not yet an
+    // enforced control (a modified client could skip it). The solved nonce
+    // is discarded for now; it will be attached to the createRecord envelope
+    // once a verifier exists. Solved inline because posting is an explicit,
+    // already-blocking submit; production moves this to a worker (§3.2).
+    const seed = pow.seedForPost(text, now_epoch);
+    const difficulty = pow.difficultyFor(.light) orelse unreachable; // .light always has one
+    _ = try pow_shell.payTax(gpa, io, seed, difficulty);
+
     return createRecord(gpa, arena, io, environ, session, lexicon.collection.post, record);
 }
 
@@ -165,7 +184,7 @@ pub fn resolveFacets(
         const raw = text[span.byte_start..span.byte_end];
         const feature: ?lexicon.FacetFeature = switch (span.kind) {
             .link => .{
-                .@"$type" = "app.bsky.richtext.facet#link",
+                .@"$type" = lexicon.richtext.facet_link,
                 .uri = raw,
             },
             .mention => blk: {
@@ -183,7 +202,7 @@ pub fn resolveFacets(
                     .ok => |resolved| {
                         if (resolved.did.len == 0) break :blk null;
                         break :blk .{
-                            .@"$type" = "app.bsky.richtext.facet#mention",
+                            .@"$type" = lexicon.richtext.facet_mention,
                             .did = resolved.did,
                         };
                     },
@@ -238,15 +257,15 @@ test "loopback round trip: faceted reply posted with exact wire body, then a lik
                 .must_contain_body = "\"did\":\"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa\"",
                 .status = .ok,
                 .body =
-                \\{"uri":"at://did:plc:cccccccccccccccccccccccc/app.bsky.feed.post/3knew1","cid":"bafyreinewpost"}
+                \\{"uri":"at://did:plc:cccccccccccccccccccccccc/app.zat4.feed.post/3knew1","cid":"bafyreinewpost"}
                 ,
             },
             .{
                 .must_contain_head = "POST /xrpc/com.atproto.repo.createRecord",
-                .must_contain_body = "\"$type\":\"app.bsky.feed.like\"",
+                .must_contain_body = "\"$type\":\"app.zat4.feed.like\"",
                 .status = .ok,
                 .body =
-                \\{"uri":"at://did:plc:cccccccccccccccccccccccc/app.bsky.feed.like/3klike1","cid":"bafyreilike"}
+                \\{"uri":"at://did:plc:cccccccccccccccccccccccc/app.zat4.feed.like/3klike1","cid":"bafyreilike"}
                 ,
             },
         },
@@ -276,9 +295,9 @@ test "loopback round trip: faceted reply posted with exact wire body, then a lik
     );
 
     const posted = try createPost(gpa, arena, io, null, &session, text, facets, .{
-        .root_uri = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/3kali1",
+        .root_uri = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.zat4.feed.post/3kali1",
         .root_cid = "bafyreialice1",
-        .parent_uri = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/3kali1",
+        .parent_uri = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.zat4.feed.post/3kali1",
         .parent_cid = "bafyreialice1",
     }, 1_767_323_045);
     try std.testing.expectEqualStrings("bafyreinewpost", posted.ok.cid);
@@ -290,7 +309,7 @@ test "loopback round trip: faceted reply posted with exact wire body, then a lik
         io,
         null,
         &session,
-        "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/3kali1",
+        "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.zat4.feed.post/3kali1",
         "bafyreialice1",
         1_767_323_045,
     );
@@ -365,6 +384,10 @@ pub fn unrepostPost(
 }
 
 test "write: uriParts splits an at-uri and refuses malformed ones" {
+    // Deliberately uses an app.bsky collection: uriParts must parse ANY
+    // at-uri the network hands it (replies/likes can reference records in
+    // any namespace), so this test is namespace-agnostic on purpose — it is
+    // the one place an app.bsky string is correct, and is NOT a wall leak.
     const p = uriParts("at://did:plc:abc/app.bsky.feed.like/3kxyz").?;
     try std.testing.expectEqualStrings("app.bsky.feed.like", p.collection);
     try std.testing.expectEqualStrings("3kxyz", p.rkey);

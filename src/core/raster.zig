@@ -88,6 +88,24 @@ pub const RectItem = struct {
     }
 };
 
+/// One straight stroke between two signed points, alpha-blended, with a
+/// square pen of `thickness` px — the primitive vector icons (reply,
+/// repost, heart) are built from. HOT → A7.
+pub const LineItem = struct {
+    x0: i16,
+    y0: i16,
+    x1: i16,
+    y1: i16,
+    color: u32,
+    thickness: u8,
+    _pad: [3]u8 = @splat(0), // A6: explicit
+
+    comptime {
+        // Budget: 2+2+2+2 + 4 + 1 + 3 pad = 16 bytes, exact (A7).
+        assert(@sizeOf(LineItem) == 16);
+    }
+};
+
 /// The paint vocabulary. Each variant is guarded above; the union's
 /// bare payload is their common 16 bytes, the tag rides its own SoA
 /// array (MultiArrayList splits tagged unions exactly this way).
@@ -95,6 +113,7 @@ pub const DrawItem = union(enum) {
     cell: CellItem,
     text: TextItem,
     rect: RectItem,
+    line: LineItem,
 };
 
 /// The frame's draw list: struct-of-arrays (tags / payloads) of
@@ -146,6 +165,7 @@ pub fn paint(
             drawCell(fb, it.x, it.y, it.codepoint, it.fg, it.bg);
         },
         .rect => drawRect(fb, bare.rect),
+        .line => drawLine(fb, bare.line),
         .text => if (engine) |e| {
             const it = bare.text;
             const g = try text.glyph(gpa, e, @enumFromInt(it.weight), it.codepoint, it.px);
@@ -170,6 +190,51 @@ fn drawCoverage(fb: *Framebuffer, x: i32, y: i32, g: text.GlyphRaster, color: u3
             if (a == 0) continue;
             const at = @as(usize, @intCast(py)) * fb.width + @as(usize, @intCast(px));
             fb.pixels[at] = if (a == 255) (color | 0xFF000000) else blend(color, fb.pixels[at], a);
+        }
+    }
+}
+
+/// Bresenham stroke with a square pen, alpha-blended and clipped. Built
+/// for small UI icons, not long fills (those are RectItems).
+fn drawLine(fb: *Framebuffer, it: LineItem) void {
+    var x0: i32 = it.x0;
+    var y0: i32 = it.y0;
+    const x1: i32 = it.x1;
+    const y1: i32 = it.y1;
+    const dx: i32 = if (x1 > x0) x1 - x0 else x0 - x1;
+    const dy: i32 = if (y1 > y0) -(y1 - y0) else -(y0 - y1);
+    const sx: i32 = if (x0 < x1) 1 else -1;
+    const sy: i32 = if (y0 < y1) 1 else -1;
+    var err: i32 = dx + dy;
+    const t: i32 = @max(1, @as(i32, it.thickness));
+    const half: i32 = @divTrunc(t, 2);
+    while (true) {
+        penDot(fb, x0, y0, half, it.color);
+        if (x0 == x1 and y0 == y1) break;
+        const e2: i32 = 2 * err;
+        if (e2 >= dy) {
+            err += dy;
+            x0 += sx;
+        }
+        if (e2 <= dx) {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+fn penDot(fb: *Framebuffer, cx: i32, cy: i32, half: i32, color: u32) void {
+    const a: u32 = color >> 24;
+    if (a == 0) return;
+    var oy: i32 = -half;
+    while (oy <= half) : (oy += 1) {
+        var ox: i32 = -half;
+        while (ox <= half) : (ox += 1) {
+            const px = cx + ox;
+            const py = cy + oy;
+            if (px < 0 or py < 0 or px >= fb.width or py >= fb.height) continue;
+            const at = @as(usize, @intCast(py)) * fb.width + @as(usize, @intCast(px));
+            fb.pixels[at] = if (a == 0xFF) (color | 0xFF000000) else blend(color, fb.pixels[at], a);
         }
     }
 }
@@ -244,11 +309,98 @@ fn blend(fg: u32, bg: u32, a: u32) u32 {
     return out;
 }
 
+/// The inclusive band of rows that changed between two frames. A7.2: cold,
+/// waived — a transient result returned by value, one per blit, never held
+/// in a collection.
+pub const Band = struct {
+    first: u32,
+    last: u32,
+};
+
+/// Pure: the inclusive row range where `new` differs from `old` — both
+/// row-major ARGB, `w` wide and `h` tall — or null if the two frames are
+/// pixel-identical. Scans top-down for the first changed row, then bottom-up
+/// for the last, so the band is exactly the rows that moved and the rows
+/// BETWEEN the change and each edge are never compared. No I/O, no
+/// allocation: this is just the decision the shell's blit acts on, kept here
+/// in the pure core so a frame's changed region is checkable WITHOUT an X
+/// server (the X-window session's hard-won lesson — make the thing
+/// observable and test it strictly). B2.
+///
+/// Cost, measured (bench "blit damage", 1280x800): a CHANGED frame scans
+/// from each edge inward to the change (~0.34 ms when the change sits near
+/// the middle — most rows still get compared); an UNCHANGED frame must
+/// compare every row to conclude "no change" (~0.36 ms). Both are ~2% of a
+/// 60 fps budget and, crucially, are cheap LOCAL memcmp that never blocks —
+/// which is the whole point: they replace a full-frame PutImage (megabytes
+/// over the X socket, and a write that BLOCKS the loop when the socket backs
+/// up). raster.paint rewrites the whole framebuffer each frame, but the
+/// resulting PIXELS barely move — only the animating region (the heart, a
+/// few rows) actually changes — so sending just this band turns ~4 MB/frame
+/// into a few hundred KB and removes the blocking write that stuttered the
+/// animation and let clicks queue behind it. (G1: the bench carries the
+/// number; G3: the scan is trivial against the socket I/O it saves.)
+pub fn damageBand(old: []const u32, new: []const u32, w: u32, h: u32) ?Band {
+    assert(old.len == new.len);
+    if (w == 0 or h == 0) return null;
+    var first: u32 = 0;
+    while (first < h) : (first += 1) {
+        const a = new[first * w ..][0..w];
+        const b = old[first * w ..][0..w];
+        if (!std.mem.eql(u32, a, b)) break;
+    }
+    if (first == h) return null; // identical — the caller skips the blit
+
+    var last: u32 = h - 1;
+    while (last > first) : (last -= 1) {
+        const a = new[last * w ..][0..w];
+        const b = old[last * w ..][0..w];
+        if (!std.mem.eql(u32, a, b)) break;
+    }
+    return .{ .first = first, .last = last };
+}
+
 // ---------------------------------------------------------------------------
 // Tests (B2, C6)
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "damageBand: identical frames report no damage" {
+    const w: u32 = 8;
+    const h: u32 = 6;
+    var a = [_]u32{0xFF101014} ** (8 * 6);
+    const b = [_]u32{0xFF101014} ** (8 * 6);
+    try testing.expectEqual(@as(?Band, null), damageBand(&a, &b, w, h));
+    // A no-op write must also be reported clean (defends the skip path).
+    a[0] = 0xFF101014;
+    try testing.expectEqual(@as(?Band, null), damageBand(&a, &b, w, h));
+}
+
+test "damageBand: a single changed row is the whole band" {
+    const w: u32 = 8;
+    const h: u32 = 6;
+    const old = [_]u32{0} ** (8 * 6);
+    var new = [_]u32{0} ** (8 * 6);
+    new[3 * w + 2] = 0xFFFFFFFF; // one pixel on row 3
+    const band = damageBand(&old, &new, w, h) orelse return error.ExpectedDamage;
+    try testing.expectEqual(@as(u32, 3), band.first);
+    try testing.expectEqual(@as(u32, 3), band.last);
+}
+
+test "damageBand: spans from the first to the last changed row only" {
+    const w: u32 = 8;
+    const h: u32 = 10;
+    const old = [_]u32{0} ** (8 * 10);
+    var new = [_]u32{0} ** (8 * 10);
+    new[2 * w + 0] = 1; // row 2
+    new[7 * w + 5] = 1; // row 7 — rows 0,1 and 8,9 unchanged
+    const band = damageBand(&old, &new, w, h) orelse return error.ExpectedDamage;
+    try testing.expectEqual(@as(u32, 2), band.first);
+    try testing.expectEqual(@as(u32, 7), band.last);
+    // The band is the rows actually touched, not the whole frame.
+    try testing.expect(band.first > 0 and band.last < h - 1);
+}
 
 test "paint: a glyph lands pixel-exact against the strike itself" {
     const gpa = testing.allocator; // C6

@@ -2,7 +2,7 @@
 //!
 //! Interface, in full: `Param`, `Failure`, `Outcome`, `query`, `procedure`.
 //! XRPC is atproto's RPC-over-HTTP — queries are GET, procedures are POST,
-//! methods are NSIDs like `app.bsky.feed.getTimeline`. How URLs are spelled,
+//! methods are NSIDs like `app.zat4.feed.getTimeline`. How URLs are spelled,
 //! how values are escaped, how JSON becomes typed records, what an error
 //! body looks like — all of that is the sealed wire-format decision living
 //! in src/core/xrpc.zig, internal to this module (D2/D3). Callers hand in
@@ -149,7 +149,7 @@ test "loopback round trip: query -> typed lexicon record (params escaped on the 
     var bound = try listenLoopback(io, 38560);
     defer bound.server.deinit(io);
     const steps = [_]fixture.ScriptStep{.{
-        .must_contain_head = "/xrpc/app.bsky.actor.getProfile?actor=alice.test",
+        .must_contain_head = "/xrpc/app.zat4.actor.getProfile?actor=alice.test",
         .status = .ok,
         .body = profile_fixture,
     }};
@@ -179,7 +179,7 @@ test "loopback round trip: server refusal becomes a Failure value, not a Zig err
     var bound = try listenLoopback(io, 38582);
     defer bound.server.deinit(io);
     const steps = [_]fixture.ScriptStep{.{
-        .must_contain_head = "/xrpc/app.bsky.actor.getProfile?actor=missing.test",
+        .must_contain_head = "/xrpc/app.zat4.actor.getProfile?actor=missing.test",
         .status = .bad_request,
         .body =
         \\{"error":"InvalidRequest","message":"Profile not found"}

@@ -1,0 +1,105 @@
+//! Headless render preview (a dev tool — shell-side I/O, not in the app
+//! graph). It drives the REAL core path — feed_view.layout → raster.paint
+//! — into an in-memory framebuffer and writes it as a PPM, so the premium
+//! feed can be eyeballed without an X server. `zig build preview`.
+
+const std = @import("std");
+const text = @import("core/text.zig");
+const raster = @import("core/raster.zig");
+const feed_view = @import("core/feed_view.zig");
+const feed = @import("core/feed.zig");
+const field = @import("core/field.zig");
+
+const W: u32 = 1280;
+const H: u32 = 880;
+const clear: u32 = 0xFF181812;
+const cell_w: u16 = 11;
+const cell_h: u16 = 17;
+
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+
+    var engine = try text.initEngine();
+    defer text.deinitEngine(gpa, &engine);
+
+    var fb: raster.Framebuffer = .{};
+    try raster.resize(gpa, &fb, W, H, clear);
+    defer raster.deinit(gpa, &fb);
+
+    var dl: raster.DrawList = .{};
+    defer dl.deinit(gpa);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Background: the static ambient field, lit and composed exactly as the
+    // live window does (just without the per-frame clock).
+    const cols: u16 = @intCast(W / cell_w);
+    const rows: u16 = @intCast(H / cell_h);
+    var f: field.Field = .{};
+    try field.init(gpa, &f, cols, rows);
+    defer field.deinit(gpa, &f);
+    field.fillAmbient(&f);
+    var particles: field.ParticleList = .{};
+    defer particles.deinit(gpa);
+    const light: field.Light = .{
+        .x = @floatFromInt(cols / 2),
+        .y = @floatFromInt(rows / 4),
+        .radius = @floatFromInt(cols),
+        .ambient = 0.30,
+    };
+    try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
+
+    // Drive the REAL path: plain TimelineItems → fromTimeline → PostViews,
+    // exactly as the live window does (the only difference is the source of
+    // the items). created_at values are now-relative so the ages render.
+    const now: i64 = 1_000_000;
+    const items = [_]feed.TimelineItem{
+        mk("mara.zat", "Mara Vesper", "the whole point of a small network is that you can actually read the room. ten thousand strangers isn't a room, it's weather.", now - 120, 48, 9, 6, true, false),
+        mk("fieldnotes.zat", "field notes", "shipped the lighting pass tonight. the letters catch the light now, and the whole field moves when you touch it.", now - 840, 121, 31, 12, false, true),
+        mk("oko.zat", "Okonkwo", "monospace is the most honest a feed can be. same column, same weight, nobody shouts louder by being wider.", now - 3600, 73, 18, 24, false, false),
+        mk("lune.zat", "lune", "woke up to the field still drifting where i left it. it kept the light on.", now - 10800, 39, 7, 3, false, false),
+    };
+    const posts = try feed_view.fromTimeline(arena, &items, now);
+
+    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null);
+    try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    var hdr: [32]u8 = undefined;
+    try buf.appendSlice(gpa, try std.fmt.bufPrint(&hdr, "P6\n{d} {d}\n255\n", .{ fb.width, fb.height }));
+    for (fb.pixels) |px| {
+        try buf.append(gpa, @intCast((px >> 16) & 0xFF));
+        try buf.append(gpa, @intCast((px >> 8) & 0xFF));
+        try buf.append(gpa, @intCast(px & 0xFF));
+    }
+    const io = init.io;
+    const file = try std.Io.Dir.createFileAbsolute(io, "/tmp/zat_preview.ppm", .{});
+    defer file.close(io);
+    var wbuf: [16384]u8 = undefined;
+    var fw = file.writer(io, &wbuf);
+    try fw.interface.writeAll(buf.items);
+    try fw.interface.flush();
+    std.debug.print("wrote /tmp/zat_preview.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
+}
+
+fn mk(handle: []const u8, name: []const u8, body: []const u8, created: i64, like: u32, boost: u32, reply: u32, liked: bool, reposted: bool) feed.TimelineItem {
+    return .{
+        .uri = "",
+        .cid = "",
+        .author_handle = handle,
+        .author_display_name = name,
+        .reposted_by_handle = "",
+        .replying_to_handle = "",
+        .text = body,
+        .created_at = created,
+        .like_count = like,
+        .repost_count = boost,
+        .reply_count = reply,
+        .quote_count = 0,
+        .label_flags = .{},
+        .item_flags = .{ .viewer_liked = liked, .viewer_reposted = reposted },
+    };
+}

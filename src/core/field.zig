@@ -177,6 +177,52 @@ pub fn writeText(f: *Field, x: u16, y: u16, fg: u8, str: []const u8) void {
     }
 }
 
+/// Fill the whole content grid with a STATIC faint glyph texture — the
+/// living "material" the premium feed rides on. ASCII ramp (the grid is
+/// u8 glyphs), deterministic from cell position, no time term: at rest the
+/// frame is unchanged so the blit is skipped (the damage band sees nothing)
+/// — the field only costs anything when an effect actually perturbs it.
+/// fg = 5 (faint) and no text flag, so compose lets dark cells starve and
+/// the light pools, exactly like the mockup. Overwrites prior content.
+/// The ASCII density ramp for the ambient field, lightest→densest. Shared
+/// (not private) so the GPU field shader in shell/gpu.zig packs exactly
+/// these glyphs in this order — one source of truth, no drift between the
+/// software texture and the GPU one.
+pub const ambient_ramp = ".:;+=*o%#";
+
+/// A LONGER ramp for the GPU field — lightest→densest, with letters in the
+/// mid range (c o x s z e a) the way the desktop mockup's field does, so the
+/// surface reads as varied organic symbols forming swirls, not one repeated
+/// mark. CODEPOINTS (u21), not bytes — the GPU strip builder rasterizes each
+/// through the font engine, so non-ASCII marks like ₿ are fine here (unlike
+/// the CPU `ambient_ramp`, which must stay u8/ASCII — CLAUDE.md §7). Leading
+/// space = a truly empty lowest level.
+pub const ambient_ramp_rich = [_]u21{ ' ', '.', ',', ':', ';', '+', '=', '*', 'c', 'o', 'x', 's', 'z', 'e', 'a', '₿', '%', '@', '#' };
+
+pub fn fillAmbient(f: *Field) void {
+    const ramp = ambient_ramp; // ASCII, only the denser pools carry a glyph
+    var y: u16 = 0;
+    while (y < f.rows) : (y += 1) {
+        var x: u16 = 0;
+        while (x < f.cols) : (x += 1) {
+            const fx: f32 = @floatFromInt(x);
+            const fy: f32 = @floatFromInt(y);
+            // two static wave systems → coherent interference, multiplied so
+            // most cells stay EMPTY; only the denser pools show a faint glyph.
+            const a = std.math.sin(fx * 0.30 + fy * 0.19) * 0.5 + 0.5;
+            const b = std.math.sin(fx * 0.12 - fy * 0.37) * 0.5 + 0.5;
+            const n = a * b;
+            if (n < 0.34) {
+                f.content[index(f, x, y)] = ContentCell.empty; // sparse: leave it dark
+                continue;
+            }
+            const t = (n - 0.34) / 0.66; // 0..1 above the floor
+            const li: usize = @intFromFloat(@min(@as(f32, @floatFromInt(ramp.len - 1)), t * @as(f32, @floatFromInt(ramp.len))));
+            f.content[index(f, x, y)] = .{ .glyph = ramp[li], .fg = 5, .flags = .{} };
+        }
+    }
+}
+
 pub fn writeDivider(f: *Field, y: u16, fg: u8, glyph: u8) void {
     if (y >= f.rows) return;
     var x: u16 = 0;
@@ -214,8 +260,11 @@ pub const KindRule = struct {
 /// (design §12.1). The STRUCTURE is the decision; these are defaults.
 pub const kinds = [_]KindRule{
     // 0 spark: the like-burst workhorse — falls, drags, shoves letters,
-    //          pops dividers, bounces off fixed chrome.
-    .{ .gravity = 14.0, .drag = 1.6, .on_text = .nudge, .on_divider = .scatter, .speed_scale = 0.16, .life_s = 1.1 },
+    //          pops dividers, bounces off fixed chrome. life is kept close to
+    //          the like effect's own length so the sparks RESOLVE with the
+    //          heart instead of drifting on after it ends (a defined finish).
+    //          [TUNE] — pair with the like recipe's total duration.
+    .{ .gravity = 14.0, .drag = 1.6, .on_text = .nudge, .on_divider = .scatter, .speed_scale = 0.16, .life_s = 0.5 },
     // 1 ember: pure light — ignites whatever it crosses, never moves it.
     .{ .gravity = 2.0, .drag = 3.0, .on_text = .ignite, .on_divider = .ignite, .speed_scale = 0.10, .life_s = 0.8 },
     // 2 mote: implode fuel — flies to its target and is absorbed on the
@@ -488,15 +537,29 @@ pub const Light = struct {
     ambient: f32, // 0..1 floor of the scene
 };
 
+/// The field's background fill — the warm near-black the framebuffer is
+/// cleared to before glyphs are drawn. ONE seat for the look (D1/D6): the
+/// shell's present calls read this instead of repeating a literal, so a
+/// background change is a single edit. Dark mode is the default; a light
+/// mode, if it ever lands, is a second named constant chosen here.
+/// 0xAARRGGGB — #181812, a warm grey that is almost black.
+pub const background: u32 = 0xFF181812;
+
 /// The field's palette (indexed by ContentCell.fg). Comptime data, not
-/// a dependency (F2). G.0's visual pass owns the final values.
+/// a dependency (F2). G.0's visual pass owns the final values — this is
+/// the warm-dark set tuned on `background` (#181812): neutrals pulled off
+/// the blue axis to a warm grey, the accent an amber signature (NOT the
+/// Bluesky blue), boost/like warmed to sit on the near-black. Contrast on
+/// #181812 was measured (G1): ink 14.8:1, dim 6.0:1, accent 9.7:1,
+/// boost 9.9:1, like 5.7:1, faint 3.1:1 — each clears its role's WCAG
+/// floor (4.5 body, 3.0 UI/large).
 pub const palette = [_]u32{
-    0xFF8B94A3, // 0 dim
-    0xFFE7EAF0, // 1 ink
-    0xFF6CA8FF, // 2 accent
-    0xFF7BD88F, // 3 boost
-    0xFFFF6B81, // 4 like
-    0xFF5C6470, // 5 faint
+    0xFF9A968A, // 0 dim    — warm grey, secondary text
+    0xFFEDEAE0, // 1 ink    — warm off-white, primary text
+    0xFFE8B84B, // 2 accent — amber, the app's signature
+    0xFF8FD18F, // 3 boost  — repost green
+    0xFFF0617A, // 4 like   — like red/pink
+    0xFF6A655A, // 5 faint  — warm faint, dividers/timestamps
 };
 
 /// PURE (B2): (content, perturb, particles, light, cell metrics) → cell
@@ -547,21 +610,28 @@ pub fn compose(
         }
     }
     // Particles draw on top at their continuous positions, rounded to
-    // cells (§6) — bright, unfloored, transient.
+    // cells (§6). They FADE OUT over their final moments rather than
+    // vanishing at full brightness — a particle that pops out of existence
+    // reads as a stutter; one that dims away is fluid and gives the burst a
+    // defined finish. The window is fixed remaining-life, so it works for any
+    // particle lifetime. [TUNE: fade window.]
     const xs = particles.items(.x);
     const ys = particles.items(.y);
     const glyphs = particles.items(.glyph);
-    for (xs, ys, glyphs) |fx, fy, glyph| {
+    const lifes = particles.items(.life);
+    const fade_window: f32 = 0.22; // seconds of remaining life over which to dim
+    for (xs, ys, glyphs, lifes) |fx, fy, glyph, life| {
         if (fx < 0 or fy < 0) continue;
         const px: i32 = @intFromFloat(fx * @as(f32, @floatFromInt(cell_w)));
         const py: i32 = @intFromFloat(fy * @as(f32, @floatFromInt(cell_h)));
         if (px < 0 or py < 0) continue;
+        const fade: f32 = std.math.clamp(life / fade_window, 0.0, 1.0);
         const baseline: i32 = py + @divTrunc(@as(i32, cell_h) * 78, 100);
         try dl.append(gpa, .{ .text = .{
             .x = @intCast(std.math.clamp(px, -32768, 32767)),
             .baseline = @intCast(std.math.clamp(baseline, -32768, 32767)),
             .codepoint = glyph,
-            .color = toneScale(0xFFFFE9B0, 1.0),
+            .color = toneScale(0xFFFFE9B0, fade),
             .px = cell_h,
             .weight = 0,
         } });
@@ -777,7 +847,12 @@ test "compose: text keeps its legibility floor in darkness; glyphs render at off
     try testing.expectEqual(@as(i16, 12), first.x);
     try testing.expectEqual(@as(u16, 16), first.px); // renders at the cell height
     const channel = first.color & 0xFF;
-    try testing.expect(channel >= @as(u32, @intFromFloat(0xF0 * 0.55)) - 8); // the §12.2 floor
+    // The §12.2 floor is ink_channel * 0.55. Derive the expected channel
+    // from the palette's ink entry (fg = 1) rather than a copied literal,
+    // so a palette retune can never silently break this guarantee — the
+    // floor is a constraint on the live colour, whatever it is.
+    const ink_blue: u32 = palette[1] & 0xFF;
+    try testing.expect(channel >= @as(u32, @intFromFloat(@as(f32, @floatFromInt(ink_blue)) * 0.55)) - 8); // the §12.2 floor
 }
 
 test "compose: each particle draws its OWN glyph (regression: not always particle 0's)" {

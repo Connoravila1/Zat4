@@ -35,6 +35,7 @@ pub fn loadTimelinePage(
     io: std.Io,
     environ: ?*const std.process.Environ.Map,
     session: *auth.Session,
+    appview_url: []const u8,
     store: *feed_core.Store,
     limit: u32,
 ) !PageOutcome {
@@ -53,12 +54,13 @@ pub fn loadTimelinePage(
         params_len += 1;
     }
 
-    const outcome = try auth.query(
+    const outcome = try auth.queryHost(
         gpa,
         arena,
         io,
         environ,
         session,
+        appview_url,
         lexicon.method.get_timeline,
         params_buf[0..params_len],
         lexicon.TimelinePage,
@@ -79,6 +81,7 @@ pub fn refreshTimeline(
     io: std.Io,
     environ: ?*const std.process.Environ.Map,
     session: *auth.Session,
+    appview_url: []const u8,
     store: *feed_core.Store,
     limit: u32,
 ) !PageOutcome {
@@ -86,12 +89,13 @@ pub fn refreshTimeline(
     const limit_str = std.fmt.bufPrint(&limit_buf, "{d}", .{limit}) catch unreachable;
     const params = [_]xrpc.Param{.{ .name = "limit", .value = limit_str }};
 
-    const outcome = try auth.query(
+    const outcome = try auth.queryHost(
         gpa,
         arena,
         io,
         environ,
         session,
+        appview_url,
         lexicon.method.get_timeline,
         &params,
         lexicon.TimelinePage,
@@ -115,15 +119,15 @@ const listenLoopback = fixture.listenLoopback;
 
 const page_one_body =
     \\{"cursor":"CURSOR-1","feed":[
-    \\ {"post":{"uri":"at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/1",
+    \\ {"post":{"uri":"at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.zat4.feed.post/1",
     \\          "cid":"bafyreialice1",
     \\          "author":{"did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","handle":"alice.test","displayName":"Alice"},
-    \\          "record":{"$type":"app.bsky.feed.post","text":"first post","createdAt":"2026-01-02T03:04:05Z"},
+    \\          "record":{"$type":"app.zat4.feed.post","text":"first post","createdAt":"2026-01-02T03:04:05Z"},
     \\          "likeCount":3,"replyCount":0,"repostCount":0,"quoteCount":0}},
-    \\ {"post":{"uri":"at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/app.bsky.feed.post/1",
+    \\ {"post":{"uri":"at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/app.zat4.feed.post/1",
     \\          "cid":"bafyreibob1",
     \\          "author":{"did":"did:plc:bbbbbbbbbbbbbbbbbbbbbbbb","handle":"bob.test"},
-    \\          "record":{"$type":"app.bsky.feed.post","text":"hello","createdAt":"2026-01-02T04:00:00Z"},
+    \\          "record":{"$type":"app.zat4.feed.post","text":"hello","createdAt":"2026-01-02T04:00:00Z"},
     \\          "likeCount":1,"replyCount":0,"repostCount":0,"quoteCount":0}}
     \\]}
 ;
@@ -131,10 +135,10 @@ const page_one_body =
 // Page two repeats alice's post (already resident) and ends the feed.
 const page_two_body =
     \\{"feed":[
-    \\ {"post":{"uri":"at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/1",
+    \\ {"post":{"uri":"at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.zat4.feed.post/1",
     \\          "cid":"bafyreialice1",
     \\          "author":{"did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","handle":"alice.test","displayName":"Alice"},
-    \\          "record":{"$type":"app.bsky.feed.post","text":"first post","createdAt":"2026-01-02T03:04:05Z"},
+    \\          "record":{"$type":"app.zat4.feed.post","text":"first post","createdAt":"2026-01-02T03:04:05Z"},
     \\          "likeCount":3,"replyCount":0,"repostCount":0,"quoteCount":0}}
     \\]}
 ;
@@ -149,7 +153,7 @@ test "loopback round trip: paginated timeline load, cursor on the wire, cross-pa
         &bound.server, io,
         &[_]ScriptStep{
             .{
-                .must_contain_head = "GET /xrpc/app.bsky.feed.getTimeline?limit=2",
+                .must_contain_head = "GET /xrpc/app.zat4.feed.getTimeline?limit=2",
                 .must_contain_head_b = "authorization: Bearer access-1",
                 .status = .ok,
                 .body = page_one_body,
@@ -182,11 +186,11 @@ test "loopback round trip: paginated timeline load, cursor on the wire, cross-pa
     var store: feed_core.Store = .{};
     defer feed_core.deinitStore(gpa, &store);
 
-    const first = try loadTimelinePage(gpa, arena, io, null, &session, &store, 2);
+    const first = try loadTimelinePage(gpa, arena, io, null, &session, pds, &store, 2);
     try std.testing.expectEqual(@as(u32, 2), first.ok.posts_added);
     try std.testing.expectEqualStrings("CURSOR-1", feed_core.nextCursor(&store));
 
-    const second = try loadTimelinePage(gpa, arena, io, null, &session, &store, 2);
+    const second = try loadTimelinePage(gpa, arena, io, null, &session, pds, &store, 2);
     try std.testing.expectEqual(@as(u32, 0), second.ok.posts_added);
     try std.testing.expectEqual(@as(u32, 1), second.ok.posts_deduped); // A8 across pages
     try std.testing.expectEqualStrings("", feed_core.nextCursor(&store)); // feed exhausted
@@ -203,15 +207,15 @@ test "loopback round trip: paginated timeline load, cursor on the wire, cross-pa
 // A refresh page: one genuinely new post on top, then an already-seen row.
 const refresh_body =
     \\{"cursor":"MUST-NOT-REPLACE","feed":[
-    \\ {"post":{"uri":"at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/9",
+    \\ {"post":{"uri":"at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.zat4.feed.post/9",
     \\          "cid":"bafyreinewest",
     \\          "author":{"did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","handle":"alice.test","displayName":"Alice"},
-    \\          "record":{"$type":"app.bsky.feed.post","text":"the newest one","createdAt":"2026-01-03T00:00:00Z"},
+    \\          "record":{"$type":"app.zat4.feed.post","text":"the newest one","createdAt":"2026-01-03T00:00:00Z"},
     \\          "likeCount":0,"replyCount":0,"repostCount":0,"quoteCount":0}},
-    \\ {"post":{"uri":"at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/1",
+    \\ {"post":{"uri":"at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.zat4.feed.post/1",
     \\          "cid":"bafyreialice1",
     \\          "author":{"did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","handle":"alice.test","displayName":"Alice"},
-    \\          "record":{"$type":"app.bsky.feed.post","text":"first post","createdAt":"2026-01-02T03:04:05Z"},
+    \\          "record":{"$type":"app.zat4.feed.post","text":"first post","createdAt":"2026-01-02T03:04:05Z"},
     \\          "likeCount":3,"replyCount":0,"repostCount":0,"quoteCount":0}}
     \\]}
 ;
@@ -246,11 +250,11 @@ test "loopback refresh: new rows land on top, the pagination cursor survives" {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
 
-    const first = try loadTimelinePage(gpa, arena_state.allocator(), io, null, &session, &store, 30);
+    const first = try loadTimelinePage(gpa, arena_state.allocator(), io, null, &session, pds, &store, 30);
     try std.testing.expect(first == .ok);
     _ = arena_state.reset(.retain_capacity);
 
-    const refreshed = try refreshTimeline(gpa, arena_state.allocator(), io, null, &session, &store, 30);
+    const refreshed = try refreshTimeline(gpa, arena_state.allocator(), io, null, &session, pds, &store, 30);
     switch (refreshed) {
         .failed => return error.TestUnexpectedXrpcFailure,
         .ok => |stats| try std.testing.expectEqual(@as(u32, 1), stats.items_added),

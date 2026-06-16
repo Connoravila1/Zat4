@@ -101,7 +101,29 @@ pub fn query(
     params: []const xrpc.Param,
     comptime Response: type,
 ) !xrpc.Outcome(Response) {
-    const first = try xrpc.query(arena, io, environ, session.pds_url, nsid, params, Response, .{
+    return queryHost(gpa, arena, io, environ, session, session.pds_url, nsid, params, Response);
+}
+
+/// Authenticated XRPC query against an EXPLICIT host — the seam Phase B
+/// needs (STANDALONE_ROADMAP): reads target the Zat4 AppView, not the
+/// user's PDS, while still carrying the session's bearer token (the AppView
+/// authenticates the requester to serve a personalized timeline) and the
+/// same refresh-and-retry-once choreography. The token REFRESH still goes to
+/// the PDS inside `refreshInPlace` — refresh is a protocol operation on the
+/// user's own server, never on the AppView. `query` above is the PDS-host
+/// convenience over this.
+pub fn queryHost(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    session: *Session,
+    host: []const u8,
+    nsid: []const u8,
+    params: []const xrpc.Param,
+    comptime Response: type,
+) !xrpc.Outcome(Response) {
+    const first = try xrpc.query(arena, io, environ, host, nsid, params, Response, .{
         .authorization = try bearer(arena, session.access_jwt),
     });
     switch (first) {
@@ -112,7 +134,7 @@ pub fn query(
         .failed => |failure| return .{ .failed = failure },
         .ok => {},
     }
-    return xrpc.query(arena, io, environ, session.pds_url, nsid, params, Response, .{
+    return xrpc.query(arena, io, environ, host, nsid, params, Response, .{
         .authorization = try bearer(arena, session.access_jwt),
     });
 }

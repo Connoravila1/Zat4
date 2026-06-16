@@ -1,50 +1,117 @@
-//! B1 classification: CORE (pure data). Lexicon wire shapes.
+//! B1 classification: CORE (pure data). Lexicon wire shapes — THE
+//! NAMESPACE WALL (STANDALONE_ROADMAP Phase A). This module is the one
+//! seat that decides which lexicon Zat4 reads and writes; sealing it here
+//! (D1/D3) is what makes the wall a single-module change. Every other
+//! module asks for "posts," never for "`app.zat4` posts" — the namespace
+//! string appears in NO other module's signatures.
+//!
+//! THE WALL, made real: Zat4 content lives in the `app.zat4.*` collections,
+//! a disjoint universe from Bluesky's `app.bsky.*`. A Bluesky AppView does
+//! not index `app.zat4.*`, so Zat4 content never surfaces there; a Zat4
+//! client/AppView only reads `app.zat4.*`, so Bluesky content never
+//! surfaces here. The separation is STRUCTURAL — the namespace itself, not
+//! a runtime filter. `com.atproto.*` calls (createSession, createRecord,
+//! resolveHandle, …) STAY: those are protocol, shared by every atproto
+//! app, not Bluesky content.
+//!
+//! Phase A decisions, recorded deliberately (near-permanent — a published
+//! schema is very hard to change; treat with A7 gravity):
+//!  1. Own the AppView query methods too (`app.zat4.actor.getProfile`,
+//!     `app.zat4.feed.getTimeline`) — a total wall at every layer, not just
+//!     the record collections. Reads await the Phase C AppView (or a Phase
+//!     B endpoint repoint to a stub); writes already land in `app.zat4.*`
+//!     in the user's own repo via the protocol-level `createRecord`.
+//!  2. Profile is a FRESH `app.zat4.actor.profile` record (a self-contained
+//!     Zat4 identity), with an OPTIONAL one-time import of name/bio at
+//!     enrollment as a UX nicety — never an ongoing dependency. The user's
+//!     DID, handle, and follow graph carry over for free: they live in the
+//!     open network, not in Bluesky.
+//!  3. Versioning is NSID-as-version (the protocol's own convention): a
+//!     breaking change bumps the collection NSID under a NEW name; the shape
+//!     under a fixed name never silently changes. `revision` below records
+//!     the current rev. Adding an OPTIONAL field is backward-compatible and
+//!     does not bump it (E4 — an absent field is an ordinary state).
+//!     Removing or retyping a field is a break and earns a new NSID.
 //!
 //! Plain-data record types (A1: fields only, behavior nowhere near them)
-//! mirroring the atproto/Bluesky lexicon JSON this client actually consumes
-//! — nothing more (start narrow; expand on demand). Field names match the
-//! wire camelCase exactly: that is what lets std.json map them with zero
-//! glue code (F2 — comptime reflection instead of generated codecs). Wire
-//! fidelity deliberately wins over Zig naming style inside this file.
+//! mirroring the lexicon JSON this client consumes — nothing more (start
+//! narrow; expand on demand). Field names match the wire camelCase exactly:
+//! that is what lets std.json map them with zero glue code (F2 — comptime
+//! reflection instead of generated codecs). Wire fidelity deliberately wins
+//! over Zig naming style inside this file.
 //!
-//! Every field that the lexicon marks optional defaults here, so a document
+//! Every field the lexicon marks optional defaults here, so a document
 //! missing it still parses: lexicons evolve, and an absent field is an
 //! ordinary state, not an error (E4). Unknown fields are ignored at the
 //! decode site for the same reason.
 //!
 //! A7 stance, recorded for review: these structs are TRANSIENT PARSE
 //! TARGETS — one per response, slice-heavy, arena-bound, decomposed
-//! immediately. They are not the bulk-resident records. When Phase 4
-//! flattens responses into resident SoA collections (A3), THOSE record
-//! types (spans + u32 indexes, no slices) carry the exact-size guards.
-//! Hardening at that point, and not before, is F5 applied on purpose.
-//! Each struct below claims its A7.2 waiver individually.
+//! immediately. They are not the bulk-resident records. When responses are
+//! flattened into resident SoA collections (A3), THOSE record types (spans
+//! + u32 indexes, no slices) carry the exact-size guards. Hardening at that
+//! point, and not before, is F5 applied on purpose. Each struct below
+//! claims its A7.2 waiver individually.
+
+/// The lexicon revision (Phase A decision 3). NSID-as-version means this is
+/// for observability and future migration tooling, not a per-record field:
+/// records carry no version byte (that would bloat hot records for nothing).
+/// Bump only on a coordinated, documented schema change; an additive,
+/// optional-field change does not bump it. Not a record (a string const):
+/// A1/A7 do not apply.
+pub const revision = "zat4.2026-06-14";
 
 /// XRPC method NSIDs live beside the shapes they return, so a lexicon
 /// change lands in exactly one file (D6).
 pub const method = struct {
     // Not a record: a string-constant namespace (no fields). A1/A7 do not apply.
-    pub const get_profile = "app.bsky.actor.getProfile";
+
+    // Zat4 AppView query methods (Phase A decision 1 — owned, total wall).
+    // These resolve against the Zat4 AppView (Phase C); until it exists they
+    // 404 against any Bluesky endpoint, which is correct — Zat4 is not a
+    // Bluesky client.
+    pub const get_profile = "app.zat4.actor.getProfile";
+    pub const get_timeline = "app.zat4.feed.getTimeline";
+
+    // Protocol methods — shared by every atproto app, NOT Bluesky content.
+    // These stay exactly as they are (the wall self-check exempts them).
     pub const create_session = "com.atproto.server.createSession";
     pub const refresh_session = "com.atproto.server.refreshSession";
     pub const get_session = "com.atproto.server.getSession";
-    pub const get_timeline = "app.bsky.feed.getTimeline";
     pub const create_record = "com.atproto.repo.createRecord";
     pub const delete_record = "com.atproto.repo.deleteRecord";
     pub const resolve_handle = "com.atproto.identity.resolveHandle";
 };
 
-/// Record collections this client writes into.
+/// Record collections this client reads and writes — the wall itself.
+/// Changing these four values is what severs Zat4 from Bluesky; every
+/// production consumer references them symbolically, so the flip propagates
+/// from this one seat (the architecture's central promise, cashed in).
 pub const collection = struct {
-    // Not a record: an extern-fn namespace (no fields). A1/A7 do not apply.
+    // Not a record: a string-constant namespace (no fields). A1/A7 do not apply.
 
-    pub const post = "app.bsky.feed.post";
-    pub const like = "app.bsky.feed.like";
-    pub const repost = "app.bsky.feed.repost";
-    pub const follow = "app.bsky.graph.follow";
+    pub const post = "app.zat4.feed.post";
+    pub const like = "app.zat4.feed.like";
+    pub const repost = "app.zat4.feed.repost";
+    pub const follow = "app.zat4.graph.follow";
+    /// Fresh Zat4-native profile (Phase A decision 2). Self-contained; an
+    /// optional one-time import at enrollment may prefill its fields, but the
+    /// record is ours and depends on nothing in app.bsky.
+    pub const profile = "app.zat4.actor.profile";
 };
 
-/// Subset of `app.bsky.actor.defs#profileViewDetailed` we consume.
+/// Richtext facet `$type` discriminators. Zat4 defines its own richtext
+/// namespace (rather than reusing app.bsky.richtext) so NO app.bsky string
+/// appears on any production write path — the wall is total. The facet
+/// STRUCTURE (byte-offset index + a mention/link feature) is the same shape
+/// the whole network uses; only the namespace is ours.
+pub const richtext = struct {
+    // Not a record: a string-constant namespace (no fields). A1/A7 do not apply.
+    pub const facet_link = "app.zat4.richtext.facet#link";
+    pub const facet_mention = "app.zat4.richtext.facet#mention";
+};
+
+/// Subset of `app.zat4.actor.defs#profileViewDetailed` we consume.
 /// A7.2: cold struct, size guard waived — transient parse target (header note).
 pub const ProfileViewDetailed = struct {
     did: []const u8 = "",
@@ -93,7 +160,7 @@ pub const GetSessionResponse = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Feed wire shapes (`app.bsky.feed.getTimeline`). Same A7.2 stance as the
+// Feed wire shapes (`app.zat4.feed.getTimeline`). Same A7.2 stance as the
 // header: transient parse targets; the RESIDENT records with size guards
 // live in core/feed.zig. Wire unions (reply refs that may be notFound /
 // blocked, reasons that may be pins) are handled by defaulting: a variant
@@ -101,7 +168,7 @@ pub const GetSessionResponse = struct {
 // empty cid/did as "not there" (E4 — absence is an ordinary state).
 // ---------------------------------------------------------------------------
 
-/// Subset of `app.bsky.actor.defs#profileViewBasic`.
+/// Subset of `app.zat4.actor.defs#profileViewBasic`.
 /// A7.2: cold struct, size guard waived — transient parse target.
 pub const ProfileViewBasic = struct {
     did: []const u8 = "",
@@ -110,7 +177,7 @@ pub const ProfileViewBasic = struct {
     avatar: ?[]const u8 = null,
 };
 
-/// The original `app.bsky.feed.post` record carried inside a PostView.
+/// The original `app.zat4.feed.post` record carried inside a PostView.
 /// A7.2: cold struct, size guard waived — transient parse target.
 pub const PostRecord = struct {
     text: []const u8 = "",
@@ -137,7 +204,7 @@ pub const Label = struct {
     val: []const u8 = "",
 };
 
-/// Subset of `app.bsky.feed.defs#postView`. Reply parents/roots arrive as
+/// Subset of `app.zat4.feed.defs#postView`. Reply parents/roots arrive as
 /// this same shape; notFound/blocked variants parse to defaults (empty cid).
 /// A7.2: cold struct, size guard waived — transient parse target.
 pub const PostView = struct {
@@ -154,14 +221,14 @@ pub const PostView = struct {
     viewer: ?Viewer = null,
 };
 
-/// `app.bsky.feed.defs#replyRef` — root and parent, hydrated.
+/// `app.zat4.feed.defs#replyRef` — root and parent, hydrated.
 /// A7.2: cold struct, size guard waived — transient parse target.
 pub const ReplyRef = struct {
     root: PostView = .{},
     parent: PostView = .{},
 };
 
-/// `app.bsky.feed.defs#reasonRepost`; a reasonPin parses to an empty `by`.
+/// `app.zat4.feed.defs#reasonRepost`; a reasonPin parses to an empty `by`.
 /// A7.2: cold struct, size guard waived — transient parse target.
 pub const ReasonRepost = struct {
     by: ProfileViewBasic = .{},
@@ -176,7 +243,7 @@ pub const FeedViewPost = struct {
     reason: ?ReasonRepost = null,
 };
 
-/// Response of `app.bsky.feed.getTimeline`.
+/// Response of `app.zat4.feed.getTimeline`.
 /// A7.2: cold struct, size guard waived — transient parse target.
 pub const TimelinePage = struct {
     cursor: ?[]const u8 = null,
@@ -198,7 +265,7 @@ pub const RecordRef = struct {
     cid: []const u8 = "",
 };
 
-/// `app.bsky.richtext.facet#byteSlice` — UTF-8 byte offsets into the text.
+/// `app.zat4.richtext.facet#byteSlice` — UTF-8 byte offsets into the text.
 /// A7.2: cold struct, size guard waived — transient build target.
 pub const ByteSlice = struct {
     byteStart: u32,
@@ -214,7 +281,7 @@ pub const FacetFeature = struct {
     uri: ?[]const u8 = null,
 };
 
-/// `app.bsky.richtext.facet`.
+/// `app.zat4.richtext.facet`.
 /// A7.2: cold struct, size guard waived — transient build target.
 pub const Facet = struct {
     index: ByteSlice,
@@ -229,7 +296,7 @@ pub const ReplyRefOut = struct {
     parent: RecordRef,
 };
 
-/// Outgoing `app.bsky.feed.post`.
+/// Outgoing `app.zat4.feed.post`.
 /// A7.2: cold struct, size guard waived — transient build target.
 pub const PostRecordOut = struct {
     @"$type": []const u8 = collection.post,
@@ -267,11 +334,26 @@ pub const SubjectRecordOut = struct {
     createdAt: []const u8,
 };
 
-/// Outgoing `app.bsky.graph.follow`.
+/// Outgoing `app.zat4.graph.follow`.
 /// A7.2: cold struct, size guard waived — transient build target.
 pub const FollowRecordOut = struct {
     @"$type": []const u8 = collection.follow,
     subject: []const u8, // the did being followed
+    createdAt: []const u8,
+};
+
+/// Outgoing `app.zat4.actor.profile` — the fresh Zat4-native profile
+/// (Phase A decision 2). Self-contained: the optional one-time enrollment
+/// import (a UX nicety) prefills displayName/description from the user's
+/// existing identity if they opt in, but the record is ours and depends on
+/// nothing in app.bsky. Avatar/banner blobs are deferred (they need the
+/// blob-upload path) — an absent avatar is an ordinary state (E4), not an
+/// error, so the field is simply omitted until that lands.
+/// A7.2: cold struct, size guard waived — one per profile edit, arena-built.
+pub const ProfileRecordOut = struct {
+    @"$type": []const u8 = collection.profile,
+    displayName: ?[]const u8 = null,
+    description: ?[]const u8 = null,
     createdAt: []const u8,
 };
 
@@ -290,3 +372,96 @@ pub fn CreateRecordInput(comptime Record: type) type {
 pub const ResolveHandleResponse = struct {
     did: []const u8 = "",
 };
+
+// ---------------------------------------------------------------------------
+// Phase A exit-criterion tests (STANDALONE_ROADMAP). The schemas round-trip
+// (build → serialize → parse → struct) under a leak-checked allocator (C6),
+// and the namespace wall is asserted structurally: no content collection or
+// owned method may name `app.bsky`. These run on every `zig build test`.
+// ---------------------------------------------------------------------------
+
+const std = @import("std");
+const testing = std.testing;
+
+/// The encode/decode policy mirrors xrpc.zig exactly (the real wire path):
+/// omit null optionals on the way out, ignore unknown fields on the way in.
+fn roundTrip(comptime T: type, arena: std.mem.Allocator, value: T) !T {
+    const json = try std.json.Stringify.valueAlloc(arena, value, .{ .emit_null_optional_fields = false });
+    return std.json.parseFromSliceLeaky(T, arena, json, .{ .ignore_unknown_fields = true });
+}
+
+test "wall: every content collection and owned method is app.zat4, never app.bsky" {
+    // The structural wall (Phase A). If any of these regresses to app.bsky,
+    // Zat4 content would land in Bluesky's universe — the build fails here.
+    inline for (.{ collection.post, collection.like, collection.repost, collection.follow, collection.profile }) |nsid| {
+        try testing.expect(std.mem.startsWith(u8, nsid, "app.zat4."));
+        try testing.expect(std.mem.indexOf(u8, nsid, "app.bsky") == null);
+    }
+    inline for (.{ method.get_profile, method.get_timeline }) |nsid| {
+        try testing.expect(std.mem.startsWith(u8, nsid, "app.zat4."));
+    }
+    inline for (.{ richtext.facet_link, richtext.facet_mention }) |nsid| {
+        try testing.expect(std.mem.startsWith(u8, nsid, "app.zat4.richtext."));
+    }
+    // Protocol methods are NOT walled — they are shared atproto, and must
+    // stay com.atproto so writes/identity keep working across the network.
+    try testing.expect(std.mem.startsWith(u8, method.create_record, "com.atproto."));
+    try testing.expect(std.mem.startsWith(u8, method.resolve_handle, "com.atproto."));
+}
+
+test "round-trip: an app.zat4.feed.post survives build → JSON → struct" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator); // C6
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const post: PostRecordOut = .{
+        .text = "hello from the zat4 universe",
+        .createdAt = "2026-06-14T00:00:00Z",
+    };
+    const back = try roundTrip(PostRecordOut, arena, post);
+    try testing.expectEqualStrings(collection.post, back.@"$type");
+    try testing.expectEqualStrings("hello from the zat4 universe", back.text);
+    try testing.expectEqualStrings("2026-06-14T00:00:00Z", back.createdAt);
+    // The defaulted $type serialized as the zat4 NSID, not app.bsky.
+    try testing.expect(std.mem.indexOf(u8, back.@"$type", "app.bsky") == null);
+}
+
+test "round-trip: the fresh app.zat4.actor.profile, with null fields omitted" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A profile with only a display name: description stays null and must be
+    // omitted from the wire (emit_null_optional_fields = false), then parse
+    // back as null — an absent field is an ordinary state (E4).
+    const profile: ProfileRecordOut = .{
+        .displayName = "Ada",
+        .createdAt = "2026-06-14T00:00:00Z",
+    };
+    const json = try std.json.Stringify.valueAlloc(arena, profile, .{ .emit_null_optional_fields = false });
+    try testing.expect(std.mem.indexOf(u8, json, "description") == null); // omitted
+    try testing.expect(std.mem.indexOf(u8, json, collection.profile) != null); // $type present
+    const back = try std.json.parseFromSliceLeaky(ProfileRecordOut, arena, json, .{ .ignore_unknown_fields = true });
+    try testing.expectEqualStrings(collection.profile, back.@"$type");
+    try testing.expectEqualStrings("Ada", back.displayName.?);
+    try testing.expect(back.description == null);
+}
+
+test "round-trip: a post with zat4 facets serializes the owned richtext type" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const facets = [_]Facet{.{
+        .index = .{ .byteStart = 0, .byteEnd = 5 },
+        .features = &.{.{ .@"$type" = richtext.facet_link, .uri = "https://zat4.app" }},
+    }};
+    const post: PostRecordOut = .{
+        .text = "zat4 link here",
+        .createdAt = "2026-06-14T00:00:00Z",
+        .facets = &facets,
+    };
+    const json = try std.json.Stringify.valueAlloc(arena, post, .{ .emit_null_optional_fields = false });
+    try testing.expect(std.mem.indexOf(u8, json, "app.zat4.richtext.facet#link") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "app.bsky") == null);
+}

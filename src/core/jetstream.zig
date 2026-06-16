@@ -4,7 +4,7 @@
 //! here, its shapes never leak — the rest of the app sees only
 //! `LivePost`, a struct of plain values.
 //!
-//! Scope, recorded: v1 reduces only `app.bsky.feed.post` *creates*.
+//! Scope, recorded: v1 reduces only `app.zat4.feed.post` *creates*.
 //! Likes, deletes, identity and account events reduce to null today; the
 //! upgrade path (live count updates, deletions) is noted in the roadmap.
 
@@ -141,19 +141,19 @@ const testing = std.testing;
 
 const post_event =
     \\{"did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","time_us":1767323045000001,"kind":"commit",
-    \\ "commit":{"rev":"3krev","operation":"create","collection":"app.bsky.feed.post",
+    \\ "commit":{"rev":"3krev","operation":"create","collection":"app.zat4.feed.post",
     \\ "rkey":"3klive1","cid":"bafyreilive1",
-    \\ "record":{"$type":"app.bsky.feed.post","text":"hello from the firehose",
+    \\ "record":{"$type":"app.zat4.feed.post","text":"hello from the firehose",
     \\ "createdAt":"2026-01-02T03:04:05Z"}}}
 ;
 
 const reply_event =
     \\{"did":"did:plc:bbbbbbbbbbbbbbbbbbbbbbbb","time_us":1767323046000002,"kind":"commit",
-    \\ "commit":{"rev":"3krev2","operation":"create","collection":"app.bsky.feed.post",
+    \\ "commit":{"rev":"3krev2","operation":"create","collection":"app.zat4.feed.post",
     \\ "rkey":"3klive2","cid":"bafyreilive2",
-    \\ "record":{"$type":"app.bsky.feed.post","text":"a live reply","createdAt":"2026-01-02T03:04:06Z",
-    \\ "reply":{"root":{"uri":"at://x/app.bsky.feed.post/1","cid":"bafyreiroot"},
-    \\          "parent":{"uri":"at://x/app.bsky.feed.post/2","cid":"bafyreiparent"}}}}}
+    \\ "record":{"$type":"app.zat4.feed.post","text":"a live reply","createdAt":"2026-01-02T03:04:06Z",
+    \\ "reply":{"root":{"uri":"at://x/app.zat4.feed.post/1","cid":"bafyreiroot"},
+    \\          "parent":{"uri":"at://x/app.zat4.feed.post/2","cid":"bafyreiparent"}}}}}
 ;
 
 test "reduce: a post-create event becomes a LivePost, fields exact" {
@@ -165,7 +165,7 @@ test "reduce: a post-create event becomes a LivePost, fields exact" {
     try testing.expectEqualStrings("bafyreilive1", live.cid);
     try testing.expectEqualStrings("hello from the firehose", live.text);
     try testing.expectEqualStrings(
-        "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/3klive1",
+        "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.zat4.feed.post/3klive1",
         live.uri,
     );
     try testing.expectEqual(@as(i64, 1_767_323_045), live.created_at);
@@ -189,11 +189,11 @@ test "reduce: everything else is null — likes, deletes, identity, garbage" {
 
     const like =
         \\{"did":"did:plc:x","time_us":1,"kind":"commit","commit":{"operation":"create",
-        \\ "collection":"app.bsky.feed.like","rkey":"r","cid":"c"}}
+        \\ "collection":"app.zat4.feed.like","rkey":"r","cid":"c"}}
     ;
     const delete =
         \\{"did":"did:plc:x","time_us":1,"kind":"commit","commit":{"operation":"delete",
-        \\ "collection":"app.bsky.feed.post","rkey":"r","cid":"c"}}
+        \\ "collection":"app.zat4.feed.post","rkey":"r","cid":"c"}}
     ;
     const identity =
         \\{"did":"did:plc:x","time_us":1,"kind":"identity"}
@@ -213,7 +213,7 @@ test "options_update carries the dids and the collection" {
     });
     try testing.expect(std.mem.indexOf(u8, message, "\"type\":\"options_update\"") != null);
     try testing.expect(std.mem.indexOf(u8, message, "did:plc:bbbb") != null);
-    try testing.expect(std.mem.indexOf(u8, message, "app.bsky.feed.post") != null);
+    try testing.expect(std.mem.indexOf(u8, message, "app.zat4.feed.post") != null);
 }
 
 test "backoff: patient and capped" {
@@ -234,8 +234,8 @@ test "reduce: real-world createdAt with fractional seconds parses" {
     defer arena_state.deinit();
     const event =
         \\{"did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","time_us":1,"kind":"commit",
-        \\ "commit":{"operation":"create","collection":"app.bsky.feed.post","rkey":"r","cid":"c1",
-        \\ "record":{"$type":"app.bsky.feed.post","text":"x","createdAt":"2026-01-02T03:04:05.102Z"}}}
+        \\ "commit":{"operation":"create","collection":"app.zat4.feed.post","rkey":"r","cid":"c1",
+        \\ "record":{"$type":"app.zat4.feed.post","text":"x","createdAt":"2026-01-02T03:04:05.102Z"}}}
     ;
     const live = (try reduce(arena_state.allocator(), event)).?;
     try testing.expectEqual(@as(i64, 1_767_323_045), live.created_at);

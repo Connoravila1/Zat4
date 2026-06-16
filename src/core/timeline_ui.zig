@@ -46,6 +46,19 @@ pub const Action = enum {
     follow,
     profile,
     toggle_reveal,
+    // Nav-rail destinations (SHELL_LAYOUT_ROADMAP S.2). Home and compose
+    // reuse the existing refresh/new_post verbs, so they get no new value
+    // here. These name destinations that do not yet have a screen (Phase D
+    // builds them); they are deliberately key-unbound in keyFor below, so
+    // the rail is clickable now and each is wired the day its screen lands
+    // — keeping the one-dispatch-path guarantee honest rather than faking
+    // a key that actionFor could not round-trip.
+    nav_explore,
+    nav_notifications,
+    nav_chat,
+    nav_feeds,
+    nav_lists,
+    nav_settings,
 };
 
 /// Key bindings, in one place: vi keys and arrows move; r (or enter) loads
@@ -101,6 +114,10 @@ pub fn keyFor(action: Action) ?u8 {
         .load_more => ' ',
         .go_top => 'g',
         .go_bottom => 'G',
+        // Nav destinations have no screen yet, so they stay unbound and
+        // resolve to a no-op click until Phase D wires them. Home and
+        // compose are not here: the rail emits the existing refresh /
+        // new_post verbs for those, reusing their keys and screens.
         else => null,
     };
 }
@@ -615,7 +632,7 @@ fn rowString(arena: Allocator, surface: *const tui.Surface, y: u16) ![]u8 {
 
 fn testItem(text: []const u8) feed.TimelineItem {
     return .{
-        .uri = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/3kali1",
+        .uri = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.zat4.feed.post/3kali1",
         .cid = "bafyreialice1",
         .author_handle = "alice.test",
         .author_display_name = "Alice",

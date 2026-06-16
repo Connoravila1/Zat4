@@ -59,6 +59,23 @@ pub const Window = struct {
     skip_bytes: usize,
     /// Scratch row for byte-swapped blits on MSBFirst servers (rare).
     swap_row: []u8,
+    /// Damage tracking for the blit. `shadow` holds the pixels last sent to
+    /// the server; blit() diffs the framebuffer against it (raster.damageBand)
+    /// and PutImages only the rows that changed — the heart animation touches
+    /// a few rows, not the whole frame, and a full-frame PutImage every frame
+    /// was the render path's real cost (the CPU paint is ~1 ms; the megabyte
+    /// socket write is what stalled and stuttered). `shadow_w`/`shadow_h` pin
+    /// the geometry the shadow was taken at, so a resize that keeps the same
+    /// pixel COUNT but different dimensions still forces a reseed. `dirty_all`
+    /// forces the next blit to be full (and reseed the shadow): the first
+    /// frame, a resize, or an Expose that may have discarded the server's
+    /// copy. gpa-owned; freed in close (C5). B3: the blit is I/O; this is just
+    /// shell bookkeeping about what the framebuffer holds — the core (which
+    /// computes the band) never touches the socket.
+    shadow: []u32,
+    shadow_w: u32,
+    shadow_h: u32,
+    dirty_all: bool,
     /// Report the first X error to the terminal, then stay quiet: a
     /// rejected blit repeats every frame and would otherwise flood stderr
     /// with thousands of identical lines. One clear line is the diagnostic.
@@ -347,6 +364,10 @@ pub fn openAt(
         .skip_bytes = 0,
         .swap_row = &.{},
         .x_error_reported = false,
+        .shadow = &.{},
+        .shadow_w = 0,
+        .shadow_h = 0,
+        .dirty_all = true, // first blit paints the whole window
     };
     raster.resize(gpa, &window.fb, width, height, layout.palette_bg) catch return error.OutOfMemory;
     return window;
@@ -370,6 +391,7 @@ pub fn close(window: *Window) void {
     _ = linux.close(window.fd);
     gpa.free(window.keysyms);
     if (window.swap_row.len > 0) gpa.free(window.swap_row);
+    if (window.shadow.len > 0) gpa.free(window.shadow);
     window.draw_list.deinit(gpa);
     raster.deinit(gpa, &window.fb);
     gpa.destroy(window);
@@ -475,13 +497,23 @@ pub fn pump(
                 .mods = @truncate(event.state),
                 ._pad = 0,
             }),
-            .expose => result.exposed = true,
+            .expose => {
+                result.exposed = true;
+                // The server can discard a window's contents before an
+                // Expose; the shadow no longer reflects what is on screen, so
+                // the next blit must repaint the whole window, not just the
+                // band that changed in our framebuffer.
+                window.dirty_all = true;
+            },
             .configure => {
                 if (event.w != window.fb.width or event.h != window.fb.height) {
                     raster.resize(window.gpa, &window.fb, event.w, event.h, layout.palette_bg) catch return error.OutOfMemory;
                     window.cols = @intCast(@max(20, event.w / text.cell_w));
                     window.rows = @intCast(@max(5, event.h / text.cell_h));
                     result.resized = true;
+                    // New geometry: the framebuffer was reallocated/cleared,
+                    // so the next blit is full and reseeds the shadow.
+                    window.dirty_all = true;
                 }
             },
             .client_delete => result.closed = true,
@@ -537,16 +569,66 @@ pub fn presentDrawList(
     try blit(window);
 }
 
-/// PutImage the current framebuffer, chunked under the request ceiling.
+/// PutImage only the rows that changed since the last blit. raster.paint
+/// rewrites the whole framebuffer each frame, but the resulting PIXELS
+/// barely move — only the animating region (the heart, a few rows) actually
+/// changes. Diffing against the shadow (raster.damageBand) and sending just
+/// that band turns a ~megabyte-per-frame socket write into a few KB, and
+/// skips the write entirely when nothing changed. That is what made the
+/// animation smooth and kept clicks from queueing behind a blocking write:
+/// the CPU cost was never the problem (paint ~1 ms; the field sim ~44 µs) —
+/// the full-frame PutImage was. A full blit (reseeding the shadow) is forced
+/// on the first frame, on resize, and after an Expose — anything that may
+/// have discarded the server's copy. (B3: blit is I/O; the band decision is
+/// the pure core's, computed without touching the socket. G1: bench "blit
+/// damage".)
 pub fn blit(window: *Window) error{ OutOfMemory, ProtocolError }!void {
     const fb = &window.fb;
     if (fb.width == 0 or fb.height == 0) return;
+    const count = fb.pixels.len;
+
+    // Reseed-and-full-blit when the shadow cannot be trusted as the server's
+    // current contents: first frame, geometry change, or a post-Expose
+    // repaint. The shadow is (re)sized to match before it is filled.
+    if (window.dirty_all or window.shadow.len != count or
+        window.shadow_w != fb.width or window.shadow_h != fb.height)
+    {
+        if (window.shadow.len != count) {
+            if (window.shadow.len > 0) window.gpa.free(window.shadow);
+            window.shadow = window.gpa.alloc(u32, count) catch return error.OutOfMemory;
+        }
+        try blitBand(window, 0, @intCast(fb.height));
+        @memcpy(window.shadow, fb.pixels);
+        window.shadow_w = fb.width;
+        window.shadow_h = fb.height;
+        window.dirty_all = false;
+        return;
+    }
+
+    // Steady state: send only the changed band, then bring the shadow up to
+    // date over exactly those rows (the rest is already in sync).
+    const band = raster.damageBand(window.shadow, fb.pixels, fb.width, fb.height) orelse return;
+    const rows: u16 = @intCast(band.last - band.first + 1);
+    try blitBand(window, @intCast(band.first), rows);
+    const lo = band.first * fb.width;
+    const hi = (band.last + 1) * fb.width;
+    @memcpy(window.shadow[lo..hi], fb.pixels[lo..hi]);
+}
+
+/// Emit `rows_total` framebuffer rows starting at `dst_y` as one or more
+/// PutImage requests, each kept under the server's max-request ceiling.
+/// Shared by the full-frame reseed and the per-frame damaged band so the
+/// chunking math and the rare MSBFirst byte-swap live in exactly one place.
+fn blitBand(window: *Window, dst_y: u16, rows_total: u16) error{ OutOfMemory, ProtocolError }!void {
+    const fb = &window.fb;
+    if (rows_total == 0) return;
     const width: u16 = @intCast(fb.width);
     const rows_per = x11.putImageRowsPerChunk(width, window.max_request_units);
     var header: [24]u8 = undefined;
-    var y: u32 = 0;
-    while (y < fb.height) {
-        const rows: u16 = @intCast(@min(rows_per, fb.height - y));
+    var y: u32 = dst_y;
+    const end: u32 = @as(u32, dst_y) + rows_total;
+    while (y < end) {
+        const rows: u16 = @intCast(@min(@as(u32, rows_per), end - y));
         try writeAll(window.fd, x11.putImageHeader(&header, window.wid, window.gc, width, rows, @intCast(y), window.root_depth));
         const slice = fb.pixels[y * fb.width .. (y + rows) * fb.width];
         if (window.image_byte_order == 0) {

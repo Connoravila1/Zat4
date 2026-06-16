@@ -30,6 +30,7 @@ const clock = @import("clock.zig");
 const websocket = @import("../core/websocket.zig");
 const jetstream = @import("../core/jetstream.zig");
 const feed_core = @import("../core/feed.zig");
+const lexicon = @import("../core/lexicon.zig");
 
 // ---------------------------------------------------------------------------
 // The mailbox — plain-data messages, the only thing that crosses out
@@ -452,7 +453,8 @@ fn runConnection(stream: *Stream, cursor: *i64, delivered: *bool) !void {
 
     var path_builder: std.ArrayList(u8) = .empty;
     defer path_builder.deinit(gpa);
-    try path_builder.appendSlice(gpa, "/subscribe?wantedCollections=app.bsky.feed.post");
+    try path_builder.appendSlice(gpa, "/subscribe?wantedCollections=");
+    try path_builder.appendSlice(gpa, lexicon.collection.post);
     // The URL bootstraps with at most 64 DIDs; the authoritative full
     // list follows in-band the moment the socket opens (options_update).
     const url_dids = stream.dids[0..@min(stream.dids.len, 64)];
@@ -811,9 +813,9 @@ const fixture = @import("test_fixture.zig");
 
 const live_event_json =
     \\{"did":"did:plc:wwwwwwwwwwwwwwwwwwwwwwww","time_us":1767323050000009,"kind":"commit",
-    \\ "commit":{"rev":"3kr","operation":"create","collection":"app.bsky.feed.post",
+    \\ "commit":{"rev":"3kr","operation":"create","collection":"app.zat4.feed.post",
     \\ "rkey":"3kws1","cid":"bafyreiwslive1",
-    \\ "record":{"$type":"app.bsky.feed.post","text":"over the socket",
+    \\ "record":{"$type":"app.zat4.feed.post","text":"over the socket",
     \\ "createdAt":"2026-01-02T03:04:05Z"}}}
 ;
 
@@ -834,7 +836,7 @@ fn serveWebSocket(server: *std.Io.net.Server, io: std.Io, expect_in_head: []cons
         const n = (readAvailable(reader, head[head_len..]) catch return) orelse return;
         head_len += n;
     }
-    if (std.mem.indexOf(u8, head[0..head_len], "wantedCollections=app.bsky.feed.post") == null) return;
+    if (std.mem.indexOf(u8, head[0..head_len], "wantedCollections=app.zat4.feed.post") == null) return;
     if (std.mem.indexOf(u8, head[0..head_len], expect_in_head) == null) return;
     const key_label = "Sec-WebSocket-Key: ";
     const key_at = std.mem.indexOf(u8, head[0..head_len], key_label) orelse return;
@@ -959,15 +961,15 @@ test "stream loopback: a 64-did subscription survives the long URL" {
 
 const live_event_2 =
     \\{"did":"did:plc:wwwwwwwwwwwwwwwwwwwwwwww","time_us":1767323050000010,"kind":"commit",
-    \\ "commit":{"rev":"3kr","operation":"create","collection":"app.bsky.feed.post",
+    \\ "commit":{"rev":"3kr","operation":"create","collection":"app.zat4.feed.post",
     \\ "rkey":"3kws2","cid":"bafyreiwslive2",
-    \\ "record":{"$type":"app.bsky.feed.post","text":"second","createdAt":"2026-01-02T03:04:06Z"}}}
+    \\ "record":{"$type":"app.zat4.feed.post","text":"second","createdAt":"2026-01-02T03:04:06Z"}}}
 ;
 const live_event_3 =
     \\{"did":"did:plc:wwwwwwwwwwwwwwwwwwwwwwww","time_us":1767323050000011,"kind":"commit",
-    \\ "commit":{"rev":"3kr","operation":"create","collection":"app.bsky.feed.post",
+    \\ "commit":{"rev":"3kr","operation":"create","collection":"app.zat4.feed.post",
     \\ "rkey":"3kws3","cid":"bafyreiwslive3",
-    \\ "record":{"$type":"app.bsky.feed.post","text":"third","createdAt":"2026-01-02T03:04:07Z"}}}
+    \\ "record":{"$type":"app.zat4.feed.post","text":"third","createdAt":"2026-01-02T03:04:07Z"}}}
 ;
 
 fn sleepMs(ms: u64) void {
@@ -1025,7 +1027,7 @@ fn serveFaithful(server: *std.Io.net.Server, io: std.Io) void {
         const n = (readAvailable(reader, head[head_len..]) catch return) orelse return;
         head_len += n;
     }
-    if (std.mem.indexOf(u8, head[0..head_len], "wantedCollections=app.bsky.feed.post") == null) return;
+    if (std.mem.indexOf(u8, head[0..head_len], "wantedCollections=app.zat4.feed.post") == null) return;
     const key_label = "Sec-WebSocket-Key: ";
     const key_at = std.mem.indexOf(u8, head[0..head_len], key_label) orelse return;
     const key_start = key_at + key_label.len;
@@ -1124,13 +1126,13 @@ test "stream loopback: faithful server — pings, a quiet lap, a split frame, co
 
 const grow_event_a =
     \\{"did":"did:plc:aaagrow","time_us":1767323050000020,"kind":"commit",
-    \\ "commit":{"operation":"create","collection":"app.bsky.feed.post","rkey":"ga","cid":"bafyreigrowa",
-    \\ "record":{"$type":"app.bsky.feed.post","text":"from a","createdAt":"2026-01-02T03:04:08Z"}}}
+    \\ "commit":{"operation":"create","collection":"app.zat4.feed.post","rkey":"ga","cid":"bafyreigrowa",
+    \\ "record":{"$type":"app.zat4.feed.post","text":"from a","createdAt":"2026-01-02T03:04:08Z"}}}
 ;
 const grow_event_b =
     \\{"did":"did:plc:bbbgrow","time_us":1767323050000021,"kind":"commit",
-    \\ "commit":{"operation":"create","collection":"app.bsky.feed.post","rkey":"gb","cid":"bafyreigrowb",
-    \\ "record":{"$type":"app.bsky.feed.post","text":"from b","createdAt":"2026-01-02T03:04:09Z"}}}
+    \\ "commit":{"operation":"create","collection":"app.zat4.feed.post","rkey":"gb","cid":"bafyreigrowb",
+    \\ "record":{"$type":"app.zat4.feed.post","text":"from b","createdAt":"2026-01-02T03:04:09Z"}}}
 ;
 
 /// A server that proves the subscription GROWS: it withholds B's event
