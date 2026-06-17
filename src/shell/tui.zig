@@ -1538,17 +1538,6 @@ var sim_rng = std.Random.DefaultPrng.init(0x7A74_2026);
 /// (B4). Everything else (terminal, or a window whose font engine
 /// failed) keeps the cell frame + diff/present pair. ONE funnel, so
 /// interim status flashes render through the same path (D6).
-// Placeholder feed content for the cut-5.6 premium base. The next slice
-// replaces this with a pure transform from the real `items` timeline
-// (B5: plain values in, PostView out). Cold data, no size guard needed
-// (A7.2: a fixed handful, never the bulk store).
-const premium_sample = [_]feed_view.PostView{
-    .{ .name = "Mara Vesper", .handle = "@mara.zat", .age = "2m", .initial = 'M', .tint = 0xFFCAA3A8, .liked = true, .boosted = false, .reply = 6, .boost = 9, .like = 48, .body = "the whole point of a small network is that you can actually read the room. ten thousand strangers isn't a room, it's weather." },
-    .{ .name = "field notes", .handle = "@fieldnotes.zat", .age = "14m", .initial = 'f', .tint = 0xFF9FC7A0, .liked = false, .boosted = true, .reply = 12, .boost = 31, .like = 121, .body = "shipped the lighting pass tonight. the letters catch the light now, and the whole field moves when you touch it." },
-    .{ .name = "Okonkwo", .handle = "@oko.zat", .age = "1h", .initial = 'O', .tint = 0xFFE0C074, .liked = false, .boosted = false, .reply = 24, .boost = 18, .like = 73, .body = "monospace is the most honest a feed can be. same column, same weight, nobody shouts louder by being wider." },
-    .{ .name = "lune", .handle = "@lune.zat", .age = "3h", .initial = 'l', .tint = 0xFFA9B6D6, .liked = false, .boosted = false, .reply = 3, .boost = 7, .like = 39, .body = "woke up to the field still drifting where i left it. it kept the light on." },
-};
-
 fn paintFrame(
     gpa: Allocator,
     out: *std.Io.Writer,
@@ -1628,16 +1617,11 @@ fn paintFrame(
             // layer owns the heart icons now.
             try effect_core.composeEffects(gpa, g.active.slice(), cell.w, cell.h, g.draw);
             const t_built = if (debug_frame_timing) clock_shell.monotonicNanos() else 0;
-            // cut 5.6: the premium content layer (avatars, type hierarchy,
-            // engagement row, dividers) painted OVER the field as proportional
-            // items, now fed by the REAL timeline via a pure transform (B5).
-            // Falls back to placeholder content only while the timeline is
-            // empty (initial load) so the screen is never blank. Buttons are
-            // inert by design until the input slice lands.
-            const feed_posts: []const feed_view.PostView = if (items.len == 0)
-                premium_sample[0..]
-            else
-                feed_view.fromTimeline(arena, items, now) catch premium_sample[0..];
+            // The premium content layer (avatars, type hierarchy, engagement
+            // row, dividers) painted OVER the field as proportional items, fed
+            // by the REAL timeline via a pure transform (B5). An empty timeline
+            // renders the chrome with no posts — no placeholder content.
+            const feed_posts = feed_view.fromTimeline(arena, items, now) catch &[_]feed_view.PostView{};
             g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null) catch g.content_h.*;
             const t_layout = if (debug_frame_timing) clock_shell.monotonicNanos() else 0;
             window_shell.presentDrawList(win, gpa, g.engine, g.draw.slice(), field_core.background) catch {}; // E2: a lost blit is the next frame's problem
@@ -1695,12 +1679,8 @@ fn paintFrameGpu(
     const sig = feedSignature(items, g.scroll.*, w, h);
     if (sig != gs.feed_sig or gs.feed.verts.items.len == 0) {
         gs.feed_sig = sig;
-        // Falls back to sample content only while the timeline is empty
-        // (initial load) so the screen is never blank.
-        const feed_posts: []const feed_view.PostView = if (items.len == 0)
-            premium_sample[0..]
-        else
-            feed_view.fromTimeline(arena, items, now) catch premium_sample[0..];
+        // An empty timeline renders the chrome with no posts (no placeholders).
+        const feed_posts = feed_view.fromTimeline(arena, items, now) catch &[_]feed_view.PostView{};
         // Per-post height cache: post heights are scroll-invariant, so only
         // reset the cache when the CONTENT or WIDTH changed (scroll/height
         // zeroed in this signature). A pure scroll then reuses every post's
