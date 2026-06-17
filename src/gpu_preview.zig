@@ -17,6 +17,7 @@ const atlas_mod = @import("core/atlas.zig");
 const feed_view = @import("core/feed_view.zig");
 const feed = @import("core/feed.zig");
 const glyph_field = @import("core/glyph_field.zig");
+const clock_shell = @import("shell/clock.zig");
 
 // Field glyph cell: big enough to read the actual symbols, still many of them.
 const cell_w: u16 = 13;
@@ -77,7 +78,7 @@ pub fn main(init: std.process.Init) !void {
     const posts = try feed_view.fromTimeline(arena, &items, now);
     // Lay the feed out at the fixed logical design width and a proportional
     // logical height; buildVertices scales it to fill the window, crisp.
-    _ = try feed_view.layout(gpa, &engine, @intCast(design_w), @intCast(logicalH(W, H)), posts, 0, &dl, null);
+    _ = try feed_view.layout(gpa, &engine, @intCast(design_w), @intCast(logicalH(W, H)), posts, 0, &dl, null, null);
 
     // Bring up GL and the renderer.
     var g = gpu.init(win.wid) catch {
@@ -87,10 +88,11 @@ pub fn main(init: std.process.Init) !void {
     defer gpu.deinit(&g);
     gpu.setViewport(@intCast(W), @intCast(H));
 
-    var renderer = gpu.initRenderer() catch {
+    var feed_path = gpu.initFeed(gpa) catch {
         std.debug.print("renderer init failed — see [gpu] lines above.\n", .{});
         return;
     };
+    defer gpu.feedDeinit(&feed_path, gpa);
     var field_renderer = gpu.initFieldRenderer(gpa, &engine, cell_w, cell_h) catch {
         std.debug.print("field renderer init failed — see [gpu] lines above.\n", .{});
         return;
@@ -114,19 +116,14 @@ pub fn main(init: std.process.Init) !void {
     defer splashes.deinit(gpa);
     const fparams: glyph_field.Params = .{};
 
-    // Build the atlas + vertices once (the scene is static), then upload.
-    var atlas: atlas_mod.Atlas = .{};
-    try atlas_mod.init(gpa, &atlas, 2048);
-    defer atlas_mod.deinit(gpa, &atlas);
-
-    var verts = gpu.buildVertices(gpa, &engine, &atlas, dl.slice(), uiScale(W)) catch |err| {
-        std.debug.print("buildVertices failed: {s}\n", .{@errorName(err)});
+    // Build the feed vertices once (the scene is static) via the Feed facade,
+    // which packs the atlas + uploads it.
+    gpu.feedBuild(&feed_path, gpa, &engine, dl.slice(), uiScale(W)) catch |err| {
+        std.debug.print("feedBuild failed: {s}\n", .{@errorName(err)});
         return;
     };
-    defer verts.deinit(gpa);
-    std.debug.print("[gpu] scene: {d} draw items -> {d} vertices ({d} quads)\n", .{ dl.len, verts.items.len, verts.items.len / 6 });
-    gpu.uploadAtlas(&renderer, &atlas);
-    gpu.glError("after uploadAtlas");
+    std.debug.print("[gpu] scene: {d} draw items -> {d} vertices ({d} quads)\n", .{ dl.len, feed_path.verts.items.len, feed_path.verts.items.len / 6 });
+    gpu.glError("after feedBuild");
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
@@ -137,6 +134,7 @@ pub fn main(init: std.process.Init) !void {
     var cur_h: u32 = H;
     var frames: u32 = 0;
     var t: f32 = 0;
+    var last_step_ns: u64 = 0; // monotonic clock of the last sim step (fixed timestep)
     var mcx: f32 = -1; // cursor cell (top-down) for the cursor-light hover; <0 = none
     var mcy: f32 = -1;
     // ambient-bias forcing (§4.3): a slow drifting two-sine swell so the still
@@ -165,10 +163,8 @@ pub fn main(init: std.process.Init) !void {
             gpa.free(bias);
             bias = new_bias;
             dl.len = 0;
-            _ = feed_view.layout(gpa, &engine, @intCast(design_w), @intCast(logicalH(cur_w, cur_h)), posts, 0, &dl, null) catch break;
-            verts.deinit(gpa);
-            verts = gpu.buildVertices(gpa, &engine, &atlas, dl.slice(), uiScale(cur_w)) catch break;
-            gpu.uploadAtlas(&renderer, &atlas);
+            _ = feed_view.layout(gpa, &engine, @intCast(design_w), @intCast(logicalH(cur_w, cur_h)), posts, 0, &dl, null, null) catch break;
+            gpu.feedBuild(&feed_path, gpa, &engine, dl.slice(), uiScale(cur_w)) catch break;
         }
 
         // Mouse → splashes: energy injected into the medium (a drag leaves a
@@ -205,36 +201,50 @@ pub fn main(init: std.process.Init) !void {
         }
         events.clearRetainingCapacity();
 
-        // Fill the time-driven ambient bias (shell side → the core stays pure).
-        var yy: u32 = 0;
-        while (yy < grows) : (yy += 1) {
-            const fy: f32 = @floatFromInt(yy);
-            var xx: u32 = 0;
-            while (xx < gcols) : (xx += 1) {
-                const fx: f32 = @floatFromInt(xx);
-                const base = std.math.sin(fx * amb_scale + t * amb_drift) *
-                    std.math.sin(fy * amb_scale * 1.3 - t * amb_drift * 0.8);
-                // a finer, slowly-drifting term → cell-scale variation, so the
-                // dense interior is an ASSORTMENT of glyphs, not a wall of '#'.
-                const fine = std.math.sin(fx * 0.21 - t * 0.07) *
-                    std.math.sin(fy * 0.18 + t * 0.06);
-                bias[yy * gcols + xx] = amb_amp * (base + 0.5 * fine);
+        // Advance the medium on a FIXED WALL-CLOCK timestep (≈60 Hz), at most
+        // once per frame, so the field evolves at a constant real-time rate no
+        // matter how fast this loop spins. Stepping once per loop iteration
+        // coupled the sim to the INPUT rate: streaming mouse-motion events drove
+        // the loop far above 60 fps, speeding up the WHOLE field whenever the
+        // pointer moved (the live app had the same bug — this mirrors its fix).
+        const dt_ns: u64 = 16_666_667; // 1/60 s
+        const now_ns = clock_shell.monotonicNanos();
+        const due = last_step_ns == 0 or (now_ns -| last_step_ns) >= dt_ns;
+        if (due) {
+            // Fill the time-driven ambient bias (shell side → the core stays pure).
+            var yy: u32 = 0;
+            while (yy < grows) : (yy += 1) {
+                const fy: f32 = @floatFromInt(yy);
+                var xx: u32 = 0;
+                while (xx < gcols) : (xx += 1) {
+                    const fx: f32 = @floatFromInt(xx);
+                    const base = std.math.sin(fx * amb_scale + t * amb_drift) *
+                        std.math.sin(fy * amb_scale * 1.3 - t * amb_drift * 0.8);
+                    // a finer, slowly-drifting term → cell-scale variation, so the
+                    // dense interior is an ASSORTMENT of glyphs, not a wall of '#'.
+                    const fine = std.math.sin(fx * 0.21 - t * 0.07) *
+                        std.math.sin(fy * 0.18 + t * 0.06);
+                    bias[yy * gcols + xx] = amb_amp * (base + 0.5 * fine);
+                }
             }
+            // Advance the medium one step (calm). Splashes injected once.
+            glyph_field.step(&field, fparams, splashes.items, bias);
+            splashes.clearRetainingCapacity();
+            t += 1.0 / 60.0;
+            last_step_ns = if (last_step_ns == 0 or (now_ns -| last_step_ns) > dt_ns * 4)
+                now_ns
+            else
+                last_step_ns + dt_ns;
         }
-
-        // Advance the medium one step/frame (calm). Splashes injected once.
-        glyph_field.step(&field, fparams, splashes.items, bias);
-        splashes.clearRetainingCapacity();
 
         // Upload the height field, render it grid-intensity behind the feed.
         gpu.uploadField(&field_grid, field.height, field.dye, field.cols, field.rows);
         gpu.clear(clear_r, clear_g, clear_b);
         gpu.drawFieldGrid(&field_grid, &field_renderer, mcx, mcy, t, @intCast(cur_w), @intCast(cur_h));
-        gpu.draw(&renderer, verts.items, @intCast(cur_w), @intCast(cur_h)); // feed, on top
+        gpu.feedDraw(&feed_path, @intCast(cur_w), @intCast(cur_h)); // feed, on top
         gpu.swap(&g);
         if (frames == 0) gpu.glError("after first draw");
 
-        t += 1.0 / 60.0;
         frames += 1;
         if (frames > 3600) break; // ~60s safety cap
     }

@@ -389,6 +389,14 @@ pub fn layout(
     scroll: i32,
     dl: *raster.DrawList,
     regions: ?*Regions,
+    /// Optional per-post height cache (advance from post_top to the next post),
+    /// indexed by post. A post's height is SCROLL-INVARIANT — it depends only on
+    /// the body text + column width — so the caller may keep this filled across
+    /// scrolls and reset it only when the feed content or width changes, turning
+    /// the costly per-post text-measure pass into a one-time cost. A slot < 0 (or
+    /// a too-short cache) means "not measured yet": layout measures and fills it.
+    /// Pass null to always measure (the original behaviour).
+    heights: ?[]i32,
 ) error{OutOfMemory}!i32 {
     const m = metricsFor(width);
     if (regions) |rg| rg.clearRetainingCapacity();
@@ -437,10 +445,28 @@ pub fn layout(
         // both advance the scroll accounting and decide visibility. Only posts
         // that actually intersect the viewport get painted — otherwise a long
         // timeline pushes y past the 16-bit draw coordinates and overflows.
-        const body_end = try wrapBody(gpa, dl, e, cx, post_top + 18 + body_line, content_w, body_c, 16, p.body, body_line, false);
+        //
+        // The body wrap (text shaping) is the costly step and it is SCROLL-
+        // INVARIANT. When the caller supplies a `heights` cache, reuse a filled
+        // slot and skip the measure entirely — this is what keeps SCROLLING
+        // cheap over a long feed (otherwise every post re-shapes every scroll
+        // frame). Geometry: next_y = body_end + 48 (erow +16, row +20, gap +12),
+        // so body_end = next_y - 48 reconstructs it from a cached advance.
+        const cached: ?i32 = if (heights) |hh| (if (pi < hh.len and hh[pi] >= 0) hh[pi] else null) else null;
+        var body_end: i32 = undefined;
+        var next_y: i32 = undefined;
+        if (cached) |adv| {
+            next_y = post_top + adv;
+            body_end = next_y - 48;
+        } else {
+            body_end = try wrapBody(gpa, dl, e, cx, post_top + 18 + body_line, content_w, body_c, 16, p.body, body_line, false);
+            next_y = body_end + 48;
+            if (heights) |hh| if (pi < hh.len) {
+                hh[pi] = next_y - post_top;
+            };
+        }
         const erow = body_end + 16;
         const bottom = erow + 20;
-        const next_y = bottom + 12;
         const visible = next_y > 0 and post_top < height;
 
         if (visible) {
@@ -594,7 +620,7 @@ test "layout emits 3 tap regions per post; hitTest resolves each at its center" 
     const posts = [_]PostView{
         .{ .name = "A", .handle = "@a.zat", .age = "1m", .body = "hello there field", .tint = 0xFFAAAAAA, .reply = 1, .boost = 2, .like = 3, .initial = 'A', .liked = true, .boosted = false },
     };
-    const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions);
+    const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null);
     try std.testing.expect(h > 112); // content extends below the top bar
     try std.testing.expectEqual(@as(usize, 3), regions.items.len);
 
@@ -630,7 +656,26 @@ test "long timeline does not overflow draw coordinates (off-screen posts skipped
     const posts = try arena.alloc(PostView, n);
     for (posts) |*pv| pv.* = .{ .name = "x", .handle = "@x.zat", .age = "1m", .body = "a body line that wraps a little across the feed column width here", .tint = 0xFF888888, .reply = 1, .boost = 2, .like = 3, .initial = 'x', .liked = false, .boosted = false };
 
-    const h = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions); // must not panic
+    const h = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, null); // must not panic
     try std.testing.expect(h > 940 * 10); // height accounts for the whole list
     try std.testing.expect(regions.items.len < 3 * 24); // only on-screen posts are tappable
+
+    // The height cache (the scroll-lag fix) must yield IDENTICAL geometry. A
+    // first pass with an all-(-1) cache measures + fills it; a second pass that
+    // reuses the filled cache (the per-frame scroll path) must return the same
+    // total height and the same tappable region set — i.e. the cached advance
+    // reconstructs body_end exactly. A regression here means cached scrolling
+    // would drift from a fresh layout.
+    const heights = try arena.alloc(i32, n);
+    @memset(heights, -1);
+    dl.len = 0;
+    regions.clearRetainingCapacity();
+    const h_fill = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights);
+    const fill_regions = regions.items.len;
+    dl.len = 0;
+    regions.clearRetainingCapacity();
+    const h_cached = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights);
+    try std.testing.expectEqual(h, h_fill);
+    try std.testing.expectEqual(h, h_cached);
+    try std.testing.expectEqual(fill_regions, regions.items.len);
 }

@@ -29,6 +29,8 @@ const feed_shell = @import("feed.zig");
 const stream_shell = @import("stream.zig");
 const cache_shell = @import("cache.zig");
 const window_shell = @import("native.zig");
+const gpu = @import("gpu.zig");
+const glyph_field = @import("../core/glyph_field.zig");
 const layout_core = @import("../core/layout.zig");
 const raster_core = @import("../core/raster.zig");
 const text_core = @import("../core/text.zig");
@@ -315,6 +317,20 @@ pub fn run(
     var gregions: feed_view.Regions = .empty;
     defer gregions.deinit(gpa);
 
+    // Phase 6.4: the GPU render path, brought up additively when the window is
+    // open AND the font engine is live AND `gpu.init` succeeds. On any failure
+    // it stays null and the SOFTWARE path renders (E2: a plainer window, never
+    // a dead one). Created once here; the window is already open by the time
+    // run() is called, so its XID is valid.
+    var gpu_state: ?GpuState = null;
+    defer if (gpu_state) |*gs| deinitGpuState(gpa, gs);
+    if (backend == .window) if (engine) |*e| {
+        gpu_state = initGpuState(gpa, e, backend.window) catch |err| blk: {
+            std.debug.print("[gpu] init failed ({s}) — using the software path.\n", .{@errorName(err)});
+            break :blk null;
+        };
+    };
+
     main_loop: while (true) {
         _ = frame_arena.reset(.retain_capacity); // C3: one arena per frame
         const arena = frame_arena.allocator();
@@ -452,7 +468,7 @@ pub fn run(
         // pix exists exactly when a window backend has a live engine; the
         // composer and profile screens stay on the cell path this cut
         // (their pixel port is the recorded next slice).
-        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions } else null;
+        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .gpu = if (gpu_state) |*gs| gs else null } else null;
         switch (mode) {
             .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, &state, revealed.items, now, session.handle, status),
             .compose => {
@@ -548,7 +564,12 @@ pub fn run(
                 // laptop's battery). The next lap's paintFrame is what
                 // advances the sim — a short pump returning no input still
                 // yields one animation frame.
-                const animating = engine != null and (gactive.len > 0 or gparticles.len > 0);
+                // The GPU field is ALIVE AT REST (ambient forcing drives it), so
+                // when the GPU path is live we always pump at frame cadence to
+                // keep the simulation ticking; otherwise only when a software
+                // effect/particles are in flight, so a still timeline costs zero
+                // CPU (the no-wasted-cycles ethos).
+                const animating = gpu_state != null or (engine != null and (gactive.len > 0 or gparticles.len > 0));
                 const pump_ms: i32 = if (animating) 16 else 500;
                 const pumped = window_shell.pump(win, pump_ms, gpa, &pumped_bytes, &pointer_events) catch {
                     status = "window error";
@@ -593,48 +614,79 @@ pub fn run(
                     // used, so clicks land on the cell under the cursor at
                     // any zoom. Convert once, then everything is cell-space.
                     const pcell = cellSize(win.fb.width, g.zoom.*);
+                    // The GPU feed lays out in LOGICAL pixels (design_w, scaled
+                    // to fill); the software feed in physical pixels. So the
+                    // region hit-test and the scroll clamp work in whichever
+                    // space the layout used — map the physical pointer back to
+                    // logical for GPU (÷scale), pass it through for software.
+                    const gpu_scale: f32 = if (g.gpu) |gs| gs.scale else 1.0;
                     for (pointer_events.items) |pev| {
                         const cx: u16 = pev.x / pcell.w;
                         const cy: u16 = pev.y / pcell.h;
+                        const rx: i32 = if (g.gpu != null) @intFromFloat(@as(f32, @floatFromInt(pev.x)) / gpu_scale) else @intCast(pev.x);
+                        const ry: i32 = if (g.gpu != null) @intFromFloat(@as(f32, @floatFromInt(pev.y)) / gpu_scale) else @intCast(pev.y);
                         switch (pev.kind) {
                             .wheel => {
                                 const delta: i32 = if (pev.button == 5) 3 else -3;
                                 g.view.scroll_rows += delta;
-                                // cut 5.6: the premium feed scrolls in PIXELS.
-                                // Wheel down (button 5) moves content up, so the
-                                // offset goes more negative; clamp so you cannot
-                                // scroll past the ends (top = 0, bottom exposes
-                                // the last post + a little breathing room).
+                                // The premium feed scrolls in PIXELS. Wheel down
+                                // (button 5) moves content up, so the offset goes
+                                // more negative; clamp so you cannot scroll past
+                                // the ends (top = 0, bottom exposes the last post
+                                // + a little breathing room). content_h is in the
+                                // layout's space, so the viewport height matches.
                                 g.scroll.* -= delta * 28;
-                                const win_h: i32 = @intCast(win.fb.height);
-                                const min_scroll: i32 = @min(0, win_h - g.content_h.* - 24);
+                                const view_h: i32 = if (g.gpu != null)
+                                    @intFromFloat(@as(f32, @floatFromInt(win.fb.height)) / gpu_scale)
+                                else
+                                    @intCast(win.fb.height);
+                                const min_scroll: i32 = @min(0, view_h - g.content_h.* - 24);
                                 g.scroll.* = @max(min_scroll, @min(0, g.scroll.*));
                                 effect_core.shiftY(g.active, -delta);
                             },
-                            .move => g.view.hover = if (field_ui.hitTest(cx, cy, g.hr.slice())) |hit| hit.target else field_ui.no_target,
+                            .move => {
+                                g.view.hover = if (field_ui.hitTest(cx, cy, g.hr.slice())) |hit| hit.target else field_ui.no_target;
+                                // GPU: the cursor lights the field (drawFieldGrid
+                                // halo) and leaves a gentle colourless wake.
+                                if (g.gpu) |gs| {
+                                    gs.mcx = @as(f32, @floatFromInt(pev.x)) / @as(f32, @floatFromInt(field_cell_w));
+                                    gs.mcy = @as(f32, @floatFromInt(pev.y)) / @as(f32, @floatFromInt(field_cell_h));
+                                    if (gs.cols > 0 and gs.rows > 0) {
+                                        const sx: u32 = @min(@as(u32, @intFromFloat(@max(0.0, gs.mcx))), gs.cols - 1);
+                                        const sy: u32 = @min(@as(u32, @intFromFloat(@max(0.0, gs.mcy))), gs.rows - 1);
+                                        // hover wake: a gentle, colourless ripple at the pointer.
+                                        gs.splashes.append(gpa, .{ .x = sx, .y = sy, .radius = 3, .amp = 0.4 }) catch {};
+                                    }
+                                }
+                            },
                             .button_down => if (pev.button == 1) {
-                                // cut 5.6: premium buttons are hit-tested in
-                                // PIXELS against the regions the feed emitted
-                                // this frame. A like/repost tap injects the field
-                                // effect at the tapped cell, so the burst blooms
-                                // right at the icon. (Persisting the toggle +
-                                // the network write is the next slice; the
-                                // delightful burst lands now.) If nothing premium
-                                // is hit, fall through to the legacy hit rects.
-                                if (feed_view.hitTest(g.regions.items, pev.x, pev.y)) |hit| {
+                                // Premium buttons are hit-tested against the
+                                // regions the feed emitted this frame. A like/
+                                // repost tap blooms the burst right at the icon:
+                                // on the GPU it stamps the living field (a real
+                                // dye splash); on the software path it triggers
+                                // the legacy burst effect. (Persisting a MOUSE
+                                // tap is still the deferred slice; the keyboard
+                                // like persists and bursts via fireEngageEffect.)
+                                // If nothing premium is hit, fall through to the
+                                // legacy cell hit rects.
+                                if (feed_view.hitTest(g.regions.items, rx, ry)) |hit| {
                                     if (hit.post < items.len) state.selected = hit.post;
-                                    const recipe: ?*const effect_core.Recipe = switch (hit.kind) {
-                                        .like => &effect_core.like_heart,
-                                        .repost => &effect_core.boost,
-                                        .reply => null,
-                                    };
-                                    if (recipe) |rc| {
-                                        const fcols = g.field.cols;
-                                        const frows = g.field.rows;
-                                        if (fcols > 0 and frows > 0) {
-                                            const tx: u16 = @min(cx, fcols - 1);
-                                            const ty: u16 = @min(cy, frows - 1);
-                                            effect_core.trigger(gpa, g.active, rc, tx, ty, 1.0) catch {};
+                                    const is_engage = hit.kind == .like or hit.kind == .repost;
+                                    if (is_engage) {
+                                        if (g.gpu) |gs| {
+                                            const sx: u32 = @intFromFloat(@max(0.0, @as(f32, @floatFromInt(pev.x)) / @as(f32, @floatFromInt(field_cell_w))));
+                                            const sy: u32 = @intFromFloat(@max(0.0, @as(f32, @floatFromInt(pev.y)) / @as(f32, @floatFromInt(field_cell_h))));
+                                            pushLikeSplash(gpa, gs, sx, sy);
+                                        } else {
+                                            const rc: *const effect_core.Recipe = if (hit.kind == .like) &effect_core.like_heart else &effect_core.boost;
+                                            const fcols = g.field.cols;
+                                            const frows = g.field.rows;
+                                            if (fcols > 0 and frows > 0) {
+                                                const tx: u16 = @min(cx, fcols - 1);
+                                                const ty: u16 = @min(cy, frows - 1);
+                                                effect_core.trigger(gpa, g.active, rc, tx, ty, 1.0) catch {};
+                                            }
                                         }
                                     }
                                 } else if (field_ui.hitTest(cx, cy, g.hr.slice())) |hit| {
@@ -1226,7 +1278,206 @@ const Grid = struct {
     scroll: *i32,
     content_h: *i32,
     regions: *feed_view.Regions,
+    /// The GPU render path, present only when `gpu.init` succeeded on this
+    /// window (else null → the software path renders, the rule's fallback).
+    /// A pointer into run()'s `gpu_state` local; one-frame contract like the
+    /// rest of Grid.
+    gpu: ?*GpuState,
 };
+
+// ===========================================================================
+// The GPU render path (Phase 6.4): the living glyph field (a pure CPU wave
+// simulation, core/glyph_field.zig) rendered grid-intensity + the premium feed,
+// both on the GPU via shell/gpu.zig. Brought up additively when the window
+// opens and `gpu.init` succeeds; the SOFTWARE path stays the automatic fallback
+// (E2: degrade to a plainer window, never a dead one). The reference pipeline is
+// src/gpu_preview.zig; this is that pipeline, driven by the live app's input.
+// ===========================================================================
+
+/// Field glyph cell — big enough to read the symbols, still many of them
+/// (matches the preview). The field grid is win/cell in physical pixels.
+const field_cell_w: u16 = 13;
+const field_cell_h: u16 = 17;
+/// The feed is authored for a fixed LOGICAL width and scaled to FILL the
+/// window (DPI): scale = window_width / design_w. So the three-pane keeps its
+/// cohesion at any window size and the type lands at design size, crisp.
+const design_w: u32 = 1340;
+/// Ambient-forcing knobs: a slow drifting swell so the still field breathes.
+const amb_amp: f32 = 0.010;
+const amb_scale: f32 = 0.060;
+const amb_drift: f32 = 0.10;
+/// 0xFF181812 — the same background the software path clears to.
+const gpu_clear_r: f32 = @as(f32, 0x18) / 255.0;
+const gpu_clear_g: f32 = @as(f32, 0x18) / 255.0;
+const gpu_clear_b: f32 = @as(f32, 0x12) / 255.0;
+
+fn uiScale(physical_w: u32) f32 {
+    return @as(f32, @floatFromInt(physical_w)) / @as(f32, @floatFromInt(design_w));
+}
+fn logicalH(physical_w: u32, physical_h: u32) u32 {
+    return @max(1, @as(u32, @intFromFloat(@as(f32, @floatFromInt(physical_h)) / uiScale(physical_w))));
+}
+
+/// The GPU path's working set, one per run(). A7.2: cold struct, size guard
+/// waived — stack-only, exactly one. The CPU sim (`field`) + shell-side
+/// ambient `bias` + queued `splashes` feed the pure `glyph_field.step`; the
+/// renderers (`grid`, `ramp`, `feed`) draw it. `t`/`mcx`/`mcy` are the animation
+/// clock and the cursor-light cell (top-down; <0 = no cursor).
+const GpuState = struct {
+    g: gpu.Gpu,
+    field: glyph_field.Field,
+    grid: gpu.FieldGrid,
+    ramp: gpu.FieldRenderer,
+    feed: gpu.Feed,
+    bias: []f32,
+    splashes: std.ArrayList(glyph_field.Splash),
+    cols: u32,
+    rows: u32,
+    t: f32,
+    mcx: f32,
+    mcy: f32,
+    /// Last frame's DPI scale (physical_w / design_w) — the feed lays out in
+    /// LOGICAL pixels, so the input handlers read this to map a click/region
+    /// back to physical pixels and thence to a field cell. Refreshed each
+    /// frame by paintFrameGpu.
+    scale: f32,
+    /// Dirty signature of the last-built feed (scroll + window size + each
+    /// post's identity/counts/flags). The field animates every frame, but the
+    /// feed — transform + per-post text measurement + vertex build — is rebuilt
+    /// ONLY when this changes, so a large feed does not pay that cost 60×/sec.
+    feed_sig: u64,
+    /// Content-only signature (excludes scroll + window height): when it
+    /// changes, the per-post `heights` cache is reset. So a pure SCROLL (which
+    /// changes feed_sig but not this) keeps the cache and skips re-measuring
+    /// every post — the scroll-lag fix.
+    feed_content_sig: u64,
+    /// Per-post measured-height cache handed to feed_view.layout. Scroll-
+    /// invariant; sized to the post count, reset to -1 on content/width change.
+    heights: []i32,
+    /// Monotonic clock of the last simulation STEP. The field advances on a
+    /// fixed wall-clock timestep (≈60 Hz) so it evolves at a constant real-time
+    /// rate no matter how fast the loop spins — without this, a fast input
+    /// stream (mouse motion floods events → the loop runs far above 60 fps)
+    /// stepped the sim every lap and the WHOLE field's motion sped up while the
+    /// pointer moved. 0 until the first frame.
+    last_step_nanos: u64,
+};
+
+/// Bring up the GPU path on the live window. Any failure (no GL, shader/pack
+/// error, OOM) propagates so the caller falls back to software (E2). Each
+/// acquired resource has an errdefer so a mid-init failure frees cleanly (C5).
+fn initGpuState(gpa: Allocator, engine: *text_core.Engine, win: *window_shell.Window) !GpuState {
+    var g = try gpu.init(win.wid);
+    errdefer gpu.deinit(&g);
+    const w: u32 = win.fb.width;
+    const h: u32 = win.fb.height;
+    gpu.setViewport(@intCast(w), @intCast(h));
+
+    var feed = try gpu.initFeed(gpa);
+    errdefer gpu.feedDeinit(&feed, gpa);
+    const ramp = try gpu.initFieldRenderer(gpa, engine, field_cell_w, field_cell_h);
+    const grid = try gpu.initFieldGrid();
+
+    const cols: u32 = @max(8, w / field_cell_w);
+    const rows: u32 = @max(8, h / field_cell_h);
+    var field: glyph_field.Field = undefined;
+    try glyph_field.init(gpa, &field, cols, rows);
+    errdefer glyph_field.deinit(gpa, &field);
+    const bias = try gpa.alloc(f32, cols * rows);
+    errdefer gpa.free(bias);
+
+    return .{
+        .g = g,
+        .field = field,
+        .grid = grid,
+        .ramp = ramp,
+        .feed = feed,
+        .bias = bias,
+        .splashes = .empty,
+        .cols = cols,
+        .rows = rows,
+        .t = 0,
+        .mcx = -1,
+        .mcy = -1,
+        .scale = uiScale(w),
+        .feed_sig = 0,
+        .feed_content_sig = 0,
+        .heights = &.{},
+        .last_step_nanos = 0,
+    };
+}
+
+/// A cheap dirty signature of the rendered feed: the scroll offset, the window
+/// size, and each post's identity (cid) + the fields that affect its render
+/// (engagement counts + viewer flags). Hashing the whole feed is far cheaper
+/// (a few µs) than the layout it gates (per-post text measurement). Relative
+/// age is intentionally excluded — it would force a rebuild every second; ages
+/// refresh on the next scroll / new post / engagement instead.
+fn feedSignature(items: []const feed_core.TimelineItem, scroll: i32, w: u32, h: u32) u64 {
+    var hh = std.hash.Wyhash.init(0x7A74_F1E1);
+    hh.update(std.mem.asBytes(&scroll));
+    hh.update(std.mem.asBytes(&w));
+    hh.update(std.mem.asBytes(&h));
+    const n: u64 = items.len;
+    hh.update(std.mem.asBytes(&n));
+    for (items) |it| {
+        hh.update(it.cid);
+        hh.update(std.mem.asBytes(&it.like_count));
+        hh.update(std.mem.asBytes(&it.repost_count));
+        hh.update(std.mem.asBytes(&it.reply_count));
+        hh.update(std.mem.asBytes(&it.item_flags));
+    }
+    return hh.final();
+}
+
+fn deinitGpuState(gpa: Allocator, gs: *GpuState) void {
+    gs.splashes.deinit(gpa);
+    if (gs.heights.len > 0) gpa.free(gs.heights);
+    gpa.free(gs.bias);
+    glyph_field.deinit(gpa, &gs.field);
+    gpu.feedDeinit(&gs.feed, gpa);
+    gpu.deinit(&gs.g);
+}
+
+/// Refit the CPU field grid + ambient-bias buffer to a new window size. New
+/// buffers allocated BEFORE the old are freed, so a failed alloc leaves the
+/// existing state (and its deinit) valid (C5). The dye/height reset on resize
+/// is accepted for v1 (the field re-seeds calm); reproject later if wanted.
+fn resizeGpuField(gpa: Allocator, gs: *GpuState, w: u32, h: u32) !void {
+    const cols: u32 = @max(8, w / field_cell_w);
+    const rows: u32 = @max(8, h / field_cell_h);
+    var newfield: glyph_field.Field = undefined;
+    try glyph_field.init(gpa, &newfield, cols, rows);
+    errdefer glyph_field.deinit(gpa, &newfield);
+    const new_bias = try gpa.alloc(f32, cols * rows);
+    glyph_field.deinit(gpa, &gs.field);
+    gs.field = newfield;
+    gpa.free(gs.bias);
+    gs.bias = new_bias;
+    gs.cols = cols;
+    gs.rows = rows;
+}
+
+/// Append the LIKE burst — a splash RECIPE: a strong central kick plus a ring
+/// of six satellites, all staining the medium red — at field cell (gx,gy).
+/// This is the heart-burst as energy injected into the field (design §1). A
+/// queue-full append is dropped silently (E4: a missed effect must never break
+/// the action). Mirrors the preview's recipe + the spec's tuning.
+fn pushLikeSplash(gpa: Allocator, gs: *GpuState, gx: u32, gy: u32) void {
+    if (gs.cols == 0 or gs.rows == 0) return;
+    const sx = @min(gx, gs.cols - 1);
+    const sy = @min(gy, gs.rows - 1);
+    gs.splashes.append(gpa, .{ .x = sx, .y = sy, .radius = 4, .amp = 2.0, .dye = 1.0 }) catch {};
+    var k: u32 = 0;
+    while (k < 6) : (k += 1) {
+        const ang = @as(f32, @floatFromInt(k)) * (6.2831853 / 6.0);
+        const ox: i32 = @intFromFloat(@cos(ang) * 5.0);
+        const oy: i32 = @intFromFloat(@sin(ang) * 5.0);
+        const rx = std.math.clamp(@as(i32, @intCast(sx)) + ox, 0, @as(i32, @intCast(gs.cols - 1)));
+        const ry = std.math.clamp(@as(i32, @intCast(sy)) + oy, 0, @as(i32, @intCast(gs.rows - 1)));
+        gs.splashes.append(gpa, .{ .x = @intCast(rx), .y = @intCast(ry), .radius = 3, .amp = 1.0, .dye = 0.85 }) catch {};
+    }
+}
 
 /// THE single source of truth for the glyph cell size. Two facts drive
 /// it: (1) the cell HEIGHT is the pixel size the font rasterizes at, and
@@ -1316,6 +1567,12 @@ fn paintFrame(
     if (pix) |g| switch (backend) {
         .window => |win| {
             if (items.len > 0 and state.selected >= items.len) state.selected = @intCast(items.len - 1);
+            // Phase 6.4: when the GPU path is live, render the field + feed on
+            // the GPU and return; the software path below is the fallback.
+            if (g.gpu) |gs| {
+                try paintFrameGpu(gpa, arena, win, g, gs, items, now);
+                return;
+            }
             // Cell size scales with the user zoom; the grid reflows to
             // fill the window at whatever size results. The font engine
             // rasterizes at the derived pixel height (cached per-size).
@@ -1381,7 +1638,7 @@ fn paintFrame(
                 premium_sample[0..]
             else
                 feed_view.fromTimeline(arena, items, now) catch premium_sample[0..];
-            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions) catch g.content_h.*;
+            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null) catch g.content_h.*;
             const t_layout = if (debug_frame_timing) clock_shell.monotonicNanos() else 0;
             window_shell.presentDrawList(win, gpa, g.engine, g.draw.slice(), field_core.background) catch {}; // E2: a lost blit is the next frame's problem
             if (debug_frame_timing) {
@@ -1401,6 +1658,120 @@ fn paintFrame(
     try present(gpa, out, arena, prev, next, backend);
 }
 
+/// The GPU render route (Phase 6.4), one frame: step the living field, render
+/// it grid-intensity, then the premium feed on top, and swap. The feed is laid
+/// out at the fixed LOGICAL design width and scaled to FILL the window (DPI),
+/// exactly as the preview does. No per-frame pixel blit — render + swap.
+fn paintFrameGpu(
+    gpa: Allocator,
+    arena: Allocator,
+    win: *window_shell.Window,
+    g: Grid,
+    gs: *GpuState,
+    items: []const feed_core.TimelineItem,
+    now: i64,
+) !void {
+    const w: u32 = win.fb.width;
+    const h: u32 = win.fb.height;
+    gpu.setViewport(@intCast(w), @intCast(h));
+    // Refit the field grid to the window when the cell count changes (cheap;
+    // a few KB R32F). On a failed realloc keep the prior grid (E2).
+    const want_cols: u32 = @max(8, w / field_cell_w);
+    const want_rows: u32 = @max(8, h / field_cell_h);
+    if (want_cols != gs.cols or want_rows != gs.rows) {
+        resizeGpuField(gpa, gs, w, h) catch {};
+    }
+
+    const scale = uiScale(w);
+    gs.scale = scale;
+    // Rebuild the feed ONLY when it changed (scroll / window size / any post's
+    // identity, counts, or flags). The field below animates every frame, but
+    // this pipeline — fromTimeline + feed_view.layout (which MEASURES every
+    // post, including off-screen ones) + buildVertices — is the one per-frame
+    // cost worth avoiding (§5 gotcha): at 60 fps over a large feed it stutters.
+    // A content hash is the dirty signal, far cheaper than the layout it gates.
+    // The feed verts persist in gs.feed across frames; feedDraw below reuses
+    // them. (G1/G3: this is the measured-cause fix for the live lag.)
+    const sig = feedSignature(items, g.scroll.*, w, h);
+    if (sig != gs.feed_sig or gs.feed.verts.items.len == 0) {
+        gs.feed_sig = sig;
+        // Falls back to sample content only while the timeline is empty
+        // (initial load) so the screen is never blank.
+        const feed_posts: []const feed_view.PostView = if (items.len == 0)
+            premium_sample[0..]
+        else
+            feed_view.fromTimeline(arena, items, now) catch premium_sample[0..];
+        // Per-post height cache: post heights are scroll-invariant, so only
+        // reset the cache when the CONTENT or WIDTH changed (scroll/height
+        // zeroed in this signature). A pure scroll then reuses every post's
+        // measured height and skips the text-shaping pass — the scroll-lag fix.
+        const content_sig = feedSignature(items, 0, w, 0);
+        if (content_sig != gs.feed_content_sig or gs.heights.len != feed_posts.len) {
+            gs.feed_content_sig = content_sig;
+            if (gs.heights.len != feed_posts.len) {
+                if (gpa.alloc(i32, feed_posts.len)) |buf| {
+                    if (gs.heights.len > 0) gpa.free(gs.heights);
+                    gs.heights = buf;
+                } else |_| {} // keep the old buffer; layout guards on length
+            }
+            @memset(gs.heights, -1);
+        }
+        const lh = logicalH(w, h);
+        g.draw.len = 0;
+        g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights) catch g.content_h.*;
+        gpu.feedBuild(&gs.feed, gpa, g.engine, g.draw.slice(), scale) catch {};
+    }
+
+    // Advance the medium on a FIXED WALL-CLOCK timestep (≈60 Hz), at most once
+    // per frame, so the field evolves at a constant real-time rate regardless of
+    // how fast this loop spins. Stepping once per loop iteration coupled the sim
+    // to the INPUT rate: a stream of mouse-motion events drove the loop far above
+    // 60 fps, so the whole field's animation sped up whenever the pointer moved
+    // (every disturbance everywhere running fast in lockstep — the "far corners
+    // react too" symptom). With the clock gate, idle and active evolve
+    // identically; only the splash the pointer injects is local to it.
+    const dt_ns: u64 = 16_666_667; // 1/60 s
+    const now_ns = clock_shell.monotonicNanos();
+    const due = gs.last_step_nanos == 0 or (now_ns -| gs.last_step_nanos) >= dt_ns;
+    if (due) {
+        // Fill the time-driven ambient bias (shell side → the core stays pure,
+        // B3): a slow drifting two-sine swell plus a finer term so the dense
+        // interior is an ASSORTMENT of glyphs, not a wall of one symbol.
+        var yy: u32 = 0;
+        while (yy < gs.rows) : (yy += 1) {
+            const fy: f32 = @floatFromInt(yy);
+            var xx: u32 = 0;
+            while (xx < gs.cols) : (xx += 1) {
+                const fx: f32 = @floatFromInt(xx);
+                const base = std.math.sin(fx * amb_scale + gs.t * amb_drift) *
+                    std.math.sin(fy * amb_scale * 1.3 - gs.t * amb_drift * 0.8);
+                const fine = std.math.sin(fx * 0.21 - gs.t * 0.07) *
+                    std.math.sin(fy * 0.18 + gs.t * 0.06);
+                gs.bias[yy * gs.cols + xx] = amb_amp * (base + 0.5 * fine);
+            }
+        }
+        // Advance the medium one step; queued splashes injected once.
+        glyph_field.step(&gs.field, .{}, gs.splashes.items, gs.bias);
+        gs.splashes.clearRetainingCapacity();
+        gs.t += 1.0 / 60.0;
+        // Advance the step clock by one tick; if we fell far behind (a stall),
+        // snap to now and DROP the backlog rather than fast-forward the field.
+        gs.last_step_nanos = if (gs.last_step_nanos == 0 or (now_ns -| gs.last_step_nanos) > dt_ns * 4)
+            now_ns
+        else
+            gs.last_step_nanos + dt_ns;
+    }
+
+    // Render: the living field behind, the feed on top, then swap.
+    gpu.uploadField(&gs.grid, gs.field.height, gs.field.dye, gs.field.cols, gs.field.rows);
+    gpu.clear(gpu_clear_r, gpu_clear_g, gpu_clear_b);
+    gpu.drawFieldGrid(&gs.grid, &gs.ramp, gs.mcx, gs.mcy, gs.t, @intCast(w), @intCast(h));
+    // The feed verts persist across frames (rebuilt above only when the feed
+    // changed); just draw them.
+    gpu.feedDraw(&gs.feed, @intCast(w), @intCast(h));
+    gpu.swap(&gs.g);
+}
+
 /// Fire the field effect for an engagement transition at the post's heart
 /// cell — the ONE place an engagement maps to a recipe, derived from the
 /// transition itself (liking vs unliking), not from a separate click
@@ -1409,6 +1780,24 @@ fn paintFrame(
 /// is found from the frame's heart slots by the post's index. Errors are
 /// swallowed: a missed effect must never break the action (E4).
 fn fireEngageEffect(gpa: Allocator, g: Grid, kind: Engagement, target: u32, now_liked: bool) void {
+    // GPU path: the living field IS the effect. Inject the like/boost burst as
+    // a SPLASH (energy + red dye) into the medium at the post's heart cell;
+    // the medium carries and keeps it. The software effect list is NOT advanced
+    // on the GPU path, so firing it here would only accumulate — so we don't.
+    // An unlike has no dye-removal in v1 (the stain persists by design).
+    if (g.gpu) |gs| {
+        if (now_liked or kind == .repost) {
+            if (heartFieldCell(g, gs, target)) |cell| pushLikeSplash(gpa, gs, cell.x, cell.y);
+        }
+        if (debug_effects) {
+            const name = switch (kind) {
+                .like => if (now_liked) "like(fill)" else "unlike(drain)",
+                .repost => "boost",
+            };
+            std.debug.print("[zat] gpu splash {s} for post {d}\n", .{ name, target });
+        }
+        return;
+    }
     const recipe: *const effect_core.Recipe = switch (kind) {
         .like => if (now_liked) &effect_core.like_heart else &effect_core.unlike_heart,
         .repost => &effect_core.boost,
@@ -1442,6 +1831,26 @@ fn fireEngageEffect(gpa: Allocator, g: Grid, kind: Engagement, target: u32, now_
             return;
         }
     }
+}
+
+/// Find the field grid cell under post `target`'s like button, for the GPU
+/// burst. The feed regions are in LOGICAL pixels (the feed lays out at
+/// design_w); map a region's centre through the frame's DPI scale to physical
+/// pixels, then to a field cell. Returns null if the post has no like region
+/// this frame (scrolled out) — the caller then fires nothing (E4).
+fn heartFieldCell(g: Grid, gs: *GpuState, target: u32) ?struct { x: u32, y: u32 } {
+    for (g.regions.items) |r| {
+        if (r.post == target and r.kind == .like) {
+            const cx_logical: f32 = @as(f32, @floatFromInt(r.x)) + @as(f32, @floatFromInt(r.w)) / 2.0;
+            const cy_logical: f32 = @as(f32, @floatFromInt(r.y)) + @as(f32, @floatFromInt(r.h)) / 2.0;
+            const px: f32 = cx_logical * gs.scale;
+            const py: f32 = cy_logical * gs.scale;
+            const gx: u32 = @intFromFloat(@max(0.0, px / @as(f32, field_cell_w)));
+            const gy: u32 = @intFromFloat(@max(0.0, py / @as(f32, field_cell_h)));
+            return .{ .x = gx, .y = gy };
+        }
+    }
+    return null;
 }
 
 fn present(

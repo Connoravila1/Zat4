@@ -741,6 +741,61 @@ pub fn draw(r: *Renderer, verts: []const Vertex, vw: i32, vh: i32) void {
     glDrawArrays(GL_TRIANGLES, 0, @intCast(verts.len));
 }
 
+/// The feed render path as ONE handle (D3: the vertex layout — `Vertex` is
+/// private — stays inside this module, so a caller in another module can hold
+/// the path without naming it). The renderer program + atlas texture are built
+/// once; `verts` are rebuilt only when the draw list changes (timeline / scroll
+/// / resize), never per frame. A7.2: cold struct, size guard waived — one per
+/// window; its hot data is the vertex list and the GPU-side buffers/texture.
+pub const Feed = struct {
+    renderer: Renderer,
+    atlas: atlas_mod.Atlas,
+    verts: std.ArrayListUnmanaged(Vertex),
+};
+
+/// initFeed / feedBuild can fail on GL bring-up (GpuInit) or atlas packing
+/// (AtlasFull / OutOfMemory).
+pub const FeedError = Error || atlas_mod.Error;
+
+/// Build the feed renderer + an empty atlas. Call once, after the context is
+/// current. Atlas dim 2048 matches the preview's proven budget.
+pub fn initFeed(gpa: std.mem.Allocator) FeedError!Feed {
+    const renderer = try initRenderer();
+    var atlas: atlas_mod.Atlas = .{};
+    try atlas_mod.init(gpa, &atlas, 2048);
+    return .{ .renderer = renderer, .atlas = atlas, .verts = .empty };
+}
+
+/// Rebuild the feed vertices from `list` at `scale`, then re-upload the atlas
+/// (buildVertices may have packed new glyphs that must reach the texture).
+/// New buffer built BEFORE the old is freed, so a failed pack leaves the prior
+/// verts intact (E2/C5). Call on change only — see the struct doc.
+pub fn feedBuild(
+    self: *Feed,
+    gpa: std.mem.Allocator,
+    engine: *text.Engine,
+    list: raster.DrawList.Slice,
+    scale: f32,
+) atlas_mod.Error!void {
+    const fresh = try buildVertices(gpa, engine, &self.atlas, list, scale);
+    self.verts.deinit(gpa);
+    self.verts = fresh;
+    uploadAtlas(&self.renderer, &self.atlas);
+}
+
+/// Issue the feed's single draw call (atlas already uploaded by feedBuild).
+pub fn feedDraw(self: *Feed, vw: i32, vh: i32) void {
+    draw(&self.renderer, self.verts.items, vw, vh);
+}
+
+/// Free the CPU-side vertex list + atlas. The GL program/buffer/texture are
+/// process-lifetime objects (matching Renderer/FieldRenderer/FieldGrid, none
+/// of which deinit) and are reclaimed at exit.
+pub fn feedDeinit(self: *Feed, gpa: std.mem.Allocator) void {
+    self.verts.deinit(gpa);
+    atlas_mod.deinit(gpa, &self.atlas);
+}
+
 fn bindAttrib(loc: GLint, size: GLint, stride: GLsizei, byte_off: usize) void {
     if (loc < 0) return;
     const l: GLuint = @intCast(loc);
