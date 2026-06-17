@@ -84,6 +84,26 @@ pub fn freeIdentity(gpa: Allocator, id: Identity) void {
     gpa.free(id.signing_key_multibase);
 }
 
+/// Resolve a DID directly to its PDS host (the DID document's atproto PDS
+/// service endpoint). The AppView's poller has DIDs from the follow graph, not
+/// handles, so it needs this DID-first path. Returns the PDS URL (gpa-owned;
+/// caller frees). A malformed DID is rejected LOCALLY (no network) — handy when
+/// the index holds placeholder/invalid DIDs that should simply be skipped.
+pub fn pdsForDid(
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    endpoints: Endpoints,
+    did: []const u8,
+) ![]u8 {
+    try core.validateDid(did);
+    var scratch_state = std.heap.ArenaAllocator.init(gpa);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+    const doc = try verifiedDocForDid(scratch, io, environ, endpoints, did, null);
+    return gpa.dupe(u8, doc.pds_url);
+}
+
 /// Strategy 1: DNS TXT record via DoH. Strategy 2: HTTPS well-known.
 /// A DNS miss — or an unreachable/garbage resolver — is an ordinary,
 /// *expected* condition handled by falling through to the second strategy

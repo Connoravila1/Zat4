@@ -37,7 +37,7 @@ pub fn main(init: std.process.Init) !void {
     var port: u16 = 2584;
     var ingest_only = false;
     var live = false;
-    var poll_handle: ?[]const u8 = null;
+    var do_poll = false;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -45,9 +45,8 @@ pub fn main(init: std.process.Init) !void {
             ingest_only = true;
         } else if (std.mem.eql(u8, a, "--live")) {
             live = true;
-        } else if (std.mem.eql(u8, a, "--poll") and i + 1 < args.len) {
-            i += 1;
-            poll_handle = args[i];
+        } else if (std.mem.eql(u8, a, "--poll")) {
+            do_poll = true;
         } else if (std.mem.eql(u8, a, "--port") and i + 1 < args.len) {
             i += 1;
             port = std.fmt.parseInt(u16, args[i], 10) catch 2584;
@@ -88,20 +87,38 @@ pub fn main(init: std.process.Init) !void {
     // (snapshot) path it is uncontended.
     var lock: serve.IndexLock = .{};
 
-    // --- PDS-POLLING INGEST (--poll <handle>) -------------------------------
+    // --- PDS-POLLING INGEST (--poll) ----------------------------------------
     // The public Jetstream is live-only and not built for custom-lexicon
     // discovery, so the AppView reads app.zat4.feed.post records DIRECTLY from
-    // the handle's PDS via listRecords (a public read), indexing new ones every
-    // few seconds. Correct + cheap for a small network; the firehose (own
-    // Jetstream / Tap) is the scale-up. A serve thread answers queries
-    // meanwhile; the index lock guards the two against each other.
-    if (poll_handle) |handle| {
-        const id = identity.resolve(arena, io, env, .{}, handle) catch |err| {
-            try out.print("zat4-appview: could not resolve {s}: {s}\n", .{ handle, @errorName(err) });
-            return err;
-        };
-        try out.print("zat4-appview: polling {s} ({s}) on {s} every 5s\n", .{ handle, id.did, id.pds_url });
+    // each author's PDS via listRecords (a public read), indexing new ones every
+    // few seconds. The author set is the WHOLE follow graph the index knows
+    // (post authors + follow endpoints), each DID resolved to its PDS once;
+    // invalid/placeholder DIDs are skipped. A serve thread answers queries
+    // meanwhile; the index lock guards the two against each other. Correct +
+    // cheap for a small network; the firehose (own Jetstream / Tap) is the
+    // scale-up.
+    if (do_poll) {
+        // Targets live for the process; resolved once before the serve thread
+        // starts (no concurrent mutation yet).
+        var target_arena = std.heap.ArenaAllocator.init(gpa);
+        const ta = target_arena.allocator();
+        const Target = struct { did: []const u8, pds: []const u8 };
+        var targets: std.ArrayList(Target) = .empty;
+
+        const dids = appview.authorDids(ta, &idx) catch &[_][]const u8{};
+        for (dids) |did| {
+            const pds = identity.pdsForDid(gpa, io, env, .{}, did) catch |err| {
+                try out.print("zat4-appview: skip {s} ({s})\n", .{ did, @errorName(err) });
+                continue;
+            };
+            targets.append(ta, .{ .did = did, .pds = pds }) catch continue;
+            try out.print("zat4-appview: polling {s} on {s}\n", .{ did, pds });
+        }
         try out.flush();
+        if (targets.items.len == 0) {
+            try out.print("zat4-appview: no resolvable authors to poll yet (seed a follow graph with real DIDs)\n", .{});
+            try out.flush();
+        }
 
         const serve_thread = try std.Thread.spawn(.{}, serveThread, .{ gpa, io, &idx, port, &lock });
         _ = serve_thread; // runs until the process is killed
@@ -109,14 +126,13 @@ pub fn main(init: std.process.Init) !void {
         var poll_arena = std.heap.ArenaAllocator.init(gpa);
         defer poll_arena.deinit();
         while (true) {
-            _ = poll_arena.reset(.retain_capacity);
-            const added = poll.pollRepo(gpa, poll_arena.allocator(), io, env, id.pds_url, id.did, &idx, &lock) catch |err| blk: {
-                try out.print("zat4-appview: poll error: {s}\n", .{@errorName(err)});
-                try out.flush();
-                break :blk 0;
-            };
-            if (added > 0) {
-                try out.print("zat4-appview: indexed +{d} new post(s) from {s}\n", .{ added, handle });
+            var total: usize = 0;
+            for (targets.items) |t| {
+                _ = poll_arena.reset(.retain_capacity);
+                total += poll.pollRepo(gpa, poll_arena.allocator(), io, env, t.pds, t.did, &idx, &lock) catch 0;
+            }
+            if (total > 0) {
+                try out.print("zat4-appview: indexed +{d} new post(s) across {d} author(s)\n", .{ total, targets.items.len });
                 try out.flush();
             }
             var nofds = [_]std.posix.pollfd{};

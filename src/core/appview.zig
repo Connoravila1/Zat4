@@ -173,6 +173,32 @@ pub fn indexPost(gpa: Allocator, idx: *Index, in: PostInput) Allocator.Error!boo
     return true;
 }
 
+/// The unique set of DIDs the index knows as authors or graph endpoints (post
+/// authors + follow followers + follow subjects) — the set the AppView polls
+/// for content. DID strings are duped into `arena` so they stay valid across
+/// index mutation. PURE read (B2). A5 note: these are stable did:plc/did:web
+/// identifiers (not bare indexes), so handing them across the module boundary
+/// is correct — they are the same kind of value a CID is.
+pub fn authorDids(arena: Allocator, idx: *const Index) Allocator.Error![]const []const u8 {
+    var seen: std.AutoHashMapUnmanaged(StrId, void) = .empty;
+    defer seen.deinit(arena);
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer out.deinit(arena);
+    const columns = [_][]const StrId{
+        idx.posts.items(.author),
+        idx.follows.items(.follower),
+        idx.follows.items(.subject),
+    };
+    for (columns) |col| {
+        for (col) |id| {
+            const gop = try seen.getOrPut(arena, id);
+            if (gop.found_existing) continue;
+            try out.append(arena, try arena.dupe(u8, str(idx, id)));
+        }
+    }
+    return out.toOwnedSlice(arena);
+}
+
 /// Index one follow edge (follower follows subject). C1.
 pub fn indexFollow(gpa: Allocator, idx: *Index, follower_did: []const u8, subject_did: []const u8) Allocator.Error!void {
     const follower = try internStr(gpa, idx, follower_did);
