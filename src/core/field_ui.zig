@@ -71,10 +71,9 @@ pub const no_target: u32 = std.math.maxInt(u32);
 /// One inline heart-button placement: the cell the heart sprite occupies
 /// and whether the post is liked. The owner's model — the like button IS
 /// the heart — so layout RESERVES the heart's cells and records this, and
-/// the shell draws the heart sprite (effect.composeStaticHeart) at (x,y)
-/// after field.compose, suppressing the one currently animating (the
-/// effect draws that one). HOT (one per visible post, scanned each
-/// frame) → A7 guard.
+/// the premium feed layer (feed_view) draws the heart icon at (x,y);
+/// this slot records its cell so a like animation/burst can originate
+/// there. HOT (one per visible post, scanned each frame) → A7 guard.
 pub const HeartSlot = struct {
     x: u16, // grid cell of the heart's left edge
     y: u16, // grid cell row of the heart
@@ -391,9 +390,8 @@ pub fn buildBand(
 
         // Engagement row: like / boost / reply. The like button IS the
         // heart (the owner's model): layout RESERVES the inline heart's
-        // cells and records a HeartSlot; the shell draws the heart sprite
-        // there (effect.composeStaticHeart) — filled red if liked, dim
-        // outline if not. The SAME heart fills and bursts in place on
+        // cells and records a HeartSlot; the premium feed layer draws the
+        // heart icon there. The SAME heart fills and bursts in place on
         // click, so the hit target and the effect origin both point at
         // the heart's own cell, not the card centre.
         {

@@ -124,8 +124,8 @@ pub const heart = Stencil.makeScaled(&.{
 /// as illegible horizontal bands (the glyphs were too small to form the
 /// outline). The font has no ♥ glyph (it returns notdef), so the heart
 /// must be built from ASCII; scale 2 is the legibility floor for that.
-/// Used for the resting button (composeStaticHeart) and the burst
-/// (composeEffects) alike — one heart, both states.
+/// Used for the like burst (composeEffects) — the same ASCII heart that
+/// the premium feed layer draws as the resting button.
 pub const heart_inline = Stencil.makeScaled(&.{
     "## ##",
     "#####",
@@ -766,38 +766,6 @@ pub fn inlineHeartCellW() u16 {
 }
 pub fn inlineHeartCellH() u16 {
     return 1; // anchored on the single engagement-bar row
-}
-
-/// Draw the RESTING like-button heart at cell (cx, cy) — the static
-/// sprite the owner wants AS the button: a filled red heart when liked,
-/// a dim outline when not. Same stencil, same fine-glyph rendering as
-/// the animation (composeEffects), so the button and its burst are
-/// literally the same heart at the same size. PURE (B2): same (liked,
-/// position, metrics) ⇒ same draw items. The heart is vertically
-/// centred on the cell row so it sits on the engagement line. Returns
-/// nothing; appends fine glyphs to the draw list (C1/C2 explicit).
-///
-/// `suppress` lets the caller hide the static heart for one post while
-/// its animation is playing (the effect draws the heart then, so drawing
-/// both would double it) — the shell passes the animating target.
-pub fn composeStaticHeart(
-    gpa: Allocator,
-    liked: bool,
-    cx: u16,
-    cy: u16,
-    cell_w: u16,
-    cell_h: u16,
-    dl: *raster.DrawList,
-) error{OutOfMemory}!void {
-    // Resting heart, drawn as density glyphs (the owner's HTML look).
-    // Liked: fully filled (fill = 1) with a gentle resting glow. Unliked:
-    // fill = 0 → the dim slate '-' outline. Same drawHeartGlyphs the burst
-    // uses, so the button and its animation are the same ASCII heart.
-    if (liked) {
-        try drawHeartGlyphs(gpa, cx, cy, cell_w, cell_h, 1.0, 0.10, dl);
-    } else {
-        try drawHeartGlyphs(gpa, cx, cy, cell_w, cell_h, 0.0, 0.0, dl);
-    }
 }
 
 /// The per-stage cell rule — pure, evaluated against progress `t`. This
