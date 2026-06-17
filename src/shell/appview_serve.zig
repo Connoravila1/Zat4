@@ -118,7 +118,10 @@ fn route(arena: Allocator, idx: *const appview.Index, cfg: ServeConfig, target: 
 }
 
 fn getTimeline(arena: Allocator, idx: *const appview.Index, cfg: ServeConfig, target: []const u8) RouteError![]const u8 {
-    const viewer = queryValue(target, "viewer") orelse "";
+    // The client percent-encodes query values (RFC 3986 unreserved set), so a
+    // DID arrives with its ':' as %3A. Decode it, or the viewer never matches an
+    // interned DID and the timeline comes back empty.
+    const viewer = (try queryValueDecoded(arena, target, "viewer")) orelse "";
     var limit = cfg.default_limit;
     if (queryValue(target, "limit")) |l| {
         limit = @min(std.fmt.parseInt(usize, l, 10) catch cfg.default_limit, cfg.max_limit);
@@ -152,7 +155,7 @@ fn getTimeline(arena: Allocator, idx: *const appview.Index, cfg: ServeConfig, ta
 }
 
 fn getProfile(arena: Allocator, idx: *const appview.Index, target: []const u8) RouteError![]const u8 {
-    const actor = queryValue(target, "actor") orelse "";
+    const actor = (try queryValueDecoded(arena, target, "actor")) orelse "";
     _ = idx;
     // Cut 1 profile is a stub shaped like the client's ProfileViewDetailed:
     // the standalone profile record (app.zat4.actor.profile) indexing lands
@@ -172,9 +175,18 @@ fn pathOf(target: []const u8) []const u8 {
     return target[0..q];
 }
 
-/// Find `name`'s value in the target's query string. Returns null if absent.
-/// Cut 1 takes values verbatim (no percent-decoding yet — DIDs and small
-/// limits are URL-safe; percent-decoding is a noted follow-up).
+/// Find `name`'s value and percent-DECODE it into the arena (the client
+/// encodes values to the RFC 3986 unreserved set — `core/xrpc.zig` — so a DID's
+/// ':' is on the wire as %3A). Null if the param is absent.
+fn queryValueDecoded(arena: Allocator, target: []const u8, name: []const u8) RouteError!?[]const u8 {
+    const raw = queryValue(target, name) orelse return null;
+    const buf = try arena.dupe(u8, raw);
+    return std.Uri.percentDecodeInPlace(buf);
+}
+
+/// Find `name`'s value in the target's query string, VERBATIM (not decoded).
+/// Returns null if absent. Used for URL-safe values (numeric limit); DID-
+/// bearing params go through `queryValueDecoded`.
 fn queryValue(target: []const u8, name: []const u8) ?[]const u8 {
     const q = std.mem.indexOfScalar(u8, target, '?') orelse return null;
     var it = std.mem.splitScalar(u8, target[q + 1 ..], '&');
@@ -220,6 +232,27 @@ test "route: getTimeline serializes a TimelinePage the client can parse" {
     // The uri is an app.zat4 at-uri, never app.bsky (the wall, server side).
     try testing.expect(std.mem.indexOf(u8, page.feed[0].post.uri, "app.zat4.feed.post") != null);
     try testing.expect(std.mem.indexOf(u8, page.feed[0].post.uri, "app.bsky") == null);
+}
+
+test "route: a percent-encoded viewer DID resolves (client encodes ':' as %3A)" {
+    // Regression: the client percent-encodes query values (core/xrpc.zig), so a
+    // real DID arrives as did%3Aplc%3A...; if the AppView reads it verbatim the
+    // viewer never matches an interned DID and the timeline is empty -- the
+    // "nothing shows when I refresh" bug. The AppView must decode it.
+    const gpa = testing.allocator;
+    var idx: appview.Index = .{};
+    defer appview.deinit(gpa, &idx);
+    try appview.indexFollow(gpa, &idx, "did:plc:me", "did:plc:author");
+    _ = try appview.indexPost(gpa, &idx, .{ .cid = "c1", .author_did = "did:plc:author", .text = "decoded ok", .created_at = 1 });
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const json = try route(arena, &idx, .{}, "/xrpc/app.zat4.feed.getTimeline?limit=10&viewer=did%3Aplc%3Ame");
+    const page = try std.json.parseFromSliceLeaky(lexicon.TimelinePage, arena, json, .{ .ignore_unknown_fields = true });
+    try testing.expectEqual(@as(usize, 1), page.feed.len);
+    try testing.expectEqualStrings("decoded ok", page.feed[0].post.record.text);
 }
 
 test "route: an unknown method is NotFound" {
