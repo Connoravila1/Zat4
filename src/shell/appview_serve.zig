@@ -31,6 +31,22 @@ pub const ServeConfig = struct {
     max_limit: usize = 100,
 };
 
+/// Guards the index against concurrent mutation by the live-ingest thread
+/// while a request reads it. A spinlock (the Mailbox's pattern): two threads,
+/// brief critical sections, and `std.atomic` is stable across 0.16 snapshots
+/// where `std.Thread.Mutex` is not (stream.zig records the same reason). In the
+/// static (snapshot) serve path nothing else touches the index, so the lock is
+/// uncontended there. A7.2: cold struct, size guard waived.
+pub const IndexLock = struct {
+    locked: std.atomic.Value(bool) = .init(false),
+    pub fn lock(self: *IndexLock) void {
+        while (self.locked.swap(true, .acquire)) std.atomic.spinLoopHint();
+    }
+    pub fn unlock(self: *IndexLock) void {
+        self.locked.store(false, .release);
+    }
+};
+
 /// Run the serve loop forever (until the process is killed). Each accepted
 /// connection is handled inline on this thread for Cut 1 — single-threaded
 /// serving is honest about scale (G3: do not build a worker pool before a
@@ -38,19 +54,19 @@ pub const ServeConfig = struct {
 /// caller guarantees it is not mutated concurrently in Cut 1 (ingest and
 /// serve run as separate processes against separate index snapshots until
 /// the shared-state design lands — recorded in the setup doc).
-pub fn run(gpa: Allocator, io: std.Io, idx: *const appview.Index, cfg: ServeConfig) !void {
+pub fn run(gpa: Allocator, io: std.Io, idx: *const appview.Index, cfg: ServeConfig, lock: *IndexLock) !void {
     var address: std.Io.net.IpAddress = .{ .ip4 = .loopback(cfg.port) };
     var server = try address.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
 
     while (true) {
         const stream = server.accept(io) catch continue; // E2: a refused accept is the next loop's problem
-        handleConn(gpa, io, idx, cfg, stream) catch {}; // E2: contained per-connection
+        handleConn(gpa, io, idx, cfg, stream, lock) catch {}; // E2: contained per-connection
         stream.close(io);
     }
 }
 
-fn handleConn(gpa: Allocator, io: std.Io, idx: *const appview.Index, cfg: ServeConfig, stream: std.Io.net.Stream) !void {
+fn handleConn(gpa: Allocator, io: std.Io, idx: *const appview.Index, cfg: ServeConfig, stream: std.Io.net.Stream, lock: *IndexLock) !void {
     var read_buf: [16 * 1024]u8 = undefined;
     var write_buf: [64 * 1024]u8 = undefined;
     var stream_reader = stream.reader(io, &read_buf);
@@ -64,7 +80,14 @@ fn handleConn(gpa: Allocator, io: std.Io, idx: *const appview.Index, cfg: ServeC
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const body = route(arena, idx, cfg, target) catch |err| switch (err) {
+    // Hold the lock only across the index read + serialization: route() builds
+    // the response by copying what it needs out of the index into the arena, so
+    // the returned body is independent of the index and the (slow) socket write
+    // below runs unlocked. The live-ingest thread can mutate between requests.
+    lock.lock();
+    const routed = route(arena, idx, cfg, target);
+    lock.unlock();
+    const body = routed catch |err| switch (err) {
         error.OutOfMemory => return err,
         error.NotFound => {
             req.respond("{\"error\":\"MethodNotImplemented\"}", .{ .status = .not_found, .extra_headers = jsonHeaders() }) catch {};

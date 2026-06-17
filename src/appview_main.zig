@@ -20,10 +20,12 @@ const std = @import("std");
 const appview = @import("core/appview.zig");
 const ingest = @import("shell/appview_ingest.zig");
 const serve = @import("shell/appview_serve.zig");
+const stream = @import("shell/stream.zig");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
+    const env = init.environ_map;
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -32,11 +34,14 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
     var port: u16 = 2584;
     var ingest_only = false;
+    var live = false;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (std.mem.eql(u8, a, "--ingest-only")) {
             ingest_only = true;
+        } else if (std.mem.eql(u8, a, "--live")) {
+            live = true;
         } else if (std.mem.eql(u8, a, "--port") and i + 1 < args.len) {
             i += 1;
             port = std.fmt.parseInt(u16, args[i], 10) catch 2584;
@@ -73,7 +78,79 @@ pub fn main(init: std.process.Init) !void {
     try out.print("zat4-appview: serving on http://127.0.0.1:{d}/xrpc/  (ctrl-c to stop)\n", .{port});
     try out.flush();
 
-    try serve.run(gpa, io, &idx, .{ .port = port });
+    // The index lock guards reads against the live-ingest thread; in the static
+    // (snapshot) path it is uncontended.
+    var lock: serve.IndexLock = .{};
+
+    if (!live) {
+        try serve.run(gpa, io, &idx, .{ .port = port }, &lock);
+        return;
+    }
+
+    // --- LIVE INGEST (Cut 2): keep indexing the firehose WHILE serving. ------
+    // stream.zig (reused unchanged) connects to Jetstream on its own thread and
+    // posts new app.zat4.feed.post events to a mailbox; a serve thread answers
+    // queries; THIS thread drains the mailbox into the index under the lock. So
+    // a post that hits the network now appears in getTimeline within seconds.
+    // Empty DID filter ⇒ all repos (every Zat4 post on the network).
+    const jetstream_host = env.get("ZAT_JETSTREAM") orelse "jetstream2.us-east.bsky.network";
+    const log_path: ?[]const u8 = env.get("ZAT_STREAM_LOG") orelse "zat-appview-stream.log";
+
+    var mailbox: stream.Mailbox = .{};
+    defer mailbox.deinit(gpa);
+    const live_stream = stream.start(gpa, io, &mailbox, jetstream_host, 443, true, &[_][]const u8{}, log_path) catch |err| {
+        try out.print("zat4-appview: live stream failed to start: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer stream.shutdown(live_stream);
+
+    try out.print("zat4-appview: live ingest on {s} (app.zat4.feed.post, all repos)\n", .{jetstream_host});
+    try out.flush();
+
+    const serve_thread = try std.Thread.spawn(.{}, serveThread, .{ gpa, io, &idx, port, &lock });
+    _ = serve_thread; // runs until the process is killed
+
+    var mail: std.ArrayList(stream.Mail) = .empty;
+    defer mail.deinit(gpa);
+    while (true) {
+        mail.clearRetainingCapacity();
+        mailbox.drain(gpa, &mail) catch {};
+        if (mail.items.len > 0) {
+            lock.lock();
+            for (mail.items) |m| switch (m) {
+                .post => |p| {
+                    _ = appview.indexPost(gpa, &idx, .{
+                        .cid = p.cid,
+                        .author_did = p.did,
+                        .text = p.text,
+                        .created_at = p.created_at,
+                    }) catch false;
+                    stream.freePost(gpa, p);
+                },
+                .status => |s| {
+                    out.print("zat4-appview: {s}\n", .{s}) catch {};
+                    out.flush() catch {};
+                },
+                .failure => |e| {
+                    out.print("zat4-appview: stream {s}; retrying\n", .{@errorName(e)}) catch {};
+                    out.flush() catch {};
+                },
+            };
+            lock.unlock();
+        }
+        // Poll the mailbox at ~20 Hz. No condvar on the mailbox, so a short
+        // timed wait (poll with no fds = a portable sleep, the codebase's
+        // pattern) keeps this loop off a busy-spin; 50 ms is invisible against
+        // human posting rates.
+        var nofds = [_]std.posix.pollfd{};
+        _ = std.posix.poll(&nofds, 50) catch 0;
+    }
+}
+
+/// The query server, on its own thread for the live path (the main thread is
+/// busy draining the firehose into the index). Reads the index under `lock`.
+fn serveThread(gpa: std.mem.Allocator, io: std.Io, idx: *const appview.Index, port: u16, lock: *serve.IndexLock) void {
+    serve.run(gpa, io, idx, .{ .port = port }, lock) catch {};
 }
 
 test {
