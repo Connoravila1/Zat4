@@ -103,6 +103,9 @@ pub fn deinit(gpa: Allocator, idx: *Index) void {
     idx.follows.deinit(gpa);
     idx.pool_bytes.deinit(gpa);
     idx.pool_spans.deinit(gpa);
+    // The intern map owns a dupe of each key (see internStr) — free them first.
+    var kit = idx.intern.keyIterator();
+    while (kit.next()) |k| gpa.free(k.*);
     idx.intern.deinit(gpa);
     idx.post_by_cid.deinit(gpa);
     idx.* = .{};
@@ -124,9 +127,13 @@ pub fn internStr(gpa: Allocator, idx: *Index, bytes: []const u8) Allocator.Error
     try idx.pool_bytes.appendSlice(gpa, bytes);
     const id: StrId = @intCast(idx.pool_spans.items.len);
     try idx.pool_spans.append(gpa, .{ .off = off, .len = @intCast(bytes.len) });
-    // The map key must outlive the call: point it at the pooled bytes.
-    const stored = idx.pool_bytes.items[off .. off + bytes.len];
-    try idx.intern.put(gpa, stored, id);
+    // The map key must outlive the call AND survive pool growth. A slice into
+    // pool_bytes dangles the instant the pool reallocates, which made the intern
+    // map rehash freed memory and panic (a use-after-realloc). So the map owns a
+    // STABLE dupe of the key; pool_bytes still holds the bytes for str().
+    const key = try gpa.dupe(u8, bytes);
+    errdefer gpa.free(key);
+    try idx.intern.put(gpa, key, id);
     return id;
 }
 
@@ -303,6 +310,29 @@ test "intern: same string returns the same id, stored once" {
     try testing.expectEqual(a, b);
     try testing.expect(a != c);
     try testing.expectEqualStrings("did:plc:x", str(&idx, a));
+}
+
+test "intern: stays valid across pool + map growth (no dangling keys)" {
+    // Regression: the intern map once keyed on slices INTO pool_bytes, which
+    // dangle when the pool reallocates — a map grow then rehashed freed memory
+    // and panicked. Interning many distinct strings forces both growths; with
+    // the dupe-key fix, dedup and resolution stay correct throughout.
+    const gpa = testing.allocator;
+    var idx: Index = .{};
+    defer deinit(gpa, &idx);
+
+    var buf: [32]u8 = undefined;
+    var ids: [200]StrId = undefined;
+    for (&ids, 0..) |*slot, i| {
+        const s = std.fmt.bufPrint(&buf, "did:plc:user{d:0>5}", .{i}) catch unreachable;
+        slot.* = try internStr(gpa, &idx, s);
+        try testing.expectEqual(slot.*, try internStr(gpa, &idx, s)); // dedup holds
+    }
+    // Every earlier id still resolves to its exact bytes (no UAF corruption).
+    for (ids, 0..) |id, i| {
+        const want = std.fmt.bufPrint(&buf, "did:plc:user{d:0>5}", .{i}) catch unreachable;
+        try testing.expectEqualStrings(want, str(&idx, id));
+    }
 }
 
 test "timeline: reverse-chron over the followed set only" {

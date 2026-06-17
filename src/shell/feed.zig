@@ -44,9 +44,14 @@ pub fn loadTimelinePage(
 
     // The cursor slice borrows the store's bytes; it is consumed (URL built,
     // request sent) before ingest can mutate the store — sequence-safe.
-    var params_buf: [2]xrpc.Param = undefined;
+    var params_buf: [3]xrpc.Param = undefined;
     var params_len: usize = 0;
     params_buf[params_len] = .{ .name = "limit", .value = limit_str };
+    params_len += 1;
+    // The Zat4 AppView (Cut 1) builds the timeline from the viewer's follow set
+    // and takes the viewer DID as a query param (token-derived identity is a
+    // Phase E hardening seat — appview_serve.zig). Send it, or the feed is empty.
+    params_buf[params_len] = .{ .name = "viewer", .value = session.did };
     params_len += 1;
     const cursor = feed_core.nextCursor(store);
     if (cursor.len > 0) {
@@ -87,7 +92,11 @@ pub fn refreshTimeline(
 ) !PageOutcome {
     var limit_buf: [12]u8 = undefined;
     const limit_str = std.fmt.bufPrint(&limit_buf, "{d}", .{limit}) catch unreachable;
-    const params = [_]xrpc.Param{.{ .name = "limit", .value = limit_str }};
+    // viewer DID: the Cut-1 AppView builds the feed from it (see loadTimelinePage).
+    const params = [_]xrpc.Param{
+        .{ .name = "limit", .value = limit_str },
+        .{ .name = "viewer", .value = session.did },
+    };
 
     const outcome = try auth.queryHost(
         gpa,

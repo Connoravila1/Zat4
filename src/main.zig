@@ -19,6 +19,8 @@ const cache_shell = @import("shell/cache.zig");
 const config = @import("shell/config.zig");
 const window_shell = @import("shell/native.zig");
 const lexicon = @import("core/lexicon.zig");
+const write = @import("shell/write.zig");
+const clock_shell = @import("shell/clock.zig");
 
 /// Trim display text to `max` bytes without splitting a UTF-8 sequence.
 fn truncate(text: []const u8, max: usize) []const u8 {
@@ -63,7 +65,13 @@ pub fn main(init: std.process.Init) !void {
     var handle: []const u8 = "bsky.app";
     var tui_mode = false;
     var window_mode = false;
-    for (args[1..]) |arg| {
+    // Headless write-path test (STANDALONE write leg): `--post "text"` publishes
+    // one app.zat4.feed.post and exits, bypassing the GUI composer. The value is
+    // the next argument.
+    var post_text: ?[]const u8 = null;
+    var ai: usize = 1;
+    while (ai < args.len) : (ai += 1) {
+        const arg = args[ai];
         if (std.mem.eql(u8, arg, "--tui")) {
             tui_mode = true;
         } else if (std.mem.eql(u8, arg, "--window")) {
@@ -71,6 +79,11 @@ pub fn main(init: std.process.Init) !void {
             // interactive run, so it sets tui_mode too.
             window_mode = true;
             tui_mode = true;
+        } else if (std.mem.eql(u8, arg, "--post")) {
+            if (ai + 1 < args.len) {
+                ai += 1;
+                post_text = args[ai];
+            }
         } else {
             handle = arg;
         }
@@ -112,6 +125,55 @@ pub fn main(init: std.process.Init) !void {
     // them mid-session.
     var session_path_buf: [512]u8 = undefined;
     const session_path = cache_shell.sessionPath(&session_path_buf, env);
+
+    // Headless post: establish a session (a fresh ZAT_APP_PASSWORD login is
+    // preferred for a one-shot write since a cached token may have expired;
+    // otherwise reuse the cached session), publish the post, print the
+    // resulting at-uri/cid, and exit. This is the write-leg test: the record
+    // lands in the user's OWN PDS under app.zat4.feed.post, from where the
+    // firehose carries it to the Zat4 AppView.
+    if (post_text) |text| {
+        var from_cache = false;
+        var session: auth.Session = undefined;
+        if (env.get("ZAT_APP_PASSWORD")) |password| {
+            const identifier = env.get("ZAT_IDENTIFIER") orelse id.handle;
+            switch (try auth.login(gpa, arena, io, env, id.pds_url, identifier, password)) {
+                .refused => |f| {
+                    try out.print("login refused: status {d} {s}: {s}\n", .{ f.status, f.code, f.message });
+                    try out.flush();
+                    return error.LoginFailed;
+                },
+                .ok => |established| session = established,
+            }
+        } else if (session_path) |sp| {
+            session = cache_shell.loadSessionAt(gpa, sp) orelse {
+                try out.print("--post needs credentials: set ZAT_APP_PASSWORD (or run the app once to cache a login)\n", .{});
+                try out.flush();
+                return error.LoginFailed;
+            };
+            from_cache = true;
+        } else {
+            try out.print("--post needs credentials: set ZAT_APP_PASSWORD\n", .{});
+            try out.flush();
+            return error.LoginFailed;
+        }
+        defer if (from_cache) cache_shell.freeSession(gpa, &session) else auth.freeSession(gpa, session);
+        if (session_path) |sp| _ = cache_shell.saveSessionAt(gpa, sp, &session); // persist rotated tokens (E4)
+
+        const now = clock_shell.unixSeconds();
+        const outcome = write.createPost(gpa, arena, io, env, &session, text, &[_]lexicon.Facet{}, null, now) catch |err| {
+            try out.print("post failed: {s}\n", .{@errorName(err)});
+            try out.flush();
+            return err;
+        };
+        switch (outcome) {
+            .ok => |ref| try out.print("posted app.zat4.feed.post\n  uri: {s}\n  cid: {s}\n", .{ ref.uri, ref.cid }),
+            .failed => |f| try out.print("post refused: status {d} {s}: {s}\n", .{ f.status, f.code, f.message }),
+        }
+        try out.flush();
+        return;
+    }
+
     if (tui_mode) {
         if (session_path) |sp| {
             if (cache_shell.loadSessionAt(gpa, sp)) |cached| {
