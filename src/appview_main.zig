@@ -21,6 +21,8 @@ const appview = @import("core/appview.zig");
 const ingest = @import("shell/appview_ingest.zig");
 const serve = @import("shell/appview_serve.zig");
 const stream = @import("shell/stream.zig");
+const poll = @import("shell/appview_poll.zig");
+const identity = @import("shell/identity.zig");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -35,6 +37,7 @@ pub fn main(init: std.process.Init) !void {
     var port: u16 = 2584;
     var ingest_only = false;
     var live = false;
+    var poll_handle: ?[]const u8 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -42,6 +45,9 @@ pub fn main(init: std.process.Init) !void {
             ingest_only = true;
         } else if (std.mem.eql(u8, a, "--live")) {
             live = true;
+        } else if (std.mem.eql(u8, a, "--poll") and i + 1 < args.len) {
+            i += 1;
+            poll_handle = args[i];
         } else if (std.mem.eql(u8, a, "--port") and i + 1 < args.len) {
             i += 1;
             port = std.fmt.parseInt(u16, args[i], 10) catch 2584;
@@ -78,9 +84,45 @@ pub fn main(init: std.process.Init) !void {
     try out.print("zat4-appview: serving on http://127.0.0.1:{d}/xrpc/  (ctrl-c to stop)\n", .{port});
     try out.flush();
 
-    // The index lock guards reads against the live-ingest thread; in the static
+    // The index lock guards reads against the ingest thread; in the static
     // (snapshot) path it is uncontended.
     var lock: serve.IndexLock = .{};
+
+    // --- PDS-POLLING INGEST (--poll <handle>) -------------------------------
+    // The public Jetstream is live-only and not built for custom-lexicon
+    // discovery, so the AppView reads app.zat4.feed.post records DIRECTLY from
+    // the handle's PDS via listRecords (a public read), indexing new ones every
+    // few seconds. Correct + cheap for a small network; the firehose (own
+    // Jetstream / Tap) is the scale-up. A serve thread answers queries
+    // meanwhile; the index lock guards the two against each other.
+    if (poll_handle) |handle| {
+        const id = identity.resolve(arena, io, env, .{}, handle) catch |err| {
+            try out.print("zat4-appview: could not resolve {s}: {s}\n", .{ handle, @errorName(err) });
+            return err;
+        };
+        try out.print("zat4-appview: polling {s} ({s}) on {s} every 5s\n", .{ handle, id.did, id.pds_url });
+        try out.flush();
+
+        const serve_thread = try std.Thread.spawn(.{}, serveThread, .{ gpa, io, &idx, port, &lock });
+        _ = serve_thread; // runs until the process is killed
+
+        var poll_arena = std.heap.ArenaAllocator.init(gpa);
+        defer poll_arena.deinit();
+        while (true) {
+            _ = poll_arena.reset(.retain_capacity);
+            const added = poll.pollRepo(gpa, poll_arena.allocator(), io, env, id.pds_url, id.did, &idx, &lock) catch |err| blk: {
+                try out.print("zat4-appview: poll error: {s}\n", .{@errorName(err)});
+                try out.flush();
+                break :blk 0;
+            };
+            if (added > 0) {
+                try out.print("zat4-appview: indexed +{d} new post(s) from {s}\n", .{ added, handle });
+                try out.flush();
+            }
+            var nofds = [_]std.posix.pollfd{};
+            _ = std.posix.poll(&nofds, 5000) catch 0; // ~5 s between polls
+        }
+    }
 
     if (!live) {
         try serve.run(gpa, io, &idx, .{ .port = port }, &lock);

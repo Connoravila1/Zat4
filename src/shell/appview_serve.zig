@@ -22,6 +22,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const appview = @import("../core/appview.zig");
 const lexicon = @import("../core/lexicon.zig");
+const feed = @import("../core/feed.zig");
 
 /// A7.2: cold config, one per process. The index is borrowed (owned by the
 /// ingest side); serve only reads it.
@@ -136,12 +137,16 @@ fn getTimeline(arena: Allocator, idx: *const appview.Index, cfg: ServeConfig, ta
     for (feed_items, rows) |*fv, r| {
         const uri_buf = try arena.alloc(u8, r.author_did.len + r.cid.len + 64);
         const uri = std.fmt.bufPrint(uri_buf, "at://{s}/{s}/{s}", .{ r.author_did, lexicon.collection.post, r.cid }) catch r.cid;
+        // Format the indexed timestamp so the client shows a real age (an empty
+        // createdAt parsed to epoch 0, hence the "2945w" ages).
+        const ts_buf = try arena.alloc(u8, 32);
+        const created_at = feed.formatTimestamp(ts_buf, r.created_at);
         fv.* = .{
             .post = .{
                 .uri = uri,
                 .cid = r.cid,
                 .author = .{ .did = r.author_did, .handle = r.author_did },
-                .record = .{ .text = r.text, .createdAt = "" },
+                .record = .{ .text = r.text, .createdAt = created_at },
                 .likeCount = r.like_count,
                 .repostCount = r.repost_count,
                 .replyCount = 0,

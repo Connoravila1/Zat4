@@ -80,6 +80,7 @@ pub const method = struct {
     pub const get_session = "com.atproto.server.getSession";
     pub const create_record = "com.atproto.repo.createRecord";
     pub const delete_record = "com.atproto.repo.deleteRecord";
+    pub const list_records = "com.atproto.repo.listRecords";
     pub const resolve_handle = "com.atproto.identity.resolveHandle";
 };
 
