@@ -123,13 +123,18 @@ pub fn main(init: std.process.Init) !void {
         const serve_thread = try std.Thread.spawn(.{}, serveThread, .{ gpa, io, &idx, port, &lock });
         _ = serve_thread; // runs until the process is killed
 
+        // Records already applied (follow/like/repost cid hashes) so re-polls
+        // don't duplicate edges or inflate counts. Poll-thread-only; gpa-owned.
+        var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer seen.deinit(gpa);
+
         var poll_arena = std.heap.ArenaAllocator.init(gpa);
         defer poll_arena.deinit();
         while (true) {
             var total: usize = 0;
             for (targets.items) |t| {
                 _ = poll_arena.reset(.retain_capacity);
-                total += poll.pollRepo(gpa, poll_arena.allocator(), io, env, t.pds, t.did, &idx, &lock) catch 0;
+                total += poll.pollRepo(gpa, poll_arena.allocator(), io, env, t.pds, t.did, &idx, &lock, &seen) catch 0;
             }
             if (total > 0) {
                 try out.print("zat4-appview: indexed +{d} new post(s) across {d} author(s)\n", .{ total, targets.items.len });
