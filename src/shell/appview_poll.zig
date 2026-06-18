@@ -21,6 +21,7 @@ const lexicon = @import("../core/lexicon.zig");
 const feed = @import("../core/feed.zig");
 const appview = @import("../core/appview.zig");
 const serve = @import("appview_serve.zig");
+const store = @import("appview_store.zig");
 
 /// A follow record's value: `subject` is the followed DID (a bare string).
 /// A7.2: cold transient parse target (one per record, never held in quantity).
@@ -69,8 +70,16 @@ fn fetch(
 /// by a 64-bit hash of the record cid — no string storage; collision risk is
 /// negligible. Owned by the poll thread only, so no index lock needed.
 fn markSeen(gpa: Allocator, seen: *std.AutoHashMapUnmanaged(u64, void), cid: []const u8) Allocator.Error!bool {
-    const gop = try seen.getOrPut(gpa, std.hash.Wyhash.hash(0, cid));
+    const gop = try seen.getOrPut(gpa, store.seenKey(cid));
     return gop.found_existing;
+}
+
+/// The record key (last path segment) of an at-uri, e.g.
+/// `at://did/app.zat4.feed.post/3kabc` → `3kabc`. The durable post line needs
+/// it (the reducer rebuilds the uri from rkey); "" if the uri has no segment.
+fn rkeyFromUri(uri: []const u8) []const u8 {
+    const slash = std.mem.lastIndexOfScalar(u8, uri, '/') orelse return "";
+    return uri[slash + 1 ..];
 }
 
 /// Poll one repo's `app.zat4.*` collections and index new records into `idx`
@@ -88,10 +97,14 @@ pub fn pollRepo(
     idx: *appview.Index,
     lock: *serve.IndexLock,
     seen: *std.AutoHashMapUnmanaged(u64, void),
+    log: *store.Store,
 ) !usize {
     var added: usize = 0;
 
-    // Posts — indexPost dedups by cid, so this is idempotent on its own.
+    // Posts — indexPost dedups by cid, so this is idempotent on its own. A
+    // newly-indexed post is also appended to the durable log (keyed by its cid)
+    // so it survives a restart without a re-poll. (The append rides inside the
+    // index lock; at Cut-1 author/post rates the write is trivial — G3.)
     if (try fetch(arena, io, environ, pds_url, did, lexicon.collection.post, lexicon.PostRecord)) |recs| {
         lock.lock();
         defer lock.unlock();
@@ -103,11 +116,15 @@ pub fn pollRepo(
                 .text = r.value.text,
                 .created_at = feed.parseTimestamp(r.value.createdAt) catch 0,
             }) catch false;
-            if (is_new) added += 1;
+            if (is_new) {
+                added += 1;
+                store.appendPost(log, arena, did, rkeyFromUri(r.uri), r.cid, r.value.text, r.value.createdAt);
+            }
         }
     }
 
-    // Follows — indexFollow appends, so gate on the follow record's cid.
+    // Follows — indexFollow appends, so gate on the follow record's cid; a
+    // newly-applied edge is persisted, and replay refills `seen` from it.
     if (try fetch(arena, io, environ, pds_url, did, lexicon.collection.follow, FollowValue)) |recs| {
         lock.lock();
         defer lock.unlock();
@@ -115,6 +132,7 @@ pub fn pollRepo(
             if (r.cid.len == 0 or r.value.subject.len == 0) continue;
             if (try markSeen(gpa, seen, r.cid)) continue;
             appview.indexFollow(gpa, idx, did, r.value.subject) catch {};
+            store.appendFollow(log, arena, did, r.value.subject, r.cid);
         }
     }
 
@@ -126,6 +144,7 @@ pub fn pollRepo(
             if (r.cid.len == 0 or r.value.subject.cid.len == 0) continue;
             if (try markSeen(gpa, seen, r.cid)) continue;
             appview.indexEngagement(gpa, idx, .like, r.value.subject.cid) catch {};
+            store.appendEngagement(log, arena, .like, did, r.value.subject.cid, r.cid);
         }
     }
 
@@ -137,6 +156,7 @@ pub fn pollRepo(
             if (r.cid.len == 0 or r.value.subject.cid.len == 0) continue;
             if (try markSeen(gpa, seen, r.cid)) continue;
             appview.indexEngagement(gpa, idx, .repost, r.value.subject.cid) catch {};
+            store.appendEngagement(log, arena, .repost, did, r.value.subject.cid, r.cid);
         }
     }
 

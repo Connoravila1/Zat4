@@ -30,6 +30,14 @@ pub const ServeConfig = struct {
     port: u16 = 2584,
     default_limit: usize = 50,
     max_limit: usize = 100,
+    /// Shared bearer token gating every request (STANDALONE_ROADMAP Phase E,
+    /// pulled forward so the AppView can be exposed past the SSH tunnel). The
+    /// client sends `Authorization: Bearer <token>`. Empty ⇒ FAIL CLOSED: every
+    /// request is rejected, so a server started without a token serves nothing
+    /// rather than serving open (E3 — the gate never silently opens). Per-user
+    /// atproto service-auth (verifying the requester's DID-signed JWT) is the
+    /// larger Phase E end state; this shared gate is the access control for now.
+    token: []const u8 = "",
 };
 
 /// Guards the index against concurrent mutation by the live-ingest thread
@@ -75,6 +83,16 @@ fn handleConn(gpa: Allocator, io: std.Io, idx: *const appview.Index, cfg: ServeC
     var http_server: std.http.Server = .init(&stream_reader.interface, &stream_writer.interface);
 
     var req = http_server.receiveHead() catch return;
+
+    // Auth gate (fail closed, E3): the request must carry a matching shared
+    // bearer token. An empty configured token rejects everything — a server
+    // without a token never serves open. Checked before routing so an
+    // unauthenticated probe learns nothing about the method surface.
+    if (!authorized(cfg.token, authHeader(&req))) {
+        req.respond("{\"error\":\"AuthRequired\"}", .{ .status = .unauthorized, .extra_headers = jsonHeaders() }) catch {};
+        return;
+    }
+
     const target = req.head.target; // e.g. /xrpc/app.zat4.feed.getTimeline?viewer=...
 
     var arena_state = std.heap.ArenaAllocator.init(gpa); // C3: per-request arena
@@ -100,6 +118,32 @@ fn handleConn(gpa: Allocator, io: std.Io, idx: *const appview.Index, cfg: ServeC
 
 fn jsonHeaders() []const std.http.Header {
     return &.{.{ .name = "content-type", .value = "application/json" }};
+}
+
+/// The request's `Authorization` header value, or null if absent (case-
+/// insensitive name match — HTTP header names are case-insensitive).
+fn authHeader(req: *std.http.Server.Request) ?[]const u8 {
+    var it = req.iterateHeaders();
+    while (it.next()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "authorization")) return h.value;
+    }
+    return null;
+}
+
+/// Strict bearer check. Empty `expected` ⇒ false (FAIL CLOSED — see
+/// ServeConfig.token). Otherwise the header must be exactly `Bearer <expected>`.
+/// The token bytes are compared in constant time so a timing side-channel
+/// cannot probe the secret out byte by byte.
+fn authorized(expected: []const u8, header: ?[]const u8) bool {
+    if (expected.len == 0) return false;
+    const h = header orelse return false;
+    const prefix = "Bearer ";
+    if (!std.mem.startsWith(u8, h, prefix)) return false;
+    const got = h[prefix.len..];
+    if (got.len != expected.len) return false;
+    var diff: u8 = 0;
+    for (got, expected) |a, b| diff |= a ^ b;
+    return diff == 0;
 }
 
 const RouteError = error{ OutOfMemory, NotFound };
@@ -258,6 +302,22 @@ test "route: a percent-encoded viewer DID resolves (client encodes ':' as %3A)" 
     const page = try std.json.parseFromSliceLeaky(lexicon.TimelinePage, arena, json, .{ .ignore_unknown_fields = true });
     try testing.expectEqual(@as(usize, 1), page.feed.len);
     try testing.expectEqualStrings("decoded ok", page.feed[0].post.record.text);
+}
+
+test "auth: strict bearer gate — fail closed, exact match, reject the rest" {
+    // Fail closed: an empty configured token rejects every request, even a
+    // well-formed bearer — a server without a token serves nothing.
+    try testing.expect(!authorized("", "Bearer anything"));
+    try testing.expect(!authorized("", null));
+
+    // With a token configured, only the exact `Bearer <token>` passes.
+    const tok = "s3cret-zat4-token";
+    try testing.expect(authorized(tok, "Bearer s3cret-zat4-token"));
+    try testing.expect(!authorized(tok, "Bearer wrong"));
+    try testing.expect(!authorized(tok, "Bearer s3cret-zat4-token-extra")); // length mismatch
+    try testing.expect(!authorized(tok, "s3cret-zat4-token")); // missing scheme
+    try testing.expect(!authorized(tok, "Basic s3cret-zat4-token")); // wrong scheme
+    try testing.expect(!authorized(tok, null)); // no header
 }
 
 test "route: an unknown method is NotFound" {

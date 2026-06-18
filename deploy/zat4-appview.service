@@ -15,6 +15,17 @@ Type=simple
 # in a viewer's timeline). Edit it and `systemctl restart zat4-appview` to
 # re-seed. Posts themselves come from polling each author's live PDS.
 StandardInput=file:/var/lib/zat4/events.jsonl
+# Durable event log (persistence): the AppView appends every newly-polled
+# record here and replays it on start, so a restart neither loses indexed
+# content nor re-polls from zero. Distinct from the hand-maintained seed above.
+# Unset this var to disable persistence (run in-memory only, as Cut 1 did).
+Environment=ZAT_APPVIEW_LOG=/var/lib/zat4/applied.jsonl
+# Shared bearer token that gates every serve request (the AppView fails CLOSED
+# without it — all requests 401). The SECRET lives only on the box in this
+# root-owned 0600 file, never in source; the leading `-` makes it optional so a
+# missing file degrades to the loud fail-closed warning, not a unit failure.
+#   /etc/zat4/appview.env  ->  ZAT_APPVIEW_TOKEN=<secret>
+EnvironmentFile=-/etc/zat4/appview.env
 ExecStart=/usr/local/bin/zat4-appview --poll --port 2584
 
 # Restart on crash, with a small backoff (E2: a fallen process comes back).
@@ -30,9 +41,10 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-# The AppView writes nothing to disk in Cut 1 (in-memory index), so it needs
-# no writable paths. If a future on-disk store lands, add it here:
-#   ReadWritePaths=/var/lib/zat4
+# The durable event log (ZAT_APPVIEW_LOG, above) is the one path the AppView
+# writes, so /var/lib/zat4 must be writable under ProtectSystem=strict. The
+# `zat4` user owns the directory and the applied.jsonl file.
+ReadWritePaths=/var/lib/zat4
 
 [Install]
 WantedBy=multi-user.target

@@ -22,6 +22,7 @@ const ingest = @import("shell/appview_ingest.zig");
 const serve = @import("shell/appview_serve.zig");
 const stream = @import("shell/stream.zig");
 const poll = @import("shell/appview_poll.zig");
+const store = @import("shell/appview_store.zig");
 const identity = @import("shell/identity.zig");
 
 pub fn main(init: std.process.Init) !void {
@@ -87,6 +88,15 @@ pub fn main(init: std.process.Init) !void {
     // (snapshot) path it is uncontended.
     var lock: serve.IndexLock = .{};
 
+    // Shared bearer token gating the serve surface (ZAT_APPVIEW_TOKEN). Empty ⇒
+    // the serve layer FAILS CLOSED (rejects every request); warn loudly so an
+    // unconfigured server's "nothing works" is diagnosable, not silent (E3).
+    const serve_token = env.get("ZAT_APPVIEW_TOKEN") orelse "";
+    if (serve_token.len == 0) {
+        try out.print("zat4-appview: WARNING — ZAT_APPVIEW_TOKEN unset; the gate is fail-closed, ALL requests will be 401. Set it to serve.\n", .{});
+        try out.flush();
+    }
+
     // --- PDS-POLLING INGEST (--poll) ----------------------------------------
     // The public Jetstream is live-only and not built for custom-lexicon
     // discovery, so the AppView reads app.zat4.feed.post records DIRECTLY from
@@ -98,6 +108,27 @@ pub fn main(init: std.process.Init) !void {
     // cheap for a small network; the firehose (own Jetstream / Tap) is the
     // scale-up.
     if (do_poll) {
+        // Durable log (STANDALONE persistence): restore previously-polled posts/
+        // follows/likes from disk BEFORE discovery, so a restart neither loses
+        // indexed content nor re-polls from zero, and the restored follow graph
+        // widens the poll target set. Path from ZAT_APPVIEW_LOG; unset/unwritable
+        // ⇒ disabled (in-memory only, as before). C2: the disk cost is visible here.
+        const log_path = env.get("ZAT_APPVIEW_LOG") orelse "";
+        var log = store.open(log_path);
+        defer store.close(&log);
+
+        // Applied-record dedup (follow/like/repost record cids), refilled by the
+        // replay below so a re-poll after restart skips already-applied records.
+        // Poll-thread-only after this point; gpa-owned.
+        var seen: store.SeenSet = .empty;
+        defer seen.deinit(gpa);
+
+        const replayed = store.replay(gpa, &idx, &seen, log_path) catch 0;
+        if (replayed > 0) {
+            try out.print("zat4-appview: restored {d} record(s) from {s}\n", .{ replayed, log_path });
+            try out.flush();
+        }
+
         // Targets live for the process; resolved once before the serve thread
         // starts (no concurrent mutation yet).
         var target_arena = std.heap.ArenaAllocator.init(gpa);
@@ -120,13 +151,8 @@ pub fn main(init: std.process.Init) !void {
             try out.flush();
         }
 
-        const serve_thread = try std.Thread.spawn(.{}, serveThread, .{ gpa, io, &idx, port, &lock });
+        const serve_thread = try std.Thread.spawn(.{}, serveThread, .{ gpa, io, &idx, port, &lock, serve_token });
         _ = serve_thread; // runs until the process is killed
-
-        // Records already applied (follow/like/repost cid hashes) so re-polls
-        // don't duplicate edges or inflate counts. Poll-thread-only; gpa-owned.
-        var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
-        defer seen.deinit(gpa);
 
         var poll_arena = std.heap.ArenaAllocator.init(gpa);
         defer poll_arena.deinit();
@@ -134,7 +160,7 @@ pub fn main(init: std.process.Init) !void {
             var total: usize = 0;
             for (targets.items) |t| {
                 _ = poll_arena.reset(.retain_capacity);
-                total += poll.pollRepo(gpa, poll_arena.allocator(), io, env, t.pds, t.did, &idx, &lock, &seen) catch 0;
+                total += poll.pollRepo(gpa, poll_arena.allocator(), io, env, t.pds, t.did, &idx, &lock, &seen, &log) catch 0;
             }
             if (total > 0) {
                 try out.print("zat4-appview: indexed +{d} new post(s) across {d} author(s)\n", .{ total, targets.items.len });
@@ -146,7 +172,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (!live) {
-        try serve.run(gpa, io, &idx, .{ .port = port }, &lock);
+        try serve.run(gpa, io, &idx, .{ .port = port, .token = serve_token }, &lock);
         return;
     }
 
@@ -170,7 +196,7 @@ pub fn main(init: std.process.Init) !void {
     try out.print("zat4-appview: live ingest on {s} (app.zat4.feed.post, all repos)\n", .{jetstream_host});
     try out.flush();
 
-    const serve_thread = try std.Thread.spawn(.{}, serveThread, .{ gpa, io, &idx, port, &lock });
+    const serve_thread = try std.Thread.spawn(.{}, serveThread, .{ gpa, io, &idx, port, &lock, serve_token });
     _ = serve_thread; // runs until the process is killed
 
     var mail: std.ArrayList(stream.Mail) = .empty;
@@ -212,12 +238,14 @@ pub fn main(init: std.process.Init) !void {
 
 /// The query server, on its own thread for the live path (the main thread is
 /// busy draining the firehose into the index). Reads the index under `lock`.
-fn serveThread(gpa: std.mem.Allocator, io: std.Io, idx: *const appview.Index, port: u16, lock: *serve.IndexLock) void {
-    serve.run(gpa, io, idx, .{ .port = port }, lock) catch {};
+fn serveThread(gpa: std.mem.Allocator, io: std.Io, idx: *const appview.Index, port: u16, lock: *serve.IndexLock, token: []const u8) void {
+    serve.run(gpa, io, idx, .{ .port = port, .token = token }, lock) catch {};
 }
 
 test {
     _ = appview;
     _ = ingest;
     _ = serve;
+    _ = poll;
+    _ = store;
 }
