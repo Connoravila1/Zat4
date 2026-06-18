@@ -1,18 +1,21 @@
 [Unit]
-# The Zat4 AppView (Phase C, Cut 1). Ingests a snapshot of app.zat4.* events
-# from /var/lib/zat4/events.jsonl on start, then serves the read query surface
-# on loopback :2584. Reachable from your laptop via an SSH tunnel; nothing is
-# exposed on the public network (Cut 1 has no auth yet — see APPVIEW_SETUP.md).
-Description=Zat4 AppView (ingest snapshot, serve timelines on 127.0.0.1:2584)
+# The Zat4 AppView (Phase C). On start it ingests the follow-graph seed from
+# /var/lib/zat4/events.jsonl, then POLLS each author's PDS (com.atproto.repo.
+# listRecords) for app.zat4 content, indexing new posts/follows/likes/reposts
+# every few seconds, while serving the read query surface on loopback :2584.
+# Reachable from your laptop via an SSH tunnel; nothing is exposed on the public
+# network (Cut 1 has no auth yet — see APPVIEW_SETUP.md).
+Description=Zat4 AppView (poll app.zat4 from PDSes, serve timelines on 127.0.0.1:2584)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-# The snapshot the AppView ingests on start. Replace with your own event file;
-# re-running `systemctl restart zat4-appview` re-ingests it.
+# The seed defines the follow graph (who the AppView polls + whose posts appear
+# in a viewer's timeline). Edit it and `systemctl restart zat4-appview` to
+# re-seed. Posts themselves come from polling each author's live PDS.
 StandardInput=file:/var/lib/zat4/events.jsonl
-ExecStart=/usr/local/bin/zat4-appview --port 2584
+ExecStart=/usr/local/bin/zat4-appview --poll --port 2584
 
 # Restart on crash, with a small backoff (E2: a fallen process comes back).
 Restart=on-failure
