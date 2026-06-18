@@ -1,0 +1,184 @@
+// ============================================================================
+// CURATED EXTRACT from ziglang/zig : lib/std/zig/Ast.zig
+// This is NOT the full file (the original is ~4144 lines). It contains the
+// data-layout declarations and the Node definition -- the parts that teach
+// data-oriented design. Parser method bodies have been omitted.
+// Full source: https://github.com/ziglang/zig/blob/master/lib/std/zig/Ast.zig
+// ============================================================================
+
+//! Abstract Syntax Tree for Zig source code.
+//! For Zig syntax, the root node is at nodes[0] and contains the list of
+//! sub-nodes.
+//! For Zon syntax, the root node is at nodes[0] and contains lhs as the node
+//! index of the main expression.
+
+const std = @import("../std.zig");
+const assert = std.debug.assert;
+const testing = std.testing;
+const mem = std.mem;
+const Token = std.zig.Token;
+const Ast = @This();
+const Allocator = std.mem.Allocator;
+const Parse = @import("Parse.zig");
+const Writer = std.Io.Writer;
+
+/// Reference to externally-owned data.
+source: [:0]const u8,
+
+tokens: TokenList.Slice,
+nodes: NodeList.Slice,
+extra_data: []u32,
+mode: Mode = .zig,
+
+errors: []const Error,
+
+pub const ByteOffset = u32;
+
+pub const TokenList = std.MultiArrayList(struct {
+    tag: Token.Tag,
+    start: ByteOffset,
+});
+pub const NodeList = std.MultiArrayList(Node);
+
+/// Index into `tokens`.
+pub const TokenIndex = u32;
+
+/// Index into `tokens`, or null.
+pub const OptionalTokenIndex = enum(u32) {
+    none = std.math.maxInt(u32),
+    _,
+
+    pub fn unwrap(oti: OptionalTokenIndex) ?TokenIndex {
+        return if (oti == .none) null else @intFromEnum(oti);
+    }
+
+    pub fn fromToken(ti: TokenIndex) OptionalTokenIndex {
+        return @enumFromInt(ti);
+    }
+
+    pub fn fromOptional(oti: ?TokenIndex) OptionalTokenIndex {
+        return if (oti) |ti| @enumFromInt(ti) else .none;
+    }
+};
+
+/// A relative token index.
+pub const TokenOffset = enum(i32) {
+    zero = 0,
+    _,
+
+    pub fn init(base: TokenIndex, destination: TokenIndex) TokenOffset {
+        const base_i64: i64 = base;
+        const destination_i64: i64 = destination;
+        return @enumFromInt(destination_i64 - base_i64);
+    }
+
+    pub fn toOptional(to: TokenOffset) OptionalTokenOffset {
+        const result: OptionalTokenOffset = @enumFromInt(@intFromEnum(to));
+        assert(result != .none);
+        return result;
+    }
+
+    pub fn toAbsolute(offset: TokenOffset, base: TokenIndex) TokenIndex {
+        return @intCast(@as(i64, base) + @intFromEnum(offset));
+    }
+};
+
+/// A relative token index, or null.
+pub const OptionalTokenOffset = enum(i32) {
+    none = std.math.maxInt(i32),
+    _,
+
+    pub fn unwrap(oto: OptionalTokenOffset) ?TokenOffset {
+        return if (oto == .none) null else @enumFromInt(@intFromEnum(oto));
+    }
+};
+
+pub fn tokenTag(tree: *const Ast, token_index: TokenIndex) Token.Tag {
+    return tree.tokens.items(.tag)[token_index];
+}
+
+pub fn tokenStart(tree: *const Ast, token_index: TokenIndex) ByteOffset {
+
+// ... [parser accessor methods omitted for brevity] ...
+
+pub const Node = struct {
+    tag: Tag,
+    main_token: TokenIndex,
+    data: Data,
+
+    /// Index into `nodes`.
+    pub const Index = enum(u32) {
+        root = 0,
+        _,
+
+        pub fn toOptional(i: Index) OptionalIndex {
+            const result: OptionalIndex = @enumFromInt(@intFromEnum(i));
+            assert(result != .none);
+            return result;
+        }
+
+        pub fn toOffset(base: Index, destination: Index) Offset {
+            const base_i64: i64 = @intFromEnum(base);
+            const destination_i64: i64 = @intFromEnum(destination);
+            return @enumFromInt(destination_i64 - base_i64);
+        }
+    };
+
+    /// Index into `nodes`, or null.
+    pub const OptionalIndex = enum(u32) {
+        root = 0,
+        none = std.math.maxInt(u32),
+        _,
+
+        pub fn unwrap(oi: OptionalIndex) ?Index {
+            return if (oi == .none) null else @enumFromInt(@intFromEnum(oi));
+        }
+
+        pub fn fromOptional(oi: ?Index) OptionalIndex {
+            return if (oi) |i| i.toOptional() else .none;
+        }
+    };
+
+    /// A relative node index.
+    pub const Offset = enum(i32) {
+        zero = 0,
+        _,
+
+        pub fn toOptional(o: Offset) OptionalOffset {
+            const result: OptionalOffset = @enumFromInt(@intFromEnum(o));
+            assert(result != .none);
+            return result;
+        }
+
+        pub fn toAbsolute(offset: Offset, base: Index) Index {
+            return @enumFromInt(@as(i64, @intFromEnum(base)) + @intFromEnum(offset));
+        }
+    };
+
+    /// A relative node index, or null.
+    pub const OptionalOffset = enum(i32) {
+        none = std.math.maxInt(i32),
+        _,
+
+        pub fn unwrap(oo: OptionalOffset) ?Offset {
+            return if (oo == .none) null else @enumFromInt(@intFromEnum(oo));
+        }
+    };
+
+    comptime {
+        // Goal is to keep this under one byte for efficiency.
+        assert(@sizeOf(Tag) == 1);
+
+        if (!std.debug.runtime_safety) {
+            assert(@sizeOf(Data) == 8);
+        }
+    }
+
+    /// The FooComma/FooSemicolon variants exist to ease the implementation of
+    /// `Ast.lastToken()`
+    pub const Tag = enum {
+        /// The root node which is guaranteed to be at `Node.Index.root`.
+        /// The meaning of the `data` field depends on whether it is a `.zig` or
+        /// `.zon` file.
+    // ... [hundreds of Tag enum variants and Data union members omitted] ...
+};
