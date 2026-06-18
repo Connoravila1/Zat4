@@ -123,6 +123,24 @@ pub fn queryHost(
     params: []const xrpc.Param,
     comptime Response: type,
 ) !xrpc.Outcome(Response) {
+    // The Zat4 AppView gates on a SHARED bearer token (appview_serve.zig), not
+    // the user's PDS session JWT. When ZAT_APPVIEW_TOKEN is configured, send it
+    // for AppView-host calls — a shared token does not expire, so the refresh-
+    // and-retry dance below (a PDS protocol op on the session JWT) does not
+    // apply and is skipped. PDS-host calls (the `query` convenience above passes
+    // `session.pds_url`) MUST keep the session JWT, so the token is scoped to a
+    // host that is NOT the user's PDS.
+    if (!std.mem.eql(u8, host, session.pds_url)) {
+        const appview_token: ?[]const u8 = if (environ) |e| e.get("ZAT_APPVIEW_TOKEN") else null;
+        if (appview_token) |tok| {
+            if (tok.len > 0) {
+                return xrpc.query(arena, io, environ, host, nsid, params, Response, .{
+                    .authorization = try bearer(arena, tok),
+                });
+            }
+        }
+    }
+
     const first = try xrpc.query(arena, io, environ, host, nsid, params, Response, .{
         .authorization = try bearer(arena, session.access_jwt),
     });
