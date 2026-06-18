@@ -44,6 +44,34 @@ allowlists fail them at the proxy — environment, not defect. The offline
 suite proves the same logic via a fixture corpus plus a loopback round trip
 over real sockets.
 
+## Standalone — the Zat4 network
+
+zat is no longer a Bluesky client: it reads and writes its own `app.zat4.*`
+lexicon and is served by its **own AppView**, so Zat4 is a self-contained
+network on the AT Protocol — Bluesky posts never enter it and Zat4 posts never
+leak to Bluesky (the wall is the namespace, enforced at both the client reads
+and the AppView ingest). Identity, handles, follow graphs, and account
+portability carry over from atproto for free. Full thread: `STANDALONE_ROADMAP.md`.
+
+- **AppView** (`src/appview_main.zig`, `zig build appview`) — a long-running
+  service that ingests `app.zat4.*` records (polling each author's PDS today;
+  the Tap firehose is the scale path), indexes them in a pure SoA core
+  (`src/core/appview.zig`), and serves `getTimeline`/`getProfile`.
+  - **Persistence:** a durable append-only event log (`ZAT_APPVIEW_LOG`) that
+    replays on start, so a restart restores the index instead of re-polling
+    from zero (`src/shell/appview_store.zig`).
+  - **Auth:** a strict, fail-closed shared bearer token (`ZAT_APPVIEW_TOKEN`)
+    on every request — a missing or wrong token is a `401`
+    (`src/shell/appview_serve.zig`).
+- **PDS** — Zat4 runs its own `bluesky-social/pds` minting `*.zat4.com`
+  handles for in-app signups (`PDS_ROADMAP.md`); existing atproto users bring
+  their own identity. The live deployment is tracked in `DEPLOY_STATE.md`.
+
+Headless write legs (bypass the GUI composer, publish one record and exit):
+
+    ZAT_APP_PASSWORD=… zig build run -- you.zat4.com --post "hello zat4"
+    ZAT_APP_PASSWORD=… zig build run -- you.zat4.com --follow someone.zat4.com
+
 ## Toolchain
 
 Zig **0.16.0** (pinned in `build.zig.zon` as `minimum_zig_version`).
@@ -56,7 +84,11 @@ Install from ziglang.org/download, or via the official PyPI wheel:
 zig build run -- alice.bsky.social   # resolve a handle (default: bsky.app)
 zig build run -- your.handle --tui      # the client, in the terminal
 zig build run -- your.handle --window   # the client, in its own X11 window
+zig build run -- you.zat4.com --post "…"     # headless: publish one app.zat4.feed.post
+zig build run -- you.zat4.com --follow h.zat4.com  # headless: publish one app.zat4.graph.follow
+zig build appview    # run the Zat4 AppView (ingest app.zat4.* -> serve timelines)
 zig build test       # offline unit tests — leak-checked (C6), deterministic
+zig build test-appview  # the AppView's offline unit tests (rides `zig build test` too)
 zig build test-live  # network smoke tests — hits the real network on purpose
 zig build bench      # the G1 performance ledger (core transforms, measured)
 zig build guards     # A7: every struct guarded or waived — also runs inside `zig build test`
@@ -161,6 +193,8 @@ store hasn't met yet render by DID until a refresh teaches their handle.
 
 | Variable | Meaning |
 |---|---|
+| `ZAT4_APPVIEW` | The Zat4 AppView base URL the client reads timelines/profiles from (default `http://127.0.0.1:2584`). |
+| `ZAT_APPVIEW_TOKEN` | Shared bearer token the client sends to the AppView (must match the AppView's). Scoped to AppView calls; PDS login/writes still use the session JWT. |
 | `ZAT_JETSTREAM` | Override the Jetstream host (default `jetstream2.us-east.bsky.network`). |
 | `ZAT_STREAM_LOG` | Stream transcript path. DEFAULT ON: `zat-stream.log` in the working directory (connects, the subscribe URL, cursor, every frame and verdict, heartbeat). Set to `off` to disable. |
 | `ZAT_REFRESH_SECS` | Auto-refresh interval for the visible feed (default 5; `0` disables, reverting to manual `r`). |
