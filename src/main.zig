@@ -69,6 +69,10 @@ pub fn main(init: std.process.Init) !void {
     // one app.zat4.feed.post and exits, bypassing the GUI composer. The value is
     // the next argument.
     var post_text: ?[]const u8 = null;
+    // Headless graph-write leg: `--follow <handle-or-did>` publishes one
+    // app.zat4.graph.follow from the logged-in account (the positional handle)
+    // to the target and exits. The value is the next argument.
+    var follow_target: ?[]const u8 = null;
     var ai: usize = 1;
     while (ai < args.len) : (ai += 1) {
         const arg = args[ai];
@@ -83,6 +87,11 @@ pub fn main(init: std.process.Init) !void {
             if (ai + 1 < args.len) {
                 ai += 1;
                 post_text = args[ai];
+            }
+        } else if (std.mem.eql(u8, arg, "--follow")) {
+            if (ai + 1 < args.len) {
+                ai += 1;
+                follow_target = args[ai];
             }
         } else {
             handle = arg;
@@ -132,7 +141,7 @@ pub fn main(init: std.process.Init) !void {
     // resulting at-uri/cid, and exit. This is the write-leg test: the record
     // lands in the user's OWN PDS under app.zat4.feed.post, from where the
     // firehose carries it to the Zat4 AppView.
-    if (post_text) |text| {
+    if (post_text != null or follow_target != null) {
         var from_cache = false;
         var session: auth.Session = undefined;
         if (env.get("ZAT_APP_PASSWORD")) |password| {
@@ -147,13 +156,13 @@ pub fn main(init: std.process.Init) !void {
             }
         } else if (session_path) |sp| {
             session = cache_shell.loadSessionAt(gpa, sp) orelse {
-                try out.print("--post needs credentials: set ZAT_APP_PASSWORD (or run the app once to cache a login)\n", .{});
+                try out.print("--post/--follow needs credentials: set ZAT_APP_PASSWORD (or run the app once to cache a login)\n", .{});
                 try out.flush();
                 return error.LoginFailed;
             };
             from_cache = true;
         } else {
-            try out.print("--post needs credentials: set ZAT_APP_PASSWORD\n", .{});
+            try out.print("--post/--follow needs credentials: set ZAT_APP_PASSWORD\n", .{});
             try out.flush();
             return error.LoginFailed;
         }
@@ -161,16 +170,44 @@ pub fn main(init: std.process.Init) !void {
         if (session_path) |sp| _ = cache_shell.saveSessionAt(gpa, sp, &session); // persist rotated tokens (E4)
 
         const now = clock_shell.unixSeconds();
-        const outcome = write.createPost(gpa, arena, io, env, &session, text, &[_]lexicon.Facet{}, null, now) catch |err| {
-            try out.print("post failed: {s}\n", .{@errorName(err)});
+
+        // The post leg: publish one app.zat4.feed.post into the user's own PDS,
+        // from where the AppView's poll/firehose carries it into Zat4.
+        if (post_text) |text| {
+            const outcome = write.createPost(gpa, arena, io, env, &session, text, &[_]lexicon.Facet{}, null, now) catch |err| {
+                try out.print("post failed: {s}\n", .{@errorName(err)});
+                try out.flush();
+                return err;
+            };
+            switch (outcome) {
+                .ok => |ref| try out.print("posted app.zat4.feed.post\n  uri: {s}\n  cid: {s}\n", .{ ref.uri, ref.cid }),
+                .failed => |f| try out.print("post refused: status {d} {s}: {s}\n", .{ f.status, f.code, f.message }),
+            }
             try out.flush();
-            return err;
-        };
-        switch (outcome) {
-            .ok => |ref| try out.print("posted app.zat4.feed.post\n  uri: {s}\n  cid: {s}\n", .{ ref.uri, ref.cid }),
-            .failed => |f| try out.print("post refused: status {d} {s}: {s}\n", .{ f.status, f.code, f.message }),
         }
-        try out.flush();
+
+        // The follow leg: resolve the target to a DID (a `did:` literal is used
+        // as-is) and publish one app.zat4.graph.follow into the user's own PDS.
+        if (follow_target) |target| {
+            const subject_did = if (std.mem.startsWith(u8, target, "did:")) target else blk: {
+                const resolved = identity.resolve(arena, io, env, .{}, target) catch |err| {
+                    try out.print("--follow: could not resolve {s}: {s}\n", .{ target, @errorName(err) });
+                    try out.flush();
+                    return err;
+                };
+                break :blk resolved.did;
+            };
+            const outcome = write.followAccount(gpa, arena, io, env, &session, subject_did, now) catch |err| {
+                try out.print("follow failed: {s}\n", .{@errorName(err)});
+                try out.flush();
+                return err;
+            };
+            switch (outcome) {
+                .ok => |ref| try out.print("followed {s}\n  subject: {s}\n  uri: {s}\n", .{ target, subject_did, ref.uri }),
+                .failed => |f| try out.print("follow refused: status {d} {s}: {s}\n", .{ f.status, f.code, f.message }),
+            }
+            try out.flush();
+        }
         return;
     }
 
