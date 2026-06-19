@@ -23,6 +23,7 @@ const serve = @import("shell/appview_serve.zig");
 const stream = @import("shell/stream.zig");
 const poll = @import("shell/appview_poll.zig");
 const store = @import("shell/appview_store.zig");
+const tap_consume = @import("shell/appview_tap.zig");
 const identity = @import("shell/identity.zig");
 
 pub fn main(init: std.process.Init) !void {
@@ -39,6 +40,7 @@ pub fn main(init: std.process.Init) !void {
     var ingest_only = false;
     var live = false;
     var do_poll = false;
+    var do_tap = false;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -48,6 +50,8 @@ pub fn main(init: std.process.Init) !void {
             live = true;
         } else if (std.mem.eql(u8, a, "--poll")) {
             do_poll = true;
+        } else if (std.mem.eql(u8, a, "--tap")) {
+            do_tap = true;
         } else if (std.mem.eql(u8, a, "--port") and i + 1 < args.len) {
             i += 1;
             port = std.fmt.parseInt(u16, args[i], 10) catch 2584;
@@ -107,6 +111,41 @@ pub fn main(init: std.process.Init) !void {
     // meanwhile; the index lock guards the two against each other. Correct +
     // cheap for a small network; the firehose (own Jetstream / Tap) is the
     // scale-up.
+    // --- TAP INGEST (--tap): the firehose path (STANDALONE "Cut 2"). ---------
+    // Connect Tap's loopback /channel WS; Tap discovers/backfills/streams every
+    // Zat4 repo, so there is no follow-graph enumeration or per-PDS polling. The
+    // durable log + `seen` are restored first (idempotent against Tap's outbox
+    // replay), a serve thread answers queries, and this thread runs the consumer.
+    if (do_tap) {
+        const log_path = env.get("ZAT_APPVIEW_LOG") orelse "";
+        var log = store.open(log_path);
+        defer store.close(&log);
+
+        var seen: store.SeenSet = .empty;
+        defer seen.deinit(gpa);
+
+        const replayed = store.replay(gpa, &idx, &seen, log_path) catch 0;
+        if (replayed > 0) {
+            try out.print("zat4-appview: restored {d} record(s) from {s}\n", .{ replayed, log_path });
+            try out.flush();
+        }
+
+        const tap_host = env.get("ZAT_TAP_HOST") orelse "127.0.0.1";
+        const tap_port: u16 = if (env.get("ZAT_TAP_PORT")) |p|
+            (std.fmt.parseInt(u16, p, 10) catch 2480)
+        else
+            2480;
+
+        const serve_thread = try std.Thread.spawn(.{}, serveThread, .{ gpa, io, &idx, port, &lock, serve_token });
+        _ = serve_thread; // runs until the process is killed
+
+        try out.print("zat4-appview: tap ingest from {s}:{d} (app.zat4.*, all repos Tap tracks)\n", .{ tap_host, tap_port });
+        try out.flush();
+
+        tap_consume.run(gpa, io, tap_host, tap_port, &idx, &lock, &log, &seen, out); // loops forever
+        return;
+    }
+
     if (do_poll) {
         // Durable log (STANDALONE persistence): restore previously-polled posts/
         // follows/likes from disk BEFORE discovery, so a restart neither loses
@@ -248,4 +287,6 @@ test {
     _ = serve;
     _ = poll;
     _ = store;
+    _ = tap_consume;
+    _ = @import("core/tap.zig");
 }

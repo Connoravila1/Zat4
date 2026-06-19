@@ -210,7 +210,13 @@ fn writeAll(fd: i32, bytes: []const u8) void {
     while (sent < bytes.len) {
         const rc = linux.write(fd, bytes.ptr + sent, bytes.len - sent);
         const signed: isize = @bitCast(rc);
-        if (signed <= 0) return; // a failed write drops this line (E2); the in-memory index still has it
+        if (signed < 0) {
+            // Retry an interrupted write rather than truncating the line — a
+            // half-written JSON line would fail to parse on replay, losing it.
+            if (-signed == @intFromEnum(std.os.linux.E.INTR)) continue;
+            return; // a real error drops this line (E2); the in-memory index still has it
+        }
+        if (signed == 0) return;
         sent += @intCast(signed);
     }
 }
@@ -269,6 +275,8 @@ fn readFileAlloc(gpa: Allocator, path: []const u8) ?[]u8 {
         const n_rc = linux.read(fd, &chunk, chunk.len);
         const n_signed: isize = @bitCast(n_rc);
         if (n_signed < 0) {
+            // Retry an interrupted read rather than discarding the whole log.
+            if (-n_signed == @intFromEnum(std.os.linux.E.INTR)) continue;
             out.deinit(gpa);
             return null;
         }
@@ -349,6 +357,39 @@ test "store: append then replay rebuilds the index (posts, follows, likes)" {
     // The dedup set carries every record cid, so a re-poll would skip them.
     try testing.expect(seen.contains(seenKey("bafy-follow-1")));
     try testing.expect(seen.contains(seenKey("bafy-like-1")));
+}
+
+test "store: a post body with newlines/quotes round-trips as ONE log line" {
+    // The log is newline-delimited and split on '\n' at replay; json escaping
+    // must keep an embedded newline INSIDE the string so the record stays one
+    // line. Load-bearing + previously untested.
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const path = tmpPath();
+    rm(path);
+    defer rm(path);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tricky = "line one\nline two\r\na \"quoted\" word and a \\ backslash";
+    {
+        var s = open(path);
+        defer close(&s);
+        appendPost(&s, arena, "did:plc:a", "rk1", "cidNL", tricky, "2026-06-14T00:00:00Z");
+    }
+
+    var idx: appview.Index = .{};
+    defer appview.deinit(gpa, &idx);
+    var seen: SeenSet = .empty;
+    defer seen.deinit(gpa);
+
+    const applied = try replay(gpa, &idx, &seen, path);
+    try testing.expectEqual(@as(usize, 1), applied); // ONE record despite embedded newlines
+    try testing.expectEqual(@as(usize, 1), idx.posts.len);
+    const span = idx.posts.items(.text)[0];
+    try testing.expectEqualStrings(tricky, idx.pool_bytes.items[span.off .. span.off + span.len]);
 }
 
 test "store: replaying the same log twice does not double-apply (idempotent restart)" {

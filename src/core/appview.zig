@@ -96,6 +96,15 @@ pub const Index = struct {
     /// cid StrId -> post row, so a like/repost can find its subject in O(1)
     /// to bump a count, and a re-seen cid is deduped (A8).
     post_by_cid: std.AutoHashMapUnmanaged(StrId, u32) = .empty,
+
+    /// Engagements whose subject post is not indexed YET (out-of-order ingest:
+    /// a like seen before its post, common across repos / firehose ordering).
+    /// Keyed by the subject post's cid; `indexPost` drains these into the post's
+    /// counts when it arrives, so an early engagement is never lost (the bug a
+    /// silent miss used to cause). Record-level dedup stays the caller's job
+    /// (the `seen` set / durable log), so each engagement RECORD counts once.
+    pending_likes: std.AutoHashMapUnmanaged(StrId, u32) = .empty,
+    pending_reposts: std.AutoHashMapUnmanaged(StrId, u32) = .empty,
 };
 
 pub fn deinit(gpa: Allocator, idx: *Index) void {
@@ -108,6 +117,8 @@ pub fn deinit(gpa: Allocator, idx: *Index) void {
     while (kit.next()) |k| gpa.free(k.*);
     idx.intern.deinit(gpa);
     idx.post_by_cid.deinit(gpa);
+    idx.pending_likes.deinit(gpa);
+    idx.pending_reposts.deinit(gpa);
     idx.* = .{};
 }
 
@@ -161,13 +172,18 @@ pub fn indexPost(gpa: Allocator, idx: *Index, in: PostInput) Allocator.Error!boo
     const text_span: Span = .{ .off = text_off, .len = @intCast(in.text.len) };
 
     const row: u32 = @intCast(idx.posts.len);
+    // Drain engagements that arrived before this post (out-of-order ingest):
+    // their counts were held pending against this cid and apply now.
+    const pending_like = if (idx.pending_likes.fetchRemove(cid_id)) |kv| kv.value else 0;
+    const pending_repost = if (idx.pending_reposts.fetchRemove(cid_id)) |kv| kv.value else 0;
+
     try idx.posts.append(gpa, .{
         .cid = cid_id,
         .author = author_id,
         .text = text_span,
         .created_at = in.created_at,
-        .like_count = 0,
-        .repost_count = 0,
+        .like_count = pending_like,
+        .repost_count = pending_repost,
     });
     try idx.post_by_cid.put(gpa, cid_id, row);
     return true;
@@ -214,11 +230,24 @@ pub const Engagement = enum { like, repost };
 /// error — backfill/ordering is a Phase E concern.
 pub fn indexEngagement(gpa: Allocator, idx: *Index, kind: Engagement, subject_cid: []const u8) Allocator.Error!void {
     const cid_id = try internStr(gpa, idx, subject_cid);
-    const row = idx.post_by_cid.get(cid_id) orelse return;
-    switch (kind) {
-        .like => idx.posts.items(.like_count)[row] +|= 1,
-        .repost => idx.posts.items(.repost_count)[row] +|= 1,
+    if (idx.post_by_cid.get(cid_id)) |row| {
+        switch (kind) {
+            .like => idx.posts.items(.like_count)[row] +|= 1,
+            .repost => idx.posts.items(.repost_count)[row] +|= 1,
+        }
+        return;
     }
+    // Subject post not indexed yet — hold the engagement PENDING against its cid
+    // rather than dropping it (E4 was a silent miss; that lost out-of-order
+    // likes/reposts permanently once the caller marked the record seen).
+    // `indexPost` drains this when the post arrives.
+    const map = switch (kind) {
+        .like => &idx.pending_likes,
+        .repost => &idx.pending_reposts,
+    };
+    const gop = try map.getOrPut(gpa, cid_id);
+    if (!gop.found_existing) gop.value_ptr.* = 0;
+    gop.value_ptr.* +|= 1;
 }
 
 /// One row of an assembled timeline, as plain values crossing the boundary
@@ -417,8 +446,34 @@ test "engagement: like/repost bump counts; an unknown subject is a miss (E4)" {
     try indexEngagement(gpa, &idx, .like, "c1");
     try indexEngagement(gpa, &idx, .like, "c1");
     try indexEngagement(gpa, &idx, .repost, "c1");
-    try indexEngagement(gpa, &idx, .like, "c-missing"); // no such post: a miss, no error
+    try indexEngagement(gpa, &idx, .like, "c-missing"); // no such post yet: held pending, not lost
 
     try testing.expectEqual(@as(u32, 2), idx.posts.items(.like_count)[0]);
     try testing.expectEqual(@as(u32, 1), idx.posts.items(.repost_count)[0]);
+}
+
+test "engagement: an out-of-order like/repost (seen before its post) is held pending, then applied" {
+    // Regression: the poll/consumer marks an engagement record 'seen' right
+    // after calling indexEngagement; when the subject post wasn't indexed yet
+    // (arbitrary cross-repo / firehose order) the old silent miss dropped the
+    // count permanently. Now it pends against the subject cid and applies the
+    // moment the post lands.
+    const gpa = testing.allocator;
+    var idx: Index = .{};
+    defer deinit(gpa, &idx);
+
+    // Three engagements arrive BEFORE the post they reference.
+    try indexEngagement(gpa, &idx, .like, "cLate");
+    try indexEngagement(gpa, &idx, .like, "cLate");
+    try indexEngagement(gpa, &idx, .repost, "cLate");
+    try testing.expectEqual(@as(usize, 0), idx.posts.len); // nothing indexed yet
+
+    // The post finally arrives — it adopts the pending counts.
+    try testing.expect(try indexPost(gpa, &idx, .{ .cid = "cLate", .author_did = "did:a", .text = "p", .created_at = 1 }));
+    try testing.expectEqual(@as(u32, 2), idx.posts.items(.like_count)[0]);
+    try testing.expectEqual(@as(u32, 1), idx.posts.items(.repost_count)[0]);
+
+    // A later engagement (post now present) bumps directly.
+    try indexEngagement(gpa, &idx, .like, "cLate");
+    try testing.expectEqual(@as(u32, 3), idx.posts.items(.like_count)[0]);
 }
