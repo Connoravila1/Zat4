@@ -8,3 +8,12 @@ zig-out/
 # Reference screenshots (not source).
 Screenshot*.png
 file.pub
+
+# Internal guiding documents — kept on disk for working context, never tracked
+# (private infra/strategy). Only the README is public.
+*.md
+!README.md
+To_compile_zig
+Zig_References
+mockup_desktop.html
+sample_events.jsonl
