@@ -85,13 +85,12 @@ pub fn ingestEvent(gpa: Allocator, arena: Allocator, idx: *appview.Index, event_
     if (std.mem.eql(u8, commit.collection, lexicon.collection.like)) {
         const subject_cid = engagementSubjectCid(rec);
         if (subject_cid.len == 0) return .ignored;
-        try appview.indexEngagement(gpa, idx, .like, subject_cid);
-        // The per-viewer like edge (viewer.like): rebuild the record uri from
-        // did + rkey so a replay/firehose like is un-likeable too.
-        if (ev.did.len > 0 and commit.rkey.len > 0) {
-            const uri = try std.fmt.allocPrint(arena, "at://{s}/{s}/{s}", .{ ev.did, lexicon.collection.like, commit.rkey });
-            try appview.setLikeEdge(gpa, idx, ev.did, subject_cid, uri);
-        }
+        // Likes are edge-managed (setLikeEdge maintains the count + viewer.like).
+        // Rebuild the record uri from did + rkey so a replayed/firehose like is
+        // counted AND un-likeable; without the rkey we can't, so it's ignored.
+        if (ev.did.len == 0 or commit.rkey.len == 0) return .ignored;
+        const uri = try std.fmt.allocPrint(arena, "at://{s}/{s}/{s}", .{ ev.did, lexicon.collection.like, commit.rkey });
+        try appview.setLikeEdge(gpa, idx, ev.did, subject_cid, uri);
         return .like;
     }
     if (std.mem.eql(u8, commit.collection, lexicon.collection.repost)) {

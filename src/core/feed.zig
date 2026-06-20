@@ -202,6 +202,15 @@ pub const Store = struct {
     /// out of band as bitsets, parallel to `posts` (A6 as written).
     liked: std.DynamicBitSetUnmanaged = .{},
     reposted: std.DynamicBitSetUnmanaged = .{},
+    /// Optimistic-write GUARD, parallel to `posts` (A6). A bit is set when WE
+    /// just changed our like/repost locally and the server has not yet caught
+    /// up. While set, a refresh must NOT overwrite the local like/repost state
+    /// or count — the AppView polls every few seconds, so a refresh landing
+    /// between our tap and the server reflecting it would otherwise revert the
+    /// heart/count (the "glitchy" flicker). Cleared the moment the server's
+    /// view AGREES with ours (or on a revert). Wire-derived, not snapshotted.
+    like_pending: std.DynamicBitSetUnmanaged = .{},
+    repost_pending: std.DynamicBitSetUnmanaged = .{},
     /// The session account's like/repost RECORD uris, parallel to `posts`
     /// (A6: out-of-band, same shape as the bitsets). `.empty` = no record
     /// uri known. WIRE-DERIVED, deliberately NOT snapshotted: a refresh
@@ -226,6 +235,8 @@ pub fn deinitStore(gpa: Allocator, store: *Store) void {
     store.author_by_did.deinit(gpa);
     store.liked.deinit(gpa);
     store.reposted.deinit(gpa);
+    store.like_pending.deinit(gpa);
+    store.repost_pending.deinit(gpa);
     store.like_uris.deinit(gpa);
     store.repost_uris.deinit(gpa);
     store.* = undefined;
@@ -420,23 +431,39 @@ fn internPost(
     if (gop.found_existing) {
         stats.posts_deduped += 1;
         const index = gop.value_ptr.*;
-        // A8 boundary, drawn precisely: the CID seals the RECORD bytes —
-        // text, refs, authorship are never re-parsed. Counts and viewer
-        // state live on the VIEW wrapper, not in the record, so fresher
-        // server truth overwrites them here. This is the "reconcile"
-        // half of optimistic updates.
+        // A8 boundary: the CID seals the RECORD bytes (text/refs/authorship are
+        // never re-parsed). Counts and viewer state live on the VIEW wrapper, so
+        // fresher server truth reconciles here — EXCEPT a like/repost we just
+        // changed locally and the server hasn't reflected yet (the pending
+        // guard), which we leave alone so a lagging refresh can't revert it.
         const posts = store.posts.slice();
-        posts.items(.like_count)[index] = view.likeCount;
-        posts.items(.repost_count)[index] = view.repostCount;
         posts.items(.reply_count)[index] = view.replyCount;
         posts.items(.quote_count)[index] = view.quoteCount;
-        if (view.viewer) |viewer| {
-            store.liked.setValue(index, viewer.like != null);
-            store.reposted.setValue(index, viewer.repost != null);
-            // Refresh the record uris too (re-interning orphans a few
-            // bytes in the append-only buffer — the accepted trade).
-            store.like_uris.items[index] = if (viewer.like) |u| try appendString(gpa, store, u) else .empty;
-            store.repost_uris.items[index] = if (viewer.repost) |u| try appendString(gpa, store, u) else .empty;
+
+        // Like: the server reports our like via viewer.like (its record uri),
+        // and OMITS viewer when we have not liked it — so absence means "not
+        // liked", not "no info".
+        const server_like: ?[]const u8 = if (view.viewer) |v| v.like else null;
+        // If a pending optimistic change now AGREES with the server, it's
+        // confirmed — clear the guard so server truth flows again.
+        if (store.like_pending.isSet(index) and (server_like != null) == store.liked.isSet(index)) {
+            store.like_pending.unset(index);
+        }
+        if (!store.like_pending.isSet(index)) {
+            store.liked.setValue(index, server_like != null);
+            store.like_uris.items[index] = if (server_like) |u| try appendString(gpa, store, u) else .empty;
+            posts.items(.like_count)[index] = view.likeCount;
+        }
+
+        // Repost: same shape.
+        const server_repost: ?[]const u8 = if (view.viewer) |v| v.repost else null;
+        if (store.repost_pending.isSet(index) and (server_repost != null) == store.reposted.isSet(index)) {
+            store.repost_pending.unset(index);
+        }
+        if (!store.repost_pending.isSet(index)) {
+            store.reposted.setValue(index, server_repost != null);
+            store.repost_uris.items[index] = if (server_repost) |u| try appendString(gpa, store, u) else .empty;
+            posts.items(.repost_count)[index] = view.repostCount;
         }
         return @enumFromInt(index);
     }
@@ -468,6 +495,8 @@ fn internPost(
     });
     try store.liked.resize(gpa, store.posts.len, false);
     try store.reposted.resize(gpa, store.posts.len, false);
+    try store.like_pending.resize(gpa, store.posts.len, false);
+    try store.repost_pending.resize(gpa, store.posts.len, false);
     try store.like_uris.resize(gpa, store.posts.len);
     try store.repost_uris.resize(gpa, store.posts.len);
     store.like_uris.items[index] = .empty;
@@ -681,6 +710,8 @@ pub fn ingestLivePost(
     });
     try store.liked.resize(gpa, store.posts.len, false);
     try store.reposted.resize(gpa, store.posts.len, false);
+    try store.like_pending.resize(gpa, store.posts.len, false);
+    try store.repost_pending.resize(gpa, store.posts.len, false);
     // The like/repost record-uri arrays are part of the same parallel
     // group as `posts`/`liked`/`reposted` (A3): they MUST grow together or
     // an index valid for `posts` overruns `like_uris`. The fetch path
@@ -750,6 +781,7 @@ pub fn applyLike(store: *Store, cid: []const u8) Applied {
     const index = lookupCid(store, cid) orelse return .unknown;
     if (store.liked.isSet(index)) return .already;
     store.liked.set(index);
+    store.like_pending.set(index); // unconfirmed local change — guard it from the lagging refresh
     store.posts.items(.like_count)[index] += 1;
     return .applied;
 }
@@ -795,6 +827,7 @@ pub fn applyUnlike(store: *Store, cid: []const u8) Disengaged {
     const span = store.like_uris.items[index];
     if (span.len == 0) return .no_record_uri;
     store.liked.unset(index);
+    store.like_pending.set(index); // unconfirmed local change — guard it from the lagging refresh
     store.posts.items(.like_count)[index] -|= 1;
     store.like_uris.items[index] = .empty;
     return .{ .applied = spanSlice(store, span) };
@@ -806,6 +839,7 @@ pub fn revertUnlike(gpa: Allocator, store: *Store, cid: []const u8, uri: []const
     const index = lookupCid(store, cid) orelse return;
     if (store.liked.isSet(index)) return;
     store.liked.set(index);
+    store.like_pending.unset(index); // optimistic undone → back in sync with the server
     store.posts.items(.like_count)[index] += 1;
     store.like_uris.items[index] = try appendString(gpa, store, uri);
 }
@@ -816,6 +850,7 @@ pub fn applyUnrepost(store: *Store, cid: []const u8) Disengaged {
     const span = store.repost_uris.items[index];
     if (span.len == 0) return .no_record_uri;
     store.reposted.unset(index);
+    store.repost_pending.set(index); // unconfirmed local change — guard it from the lagging refresh
     store.posts.items(.repost_count)[index] -|= 1;
     store.repost_uris.items[index] = .empty;
     return .{ .applied = spanSlice(store, span) };
@@ -825,6 +860,7 @@ pub fn revertUnrepost(gpa: Allocator, store: *Store, cid: []const u8, uri: []con
     const index = lookupCid(store, cid) orelse return;
     if (store.reposted.isSet(index)) return;
     store.reposted.set(index);
+    store.repost_pending.unset(index); // optimistic undone → back in sync with the server
     store.posts.items(.repost_count)[index] += 1;
     store.repost_uris.items[index] = try appendString(gpa, store, uri);
 }
@@ -833,6 +869,7 @@ pub fn revertLike(store: *Store, cid: []const u8) void {
     const index = lookupCid(store, cid) orelse return;
     if (!store.liked.isSet(index)) return;
     store.liked.unset(index);
+    store.like_pending.unset(index); // optimistic undone → back in sync with the server
     const counts = store.posts.items(.like_count);
     counts[index] -|= 1;
 }
@@ -841,6 +878,7 @@ pub fn applyRepost(store: *Store, cid: []const u8) Applied {
     const index = lookupCid(store, cid) orelse return .unknown;
     if (store.reposted.isSet(index)) return .already;
     store.reposted.set(index);
+    store.repost_pending.set(index); // unconfirmed local change — guard it from the lagging refresh
     store.posts.items(.repost_count)[index] += 1;
     return .applied;
 }
@@ -849,6 +887,7 @@ pub fn revertRepost(store: *Store, cid: []const u8) void {
     const index = lookupCid(store, cid) orelse return;
     if (!store.reposted.isSet(index)) return;
     store.reposted.unset(index);
+    store.repost_pending.unset(index); // optimistic undone → back in sync with the server
     const counts = store.posts.items(.repost_count);
     counts[index] -|= 1;
 }

@@ -115,13 +115,11 @@ pub const Index = struct {
     /// to bump a count, and a re-seen cid is deduped (A8).
     post_by_cid: std.AutoHashMapUnmanaged(StrId, u32) = .empty,
 
-    /// Engagements whose subject post is not indexed YET (out-of-order ingest:
-    /// a like seen before its post, common across repos / firehose ordering).
-    /// Keyed by the subject post's cid; `indexPost` drains these into the post's
-    /// counts when it arrives, so an early engagement is never lost (the bug a
-    /// silent miss used to cause). Record-level dedup stays the caller's job
-    /// (the `seen` set / durable log), so each engagement RECORD counts once.
-    pending_likes: std.AutoHashMapUnmanaged(StrId, u32) = .empty,
+    /// REPOSTS whose subject post is not indexed YET (out-of-order ingest, e.g.
+    /// across repos). Keyed by the subject's cid; `indexPost` drains these into
+    /// the post's repost_count when it arrives, so an early repost is never lost.
+    /// (Likes need no pending map — they live in `like_edges`, keyed by cid, and
+    /// `indexPost` counts them directly via `countLikeEdges`.)
     pending_reposts: std.AutoHashMapUnmanaged(StrId, u32) = .empty,
 
     /// Per-viewer LIKE edges: a packed (viewer_id, subject-cid_id) key → the
@@ -142,7 +140,6 @@ pub fn deinit(gpa: Allocator, idx: *Index) void {
     while (kit.next()) |k| gpa.free(k.*);
     idx.intern.deinit(gpa);
     idx.post_by_cid.deinit(gpa);
-    idx.pending_likes.deinit(gpa);
     idx.pending_reposts.deinit(gpa);
     idx.like_edges.deinit(gpa);
     idx.* = .{};
@@ -198,17 +195,18 @@ pub fn indexPost(gpa: Allocator, idx: *Index, in: PostInput) Allocator.Error!boo
     const text_span: Span = .{ .off = text_off, .len = @intCast(in.text.len) };
 
     const row: u32 = @intCast(idx.posts.len);
-    // Drain engagements that arrived before this post (out-of-order ingest):
-    // their counts were held pending against this cid and apply now.
-    const pending_like = if (idx.pending_likes.fetchRemove(cid_id)) |kv| kv.value else 0;
+    // Out-of-order ingest. Reposts were held PENDING against this cid (drained
+    // here). Likes were stored as EDGES (keyed by cid, order-independent) — so
+    // seed the like_count from the edges already pointing at this cid.
     const pending_repost = if (idx.pending_reposts.fetchRemove(cid_id)) |kv| kv.value else 0;
+    const like_count = countLikeEdges(idx, cid_id);
 
     try idx.posts.append(gpa, .{
         .cid = cid_id,
         .author = author_id,
         .text = text_span,
         .created_at = in.created_at,
-        .like_count = pending_like,
+        .like_count = like_count,
         .repost_count = pending_repost,
     });
     try idx.post_by_cid.put(gpa, cid_id, row);
@@ -251,27 +249,24 @@ pub fn indexFollow(gpa: Allocator, idx: *Index, follower_did: []const u8, subjec
 /// What a like/repost bumps. Subject is the post's cid.
 pub const Engagement = enum { like, repost };
 
-/// Bump a like/repost count on the subject post, if we have it. An
-/// engagement for a post we have not indexed is an ordinary miss (E4), not an
-/// error — backfill/ordering is a Phase E concern.
+/// Bump a REPOST count on the subject post, or hold it PENDING against the cid
+/// if the post is not indexed yet (out-of-order ingest), drained by indexPost.
+///
+/// LIKES are NOT handled here: they are edge-managed — `setLikeEdge` maintains
+/// the like_count AND the per-viewer `viewer.like` uri as the SINGLE source of
+/// truth (so an unlike, a re-poll, and a duplicate all reconcile correctly). A
+/// `.like` kind is therefore a no-op, so a caller that still routes a like
+/// through here cannot double-count it.
 pub fn indexEngagement(gpa: Allocator, idx: *Index, kind: Engagement, subject_cid: []const u8) Allocator.Error!void {
+    if (kind != .repost) return;
     const cid_id = try internStr(gpa, idx, subject_cid);
     if (idx.post_by_cid.get(cid_id)) |row| {
-        switch (kind) {
-            .like => idx.posts.items(.like_count)[row] +|= 1,
-            .repost => idx.posts.items(.repost_count)[row] +|= 1,
-        }
+        idx.posts.items(.repost_count)[row] +|= 1;
         return;
     }
-    // Subject post not indexed yet — hold the engagement PENDING against its cid
-    // rather than dropping it (E4 was a silent miss; that lost out-of-order
-    // likes/reposts permanently once the caller marked the record seen).
-    // `indexPost` drains this when the post arrives.
-    const map = switch (kind) {
-        .like => &idx.pending_likes,
-        .repost => &idx.pending_reposts,
-    };
-    const gop = try map.getOrPut(gpa, cid_id);
+    // Subject post not indexed yet — hold PENDING against its cid (E4: not a
+    // silent miss), drained by indexPost when the post arrives.
+    const gop = try idx.pending_reposts.getOrPut(gpa, cid_id);
     if (!gop.found_existing) gop.value_ptr.* = 0;
     gop.value_ptr.* +|= 1;
 }
@@ -279,6 +274,19 @@ pub fn indexEngagement(gpa: Allocator, idx: *Index, kind: Engagement, subject_ci
 /// Pack a (viewer, subject-cid) interned-id pair into one map key.
 fn edgeKey(viewer: StrId, subject_cid: StrId) u64 {
     return (@as(u64, viewer) << 32) | @as(u64, subject_cid);
+}
+
+/// Count the like edges whose SUBJECT is `cid_id` (the low 32 bits of the key)
+/// — the like_count a post inherits from edges stored before it arrived. O(edges)
+/// once per post (G3: a flat scan is fine at Cut-1 scale; not tuned until a
+/// profiler indicts it).
+fn countLikeEdges(idx: *const Index, cid_id: StrId) u32 {
+    var n: u32 = 0;
+    var it = idx.like_edges.keyIterator();
+    while (it.next()) |k| {
+        if (@as(StrId, @truncate(k.*)) == cid_id) n +|= 1;
+    }
+    return n;
 }
 
 /// Record that `actor_did` liked the post with `subject_cid`, via the like
@@ -292,7 +300,15 @@ pub fn setLikeEdge(gpa: Allocator, idx: *Index, actor_did: []const u8, subject_c
     const actor_id = try internStr(gpa, idx, actor_did);
     const cid_id = try internStr(gpa, idx, subject_cid);
     const uri_id = try internStr(gpa, idx, record_uri);
-    try idx.like_edges.put(gpa, edgeKey(actor_id, cid_id), uri_id);
+    const gop = try idx.like_edges.getOrPut(gpa, edgeKey(actor_id, cid_id));
+    const was_new = !gop.found_existing;
+    gop.value_ptr.* = uri_id;
+    // The edge set is the SINGLE source of truth for likes — a NEW edge adds one
+    // to the subject post's like_count. If the post isn't indexed yet, indexPost
+    // counts the already-stored edges for its cid when it arrives (out-of-order).
+    if (was_new) {
+        if (idx.post_by_cid.get(cid_id)) |row| idx.posts.items(.like_count)[row] +|= 1;
+    }
 }
 
 /// Drop every like edge authored by `actor_did`. The poll calls this before
@@ -305,11 +321,18 @@ pub fn clearLikeEdgesForActor(gpa: Allocator, idx: *Index, actor_did: []const u8
     const actor_id = idx.intern.get(actor_did) orelse return;
     var to_remove: std.ArrayList(u64) = .empty;
     defer to_remove.deinit(gpa);
-    var it = idx.like_edges.iterator();
-    while (it.next()) |e| {
-        if (@as(StrId, @truncate(e.key_ptr.* >> 32)) == actor_id) to_remove.append(gpa, e.key_ptr.*) catch return;
+    var it = idx.like_edges.keyIterator();
+    while (it.next()) |k| {
+        if (@as(StrId, @truncate(k.* >> 32)) == actor_id) to_remove.append(gpa, k.*) catch return;
     }
-    for (to_remove.items) |k| _ = idx.like_edges.remove(k);
+    for (to_remove.items) |key| {
+        if (idx.like_edges.remove(key)) {
+            // Drop the like_count this edge contributed (the count tracks the
+            // edge set). Low 32 bits of the key are the subject cid's id.
+            const cid_id: StrId = @truncate(key);
+            if (idx.post_by_cid.get(cid_id)) |row| idx.posts.items(.like_count)[row] -|= 1;
+        }
+    }
 }
 
 /// One row of an assembled timeline, as plain values crossing the boundary
@@ -509,43 +532,70 @@ test "timeline: limit caps the rows; unknown viewer is empty (E4)" {
     try testing.expectEqual(@as(usize, 0), unknown.len);
 }
 
-test "engagement: like/repost bump counts; an unknown subject is a miss (E4)" {
+test "engagement: likes are edge-counted (one per actor, deduped); reposts bump; unknown subject pends" {
     const gpa = testing.allocator;
     var idx: Index = .{};
     defer deinit(gpa, &idx);
 
     _ = try indexPost(gpa, &idx, .{ .cid = "c1", .author_did = "did:a", .text = "p", .created_at = 1 });
-    try indexEngagement(gpa, &idx, .like, "c1");
-    try indexEngagement(gpa, &idx, .like, "c1");
+    // Two DIFFERENT actors like c1 → count 2; the SAME actor liking again dedups
+    // (an edge is keyed by (actor, subject), so a re-poll/duplicate never inflates).
+    try setLikeEdge(gpa, &idx, "did:x", "c1", "at://did:x/app.zat4.feed.like/r1");
+    try setLikeEdge(gpa, &idx, "did:y", "c1", "at://did:y/app.zat4.feed.like/r1");
+    try setLikeEdge(gpa, &idx, "did:x", "c1", "at://did:x/app.zat4.feed.like/r1b");
     try indexEngagement(gpa, &idx, .repost, "c1");
-    try indexEngagement(gpa, &idx, .like, "c-missing"); // no such post yet: held pending, not lost
 
     try testing.expectEqual(@as(u32, 2), idx.posts.items(.like_count)[0]);
     try testing.expectEqual(@as(u32, 1), idx.posts.items(.repost_count)[0]);
 }
 
-test "engagement: an out-of-order like/repost (seen before its post) is held pending, then applied" {
-    // Regression: the poll/consumer marks an engagement record 'seen' right
-    // after calling indexEngagement; when the subject post wasn't indexed yet
-    // (arbitrary cross-repo / firehose order) the old silent miss dropped the
-    // count permanently. Now it pends against the subject cid and applies the
-    // moment the post lands.
+test "engagement: out-of-order likes/reposts apply when the post lands; an unlike drops the count" {
     const gpa = testing.allocator;
     var idx: Index = .{};
     defer deinit(gpa, &idx);
 
-    // Three engagements arrive BEFORE the post they reference.
-    try indexEngagement(gpa, &idx, .like, "cLate");
-    try indexEngagement(gpa, &idx, .like, "cLate");
+    // Engagements arrive BEFORE the post: a repost pends; likes live in the edge
+    // set (keyed by cid, order-independent).
+    try setLikeEdge(gpa, &idx, "did:x", "cLate", "at://did:x/app.zat4.feed.like/r1");
+    try setLikeEdge(gpa, &idx, "did:y", "cLate", "at://did:y/app.zat4.feed.like/r1");
     try indexEngagement(gpa, &idx, .repost, "cLate");
     try testing.expectEqual(@as(usize, 0), idx.posts.len); // nothing indexed yet
 
-    // The post finally arrives — it adopts the pending counts.
+    // The post arrives — it adopts the pending repost AND counts the like edges.
     try testing.expect(try indexPost(gpa, &idx, .{ .cid = "cLate", .author_did = "did:a", .text = "p", .created_at = 1 }));
     try testing.expectEqual(@as(u32, 2), idx.posts.items(.like_count)[0]);
     try testing.expectEqual(@as(u32, 1), idx.posts.items(.repost_count)[0]);
 
-    // A later engagement (post now present) bumps directly.
-    try indexEngagement(gpa, &idx, .like, "cLate");
+    // A new actor likes it now (post present) — the count bumps directly.
+    try setLikeEdge(gpa, &idx, "did:z", "cLate", "at://did:z/app.zat4.feed.like/r1");
     try testing.expectEqual(@as(u32, 3), idx.posts.items(.like_count)[0]);
+
+    // UNLIKE: clearing actor x's edges (and not re-adding) drops x's like — the
+    // count reconciles. This is exactly what makes an unlike stick on a poll
+    // AppView (the poll clears then re-adds each actor's CURRENT likes).
+    clearLikeEdgesForActor(gpa, &idx, "did:x");
+    try testing.expectEqual(@as(u32, 2), idx.posts.items(.like_count)[0]);
+}
+
+test "viewer.like: buildTimeline reports the viewer's own like record uri, and only theirs" {
+    const gpa = testing.allocator;
+    var idx: Index = .{};
+    defer deinit(gpa, &idx);
+
+    try indexFollow(gpa, &idx, "did:me", "did:auth");
+    try indexFollow(gpa, &idx, "did:other", "did:auth");
+    _ = try indexPost(gpa, &idx, .{ .cid = "cp", .author_did = "did:auth", .text = "hi", .created_at = 1 });
+    try setLikeEdge(gpa, &idx, "did:me", "cp", "at://did:me/app.zat4.feed.like/rk");
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    const mine = try buildTimeline(arena_state.allocator(), &idx, "did:me", 10);
+    try testing.expectEqual(@as(usize, 1), mine.len);
+    try testing.expectEqualStrings("at://did:me/app.zat4.feed.like/rk", mine[0].viewer_like_uri);
+    try testing.expectEqual(@as(u32, 1), mine[0].like_count);
+
+    // A different viewer who did NOT like it sees no viewer.like.
+    const theirs = try buildTimeline(arena_state.allocator(), &idx, "did:other", 10);
+    try testing.expectEqualStrings("", theirs[0].viewer_like_uri);
 }
