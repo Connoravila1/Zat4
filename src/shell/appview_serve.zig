@@ -214,6 +214,10 @@ fn getTimeline(arena: Allocator, idx: *const appview.Index, cfg: ServeConfig, ta
                 .replyCount = 0,
                 .quoteCount = 0,
                 .indexedAt = "",
+                // viewer.like: the viewer's own like record uri — the client
+                // shows the filled heart from it on reload AND deletes it to
+                // unlike. Absent (null) when the viewer hasn't liked this post.
+                .viewer = if (r.viewer_like_uri.len > 0) .{ .like = r.viewer_like_uri } else null,
             },
         };
     }

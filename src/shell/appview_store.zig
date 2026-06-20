@@ -134,6 +134,9 @@ const FollowEnvelope = struct {
 const EngCommit = struct {
     operation: []const u8 = "create",
     collection: []const u8,
+    /// The engagement record's rkey — so a replay can rebuild the like's uri
+    /// (at://did/collection/rkey) and re-establish the viewer.like edge.
+    rkey: []const u8 = "",
     cid: []const u8,
     record: lexicon.SubjectRecordOut,
 };
@@ -199,6 +202,7 @@ pub fn appendEngagement(
     actor_did: []const u8,
     subject_cid: []const u8,
     record_cid: []const u8,
+    record_uri: []const u8,
 ) void {
     if (store.fd < 0 or record_cid.len == 0 or subject_cid.len == 0) return;
     const collection = switch (kind) {
@@ -209,11 +213,18 @@ pub fn appendEngagement(
         .did = actor_did,
         .commit = .{
             .collection = collection,
+            .rkey = rkeyOf(record_uri),
             .cid = record_cid,
             .record = .{ .@"$type" = collection, .subject = .{ .cid = subject_cid }, .createdAt = "" },
         },
     };
     writeEnvelope(store, arena, env);
+}
+
+/// The rkey of an at-uri (its last path segment); "" if none.
+fn rkeyOf(uri: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, uri, '/')) |i| return uri[i + 1 ..];
+    return "";
 }
 
 fn writeEnvelope(store: *Store, arena: Allocator, env: anytype) void {
@@ -352,7 +363,7 @@ test "store: append then replay rebuilds the index (posts, follows, likes)" {
         try testing.expect(store.fd >= 0);
         appendFollow(&store, arena, "did:plc:me", "did:plc:author", "bafy-follow-1");
         appendPost(&store, arena, "did:plc:author", "rk1", "bafy-post-1", "hello zat4", "2026-06-14T00:00:00Z");
-        appendEngagement(&store, arena, .like, "did:plc:me", "bafy-post-1", "bafy-like-1");
+        appendEngagement(&store, arena, .like, "did:plc:me", "bafy-post-1", "bafy-like-1", "at://did:plc:me/app.zat4.feed.like/r1");
     }
 
     // A fresh process: replay the log into a new index + seen set.
@@ -426,7 +437,7 @@ test "store: replaying the same log twice does not double-apply (idempotent rest
         defer close(&store);
         appendFollow(&store, arena, "did:plc:me", "did:plc:a", "bafy-f1");
         appendPost(&store, arena, "did:plc:a", "rk1", "bafy-p1", "p", "2026-06-14T00:00:00Z");
-        appendEngagement(&store, arena, .like, "did:plc:me", "bafy-p1", "bafy-l1");
+        appendEngagement(&store, arena, .like, "did:plc:me", "bafy-p1", "bafy-l1", "at://did:plc:me/app.zat4.feed.like/r1");
     }
 
     var idx: appview.Index = .{};

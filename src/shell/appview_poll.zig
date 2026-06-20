@@ -158,11 +158,20 @@ pub fn pollRepo(
     if (try fetch(arena, io, environ, pds_url, did, lexicon.collection.like, RefValue)) |recs| {
         lock.lock();
         defer lock.unlock();
+        // Reconcile this actor's like edges with their CURRENT records: drop
+        // the old set, then re-add what they still like below. A poll sees
+        // creates, not deletes, so without this an UNLIKE would leave a stale
+        // edge that re-fills the heart on the next refresh.
+        appview.clearLikeEdgesForActor(gpa, idx, did);
         for (recs) |r| {
             if (r.cid.len == 0 or r.value.subject.cid.len == 0) continue;
+            // Refresh the per-viewer like edge EVERY poll (idempotent), BEFORE
+            // the count's seen-gate — so likes from prior sessions also become
+            // known as `viewer.like` and thus un-likeable, not just new ones.
+            appview.setLikeEdge(gpa, idx, did, r.value.subject.cid, r.uri) catch {};
             if (try markSeen(gpa, seen, r.cid)) continue;
             appview.indexEngagement(gpa, idx, .like, r.value.subject.cid) catch {};
-            store.appendEngagement(log, arena, .like, did, r.value.subject.cid, r.cid);
+            store.appendEngagement(log, arena, .like, did, r.value.subject.cid, r.cid, r.uri);
         }
     }
 
@@ -174,7 +183,7 @@ pub fn pollRepo(
             if (r.cid.len == 0 or r.value.subject.cid.len == 0) continue;
             if (try markSeen(gpa, seen, r.cid)) continue;
             appview.indexEngagement(gpa, idx, .repost, r.value.subject.cid) catch {};
-            store.appendEngagement(log, arena, .repost, did, r.value.subject.cid, r.cid);
+            store.appendEngagement(log, arena, .repost, did, r.value.subject.cid, r.cid, r.uri);
         }
     }
 

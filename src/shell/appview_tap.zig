@@ -242,7 +242,10 @@ fn applyEvent(
             lock.lock();
             appview.indexEngagement(gpa, idx, kind, e.subject_cid) catch {};
             lock.unlock();
-            store.appendEngagement(log, arena, kind, e.did, e.subject_cid, e.record_cid);
+            // record_uri "" for now: the Tap engagement doesn't carry the like
+            // record's rkey, so a tap-ingested like's viewer.like edge is not
+            // rebuilt on replay (the poll path covers it). Wire when Tap lands.
+            store.appendEngagement(log, arena, kind, e.did, e.subject_cid, e.record_cid, "");
             return true;
         },
     }

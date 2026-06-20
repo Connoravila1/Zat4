@@ -123,6 +123,13 @@ pub const Index = struct {
     /// (the `seen` set / durable log), so each engagement RECORD counts once.
     pending_likes: std.AutoHashMapUnmanaged(StrId, u32) = .empty,
     pending_reposts: std.AutoHashMapUnmanaged(StrId, u32) = .empty,
+
+    /// Per-viewer LIKE edges: a packed (viewer_id, subject-cid_id) key → the
+    /// viewer's like RECORD uri (interned). Lets getTimeline answer
+    /// `viewer.like` — whether THIS viewer liked a post, and which record to
+    /// delete to unlike. Keyed by the interned pair so lookup is O(1) and
+    /// survives post-row reordering. Set by `setLikeEdge`, idempotently.
+    like_edges: std.AutoHashMapUnmanaged(u64, StrId) = .empty,
 };
 
 pub fn deinit(gpa: Allocator, idx: *Index) void {
@@ -137,6 +144,7 @@ pub fn deinit(gpa: Allocator, idx: *Index) void {
     idx.post_by_cid.deinit(gpa);
     idx.pending_likes.deinit(gpa);
     idx.pending_reposts.deinit(gpa);
+    idx.like_edges.deinit(gpa);
     idx.* = .{};
 }
 
@@ -268,6 +276,42 @@ pub fn indexEngagement(gpa: Allocator, idx: *Index, kind: Engagement, subject_ci
     gop.value_ptr.* +|= 1;
 }
 
+/// Pack a (viewer, subject-cid) interned-id pair into one map key.
+fn edgeKey(viewer: StrId, subject_cid: StrId) u64 {
+    return (@as(u64, viewer) << 32) | @as(u64, subject_cid);
+}
+
+/// Record that `actor_did` liked the post with `subject_cid`, via the like
+/// record at `record_uri` — the edge getTimeline reads to emit `viewer.like`.
+/// Idempotent (a re-poll of the same like overwrites with the same uri) and
+/// SEPARATE from the count (which `indexEngagement` gates by record cid), so
+/// the poll can refresh edges for already-counted likes too — that is what
+/// makes likes from PRIOR sessions un-likeable after a redeploy. C1.
+pub fn setLikeEdge(gpa: Allocator, idx: *Index, actor_did: []const u8, subject_cid: []const u8, record_uri: []const u8) Allocator.Error!void {
+    if (actor_did.len == 0 or subject_cid.len == 0 or record_uri.len == 0) return;
+    const actor_id = try internStr(gpa, idx, actor_did);
+    const cid_id = try internStr(gpa, idx, subject_cid);
+    const uri_id = try internStr(gpa, idx, record_uri);
+    try idx.like_edges.put(gpa, edgeKey(actor_id, cid_id), uri_id);
+}
+
+/// Drop every like edge authored by `actor_did`. The poll calls this before
+/// re-adding the actor's CURRENT likes (via setLikeEdge), so a poll-only
+/// AppView — which sees creates but not deletes — still reflects an UNLIKE: a
+/// deleted like simply isn't re-added, so its edge is gone. Without it, the
+/// stale edge would re-fill the heart on the next refresh. A no-op for an
+/// unknown actor. Errors are swallowed (a failed reconcile keeps the old set).
+pub fn clearLikeEdgesForActor(gpa: Allocator, idx: *Index, actor_did: []const u8) void {
+    const actor_id = idx.intern.get(actor_did) orelse return;
+    var to_remove: std.ArrayList(u64) = .empty;
+    defer to_remove.deinit(gpa);
+    var it = idx.like_edges.iterator();
+    while (it.next()) |e| {
+        if (@as(StrId, @truncate(e.key_ptr.* >> 32)) == actor_id) to_remove.append(gpa, e.key_ptr.*) catch return;
+    }
+    for (to_remove.items) |k| _ = idx.like_edges.remove(k);
+}
+
 /// One row of an assembled timeline, as plain values crossing the boundary
 /// (A5: DIDs/CIDs, never the internal index). The shell serializes these into
 /// the lexicon's TimelinePage shape.
@@ -281,6 +325,10 @@ pub const TimelineRow = struct {
     created_at: i64,
     like_count: u32,
     repost_count: u32,
+    /// The viewer's own like RECORD uri for this post, if they liked it — the
+    /// AppView's `viewer.like`. Empty when the viewer hasn't liked it. The
+    /// client shows the filled heart from it AND deletes it to unlike.
+    viewer_like_uri: []const u8 = "",
 };
 
 /// Build a reverse-chronological timeline for `viewer_did`: the most recent
@@ -334,6 +382,11 @@ pub fn buildTimeline(arena: Allocator, idx: *const Index, viewer_did: []const u8
     const likes = idx.posts.items(.like_count);
     const reposts = idx.posts.items(.repost_count);
     for (out, rows.items[0..n]) |*o, row| {
+        // The viewer's own like record uri for this post (viewer.like), if any.
+        const viewer_like: []const u8 = if (idx.like_edges.get(edgeKey(viewer_id, cids[row]))) |uid|
+            str(idx, uid)
+        else
+            "";
         o.* = .{
             .cid = str(idx, cids[row]),
             .author_did = str(idx, authors[row]),
@@ -344,6 +397,7 @@ pub fn buildTimeline(arena: Allocator, idx: *const Index, viewer_did: []const u8
             .created_at = createds[row],
             .like_count = likes[row],
             .repost_count = reposts[row],
+            .viewer_like_uri = viewer_like,
         };
     }
     return out;
