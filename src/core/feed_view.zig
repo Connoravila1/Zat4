@@ -1,3 +1,21 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//
+// Zat4 — a social-media client built on the AT Protocol.
+// Copyright (C) 2026  Connor Avila
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published
+// by the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 //! B1 classification: CORE (pure). The premium feed view — a slice of
 //! plain post records becomes proportional draw items (avatars, names,
 //! body, an engagement row, dividers) layered OVER the living field
@@ -326,7 +344,6 @@ fn drawRail(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, rx: i32
 }
 
 fn drawSidebar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, sx: i32, height: i32) !void {
-    _ = height;
     const x0 = sx + 16;
     const w = side_w - 32;
 
@@ -375,6 +392,15 @@ fn drawSidebar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, sx: 
         _ = try str(gpa, dl, e, .semibold, fbx + @divTrunc(fbw - flw, 2), py + 24, bg, 13, "Follow");
         py += 48;
     }
+
+    // §13 (AGPL): Zat4 is served over a network, so every interacting user must
+    // be OFFERED the Corresponding Source. This persistent footer is that offer —
+    // a visible pointer to the canonical repository, pinned to the sidebar bottom.
+    // Putting the licence in the repo alone does not satisfy §13; the offer has to
+    // reach network users of the running instance. Keep this visible.
+    const fy = @max(py + 8, height - 40);
+    _ = try str(gpa, dl, e, .regular, x0, fy, faint, 12, "Zat4 — free software, GNU AGPL-3.0");
+    _ = try str(gpa, dl, e, .regular, x0, fy + 18, muted, 12, "source: codeberg.org/connoravila/Zat");
 }
 
 /// Emit the whole premium feed for `posts` into `dl`, OVER whatever the

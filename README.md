@@ -87,3 +87,21 @@ native windows on three platforms, and the GPU glyph-field renderer — and the
 standalone server side — an AppView with firehose ingestion, durable persistence,
 and bearer auth, plus a project-run PDS minting `*.zat4.com` handles — are all
 working. The codebase carries zero third-party dependencies.
+
+## License
+
+zat is free software, licensed under the **GNU Affero General Public License,
+version 3 or (at your option) any later version** (AGPL-3.0-or-later). The full
+text is in [`LICENSE`](LICENSE), and every source file carries the licence
+header.
+
+Because zat is served over a network, the AGPL's **section 13** applies: anyone
+who interacts with a running instance must be offered its Corresponding Source.
+The app honours this with a persistent, visible **source link in its UI** (the
+sidebar footer) pointing back to this repository. If you deploy a modified
+version, keep that offer accurate — it must point to *your* modified source.
+
+Bundled components keep their own licences, retained in their files: the
+`stb_truetype` rasterizer (`vendor/`, public domain) and the embedded UI font
+(BSD-2-Clause, notice in `src/core/font.zig`). These are compatible with the
+AGPL and do not change the licensing of the project's own code.
