@@ -264,6 +264,34 @@ fn iconHeart(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, s: i32, color
     }
 }
 
+/// The UNLIKED like button: a HOLLOW heart OUTLINE, so a tap can visibly fill
+/// it with red. Traced as the parametric heart curve (x=16sin³t, y=13cos t −
+/// 5cos2t − 2cos3t − cos4t) — one clean closed stroke, normalized into the s×s
+/// icon box — rather than a scanline fill, which is solid and cannot read as
+/// empty. The filled `iconHeart` above is the LIKED state.
+fn iconHeartHollow(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, s: i32, color: u32) !void {
+    const f: f32 = @floatFromInt(s);
+    const segs: usize = 28;
+    var prev_x: i32 = 0;
+    var prev_y: i32 = 0;
+    var i: usize = 0;
+    while (i <= segs) : (i += 1) {
+        const t = (@as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(segs))) * 6.2831853;
+        const st = @sin(t);
+        const hx = 16.0 * st * st * st;
+        const hy = 13.0 * @cos(t) - 5.0 * @cos(2.0 * t) - 2.0 * @cos(3.0 * t) - @cos(4.0 * t);
+        // Normalize: hx∈[-16,16] → centred horizontally; hy∈[-17,12], flipped to
+        // screen-y-down and centred so the lobes sit high and the point at ~0.96.
+        const nx = 0.5 + (hx / 16.0) * 0.46;
+        const ny = 0.52 - (hy / 17.0) * 0.44;
+        const px = x + fxi(nx * f);
+        const py = y + fxi(ny * f);
+        if (i > 0) try line(gpa, dl, prev_x, prev_y, px, py, color, 1);
+        prev_x = px;
+        prev_y = py;
+    }
+}
+
 fn ring(gpa: Allocator, dl: *raster.DrawList, cx: i32, cy: i32, r: f32, color: u32, th: u8, segs: usize) !void {
     var i: usize = 0;
     while (i < segs) : (i += 1) {
@@ -423,6 +451,11 @@ pub fn layout(
     /// a too-short cache) means "not measured yet": layout measures and fills it.
     /// Pass null to always measure (the original behaviour).
     heights: ?[]i32,
+    /// When true, the per-post engagement HEART icon is NOT drawn — the GPU path
+    /// draws it as an SDF heart instead, so it fills + pops IN PLACE. The like
+    /// region, count, and reserved space are still emitted. False (software /
+    /// preview) draws the heart here as before.
+    skip_heart: bool,
 ) error{OutOfMemory}!i32 {
     const m = metricsFor(width);
     if (regions) |rg| rg.clearRetainingCapacity();
@@ -528,7 +561,17 @@ pub fn layout(
             ex = try str(gpa, dl, e, .regular, ex, erow, if (p.boosted) boost_c else muted, 13, std.fmt.bufPrint(&nb, "{d}", .{p.boost}) catch "0");
             try emitRegion(gpa, regions, rt_x, tap_y, ex - rt_x, tap_h, @intCast(pi), .repost);
             ex += 22;
-            try iconHeart(gpa, dl, ex, iy, is, if (p.liked) like_c else faint);
+            // Liked → a FILLED red heart; unliked → a HOLLOW outline so the tap
+            // visibly fills it. On the GPU path this is SKIPPED — the SDF heart
+            // pass draws it instead, so it fills + pops IN PLACE (no offset
+            // overlay). Software/preview still draw it here.
+            if (!skip_heart) {
+                if (p.liked) {
+                    try iconHeart(gpa, dl, ex, iy, is, like_c);
+                } else {
+                    try iconHeartHollow(gpa, dl, ex, iy, is, faint);
+                }
+            }
             const like_x = ex;
             ex += is + 7;
             ex = try str(gpa, dl, e, .regular, ex, erow, if (p.liked) like_c else muted, 13, std.fmt.bufPrint(&nb, "{d}", .{p.like}) catch "0");

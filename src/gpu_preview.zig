@@ -96,7 +96,7 @@ pub fn main(init: std.process.Init) !void {
     const posts = try feed_view.fromTimeline(arena, &items, now);
     // Lay the feed out at the fixed logical design width and a proportional
     // logical height; buildVertices scales it to fill the window, crisp.
-    _ = try feed_view.layout(gpa, &engine, @intCast(design_w), @intCast(logicalH(W, H)), posts, 0, &dl, null, null);
+    _ = try feed_view.layout(gpa, &engine, @intCast(design_w), @intCast(logicalH(W, H)), posts, 0, &dl, null, null, false);
 
     // Bring up GL and the renderer.
     var g = gpu.init(win.wid) catch {
@@ -181,7 +181,7 @@ pub fn main(init: std.process.Init) !void {
             gpa.free(bias);
             bias = new_bias;
             dl.len = 0;
-            _ = feed_view.layout(gpa, &engine, @intCast(design_w), @intCast(logicalH(cur_w, cur_h)), posts, 0, &dl, null, null) catch break;
+            _ = feed_view.layout(gpa, &engine, @intCast(design_w), @intCast(logicalH(cur_w, cur_h)), posts, 0, &dl, null, null, false) catch break;
             gpu.feedBuild(&feed_path, gpa, &engine, dl.slice(), uiScale(cur_w)) catch break;
         }
 

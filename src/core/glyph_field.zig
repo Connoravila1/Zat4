@@ -87,7 +87,7 @@ pub const Params = struct {
     decay: f32 = 0.999,
     // dye transport: how fast colour charge drifts downhill (carried by wave
     // troughs) and how much it diffuses. It NEVER decays — effects persist.
-    dye_flow: f32 = 0.6,
+    dye_flow: f32 = 0.85,
     dye_diffuse: f32 = 0.04,
     // A7.2: cold struct, size guard waived (single config instance).
 };

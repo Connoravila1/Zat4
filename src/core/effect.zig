@@ -458,6 +458,89 @@ pub fn advance(
     }
 }
 
+/// Advance ONLY the stage clocks of every active effect by `dt`, culling any
+/// that finish. PURE (B2). This is for renderers that draw the effect THEMSELVES
+/// from the stage clock — the GPU like-heart pass — and so need neither
+/// advance()'s field writes nor its spawn events. It mirrors advance()'s clock
+/// bookkeeping exactly, minus the field coupling, so the GPU path can tick a
+/// like without owning a field.Field at all.
+pub fn advanceClocks(active: *ActiveList, dt: f32) void {
+    var i: usize = 0;
+    while (i < active.len) {
+        const s = active.slice();
+        const recipe = s.items(.recipe)[i];
+        const stage_idx = &s.items(.stage)[i];
+        const stage_t = &s.items(.stage_t)[i];
+        if (stage_idx.* >= recipe.stages.len) {
+            active.swapRemove(i);
+            continue;
+        }
+        const dur = recipe.stages[stage_idx.*].duration;
+        stage_t.* += dt;
+        if (dur <= 0 or stage_t.* >= dur) {
+            stage_idx.* += 1;
+            stage_t.* = 0;
+            s.items(.fired)[i] = false;
+        }
+        if (stage_idx.* >= recipe.stages.len) {
+            active.swapRemove(i);
+            continue;
+        }
+        i += 1;
+    }
+}
+
+/// Fraction [0,1] of the way through the WHOLE effect (across all stages),
+/// from the current stage index + in-stage clock. Pure — the basis for the
+/// lifetime-spanning curves (the pop overshoot, the star expansion) that a
+/// per-stage `t` can't express.
+pub fn elapsedFraction(r: *const Recipe, stage_idx: u8, stage_t: f32) f32 {
+    const total = r.lifetime();
+    if (total <= 0) return 1.0;
+    var acc: f32 = 0;
+    var i: usize = 0;
+    while (i < stage_idx and i < r.stages.len) : (i += 1) acc += r.stages[i].duration;
+    return std.math.clamp((acc + stage_t) / total, 0.0, 1.0);
+}
+
+/// The Twitter-style scale POP: 1.0 → overshoot → settle to 1.0, as a pure
+/// function of lifetime fraction `e`. Rises fast to the peak in the first
+/// ~38% (the heart punches in), then eases back — no spring library, just two
+/// eased segments. Peak 1.28 [TUNE].
+fn popScale(e: f32) f32 {
+    const peak_at: f32 = 0.38;
+    const peak: f32 = 1.28;
+    if (e <= peak_at) {
+        return 1.0 + (peak - 1.0) * easeOut(e / peak_at);
+    }
+    return peak - (peak - 1.0) * easeOut((e - peak_at) / (1.0 - peak_at));
+}
+
+/// What the GPU heart pass needs to draw one like-heart this frame, derived
+/// PURELY from the recipe + stage clock (B2): the bottom-up `fill` [0,1], the
+/// `scale` pop, the settling `glow`, and `burst` [0,1] — the star expansion,
+/// 0 until the back half, ramping to 1 as the effect ends (and always 0 for a
+/// draining unlike, which has no celebratory burst). A7.2: a transient value.
+pub const HeartVisual = struct { fill: f32, scale: f32, glow: f32, burst: f32 };
+
+pub fn heartVisual(r: *const Recipe, stage_idx: u8, stage_t: f32) HeartVisual {
+    if (stage_idx >= r.stages.len) {
+        return .{ .fill = if (r.drains) 0.0 else 1.0, .scale = 1.0, .glow = 0.0, .burst = 0.0 };
+    }
+    const stage = r.stages[stage_idx];
+    const dur = if (stage.duration > 0) stage.duration else 0.0001;
+    const t = std.math.clamp(stage_t / dur, 0.0, 1.0);
+    const e = elapsedFraction(r, stage_idx, stage_t);
+    const fill = heartFill(r.drains, stage.kind, t);
+    const scale = if (r.drains) 1.0 else popScale(e);
+    // Stars expand over the back half (after the fill has landed), fading as
+    // the effect releases. None for an unlike.
+    const burst: f32 = if (r.drains) 0.0 else std.math.clamp((e - 0.45) / 0.55, 0.0, 1.0);
+    // Glow: bright at the pop, easing out through the comedown.
+    const glow: f32 = if (r.drains) 0.0 else (1.0 - e) * 0.6 + fill * 0.4;
+    return .{ .fill = fill, .scale = scale, .glow = std.math.clamp(glow, 0.0, 1.0), .burst = burst };
+}
+
 /// Shift every active effect's Y origin by a signed cell `delta`. PURE
 /// (B2): mutates only the passed list, no clock/IO. When the timeline
 /// scrolls, content moves by some rows; calling this with the matching
@@ -1122,4 +1205,50 @@ test "shiftY moves every effect by the scroll delta and saturates at the top" {
     }
     // x is untouched by a Y shift.
     try testing.expectEqual(@as(u16, 10), active.slice().items(.x)[0]);
+}
+
+test "advanceClocks ticks the stage clock and culls a finished effect (GPU heart path)" {
+    const gpa = testing.allocator;
+    var active: ActiveList = .empty;
+    defer active.deinit(gpa);
+
+    try trigger(gpa, &active, &like_heart, 10, 10, 1.0);
+    try testing.expectEqual(@as(usize, 1), active.len);
+
+    // Tick the full lifetime in small steps; it must self-cull, no field needed.
+    var elapsed: f32 = 0;
+    const dt: f32 = 1.0 / 60.0;
+    while (elapsed < like_heart.lifetime() + 0.05) : (elapsed += dt) {
+        advanceClocks(&active, dt);
+    }
+    try testing.expectEqual(@as(usize, 0), active.len); // ran out and culled (E4)
+}
+
+test "heartVisual: fill rises, the scale pops above 1, stars burst only late" {
+    const r = &like_heart;
+    // Near the start: fill is low, no star burst yet.
+    const a = heartVisual(r, 0, 0.0);
+    try testing.expect(a.fill < 0.2);
+    try testing.expectApproxEqAbs(@as(f32, 0.0), a.burst, 1e-6);
+
+    // Around the pop window (~38% of lifetime), the heart is scaled UP.
+    const e_peak = like_heart.lifetime() * 0.38;
+    // Drive to that elapsed by walking stages.
+    var stage_i: u8 = 0;
+    var t_in: f32 = e_peak;
+    while (stage_i < r.stages.len and t_in > r.stages[stage_i].duration) : (stage_i += 1) {
+        t_in -= r.stages[stage_i].duration;
+    }
+    const b = heartVisual(r, stage_i, t_in);
+    try testing.expect(b.scale > 1.05); // visibly popped
+
+    // Past the lifetime: settled to full, scale back to rest, stars done firing.
+    const c = heartVisual(r, @intCast(r.stages.len), 0.0);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), c.fill, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), c.scale, 1e-6);
+
+    // A draining unlike never pops and never throws stars.
+    const u = heartVisual(&unlike_heart, 0, unlike_heart.stages[0].duration * 0.5);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), u.scale, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.0), u.burst, 1e-6);
 }

@@ -691,21 +691,17 @@ pub fn run(
                                 if (feed_view.hitTest(g.regions.items, rx, ry)) |hit| {
                                     if (hit.post < items.len) state.selected = hit.post;
                                     const is_engage = hit.kind == .like or hit.kind == .repost;
-                                    if (is_engage) {
-                                        if (g.gpu) |gs| {
-                                            const sx: u32 = @intFromFloat(@max(0.0, @as(f32, @floatFromInt(pev.x)) / @as(f32, @floatFromInt(field_cell_w))));
-                                            const sy: u32 = @intFromFloat(@max(0.0, @as(f32, @floatFromInt(pev.y)) / @as(f32, @floatFromInt(field_cell_h))));
-                                            pushLikeSplash(gpa, gs, sx, sy);
-                                        } else {
-                                            const rc: *const effect_core.Recipe = if (hit.kind == .like) &effect_core.like_heart else &effect_core.boost;
-                                            const fcols = g.field.cols;
-                                            const frows = g.field.rows;
-                                            if (fcols > 0 and frows > 0) {
-                                                const tx: u16 = @min(cx, fcols - 1);
-                                                const ty: u16 = @min(cy, frows - 1);
-                                                effect_core.trigger(gpa, g.active, rc, tx, ty, 1.0) catch {};
-                                            }
-                                        }
+                                    if (is_engage and hit.post < items.len) {
+                                        // Route the tap through the SAME path the keyboard
+                                        // like/boost uses: optimistic toggle (the heart fills
+                                        // red), persist via the write worker, repaint, and
+                                        // fire the field splash + heart-pop effect. This is
+                                        // what makes a MOUSE like persist + animate (the
+                                        // previously-deferred slice); fireEngageEffect places
+                                        // the splash at the post's own heart cell.
+                                        const ek: Engagement = if (hit.kind == .like) .like else .repost;
+                                        const r = try engageSelected(ek, gpa, arena, session, store, items[hit.post], hit.post, &state, revealed.items, now, out, &prev, &next, backend, pix, writer);
+                                        if (r.status.len > 0) status = r.status;
                                     }
                                 } else if (field_ui.hitTest(cx, cy, g.hr.slice())) |hit| {
                                     if (hit.target != field_ui.no_target and hit.target < items.len) state.selected = hit.target;
@@ -1347,6 +1343,9 @@ const GpuState = struct {
     grid: gpu.FieldGrid,
     ramp: gpu.FieldRenderer,
     feed: gpu.Feed,
+    /// The animated like-heart pass (SDF fill + pop + star burst), drawn over
+    /// the feed for each active like effect this frame.
+    heart: gpu.HeartRenderer,
     bias: []f32,
     splashes: std.ArrayList(glyph_field.Splash),
     cols: u32,
@@ -1395,6 +1394,7 @@ fn initGpuState(gpa: Allocator, engine: *text_core.Engine, win: *window_shell.Wi
     errdefer gpu.feedDeinit(&feed, gpa);
     const ramp = try gpu.initFieldRenderer(gpa, engine, field_cell_w, field_cell_h);
     const grid = try gpu.initFieldGrid();
+    const heart = try gpu.initHeartRenderer();
 
     const cols: u32 = @max(8, w / field_cell_w);
     const rows: u32 = @max(8, h / field_cell_h);
@@ -1410,6 +1410,7 @@ fn initGpuState(gpa: Allocator, engine: *text_core.Engine, win: *window_shell.Wi
         .grid = grid,
         .ramp = ramp,
         .feed = feed,
+        .heart = heart,
         .bias = bias,
         .splashes = .empty,
         .cols = cols,
@@ -1485,15 +1486,23 @@ fn pushLikeSplash(gpa: Allocator, gs: *GpuState, gx: u32, gy: u32) void {
     if (gs.cols == 0 or gs.rows == 0) return;
     const sx = @min(gx, gs.cols - 1);
     const sy = @min(gy, gs.rows - 1);
-    gs.splashes.append(gpa, .{ .x = sx, .y = sy, .radius = 4, .amp = 2.0, .dye = 1.0 }) catch {};
-    var k: u32 = 0;
-    while (k < 6) : (k += 1) {
-        const ang = @as(f32, @floatFromInt(k)) * (6.2831853 / 6.0);
-        const ox: i32 = @intFromFloat(@cos(ang) * 5.0);
-        const oy: i32 = @intFromFloat(@sin(ang) * 5.0);
-        const rx = std.math.clamp(@as(i32, @intCast(sx)) + ox, 0, @as(i32, @intCast(gs.cols - 1)));
-        const ry = std.math.clamp(@as(i32, @intCast(sy)) + oy, 0, @as(i32, @intCast(gs.rows - 1)));
-        gs.splashes.append(gpa, .{ .x = @intCast(rx), .y = @intCast(ry), .radius = 3, .amp = 1.0, .dye = 0.85 }) catch {};
+    // A strong central splash THROWS the wave; two concentric rings of dyed
+    // splashes carry the red OUTWARD on it, so a like visibly shoots out and
+    // ripples — not a faint local blush. [TUNE: amp = wave reach, dye = red.]
+    gs.splashes.append(gpa, .{ .x = sx, .y = sy, .radius = 6, .amp = 3.6, .dye = 1.0 }) catch {};
+    const ring_dist = [_]f32{ 5.0, 9.0 };
+    const ring_amp = [_]f32{ 1.8, 1.1 };
+    const ring_dye = [_]f32{ 0.9, 0.6 };
+    for (ring_dist, ring_amp, ring_dye) |dist, amp, dye| {
+        var k: u32 = 0;
+        while (k < 8) : (k += 1) {
+            const ang = @as(f32, @floatFromInt(k)) * (6.2831853 / 8.0);
+            const ox: i32 = @intFromFloat(@cos(ang) * dist);
+            const oy: i32 = @intFromFloat(@sin(ang) * dist);
+            const rx = std.math.clamp(@as(i32, @intCast(sx)) + ox, 0, @as(i32, @intCast(gs.cols - 1)));
+            const ry = std.math.clamp(@as(i32, @intCast(sy)) + oy, 0, @as(i32, @intCast(gs.rows - 1)));
+            gs.splashes.append(gpa, .{ .x = @intCast(rx), .y = @intCast(ry), .radius = 3, .amp = amp, .dye = dye }) catch {};
+        }
     }
 }
 
@@ -1640,7 +1649,7 @@ fn paintFrame(
             // by the REAL timeline via a pure transform (B5). An empty timeline
             // renders the chrome with no posts — no placeholder content.
             const feed_posts = feed_view.fromTimeline(arena, items, now) catch &[_]feed_view.PostView{};
-            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null) catch g.content_h.*;
+            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false) catch g.content_h.*;
             const t_layout = if (debug_frame_timing) clock_shell.monotonicNanos() else 0;
             window_shell.presentDrawList(win, gpa, g.engine, g.draw.slice(), field_core.background) catch {}; // E2: a lost blit is the next frame's problem
             if (debug_frame_timing) {
@@ -1716,7 +1725,7 @@ fn paintFrameGpu(
         }
         const lh = logicalH(w, h);
         g.draw.len = 0;
-        g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights) catch g.content_h.*;
+        g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true) catch g.content_h.*;
         gpu.feedBuild(&gs.feed, gpa, g.engine, g.draw.slice(), scale) catch {};
     }
 
@@ -1751,6 +1760,9 @@ fn paintFrameGpu(
         // Advance the medium one step; queued splashes injected once.
         glyph_field.step(&gs.field, .{}, gs.splashes.items, gs.bias);
         gs.splashes.clearRetainingCapacity();
+        // Tick the like-heart animation clocks on the same 60 Hz step (no
+        // field.zig coupling — the GPU heart pass draws them from this clock).
+        effect_core.advanceClocks(g.active, 1.0 / 60.0);
         gs.t += 1.0 / 60.0;
         // Advance the step clock by one tick; if we fell far behind (a stall),
         // snap to now and DROP the backlog rather than fast-forward the field.
@@ -1767,7 +1779,53 @@ fn paintFrameGpu(
     // The feed verts persist across frames (rebuilt above only when the feed
     // changed); just draw them.
     gpu.feedDraw(&gs.feed, @intCast(w), @intCast(h));
+    // The engagement hearts: one SDF heart per visible like button, drawn IN
+    // PLACE (feed_view skips its own), so a like fills + pops the ACTUAL heart.
+    drawEngagementHearts(g, gs, items, @intCast(w), @intCast(h));
     gpu.swap(&gs.g);
+}
+
+/// Draw the engagement heart for EVERY visible like button as an SDF heart, at
+/// the heart's real place in the feed — the like region's LEFT edge (the region
+/// also spans the count, so its CENTRE sits too far right; that mismatch was the
+/// "offset overlay" bug). `fill` is the post's liked state; if a like effect is
+/// live for that post it ANIMATES (bottom-up fill + scale pop + star burst) from
+/// the pure, tested `effect.heartVisual`. This is the ONE heart on the GPU path
+/// (feed_view skips its own), so the fill happens IN PLACE. No allocation.
+fn drawEngagementHearts(g: Grid, gs: *GpuState, items: []const feed_core.TimelineItem, vw: i32, vh: i32) void {
+    const scale = gs.scale;
+    const s = g.active.slice();
+    const recipes = s.items(.recipe);
+    const axs = s.items(.x);
+    const ays = s.items(.y);
+    const stages = s.items(.stage);
+    const stage_ts = s.items(.stage_t);
+    for (g.regions.items) |r| {
+        if (r.kind != .like or r.post >= items.len) continue;
+        const liked = items[r.post].item_flags.viewer_liked;
+        // Heart centre: the region starts at the heart's left edge; the icon box
+        // is 16 logical wide, so the heart centres 8 in. Vertical centre of the
+        // region row. [TUNE] 8 = is/2; size 9 = half the icon box.
+        const cx: f32 = (@as(f32, @floatFromInt(r.x)) + 8.0) * scale;
+        const cy: f32 = (@as(f32, @floatFromInt(r.y)) + @as(f32, @floatFromInt(r.h)) * 0.5) * scale;
+        const size: f32 = 9.0 * scale;
+        // Static fill from the liked state; overridden by the live animation if
+        // a like effect for this post is playing (matched by its heart cell).
+        var vis = effect_core.HeartVisual{ .fill = if (liked) 1.0 else 0.0, .scale = 1.0, .glow = 0.0, .burst = 0.0 };
+        if (heartFieldCell(g, gs, r.post)) |cell| {
+            const hx: u16 = @intCast(@min(cell.x, std.math.maxInt(u16)));
+            const hy: u16 = @intCast(@min(cell.y, std.math.maxInt(u16)));
+            var i: usize = 0;
+            while (i < g.active.len) : (i += 1) {
+                if (recipes[i] != &effect_core.like_heart) continue;
+                if (axs[i] == hx and ays[i] == hy) {
+                    vis = effect_core.heartVisual(recipes[i], stages[i], stage_ts[i]);
+                    break;
+                }
+            }
+        }
+        gpu.drawHeart(&gs.heart, cx, cy, size, vis.fill, vis.scale, vis.glow, vis.burst, vw, vh);
+    }
 }
 
 /// Fire the field effect for an engagement transition at the post's heart
@@ -1785,7 +1843,18 @@ fn fireEngageEffect(gpa: Allocator, g: Grid, kind: Engagement, target: u32, now_
     // An unlike has no dye-removal in v1 (the stain persists by design).
     if (g.gpu) |gs| {
         if (now_liked or kind == .repost) {
-            if (heartFieldCell(g, gs, target)) |cell| pushLikeSplash(gpa, gs, cell.x, cell.y);
+            if (heartFieldCell(g, gs, target)) |cell| {
+                pushLikeSplash(gpa, gs, cell.x, cell.y);
+                // The animated like-heart pop (fill + scale + stars) is drawn by
+                // the GPU heart pass in paintFrameGpu; trigger it here so its
+                // clock is ticked by advanceClocks. Only a LIKE pops the heart;
+                // a boost gets the field splash for now (its own shape later).
+                if (now_liked and kind == .like) {
+                    const hx: u16 = @intCast(@min(cell.x, std.math.maxInt(u16)));
+                    const hy: u16 = @intCast(@min(cell.y, std.math.maxInt(u16)));
+                    effect_core.trigger(gpa, g.active, &effect_core.like_heart, hx, hy, 1.0) catch {};
+                }
+            }
         }
         if (debug_effects) {
             const name = switch (kind) {

@@ -951,8 +951,12 @@ const field_grid_frag_src: [:0]const GLchar =
     \\  float b = 0.38 + 0.55 * pool + cg;
     \\  // persistent colour charge from effects (a like stains it red)
     \\  float dye = clamp(texture2D(uDye, (cell + 0.5) / uFieldSize).r, 0.0, 1.0);
+    \\  // Amplify the persistent charge for VISIBILITY: dye diffuses thin as it
+    \\  // rides the waves, so a raw mix reads as a faint tint. Boost it so even a
+    \\  // spread-out red front still ignites cells and reads clearly as red. [TUNE]
+    \\  float dyev = clamp(dye * 2.4, 0.0, 1.0);
     \\  float dn = clamp(intensity * min(1.2, b), 0.0, 1.0);
-    \\  dn = max(dn, dye * 0.7);                 // red charge keeps its glyphs lit
+    \\  dn = max(dn, dyev * 0.9);                // red charge lights its glyphs strongly
     \\  if (dn < 0.04) discard;                 // the mockup's sparse cull
     \\  float idx = floor(dn * (uRampN - 1.0) + 0.5);
     \\  vec2 local = fract(px / uCell);
@@ -961,8 +965,8 @@ const field_grid_frag_src: [:0]const GLchar =
     \\  // cool grey-white, dimmer; tinting to the rose 'like' colour where dyed.
     \\  float lum = clamp(0.35 + b * 0.45 + intensity * 0.30, 0.0, 1.05);
     \\  vec3 base = mix(vec3(84.0, 89.0, 102.0) / 255.0, vec3(166.0, 172.0, 186.0) / 255.0, clamp(0.28 + b * 0.5, 0.0, 1.0));
-    \\  vec3 col = mix(base, vec3(240.0, 97.0, 122.0) / 255.0, dye);
-    \\  lum = max(lum, dye * 0.95);             // red reads even in quiet areas
+    \\  vec3 col = mix(base, vec3(245.0, 80.0, 110.0) / 255.0, dyev);
+    \\  lum = max(lum, dyev);                   // red reads even in quiet areas
     \\  gl_FragColor = vec4(col * lum, cov);
     \\}
 ;
@@ -1091,6 +1095,145 @@ pub fn drawFieldGrid(fg: *FieldGrid, fr: *FieldRenderer, mx: f32, my: f32, time:
     glUniform2f(fg.u_fieldsize, @floatFromInt(fg.field_w), @floatFromInt(fg.field_h));
     glUniform1f(fg.u_gain, fg.gain);
     glUniform2f(fg.u_mouse, mx, my);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
+// ===========================================================================
+// THE LIKE-HEART RENDERER: a singular SDF heart for the animated like — a
+// smooth, anti-aliased heart that fills bottom-up with red, POPS (scale
+// overshoot), and throws a star burst. No ♥ glyph and no path-fill exist, so
+// the heart is pure shader math (an IQ heart SDF) — dependency-free, the same
+// posture as the rest of the GPU path. One draw call per active like (usually
+// 0-2), over a full-screen triangle, the heart placed + sized by uniforms (the
+// FieldGrid pattern). Driven entirely by effect.heartVisual (the pure, tested
+// fill/scale/glow/burst). Process-lifetime; never freed, like the others.
+// ===========================================================================
+
+const heart_vert_src: [:0]const GLchar =
+    \\attribute vec2 aPos;
+    \\void main() { gl_Position = vec4(aPos, 0.0, 1.0); }
+;
+
+const heart_frag_src: [:0]const GLchar =
+    \\precision highp float;
+    \\uniform vec2 uViewport;   // px
+    \\uniform vec2 uCenter;     // heart centre in px (top-down origin)
+    \\uniform float uSize;      // heart half-extent in px (at rest)
+    \\uniform float uFill;      // 0 hollow .. 1 full red
+    \\uniform float uScale;     // pop overshoot
+    \\uniform float uGlow;      // 0..1 brightness lift
+    \\uniform float uBurst;     // 0..1 star expansion
+    \\float dot2(vec2 v){ return dot(v, v); }
+    \\float sdHeart(vec2 p){
+    \\  p.x = abs(p.x);
+    \\  if (p.y + p.x > 1.0)
+    \\    return sqrt(dot2(p - vec2(0.25, 0.75))) - sqrt(2.0)/4.0;
+    \\  return sqrt(min(dot2(p - vec2(0.0, 1.0)), dot2(p - 0.5*max(p.x + p.y, 0.0)))) * sign(p.x - p.y);
+    \\}
+    \\void main(){
+    \\  vec2 frag = vec2(gl_FragCoord.x, uViewport.y - gl_FragCoord.y); // top-down px
+    \\  float s = uSize * uScale;
+    \\  vec2 lp = (frag - uCenter) / s;                 // local, y-down, in size units
+    \\  // Into IQ heart space (y up, point at 0, lobes ~1). [TUNE] 1.05 fit, 0.62 centre.
+    \\  vec2 p = vec2(lp.x, -lp.y) * 1.05 + vec2(0.0, 0.62);
+    \\  float d = sdHeart(p);
+    \\  float aa = 2.0 / s;                             // ~2px AA (no derivatives ext)
+    \\  float inside = smoothstep(aa, -aa, d);          // 1 inside the heart
+    \\  float rim = smoothstep(aa * 2.2, 0.0, abs(d));  // the outline band
+    \\  // bottom-up fill: lp.y large = bottom point; the red line climbs as uFill rises.
+    \\  float yline = mix(1.05, -1.15, uFill);          // [TUNE] heart local-y span
+    \\  float fillMask = smoothstep(yline - 0.06, yline + 0.06, lp.y);
+    \\  float filledInside = inside * fillMask;
+    \\  vec3 rose = vec3(245.0, 80.0, 110.0) / 255.0;
+    \\  vec3 grey = vec3(0.46, 0.48, 0.56);
+    \\  vec3 rimCol = mix(grey, rose, clamp(uFill + uGlow * 0.4, 0.0, 1.0));
+    \\  vec3 fillCol = rose * (0.9 + uGlow * 0.5);
+    \\  vec3 col = mix(rimCol, fillCol, filledInside);
+    \\  float alpha = max(rim, filledInside);
+    \\  // Star burst: 8 sparkles radiating out over the back half, fading as they fly.
+    \\  float starA = 0.0;
+    \\  for (int i = 0; i < 8; i++) {
+    \\    float ang = (float(i) / 8.0) * 6.2831853 + 0.39;
+    \\    vec2 sp = vec2(cos(ang), sin(ang)) * mix(0.55, 2.6, uBurst);
+    \\    float dd = length(lp - sp);
+    \\    starA += smoothstep(0.18 * (1.0 - uBurst) + 0.01, 0.0, dd);
+    \\  }
+    \\  starA = clamp(starA, 0.0, 1.0) * (1.0 - uBurst);
+    \\  if (uBurst <= 0.001) starA = 0.0;
+    \\  col = mix(col, vec3(1.0, 0.84, 0.46), starA);
+    \\  alpha = max(alpha, starA);
+    \\  if (alpha < 0.01) discard;
+    \\  gl_FragColor = vec4(col, alpha);
+    \\}
+;
+
+/// A7.2: cold struct, one per window; its hot work is the GPU draw. Never freed
+/// (process-lifetime), like Renderer / FieldGrid.
+pub const HeartRenderer = struct {
+    program: GLuint,
+    vbo: GLuint,
+    a_pos: GLint,
+    u_viewport: GLint,
+    u_center: GLint,
+    u_size: GLint,
+    u_fill: GLint,
+    u_scale: GLint,
+    u_glow: GLint,
+    u_burst: GLint,
+};
+
+pub fn initHeartRenderer() Error!HeartRenderer {
+    const vs = try compileShader(GL_VERTEX_SHADER, heart_vert_src);
+    const fs = try compileShader(GL_FRAGMENT_SHADER, heart_frag_src);
+    const prog = glCreateProgram();
+    glAttachShader(prog, vs);
+    glAttachShader(prog, fs);
+    glLinkProgram(prog);
+    var ok: GLint = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    if (ok == 0) {
+        var log: [1024]GLchar = undefined;
+        var n: GLsizei = 0;
+        glGetProgramInfoLog(prog, log.len, &n, &log);
+        elog("heart program link FAILED: {s}", .{log[0..@intCast(n)]});
+        return Error.GpuInit;
+    }
+    const tri = [_]f32{ -1, -1, 3, -1, -1, 3 };
+    var vbo: GLuint = 0;
+    glGenBuffers(1, @ptrCast(&vbo));
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, @intCast(tri.len * @sizeOf(f32)), &tri, GL_STATIC_DRAW);
+    elog("heart renderer ready (SDF like-heart pass)", .{});
+    return .{
+        .program = prog,
+        .vbo = vbo,
+        .a_pos = glGetAttribLocation(prog, "aPos"),
+        .u_viewport = glGetUniformLocation(prog, "uViewport"),
+        .u_center = glGetUniformLocation(prog, "uCenter"),
+        .u_size = glGetUniformLocation(prog, "uSize"),
+        .u_fill = glGetUniformLocation(prog, "uFill"),
+        .u_scale = glGetUniformLocation(prog, "uScale"),
+        .u_glow = glGetUniformLocation(prog, "uGlow"),
+        .u_burst = glGetUniformLocation(prog, "uBurst"),
+    };
+}
+
+/// Draw one animated heart centred at (cx,cy) px (top-down), `size` px half-
+/// extent, with fill/scale/glow/burst from effect.heartVisual. Blends over the
+/// already-drawn feed.
+pub fn drawHeart(hr: *HeartRenderer, cx: f32, cy: f32, size: f32, fill: f32, scale: f32, glow: f32, burst: f32, vw: i32, vh: i32) void {
+    glUseProgram(hr.program);
+    glBindBuffer(GL_ARRAY_BUFFER, hr.vbo);
+    bindAttrib(hr.a_pos, 2, 2 * @sizeOf(f32), 0);
+    glUniform2f(hr.u_viewport, @floatFromInt(vw), @floatFromInt(vh));
+    glUniform2f(hr.u_center, cx, cy);
+    glUniform1f(hr.u_size, size);
+    glUniform1f(hr.u_fill, fill);
+    glUniform1f(hr.u_scale, scale);
+    glUniform1f(hr.u_glow, glow);
+    glUniform1f(hr.u_burst, burst);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDrawArrays(GL_TRIANGLES, 0, 3);
