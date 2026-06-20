@@ -400,7 +400,7 @@ fn drawSidebar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, sx: 
     // reach network users of the running instance. Keep this visible.
     const fy = @max(py + 8, height - 40);
     _ = try str(gpa, dl, e, .regular, x0, fy, faint, 12, "Zat4 — free software, GNU AGPL-3.0");
-    _ = try str(gpa, dl, e, .regular, x0, fy + 18, muted, 12, "source: codeberg.org/connoravila/Zat");
+    _ = try str(gpa, dl, e, .regular, x0, fy + 18, muted, 12, "source: codeberg.org/connoravila/zat4");
 }
 
 /// Emit the whole premium feed for `posts` into `dl`, OVER whatever the

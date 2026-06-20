@@ -98,8 +98,9 @@ header.
 Because zat is served over a network, the AGPL's **section 13** applies: anyone
 who interacts with a running instance must be offered its Corresponding Source.
 The app honours this with a persistent, visible **source link in its UI** (the
-sidebar footer) pointing back to this repository. If you deploy a modified
-version, keep that offer accurate — it must point to *your* modified source.
+sidebar footer at `codeberg.org/connoravila/zat4`) pointing back to this
+repository. If you deploy a modified version, keep that offer accurate — it must
+point to *your* modified source.
 
 Bundled components keep their own licences, retained in their files: the
 `stb_truetype` rasterizer (`vendor/`, public domain) and the embedded UI font
