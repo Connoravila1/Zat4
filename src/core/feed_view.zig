@@ -46,13 +46,24 @@ const faint: u32 = 0xFF6A655A;
 const accent: u32 = 0xFFE8B84B;
 const like_c: u32 = 0xFFF0617A;
 const boost_c: u32 = 0xFF8FD18F;
+/// Resting engagement-icon colour — a cool blueish grey matching the SDF
+/// heart's outline (shader grey vec3(0.46,0.48,0.56)), so the reply, repost,
+/// and hollow-heart icons read as one set.
+const icon_grey: u32 = 0xFF757A8F;
 const veil: u32 = 0xD4181812; // ~83% over the field — texture glows faintly through
 // ambient-texture slice will lower this so the living field glows through.
 const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 
 /// Which control a hit region belongs to. The button slice maps these to
-/// effects/writes; the view only reports geometry (B5).
-pub const Action = enum(u8) { reply, repost, like };
+/// effects/writes; the view only reports geometry (B5). `nav` (a left-rail
+/// destination; the region's `post` field carries the Screen index) and
+/// `compose` (the New-post button) route navigation rather than engagement.
+pub const Action = enum(u8) { reply, repost, like, nav, compose };
+
+/// The six top-level rail destinations, in order. The `Screen` index a nav
+/// region carries is an index into this. Shared by the rail (draw + hit) and
+/// the body (the screen title), so the two never drift.
+pub const nav_labels = [_][]const u8{ "Home", "Explore", "Activity", "Messages", "Profile", "Settings" };
 
 /// One tappable button region in window pixels, tagged with the post it
 /// belongs to and the control. Emitted alongside the draw items so a click
@@ -338,25 +349,32 @@ fn navIcon(idx: usize, gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, s: 
     switch (idx) {
         0 => try iconHome(gpa, dl, x, y, s, c),
         1 => try iconSearch(gpa, dl, x, y, s, c),
-        2 => try iconHeart(gpa, dl, x, y, s, c),
+        2 => try iconHeartHollow(gpa, dl, x, y, s, c),
         3 => try iconReply(gpa, dl, x, y, s, c),
         4 => try iconPerson(gpa, dl, x, y, s, c),
         else => try iconGear(gpa, dl, x, y, s, c),
     }
 }
 
-fn drawRail(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, rx: i32, height: i32) !void {
+fn drawRail(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, rx: i32, height: i32, active: usize, regions: ?*Regions) !void {
     const x0 = rx + 14;
     const wm = try str(gpa, dl, e, .semibold, x0 + 8, 58, accent, 26, "zat4");
     _ = try str(gpa, dl, e, .semibold, wm, 58, ink, 26, ".");
 
-    const labels = [_][]const u8{ "Home", "Explore", "Activity", "Messages", "Profile", "Settings" };
+    // The nav GROUP (Home…Settings) sits on its OWN box — the logo above and
+    // the New-post button below stay on the field, each its own section.
+    try rect(gpa, dl, x0 - 2, 94, rail_w - 24, 304, panel, 18);
+
     var ny: i32 = 108;
-    for (labels, 0..) |label, idx| {
-        const on = idx == 0;
+    for (nav_labels, 0..) |label, idx| {
+        const on = idx == active;
         const col = if (on) ink else muted;
+        // A faint accent pill marks the active destination.
+        if (on) try rect(gpa, dl, x0 + 2, ny - 8, rail_w - 32, 42, 0x1FE8B84B, 12);
         try navIcon(idx, gpa, dl, x0 + 10, ny, 22, if (on) accent else muted);
         _ = try str(gpa, dl, e, if (on) .semibold else .regular, x0 + 48, ny + 17, col, 16, label);
+        // Full-row tap target → the Screen at this index (post carries it).
+        try emitRegion(gpa, regions, rx + 14, ny - 8, rail_w - 28, 42, @intCast(idx), .nav);
         ny += 50;
     }
 
@@ -364,11 +382,16 @@ fn drawRail(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, rx: i32
     try rect(gpa, dl, x0 + 6, ny, rail_w - 44, 50, accent, 14);
     const npw: i32 = @intCast(text.measure(e, .semibold, "New post", 16));
     _ = try str(gpa, dl, e, .semibold, x0 + 6 + @divTrunc(rail_w - 44 - npw, 2), ny + 32, bg, 16, "New post");
+    try emitRegion(gpa, regions, x0 + 6, ny, rail_w - 44, 50, 0, .compose);
 
     const by = height - 60;
+    // The account card gets its own small box.
+    try rect(gpa, dl, x0 - 2, by - 10, rail_w - 24, 58, panel, 16);
     try rect(gpa, dl, x0 + 6, by, 38, 38, 0xFF3F3B2D, 19);
     _ = try str(gpa, dl, e, .semibold, x0 + 54, by + 16, ink, 14, "you");
     _ = try str(gpa, dl, e, .regular, x0 + 54, by + 33, faint, 12, "@you.zat");
+    // The "you" card opens the Profile screen (index 4).
+    try emitRegion(gpa, regions, x0 + 6, by - 4, rail_w - 40, 46, 4, .nav);
 }
 
 fn drawSidebar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, sx: i32, height: i32) !void {
@@ -456,6 +479,11 @@ pub fn layout(
     /// region, count, and reserved space are still emitted. False (software /
     /// preview) draws the heart here as before.
     skip_heart: bool,
+    /// The active top-level Screen (index into `nav_labels`). 0 = Home renders
+    /// the feed; any other index renders that screen's body (a titled premium
+    /// placeholder for now) while the rail + sidebar chrome stay put. The rail
+    /// highlights this index.
+    active_screen: u8,
 ) error{OutOfMemory}!i32 {
     const m = metricsFor(width);
     if (regions) |rg| rg.clearRetainingCapacity();
@@ -465,15 +493,19 @@ pub fn layout(
 
     var feed_y0: i32 = 112;
     if (m.wide) {
-        // 2a. Desktop three-pane: nav rail + sidebar flank the feed.
-        try drawRail(gpa, dl, e, m.rail_x, height);
+        // 2a. Desktop three-pane: nav rail + sidebar flank the feed. Each
+        // SECTION draws its own box (the nav group, the account card, the
+        // sidebar cards) so the field stays visible between them.
+        try drawRail(gpa, dl, e, m.rail_x, height, active_screen, regions);
         try drawSidebar(gpa, dl, e, m.side_x, height);
-        // feed header: "Home" + tabs
-        _ = try str(gpa, dl, e, .semibold, m.lx, 50, ink, 27, "Home");
-        _ = try str(gpa, dl, e, .semibold, m.lx, 88, ink, 16, "Following");
-        const fw2: i32 = @intCast(text.measure(e, .semibold, "Following", 16));
-        _ = try str(gpa, dl, e, .regular, m.lx + fw2 + 28, 88, faint, 16, "Discover");
-        try rect(gpa, dl, m.lx, 98, fw2, 3, accent, 2);
+        // feed header: the active screen's title (+ tabs on Home).
+        _ = try str(gpa, dl, e, .semibold, m.lx, 50, ink, 27, nav_labels[active_screen]);
+        if (active_screen == 0) {
+            _ = try str(gpa, dl, e, .semibold, m.lx, 88, ink, 16, "Following");
+            const fw2: i32 = @intCast(text.measure(e, .semibold, "Following", 16));
+            _ = try str(gpa, dl, e, .regular, m.lx + fw2 + 28, 88, faint, 16, "Discover");
+            try rect(gpa, dl, m.lx, 98, fw2, 3, accent, 2);
+        }
         try rect(gpa, dl, m.col_x, 110, m.col_w, 1, divider, 0);
         feed_y0 = 126;
     } else {
@@ -486,6 +518,16 @@ pub fn layout(
         try rect(gpa, dl, m.lx, 86, fw, 3, accent, 2);
         try rect(gpa, dl, m.col_x, 96, m.col_w, 1, divider, 0);
         feed_y0 = 112;
+    }
+
+    // Non-Home screens render a titled placeholder body for now — their real
+    // content (Explore, Activity, Messages, Profile, Settings) lands as each is
+    // built. The rail + sidebar chrome above already drew; fill the column.
+    if (active_screen != 0) {
+        const msg = "Coming soon";
+        const tw: i32 = @intCast(text.measure(e, .regular, msg, 16));
+        _ = try str(gpa, dl, e, .regular, m.col_x + @divTrunc(m.col_w - tw, 2), @divTrunc(height, 2), muted, 16, msg);
+        return height;
     }
 
     // 3. Posts.
@@ -549,13 +591,13 @@ pub fn layout(
             const tap_h: u16 = 30;
             const tap_y: i32 = erow - 20;
             var ex = cx;
-            try iconReply(gpa, dl, ex, iy, is, faint);
+            try iconReply(gpa, dl, ex, iy, is, icon_grey);
             const reply_x = ex;
             ex += is + 7;
             ex = try str(gpa, dl, e, .regular, ex, erow, muted, 13, std.fmt.bufPrint(&nb, "{d}", .{p.reply}) catch "0");
             try emitRegion(gpa, regions, reply_x, tap_y, ex - reply_x, tap_h, @intCast(pi), .reply);
             ex += 22;
-            try iconRepost(gpa, dl, ex, iy, is, if (p.boosted) boost_c else faint);
+            try iconRepost(gpa, dl, ex, iy, is, if (p.boosted) boost_c else icon_grey);
             const rt_x = ex;
             ex += is + 7;
             ex = try str(gpa, dl, e, .regular, ex, erow, if (p.boosted) boost_c else muted, 13, std.fmt.bufPrint(&nb, "{d}", .{p.boost}) catch "0");
@@ -569,7 +611,7 @@ pub fn layout(
                 if (p.liked) {
                     try iconHeart(gpa, dl, ex, iy, is, like_c);
                 } else {
-                    try iconHeartHollow(gpa, dl, ex, iy, is, faint);
+                    try iconHeartHollow(gpa, dl, ex, iy, is, icon_grey);
                 }
             }
             const like_x = ex;

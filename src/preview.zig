@@ -81,7 +81,7 @@ pub fn main(init: std.process.Init) !void {
     };
     const posts = try feed_view.fromTimeline(arena, &items, now);
 
-    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false);
+    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, 0);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;

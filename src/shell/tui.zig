@@ -334,6 +334,9 @@ pub fn run(
     var gcontent_h: i32 = 0;
     var gregions: feed_view.Regions = .empty;
     defer gregions.deinit(gpa);
+    // The active top-level Screen (index into feed_view.nav_labels); the rail
+    // sets it on a click. 0 = Home (the feed). Lives across frames in run().
+    var gscreen: u8 = 0;
 
     // Phase 6.4: the GPU render path, brought up additively when the window is
     // open AND the font engine is live AND `gpu.init` succeeds. On any failure
@@ -486,7 +489,7 @@ pub fn run(
         // pix exists exactly when a window backend has a live engine; the
         // composer and profile screens stay on the cell path this cut
         // (their pixel port is the recorded next slice).
-        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .gpu = if (gpu_state) |*gs| gs else null } else null;
+        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null } else null;
         switch (mode) {
             .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, &state, revealed.items, now, session.handle, status),
             .compose => {
@@ -689,19 +692,24 @@ pub fn run(
                                 // If nothing premium is hit, fall through to the
                                 // legacy cell hit rects.
                                 if (feed_view.hitTest(g.regions.items, rx, ry)) |hit| {
-                                    if (hit.post < items.len) state.selected = hit.post;
-                                    const is_engage = hit.kind == .like or hit.kind == .repost;
-                                    if (is_engage and hit.post < items.len) {
-                                        // Route the tap through the SAME path the keyboard
-                                        // like/boost uses: optimistic toggle (the heart fills
-                                        // red), persist via the write worker, repaint, and
-                                        // fire the field splash + heart-pop effect. This is
-                                        // what makes a MOUSE like persist + animate (the
-                                        // previously-deferred slice); fireEngageEffect places
-                                        // the splash at the post's own heart cell.
-                                        const ek: Engagement = if (hit.kind == .like) .like else .repost;
-                                        const r = try engageSelected(ek, gpa, arena, session, store, items[hit.post], hit.post, &state, revealed.items, now, out, &prev, &next, backend, pix, writer);
-                                        if (r.status.len > 0) status = r.status;
+                                    switch (hit.kind) {
+                                        // Left-rail destination: switch the active screen
+                                        // (post carries the Screen index). The next frame
+                                        // re-renders the body (sig folds in the screen).
+                                        .nav => gscreen = @intCast(hit.post),
+                                        // New-post button → the composer (cell path for now).
+                                        .compose => mode = .compose,
+                                        // Like / boost: the SAME path the keyboard uses —
+                                        // optimistic toggle (heart fills red), persist via
+                                        // the worker, and fire the splash + heart-pop.
+                                        .like, .repost => if (hit.post < items.len) {
+                                            state.selected = hit.post;
+                                            const ek: Engagement = if (hit.kind == .like) .like else .repost;
+                                            const r = try engageSelected(ek, gpa, arena, session, store, items[hit.post], hit.post, &state, revealed.items, now, out, &prev, &next, backend, pix, writer);
+                                            if (r.status.len > 0) status = r.status;
+                                        },
+                                        // Reply → the thread/reply view (a later screen).
+                                        .reply => {},
                                     }
                                 } else if (field_ui.hitTest(cx, cy, g.hr.slice())) |hit| {
                                     if (hit.target != field_ui.no_target and hit.target < items.len) state.selected = hit.target;
@@ -1292,6 +1300,10 @@ const Grid = struct {
     scroll: *i32,
     content_h: *i32,
     regions: *feed_view.Regions,
+    /// The active top-level Screen (index into feed_view.nav_labels): 0 = Home
+    /// (the feed); the rail switches it on a click. Shared (a pointer to a run()
+    /// local) so paint and the click handler agree on the same value.
+    screen: *u8,
     /// The GPU render path, present only when `gpu.init` succeeded on this
     /// window (else null → the software path renders, the rule's fallback).
     /// A pointer into run()'s `gpu_state` local; one-frame contract like the
@@ -1649,7 +1661,7 @@ fn paintFrame(
             // by the REAL timeline via a pure transform (B5). An empty timeline
             // renders the chrome with no posts — no placeholder content.
             const feed_posts = feed_view.fromTimeline(arena, items, now) catch &[_]feed_view.PostView{};
-            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false) catch g.content_h.*;
+            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*) catch g.content_h.*;
             const t_layout = if (debug_frame_timing) clock_shell.monotonicNanos() else 0;
             window_shell.presentDrawList(win, gpa, g.engine, g.draw.slice(), field_core.background) catch {}; // E2: a lost blit is the next frame's problem
             if (debug_frame_timing) {
@@ -1703,7 +1715,9 @@ fn paintFrameGpu(
     // A content hash is the dirty signal, far cheaper than the layout it gates.
     // The feed verts persist in gs.feed across frames; feedDraw below reuses
     // them. (G1/G3: this is the measured-cause fix for the live lag.)
-    const sig = feedSignature(items, g.scroll.*, w, h);
+    // Fold the active screen into the dirty signature: switching screens
+    // changes the rendered body, so the cached feed verts must rebuild.
+    const sig = feedSignature(items, g.scroll.*, w, h) ^ (@as(u64, g.screen.*) *% 0x9E37_79B9_7F4A_7C15);
     if (sig != gs.feed_sig or gs.feed.verts.items.len == 0) {
         gs.feed_sig = sig;
         // An empty timeline renders the chrome with no posts (no placeholders).
@@ -1725,7 +1739,7 @@ fn paintFrameGpu(
         }
         const lh = logicalH(w, h);
         g.draw.len = 0;
-        g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true) catch g.content_h.*;
+        g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true, g.screen.*) catch g.content_h.*;
         gpu.feedBuild(&gs.feed, gpa, g.engine, g.draw.slice(), scale) catch {};
     }
 
