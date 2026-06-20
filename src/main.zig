@@ -229,7 +229,12 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (tui_mode) {
+    // The cached session is only the NO-PASSWORD fallback. When ZAT_APP_PASSWORD
+    // is given it must WIN — otherwise a stale cached session (expired/revoked
+    // tokens) is used forever and every write fails `ExpiredToken`, even though
+    // the user supplied fresh credentials. So skip the cache path when a
+    // password is present and fall through to the fresh login below.
+    if (tui_mode and env.get("ZAT_APP_PASSWORD") == null) {
         if (session_path) |sp| {
             if (cache_shell.loadSessionAt(gpa, sp)) |cached| {
                 var session = cached;

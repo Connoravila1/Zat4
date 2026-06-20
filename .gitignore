@@ -17,3 +17,6 @@ To_compile_zig
 Zig_References
 mockup_desktop.html
 sample_events.jsonl
+
+# local launcher (holds the AppView read token)
+run-local.sh

@@ -86,7 +86,10 @@ pub const Result = struct {
     outcome: Outcome,
 
     pub const Outcome = union(enum) {
-        ok,
+        /// On a CREATE (like/repost), the created record's uri (owned copy) —
+        /// the UI records it so a later unlike/unrepost can delete that record.
+        /// Empty for delete kinds and on OOM. Freed by freeResult.
+        ok: []const u8,
         /// The server refused (e.g. auth/validation). status+code are owned.
         refused: struct { status: u16, code: []const u8 },
         /// A transport/local failure (the error name, owned copy).
@@ -104,10 +107,16 @@ fn freeRequest(gpa: Allocator, r: Request) void {
 pub fn freeResult(gpa: Allocator, r: Result) void {
     gpa.free(r.cid);
     gpa.free(r.revert_uri);
-    switch (r.outcome) {
+    freeOutcome(gpa, r.outcome);
+}
+
+/// Free an Outcome's owned bytes (the .ok uri, the .refused code, the
+/// .net_error name). Empty slices (literals on OOM) are a no-op free.
+fn freeOutcome(gpa: Allocator, o: Result.Outcome) void {
+    switch (o) {
+        .ok => |uri| if (uri.len > 0) gpa.free(uri),
         .refused => |f| gpa.free(f.code),
         .net_error => |name| gpa.free(name),
-        .ok => {},
     }
 }
 
@@ -315,7 +324,7 @@ fn processOne(worker: *Worker, req: Request) void {
     };
 
     const outcome: Result.Outcome = if (call) |wo| switch (wo) {
-        .ok => .ok,
+        .ok => |ref| .{ .ok = gpa.dupe(u8, ref.uri) catch "" },
         .failed => |f| .{ .refused = .{
             .status = f.status,
             .code = gpa.dupe(u8, f.code) catch "",
@@ -325,14 +334,12 @@ fn processOne(worker: *Worker, req: Request) void {
     const cid_copy = gpa.dupe(u8, req.cid) catch {
         // If even the cid copy fails, drop the result; the optimistic
         // state stays (a benign over-count until the next refresh).
-        if (outcome == .refused) gpa.free(outcome.refused.code);
-        if (outcome == .net_error) gpa.free(outcome.net_error);
+        freeOutcome(gpa, outcome);
         return;
     };
     const revert_copy = gpa.dupe(u8, req.record_uri) catch {
         gpa.free(cid_copy);
-        if (outcome == .refused) gpa.free(outcome.refused.code);
-        if (outcome == .net_error) gpa.free(outcome.net_error);
+        freeOutcome(gpa, outcome);
         return;
     };
     const result: Result = .{ .kind = req.kind, .cid = cid_copy, .revert_uri = revert_copy, .outcome = outcome };
@@ -380,7 +387,7 @@ test "mailbox deinit frees the backing array (the leak the smoke test caught)" {
     var box: ResultBox = .{};
     var i: usize = 0;
     while (i < 5) : (i += 1) {
-        const r: Result = .{ .kind = .like, .cid = try gpa.dupe(u8, "c"), .revert_uri = try gpa.dupe(u8, ""), .outcome = .ok };
+        const r: Result = .{ .kind = .like, .cid = try gpa.dupe(u8, "c"), .revert_uri = try gpa.dupe(u8, ""), .outcome = .{ .ok = "" } };
         try testing.expect(box.push(gpa, r));
     }
     // Drain three (caller frees them), leaving two in the box.
@@ -398,7 +405,7 @@ test "result hygiene: every outcome variant frees without leak" {
     const gpa = testing.allocator;
     // ok
     {
-        const r: Result = .{ .kind = .like, .cid = try gpa.dupe(u8, "c"), .revert_uri = try gpa.dupe(u8, ""), .outcome = .ok };
+        const r: Result = .{ .kind = .like, .cid = try gpa.dupe(u8, "c"), .revert_uri = try gpa.dupe(u8, ""), .outcome = .{ .ok = "" } };
         freeResult(gpa, r);
     }
     // refused

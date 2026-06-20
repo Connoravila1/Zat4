@@ -440,26 +440,40 @@ pub fn run(
         try write_out.drain(gpa, &write_results);
         for (write_results.items) |res| {
             switch (res.outcome) {
-                .ok => {},
+                .ok => |uri| {
+                    // Record OUR created like/repost uri so a later unlike/
+                    // unrepost can delete that record — the AppView never sends
+                    // viewer.like, so the optimistic path has no uri otherwise.
+                    if (uri.len > 0) switch (res.kind) {
+                        .like => feed_core.setLikeUri(gpa, store, res.cid, uri) catch {},
+                        .repost => feed_core.setRepostUri(gpa, store, res.cid, uri) catch {},
+                        .unlike, .unrepost => {},
+                    };
+                    if (debug_effects) std.debug.print("[zat] write OK ({s})\n", .{@tagName(res.kind)});
+                },
                 .refused => |f| {
                     revertWrite(res.kind, gpa, store, res.cid, res.revert_uri) catch {};
                     status = std.fmt.bufPrint(&status_buf, "refused: {d} {s}", .{ f.status, f.code }) catch "refused";
+                    if (debug_effects) std.debug.print("[zat] write REFUSED ({s}): status {d} code {s}\n", .{ @tagName(res.kind), f.status, f.code });
                 },
                 .net_error => |name| {
                     revertWrite(res.kind, gpa, store, res.cid, res.revert_uri) catch {};
                     status = std.fmt.bufPrint(&status_buf, "network error: {s}", .{name}) catch "network error";
+                    if (debug_effects) std.debug.print("[zat] write NET_ERROR ({s}): {s}\n", .{ @tagName(res.kind), name });
                 },
             }
             write_worker.freeResult(gpa, res);
         }
 
-        // Auto-refresh tick: in timeline mode, once the interval has elapsed
-        // and we have an established feed, re-run the same getTimeline the
-        // `r` key runs. New posts slot in at the top and the viewport jumps
-        // so they are seen — identical to a manual refresh, just on a timer.
-        // Failure is contained to the status line (E2); only OOM is fatal.
-        // Never fires mid-compose, so it cannot disturb a draft.
-        if (refresh_interval > 0 and mode == .timeline and store.feed.len > 0 and
+        // Auto-refresh tick: in timeline mode, once the interval has elapsed,
+        // re-run the same getTimeline the `r` key runs. New posts slot in at
+        // the top and the viewport jumps so they are seen — identical to a
+        // manual refresh, just on a timer. This ALSO does the initial load: an
+        // empty store (a cleared cache / first run) would otherwise never fetch
+        // — the window path has no separate startup fetch, so the first tick is
+        // the first load. Failure is contained to the status line (E2); only
+        // OOM is fatal. Never fires mid-compose, so it cannot disturb a draft.
+        if (refresh_interval > 0 and mode == .timeline and
             now - last_auto_refresh >= refresh_interval and
             clock_shell.monotonicNanos() -| last_input_nanos >= input_idle_gate_nanos)
         {
@@ -1831,7 +1845,7 @@ fn drawEngagementHearts(g: Grid, gs: *GpuState, items: []const feed_core.Timelin
             const hy: u16 = @intCast(@min(cell.y, std.math.maxInt(u16)));
             var i: usize = 0;
             while (i < g.active.len) : (i += 1) {
-                if (recipes[i] != &effect_core.like_heart) continue;
+                if (recipes[i] != &effect_core.like_heart and recipes[i] != &effect_core.unlike_heart) continue;
                 if (axs[i] == hx and ays[i] == hy) {
                     vis = effect_core.heartVisual(recipes[i], stages[i], stage_ts[i]);
                     break;
@@ -1856,18 +1870,21 @@ fn fireEngageEffect(gpa: Allocator, g: Grid, kind: Engagement, target: u32, now_
     // on the GPU path, so firing it here would only accumulate — so we don't.
     // An unlike has no dye-removal in v1 (the stain persists by design).
     if (g.gpu) |gs| {
-        if (now_liked or kind == .repost) {
-            if (heartFieldCell(g, gs, target)) |cell| {
+        if (heartFieldCell(g, gs, target)) |cell| {
+            const hx: u16 = @intCast(@min(cell.x, std.math.maxInt(u16)));
+            const hy: u16 = @intCast(@min(cell.y, std.math.maxInt(u16)));
+            if (now_liked or kind == .repost) {
+                // Like / boost: splash the field, and (for a like) pop the heart.
+                // The pop/drain are drawn by the GPU heart pass in paintFrameGpu;
+                // triggering here lets advanceClocks tick them.
                 pushLikeSplash(gpa, gs, cell.x, cell.y);
-                // The animated like-heart pop (fill + scale + stars) is drawn by
-                // the GPU heart pass in paintFrameGpu; trigger it here so its
-                // clock is ticked by advanceClocks. Only a LIKE pops the heart;
-                // a boost gets the field splash for now (its own shape later).
                 if (now_liked and kind == .like) {
-                    const hx: u16 = @intCast(@min(cell.x, std.math.maxInt(u16)));
-                    const hy: u16 = @intCast(@min(cell.y, std.math.maxInt(u16)));
                     effect_core.trigger(gpa, g.active, &effect_core.like_heart, hx, hy, 1.0) catch {};
                 }
+            } else if (kind == .like) {
+                // Unlike: DRAIN the heart back to hollow (no field splash — the
+                // red dye is permanent ink in the medium by design).
+                effect_core.trigger(gpa, g.active, &effect_core.unlike_heart, hx, hy, 1.0) catch {};
             }
         }
         if (debug_effects) {

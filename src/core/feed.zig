@@ -754,6 +754,21 @@ pub fn applyLike(store: *Store, cid: []const u8) Applied {
     return .applied;
 }
 
+/// Record the uri of OUR newly-created like record (handed back by the write
+/// once it lands) so a later UNLIKE can delete it. Without this the AppView's
+/// missing `viewer.like` leaves the uri unknown and unlike is a no-op
+/// (`.no_record_uri`). A no-op if the post has since scrolled out (E4). C1.
+pub fn setLikeUri(gpa: Allocator, store: *Store, cid: []const u8, uri: []const u8) error{OutOfMemory}!void {
+    const index = lookupCid(store, cid) orelse return;
+    store.like_uris.items[index] = try appendString(gpa, store, uri);
+}
+
+/// As `setLikeUri`, for a repost record (so a later unrepost can delete it).
+pub fn setRepostUri(gpa: Allocator, store: *Store, cid: []const u8, uri: []const u8) error{OutOfMemory}!void {
+    const index = lookupCid(store, cid) orelse return;
+    store.repost_uris.items[index] = try appendString(gpa, store, uri);
+}
+
 /// The disengage verdict: `applied` carries the like/repost RECORD uri
 /// to delete. It BORROWS the store's bytes and is valid only until the
 /// next store-mutating call — callers copy it out before reverting (the
