@@ -449,17 +449,14 @@ pub fn run(
                         .repost => feed_core.setRepostUri(gpa, store, res.cid, uri) catch {},
                         .unlike, .unrepost => {},
                     };
-                    if (debug_effects) std.debug.print("[zat] write OK ({s})\n", .{@tagName(res.kind)});
                 },
                 .refused => |f| {
                     revertWrite(res.kind, gpa, store, res.cid, res.revert_uri) catch {};
                     status = std.fmt.bufPrint(&status_buf, "refused: {d} {s}", .{ f.status, f.code }) catch "refused";
-                    if (debug_effects) std.debug.print("[zat] write REFUSED ({s}): status {d} code {s}\n", .{ @tagName(res.kind), f.status, f.code });
                 },
                 .net_error => |name| {
                     revertWrite(res.kind, gpa, store, res.cid, res.revert_uri) catch {};
                     status = std.fmt.bufPrint(&status_buf, "network error: {s}", .{name}) catch "network error";
-                    if (debug_effects) std.debug.print("[zat] write NET_ERROR ({s}): {s}\n", .{ @tagName(res.kind), name });
                 },
             }
             write_worker.freeResult(gpa, res);
