@@ -201,6 +201,13 @@ pub fn decode(gpa: Allocator, bytes: []const u8) DecodeError!feed.Store {
 
     try takeBitset(gpa, &c, &store.liked, header.posts_len);
     try takeBitset(gpa, &c, &store.reposted, header.posts_len);
+    // The optimistic-write guards are transient (they mark a tap the server
+    // has not yet confirmed): a fresh process has no in-flight writes, so they
+    // are deliberately NOT in the snapshot. Size them all-false so indexing is
+    // safe — without this, a refresh that re-ingests a resident post indexes a
+    // zero-length bitset and panics.
+    try store.like_pending.resize(gpa, store.posts.len, false);
+    try store.repost_pending.resize(gpa, store.posts.len, false);
     // The record-uri arrays are wire-derived and deliberately NOT in the
     // snapshot: size them empty so indexing is safe; a refresh fills them.
     try store.like_uris.resize(gpa, store.posts.len);
@@ -363,6 +370,13 @@ test "snapshot: a populated store round-trips exactly" {
         .created_at = 1_767_323_111,
     });
     try testing.expectEqual(feed.LiveIngest.duplicate, dup);
+
+    // Regression: a page refresh re-ingests resident posts through internPost's
+    // found_existing branch, which indexes the optimistic-write guards. Those
+    // guards are transient and deliberately absent from the snapshot, so decode
+    // must size them to posts_len — otherwise this refresh indexes a zero-length
+    // bitset and panics (the live crash this test pins down).
+    _ = try feed.ingestPageRefresh(gpa, &loaded, feed.fixture_page);
 }
 
 test "snapshot: lies are refused — magic, truncation, poisoned span, trailing bytes" {
