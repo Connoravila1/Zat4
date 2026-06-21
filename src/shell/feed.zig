@@ -133,12 +133,14 @@ pub fn refreshTimeline(
     }
 }
 
-/// Load one author's posts into `store` — the profile screen's body. Same
-/// thin shape as `loadTimelinePage`: the only network seam is the
-/// authenticated getAuthorFeed call; the pure ingest does the rest. `actor`
-/// is whose feed; the viewer DID (session) is sent so the AppView stamps
-/// each row's viewer.like. The caller owns `store` and clears it between
-/// profiles (a profile is a fresh fetch, not paginated here — Cut 1).
+/// Load one author's posts into the SHARED `store` as CONTENT (no Home
+/// feed-ordering rows) — the profile screen's body. The view's ORDERING is
+/// derived by `feed_core.buildAuthorView` as a query over the store, so a post
+/// is one record seen through many lenses (ZONES invariant 4): engagement and
+/// identity stay unified across Home, profile, and future zones. Same thin
+/// shape as `loadTimelinePage`: the only network seam is the authenticated
+/// getAuthorFeed call. `actor` is whose feed; the viewer DID (session) is sent
+/// so the AppView stamps each row's viewer.like.
 pub fn loadAuthorFeed(
     gpa: Allocator,
     arena: Allocator,
@@ -171,7 +173,7 @@ pub fn loadAuthorFeed(
     );
     switch (outcome) {
         .failed => |failure| return .{ .failed = failure },
-        .ok => |page| return .{ .ok = try feed_core.ingestPage(gpa, store, page) },
+        .ok => |page| return .{ .ok = try feed_core.ingestPosts(gpa, store, page) },
     }
 }
 
@@ -391,7 +393,10 @@ test "loopback author feed: the actor + viewer ride the wire; posts land in the 
         .ok => |stats| try std.testing.expectEqual(@as(u32, 2), stats.posts_added),
     }
 
-    const items = try feed_core.buildTimeline(arena_state.allocator(), &store);
+    // Content-only ingest: no Home feed-ordering rows; the profile VIEW is a
+    // query over the shared store.
+    try std.testing.expectEqual(@as(usize, 0), store.feed.len);
+    const items = try feed_core.buildAuthorView(arena_state.allocator(), &store, session.did);
     try std.testing.expectEqual(@as(usize, 2), items.len);
     try std.testing.expectEqualStrings("my newest", items[0].text);
 }

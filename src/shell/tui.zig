@@ -337,11 +337,11 @@ pub fn run(
     // The active top-level Screen (index into feed_view.nav_labels); the rail
     // sets it on a click. 0 = Home (the feed). Lives across frames in run().
     var gscreen: u8 = 0;
-    // The premium Profile screen's OWN post store (C4: its own memory), fetched
-    // lazily each time the screen is entered (read-only Cut 1). The home `store`
-    // stays the interactive feed. `on_profile_prev` detects the entry edge.
-    var profile_store: feed_core.Store = .{};
-    defer feed_core.deinitStore(gpa, &profile_store);
+    // The premium Profile screen is a VIEW over the ONE shared `store`, not a
+    // second store (ZONES invariant 4 — the post is the post). Entering it
+    // fetches the author's posts as CONTENT into `store`; the view's ordering
+    // is a query (`feed_core.buildAuthorView`). `on_profile_prev` detects the
+    // entry edge so the fetch fires once per visit.
     var on_profile_prev = false;
 
     // Phase 6.4: the GPU render path, brought up additively when the window is
@@ -503,14 +503,12 @@ pub fn run(
         }
 
         // Premium Profile screen: on ENTERING it (the rail click flips gscreen),
-        // fetch the viewed account's own posts into its own store — a fresh fetch
-        // each visit, read-only in Cut 1. Failure is contained to the status line
-        // (E2); only OOM is fatal. Gated to the timeline mode + window path.
+        // fetch the viewed account's posts as CONTENT into the SHARED store — a
+        // fresh fetch each visit. Failure is contained to the status line (E2);
+        // only OOM is fatal. Gated to the timeline mode + window path.
         const on_profile = mode == .timeline and gscreen == feed_view.screen_profile;
         if (on_profile and !on_profile_prev) {
-            feed_core.deinitStore(gpa, &profile_store);
-            profile_store = .{};
-            const po = feed_shell.loadAuthorFeed(gpa, arena, io, environ, session, appview_url, &profile_store, session.did, 30) catch |err| switch (err) {
+            const po = feed_shell.loadAuthorFeed(gpa, arena, io, environ, session, appview_url, store, session.did, 30) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => blk: {
                     status = "profile: network error"; // contained
@@ -523,23 +521,23 @@ pub fn run(
             };
         }
         on_profile_prev = on_profile;
-        // The profile view-models (and header) only when the screen is showing;
-        // an empty store on any other screen builds to an empty slice cheaply.
-        const profile_items: []const feed_core.TimelineItem =
-            if (on_profile) try feed_core.buildTimeline(arena, &profile_store) else &.{};
-        const profile_header: ?feed_view.ProfileHeader = if (on_profile) .{
-            .display_name = session.handle,
-            .handle = try std.fmt.allocPrint(arena, "@{s}", .{session.handle}),
-            .post_count = @intCast(profile_items.len),
-        } else null;
 
-        const items = try feed_core.buildTimeline(arena, store);
+        // The ACTIVE view: Home (one ordering over the store) or — on the
+        // profile screen — a query for the viewed author's posts over the SAME
+        // store. Either way it's one list of view-models the render + input +
+        // engagement paths all key off; the post records (and so engagement and
+        // identity) are shared (ZONES invariant 4).
+        const view_items: []const feed_core.TimelineItem = if (on_profile)
+            try feed_core.buildAuthorView(arena, store, session.did)
+        else
+            try feed_core.buildTimeline(arena, store);
+        const profile_header = try profileHeaderFor(arena, session, gscreen, view_items.len);
         // pix exists exactly when a window backend has a live engine; the
         // composer and profile screens stay on the cell path this cut
         // (their pixel port is the recorded next slice).
         const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null } else null;
         switch (mode) {
-            .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, profile_items, profile_header, &state, revealed.items, now, session.handle, status),
+            .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status),
             .compose => {
                 if (pix) |g| switch (backend) {
                     .window => |win| {
@@ -665,7 +663,7 @@ pub fn run(
                 // is folded into the loop's own re-render lap.)
                 if (pumped.exposed or pumped.resized) {
                     if (mode == .timeline) {
-                        try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, profile_items, profile_header, &state, revealed.items, now, session.handle, status);
+                        try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status);
                     } else {
                         try present(gpa, out, arena, &prev, &next, backend);
                     }
@@ -750,22 +748,20 @@ pub fn run(
                                         // Like / boost: the SAME path the keyboard uses —
                                         // optimistic toggle (heart fills red), persist via
                                         // the worker, and fire the splash + heart-pop.
-                                        // Engagement is Home-only in Cut 1: the Profile
-                                        // screen's regions index its OWN posts, not `items`/
-                                        // `store`, so a tap there would engage the wrong
-                                        // record. Read-only until the profile gets its own
-                                        // engagement routing (recorded follow-up).
-                                        .like, .repost => if (gscreen == feed_view.screen_home and hit.post < items.len) {
+                                        // Works in ANY view: engageSelected is CID-keyed on
+                                        // the one shared store, so a like from the profile
+                                        // updates the same record Home shows (ZONES inv. 4).
+                                        .like, .repost => if (hit.post < view_items.len) {
                                             state.selected = hit.post;
                                             const ek: Engagement = if (hit.kind == .like) .like else .repost;
-                                            const r = try engageSelected(ek, gpa, arena, session, store, items[hit.post], hit.post, &state, revealed.items, now, out, &prev, &next, backend, pix, writer);
+                                            const r = try engageSelected(ek, gpa, arena, session, store, view_items[hit.post], hit.post, gscreen, session.did, &state, revealed.items, now, out, &prev, &next, backend, pix, writer);
                                             if (r.status.len > 0) status = r.status;
                                         },
                                         // Reply → the thread/reply view (a later screen).
                                         .reply => {},
                                     }
                                 } else if (field_ui.hitTest(cx, cy, g.hr.slice())) |hit| {
-                                    if (hit.target != field_ui.no_target and hit.target < items.len) state.selected = hit.target;
+                                    if (hit.target != field_ui.no_target and hit.target < view_items.len) state.selected = hit.target;
                                     if (hit.action != .none) if (timeline_ui.keyFor(hit.action)) |byte| {
                                         try pumped_bytes.append(gpa, byte);
                                     };
@@ -819,12 +815,12 @@ pub fn run(
                 if (zc == '+' or zc == '=') {
                     gzoom = std.math.clamp(gzoom + 0.15, zoom_min, zoom_max);
                     status = "zoom in";
-                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, profile_items, profile_header, &state, revealed.items, now, session.handle, status);
+                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status);
                     continue;
                 } else if (zc == '-' or zc == '_') {
                     gzoom = std.math.clamp(gzoom - 0.15, zoom_min, zoom_max);
                     status = "zoom out";
-                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, profile_items, profile_header, &state, revealed.items, now, session.handle, status);
+                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status);
                     continue;
                 }
             };
@@ -833,7 +829,7 @@ pub fn run(
                 .quit => break :main_loop,
                 .refresh => {
                     status = "refreshing...";
-                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, profile_items, profile_header, &state, revealed.items, now, session.handle, status);
+                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status);
 
                     const outcome = feed_shell.refreshTimeline(gpa, arena, io, environ, session, appview_url, store, 30) catch |err| switch (err) {
                         error.OutOfMemory => return err,
@@ -874,7 +870,7 @@ pub fn run(
                     }
                     // Paint the wait before paying it.
                     status = "loading...";
-                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, profile_items, profile_header, &state, revealed.items, now, session.handle, status);
+                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status);
 
                     const outcome = feed_shell.loadTimelinePage(gpa, arena, io, environ, session, appview_url, store, 30) catch |err| switch (err) {
                         error.OutOfMemory => return err,
@@ -899,20 +895,20 @@ pub fn run(
                         if (live_stream == null) status = "live stream unavailable" else subscribed_authors = store.authors.len;
                     }
                 },
-                .like => if (items.len > 0) {
-                    const r = try engageSelected(.like, gpa, arena, session, store, items[state.selected], state.selected, &state, revealed.items, now, out, &prev, &next, backend, pix, writer);
+                .like => if (view_items.len > 0) {
+                    const r = try engageSelected(.like, gpa, arena, session, store, view_items[state.selected], state.selected, gscreen, session.did, &state, revealed.items, now, out, &prev, &next, backend, pix, writer);
                     if (r.status.len > 0) status = r.status;
                     if (r.skip_rest) continue;
                 },
-                .repost => if (items.len > 0) {
-                    const r = try engageSelected(.repost, gpa, arena, session, store, items[state.selected], state.selected, &state, revealed.items, now, out, &prev, &next, backend, pix, writer);
+                .repost => if (view_items.len > 0) {
+                    const r = try engageSelected(.repost, gpa, arena, session, store, view_items[state.selected], state.selected, gscreen, session.did, &state, revealed.items, now, out, &prev, &next, backend, pix, writer);
                     if (r.status.len > 0) status = r.status;
                     if (r.skip_rest) continue;
                 },
-                .profile => if (items.len > 0) {
-                    const item = items[state.selected];
+                .profile => if (view_items.len > 0) {
+                    const item = view_items[state.selected];
                     status = "loading profile...";
-                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, profile_items, profile_header, &state, revealed.items, now, session.handle, status);
+                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status);
                     const outcome = auth.queryHost(gpa, arena, io, environ, session, appview_url, lexicon.method.get_profile, &.{
                         .{ .name = "actor", .value = item.author_handle },
                     }, lexicon.ProfileViewDetailed) catch |err| switch (err) {
@@ -944,8 +940,8 @@ pub fn run(
                         }) catch "refused",
                     }
                 },
-                .toggle_reveal => if (items.len > 0) {
-                    const item = items[state.selected];
+                .toggle_reveal => if (view_items.len > 0) {
+                    const item = view_items[state.selected];
                     var found: ?usize = null;
                     for (revealed.items, 0..) |cid, i| {
                         if (std.mem.eql(u8, cid, item.cid)) {
@@ -962,12 +958,12 @@ pub fn run(
                         status = "shown (x re-hides)";
                     }
                 },
-                .follow => if (items.len > 0) {
-                    const item = items[state.selected];
+                .follow => if (view_items.len > 0) {
+                    const item = view_items[state.selected];
                     const did = feed_core.authorDidForCid(store, item.cid);
                     if (did.len > 0) {
                         status = "following...";
-                        try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, profile_items, profile_header, &state, revealed.items, now, session.handle, status);
+                        try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status);
                         const outcome = write.followAccount(gpa, arena, io, environ, session, did, now) catch |err| switch (err) {
                             error.OutOfMemory => return err,
                             else => {
@@ -983,8 +979,8 @@ pub fn run(
                         };
                     }
                 },
-                .reply => if (items.len > 0) {
-                    const item = items[state.selected];
+                .reply => if (view_items.len > 0) {
+                    const item = view_items[state.selected];
                     if (feed_core.replyRefsForCid(store, item.cid)) |refs| {
                         // Copy the refs out of the store before composing:
                         // the composer outlives this frame and the store may
@@ -1011,7 +1007,7 @@ pub fn run(
                     mode = .compose;
                 },
                 else => |action| {
-                    timeline_ui.applyAction(&state, action, items.len);
+                    timeline_ui.applyAction(&state, action, view_items.len);
                     switch (action) {
                         // Key navigation scrolls the pixel viewport to the
                         // cursor; wheel reading never does (one-shot flag,
@@ -1180,6 +1176,24 @@ fn handleComposeInput(
 
 const Engagement = enum { like, repost };
 
+/// Build the ACTIVE view's posts over the SHARED store — Home's timeline, or
+/// the profile screen's author query. The single place "which view is showing"
+/// is decided, for both the main loop and engageSelected's optimistic repaint.
+fn buildActiveView(arena: Allocator, store: *feed_core.Store, screen: u8, profile_did: []const u8) error{OutOfMemory}![]feed_core.TimelineItem {
+    if (screen == feed_view.screen_profile) return feed_core.buildAuthorView(arena, store, profile_did);
+    return feed_core.buildTimeline(arena, store);
+}
+
+/// The profile header (handle + post count) on the profile screen, else null.
+fn profileHeaderFor(arena: Allocator, session: *const auth.Session, screen: u8, post_count: usize) error{OutOfMemory}!?feed_view.ProfileHeader {
+    if (screen != feed_view.screen_profile) return null;
+    return .{
+        .display_name = session.handle,
+        .handle = try std.fmt.allocPrint(arena, "@{s}", .{session.handle}),
+        .post_count = @intCast(post_count),
+    };
+}
+
 const EngageResult = struct {
     // A7.2: cold struct, size guard waived — one per action, returned by value.
 
@@ -1198,6 +1212,10 @@ fn engageSelected(
     store: *feed_core.Store,
     item: feed_core.TimelineItem,
     target: u32,
+    /// The active Screen + the profile's author DID, so the optimistic repaint
+    /// rebuilds the SAME view the tap came from (Home or a profile).
+    screen: u8,
+    profile_did: []const u8,
     state: *timeline_ui.UiState,
     revealed_cids: []const []const u8,
     now: i64,
@@ -1236,10 +1254,9 @@ fn engageSelected(
             const record_uri = uri_buf[0..borrowed.len];
             @memcpy(record_uri, borrowed);
 
-            const fresh = try feed_core.buildTimeline(arena, store);
-            // Engagement is Home-only, so this optimistic repaint is always the
-            // Home feed — no profile posts/header in play.
-            try paintFrame(gpa, out, arena, prev, next, backend, pix, fresh, &.{}, null, state, revealed_cids, now, session.handle, if (kind == .like) "unliking..." else "unboosting...");
+            const fresh = try buildActiveView(arena, store, screen, profile_did);
+            const fresh_header = try profileHeaderFor(arena, session, screen, fresh.len);
+            try paintFrame(gpa, out, arena, prev, next, backend, pix, fresh, fresh_header, state, revealed_cids, now, session.handle, if (kind == .like) "unliking..." else "unboosting...");
             // Fire the drain effect at the post's heart cell (state is now
             // DISENGAGED → the cooler recipe). One trigger, derived from the
             // actual transition — no click-path race.
@@ -1266,8 +1283,9 @@ fn engageSelected(
 
     // Optimistic first: the bumped count paints now; the worker call
     // follows on its own thread; a refusal reverts (drained in the loop).
-    const fresh = try feed_core.buildTimeline(arena, store);
-    try paintFrame(gpa, out, arena, prev, next, backend, pix, fresh, &.{}, null, state, revealed_cids, now, session.handle, if (kind == .like) "liking..." else "boosting...");
+    const fresh = try buildActiveView(arena, store, screen, profile_did);
+    const fresh_header = try profileHeaderFor(arena, session, screen, fresh.len);
+    try paintFrame(gpa, out, arena, prev, next, backend, pix, fresh, fresh_header, state, revealed_cids, now, session.handle, if (kind == .like) "liking..." else "boosting...");
     // Fire the like/boost burst at the post's heart cell (state is now
     // ENGAGED). One trigger derived from the transition.
     if (pix) |g| fireEngageEffect(gpa, g, kind, target, true);
@@ -1640,11 +1658,11 @@ fn paintFrame(
     next: *tui.Surface,
     backend: Backend,
     pix: ?Grid,
-    items: []const feed_core.TimelineItem,
-    /// The premium Profile screen's posts + header (the viewed account's own,
-    /// read-only Cut 1). Used only when the active Screen is the profile;
-    /// `profile_header` is null on every other screen.
-    profile_items: []const feed_core.TimelineItem,
+    /// The ACTIVE view's posts — Home's timeline, or a profile/zone query. ONE
+    /// list of view-models over the shared store, chosen by the caller; the
+    /// renderer and input paths key off it uniformly (ZONES invariant 4).
+    view_items: []const feed_core.TimelineItem,
+    /// The profile header band, non-null only on the profile screen.
     profile_header: ?feed_view.ProfileHeader,
     state: *timeline_ui.UiState,
     revealed: []const []const u8,
@@ -1654,15 +1672,11 @@ fn paintFrame(
 ) !void {
     if (pix) |g| switch (backend) {
         .window => |win| {
-            // The Profile screen renders its OWN post list; every other screen
-            // renders the home timeline (placeholders draw no posts at all).
-            const on_profile = g.screen.* == feed_view.screen_profile;
-            const active_items = if (on_profile) profile_items else items;
-            if (items.len > 0 and state.selected >= items.len) state.selected = @intCast(items.len - 1);
+            if (view_items.len > 0 and state.selected >= view_items.len) state.selected = @intCast(view_items.len - 1);
             // Phase 6.4: when the GPU path is live, render the field + feed on
             // the GPU and return; the software path below is the fallback.
             if (g.gpu) |gs| {
-                try paintFrameGpu(gpa, arena, win, g, gs, active_items, profile_header, now);
+                try paintFrameGpu(gpa, arena, win, g, gs, view_items, profile_header, now);
                 return;
             }
             // Cell size scales with the user zoom; the grid reflows to
@@ -1698,7 +1712,7 @@ fn paintFrame(
             // (F4).
             const t_start = if (debug_frame_timing) clock_shell.monotonicNanos() else 0;
             const pane_cfg: field_ui.PaneConfig = .{};
-            _ = try field_ui.layoutShell(g.field, pane_cfg, g.hr, g.hearts, items, state.selected, g.view, revealed, now, account_handle, status, gpa);
+            _ = try field_ui.layoutShell(g.field, pane_cfg, g.hr, g.hearts, view_items, state.selected, g.view, revealed, now, account_handle, status, gpa);
             // cut 5.6: replace the old cell-grid feed text with the static
             // ambient glyph texture — the premium feed_view layer draws the
             // real content on top. layoutShell still runs so the hit rects and
@@ -1724,7 +1738,7 @@ fn paintFrame(
             // row, dividers) painted OVER the field as proportional items, fed
             // by the REAL timeline via a pure transform (B5). An empty timeline
             // renders the chrome with no posts — no placeholder content.
-            const feed_posts = feed_view.fromTimeline(arena, active_items, now) catch &[_]feed_view.PostView{};
+            const feed_posts = feed_view.fromTimeline(arena, view_items, now) catch &[_]feed_view.PostView{};
             g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*, profile_header) catch g.content_h.*;
             const t_layout = if (debug_frame_timing) clock_shell.monotonicNanos() else 0;
             window_shell.presentDrawList(win, gpa, g.engine, g.draw.slice(), field_core.background) catch {}; // E2: a lost blit is the next frame's problem
@@ -1741,7 +1755,7 @@ fn paintFrame(
         },
         .terminal => {},
     };
-    timeline_ui.buildFrame(next, items, state, revealed, now, account_handle, status);
+    timeline_ui.buildFrame(next, view_items, state, revealed, now, account_handle, status);
     try present(gpa, out, arena, prev, next, backend);
 }
 
@@ -1755,10 +1769,8 @@ fn paintFrameGpu(
     win: *window_shell.Window,
     g: Grid,
     gs: *GpuState,
-    items: []const feed_core.TimelineItem,
-    /// Non-null on the Profile screen: its header band, and the signal to draw
-    /// hearts STATICALLY (the SDF in-place heart pass is the Home screen's, fed
-    /// by tap effects which only fire on Home).
+    items: []const feed_core.TimelineItem, // the ACTIVE view's posts
+    /// The profile header band, non-null only on the profile screen.
     profile_header: ?feed_view.ProfileHeader,
     now: i64,
 ) !void {
@@ -1807,9 +1819,10 @@ fn paintFrameGpu(
         }
         const lh = logicalH(w, h);
         g.draw.len = 0;
-        // skip_heart: Home draws hearts via the SDF in-place pass (skip here);
-        // the Profile screen has no tap-driven heart pass, so draw them statically.
-        g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, profile_header == null, g.screen.*, profile_header) catch g.content_h.*;
+        // skip_heart=true on every screen: the SDF heart pass (drawEngagementHearts,
+        // below) draws the heart in place for each visible like button of the
+        // ACTIVE view, so layout never draws its own — one heart, one pipeline.
+        g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true, g.screen.*, profile_header) catch g.content_h.*;
         gpu.feedBuild(&gs.feed, gpa, g.engine, g.draw.slice(), scale) catch {};
     }
 

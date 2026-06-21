@@ -287,18 +287,7 @@ pub fn ingestPage(
     var stats: IngestStats = .{};
 
     for (page.feed) |item| {
-        const post_index = try internPost(gpa, store, item.post, &stats);
-
-        // Reply context: parent/root arrive hydrated as PostViews and are
-        // interned as ordinary posts (A2: the bulk path serves them too);
-        // notFound/blocked variants parse to an empty cid and stay .none.
-        if (item.reply) |reply| {
-            const parent = try internPostIfPresent(gpa, store, reply.parent, &stats);
-            const root = try internPostIfPresent(gpa, store, reply.root, &stats);
-            const posts = store.posts.slice();
-            posts.items(.reply_parent)[@intFromEnum(post_index)] = parent;
-            posts.items(.reply_root)[@intFromEnum(post_index)] = root;
-        }
+        const post_index = try internPageItem(gpa, store, item, &stats);
 
         const reposted_by: OptionalAuthorIndex = blk: {
             const reason = item.reason orelse break :blk .none;
@@ -315,6 +304,41 @@ pub fn ingestPage(
     else
         .empty;
 
+    return stats;
+}
+
+/// Intern one page item's CONTENT (the post + its reply linkage) into the
+/// store, returning its index. Shared by ingestPage (which also records a Home
+/// feed-ordering row) and ingestPosts (which records no ordering at all). A8:
+/// a resident CID returns its existing index.
+fn internPageItem(gpa: Allocator, store: *Store, item: lexicon.FeedViewPost, stats: *IngestStats) error{OutOfMemory}!PostIndex {
+    const post_index = try internPost(gpa, store, item.post, stats);
+    // Reply context: parent/root arrive hydrated as PostViews and are interned
+    // as ordinary posts (A2: the bulk path serves them too); notFound/blocked
+    // variants parse to an empty cid and stay .none.
+    if (item.reply) |reply| {
+        const parent = try internPostIfPresent(gpa, store, reply.parent, stats);
+        const root = try internPostIfPresent(gpa, store, reply.root, stats);
+        const posts = store.posts.slice();
+        posts.items(.reply_parent)[@intFromEnum(post_index)] = parent;
+        posts.items(.reply_root)[@intFromEnum(post_index)] = root;
+    }
+    return post_index;
+}
+
+/// Ingest a page's posts as CONTENT ONLY — into the shared `store.posts`, with
+/// NO Home feed-ordering rows and WITHOUT touching the Home pagination cursor.
+/// This is how a non-Home VIEW (a profile, later a zone) populates the one
+/// store it shares with everything else: the posts become resident and
+/// engagement/identity stay unified, while the view's ORDERING is derived
+/// separately by a query (e.g. `buildAuthorView`). A8 dedups by CID, so a post
+/// already held (from Home or another view) is not duplicated.
+pub fn ingestPosts(gpa: Allocator, store: *Store, page: lexicon.TimelinePage) error{OutOfMemory}!IngestStats {
+    var stats: IngestStats = .{};
+    for (page.feed) |item| {
+        _ = try internPageItem(gpa, store, item, &stats);
+        stats.items_added += 1;
+    }
     return stats;
 }
 
@@ -449,8 +473,15 @@ fn internPost(
     if (gop.found_existing) {
         stats.posts_deduped += 1;
         const index = gop.value_ptr.*;
-        // A8 boundary: the CID seals the RECORD bytes (text/refs/authorship are
-        // never re-parsed). Counts and viewer state live on the VIEW wrapper, so
+        // Authorship LINKAGE is sealed by the CID (the post keeps its author
+        // index), but the author's mutable IDENTITY (handle / display name) is
+        // NOT content-addressed — reconcile it so a handle the AppView resolved
+        // AFTER this post was first cached reaches the resident copy too (the
+        // home feed's "shows the DID" fix). internAuthor dedups by DID and
+        // rewrites only on a real change, so this is cheap and idempotent.
+        _ = try internAuthor(gpa, store, view.author, stats);
+        // A8 boundary: the CID seals the RECORD bytes (text/refs are never
+        // re-parsed). Counts and viewer state live on the VIEW wrapper, so
         // fresher server truth reconciles here — EXCEPT a like/repost we just
         // changed locally and the server hasn't reflected yet (the pending
         // guard), which we leave alone so a lagging refresh can't revert it.
@@ -615,47 +646,92 @@ pub fn buildTimeline(
 ) error{OutOfMemory}![]TimelineItem {
     const out = try arena.alloc(TimelineItem, store.feed.len);
     const feed = store.feed.slice();
+    for (feed.items(.post), feed.items(.reposted_by), out) |post_index, reposted_by, *item| {
+        item.* = fillTimelineItem(store, @intFromEnum(post_index), reposted_by);
+    }
+    return out;
+}
+
+/// Build the render-ready view-model for ONE post + its (optional) reposter.
+/// The single seam every VIEW shares: Home (store.feed order), a profile
+/// (one author's posts), a zone (a tag query), an algorithm (a scored order)
+/// are all just different ORDERINGS of post indices over the one store — the
+/// post is the post (ZONES invariant 4), seen through N lenses. Pure.
+fn fillTimelineItem(store: *const Store, p: usize, reposted_by: OptionalAuthorIndex) TimelineItem {
     const posts = store.posts.slice();
     const authors = store.authors.slice();
-
     const post_authors = posts.items(.author);
     const author_handles = authors.items(.handle);
     const author_display_names = authors.items(.display_name);
+    const author = @intFromEnum(post_authors[p]);
 
-    for (feed.items(.post), feed.items(.reposted_by), out) |post_index, reposted_by, *item| {
-        const p = @intFromEnum(post_index);
-        const author = @intFromEnum(post_authors[p]);
+    const replying_to: []const u8 = if (posts.items(.reply_parent)[p].unwrap()) |parent| blk: {
+        const parent_author = @intFromEnum(post_authors[@intFromEnum(parent)]);
+        break :blk sliceSpan(store, author_handles[parent_author]);
+    } else "";
 
-        const replying_to: []const u8 = if (posts.items(.reply_parent)[p].unwrap()) |parent| blk: {
-            const parent_author = @intFromEnum(post_authors[@intFromEnum(parent)]);
-            break :blk sliceSpan(store, author_handles[parent_author]);
-        } else "";
+    const reposted_by_handle: []const u8 = if (reposted_by.unwrap()) |reposter|
+        sliceSpan(store, author_handles[@intFromEnum(reposter)])
+    else
+        "";
 
-        const reposted_by_handle: []const u8 = if (reposted_by.unwrap()) |reposter|
-            sliceSpan(store, author_handles[@intFromEnum(reposter)])
-        else
-            "";
+    return .{
+        .uri = sliceSpan(store, posts.items(.uri)[p]),
+        .cid = sliceSpan(store, posts.items(.cid)[p]),
+        .author_handle = sliceSpan(store, author_handles[author]),
+        .author_display_name = sliceSpan(store, author_display_names[author]),
+        .reposted_by_handle = reposted_by_handle,
+        .replying_to_handle = replying_to,
+        .text = sliceSpan(store, posts.items(.text)[p]),
+        .created_at = posts.items(.created_at)[p],
+        .like_count = posts.items(.like_count)[p],
+        .repost_count = posts.items(.repost_count)[p],
+        .reply_count = posts.items(.reply_count)[p],
+        .quote_count = posts.items(.quote_count)[p],
+        .label_flags = posts.items(.label_flags)[p],
+        .item_flags = .{
+            .viewer_liked = store.liked.isSet(p),
+            .viewer_reposted = store.reposted.isSet(p),
+        },
+    };
+}
 
-        item.* = .{
-            .uri = sliceSpan(store, posts.items(.uri)[p]),
-            .cid = sliceSpan(store, posts.items(.cid)[p]),
-            .author_handle = sliceSpan(store, author_handles[author]),
-            .author_display_name = sliceSpan(store, author_display_names[author]),
-            .reposted_by_handle = reposted_by_handle,
-            .replying_to_handle = replying_to,
-            .text = sliceSpan(store, posts.items(.text)[p]),
-            .created_at = posts.items(.created_at)[p],
-            .like_count = posts.items(.like_count)[p],
-            .repost_count = posts.items(.repost_count)[p],
-            .reply_count = posts.items(.reply_count)[p],
-            .quote_count = posts.items(.quote_count)[p],
-            .label_flags = posts.items(.label_flags)[p],
-            .item_flags = .{
-                .viewer_liked = store.liked.isSet(p),
-                .viewer_reposted = store.reposted.isSet(p),
-            },
-        };
+/// Build a VIEW of one author's own posts over the SHARED store, reverse-chron
+/// — the profile screen's body. PURE: a query, not a container (ZONES inv. 4).
+/// The posts are the same records Home/zones/etc. reference; engagement and
+/// identity therefore stay consistent across every view automatically. An
+/// unknown author is an empty view (E4). Allocates in `arena` (C3).
+pub fn buildAuthorView(
+    arena: Allocator,
+    store: *const Store,
+    author_did: []const u8,
+) error{OutOfMemory}![]TimelineItem {
+    const author_index = store.author_by_did.getAdapted(
+        author_did,
+        std.hash_map.StringIndexAdapter{ .bytes = &store.string_bytes },
+    ) orelse return &.{};
+
+    const posts = store.posts.slice();
+    const post_authors = posts.items(.author);
+    const createds = posts.items(.created_at);
+
+    // Collect this author's post rows, then sort reverse-chron. A flat scan over
+    // the resident posts is right for Cut 1 (G3: trivial against network wait).
+    var rows: std.ArrayList(u32) = .empty;
+    defer rows.deinit(arena);
+    for (post_authors, 0..) |a, p| {
+        if (@intFromEnum(a) == author_index) try rows.append(arena, @intCast(p));
     }
+    const Ctx = struct {
+        createds: []const i64,
+        pub fn lessThan(ctx: @This(), x: u32, y: u32) bool {
+            return ctx.createds[x] > ctx.createds[y]; // newest first
+        }
+    };
+    std.sort.block(u32, rows.items, Ctx{ .createds = createds }, Ctx.lessThan);
+
+    const out = try arena.alloc(TimelineItem, rows.items.len);
+    for (rows.items, out) |p, *item| item.* = fillTimelineItem(store, p, .none);
     return out;
 }
 
@@ -1516,6 +1592,54 @@ test "ingest: a later sighting reconciles a placeholder handle to the resolved o
     // BOTH posts (one author) now read the reconciled handle, not the DID.
     try testing.expectEqual(@as(usize, 2), items.len);
     for (items) |it| try testing.expectEqualStrings("bob.zat4.com", it.author_handle);
+}
+
+test "view model: a profile view is a query over the shared store; engagement is unified" {
+    const gpa = testing.allocator; // C6
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    // Home: the fixture (alice ×2 posts, bob ×1) builds the Home ordering.
+    _ = try ingestPage(gpa, &store, fixture_page);
+    const home_len = store.feed.len;
+
+    // Alice's profile view = a QUERY over the shared store, reverse-chron.
+    const av0 = try buildAuthorView(arena_state.allocator(), &store, alice.did);
+    try testing.expectEqual(@as(usize, 2), av0.len);
+    try testing.expectEqualStrings("alice's second post", av0[0].text); // newer first
+    try testing.expectEqualStrings("first post", av0[1].text);
+
+    // A profile FETCH ingests content-only — a new alice post + her resident
+    // one (dedup). It must NOT add Home feed-ordering rows (no container/copy).
+    const profile_page = lexicon.TimelinePage{ .feed = &.{
+        .{ .post = .{
+            .uri = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.zat4.feed.post/3kali3",
+            .cid = "bafyreialice3",
+            .author = alice,
+            .record = .{ .text = "alice newest", .createdAt = "2026-01-09T00:00:00Z" },
+        } },
+        .{ .post = alice_post_1 }, // already resident → dedup, no dup
+    } };
+    _ = try ingestPosts(gpa, &store, profile_page);
+    try testing.expectEqual(home_len, store.feed.len); // Home ordering untouched
+
+    const av1 = try buildAuthorView(arena_state.allocator(), &store, alice.did);
+    try testing.expectEqual(@as(usize, 3), av1.len);
+    try testing.expectEqualStrings("alice newest", av1[0].text);
+
+    // Engagement is CID-keyed on the ONE store: liking from the profile view
+    // shows liked in the HOME view too — same record, two lenses (ZONES inv. 4).
+    _ = applyLike(&store, "bafyreialice1");
+    const home = try buildTimeline(arena_state.allocator(), &store);
+    for (home) |it| {
+        if (std.mem.eql(u8, it.cid, "bafyreialice1")) try testing.expect(it.item_flags.viewer_liked);
+    }
+    const av2 = try buildAuthorView(arena_state.allocator(), &store, alice.did);
+    for (av2) |it| {
+        if (std.mem.eql(u8, it.cid, "bafyreialice1")) try testing.expect(it.item_flags.viewer_liked);
+    }
 }
 
 test "refresh ingest: new rows prepend in order, cursor untouched, rows dedup by pair" {
