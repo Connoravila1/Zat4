@@ -49,6 +49,9 @@ const FollowValue = struct { subject: []const u8 = "" };
 const SubjectRef = struct { cid: []const u8 = "" };
 /// A like/repost record's value. A7.2: cold transient parse target.
 const RefValue = struct { subject: SubjectRef = .{} };
+/// An `app.zat4.actor.profile` record's value — the display name (avatar is a
+/// blob, deferred). A7.2: cold transient parse target.
+const ProfileValue = struct { displayName: []const u8 = "" };
 
 /// One `listRecords` entry over a record value of type `Value`.
 fn Rec(comptime Value: type) type {
@@ -119,12 +122,13 @@ pub fn pollRepo(
 ) !usize {
     var added: usize = 0;
 
-    // Handle: resolve this author's DID → handle ONCE (describeRepo is a public
-    // read on the PDS), so posts serve `@handle` instead of the DID. Gated on
-    // "not yet known" so it costs one request per author for the AppView's life,
-    // not per poll cycle (G3). The verified handle is persisted (appendHandle)
-    // so a restart restores it via replay — no re-resolve on boot. A failed or
-    // unverified resolve simply leaves the DID showing (E2/E4).
+    // Identity: resolve this author's DID → handle (describeRepo, a public read)
+    // AND display name (their app.zat4.actor.profile record) ONCE, so posts serve
+    // `@handle` + a human name instead of the DID. Gated on "handle not yet known"
+    // so it costs ~two requests per author for the AppView's life, not per poll
+    // cycle (G3). Both are persisted (appendIdentity) so a restart restores them
+    // via replay — no re-resolve on boot. A failed/unverified resolve simply
+    // leaves the DID showing (E2/E4).
     {
         lock.lock();
         const known = appview.handleFor(idx, did).len > 0;
@@ -132,15 +136,23 @@ pub fn pollRepo(
         if (!known) {
             const params = [_]xrpc.Param{.{ .name = "repo", .value = did }};
             const outcome = xrpc.query(arena, io, environ, pds_url, lexicon.method.describe_repo, &params, lexicon.RepoDescription, .{}) catch null;
-            if (outcome) |o| switch (o) {
-                .ok => |desc| if (desc.handle.len > 0 and desc.handleIsCorrect) {
-                    lock.lock();
-                    appview.setHandle(gpa, idx, did, desc.handle) catch {};
-                    lock.unlock();
-                    store.appendHandle(log, arena, did, desc.handle);
-                },
-                .failed => {},
-            };
+            const handle: []const u8 = if (outcome) |o| switch (o) {
+                .ok => |desc| if (desc.handle.len > 0 and desc.handleIsCorrect) desc.handle else "",
+                .failed => "",
+            } else "";
+            // Display name: the first record of the profile collection (the self
+            // profile). Absent/failed ⇒ "" (the client falls back to the handle).
+            var display_name: []const u8 = "";
+            if (try fetch(arena, io, environ, pds_url, did, lexicon.collection.profile, ProfileValue)) |recs| {
+                if (recs.len > 0) display_name = recs[0].value.displayName;
+            }
+            if (handle.len > 0 or display_name.len > 0) {
+                lock.lock();
+                if (handle.len > 0) appview.setHandle(gpa, idx, did, handle) catch {};
+                if (display_name.len > 0) appview.setDisplayName(gpa, idx, did, display_name) catch {};
+                lock.unlock();
+                store.appendIdentity(log, arena, did, handle, display_name);
+            }
         }
     }
 

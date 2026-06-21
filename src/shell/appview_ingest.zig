@@ -76,8 +76,10 @@ pub fn ingestEvent(gpa: Allocator, arena: Allocator, idx: *appview.Index, event_
     if (std.mem.eql(u8, ev.kind, "identity")) {
         const info = ev.identity orelse return .ignored;
         const did = if (ev.did.len > 0) ev.did else info.did;
-        if (did.len == 0 or info.handle.len == 0) return .ignored;
-        try appview.setHandle(gpa, idx, did, info.handle);
+        if (did.len == 0) return .ignored;
+        if (info.handle.len > 0) try appview.setHandle(gpa, idx, did, info.handle);
+        if (info.displayName.len > 0) try appview.setDisplayName(gpa, idx, did, info.displayName);
+        if (info.handle.len == 0 and info.displayName.len == 0) return .ignored;
         return .identity;
     }
     if (!std.mem.eql(u8, ev.kind, "commit")) return .ignored;
@@ -133,6 +135,7 @@ const GraphEvent = struct {
 const IdentityInfo = struct {
     did: []const u8 = "",
     handle: []const u8 = "",
+    displayName: []const u8 = "",
 };
 
 /// A7.2: cold struct, size guard waived — transient parse target.

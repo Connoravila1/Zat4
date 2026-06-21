@@ -152,7 +152,8 @@ const EngEnvelope = struct {
 /// reads (a DID's handle), so replay restores handles via the same path.
 const IdentityRecord = struct {
     did: []const u8,
-    handle: []const u8,
+    handle: []const u8 = "",
+    displayName: []const u8 = "",
 };
 /// A7.2: cold struct, size guard waived — transient serialize source.
 const IdentityEnvelope = struct {
@@ -235,12 +236,13 @@ pub fn appendEngagement(
     writeEnvelope(store, arena, env);
 }
 
-/// Append a DID→handle identity line so the resolved handle survives a restart
-/// (replayed via the shared reducer's `identity` branch — no re-resolve on
-/// boot). A disabled store is a silent no-op. `arena` is stringify scratch.
-pub fn appendHandle(store: *Store, arena: Allocator, did: []const u8, handle: []const u8) void {
-    if (store.fd < 0 or did.len == 0 or handle.len == 0) return;
-    const env: IdentityEnvelope = .{ .did = did, .identity = .{ .did = did, .handle = handle } };
+/// Append a DID identity line (handle + display name) so resolved identity
+/// survives a restart (replayed via the shared reducer's `identity` branch — no
+/// re-resolve on boot). A disabled store, or no identity to record, is a silent
+/// no-op. `arena` is stringify scratch.
+pub fn appendIdentity(store: *Store, arena: Allocator, did: []const u8, handle: []const u8, display_name: []const u8) void {
+    if (store.fd < 0 or did.len == 0 or (handle.len == 0 and display_name.len == 0)) return;
+    const env: IdentityEnvelope = .{ .did = did, .identity = .{ .did = did, .handle = handle, .displayName = display_name } };
     writeEnvelope(store, arena, env);
 }
 

@@ -134,6 +134,12 @@ pub const Index = struct {
     /// of echoing the DID. Resolved by the shell (describeRepo / identity
     /// events) and persisted, so it survives a restart.
     handles: std.AutoHashMapUnmanaged(StrId, StrId) = .empty,
+
+    /// Author DID id → display-name id (both interned), from the author's
+    /// `app.zat4.actor.profile` record. Lets the serve layer answer
+    /// `author.displayName` with the human name; absent ⇒ the client falls back
+    /// to the handle. Resolved + persisted alongside the handle.
+    display_names: std.AutoHashMapUnmanaged(StrId, StrId) = .empty,
 };
 
 pub fn deinit(gpa: Allocator, idx: *Index) void {
@@ -149,6 +155,7 @@ pub fn deinit(gpa: Allocator, idx: *Index) void {
     idx.pending_reposts.deinit(gpa);
     idx.like_edges.deinit(gpa);
     idx.handles.deinit(gpa);
+    idx.display_names.deinit(gpa);
     idx.* = .{};
 }
 
@@ -365,6 +372,25 @@ fn handleForId(idx: *const Index, did_id: StrId) []const u8 {
     return if (idx.handles.get(did_id)) |h| str(idx, h) else "";
 }
 
+/// Record `did`'s display name (from its `app.zat4.actor.profile` record), so a
+/// post can be served with `author.displayName`. Idempotent. Empty ⇒ no-op (E4).
+pub fn setDisplayName(gpa: Allocator, idx: *Index, did: []const u8, name: []const u8) Allocator.Error!void {
+    if (did.len == 0 or name.len == 0) return;
+    const did_id = try internStr(gpa, idx, did);
+    const name_id = try internStr(gpa, idx, name);
+    try idx.display_names.put(gpa, did_id, name_id);
+}
+
+/// The display name known for `did`, or "" if none. Pure.
+pub fn displayNameFor(idx: *const Index, did: []const u8) []const u8 {
+    const did_id = idx.intern.get(did) orelse return "";
+    return displayNameForId(idx, did_id);
+}
+
+fn displayNameForId(idx: *const Index, did_id: StrId) []const u8 {
+    return if (idx.display_names.get(did_id)) |n| str(idx, n) else "";
+}
+
 /// One row of an assembled timeline, as plain values crossing the boundary
 /// (A5: DIDs/CIDs, never the internal index). The shell serializes these into
 /// the lexicon's TimelinePage shape.
@@ -377,6 +403,9 @@ pub const TimelineRow = struct {
     /// The author's handle (e.g. `connor.zat4.com`), or "" if not yet indexed
     /// — the serve layer falls back to the DID for `author.handle` then.
     author_handle: []const u8 = "",
+    /// The author's display name (from their profile record), or "" if none —
+    /// the client falls back to the handle then.
+    author_display_name: []const u8 = "",
     text: []const u8,
     created_at: i64,
     like_count: u32,
@@ -490,6 +519,7 @@ fn materializeRows(
             .cid = str(idx, cids[row]),
             .author_did = str(idx, authors[row]),
             .author_handle = handleForId(idx, authors[row]),
+            .author_display_name = displayNameForId(idx, authors[row]),
             .text = blk: {
                 const s = texts[row];
                 break :blk idx.pool_bytes.items[s.off .. s.off + s.len];
@@ -651,17 +681,21 @@ test "handles: a post row carries the author's indexed handle; unknown stays emp
 
     _ = try indexPost(gpa, &idx, .{ .cid = "c1", .author_did = "did:plc:bob", .text = "hi", .created_at = 10 });
     try setHandle(gpa, &idx, "did:plc:bob", "bob.zat4.com");
+    try setDisplayName(gpa, &idx, "did:plc:bob", "Bob Builder");
     // Idempotent re-resolve overwrites with the same value (no growth, no dup).
     try setHandle(gpa, &idx, "did:plc:bob", "bob.zat4.com");
 
     try testing.expectEqualStrings("bob.zat4.com", handleFor(&idx, "did:plc:bob"));
+    try testing.expectEqualStrings("Bob Builder", displayNameFor(&idx, "did:plc:bob"));
     try testing.expectEqualStrings("", handleFor(&idx, "did:plc:nobody"));
+    try testing.expectEqualStrings("", displayNameFor(&idx, "did:plc:nobody"));
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const rows = try buildAuthorFeed(arena_state.allocator(), &idx, "did:plc:bob", "did:plc:bob", 10);
     try testing.expectEqual(@as(usize, 1), rows.len);
     try testing.expectEqualStrings("bob.zat4.com", rows[0].author_handle);
+    try testing.expectEqualStrings("Bob Builder", rows[0].author_display_name);
     try testing.expectEqualStrings("did:plc:bob", rows[0].author_did);
 }
 
