@@ -959,6 +959,32 @@ pub fn revertUnrepost(gpa: Allocator, store: *Store, cid: []const u8, uri: []con
     store.repost_uris.items[index] = try appendString(gpa, store, uri);
 }
 
+/// Optimistic disengage when OUR like/repost record's uri is not known YET —
+/// the create is still in flight, so `applyUnlike` would return `.no_record_uri`
+/// and block undo until the round-trip finishes (the "can't unlike for a few
+/// seconds" bug). Instead, hollow the heart and drop the count NOW, keeping the
+/// pending guard so a lagging refresh can't re-fill it; the shell remembers to
+/// delete the record the instant the create hands back its uri. Returns whether
+/// it acted (false = not engaged / unknown post). The post is liked, so there's
+/// always a record coming — undo just shouldn't wait for it.
+pub fn applyUnlikeDeferred(store: *Store, cid: []const u8) bool {
+    const index = lookupCid(store, cid) orelse return false;
+    if (!store.liked.isSet(index)) return false;
+    store.liked.unset(index);
+    store.like_pending.set(index);
+    store.posts.items(.like_count)[index] -|= 1;
+    return true;
+}
+
+pub fn applyUnrepostDeferred(store: *Store, cid: []const u8) bool {
+    const index = lookupCid(store, cid) orelse return false;
+    if (!store.reposted.isSet(index)) return false;
+    store.reposted.unset(index);
+    store.repost_pending.set(index);
+    store.posts.items(.repost_count)[index] -|= 1;
+    return true;
+}
+
 pub fn revertLike(store: *Store, cid: []const u8) void {
     const index = lookupCid(store, cid) orelse return;
     if (!store.liked.isSet(index)) return;
@@ -1294,6 +1320,16 @@ test "disengage: a cache-warm like (no record uri) says so and touches nothing" 
     // E4: the refusal is information, not mutation.
     try testing.expect(store.liked.isSet(0));
     try testing.expectEqual(count, store.posts.items(.like_count)[0]);
+
+    // The DEFERRED unlike, by contrast, hollows the heart NOW (no uri needed):
+    // the shell uses this so undo isn't blocked while the like's create is in
+    // flight. The pending guard stays set so a lagging refresh can't re-fill it.
+    try testing.expect(applyUnlikeDeferred(&store, cid0));
+    try testing.expect(!store.liked.isSet(0));
+    try testing.expect(store.like_pending.isSet(0));
+    try testing.expectEqual(count - 1, store.posts.items(.like_count)[0]);
+    // Not liked anymore ⇒ a second deferred unlike is a no-op.
+    try testing.expect(!applyUnlikeDeferred(&store, cid0));
 }
 
 test "ingest: a second page deduplicates across pages by CID (A8)" {

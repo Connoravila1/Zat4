@@ -270,6 +270,14 @@ pub fn run(
     defer if (writer) |w| write_worker.shutdown(w);
     var write_results: std.ArrayList(write_worker.Result) = .empty;
     defer write_results.deinit(gpa);
+    // Deferred-undo intents: a post the user UN-engaged before its like/repost
+    // create had returned a record uri. Keyed by a hash of the post cid; when
+    // the create's result lands (with the uri), the drain fires the delete at
+    // once — so undo is instant instead of waiting on the create round-trip.
+    var deferred_unlike: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer deferred_unlike.deinit(gpa);
+    var deferred_unrepost: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer deferred_unrepost.deinit(gpa);
 
     // Auto-refresh: the reliable live path. The Jetstream subsystem stays
     // wired (it proves the firehose engineering), but the VISIBLE feed is
@@ -445,6 +453,24 @@ pub fn run(
         write_results.clearRetainingCapacity();
         try write_out.drain(gpa, &write_results);
         for (write_results.items) |res| {
+            // Deferred-undo: if the user un-engaged this post WHILE its create
+            // was in flight, the create's result is the first moment we can
+            // delete the record. Fire the delete now (the optimistic hollow is
+            // already shown); on a failed create there's nothing to delete.
+            const deferred: ?*std.AutoHashMapUnmanaged(u64, void) = switch (res.kind) {
+                .like => &deferred_unlike,
+                .repost => &deferred_unrepost,
+                .unlike, .unrepost => null,
+            };
+            if (deferred) |set| {
+                if (set.remove(std.hash.Wyhash.hash(0, res.cid))) {
+                    if (res.outcome == .ok and res.outcome.ok.len > 0) {
+                        if (writer) |w| _ = write_worker.submit(w, if (res.kind == .like) .unlike else .unrepost, res.cid, "", "", res.outcome.ok, now);
+                    }
+                    write_worker.freeResult(gpa, res);
+                    continue;
+                }
+            }
             switch (res.outcome) {
                 .ok => |uri| {
                     // Record OUR created like/repost uri so a later unlike/
@@ -754,7 +780,7 @@ pub fn run(
                                         .like, .repost => if (hit.post < view_items.len) {
                                             state.selected = hit.post;
                                             const ek: Engagement = if (hit.kind == .like) .like else .repost;
-                                            const r = try engageSelected(ek, gpa, arena, session, store, view_items[hit.post], hit.post, gscreen, session.did, &state, revealed.items, now, out, &prev, &next, backend, pix, writer);
+                                            const r = try engageSelected(ek, gpa, arena, session, store, view_items[hit.post], hit.post, gscreen, session.did, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
                                             if (r.status.len > 0) status = r.status;
                                         },
                                         // Reply → the thread/reply view (a later screen).
@@ -896,12 +922,12 @@ pub fn run(
                     }
                 },
                 .like => if (view_items.len > 0) {
-                    const r = try engageSelected(.like, gpa, arena, session, store, view_items[state.selected], state.selected, gscreen, session.did, &state, revealed.items, now, out, &prev, &next, backend, pix, writer);
+                    const r = try engageSelected(.like, gpa, arena, session, store, view_items[state.selected], state.selected, gscreen, session.did, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
                     if (r.status.len > 0) status = r.status;
                     if (r.skip_rest) continue;
                 },
                 .repost => if (view_items.len > 0) {
-                    const r = try engageSelected(.repost, gpa, arena, session, store, view_items[state.selected], state.selected, gscreen, session.did, &state, revealed.items, now, out, &prev, &next, backend, pix, writer);
+                    const r = try engageSelected(.repost, gpa, arena, session, store, view_items[state.selected], state.selected, gscreen, session.did, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
                     if (r.status.len > 0) status = r.status;
                     if (r.skip_rest) continue;
                 },
@@ -1225,6 +1251,10 @@ fn engageSelected(
     backend: Backend,
     pix: ?Grid,
     writer: ?*write_worker.Worker,
+    /// Deferred-undo intent sets (by post-cid hash) for the case where the user
+    /// un-engages before the create's record uri is known — see the drain.
+    def_unlike: *std.AutoHashMapUnmanaged(u64, void),
+    def_unrepost: *std.AutoHashMapUnmanaged(u64, void),
 ) !EngageResult {
     const applied = switch (kind) {
         .like => feed_core.applyLike(store, item.cid),
@@ -1242,7 +1272,24 @@ fn engageSelected(
             const borrowed = switch (dis) {
                 .applied => |uri| uri,
                 .not_engaged, .unknown => return .{ .status = "" },
-                .no_record_uri => return .{ .status = if (kind == .like) "refresh to unlike" else "refresh to unboost" },
+                // The record uri isn't known yet (the create is still in
+                // flight). Don't make the user wait: hollow the heart NOW and
+                // remember to delete the record the instant the create returns
+                // its uri (handled in the write-result drain). Undo is instant.
+                .no_record_uri => {
+                    const acted = switch (kind) {
+                        .like => feed_core.applyUnlikeDeferred(store, item.cid),
+                        .repost => feed_core.applyUnrepostDeferred(store, item.cid),
+                    };
+                    if (!acted) return .{ .status = "" };
+                    const set = if (kind == .like) def_unlike else def_unrepost;
+                    set.put(gpa, std.hash.Wyhash.hash(0, item.cid), {}) catch {};
+                    const fresh = try buildActiveView(arena, store, screen, profile_did);
+                    const fresh_header = try profileHeaderFor(arena, session, screen, fresh.len);
+                    try paintFrame(gpa, out, arena, prev, next, backend, pix, fresh, fresh_header, state, revealed_cids, now, session.handle, if (kind == .like) "unliking..." else "unboosting...");
+                    if (pix) |g| fireEngageEffect(gpa, g, kind, target, false);
+                    return .{ .status = if (kind == .like) "unliking..." else "unboosting..." };
+                },
             };
             var uri_buf: [512]u8 = undefined;
             if (borrowed.len > uri_buf.len) {
