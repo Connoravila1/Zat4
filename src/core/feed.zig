@@ -941,6 +941,51 @@ pub fn bumpReplyCount(store: *Store, cid_bytes: []const u8) void {
     store.posts.items(.reply_count)[index] += 1;
 }
 
+/// Reconcile an OPTIMISTICALLY-inserted post (under a temporary cid) to its real
+/// server identity once the create write confirms: repoint its cid + uri and
+/// re-key the cid index. So the post persists AND the next refresh dedups it by
+/// the real cid (A8) instead of adding a second copy. No-op if the temp cid
+/// isn't resident (e.g. a refresh already replaced it).
+pub fn reconcileOptimisticPost(
+    gpa: Allocator,
+    store: *Store,
+    temp_cid: []const u8,
+    real_cid: []const u8,
+    real_uri: []const u8,
+) error{OutOfMemory}!void {
+    const index = lookupCid(store, temp_cid) orelse return;
+    const adapter = std.hash_map.StringIndexAdapter{ .bytes = &store.string_bytes };
+    const ctx = std.hash_map.StringIndexContext{ .bytes = &store.string_bytes };
+    _ = store.post_by_cid.removeAdapted(temp_cid, adapter); // drop the temp key
+    const cid = try appendString(gpa, store, real_cid);
+    const uri = try appendString(gpa, store, real_uri);
+    store.posts.items(.cid)[index] = cid;
+    store.posts.items(.uri)[index] = uri;
+    const gop = try store.post_by_cid.getOrPutContextAdapted(gpa, real_cid, adapter, ctx);
+    gop.key_ptr.* = cid.offset;
+    gop.value_ptr.* = index;
+}
+
+/// Detach an optimistic post whose create FAILED: remove its feed row(s), un-key
+/// its cid, and null its reply edges so it vanishes from BOTH the feed and any
+/// thread (buildThreadView reaches posts via parent edges; with none, this slot
+/// is an unreachable island). The slot stays in `posts` but is invisible — a
+/// rare path (a failed write), self-healed on the next full reload.
+pub fn dropOptimisticPost(store: *Store, temp_cid: []const u8) void {
+    const index = lookupCid(store, temp_cid) orelse return;
+    const idx_enum: PostIndex = @enumFromInt(index);
+    var i: usize = 0;
+    while (i < store.feed.len) {
+        if (store.feed.items(.post)[i] == idx_enum) {
+            store.feed.orderedRemove(i);
+        } else i += 1;
+    }
+    store.posts.items(.reply_parent)[index] = .none;
+    store.posts.items(.reply_root)[index] = .none;
+    const adapter = std.hash_map.StringIndexAdapter{ .bytes = &store.string_bytes };
+    _ = store.post_by_cid.removeAdapted(temp_cid, adapter);
+}
+
 /// Up to `max` author DIDs currently held — what the stream subscribes
 /// to. Slices borrow the store; the stream copies them (E1).
 pub fn authorDids(arena: Allocator, store: *const Store, max: usize) error{OutOfMemory}![]const []const u8 {
@@ -1778,6 +1823,42 @@ test "a reply's hydrated parent ref does NOT clobber the parent's real counts" {
     } };
     _ = try ingestPosts(gpa, &store, .{ .feed = &.{parent_now} });
     try testing.expectEqual(@as(u32, 3), store.posts.items(.reply_count)[p]); // authoritative view updates
+}
+
+test "optimistic post: reconcile re-keys temp→real; drop detaches on failure" {
+    const gpa = testing.allocator;
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+
+    // An optimistic top-level post under a temp cid → present in the feed.
+    _ = try ingestLivePost(gpa, &store, .{
+        .did = "did:plc:me", .handle = "me.zat",
+        .uri = "", .cid = "pending:0", .text = "hello",
+        .reply_parent_cid = "", .reply_root_cid = "", .created_at = 100,
+    });
+    try testing.expect(lookupCid(&store, "pending:0") != null);
+    const idx = lookupCid(&store, "pending:0").?;
+
+    // Confirm: re-key to the real cid/uri; the temp key is gone, the slot kept.
+    try reconcileOptimisticPost(gpa, &store, "pending:0", "bafyreal", "at://did:plc:me/app.zat4.feed.post/bafyreal");
+    try testing.expect(lookupCid(&store, "pending:0") == null);
+    try testing.expectEqual(idx, lookupCid(&store, "bafyreal").?);
+
+    // An optimistic REPLY that then FAILS → detached from feed + thread.
+    _ = try ingestLivePost(gpa, &store, .{
+        .did = "did:plc:me", .handle = "me.zat",
+        .uri = "", .cid = "pending:1", .text = "a reply",
+        .reply_parent_cid = "bafyreal", .reply_root_cid = "bafyreal", .created_at = 110,
+    });
+    const before = store.feed.len;
+    dropOptimisticPost(&store, "pending:1");
+    try testing.expect(lookupCid(&store, "pending:1") == null); // un-keyed
+    try testing.expectEqual(before - 1, store.feed.len); // feed row removed
+    // The thread of the (real) parent no longer contains the dropped reply.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const thread = try buildThreadView(arena_state.allocator(), &store, "bafyreal");
+    try testing.expectEqual(@as(usize, 1), thread.len); // just the parent
 }
 
 test "buildThreadView: nested preorder with view-derived depth + focus" {

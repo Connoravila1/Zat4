@@ -231,6 +231,10 @@ pub fn run(
     // post on send; .profile upserts the self profile record with the buffer as
     // the display name. Set when the editor / composer is opened.
     var compose_kind: ComposeKind = .post;
+    // A post/reply optimistically shown, its create write queued for the loop to
+    // run after the post is on screen (0ms posting). At most one in flight.
+    var pending_send: ?SendJob = null;
+    defer if (pending_send) |job| freeSendJob(gpa, job);
 
     // Reveal toggles: cids the user has opened past a moderation collapse.
     // Plain values handed to the core each frame (B5); freed here (C4/C5).
@@ -676,6 +680,35 @@ pub fn run(
             },
         }
 
+        // 0ms posting: a queued send was shown optimistically and PAINTED above
+        // this frame; perform the actual create write now, then reconcile the
+        // temp cid to the server's (keep the post) or drop it on failure. The
+        // write blocks briefly, but the post is already on screen — it FELT
+        // instant. Network failure is contained (E2); only OOM is fatal.
+        if (pending_send) |job| {
+            pending_send = null;
+            defer freeSendJob(gpa, job);
+            const facets = write.resolveFacets(arena, io, environ, session, job.text) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => &[_]lexicon.Facet{}, // post without facets rather than fail
+            };
+            const posted = write.createPost(gpa, arena, io, environ, session, job.text, facets, job.target, now) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => blk: {
+                    feed_core.dropOptimisticPost(store, job.temp_cid);
+                    status = "send failed";
+                    break :blk null;
+                },
+            };
+            if (posted) |result| switch (result) {
+                .ok => |ref| feed_core.reconcileOptimisticPost(gpa, store, job.temp_cid, ref.cid, ref.uri) catch {},
+                .failed => |f| {
+                    feed_core.dropOptimisticPost(store, job.temp_cid);
+                    status = std.fmt.bufPrint(&status_buf, "send refused: {d} {s}", .{ f.status, f.code }) catch "refused";
+                },
+            };
+        }
+
         // Wait for input; the timeout re-renders so relative ages stay
         // honest on an idle screen. 500 ms: the mailbox drains and
         // relative ages tick at human latency; two wakeups a second is
@@ -988,7 +1021,7 @@ pub fn run(
             }
 
             if (mode == .compose) {
-                try handleComposeInput(gpa, arena, io, environ, session, out, backend, &prev, &next, &status, &status_buf, &mode, store, &compose_buf, &reply_target, &reply_handle, compose_kind, pix, decoded.event, now);
+                try handleComposeInput(gpa, arena, io, environ, session, out, backend, &prev, &next, &status, &status_buf, &mode, store, &compose_buf, &reply_target, &reply_handle, compose_kind, pix, &pending_send, decoded.event, now);
                 continue;
             }
 
@@ -1278,6 +1311,39 @@ fn handleProfileInput(
     }
 }
 
+/// A queued create-write for a post/reply that was already shown OPTIMISTICALLY
+/// (seated in the store under `temp_cid`). The loop performs the write AFTER the
+/// optimistic post is on screen, then reconciles the temp cid to the server's
+/// real one (or drops the post on failure). Owns its strings (gpa) — they
+/// outlive the cleared compose draft. One in flight at a time.
+/// A7.2: cold struct, size guard waived — at most one in flight, transient.
+const SendJob = struct {
+    temp_cid: []const u8,
+    text: []const u8,
+    target: ?write.ReplyTarget,
+};
+
+fn dupeTarget(gpa: Allocator, t: ?write.ReplyTarget) !?write.ReplyTarget {
+    const tt = t orelse return null;
+    return .{
+        .root_uri = try gpa.dupe(u8, tt.root_uri),
+        .root_cid = try gpa.dupe(u8, tt.root_cid),
+        .parent_uri = try gpa.dupe(u8, tt.parent_uri),
+        .parent_cid = try gpa.dupe(u8, tt.parent_cid),
+    };
+}
+
+fn freeSendJob(gpa: Allocator, job: SendJob) void {
+    gpa.free(job.temp_cid);
+    if (job.text.len > 0) gpa.free(job.text);
+    if (job.target) |t| {
+        gpa.free(t.root_uri);
+        gpa.free(t.root_cid);
+        gpa.free(t.parent_uri);
+        gpa.free(t.parent_cid);
+    }
+}
+
 /// Paint the composer's blocking-write status frame ("posting…" / "saving…").
 /// On the live GPU window it goes through the PREMIUM composer (so the card
 /// stays put with the status under it); otherwise the cell-grid composer is the
@@ -1339,6 +1405,9 @@ fn handleComposeInput(
     /// drawn through the PREMIUM composer when the GPU path is up — otherwise it
     /// flashed the cell-grid composer for the duration of the network write.
     pix: ?Grid,
+    /// Set by a post/reply send: the queued create-write the loop performs AFTER
+    /// the optimistic post is on screen (0ms). Null when nothing is queued.
+    pending_send: *?SendJob,
     ev: tui.InputEvent,
     now: i64,
 ) !void {
@@ -1387,57 +1456,36 @@ fn handleComposeInput(
                 }
                 return;
             }
-            status.* = "posting...";
-            try composeBusyFrame(gpa, arena, out, backend, prev, next, pix, compose_kind, reply_handle.*, compose_buf.items, status.*);
-            // Transport failure is contained to a status line —
-            // a wifi blip must not take the screen down (E2).
-            // Only OOM stays fatal.
-            const facets = write.resolveFacets(arena, io, environ, session, compose_buf.items) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => {
-                    status.* = "network error";
-                    return;
-                },
+            // TRULY 0ms: seat the post in the store under a TEMPORARY cid and
+            // return to the feed immediately — it renders THIS frame. The actual
+            // create write is queued (`pending_send`) and run by the loop AFTER
+            // the optimistic post is on screen; it then reconciles the temp cid
+            // to the server's real one, or drops the post on failure. The temp
+            // cid is unique: `posts.len` only grows.
+            const target = reply_target.*;
+            const temp_cid = try std.fmt.allocPrint(gpa, "pending:{d}", .{store.posts.len});
+            _ = feed_core.ingestLivePost(gpa, store, .{
+                .did = session.did,
+                .handle = session.handle,
+                .uri = "",
+                .cid = temp_cid,
+                .text = compose_buf.items,
+                .reply_parent_cid = if (target) |t| t.parent_cid else "",
+                .reply_root_cid = if (target) |t| t.root_cid else "",
+                .created_at = now,
+            }) catch {};
+            if (target) |t| feed_core.bumpReplyCount(store, t.parent_cid);
+            pending_send.* = .{
+                .temp_cid = temp_cid,
+                .text = try gpa.dupe(u8, compose_buf.items),
+                .target = try dupeTarget(gpa, target),
             };
-            const posted = write.createPost(gpa, arena, io, environ, session, compose_buf.items, facets, reply_target.*, now) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => {
-                    status.* = "network error";
-                    return;
-                },
-            };
-            switch (posted) {
-                .ok => |ref| {
-                    // Optimistic local ingest: the new post/reply is the same
-                    // record the AppView will serve, so seat it in the shared
-                    // store NOW — it shows instantly in the feed and the thread
-                    // instead of after the 5s refresh (A8 dedups on confirm).
-                    const rt = reply_target.*;
-                    _ = feed_core.ingestLivePost(gpa, store, .{
-                        .did = session.did,
-                        .handle = session.handle,
-                        .uri = ref.uri,
-                        .cid = ref.cid,
-                        .text = compose_buf.items,
-                        .reply_parent_cid = if (rt) |t| t.parent_cid else "",
-                        .reply_root_cid = if (rt) |t| t.root_cid else "",
-                        .created_at = now,
-                    }) catch {};
-                    // Bump the parent's reply count instantly too.
-                    if (rt) |t| feed_core.bumpReplyCount(store, t.parent_cid);
-                    compose_buf.clearRetainingCapacity();
-                    reply_target.* = null;
-                    reply_handle.* = "";
-                    mode.* = .timeline;
-                    status.* = "posted";
-                },
-                .failed => |failure| {
-                    // The draft survives a refusal.
-                    status.* = std.fmt.bufPrint(status_buf, "refused: {d} {s}", .{
-                        failure.status, failure.code,
-                    }) catch "refused";
-                },
-            }
+            compose_buf.clearRetainingCapacity();
+            reply_target.* = null;
+            reply_handle.* = "";
+            mode.* = .timeline;
+            if (pix) |g| g.scroll.* = 0; // jump to top so you see your post land
+            status.* = "";
         },
         .none => {},
     }
