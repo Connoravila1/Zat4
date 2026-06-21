@@ -98,15 +98,42 @@ pub fn main(init: std.process.Init) !void {
     try writePpm(io, gpa, &fb, "/tmp/zat_compose.ppm");
     std.debug.print("wrote /tmp/zat_compose.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
 
-    // The thread view (PHASE C4): the same posts rendered on the thread screen —
-    // the "Thread" top bar + a back button, posts in thread order.
+    // The thread view (PHASE C4): Reddit-style NESTED. A small tree with depths
+    // (the view-derived nesting buildThreadView produces) — root, two replies,
+    // a reply-to-a-reply — to show the indent + guide rails + focus highlight.
     @memset(fb.pixels, clear);
     dl.len = 0;
     try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
-    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, feed_view.screen_thread, null);
+    const thread = [_]feed_view.PostView{
+        tv("mara.zat", "Mara Vesper", "the whole point of a small network is that you can actually read the room.", 0xFFCAA3A8, 'M', 0, false),
+        tv("oko.zat", "Okonkwo", "agreed — ten thousand strangers isn't a room, it's weather.", 0xFF9FC7A0, 'O', 1, false),
+        tv("lune.zat", "lune", "weather you can't even reply to without getting rained on.", 0xFFA9B6D6, 'l', 2, true),
+        tv("rune.zat", "rune", "this is why i kept the field on. it keeps the light at human scale.", 0xFFB5A9CC, 'r', 1, false),
+    };
+    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), &thread, 0, &dl, null, null, false, feed_view.screen_thread, null);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_thread.ppm");
     std.debug.print("wrote /tmp/zat_thread.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
+}
+
+/// A thread PostView with an explicit nesting depth + focus flag (preview only).
+fn tv(handle: []const u8, name: []const u8, body: []const u8, tint: u32, initial: u8, depth: u8, is_focus: bool) feed_view.PostView {
+    _ = handle;
+    return .{
+        .name = name,
+        .handle = "@x.zat",
+        .age = "2h",
+        .body = body,
+        .tint = tint,
+        .reply = 0,
+        .boost = 0,
+        .like = 0,
+        .initial = initial,
+        .liked = false,
+        .boosted = false,
+        .depth = depth,
+        .is_focus = is_focus,
+    };
 }
 
 fn writePpm(io: std.Io, gpa: std.mem.Allocator, fb: *const raster.Framebuffer, path: []const u8) !void {

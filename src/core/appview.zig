@@ -599,21 +599,21 @@ fn fillRow(idx: *const Index, viewer_id: ?StrId, row: u32, reply_counts: *const 
     };
 }
 
-/// A post's thread, as plain boundary rows: the ancestor chain (root → immediate
-/// parent, in order), the focused post, and its direct replies (chronological).
-/// `found` is false when the focus cid isn't indexed (E4 — an empty thread, not
-/// an error). A7.2: cold struct, size guard waived — transient boundary value.
+/// A post's whole thread, as a FLAT set of boundary rows (its root + the whole
+/// descendant tree). No tree/depth here — the client derives structure from the
+/// reply edges (the post is the post; nesting is the reader's lens). `found` is
+/// false when the focus cid isn't indexed (E4 — an empty thread, not an error).
+/// A7.2: cold struct, size guard waived — transient boundary value.
 pub const ThreadRows = struct {
-    ancestors: []TimelineRow = &.{},
-    post: TimelineRow = undefined,
-    replies: []TimelineRow = &.{},
+    posts: []TimelineRow = &.{},
     found: bool = false,
 };
 
-/// Build the thread around the post with cid `focus_cid`: walk `reply_parent`
-/// up to the root for the ancestor chain, scan for posts whose parent is the
-/// focus for the direct replies (chronological), `limit` replies. PURE (B2);
-/// allocates into `arena`. An unknown focus cid ⇒ `found = false` (E4).
+/// Build the whole thread containing the post with cid `focus_cid`: walk
+/// `reply_parent` up to the thread root, then collect the entire descendant tree
+/// (BFS over the child edges), `limit` posts. Reply ROOTS may be stale on older
+/// records, so the tree is built from immediate-PARENT edges, which are exact.
+/// PURE (B2); allocates into `arena`. Unknown focus cid ⇒ `found = false` (E4).
 pub fn buildPostThread(
     arena: Allocator,
     idx: *const Index,
@@ -628,48 +628,47 @@ pub fn buildPostThread(
     var reply_counts = try buildReplyCounts(arena, idx);
     defer reply_counts.deinit(arena);
 
-    // Ancestors: walk the parent chain up. A cycle guard caps the walk (a
-    // malformed thread can't hang the server). Collected parent-first, then
-    // reversed to root-first for rendering above the focus.
-    var anc: std.ArrayList(u32) = .empty;
-    defer anc.deinit(arena);
-    var cur = focus_row;
+    // Walk the parent chain up to the thread root (cycle-guarded).
+    var root_row = focus_row;
     var guard: usize = 0;
     while (guard < 4096) : (guard += 1) {
-        const pid = idx.reply_parent.items[cur];
+        const pid = idx.reply_parent.items[root_row];
         if (pid == no_str) break;
         const prow = idx.post_by_cid.get(pid) orelse break;
-        try anc.append(arena, prow);
-        cur = prow;
+        root_row = prow;
     }
-    std.mem.reverse(u32, anc.items);
 
-    // Direct replies: posts whose parent is the focus, chronological ascending.
-    var reps: std.ArrayList(u32) = .empty;
-    defer reps.deinit(arena);
+    // parent row → child rows, then BFS the whole tree from the root. Order
+    // doesn't matter (the client re-derives the nesting); BFS just bounds it.
+    var children: std.AutoHashMapUnmanaged(u32, std.ArrayListUnmanaged(u32)) = .empty;
+    defer {
+        var vit = children.valueIterator();
+        while (vit.next()) |v| v.deinit(arena);
+        children.deinit(arena);
+    }
     for (idx.reply_parent.items, 0..) |pid, row| {
-        if (pid == focus_cid_id) try reps.append(arena, @intCast(row));
+        if (pid == no_str) continue;
+        const prow = idx.post_by_cid.get(pid) orelse continue;
+        const gop = try children.getOrPut(arena, prow);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(arena, @intCast(row));
     }
-    const Asc = struct {
-        createds: []const i64,
-        pub fn lessThan(ctx: @This(), a: u32, b: u32) bool {
-            return ctx.createds[a] < ctx.createds[b]; // oldest first
+
+    var out: std.ArrayList(TimelineRow) = .empty;
+    defer out.deinit(arena);
+    var queue: std.ArrayList(u32) = .empty;
+    defer queue.deinit(arena);
+    try queue.append(arena, root_row);
+    var head: usize = 0;
+    while (head < queue.items.len and out.items.len < limit) : (head += 1) {
+        const row = queue.items[head];
+        try out.append(arena, fillRow(idx, viewer_id, row, &reply_counts));
+        if (children.get(row)) |kids| {
+            for (kids.items) |k| try queue.append(arena, k);
         }
-    };
-    std.sort.block(u32, reps.items, Asc{ .createds = idx.posts.items(.created_at) }, Asc.lessThan);
+    }
 
-    const ancestors = try arena.alloc(TimelineRow, anc.items.len);
-    for (ancestors, anc.items) |*o, r| o.* = fillRow(idx, viewer_id, r, &reply_counts);
-    const rn = @min(limit, reps.items.len);
-    const replies = try arena.alloc(TimelineRow, rn);
-    for (replies, reps.items[0..rn]) |*o, r| o.* = fillRow(idx, viewer_id, r, &reply_counts);
-
-    return .{
-        .ancestors = ancestors,
-        .post = fillRow(idx, viewer_id, focus_row, &reply_counts),
-        .replies = replies,
-        .found = true,
-    };
+    return .{ .posts = try out.toOwnedSlice(arena), .found = true };
 }
 
 /// Hydrate a reply target from an interned cid id: if the referenced post is
@@ -887,27 +886,33 @@ test "post thread: ancestors walk to root, direct replies in chronological order
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Focus on midA: ancestor chain is [root]; direct reply is [leaf].
+    // Focus anywhere in the thread returns the WHOLE thread (root + all 3
+    // descendants), flat — the client derives the nesting. Focusing midA still
+    // yields all 4 posts (root, midA, midB, leaf).
     const t = try buildPostThread(arena, &idx, "cMidA", "did:x", 50);
     try testing.expect(t.found);
-    try testing.expectEqual(@as(usize, 1), t.ancestors.len);
-    try testing.expectEqualStrings("root", t.ancestors[0].text);
-    try testing.expectEqualStrings("mid A", t.post.text);
-    try testing.expectEqual(@as(u32, 1), t.post.reply_count); // leaf replies to it
-    try testing.expectEqual(@as(usize, 1), t.replies.len);
-    try testing.expectEqualStrings("leaf", t.replies[0].text);
+    try testing.expectEqual(@as(usize, 4), t.posts.len);
+    var saw_root = false;
+    var saw_leaf = false;
+    var root_replies: u32 = 0;
+    for (t.posts) |p| {
+        if (std.mem.eql(u8, p.text, "root")) {
+            saw_root = true;
+            root_replies = p.reply_count;
+        }
+        if (std.mem.eql(u8, p.text, "leaf")) saw_leaf = true;
+    }
+    try testing.expect(saw_root and saw_leaf);
+    try testing.expectEqual(@as(u32, 2), root_replies); // midA + midB reply to root
 
-    // Focus on root: no ancestors; two direct replies, chronological (midA, midB).
+    // Focusing the root yields the same whole thread.
     const r = try buildPostThread(arena, &idx, "cRoot", "did:x", 50);
-    try testing.expectEqual(@as(usize, 0), r.ancestors.len);
-    try testing.expectEqual(@as(usize, 2), r.replies.len);
-    try testing.expectEqualStrings("mid A", r.replies[0].text); // older first
-    try testing.expectEqualStrings("mid B", r.replies[1].text);
+    try testing.expectEqual(@as(usize, 4), r.posts.len);
 
     // An unknown focus cid is an empty thread, not an error (E4).
     const none = try buildPostThread(arena, &idx, "cGhost", "did:x", 50);
     try testing.expect(!none.found);
-    try testing.expectEqual(@as(usize, 0), none.ancestors.len);
+    try testing.expectEqual(@as(usize, 0), none.posts.len);
 }
 
 test "handles: a post row carries the author's indexed handle; unknown stays empty" {

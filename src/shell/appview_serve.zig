@@ -281,18 +281,12 @@ fn feedViewPostFor(arena: Allocator, r: appview.TimelineRow) RouteError!lexicon.
     };
 }
 
-/// Serialize a post thread into the lexicon's ThreadView (ancestors + focus +
-/// replies), reusing the same per-post projection as the feed.
+/// Serialize a post thread into the lexicon's ThreadView (the whole thread as a
+/// flat reference set), reusing the same per-post projection as the feed.
 fn serializeThread(arena: Allocator, thread: appview.ThreadRows) RouteError![]const u8 {
-    const ancestors = try arena.alloc(lexicon.FeedViewPost, thread.ancestors.len);
-    for (ancestors, thread.ancestors) |*fv, r| fv.* = try feedViewPostFor(arena, r);
-    const replies = try arena.alloc(lexicon.FeedViewPost, thread.replies.len);
-    for (replies, thread.replies) |*fv, r| fv.* = try feedViewPostFor(arena, r);
-    const view: lexicon.ThreadView = .{
-        .ancestors = ancestors,
-        .post = if (thread.found) try feedViewPostFor(arena, thread.post) else .{},
-        .replies = replies,
-    };
+    const posts = try arena.alloc(lexicon.FeedViewPost, thread.posts.len);
+    for (posts, thread.posts) |*fv, r| fv.* = try feedViewPostFor(arena, r);
+    const view: lexicon.ThreadView = .{ .posts = posts };
     return std.json.Stringify.valueAlloc(arena, view, .{ .emit_null_optional_fields = false });
 }
 

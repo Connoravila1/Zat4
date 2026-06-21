@@ -621,6 +621,11 @@ pub const TimelineItem = struct {
     /// module for the verdict — neither side knows the other's interior.
     label_flags: moderation.LabelFlags,
     item_flags: ItemFlags,
+    /// Thread nesting depth (0 = root) and whether this is the focused post —
+    /// VIEW-DERIVED state set only by `buildThreadView` (the reader's lens;
+    /// never on the stored Post). Both default off, riding the tail padding.
+    depth: u8 = 0,
+    is_focus: bool = false,
 
     comptime {
         // Produced in bulk every build — hot, so guarded (A7). Slices make
@@ -630,9 +635,9 @@ pub const TimelineItem = struct {
         // cid on the item — they are the stable ids A5 prescribes for
         // crossing the boundary — and ItemFlags rides the tail padding
         // (7×16 slices + 8 i64 + 16 counts + 2 + 1 = 139 payload, 5 pad).
-        // Second raise: +2 LabelFlags for moderation. First raise: the
-        // guard caught a budget that counted four slices when five were
-        // present — corrected to reality.)
+        // depth + is_focus take 2 of those 5 pad bytes — still 144. Second
+        // raise: +2 LabelFlags for moderation. First raise: the guard caught
+        // a budget that counted four slices when five were present.)
         if (@sizeOf(usize) == 8) assert(@sizeOf(TimelineItem) == 144);
     }
 };
@@ -735,67 +740,82 @@ pub fn buildAuthorView(
     return out;
 }
 
-/// Build a post's THREAD as a view over the shared store (ZONES inv. 4 — a
-/// query, not a container): the ancestor chain (root → immediate parent, in
-/// order), the focused post, then its direct replies (chronological). The store
-/// already holds the reply linkage (ingestPosts interned each post's reply
-/// refs), so this reconstructs the thread by walking `reply_parent` up and
-/// scanning for children — the same shape the AppView's buildPostThread serves,
-/// derived locally so engagement/identity stay unified with every other view.
-/// An unknown focus cid is an empty view (E4). Allocates in `arena`.
+/// Build a post's THREAD as a Reddit-style NESTED view over the shared store
+/// (ZONES inv. 4 — a query, not a container): walk `reply_parent` up to the
+/// thread root, then DFS the whole descendant tree in preorder (siblings
+/// chronological), stamping each item's view-derived `depth` (root = 0) and
+/// marking the focused post. The store already holds the reply linkage (every
+/// ingested post interns its reply refs), so the nesting is derived locally —
+/// engagement/identity stay unified with every other view, and the nesting is a
+/// LENS over the same records, never a property of the post. An unknown focus
+/// cid is an empty view (E4). Allocates in `arena`.
 pub fn buildThreadView(
     arena: Allocator,
     store: *const Store,
     focus_cid: []const u8,
 ) error{OutOfMemory}![]TimelineItem {
-    const focus = lookupCid(store, focus_cid) orelse return &.{};
+    const focus_usize = lookupCid(store, focus_cid) orelse return &.{};
+    const focus: u32 = @intCast(focus_usize);
     const posts = store.posts.slice();
     const parents = posts.items(.reply_parent);
     const createds = posts.items(.created_at);
 
-    // Ancestors: walk the parent chain up (cycle-guarded), parent-first, then
-    // reverse to root-first for rendering above the focus.
-    var anc: std.ArrayList(u32) = .empty;
-    defer anc.deinit(arena);
-    var cur: u32 = @intCast(focus);
+    // Walk up to the thread root (cycle-guarded).
+    var root: u32 = focus;
     var guard: usize = 0;
     while (guard < 4096) : (guard += 1) {
-        const p = parents[cur].unwrap() orelse break;
-        const pr: u32 = @intFromEnum(p);
-        try anc.append(arena, pr);
-        cur = pr;
+        const p = parents[root].unwrap() orelse break;
+        root = @intFromEnum(p);
     }
-    std.mem.reverse(u32, anc.items);
 
-    // Direct replies: posts whose parent is the focus, chronological ascending.
-    var reps: std.ArrayList(u32) = .empty;
-    defer reps.deinit(arena);
+    // parent row → child rows (the tree, built from the exact parent edges).
+    var children: std.AutoHashMapUnmanaged(u32, std.ArrayListUnmanaged(u32)) = .empty;
+    defer {
+        var vit = children.valueIterator();
+        while (vit.next()) |v| v.deinit(arena);
+        children.deinit(arena);
+    }
     for (parents, 0..) |pp, row| {
         if (pp.unwrap()) |pi| {
-            if (@intFromEnum(pi) == focus) try reps.append(arena, @intCast(row));
+            const pr: u32 = @intFromEnum(pi);
+            const gop = try children.getOrPut(arena, pr);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(arena, @intCast(row));
         }
     }
+
     const Asc = struct {
         createds: []const i64,
         pub fn lessThan(ctx: @This(), x: u32, y: u32) bool {
             return ctx.createds[x] < ctx.createds[y]; // oldest first
         }
     };
-    std.sort.block(u32, reps.items, Asc{ .createds = createds }, Asc.lessThan);
 
-    const out = try arena.alloc(TimelineItem, anc.items.len + 1 + reps.items.len);
-    var i: usize = 0;
-    for (anc.items) |r| {
-        out[i] = fillTimelineItem(store, r, .none);
-        i += 1;
+    // DFS preorder via an explicit stack: pop a node, emit it, push its children
+    // in REVERSE chronological order so the oldest pops (and renders) first —
+    // each subtree fully emitted before the next sibling (the nested order).
+    const Frame = struct { row: u32, depth: u8 };
+    var out: std.ArrayList(TimelineItem) = .empty;
+    defer out.deinit(arena);
+    var stack: std.ArrayList(Frame) = .empty;
+    defer stack.deinit(arena);
+    try stack.append(arena, .{ .row = root, .depth = 0 });
+    while (stack.pop()) |fr| {
+        var item = fillTimelineItem(store, fr.row, .none);
+        item.depth = fr.depth;
+        item.is_focus = fr.row == focus;
+        try out.append(arena, item);
+        if (children.get(fr.row)) |kids| {
+            const ks = try arena.dupe(u32, kids.items);
+            std.sort.block(u32, ks, Asc{ .createds = createds }, Asc.lessThan);
+            var i = ks.len;
+            while (i > 0) {
+                i -= 1;
+                try stack.append(arena, .{ .row = ks[i], .depth = fr.depth +| 1 });
+            }
+        }
     }
-    out[i] = fillTimelineItem(store, focus, .none);
-    i += 1;
-    for (reps.items) |r| {
-        out[i] = fillTimelineItem(store, r, .none);
-        i += 1;
-    }
-    return out;
+    return out.toOwnedSlice(arena);
 }
 
 // ---------------------------------------------------------------------------
@@ -1691,6 +1711,55 @@ test "ingest: a later sighting reconciles a placeholder handle to the resolved o
     // BOTH posts (one author) now read the reconciled handle, not the DID.
     try testing.expectEqual(@as(usize, 2), items.len);
     for (items) |it| try testing.expectEqualStrings("bob.zat4.com", it.author_handle);
+}
+
+test "buildThreadView: nested preorder with view-derived depth + focus" {
+    const gpa = testing.allocator;
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // root <- childA <- grandchild ; root <- childB (childA older than childB).
+    const mk = struct {
+        fn p(g: Allocator, s: *Store, cid: []const u8, text: []const u8, parent: []const u8, created: i64) !void {
+            _ = try ingestLivePost(g, s, .{
+                .did = "did:plc:a",
+                .handle = "a.zat4.com",
+                .uri = "at://did:plc:a/app.zat4.feed.post/x",
+                .cid = cid,
+                .text = text,
+                .reply_parent_cid = parent,
+                .reply_root_cid = if (parent.len > 0) "cRoot" else "",
+                .created_at = created,
+            });
+        }
+    }.p;
+    try mk(gpa, &store, "cRoot", "root", "", 10);
+    try mk(gpa, &store, "cA", "child A", "cRoot", 20);
+    try mk(gpa, &store, "cB", "child B", "cRoot", 25);
+    try mk(gpa, &store, "cG", "grandchild", "cA", 30);
+
+    // Focus the grandchild; the view is the WHOLE thread from the root, nested.
+    const t = try buildThreadView(arena, &store, "cG");
+    try testing.expectEqual(@as(usize, 4), t.len);
+    // Preorder, siblings chronological: root(0), childA(1), grandchild(2), childB(1).
+    try testing.expectEqualStrings("root", t[0].text);
+    try testing.expectEqual(@as(u8, 0), t[0].depth);
+    try testing.expectEqualStrings("child A", t[1].text);
+    try testing.expectEqual(@as(u8, 1), t[1].depth);
+    try testing.expectEqualStrings("grandchild", t[2].text);
+    try testing.expectEqual(@as(u8, 2), t[2].depth);
+    try testing.expect(t[2].is_focus); // the focused post is marked
+    try testing.expectEqualStrings("child B", t[3].text);
+    try testing.expectEqual(@as(u8, 1), t[3].depth);
+    // Only the focus is flagged.
+    var focus_count: usize = 0;
+    for (t) |it| {
+        if (it.is_focus) focus_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), focus_count);
 }
 
 test "view model: a profile view is a query over the shared store; engagement is unified" {

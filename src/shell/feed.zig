@@ -216,21 +216,9 @@ pub fn loadThread(
     switch (outcome) {
         .failed => |failure| return .{ .failed = failure },
         .ok => |thread| {
-            // Flatten ancestors + focus + replies into one page and ingest as
-            // content; the thread view is a query over the store afterwards.
-            const items = try arena.alloc(lexicon.FeedViewPost, thread.ancestors.len + 1 + thread.replies.len);
-            var i: usize = 0;
-            for (thread.ancestors) |a| {
-                items[i] = a;
-                i += 1;
-            }
-            items[i] = thread.post;
-            i += 1;
-            for (thread.replies) |rp| {
-                items[i] = rp;
-                i += 1;
-            }
-            const page: lexicon.TimelinePage = .{ .feed = items };
+            // The whole thread arrives flat; ingest as content. The nested view
+            // is then a query over the store (feed_core.buildThreadView).
+            const page: lexicon.TimelinePage = .{ .feed = thread.posts };
             return .{ .ok = try feed_core.ingestPosts(gpa, store, page) };
         },
     }

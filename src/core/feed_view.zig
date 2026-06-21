@@ -149,12 +149,16 @@ pub const PostView = struct {
     initial: u8, // avatar letter (ASCII)
     liked: bool,
     boosted: bool,
-    _pad: u8 = 0, // A6: explicit
+    /// Thread nesting depth (0 = root) + whether this is the focused post —
+    /// VIEW-DERIVED (the reader's lens), 0/false outside the thread view. Both
+    /// ride the tail padding, so the size is unchanged.
+    depth: u8 = 0,
+    is_focus: bool = false,
 
     comptime {
-        // Budget: 4 slices (4×16) + 4 u32 (16) + 4 bytes, padded to the
-        // 8-byte slice alignment = 88. Exact (A7); raising needs an A7.1
-        // note here.
+        // Budget: 4 slices (4×16) + 4 u32 (16) + 5 bytes (initial/liked/
+        // boosted/depth/is_focus), padded to the 8-byte slice alignment = 88.
+        // Exact (A7); raising needs an A7.1 note here.
         assert(@sizeOf(PostView) == 88);
     }
 };
@@ -601,17 +605,29 @@ pub fn layout(
         return height;
     }
 
-    // 3. Posts.
-    const av: i32 = 46;
+    // 3. Posts. On the THREAD screen the view nests: each post is indented by its
+    // (view-derived) depth and gets vertical guide rails for its ancestor levels,
+    // with a smaller avatar so the staircase fits the column. Depth is 0 on every
+    // other screen, so this collapses to the flat feed there.
+    const is_thread = active_screen == screen_thread;
+    const av: i32 = if (is_thread) 32 else 46;
     const gap: i32 = 13;
-    const cx = m.lx + av + gap;
-    const content_w = m.cw - av - gap;
+    const indent_step: i32 = 30;
+    const max_levels: i32 = 7; // cap the indent so a deep thread can't run off-column
+    const init_px: u16 = if (is_thread) 17 else 22;
+    const av_base: i32 = @divTrunc(av * 2, 3) + 1; // avatar-initial baseline within the disc
     const body_line: i32 = @max(23, @as(i32, @intCast(text.lineMetrics(e, .regular, 16).height)));
 
     var y: i32 = feed_y0 + scroll;
     for (posts, 0..) |p, pi| {
         var nb: [12]u8 = undefined;
         const post_top = y;
+        // View-derived nesting geometry (thread screen only).
+        const dep: i32 = if (is_thread) @min(@as(i32, p.depth), max_levels) else 0;
+        const indent: i32 = dep * indent_step;
+        const ax = m.lx + indent; // avatar left
+        const cx = ax + av + gap; // text/body left
+        const content_w = m.cw - indent - av - gap;
 
         // Measure the post's height WITHOUT drawing (no i16 casts), so we can
         // both advance the scroll accounting and decide visibility. Only posts
@@ -642,16 +658,31 @@ pub fn layout(
         const visible = next_y > 0 and post_top < height;
 
         if (visible) {
+            // The focused post (thread screen): a faint accent wash behind it,
+            // drawn first so everything else sits on top.
+            if (p.is_focus) try rect(gpa, dl, m.col_x, post_top - 6, m.col_w, (next_y - post_top), 0x16E8B84B, 8);
+
             // Whole-post tap target → open this post's thread. Emitted FIRST so
             // the avatar + engagement regions (emitted after, found first in the
             // reverse hit-test) punch through it — "whole post minus carve-outs".
             try emitRegion(gpa, regions, m.col_x, post_top, m.col_w, @intCast(@max(0, @min(32767, bottom - post_top))), @intCast(pi), .post_body);
 
+            // Nesting rails: a thin vertical guide at each ancestor level's avatar
+            // column, spanning the row. DFS order keeps a subtree contiguous, so
+            // consecutive rows form one continuous line per level (the Reddit rail).
+            if (is_thread and dep > 0) {
+                var l: i32 = 0;
+                while (l < dep) : (l += 1) {
+                    const rx = m.lx + l * indent_step + @divTrunc(av, 2);
+                    try rect(gpa, dl, rx, post_top - 6, 2, (next_y - post_top), 0x33B7B3A8, 0);
+                }
+            }
+
             // avatar disc + initial — tapping it opens that author's profile.
-            try rect(gpa, dl, m.lx, post_top, av, av, p.tint, @intCast(av >> 1));
-            const iadv: i32 = @intCast(text.advance(e, .semibold, p.initial, 22));
-            _ = try glyph1(gpa, dl, e, .semibold, m.lx + @divTrunc(av - iadv, 2), post_top + 31, bg, 22, p.initial);
-            try emitRegion(gpa, regions, m.lx, post_top, av, av, @intCast(pi), .author);
+            try rect(gpa, dl, ax, post_top, av, av, p.tint, @intCast(av >> 1));
+            const iadv: i32 = @intCast(text.advance(e, .semibold, p.initial, init_px));
+            _ = try glyph1(gpa, dl, e, .semibold, ax + @divTrunc(av - iadv, 2), post_top + av_base, bg, init_px, p.initial);
+            try emitRegion(gpa, regions, ax, post_top, av, @intCast(av), @intCast(pi), .author);
 
             // name · handle · age
             var bx = try str(gpa, dl, e, .semibold, cx, post_top + 17, ink, 17, p.name);
@@ -696,8 +727,13 @@ pub fn layout(
             ex = try str(gpa, dl, e, .regular, ex, erow, if (p.liked) like_c else muted, 13, std.fmt.bufPrint(&nb, "{d}", .{p.like}) catch "0");
             try emitRegion(gpa, regions, like_x, tap_y, ex - like_x, tap_h, @intCast(pi), .like);
 
-            // divider
-            try rect(gpa, dl, m.col_x, bottom, m.col_w, 1, divider, 0);
+            // divider — full-width on the flat feed; the thread uses its rails
+            // for separation, so only a short divider under the indented content.
+            if (is_thread) {
+                try rect(gpa, dl, ax, bottom, m.col_x + m.col_w - ax - 4, 1, divider, 0);
+            } else {
+                try rect(gpa, dl, m.col_x, bottom, m.col_w, 1, divider, 0);
+            }
         }
         y = next_y;
     }
@@ -923,6 +959,8 @@ pub fn fromTimeline(arena: Allocator, items: []const feed.TimelineItem, now: i64
             .initial = initialOf(name),
             .liked = it.item_flags.viewer_liked,
             .boosted = it.item_flags.viewer_reposted,
+            .depth = it.depth,
+            .is_focus = it.is_focus,
         };
     }
     return out;

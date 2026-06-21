@@ -284,15 +284,14 @@ pub const TimelinePage = struct {
     feed: []const FeedViewPost = &.{},
 };
 
-/// Response of `app.zat4.feed.getPostThread`: the focused post with its ancestor
-/// chain (root → immediate parent, in order) and its direct replies
-/// (chronological). FLAT (not bsky's recursive ThreadViewPost) — the client
-/// renders the ancestors above the focused post and the replies below it.
+/// Response of `app.zat4.feed.getPostThread`: every post in the focused post's
+/// thread (its root + the whole descendant tree), as a FLAT reference set — no
+/// tree, no depth on the wire (the post is the post; structure is the reader's
+/// lens, derived client-side from the reply edges). The client builds the nested
+/// order + per-post depth in `feed.buildThreadView`.
 /// A7.2: cold struct, size guard waived — transient parse/build target.
 pub const ThreadView = struct {
-    ancestors: []const FeedViewPost = &.{},
-    post: FeedViewPost = .{},
-    replies: []const FeedViewPost = &.{},
+    posts: []const FeedViewPost = &.{},
 };
 
 // ---------------------------------------------------------------------------
