@@ -382,6 +382,7 @@ test {
     _ = @import("shell/xrpc.zig");
     _ = @import("shell/auth.zig");
     _ = @import("core/feed.zig");
+    _ = @import("core/feed_view.zig");
     _ = @import("core/appview.zig");
     _ = @import("core/moderation.zig");
     _ = @import("core/tui.zig");

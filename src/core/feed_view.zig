@@ -772,14 +772,14 @@ test "layout emits 3 tap regions per post; hitTest resolves each at its center" 
     const posts = [_]PostView{
         .{ .name = "A", .handle = "@a.zat", .age = "1m", .body = "hello there field", .tint = 0xFFAAAAAA, .reply = 1, .boost = 2, .like = 3, .initial = 'A', .liked = true, .boosted = false },
     };
-    const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null);
+    const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null);
     try std.testing.expect(h > 112); // content extends below the top bar
     try std.testing.expectEqual(@as(usize, 3), regions.items.len);
 
     var saw_like = false;
     for (regions.items) |r| {
-        const cxp = @as(i32, r.x) + @as(i32, r.w) / 2;
-        const cyp = @as(i32, r.y) + @as(i32, r.h) / 2;
+        const cxp = @as(i32, r.x) + @divTrunc(@as(i32, r.w), 2);
+        const cyp = @as(i32, r.y) + @divTrunc(@as(i32, r.h), 2);
         const hit = hitTest(regions.items, cxp, cyp) orelse return error.NoHit;
         try std.testing.expectEqual(r.kind, hit.kind);
         try std.testing.expectEqual(@as(u16, 0), hit.post);
@@ -808,7 +808,7 @@ test "long timeline does not overflow draw coordinates (off-screen posts skipped
     const posts = try arena.alloc(PostView, n);
     for (posts) |*pv| pv.* = .{ .name = "x", .handle = "@x.zat", .age = "1m", .body = "a body line that wraps a little across the feed column width here", .tint = 0xFF888888, .reply = 1, .boost = 2, .like = 3, .initial = 'x', .liked = false, .boosted = false };
 
-    const h = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, null); // must not panic
+    const h = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, null, false, screen_home, null); // must not panic
     try std.testing.expect(h > 940 * 10); // height accounts for the whole list
     try std.testing.expect(regions.items.len < 3 * 24); // only on-screen posts are tappable
 
@@ -822,12 +822,42 @@ test "long timeline does not overflow draw coordinates (off-screen posts skipped
     @memset(heights, -1);
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h_fill = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights);
+    const h_fill = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null);
     const fill_regions = regions.items.len;
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h_cached = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights);
+    const h_cached = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null);
     try std.testing.expectEqual(h, h_fill);
     try std.testing.expectEqual(h, h_cached);
     try std.testing.expectEqual(fill_regions, regions.items.len);
+}
+
+test "profile screen renders the author's posts under a header; other screens stay placeholders" {
+    const gpa = std.testing.allocator;
+    var engine = try text.initEngine();
+    defer text.deinitEngine(gpa, &engine);
+    var dl: raster.DrawList = .{};
+    defer dl.deinit(gpa);
+    var regions: Regions = .empty;
+    defer regions.deinit(gpa);
+
+    const posts = [_]PostView{
+        .{ .name = "Connor", .handle = "@connor.zat4.com", .age = "2h", .body = "hello world", .tint = 0xFFAAAAAA, .reply = 0, .boost = 0, .like = 1, .initial = 'C', .liked = false, .boosted = false },
+    };
+    const header: ProfileHeader = .{ .display_name = "connor.zat4.com", .handle = "@connor.zat4.com", .post_count = 1 };
+
+    // Profile screen: the author's post renders below the header band — same
+    // post loop as Home, so it emits the 3 tap regions (read-only at the tap
+    // layer, but the geometry is identical).
+    const hp = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_profile, header);
+    try std.testing.expect(hp > 112);
+    try std.testing.expectEqual(@as(usize, 3), regions.items.len);
+
+    // A non-Home, non-Profile screen is a titled placeholder: no posts render,
+    // so no tap regions, and the height clamps to the viewport (no post stack).
+    dl.len = 0;
+    regions.clearRetainingCapacity();
+    const he = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, 1, null); // Explore
+    try std.testing.expectEqual(@as(i32, 940), he);
+    try std.testing.expectEqual(@as(usize, 0), regions.items.len);
 }
