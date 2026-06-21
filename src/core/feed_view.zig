@@ -62,7 +62,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// `compose` (the New-post button) route navigation rather than engagement.
 /// `compose_send` / `compose_cancel` are the premium composer's footer buttons
 /// (the shell turns a tap into the same control byte the keyboard sends).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new };
 
 /// The six top-level rail destinations, in order. The `Screen` index a nav
 /// region carries is an index into this. Shared by the rail (draw + hit) and
@@ -535,6 +535,9 @@ pub fn layout(
     /// Null on every other screen (Home draws the feed; the rest are
     /// placeholders).
     profile: ?ProfileHeader,
+    /// Count of staged-but-unrevealed new posts. When > 0 on Home, a pinned
+    /// "N new posts" pill is drawn below the header (a `.reveal_new` tap region).
+    pending_new: usize,
 ) error{OutOfMemory}!i32 {
     const m = metricsFor(width);
     if (regions) |rg| rg.clearRetainingCapacity();
@@ -758,6 +761,22 @@ pub fn layout(
     // The sticky top bar, drawn LAST so the posts above scroll BEHIND its
     // frosted box with the title/tabs crisp on top.
     try drawTopBar(gpa, dl, e, m, active_screen, regions);
+
+    // The "N new posts" pill (Home only): staged arrivals waiting to be revealed.
+    // Pinned just below the header, centered; tapping it reveals + scrolls to top
+    // — the reader is never displaced involuntarily (Twitter/Bluesky pattern).
+    if (active_screen == screen_home and pending_new > 0) {
+        var pb: [40]u8 = undefined;
+        const label = std.fmt.bufPrint(&pb, "\xE2\x86\x91 {d} new post{s}", .{ pending_new, if (pending_new == 1) "" else "s" }) catch "new posts";
+        const lw: i32 = @intCast(text.measure(e, .semibold, label, 14));
+        const pw = lw + 40;
+        const pill_h: i32 = 38;
+        const px = m.col_x + @divTrunc(m.col_w - pw, 2);
+        const py: i32 = if (m.wide) 120 else 104;
+        try rect(gpa, dl, px, py, pw, pill_h, accent, 19);
+        _ = try str(gpa, dl, e, .semibold, px + 20, py + 25, bg, 14, label);
+        try emitRegion(gpa, regions, px, py, pw, pill_h, 0, .reveal_new);
+    }
     return y - scroll; // total content height (scroll-independent), for clamping
 }
 
@@ -1055,7 +1074,7 @@ test "layout emits 4 tap regions per post (avatar + 3 engagement); hitTest resol
     const posts = [_]PostView{
         .{ .name = "A", .handle = "@a.zat", .age = "1m", .body = "hello there field", .tint = 0xFFAAAAAA, .reply = 1, .boost = 2, .like = 3, .initial = 'A', .liked = true, .boosted = false },
     };
-    const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null);
+    const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0);
     try std.testing.expect(h > 112); // content extends below the top bar
     // 5 regions per post: the whole-post body tap + the avatar + 3 engagement.
     try std.testing.expectEqual(@as(usize, 5), regions.items.len);
@@ -1137,7 +1156,7 @@ test "long timeline does not overflow draw coordinates (off-screen posts skipped
     const posts = try arena.alloc(PostView, n);
     for (posts) |*pv| pv.* = .{ .name = "x", .handle = "@x.zat", .age = "1m", .body = "a body line that wraps a little across the feed column width here", .tint = 0xFF888888, .reply = 1, .boost = 2, .like = 3, .initial = 'x', .liked = false, .boosted = false };
 
-    const h = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, null, false, screen_home, null); // must not panic
+    const h = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, null, false, screen_home, null, 0); // must not panic
     try std.testing.expect(h > 940 * 10); // height accounts for the whole list
     try std.testing.expect(regions.items.len < 4 * 24); // only on-screen posts are tappable
 
@@ -1151,11 +1170,11 @@ test "long timeline does not overflow draw coordinates (off-screen posts skipped
     @memset(heights, -1);
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h_fill = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null);
+    const h_fill = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0);
     const fill_regions = regions.items.len;
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h_cached = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null);
+    const h_cached = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0);
     try std.testing.expectEqual(h, h_fill);
     try std.testing.expectEqual(h, h_cached);
     try std.testing.expectEqual(fill_regions, regions.items.len);
@@ -1178,7 +1197,7 @@ test "profile screen renders the author's posts under a header; other screens st
     // Profile screen: the author's post renders below the header band — same
     // post loop as Home, so it emits the 5 tap regions (post body + avatar + 3
     // engagement; the header here isn't editable, so no edit-profile region).
-    const hp = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_profile, header);
+    const hp = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_profile, header, 0);
     try std.testing.expect(hp > 112);
     try std.testing.expectEqual(@as(usize, 5), regions.items.len);
 
@@ -1186,7 +1205,7 @@ test "profile screen renders the author's posts under a header; other screens st
     // so no tap regions, and the height clamps to the viewport (no post stack).
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const he = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, 1, null); // Explore
+    const he = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, 1, null, 0); // Explore
     try std.testing.expectEqual(@as(i32, 940), he);
     try std.testing.expectEqual(@as(usize, 0), regions.items.len);
 }

@@ -535,6 +535,7 @@ pub fn run(
             clock_shell.monotonicNanos() -| last_input_nanos >= input_idle_gate_nanos)
         {
             last_auto_refresh = now;
+            const was_empty = store.feed.len == 0;
             const outcome = feed_shell.refreshTimeline(gpa, arena, io, environ, session, appview_url, store, 30) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => blk: {
@@ -543,11 +544,21 @@ pub fn run(
                 },
             };
             if (outcome) |result| switch (result) {
-                .ok => |stats| if (stats.items_added > 0) {
-                    state.selected = 0;
-                    state.scroll_top = 0;
-                    gview.scroll_rows = 0;
-                    status = std.fmt.bufPrint(&status_buf, "+{d} new", .{stats.items_added}) catch "new posts";
+                // New posts are STAGED (refreshTimeline doesn't displace the
+                // reader). Reveal them immediately ONLY on the first load (an
+                // empty feed) or when the reader is at the very top of Home;
+                // otherwise leave them behind the "N new posts" pill so the
+                // reader's place is never yanked (the Twitter/Bluesky pattern).
+                .ok => if (feed_core.pendingCount(store) > 0) {
+                    const at_top_home = gscreen == feed_view.screen_home and gscroll_px == 0;
+                    if (was_empty or at_top_home) {
+                        _ = feed_core.revealPending(gpa, store) catch 0;
+                        state.selected = 0;
+                        state.scroll_top = 0;
+                        gview.scroll_rows = 0;
+                        gscroll_px = 0;
+                    }
+                    // else: the pill (feed_core.pendingCount) carries the count.
                 },
                 .failed => {}, // a refused poll is silent; the next tick retries
             };
@@ -613,7 +624,7 @@ pub fn run(
         // pix exists exactly when a window backend has a live engine; the
         // composer and profile screens stay on the cell path this cut
         // (their pixel port is the recorded next slice).
-        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null } else null;
+        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store) } else null;
         switch (mode) {
             .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status),
             .compose => {
@@ -959,6 +970,16 @@ pub fn run(
                                             gscreen = thread_return_screen;
                                             g.scroll.* = 0;
                                         },
+                                        // "N new posts" pill → reveal the staged
+                                        // posts + jump to the top (the reader opted
+                                        // in, so displacing them now is wanted).
+                                        .reveal_new => {
+                                            _ = feed_core.revealPending(gpa, store) catch 0;
+                                            g.scroll.* = 0;
+                                            gview.scroll_rows = 0;
+                                            state.selected = 0;
+                                            status = "";
+                                        },
                                         // The composer's footer buttons never appear
                                         // on the timeline; they are handled in compose
                                         // mode below.
@@ -1062,18 +1083,20 @@ pub fn run(
                     };
                     status = switch (outcome) {
                         .ok => |stats| blk: {
-                            if (stats.items_added > 0) {
-                                // An explicit refresh asks to SEE the new —
-                                // jump to the top. (Passive live arrivals
-                                // still preserve the reading position.)
+                            // An explicit refresh asks to SEE the new — REVEAL
+                            // the staged posts and jump to the top. (The passive
+                            // auto-refresh stages them behind the pill instead.)
+                            const revealed_n = feed_core.revealPending(gpa, store) catch 0;
+                            if (revealed_n > 0) {
                                 state.selected = 0;
                                 state.scroll_top = 0;
                                 gview.scroll_rows = 0;
+                                gscroll_px = 0;
                             }
-                            break :blk if (stats.items_added == 0)
+                            break :blk if (stats.items_added == 0 and revealed_n == 0)
                                 "no new posts"
                             else
-                                std.fmt.bufPrint(&status_buf, "+{d} new at top", .{stats.items_added}) catch "new posts";
+                                std.fmt.bufPrint(&status_buf, "+{d} new at top", .{revealed_n}) catch "new posts";
                         },
                         .failed => |failure| std.fmt.bufPrint(&status_buf, "refused: {d} {s}", .{
                             failure.status, failure.code,
@@ -1752,6 +1775,9 @@ const Grid = struct {
     /// A pointer into run()'s `gpu_state` local; one-frame contract like the
     /// rest of Grid.
     gpu: ?*GpuState,
+    /// Count of staged-but-unrevealed new posts this frame — drives the Home
+    /// "N new posts" pill. A value (set per frame), not a pointer.
+    pending_new: usize = 0,
 };
 
 // ===========================================================================
@@ -2109,7 +2135,7 @@ fn paintFrame(
             // by the REAL timeline via a pure transform (B5). An empty timeline
             // renders the chrome with no posts — no placeholder content.
             const feed_posts = feed_view.fromTimeline(arena, view_items, now) catch &[_]feed_view.PostView{};
-            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*, profile_header) catch g.content_h.*;
+            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*, profile_header, g.pending_new) catch g.content_h.*;
             const t_layout = if (debug_frame_timing) clock_shell.monotonicNanos() else 0;
             window_shell.presentDrawList(win, gpa, g.engine, g.draw.slice(), field_core.background) catch {}; // E2: a lost blit is the next frame's problem
             if (debug_frame_timing) {
@@ -2278,7 +2304,7 @@ fn paintFrameGpu(
         // skip_heart=true on every screen: the SDF heart pass (drawEngagementHearts,
         // below) draws the heart in place for each visible like button of the
         // ACTIVE view, so layout never draws its own — one heart, one pipeline.
-        g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true, g.screen.*, profile_header) catch g.content_h.*;
+        g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true, g.screen.*, profile_header, g.pending_new) catch g.content_h.*;
         gpu.feedBuild(&gs.feed, gpa, g.engine, g.draw.slice(), scale) catch {};
     }
 

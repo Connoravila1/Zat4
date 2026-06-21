@@ -196,6 +196,12 @@ pub const Store = struct {
     posts: std.MultiArrayList(Post) = .empty,
     authors: std.MultiArrayList(Author) = .empty,
     feed: std.MultiArrayList(FeedItem) = .empty,
+    /// STAGED feed rows — newer posts the refresh fetched but has NOT revealed,
+    /// so the reader isn't displaced. They are resident CONTENT (in `posts`); only
+    /// the Home ORDERING waits here behind the "N new posts" pill until the reader
+    /// opts in (taps the pill / is at the very top). `revealPending` flushes them
+    /// to the front of `feed`. (Ordering is a query; this is a deferred ordering.)
+    pending: std.MultiArrayList(FeedItem) = .empty,
     post_by_cid: SpanIndexMap = .empty,
     author_by_did: SpanIndexMap = .empty,
     /// Whether THIS account has liked/reposted each post — booleans stored
@@ -231,6 +237,7 @@ pub fn deinitStore(gpa: Allocator, store: *Store) void {
     store.posts.deinit(gpa);
     store.authors.deinit(gpa);
     store.feed.deinit(gpa);
+    store.pending.deinit(gpa);
     store.post_by_cid.deinit(gpa);
     store.author_by_did.deinit(gpa);
     store.liked.deinit(gpa);
@@ -376,16 +383,25 @@ pub fn ingestPageRefresh(
             break :blk .from(try internAuthor(gpa, store, reason.by, &stats));
         };
 
-        const already_in_feed = blk: {
+        // Dedup against BOTH the revealed feed AND the staging area, so a post
+        // already shown (or already waiting behind the pill) is not re-staged.
+        const already_known = blk: {
             const feed_posts = store.feed.items(.post);
             const feed_reposters = store.feed.items(.reposted_by);
             for (feed_posts, feed_reposters) |fp, fr| {
                 if (fp == post_index and fr == reposted_by) break :blk true;
             }
+            const pend_posts = store.pending.items(.post);
+            const pend_reposters = store.pending.items(.reposted_by);
+            for (pend_posts, pend_reposters) |fp, fr| {
+                if (fp == post_index and fr == reposted_by) break :blk true;
+            }
             break :blk false;
         };
-        if (!already_in_feed) {
-            try store.feed.insert(gpa, insert_at, .{
+        if (!already_known) {
+            // STAGE it (do not displace the reader). `revealPending` moves the
+            // staged rows to the front of the feed when the reader opts in.
+            try store.pending.insert(gpa, insert_at, .{
                 .post = post_index,
                 .reposted_by = reposted_by,
             });
@@ -395,6 +411,29 @@ pub fn ingestPageRefresh(
     }
 
     return stats;
+}
+
+/// Number of staged-but-unrevealed new posts — the "N new posts" pill count.
+pub fn pendingCount(store: *const Store) usize {
+    return store.pending.len;
+}
+
+/// Reveal the staged new posts: move them, in order, to the FRONT of the Home
+/// feed (newest first), then clear the staging area. The caller scrolls to the
+/// top so the reader lands on the new posts. Returns how many were revealed.
+pub fn revealPending(gpa: Allocator, store: *Store) error{OutOfMemory}!usize {
+    const n = store.pending.len;
+    if (n == 0) return 0;
+    var i: usize = n;
+    while (i > 0) {
+        i -= 1; // insert from the back so the staged order is preserved at the front
+        try store.feed.insert(gpa, 0, .{
+            .post = store.pending.items(.post)[i],
+            .reposted_by = store.pending.items(.reposted_by)[i],
+        });
+    }
+    store.pending.clearRetainingCapacity();
+    return n;
 }
 
 /// Intern an author by DID. First sighting wins the display fields for now;
@@ -1985,17 +2024,26 @@ test "refresh ingest: new rows prepend in order, cursor untouched, rows dedup by
     };
     const stats = try ingestPageRefresh(gpa, &store, refresh_page);
     try testing.expectEqual(@as(u32, 1), stats.items_added);
-    try testing.expectEqual(len_before + 1, store.feed.len);
+    // STAGED, not revealed: the feed is unchanged (the reader isn't displaced);
+    // the new post waits behind the pill. The cursor is untouched.
+    try testing.expectEqual(len_before, store.feed.len);
+    try testing.expectEqual(@as(usize, 1), pendingCount(&store));
     try testing.expectEqualStrings("CURSOR-1", nextCursor(&store));
+
+    // Reveal: the staged post lands on TOP, in order; the pill clears.
+    _ = try revealPending(gpa, &store);
+    try testing.expectEqual(len_before + 1, store.feed.len);
+    try testing.expectEqual(@as(usize, 0), pendingCount(&store));
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const items = try buildTimeline(arena_state.allocator(), &store);
     try testing.expectEqualStrings("the newest post", items[0].text);
 
-    // Refreshing the same page again adds nothing.
+    // Refreshing the same page again stages nothing (now revealed in the feed).
     const again = try ingestPageRefresh(gpa, &store, refresh_page);
     try testing.expectEqual(@as(u32, 0), again.items_added);
+    try testing.expectEqual(@as(usize, 0), pendingCount(&store));
     try testing.expectEqual(len_before + 1, store.feed.len);
 }
 

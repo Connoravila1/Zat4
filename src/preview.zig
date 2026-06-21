@@ -83,7 +83,7 @@ pub fn main(init: std.process.Init) !void {
     items[1].replying_to_handle = "mara.zat";
     const posts = try feed_view.fromTimeline(arena, &items, now);
 
-    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, 0, null);
+    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, 0, null, 3);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
 
     const io = init.io;
@@ -112,7 +112,7 @@ pub fn main(init: std.process.Init) !void {
         tv("lune.zat", "lune", "weather you can't even reply to without getting rained on.", 0xFFA9B6D6, 'l', 2, true),
         tv("rune.zat", "rune", "this is why i kept the field on. it keeps the light at human scale.", 0xFFB5A9CC, 'r', 1, false),
     };
-    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), &thread, 0, &dl, null, null, false, feed_view.screen_thread, null);
+    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), &thread, 0, &dl, null, null, false, feed_view.screen_thread, null, 0);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_thread.ppm");
     std.debug.print("wrote /tmp/zat_thread.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });

@@ -379,6 +379,11 @@ test "loopback refresh: new rows land on top, the pagination cursor survives" {
     }
     try std.testing.expectEqualStrings("CURSOR-1", feed_core.nextCursor(&store));
 
+    // A passive refresh STAGES the new post behind the pill (no displacement);
+    // reveal it (as the pill tap / at-top auto-reveal does) before it's in the feed.
+    try std.testing.expectEqual(@as(usize, 1), feed_core.pendingCount(&store));
+    _ = try feed_core.revealPending(gpa, &store);
+
     _ = arena_state.reset(.retain_capacity);
     const items = try feed_core.buildTimeline(arena_state.allocator(), &store);
     try std.testing.expectEqualStrings("the newest one", items[0].text);
