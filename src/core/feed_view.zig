@@ -51,6 +51,8 @@ const boost_c: u32 = 0xFF8FD18F;
 /// and hollow-heart icons read as one set.
 const icon_grey: u32 = 0xFF757A8F;
 const veil: u32 = 0xD4181812; // ~83% over the field — texture glows faintly through
+const header_veil: u32 = 0xF2181812; // ~95%: the sticky top bar, drawn OVER the posts so
+// they scroll BEHIND it (firmly dimmed), the title/tabs crisp on top — a frosted header
 // ambient-texture slice will lower this so the living field glows through.
 const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 
@@ -511,6 +513,10 @@ pub fn layout(
     // 1. Feed column readability panel.
     try rect(gpa, dl, m.col_x, 0, m.col_w, height, veil, 0);
 
+    // The feed-column TOP BAR (title, tabs, divider, and its frosted box) is
+    // drawn LAST — see drawTopBar at the end — so the posts scroll BEHIND it.
+    // Here we only place the rail/sidebar (their own columns, nothing scrolls
+    // under them) and fix where the post stack begins.
     var feed_y0: i32 = 112;
     if (m.wide) {
         // 2a. Desktop three-pane: nav rail + sidebar flank the feed. Each
@@ -518,25 +524,8 @@ pub fn layout(
         // sidebar cards) so the field stays visible between them.
         try drawRail(gpa, dl, e, m.rail_x, height, active_screen, regions);
         try drawSidebar(gpa, dl, e, m.side_x, height);
-        // feed header: the active screen's title (+ tabs on Home).
-        _ = try str(gpa, dl, e, .semibold, m.lx, 50, ink, 27, nav_labels[active_screen]);
-        if (active_screen == 0) {
-            _ = try str(gpa, dl, e, .semibold, m.lx, 88, ink, 16, "Following");
-            const fw2: i32 = @intCast(text.measure(e, .semibold, "Following", 16));
-            _ = try str(gpa, dl, e, .regular, m.lx + fw2 + 28, 88, faint, 16, "Discover");
-            try rect(gpa, dl, m.lx, 98, fw2, 3, accent, 2);
-        }
-        try rect(gpa, dl, m.col_x, 110, m.col_w, 1, divider, 0);
         feed_y0 = 126;
     } else {
-        // 2b. Mobile: wordmark + tabs pinned in the feed column.
-        const wm = try str(gpa, dl, e, .semibold, m.lx, 42, accent, 22, "zat4");
-        _ = try str(gpa, dl, e, .semibold, wm, 42, ink, 22, ".");
-        _ = try str(gpa, dl, e, .semibold, m.lx, 76, ink, 15, "Following");
-        const fw: i32 = @intCast(text.measure(e, .semibold, "Following", 15));
-        _ = try str(gpa, dl, e, .regular, m.lx + fw + 26, 76, faint, 15, "Discover");
-        try rect(gpa, dl, m.lx, 86, fw, 3, accent, 2);
-        try rect(gpa, dl, m.col_x, 96, m.col_w, 1, divider, 0);
         feed_y0 = 112;
     }
 
@@ -568,6 +557,7 @@ pub fn layout(
         const msg = "Coming soon";
         const tw: i32 = @intCast(text.measure(e, .regular, msg, 16));
         _ = try str(gpa, dl, e, .regular, m.col_x + @divTrunc(m.col_w - tw, 2), @divTrunc(height, 2), muted, 16, msg);
+        try drawTopBar(gpa, dl, e, m, active_screen); // no posts scroll here, but keep the title consistent
         return height;
     }
 
@@ -665,7 +655,38 @@ pub fn layout(
         }
         y = next_y;
     }
+    // The sticky top bar, drawn LAST so the posts above scroll BEHIND its
+    // frosted box with the title/tabs crisp on top.
+    try drawTopBar(gpa, dl, e, m, active_screen);
     return y - scroll; // total content height (scroll-independent), for clamping
+}
+
+/// The feed column's sticky TOP BAR: a frosted box over the top strip, then the
+/// screen title (+ Following/Discover tabs on Home / mobile), then the hairline
+/// divider. Emitted AFTER the posts so they pass behind it (occluded + dimmed),
+/// the chrome reading crisply on top. The box spans the feed column width; the
+/// rail/sidebar live in their own columns and are untouched.
+fn drawTopBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, active_screen: u8) error{OutOfMemory}!void {
+    if (m.wide) {
+        try rect(gpa, dl, m.col_x, 0, m.col_w, 111, header_veil, 0);
+        _ = try str(gpa, dl, e, .semibold, m.lx, 50, ink, 27, nav_labels[active_screen]);
+        if (active_screen == screen_home) {
+            _ = try str(gpa, dl, e, .semibold, m.lx, 88, ink, 16, "Following");
+            const fw2: i32 = @intCast(text.measure(e, .semibold, "Following", 16));
+            _ = try str(gpa, dl, e, .regular, m.lx + fw2 + 28, 88, faint, 16, "Discover");
+            try rect(gpa, dl, m.lx, 98, fw2, 3, accent, 2);
+        }
+        try rect(gpa, dl, m.col_x, 110, m.col_w, 1, divider, 0);
+    } else {
+        try rect(gpa, dl, m.col_x, 0, m.col_w, 97, header_veil, 0);
+        const wm = try str(gpa, dl, e, .semibold, m.lx, 42, accent, 22, "zat4");
+        _ = try str(gpa, dl, e, .semibold, wm, 42, ink, 22, ".");
+        _ = try str(gpa, dl, e, .semibold, m.lx, 76, ink, 15, "Following");
+        const fw: i32 = @intCast(text.measure(e, .semibold, "Following", 15));
+        _ = try str(gpa, dl, e, .regular, m.lx + fw + 26, 76, faint, 15, "Discover");
+        try rect(gpa, dl, m.lx, 86, fw, 3, accent, 2);
+        try rect(gpa, dl, m.col_x, 96, m.col_w, 1, divider, 0);
+    }
 }
 
 fn emitRegion(gpa: Allocator, regions: ?*Regions, x: i32, y: i32, w: i32, h: u16, post: u16, kind: Action) !void {
