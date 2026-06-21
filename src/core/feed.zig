@@ -735,6 +735,69 @@ pub fn buildAuthorView(
     return out;
 }
 
+/// Build a post's THREAD as a view over the shared store (ZONES inv. 4 — a
+/// query, not a container): the ancestor chain (root → immediate parent, in
+/// order), the focused post, then its direct replies (chronological). The store
+/// already holds the reply linkage (ingestPosts interned each post's reply
+/// refs), so this reconstructs the thread by walking `reply_parent` up and
+/// scanning for children — the same shape the AppView's buildPostThread serves,
+/// derived locally so engagement/identity stay unified with every other view.
+/// An unknown focus cid is an empty view (E4). Allocates in `arena`.
+pub fn buildThreadView(
+    arena: Allocator,
+    store: *const Store,
+    focus_cid: []const u8,
+) error{OutOfMemory}![]TimelineItem {
+    const focus = lookupCid(store, focus_cid) orelse return &.{};
+    const posts = store.posts.slice();
+    const parents = posts.items(.reply_parent);
+    const createds = posts.items(.created_at);
+
+    // Ancestors: walk the parent chain up (cycle-guarded), parent-first, then
+    // reverse to root-first for rendering above the focus.
+    var anc: std.ArrayList(u32) = .empty;
+    defer anc.deinit(arena);
+    var cur: u32 = @intCast(focus);
+    var guard: usize = 0;
+    while (guard < 4096) : (guard += 1) {
+        const p = parents[cur].unwrap() orelse break;
+        const pr: u32 = @intFromEnum(p);
+        try anc.append(arena, pr);
+        cur = pr;
+    }
+    std.mem.reverse(u32, anc.items);
+
+    // Direct replies: posts whose parent is the focus, chronological ascending.
+    var reps: std.ArrayList(u32) = .empty;
+    defer reps.deinit(arena);
+    for (parents, 0..) |pp, row| {
+        if (pp.unwrap()) |pi| {
+            if (@intFromEnum(pi) == focus) try reps.append(arena, @intCast(row));
+        }
+    }
+    const Asc = struct {
+        createds: []const i64,
+        pub fn lessThan(ctx: @This(), x: u32, y: u32) bool {
+            return ctx.createds[x] < ctx.createds[y]; // oldest first
+        }
+    };
+    std.sort.block(u32, reps.items, Asc{ .createds = createds }, Asc.lessThan);
+
+    const out = try arena.alloc(TimelineItem, anc.items.len + 1 + reps.items.len);
+    var i: usize = 0;
+    for (anc.items) |r| {
+        out[i] = fillTimelineItem(store, r, .none);
+        i += 1;
+    }
+    out[i] = fillTimelineItem(store, focus, .none);
+    i += 1;
+    for (reps.items) |r| {
+        out[i] = fillTimelineItem(store, r, .none);
+        i += 1;
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // Live ingest — one post arriving off the stream, prepended (it is newer
 // than everything held). Input is plain values defined HERE: the feed

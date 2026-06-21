@@ -177,6 +177,65 @@ pub fn loadAuthorFeed(
     }
 }
 
+/// Fetch a post's thread (`getPostThread?uri=&viewer=`) and ingest its posts —
+/// ancestors, the focused post, and its replies — as CONTENT into the SHARED
+/// store. The thread VIEW is then a pure query (`feed_core.buildThreadView`), so
+/// engagement + identity stay unified with every other view (ZONES inv. 4). The
+/// reply linkage rides on each post's `reply` ref, so the store reconstructs the
+/// chain. `uri` is the focused post's at-uri (as the feed served it).
+pub fn loadThread(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    session: *auth.Session,
+    appview_url: []const u8,
+    store: *feed_core.Store,
+    uri: []const u8,
+    limit: u32,
+) !PageOutcome {
+    var limit_buf: [12]u8 = undefined;
+    const limit_str = std.fmt.bufPrint(&limit_buf, "{d}", .{limit}) catch unreachable;
+    const params = [_]xrpc.Param{
+        .{ .name = "uri", .value = uri },
+        .{ .name = "viewer", .value = session.did },
+        .{ .name = "limit", .value = limit_str },
+    };
+
+    const outcome = try auth.queryHost(
+        gpa,
+        arena,
+        io,
+        environ,
+        session,
+        appview_url,
+        lexicon.method.get_post_thread,
+        &params,
+        lexicon.ThreadView,
+    );
+    switch (outcome) {
+        .failed => |failure| return .{ .failed = failure },
+        .ok => |thread| {
+            // Flatten ancestors + focus + replies into one page and ingest as
+            // content; the thread view is a query over the store afterwards.
+            const items = try arena.alloc(lexicon.FeedViewPost, thread.ancestors.len + 1 + thread.replies.len);
+            var i: usize = 0;
+            for (thread.ancestors) |a| {
+                items[i] = a;
+                i += 1;
+            }
+            items[i] = thread.post;
+            i += 1;
+            for (thread.replies) |rp| {
+                items[i] = rp;
+                i += 1;
+            }
+            const page: lexicon.TimelinePage = .{ .feed = items };
+            return .{ .ok = try feed_core.ingestPosts(gpa, store, page) };
+        },
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Loopback round trip — a scripted fixture PDS serves two timeline pages;
 // the second request must carry the first page's cursor on the wire, and a

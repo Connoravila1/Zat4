@@ -91,6 +91,7 @@ pub const method = struct {
     pub const get_profile = "app.zat4.actor.getProfile";
     pub const get_timeline = "app.zat4.feed.getTimeline";
     pub const get_author_feed = "app.zat4.feed.getAuthorFeed";
+    pub const get_post_thread = "app.zat4.feed.getPostThread";
 
     // Protocol methods — shared by every atproto app, NOT Bluesky content.
     // These stay exactly as they are (the wall self-check exempts them).
@@ -281,6 +282,17 @@ pub const FeedViewPost = struct {
 pub const TimelinePage = struct {
     cursor: ?[]const u8 = null,
     feed: []const FeedViewPost = &.{},
+};
+
+/// Response of `app.zat4.feed.getPostThread`: the focused post with its ancestor
+/// chain (root → immediate parent, in order) and its direct replies
+/// (chronological). FLAT (not bsky's recursive ThreadViewPost) — the client
+/// renders the ancestors above the focused post and the replies below it.
+/// A7.2: cold struct, size guard waived — transient parse/build target.
+pub const ThreadView = struct {
+    ancestors: []const FeedViewPost = &.{},
+    post: FeedViewPost = .{},
+    replies: []const FeedViewPost = &.{},
 };
 
 // ---------------------------------------------------------------------------

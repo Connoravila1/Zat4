@@ -362,6 +362,20 @@ pub fn run(
     var profile_target_did: []const u8 = session.did;
     var profile_dirty = false;
 
+    // The Thread screen (C4): tapping a post body opens its thread — also a VIEW
+    // over the ONE shared store (the reply linkage rides on each post). Entering
+    // fetches the thread (`feed_shell.loadThread`) as CONTENT; the ordering is a
+    // query (`feed_core.buildThreadView`) keyed by the focused post's cid. The
+    // uri is sent to the AppView's getPostThread; `thread_return_screen` is where
+    // Back goes.
+    var on_thread_prev = false;
+    var thread_focus_cid_buf: [256]u8 = undefined;
+    var thread_focus_uri_buf: [320]u8 = undefined;
+    var thread_focus_cid: []const u8 = "";
+    var thread_focus_uri: []const u8 = "";
+    var thread_dirty = false;
+    var thread_return_screen: u8 = 0;
+
     // Phase 6.4: the GPU render path, brought up additively when the window is
     // open AND the font engine is live AND `gpu.init` succeeds. On any failure
     // it stays null and the SOFTWARE path renders (E2: a plainer window, never
@@ -559,12 +573,35 @@ pub fn run(
         }
         on_profile_prev = on_profile;
 
-        // The ACTIVE view: Home (one ordering over the store) or — on the
-        // profile screen — a query for the TARGET author's posts over the SAME
-        // store. Either way it's one list of view-models the render + input +
-        // engagement paths all key off; the post records (and so engagement and
-        // identity) are shared (ZONES invariant 4).
-        const view_items: []const feed_core.TimelineItem = if (on_profile)
+        // Thread screen: on ENTERING (a post-body tap flips gscreen) or a target
+        // change, fetch the focused post's thread as CONTENT into the SHARED
+        // store. The view ordering is then a query (buildThreadView). Same E2
+        // containment as the profile fetch.
+        const on_thread = mode == .timeline and gscreen == feed_view.screen_thread;
+        if (on_thread and (!on_thread_prev or thread_dirty)) {
+            const to = feed_shell.loadThread(gpa, arena, io, environ, session, appview_url, store, thread_focus_uri, 50) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => blk: {
+                    status = "thread: network error"; // contained
+                    break :blk null;
+                },
+            };
+            if (to) |result| switch (result) {
+                .ok => {},
+                .failed => status = "thread: unavailable",
+            };
+            thread_dirty = false;
+        }
+        on_thread_prev = on_thread;
+
+        // The ACTIVE view: Home (one ordering over the store), the profile screen
+        // (the TARGET author's posts), or a post's THREAD — each a query over the
+        // SAME store. One list of view-models the render + input + engagement
+        // paths all key off; the post records (and so engagement + identity) are
+        // shared (ZONES invariant 4).
+        const view_items: []const feed_core.TimelineItem = if (on_thread)
+            try feed_core.buildThreadView(arena, store, thread_focus_cid)
+        else if (on_profile)
             try feed_core.buildAuthorView(arena, store, profile_target_did)
         else
             try feed_core.buildTimeline(arena, store);
@@ -837,7 +874,7 @@ pub fn run(
                                         .like, .repost => if (hit.post < view_items.len) {
                                             state.selected = hit.post;
                                             const ek: Engagement = if (hit.kind == .like) .like else .repost;
-                                            const r = try engageSelected(ek, gpa, arena, session, store, view_items[hit.post], hit.post, gscreen, profile_target_did, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
+                                            const r = try engageSelected(ek, gpa, arena, session, store, view_items[hit.post], hit.post, gscreen, profile_target_did, thread_focus_cid, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
                                             if (r.status.len > 0) status = r.status;
                                         },
                                         // Reply → open the premium composer in reply
@@ -863,6 +900,31 @@ pub fn run(
                                                 status = "";
                                                 mode = .compose;
                                             }
+                                        },
+                                        // Post body tap → open this post's THREAD
+                                        // (whole post minus the avatar/engagement
+                                        // carve-outs). Remember the focus cid (for
+                                        // the buildThreadView query) + the uri (for
+                                        // the getPostThread fetch) and where Back
+                                        // returns. Copy them out — the view list is
+                                        // rebuilt next frame.
+                                        .post_body => if (hit.post < view_items.len) {
+                                            const item = view_items[hit.post];
+                                            if (item.cid.len > 0 and item.cid.len <= thread_focus_cid_buf.len and item.uri.len <= thread_focus_uri_buf.len) {
+                                                @memcpy(thread_focus_cid_buf[0..item.cid.len], item.cid);
+                                                thread_focus_cid = thread_focus_cid_buf[0..item.cid.len];
+                                                @memcpy(thread_focus_uri_buf[0..item.uri.len], item.uri);
+                                                thread_focus_uri = thread_focus_uri_buf[0..item.uri.len];
+                                                if (gscreen != feed_view.screen_thread) thread_return_screen = gscreen;
+                                                gscreen = feed_view.screen_thread;
+                                                thread_dirty = true;
+                                                g.scroll.* = 0; // top of the thread
+                                            }
+                                        },
+                                        // Back (thread top bar) → the prior screen.
+                                        .back => {
+                                            gscreen = thread_return_screen;
+                                            g.scroll.* = 0;
                                         },
                                         // The composer's footer buttons never appear
                                         // on the timeline; they are handled in compose
@@ -1023,12 +1085,12 @@ pub fn run(
                     }
                 },
                 .like => if (view_items.len > 0) {
-                    const r = try engageSelected(.like, gpa, arena, session, store, view_items[state.selected], state.selected, gscreen, profile_target_did, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
+                    const r = try engageSelected(.like, gpa, arena, session, store, view_items[state.selected], state.selected, gscreen, profile_target_did, thread_focus_cid, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
                     if (r.status.len > 0) status = r.status;
                     if (r.skip_rest) continue;
                 },
                 .repost => if (view_items.len > 0) {
-                    const r = try engageSelected(.repost, gpa, arena, session, store, view_items[state.selected], state.selected, gscreen, profile_target_did, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
+                    const r = try engageSelected(.repost, gpa, arena, session, store, view_items[state.selected], state.selected, gscreen, profile_target_did, thread_focus_cid, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
                     if (r.status.len > 0) status = r.status;
                     if (r.skip_rest) continue;
                 },
@@ -1373,10 +1435,12 @@ const Engagement = enum { like, repost };
 /// profile record (the in-app profile editor reuses the composer's input).
 const ComposeKind = enum { post, profile };
 
-/// Build the ACTIVE view's posts over the SHARED store — Home's timeline, or
-/// the profile screen's author query. The single place "which view is showing"
-/// is decided, for both the main loop and engageSelected's optimistic repaint.
-fn buildActiveView(arena: Allocator, store: *feed_core.Store, screen: u8, profile_did: []const u8) error{OutOfMemory}![]feed_core.TimelineItem {
+/// Build the ACTIVE view's posts over the SHARED store — Home's timeline, the
+/// profile screen's author query, or a post's thread. The single place "which
+/// view is showing" is decided, for both the main loop and engageSelected's
+/// optimistic repaint.
+fn buildActiveView(arena: Allocator, store: *feed_core.Store, screen: u8, profile_did: []const u8, thread_cid: []const u8) error{OutOfMemory}![]feed_core.TimelineItem {
+    if (screen == feed_view.screen_thread) return feed_core.buildThreadView(arena, store, thread_cid);
     if (screen == feed_view.screen_profile) return feed_core.buildAuthorView(arena, store, profile_did);
     return feed_core.buildTimeline(arena, store);
 }
@@ -1427,10 +1491,12 @@ fn engageSelected(
     store: *feed_core.Store,
     item: feed_core.TimelineItem,
     target: u32,
-    /// The active Screen + the profile's author DID, so the optimistic repaint
-    /// rebuilds the SAME view the tap came from (Home or a profile).
+    /// The active Screen + the profile's author DID + the thread's focus cid, so
+    /// the optimistic repaint rebuilds the SAME view the tap came from (Home,
+    /// a profile, or a thread).
     screen: u8,
     profile_did: []const u8,
+    thread_cid: []const u8,
     state: *timeline_ui.UiState,
     revealed_cids: []const []const u8,
     now: i64,
@@ -1473,7 +1539,7 @@ fn engageSelected(
                     if (!acted) return .{ .status = "" };
                     const set = if (kind == .like) def_unlike else def_unrepost;
                     set.put(gpa, std.hash.Wyhash.hash(0, item.cid), {}) catch {};
-                    const fresh = try buildActiveView(arena, store, screen, profile_did);
+                    const fresh = try buildActiveView(arena, store, screen, profile_did, thread_cid);
                     const fresh_header = try profileHeaderFor(arena, session, screen, profile_did, fresh);
                     try paintFrame(gpa, out, arena, prev, next, backend, pix, fresh, fresh_header, state, revealed_cids, now, session.handle, if (kind == .like) "unliking..." else "unboosting...");
                     if (pix) |g| fireEngageEffect(gpa, g, kind, target, false);
@@ -1490,7 +1556,7 @@ fn engageSelected(
             const record_uri = uri_buf[0..borrowed.len];
             @memcpy(record_uri, borrowed);
 
-            const fresh = try buildActiveView(arena, store, screen, profile_did);
+            const fresh = try buildActiveView(arena, store, screen, profile_did, thread_cid);
             const fresh_header = try profileHeaderFor(arena, session, screen, profile_did, fresh);
             try paintFrame(gpa, out, arena, prev, next, backend, pix, fresh, fresh_header, state, revealed_cids, now, session.handle, if (kind == .like) "unliking..." else "unboosting...");
             // Fire the drain effect at the post's heart cell (state is now
@@ -1519,7 +1585,7 @@ fn engageSelected(
 
     // Optimistic first: the bumped count paints now; the worker call
     // follows on its own thread; a refusal reverts (drained in the loop).
-    const fresh = try buildActiveView(arena, store, screen, profile_did);
+    const fresh = try buildActiveView(arena, store, screen, profile_did, thread_cid);
     const fresh_header = try profileHeaderFor(arena, session, screen, profile_did, fresh);
     try paintFrame(gpa, out, arena, prev, next, backend, pix, fresh, fresh_header, state, revealed_cids, now, session.handle, if (kind == .like) "liking..." else "boosting...");
     // Fire the like/boost burst at the post's heart cell (state is now

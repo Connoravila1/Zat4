@@ -62,7 +62,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// `compose` (the New-post button) route navigation rather than engagement.
 /// `compose_send` / `compose_cancel` are the premium composer's footer buttons
 /// (the shell turns a tap into the same control byte the keyboard sends).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back };
 
 /// The six top-level rail destinations, in order. The `Screen` index a nav
 /// region carries is an index into this. Shared by the rail (draw + hit) and
@@ -73,6 +73,9 @@ pub const nav_labels = [_][]const u8{ "Home", "Explore", "Activity", "Messages",
 /// post lists rather than a placeholder). Keep in sync with `nav_labels`.
 pub const screen_home: u8 = 0;
 pub const screen_profile: u8 = 4;
+/// A transient sub-screen (not a rail destination): a post's thread, shown when
+/// a post body is tapped. One past the nav labels, so the rail highlights none.
+pub const screen_thread: u8 = 6;
 
 /// The profile screen's header band — the viewed account's identity over its
 /// post list. Plain data handed in by the shell (B5); the post count is the
@@ -586,11 +589,15 @@ pub fn layout(
         // divider under the header (scrolled); the post list starts below it
         try rect(gpa, dl, m.col_x, hy + hav + 100, m.col_w, 1, divider, 0);
         feed_y0 = content_top + 4 + hav + 100 + 14;
+    } else if (active_screen == screen_thread) {
+        // A post's thread: the `posts` handed in ARE the thread (ancestors, the
+        // focused post, then replies, in that order) — fall through to the post
+        // loop. The top bar shows "Thread" + a back button (drawTopBar).
     } else if (active_screen != 0) {
         const msg = "Coming soon";
         const tw: i32 = @intCast(text.measure(e, .regular, msg, 16));
         _ = try str(gpa, dl, e, .regular, m.col_x + @divTrunc(m.col_w - tw, 2), @divTrunc(height, 2), muted, 16, msg);
-        try drawTopBar(gpa, dl, e, m, active_screen); // no posts scroll here, but keep the title consistent
+        try drawTopBar(gpa, dl, e, m, active_screen, regions); // no posts scroll here, but keep the title consistent
         return height;
     }
 
@@ -635,6 +642,11 @@ pub fn layout(
         const visible = next_y > 0 and post_top < height;
 
         if (visible) {
+            // Whole-post tap target → open this post's thread. Emitted FIRST so
+            // the avatar + engagement regions (emitted after, found first in the
+            // reverse hit-test) punch through it — "whole post minus carve-outs".
+            try emitRegion(gpa, regions, m.col_x, post_top, m.col_w, @intCast(@max(0, @min(32767, bottom - post_top))), @intCast(pi), .post_body);
+
             // avatar disc + initial — tapping it opens that author's profile.
             try rect(gpa, dl, m.lx, post_top, av, av, p.tint, @intCast(av >> 1));
             const iadv: i32 = @intCast(text.advance(e, .semibold, p.initial, 22));
@@ -691,7 +703,7 @@ pub fn layout(
     }
     // The sticky top bar, drawn LAST so the posts above scroll BEHIND its
     // frosted box with the title/tabs crisp on top.
-    try drawTopBar(gpa, dl, e, m, active_screen);
+    try drawTopBar(gpa, dl, e, m, active_screen, regions);
     return y - scroll; // total content height (scroll-independent), for clamping
 }
 
@@ -833,10 +845,23 @@ pub fn layoutCompose(
 /// divider. Emitted AFTER the posts so they pass behind it (occluded + dimmed),
 /// the chrome reading crisply on top. The box spans the feed column width; the
 /// rail/sidebar live in their own columns and are untouched.
-fn drawTopBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, active_screen: u8) error{OutOfMemory}!void {
+fn drawTopBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, active_screen: u8, regions: ?*Regions) error{OutOfMemory}!void {
+    const is_thread = active_screen == screen_thread;
+    // screen_thread is past nav_labels, so guard the index → a "Thread" title.
+    const title: []const u8 = if (active_screen < nav_labels.len) nav_labels[active_screen] else "Thread";
     if (m.wide) {
         try rect(gpa, dl, m.col_x, 0, m.col_w, 111, header_veil, 0);
-        _ = try str(gpa, dl, e, .semibold, m.lx, 50, ink, 27, nav_labels[active_screen]);
+        // The thread screen gets a back button on the left; the title sits after.
+        var tx = m.lx;
+        if (is_thread) {
+            const bl = "<  Back";
+            const blw: i32 = @intCast(text.measure(e, .semibold, bl, 15) + 26);
+            try rect(gpa, dl, m.lx, 30, blw, 36, panel, 16);
+            _ = try str(gpa, dl, e, .semibold, m.lx + 13, 53, ink, 15, bl);
+            try emitRegion(gpa, regions, m.lx, 30, blw, 36, 0, .back);
+            tx = m.lx + blw + 22;
+        }
+        _ = try str(gpa, dl, e, .semibold, tx, 50, ink, 27, title);
         if (active_screen == screen_home) {
             _ = try str(gpa, dl, e, .semibold, m.lx, 88, ink, 16, "Following");
             const fw2: i32 = @intCast(text.measure(e, .semibold, "Following", 16));
@@ -846,6 +871,16 @@ fn drawTopBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Me
         try rect(gpa, dl, m.col_x, 110, m.col_w, 1, divider, 0);
     } else {
         try rect(gpa, dl, m.col_x, 0, m.col_w, 97, header_veil, 0);
+        if (is_thread) {
+            const bl = "<  Back";
+            const blw: i32 = @intCast(text.measure(e, .semibold, bl, 14) + 22);
+            try rect(gpa, dl, m.lx, 16, blw, 32, panel, 15);
+            _ = try str(gpa, dl, e, .semibold, m.lx + 11, 37, ink, 14, bl);
+            try emitRegion(gpa, regions, m.lx, 16, blw, 32, 0, .back);
+            _ = try str(gpa, dl, e, .semibold, m.lx + blw + 18, 38, ink, 18, "Thread");
+            try rect(gpa, dl, m.col_x, 96, m.col_w, 1, divider, 0);
+            return;
+        }
         const wm = try str(gpa, dl, e, .semibold, m.lx, 42, accent, 22, "zat4");
         _ = try str(gpa, dl, e, .semibold, wm, 42, ink, 22, ".");
         _ = try str(gpa, dl, e, .semibold, m.lx, 76, ink, 15, "Following");
@@ -962,10 +997,12 @@ test "layout emits 4 tap regions per post (avatar + 3 engagement); hitTest resol
     };
     const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null);
     try std.testing.expect(h > 112); // content extends below the top bar
-    try std.testing.expectEqual(@as(usize, 4), regions.items.len);
+    // 5 regions per post: the whole-post body tap + the avatar + 3 engagement.
+    try std.testing.expectEqual(@as(usize, 5), regions.items.len);
 
     var saw_like = false;
     var saw_author = false;
+    var saw_body = false;
     for (regions.items) |r| {
         const cxp = @as(i32, r.x) + @divTrunc(@as(i32, r.w), 2);
         const cyp = @as(i32, r.y) + @divTrunc(@as(i32, r.h), 2);
@@ -974,10 +1011,17 @@ test "layout emits 4 tap regions per post (avatar + 3 engagement); hitTest resol
         try std.testing.expectEqual(@as(u16, 0), hit.post);
         if (r.kind == .like) saw_like = true;
         if (r.kind == .author) saw_author = true;
+        if (r.kind == .post_body) saw_body = true;
     }
     try std.testing.expect(saw_like);
     try std.testing.expect(saw_author);
-    // a click far outside every region resolves to nothing
+    try std.testing.expect(saw_body);
+    // The avatar + engagement regions PUNCH THROUGH the whole-post body region:
+    // each self-hit-tests to itself (verified in the loop above) even though the
+    // body region covers them, because they are emitted AFTER it (found first in
+    // the reverse hit-test). So a tap on the avatar opens the profile, the body
+    // opens the thread.
+    // a click far outside every region (above the first post) resolves to nothing
     try std.testing.expect(hitTest(regions.items, 5, 5) == null);
 }
 
@@ -1072,11 +1116,11 @@ test "profile screen renders the author's posts under a header; other screens st
     const header: ProfileHeader = .{ .display_name = "connor.zat4.com", .handle = "@connor.zat4.com", .post_count = 1 };
 
     // Profile screen: the author's post renders below the header band — same
-    // post loop as Home, so it emits the 3 tap regions (read-only at the tap
-    // layer, but the geometry is identical).
+    // post loop as Home, so it emits the 5 tap regions (post body + avatar + 3
+    // engagement; the header here isn't editable, so no edit-profile region).
     const hp = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_profile, header);
     try std.testing.expect(hp > 112);
-    try std.testing.expectEqual(@as(usize, 4), regions.items.len);
+    try std.testing.expectEqual(@as(usize, 5), regions.items.len);
 
     // A non-Home, non-Profile screen is a titled placeholder: no posts render,
     // so no tap regions, and the height clamps to the viewport (no post stack).

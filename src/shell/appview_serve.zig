@@ -177,6 +177,9 @@ fn route(arena: Allocator, idx: *const appview.Index, cfg: ServeConfig, target: 
     if (std.mem.endsWith(u8, path, "app.zat4.feed.getAuthorFeed")) {
         return getAuthorFeed(arena, idx, cfg, target);
     }
+    if (std.mem.endsWith(u8, path, "app.zat4.feed.getPostThread")) {
+        return getPostThread(arena, idx, cfg, target);
+    }
     if (std.mem.endsWith(u8, path, "app.zat4.actor.getProfile")) {
         return getProfile(arena, idx, target);
     }
@@ -212,49 +215,85 @@ fn getAuthorFeed(arena: Allocator, idx: *const appview.Index, cfg: ServeConfig, 
     return serializeFeed(arena, rows);
 }
 
+fn getPostThread(arena: Allocator, idx: *const appview.Index, cfg: ServeConfig, target: []const u8) RouteError![]const u8 {
+    // `uri` is the focused post's at-uri (percent-encoded). The AppView keys
+    // posts by cid and synthesizes uris as at://did/app.zat4.feed.post/<cid>, so
+    // the focus cid is the uri's trailing path segment.
+    const uri = (try queryValueDecoded(arena, target, "uri")) orelse "";
+    const viewer = (try queryValueDecoded(arena, target, "viewer")) orelse "";
+    const focus_cid = if (std.mem.lastIndexOfScalar(u8, uri, '/')) |i| uri[i + 1 ..] else uri;
+    var limit = cfg.default_limit;
+    if (queryValue(target, "limit")) |l| {
+        limit = @min(std.fmt.parseInt(usize, l, 10) catch cfg.default_limit, cfg.max_limit);
+    }
+
+    const thread = try appview.buildPostThread(arena, idx, focus_cid, viewer, limit);
+    return serializeThread(arena, thread);
+}
+
 /// Serialize feed rows into the lexicon's TimelinePage shape so the existing
 /// client parser consumes them unchanged (D3 — the AppView speaks the same
 /// wire the client already reads). Shared by getTimeline and getAuthorFeed.
 fn serializeFeed(arena: Allocator, rows: []const appview.TimelineRow) RouteError![]const u8 {
     const feed_items = try arena.alloc(lexicon.FeedViewPost, rows.len);
-    for (feed_items, rows) |*fv, r| {
-        const uri_buf = try arena.alloc(u8, r.author_did.len + r.cid.len + 64);
-        const uri = std.fmt.bufPrint(uri_buf, "at://{s}/{s}/{s}", .{ r.author_did, lexicon.collection.post, r.cid }) catch r.cid;
-        // Format the indexed timestamp so the client shows a real age (an empty
-        // createdAt parsed to epoch 0, hence the "2945w" ages).
-        const ts_buf = try arena.alloc(u8, 32);
-        const created_at = feed.formatTimestamp(ts_buf, r.created_at);
-        // The reply ref (when this post is a reply): hydrated parent/root post
-        // views so the client shows "replying to @handle" and can intern them.
-        const reply: ?lexicon.ReplyRef = if (r.reply_parent != null or r.reply_root != null) .{
-            .parent = if (r.reply_parent) |pt| try replyPostView(arena, pt) else .{},
-            .root = if (r.reply_root) |rt| try replyPostView(arena, rt) else .{},
-        } else null;
-        fv.* = .{
-            .post = .{
-                .uri = uri,
-                .cid = r.cid,
-                .author = .{
-                    .did = r.author_did,
-                    .handle = if (r.author_handle.len > 0) r.author_handle else r.author_did,
-                    .displayName = if (r.author_display_name.len > 0) r.author_display_name else null,
-                },
-                .record = .{ .text = r.text, .createdAt = created_at },
-                .likeCount = r.like_count,
-                .repostCount = r.repost_count,
-                .replyCount = r.reply_count,
-                .quoteCount = 0,
-                .indexedAt = "",
-                // viewer.like: the viewer's own like record uri — the client
-                // shows the filled heart from it on reload AND deletes it to
-                // unlike. Absent (null) when the viewer hasn't liked this post.
-                .viewer = if (r.viewer_like_uri.len > 0) .{ .like = r.viewer_like_uri } else null,
-            },
-            .reply = reply,
-        };
-    }
+    for (feed_items, rows) |*fv, r| fv.* = try feedViewPostFor(arena, r);
     const page: lexicon.TimelinePage = .{ .cursor = null, .feed = feed_items };
     return std.json.Stringify.valueAlloc(arena, page, .{ .emit_null_optional_fields = false });
+}
+
+/// Project one boundary `TimelineRow` into the lexicon `FeedViewPost` the client
+/// parses — the single per-post wire projection, shared by the feed and thread
+/// serializers (D3 — one wire shape).
+fn feedViewPostFor(arena: Allocator, r: appview.TimelineRow) RouteError!lexicon.FeedViewPost {
+    const uri_buf = try arena.alloc(u8, r.author_did.len + r.cid.len + 64);
+    const uri = std.fmt.bufPrint(uri_buf, "at://{s}/{s}/{s}", .{ r.author_did, lexicon.collection.post, r.cid }) catch r.cid;
+    // Format the indexed timestamp so the client shows a real age (an empty
+    // createdAt parsed to epoch 0, hence the "2945w" ages).
+    const ts_buf = try arena.alloc(u8, 32);
+    const created_at = feed.formatTimestamp(ts_buf, r.created_at);
+    // The reply ref (when this post is a reply): hydrated parent/root post views
+    // so the client shows "replying to @handle" and can intern them.
+    const reply: ?lexicon.ReplyRef = if (r.reply_parent != null or r.reply_root != null) .{
+        .parent = if (r.reply_parent) |pt| try replyPostView(arena, pt) else .{},
+        .root = if (r.reply_root) |rt| try replyPostView(arena, rt) else .{},
+    } else null;
+    return .{
+        .post = .{
+            .uri = uri,
+            .cid = r.cid,
+            .author = .{
+                .did = r.author_did,
+                .handle = if (r.author_handle.len > 0) r.author_handle else r.author_did,
+                .displayName = if (r.author_display_name.len > 0) r.author_display_name else null,
+            },
+            .record = .{ .text = r.text, .createdAt = created_at },
+            .likeCount = r.like_count,
+            .repostCount = r.repost_count,
+            .replyCount = r.reply_count,
+            .quoteCount = 0,
+            .indexedAt = "",
+            // viewer.like: the viewer's own like record uri — the client shows
+            // the filled heart from it on reload AND deletes it to unlike.
+            // Absent (null) when the viewer hasn't liked this post.
+            .viewer = if (r.viewer_like_uri.len > 0) .{ .like = r.viewer_like_uri } else null,
+        },
+        .reply = reply,
+    };
+}
+
+/// Serialize a post thread into the lexicon's ThreadView (ancestors + focus +
+/// replies), reusing the same per-post projection as the feed.
+fn serializeThread(arena: Allocator, thread: appview.ThreadRows) RouteError![]const u8 {
+    const ancestors = try arena.alloc(lexicon.FeedViewPost, thread.ancestors.len);
+    for (ancestors, thread.ancestors) |*fv, r| fv.* = try feedViewPostFor(arena, r);
+    const replies = try arena.alloc(lexicon.FeedViewPost, thread.replies.len);
+    for (replies, thread.replies) |*fv, r| fv.* = try feedViewPostFor(arena, r);
+    const view: lexicon.ThreadView = .{
+        .ancestors = ancestors,
+        .post = if (thread.found) try feedViewPostFor(arena, thread.post) else .{},
+        .replies = replies,
+    };
+    return std.json.Stringify.valueAlloc(arena, view, .{ .emit_null_optional_fields = false });
 }
 
 /// Build a minimal hydrated PostView for a reply parent/root from its indexed

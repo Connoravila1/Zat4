@@ -551,49 +551,125 @@ fn materializeRows(
 
     const n = @min(limit, rows.len);
     const out = try arena.alloc(TimelineRow, n);
-    const authors = idx.posts.items(.author);
-    const cids = idx.posts.items(.cid);
-    const texts = idx.posts.items(.text);
-    const likes = idx.posts.items(.like_count);
-    const reposts = idx.posts.items(.repost_count);
 
-    // Reply counts: one pass over ALL posts' parent edges → parent cid id ⇒
-    // number of direct replies. Keyed by the parent's interned cid id, which
-    // equals the parent post's own cid id (internStr dedups), so each output
-    // row reads its count by its own cid id. O(posts), built once per request.
-    var reply_counts: std.AutoHashMapUnmanaged(StrId, u32) = .empty;
+    var reply_counts = try buildReplyCounts(arena, idx);
     defer reply_counts.deinit(arena);
+    for (out, rows[0..n]) |*o, row| o.* = fillRow(idx, viewer_id, row, &reply_counts);
+    return out;
+}
+
+/// Direct-reply tally: parent cid id ⇒ number of posts replying to it. One pass
+/// over ALL posts' parent edges (O(posts)). Keyed by the parent's interned cid
+/// id, which equals the parent post's own cid id (internStr dedups), so a row
+/// reads its count by its own cid id. Caller owns the arena backing.
+fn buildReplyCounts(arena: Allocator, idx: *const Index) Allocator.Error!std.AutoHashMapUnmanaged(StrId, u32) {
+    var reply_counts: std.AutoHashMapUnmanaged(StrId, u32) = .empty;
     for (idx.reply_parent.items) |pid| {
         if (pid == no_str) continue;
         const gop = try reply_counts.getOrPut(arena, pid);
         gop.value_ptr.* = (if (gop.found_existing) gop.value_ptr.* else 0) + 1;
     }
+    return reply_counts;
+}
 
-    for (out, rows[0..n]) |*o, row| {
-        // The viewer's own like record uri for this post (viewer.like), if any.
-        const viewer_like: []const u8 = if (viewer_id) |vid|
-            (if (idx.like_edges.get(edgeKey(vid, cids[row]))) |uid| str(idx, uid) else "")
-        else
-            "";
-        o.* = .{
-            .cid = str(idx, cids[row]),
-            .author_did = str(idx, authors[row]),
-            .author_handle = handleForId(idx, authors[row]),
-            .author_display_name = displayNameForId(idx, authors[row]),
-            .text = blk: {
-                const s = texts[row];
-                break :blk idx.pool_bytes.items[s.off .. s.off + s.len];
-            },
-            .created_at = createds[row],
-            .like_count = likes[row],
-            .repost_count = reposts[row],
-            .viewer_like_uri = viewer_like,
-            .reply_count = reply_counts.get(cids[row]) orelse 0,
-            .reply_parent = hydrateReplyTarget(idx, idx.reply_parent.items[row]),
-            .reply_root = hydrateReplyTarget(idx, idx.reply_root.items[row]),
-        };
+/// Fill one indexed post `row` into a plain `TimelineRow`, stamping the viewer's
+/// like uri + the reply count + hydrated reply targets. PURE read — the single
+/// per-post boundary projection, shared by every feed/thread builder.
+fn fillRow(idx: *const Index, viewer_id: ?StrId, row: u32, reply_counts: *const std.AutoHashMapUnmanaged(StrId, u32)) TimelineRow {
+    const cid_id = idx.posts.items(.cid)[row];
+    const author_id = idx.posts.items(.author)[row];
+    const s = idx.posts.items(.text)[row];
+    const viewer_like: []const u8 = if (viewer_id) |vid|
+        (if (idx.like_edges.get(edgeKey(vid, cid_id))) |uid| str(idx, uid) else "")
+    else
+        "";
+    return .{
+        .cid = str(idx, cid_id),
+        .author_did = str(idx, author_id),
+        .author_handle = handleForId(idx, author_id),
+        .author_display_name = displayNameForId(idx, author_id),
+        .text = idx.pool_bytes.items[s.off .. s.off + s.len],
+        .created_at = idx.posts.items(.created_at)[row],
+        .like_count = idx.posts.items(.like_count)[row],
+        .repost_count = idx.posts.items(.repost_count)[row],
+        .viewer_like_uri = viewer_like,
+        .reply_count = reply_counts.get(cid_id) orelse 0,
+        .reply_parent = hydrateReplyTarget(idx, idx.reply_parent.items[row]),
+        .reply_root = hydrateReplyTarget(idx, idx.reply_root.items[row]),
+    };
+}
+
+/// A post's thread, as plain boundary rows: the ancestor chain (root → immediate
+/// parent, in order), the focused post, and its direct replies (chronological).
+/// `found` is false when the focus cid isn't indexed (E4 — an empty thread, not
+/// an error). A7.2: cold struct, size guard waived — transient boundary value.
+pub const ThreadRows = struct {
+    ancestors: []TimelineRow = &.{},
+    post: TimelineRow = undefined,
+    replies: []TimelineRow = &.{},
+    found: bool = false,
+};
+
+/// Build the thread around the post with cid `focus_cid`: walk `reply_parent`
+/// up to the root for the ancestor chain, scan for posts whose parent is the
+/// focus for the direct replies (chronological), `limit` replies. PURE (B2);
+/// allocates into `arena`. An unknown focus cid ⇒ `found = false` (E4).
+pub fn buildPostThread(
+    arena: Allocator,
+    idx: *const Index,
+    focus_cid: []const u8,
+    viewer_did: []const u8,
+    limit: usize,
+) Allocator.Error!ThreadRows {
+    const focus_cid_id = idx.intern.get(focus_cid) orelse return .{};
+    const focus_row = idx.post_by_cid.get(focus_cid_id) orelse return .{};
+    const viewer_id: ?StrId = idx.intern.get(viewer_did);
+
+    var reply_counts = try buildReplyCounts(arena, idx);
+    defer reply_counts.deinit(arena);
+
+    // Ancestors: walk the parent chain up. A cycle guard caps the walk (a
+    // malformed thread can't hang the server). Collected parent-first, then
+    // reversed to root-first for rendering above the focus.
+    var anc: std.ArrayList(u32) = .empty;
+    defer anc.deinit(arena);
+    var cur = focus_row;
+    var guard: usize = 0;
+    while (guard < 4096) : (guard += 1) {
+        const pid = idx.reply_parent.items[cur];
+        if (pid == no_str) break;
+        const prow = idx.post_by_cid.get(pid) orelse break;
+        try anc.append(arena, prow);
+        cur = prow;
     }
-    return out;
+    std.mem.reverse(u32, anc.items);
+
+    // Direct replies: posts whose parent is the focus, chronological ascending.
+    var reps: std.ArrayList(u32) = .empty;
+    defer reps.deinit(arena);
+    for (idx.reply_parent.items, 0..) |pid, row| {
+        if (pid == focus_cid_id) try reps.append(arena, @intCast(row));
+    }
+    const Asc = struct {
+        createds: []const i64,
+        pub fn lessThan(ctx: @This(), a: u32, b: u32) bool {
+            return ctx.createds[a] < ctx.createds[b]; // oldest first
+        }
+    };
+    std.sort.block(u32, reps.items, Asc{ .createds = idx.posts.items(.created_at) }, Asc.lessThan);
+
+    const ancestors = try arena.alloc(TimelineRow, anc.items.len);
+    for (ancestors, anc.items) |*o, r| o.* = fillRow(idx, viewer_id, r, &reply_counts);
+    const rn = @min(limit, reps.items.len);
+    const replies = try arena.alloc(TimelineRow, rn);
+    for (replies, reps.items[0..rn]) |*o, r| o.* = fillRow(idx, viewer_id, r, &reply_counts);
+
+    return .{
+        .ancestors = ancestors,
+        .post = fillRow(idx, viewer_id, focus_row, &reply_counts),
+        .replies = replies,
+        .found = true,
+    };
 }
 
 /// Hydrate a reply target from an interned cid id: if the referenced post is
@@ -793,6 +869,45 @@ test "reply linkage: a reply bumps its parent's reply_count and carries a hydrat
     const orphan_parent = alice2[0].reply_parent orelse return error.NoReplyParent;
     try testing.expectEqualStrings("cMissing", orphan_parent.cid);
     try testing.expectEqualStrings("", orphan_parent.author_handle);
+}
+
+test "post thread: ancestors walk to root, direct replies in chronological order" {
+    const gpa = testing.allocator;
+    var idx: Index = .{};
+    defer deinit(gpa, &idx);
+
+    // A chain: root <- midA (reply to root) <- leaf (reply to midA); plus midB,
+    // a second direct reply to root (newer than midA).
+    _ = try indexPost(gpa, &idx, .{ .cid = "cRoot", .author_did = "did:a", .text = "root", .created_at = 10 });
+    _ = try indexPost(gpa, &idx, .{ .cid = "cMidA", .author_did = "did:b", .text = "mid A", .created_at = 20, .reply_parent_cid = "cRoot", .reply_root_cid = "cRoot" });
+    _ = try indexPost(gpa, &idx, .{ .cid = "cMidB", .author_did = "did:c", .text = "mid B", .created_at = 30, .reply_parent_cid = "cRoot", .reply_root_cid = "cRoot" });
+    _ = try indexPost(gpa, &idx, .{ .cid = "cLeaf", .author_did = "did:d", .text = "leaf", .created_at = 40, .reply_parent_cid = "cMidA", .reply_root_cid = "cRoot" });
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Focus on midA: ancestor chain is [root]; direct reply is [leaf].
+    const t = try buildPostThread(arena, &idx, "cMidA", "did:x", 50);
+    try testing.expect(t.found);
+    try testing.expectEqual(@as(usize, 1), t.ancestors.len);
+    try testing.expectEqualStrings("root", t.ancestors[0].text);
+    try testing.expectEqualStrings("mid A", t.post.text);
+    try testing.expectEqual(@as(u32, 1), t.post.reply_count); // leaf replies to it
+    try testing.expectEqual(@as(usize, 1), t.replies.len);
+    try testing.expectEqualStrings("leaf", t.replies[0].text);
+
+    // Focus on root: no ancestors; two direct replies, chronological (midA, midB).
+    const r = try buildPostThread(arena, &idx, "cRoot", "did:x", 50);
+    try testing.expectEqual(@as(usize, 0), r.ancestors.len);
+    try testing.expectEqual(@as(usize, 2), r.replies.len);
+    try testing.expectEqualStrings("mid A", r.replies[0].text); // older first
+    try testing.expectEqualStrings("mid B", r.replies[1].text);
+
+    // An unknown focus cid is an empty thread, not an error (E4).
+    const none = try buildPostThread(arena, &idx, "cGhost", "did:x", 50);
+    try testing.expect(!none.found);
+    try testing.expectEqual(@as(usize, 0), none.ancestors.len);
 }
 
 test "handles: a post row carries the author's indexed handle; unknown stays empty" {
