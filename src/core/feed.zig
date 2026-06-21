@@ -387,7 +387,25 @@ fn internAuthor(
         std.hash_map.StringIndexAdapter{ .bytes = &store.string_bytes },
         std.hash_map.StringIndexContext{ .bytes = &store.string_bytes },
     );
-    if (gop.found_existing) return @enumFromInt(gop.value_ptr.*);
+    if (gop.found_existing) {
+        const ai: u32 = gop.value_ptr.*;
+        // Identity (handle, display name) is NOT content-addressed the way a
+        // post's CID is — it can change, and an earlier page may have carried
+        // the DID as a placeholder handle before the AppView resolved the real
+        // one. Reconcile a fresher non-empty value, but only on an ACTUAL change
+        // so the string pool doesn't grow on every refresh.
+        const authors = store.authors.slice();
+        if (profile.handle.len > 0 and
+            !std.mem.eql(u8, sliceSpan(store, authors.items(.handle)[ai]), profile.handle))
+        {
+            authors.items(.handle)[ai] = try appendString(gpa, store, profile.handle);
+        }
+        if (profile.displayName) |dn| {
+            if (dn.len > 0 and !std.mem.eql(u8, sliceSpan(store, authors.items(.display_name)[ai]), dn))
+                authors.items(.display_name)[ai] = try appendString(gpa, store, dn);
+        }
+        return @enumFromInt(ai);
+    }
 
     const did = try appendString(gpa, store, profile.did);
     const handle = try appendString(gpa, store, profile.handle);
@@ -1471,6 +1489,33 @@ test "live ingest: prepends, dedups by cid, links replies, did fallback handle" 
     });
     try testing.expectEqual(LiveIngest.duplicate, dup);
     try testing.expectEqual(items_before + 1, store.feed.len);
+}
+
+test "ingest: a later sighting reconciles a placeholder handle to the resolved one" {
+    const gpa = testing.allocator; // C6
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    // First sighting: only the DID is known, so the handle is the DID placeholder.
+    _ = try ingestLivePost(gpa, &store, .{
+        .did = "did:plc:bob",          .handle = "did:plc:bob",
+        .uri = "at://did:plc:bob/app.zat4.feed.post/1", .cid = "c1",
+        .text = "one", .reply_parent_cid = "", .reply_root_cid = "", .created_at = 10,
+    });
+    // A later post by the SAME author carries the resolved handle (the AppView
+    // now serves it). internAuthor dedups by DID but must reconcile the handle.
+    _ = try ingestLivePost(gpa, &store, .{
+        .did = "did:plc:bob",          .handle = "bob.zat4.com",
+        .uri = "at://did:plc:bob/app.zat4.feed.post/2", .cid = "c2",
+        .text = "two", .reply_parent_cid = "", .reply_root_cid = "", .created_at = 20,
+    });
+
+    const items = try buildTimeline(arena_state.allocator(), &store);
+    // BOTH posts (one author) now read the reconciled handle, not the DID.
+    try testing.expectEqual(@as(usize, 2), items.len);
+    for (items) |it| try testing.expectEqualStrings("bob.zat4.com", it.author_handle);
 }
 
 test "refresh ingest: new rows prepend in order, cursor untouched, rows dedup by pair" {
