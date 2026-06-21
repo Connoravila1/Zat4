@@ -73,12 +73,14 @@ pub fn main(init: std.process.Init) !void {
     // exactly as the live window does (the only difference is the source of
     // the items). created_at values are now-relative so the ages render.
     const now: i64 = 1_000_000;
-    const items = [_]feed.TimelineItem{
+    var items = [_]feed.TimelineItem{
         mk("mara.zat", "Mara Vesper", "the whole point of a small network is that you can actually read the room. ten thousand strangers isn't a room, it's weather.", now - 120, 48, 9, 6, true, false),
         mk("fieldnotes.zat", "field notes", "shipped the lighting pass tonight. the letters catch the light now, and the whole field moves when you touch it.", now - 840, 121, 31, 12, false, true),
         mk("oko.zat", "Okonkwo", "monospace is the most honest a feed can be. same column, same weight, nobody shouts louder by being wider.", now - 3600, 73, 18, 24, false, false),
         mk("lune.zat", "lune", "woke up to the field still drifting where i left it. it kept the light on.", now - 10800, 39, 7, 3, false, false),
     };
+    // Make one feed item a reply, to show the "Replying to @x" context line.
+    items[1].replying_to_handle = "mara.zat";
     const posts = try feed_view.fromTimeline(arena, &items, now);
 
     _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, 0, null);

@@ -142,6 +142,10 @@ pub const PostView = struct {
     handle: []const u8,
     age: []const u8,
     body: []const u8,
+    /// "@handle" of the post this replies to, or "" — drives the feed's
+    /// "Replying to @x" context line so a reply doesn't read as a standalone
+    /// post (Twitter/Bluesky parity).
+    replying_to: []const u8 = "",
     tint: u32, // avatar fill (ARGB)
     reply: u32,
     boost: u32,
@@ -156,10 +160,12 @@ pub const PostView = struct {
     is_focus: bool = false,
 
     comptime {
-        // Budget: 4 slices (4×16) + 4 u32 (16) + 5 bytes (initial/liked/
-        // boosted/depth/is_focus), padded to the 8-byte slice alignment = 88.
-        // Exact (A7); raising needs an A7.1 note here.
-        assert(@sizeOf(PostView) == 88);
+        // Budget: 5 slices (5×16=80) + 4 u32 (16) + 5 bytes (initial/liked/
+        // boosted/depth/is_focus), padded to the 8-byte slice alignment = 104.
+        // (A7.1 raise 88 → 104: the `replying_to` handle is a real view field —
+        // the feed's reply-context line needs the parent handle on the
+        // view-model. Built for a handful of visible rows, so the +16 is fine.)
+        assert(@sizeOf(PostView) == 104);
     }
 };
 
@@ -628,6 +634,11 @@ pub fn layout(
         const ax = m.lx + indent; // avatar left
         const cx = ax + av + gap; // text/body left
         const content_w = m.cw - indent - av - gap;
+        // A reply reserves a row for its "Replying to @x" context line above the
+        // body — but ONLY on the flat feed; in a thread the rails already convey
+        // the relationship. Stable per post, so the height cache stays valid.
+        const show_reply_to = !is_thread and p.replying_to.len > 0;
+        const reply_h: i32 = if (show_reply_to) 19 else 0;
 
         // Measure the post's height WITHOUT drawing (no i16 casts), so we can
         // both advance the scroll accounting and decide visibility. Only posts
@@ -647,7 +658,7 @@ pub fn layout(
             next_y = post_top + adv;
             body_end = next_y - 48;
         } else {
-            body_end = try wrapBody(gpa, dl, e, cx, post_top + 18 + body_line, content_w, body_c, 16, p.body, body_line, false);
+            body_end = try wrapBody(gpa, dl, e, cx, post_top + 18 + reply_h + body_line, content_w, body_c, 16, p.body, body_line, false);
             next_y = body_end + 48;
             if (heights) |hh| if (pi < hh.len) {
                 hh[pi] = next_y - post_top;
@@ -690,8 +701,15 @@ pub fn layout(
             bx = try str(gpa, dl, e, .regular, bx + 7, post_top + 17, faint, 14, "·");
             _ = try str(gpa, dl, e, .regular, bx + 7, post_top + 17, faint, 14, p.age);
 
+            // "Replying to @x" — only on a reply, so it doesn't read as a
+            // standalone post (Twitter/Bluesky parity). Muted label, accent handle.
+            if (show_reply_to) {
+                const rx = try str(gpa, dl, e, .regular, cx, post_top + 36, muted, 13, "Replying to ");
+                _ = try str(gpa, dl, e, .regular, rx, post_top + 36, accent, 13, p.replying_to);
+            }
+
             // body (draw)
-            _ = try wrapBody(gpa, dl, e, cx, post_top + 18 + body_line, content_w, body_c, 16, p.body, body_line, true);
+            _ = try wrapBody(gpa, dl, e, cx, post_top + 18 + reply_h + body_line, content_w, body_c, 16, p.body, body_line, true);
 
             // engagement row — vector icons + counts (+ tap regions)
             const is: i32 = 16;
@@ -952,6 +970,10 @@ pub fn fromTimeline(arena: Allocator, items: []const feed.TimelineItem, now: i64
             .handle = try std.fmt.allocPrint(arena, "@{s}", .{it.author_handle}),
             .age = try ageStr(arena, now, it.created_at),
             .body = it.text,
+            .replying_to = if (it.replying_to_handle.len > 0)
+                try std.fmt.allocPrint(arena, "@{s}", .{it.replying_to_handle})
+            else
+                "",
             .tint = tintFor(it.author_handle),
             .reply = it.reply_count,
             .boost = it.repost_count,

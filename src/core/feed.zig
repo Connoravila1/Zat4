@@ -312,7 +312,7 @@ pub fn ingestPage(
 /// feed-ordering row) and ingestPosts (which records no ordering at all). A8:
 /// a resident CID returns its existing index.
 fn internPageItem(gpa: Allocator, store: *Store, item: lexicon.FeedViewPost, stats: *IngestStats) error{OutOfMemory}!PostIndex {
-    const post_index = try internPost(gpa, store, item.post, stats);
+    const post_index = try internPost(gpa, store, item.post, stats, false);
     // Reply context: parent/root arrive hydrated as PostViews and are interned
     // as ordinary posts (A2: the bulk path serves them too); notFound/blocked
     // variants parse to an empty cid and stay .none.
@@ -360,7 +360,7 @@ pub fn ingestPageRefresh(
     var insert_at: usize = 0;
 
     for (page.feed) |item| {
-        const post_index = try internPost(gpa, store, item.post, &stats);
+        const post_index = try internPost(gpa, store, item.post, &stats, false);
 
         if (item.reply) |reply| {
             const parent = try internPostIfPresent(gpa, store, reply.parent, &stats);
@@ -463,6 +463,13 @@ fn internPost(
     store: *Store,
     view: lexicon.PostView,
     stats: *IngestStats,
+    /// True when `view` is a CONTEXT reference (a reply's hydrated parent/root),
+    /// not the post's own feed view. A reference carries no authoritative counts
+    /// or viewer state (it defaults them to 0/absent), so on an already-resident
+    /// post we must NOT reconcile from it — else a reply referencing a post
+    /// CLOBBERS that post's real reply/like counts to zero (the "count flips to
+    /// zero" bug). Identity (handle) is still reconciled; that's content-free.
+    is_reference: bool,
 ) error{OutOfMemory}!PostIndex {
     const gop = try store.post_by_cid.getOrPutContextAdapted(
         gpa,
@@ -480,6 +487,8 @@ fn internPost(
         // home feed's "shows the DID" fix). internAuthor dedups by DID and
         // rewrites only on a real change, so this is cheap and idempotent.
         _ = try internAuthor(gpa, store, view.author, stats);
+        // A reference never reconciles counts/viewer — it has none to give.
+        if (is_reference) return @enumFromInt(index);
         // A8 boundary: the CID seals the RECORD bytes (text/refs are never
         // re-parsed). Counts and viewer state live on the VIEW wrapper, so
         // fresher server truth reconciles here — EXCEPT a like/repost we just
@@ -573,7 +582,7 @@ fn internPostIfPresent(
     stats: *IngestStats,
 ) error{OutOfMemory}!OptionalPostIndex {
     if (view.cid.len == 0) return .none;
-    return .from(try internPost(gpa, store, view, stats));
+    return .from(try internPost(gpa, store, view, stats, true));
 }
 
 // ---------------------------------------------------------------------------
@@ -921,6 +930,15 @@ pub fn ingestLivePost(
 fn optionalIndexForCid(store: *const Store, cid_bytes: []const u8) OptionalPostIndex {
     const index = lookupCid(store, cid_bytes) orelse return .none;
     return OptionalPostIndex.from(@enumFromInt(index));
+}
+
+/// Optimistically bump the resident post's reply_count by one (the parent of a
+/// just-sent reply), so the count moves INSTANTLY rather than waiting for the
+/// next refresh. A no-op if the cid isn't resident. The server reconciles the
+/// real count on the next fetch (and a reference can no longer downgrade it).
+pub fn bumpReplyCount(store: *Store, cid_bytes: []const u8) void {
+    const index = lookupCid(store, cid_bytes) orelse return;
+    store.posts.items(.reply_count)[index] += 1;
 }
 
 /// Up to `max` author DIDs currently held — what the stream subscribes
@@ -1711,6 +1729,55 @@ test "ingest: a later sighting reconciles a placeholder handle to the resolved o
     // BOTH posts (one author) now read the reconciled handle, not the DID.
     try testing.expectEqual(@as(usize, 2), items.len);
     for (items) |it| try testing.expectEqualStrings("bob.zat4.com", it.author_handle);
+}
+
+test "a reply's hydrated parent ref does NOT clobber the parent's real counts" {
+    const gpa = testing.allocator;
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+
+    // The parent post arrives with a real reply count of 2 + 5 likes.
+    const parent_full: lexicon.FeedViewPost = .{ .post = .{
+        .uri = "at://did:plc:a/app.zat4.feed.post/cP",
+        .cid = "cP",
+        .author = .{ .did = "did:plc:a", .handle = "a.zat" },
+        .record = .{ .text = "parent" },
+        .replyCount = 2,
+        .likeCount = 5,
+    } };
+    _ = try ingestPosts(gpa, &store, .{ .feed = &.{parent_full} });
+
+    // A reply to it arrives; its hydrated PARENT ref carries the default 0 counts
+    // (a context reference, not the post's own view). It must NOT zero cP.
+    const reply_item: lexicon.FeedViewPost = .{
+        .post = .{
+            .uri = "at://did:plc:b/app.zat4.feed.post/cR",
+            .cid = "cR",
+            .author = .{ .did = "did:plc:b", .handle = "b.zat" },
+            .record = .{ .text = "a reply" },
+        },
+        .reply = .{
+            .parent = .{ .cid = "cP", .author = .{ .did = "did:plc:a", .handle = "a.zat" }, .record = .{ .text = "parent" } },
+            .root = .{ .cid = "cP", .author = .{ .did = "did:plc:a", .handle = "a.zat" }, .record = .{ .text = "parent" } },
+        },
+    };
+    _ = try ingestPosts(gpa, &store, .{ .feed = &.{reply_item} });
+
+    const p = lookupCid(&store, "cP").?;
+    try testing.expectEqual(@as(u32, 2), store.posts.items(.reply_count)[p]); // NOT clobbered to 0
+    try testing.expectEqual(@as(u32, 5), store.posts.items(.like_count)[p]);
+
+    // The real feed view of cP (counts present) still reconciles normally.
+    const parent_now: lexicon.FeedViewPost = .{ .post = .{
+        .uri = "at://did:plc:a/app.zat4.feed.post/cP",
+        .cid = "cP",
+        .author = .{ .did = "did:plc:a", .handle = "a.zat" },
+        .record = .{ .text = "parent" },
+        .replyCount = 3,
+        .likeCount = 5,
+    } };
+    _ = try ingestPosts(gpa, &store, .{ .feed = &.{parent_now} });
+    try testing.expectEqual(@as(u32, 3), store.posts.items(.reply_count)[p]); // authoritative view updates
 }
 
 test "buildThreadView: nested preorder with view-derived depth + focus" {

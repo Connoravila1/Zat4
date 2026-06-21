@@ -988,7 +988,7 @@ pub fn run(
             }
 
             if (mode == .compose) {
-                try handleComposeInput(gpa, arena, io, environ, session, out, backend, &prev, &next, &status, &status_buf, &mode, &compose_buf, &reply_target, &reply_handle, compose_kind, pix, decoded.event, now);
+                try handleComposeInput(gpa, arena, io, environ, session, out, backend, &prev, &next, &status, &status_buf, &mode, store, &compose_buf, &reply_target, &reply_handle, compose_kind, pix, decoded.event, now);
                 continue;
             }
 
@@ -1328,6 +1328,9 @@ fn handleComposeInput(
     status: *[]const u8,
     status_buf: []u8,
     mode: *Mode,
+    /// The shared store — a successful post/reply is optimistically ingested
+    /// into it so it shows INSTANTLY (the 5s refresh would otherwise gate it).
+    store: *feed_core.Store,
     compose_buf: *std.ArrayList(u8),
     reply_target: *?write.ReplyTarget,
     reply_handle: *[]const u8,
@@ -1404,7 +1407,24 @@ fn handleComposeInput(
                 },
             };
             switch (posted) {
-                .ok => {
+                .ok => |ref| {
+                    // Optimistic local ingest: the new post/reply is the same
+                    // record the AppView will serve, so seat it in the shared
+                    // store NOW — it shows instantly in the feed and the thread
+                    // instead of after the 5s refresh (A8 dedups on confirm).
+                    const rt = reply_target.*;
+                    _ = feed_core.ingestLivePost(gpa, store, .{
+                        .did = session.did,
+                        .handle = session.handle,
+                        .uri = ref.uri,
+                        .cid = ref.cid,
+                        .text = compose_buf.items,
+                        .reply_parent_cid = if (rt) |t| t.parent_cid else "",
+                        .reply_root_cid = if (rt) |t| t.root_cid else "",
+                        .created_at = now,
+                    }) catch {};
+                    // Bump the parent's reply count instantly too.
+                    if (rt) |t| feed_core.bumpReplyCount(store, t.parent_cid);
                     compose_buf.clearRetainingCapacity();
                     reply_target.* = null;
                     reply_handle.* = "";
