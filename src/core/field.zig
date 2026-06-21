@@ -213,7 +213,7 @@ pub const ambient_ramp = ".:;+=*o%#";
 /// surface reads as varied organic symbols forming swirls, not one repeated
 /// mark. CODEPOINTS (u21), not bytes — the GPU strip builder rasterizes each
 /// through the font engine, so non-ASCII marks like ₿ are fine here (unlike
-/// the CPU `ambient_ramp`, which must stay u8/ASCII — CLAUDE.md §7). Leading
+/// the CPU `ambient_ramp`, which must stay u8/ASCII — see the field notes). Leading
 /// space = a truly empty lowest level.
 pub const ambient_ramp_rich = [_]u21{ ' ', '.', ',', ':', ';', '+', '=', '*', 'c', 'o', 'x', 's', 'z', 'e', 'a', '₿', '%', '@', '#' };
 
