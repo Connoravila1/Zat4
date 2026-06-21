@@ -536,8 +536,14 @@ pub fn layout(
     if (active_screen == screen_profile) {
         const ph = profile orelse ProfileHeader{ .display_name = "", .handle = "", .post_count = 0 };
         const hx = m.lx;
-        const hy = feed_y0 + 4;
         const hav: i32 = 64; // a larger avatar than the feed rows use
+        // The identity band is CONTENT, above the posts — so it SCROLLS with
+        // them (only the top bar is sticky). Draw at the scrolled screen y; keep
+        // feed_y0 in scroll-independent CONTENT space (the post loop adds scroll).
+        // Without the scroll offset the band stayed pinned and the rising posts
+        // collided with it.
+        const content_top = feed_y0;
+        const hy = content_top + 4 + scroll;
         // avatar disc + initial
         try rect(gpa, dl, hx, hy, hav, hav, tintFor(ph.handle), @intCast(hav >> 1));
         const initial = initialOf(if (ph.display_name.len > 0) ph.display_name else ph.handle);
@@ -549,10 +555,9 @@ pub fn layout(
         var cb: [24]u8 = undefined;
         const counts = std.fmt.bufPrint(&cb, "{d} posts", .{ph.post_count}) catch "0 posts";
         _ = try str(gpa, dl, e, .regular, hx, hy + hav + 82, muted, 14, counts);
-        // divider under the header; the post list starts below it
-        const header_bottom = hy + hav + 100;
-        try rect(gpa, dl, m.col_x, header_bottom, m.col_w, 1, divider, 0);
-        feed_y0 = header_bottom + 14;
+        // divider under the header (scrolled); the post list starts below it
+        try rect(gpa, dl, m.col_x, hy + hav + 100, m.col_w, 1, divider, 0);
+        feed_y0 = content_top + 4 + hav + 100 + 14;
     } else if (active_screen != 0) {
         const msg = "Coming soon";
         const tw: i32 = @intCast(text.measure(e, .regular, msg, 16));
