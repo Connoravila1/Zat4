@@ -60,7 +60,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// effects/writes; the view only reports geometry (B5). `nav` (a left-rail
 /// destination; the region's `post` field carries the Screen index) and
 /// `compose` (the New-post button) route navigation rather than engagement.
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile };
 
 /// The six top-level rail destinations, in order. The `Screen` index a nav
 /// region carries is an index into this. Shared by the rail (draw + hit) and
@@ -80,6 +80,9 @@ pub const ProfileHeader = struct {
     display_name: []const u8,
     handle: []const u8, // already "@handle" form, as the post rows carry it
     post_count: u32,
+    /// True when this is the viewer's OWN profile — draws an "Edit profile"
+    /// button (a `.edit_profile` tap region) so they can set their display name.
+    editable: bool = false,
 };
 
 /// One tappable button region in window pixels, tagged with the post it
@@ -555,6 +558,18 @@ pub fn layout(
         var cb: [24]u8 = undefined;
         const counts = std.fmt.bufPrint(&cb, "{d} posts", .{ph.post_count}) catch "0 posts";
         _ = try str(gpa, dl, e, .regular, hx, hy + hav + 82, muted, 14, counts);
+        // "Edit profile" pill on your OWN profile — a tappable .edit_profile
+        // region (no specific post). Sits at the top-right of the identity band.
+        if (ph.editable) {
+            const label = "Edit profile";
+            const lw: i32 = @intCast(text.measure(e, .semibold, label, 14));
+            const bw = lw + 28;
+            const bx2 = m.lx + m.cw - bw;
+            const by2 = hy + 10;
+            try rect(gpa, dl, bx2, by2, bw, 32, panel, 16);
+            _ = try str(gpa, dl, e, .semibold, bx2 + 14, by2 + 21, ink, 14, label);
+            try emitRegion(gpa, regions, bx2, by2, bw, 32, 0, .edit_profile);
+        }
         // divider under the header (scrolled); the post list starts below it
         try rect(gpa, dl, m.col_x, hy + hav + 100, m.col_w, 1, divider, 0);
         feed_y0 = content_top + 4 + hav + 100 + 14;

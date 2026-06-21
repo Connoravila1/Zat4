@@ -130,6 +130,46 @@ pub fn createPost(
     return createRecord(gpa, arena, io, environ, session, lexicon.collection.post, record);
 }
 
+/// Create or REPLACE the session account's `app.zat4.actor.profile` record
+/// (rkey "self") with a display name — the in-app profile editor's write.
+/// putRecord upserts, so editing overwrites the one record. Avatar/description
+/// are deferred (avatar needs the blob path). `now_epoch` from the shell clock.
+pub fn putProfile(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    session: *auth.Session,
+    display_name: []const u8,
+    now_epoch: i64,
+) !WriteOutcome {
+    var ts_buf: [24]u8 = undefined;
+    const record = lexicon.ProfileRecordOut{
+        .displayName = if (display_name.len > 0) display_name else null,
+        .createdAt = feed_core.formatTimestamp(&ts_buf, now_epoch),
+    };
+    const input = lexicon.PutRecordInput(@TypeOf(record)){
+        .repo = session.did,
+        .collection = lexicon.collection.profile,
+        .rkey = "self",
+        .record = record,
+    };
+    const outcome = try auth.procedure(
+        gpa,
+        arena,
+        io,
+        environ,
+        session,
+        lexicon.method.put_record,
+        input,
+        lexicon.RecordRef,
+    );
+    return switch (outcome) {
+        .ok => |ref| .{ .ok = ref },
+        .failed => |failure| .{ .failed = failure },
+    };
+}
+
 pub fn likePost(
     gpa: Allocator,
     arena: Allocator,
@@ -332,6 +372,45 @@ test "loopback round trip: faceted reply posted with exact wire body, then a lik
         1_767_323_045,
     );
     try std.testing.expectEqualStrings("bafyreilike", liked.ok.cid);
+}
+
+test "loopback: putProfile upserts the self profile record with the display name" {
+    const gpa = std.testing.allocator; // C6
+    const io = std.testing.io;
+
+    var bound = try listenLoopback(io, 38756);
+    defer bound.server.deinit(io);
+    const thread = try std.Thread.spawn(.{}, serveScript, .{
+        &bound.server, io,
+        &[_]ScriptStep{
+            .{
+                .must_contain_head = "POST /xrpc/com.atproto.repo.putRecord",
+                // The envelope upserts at rkey "self" (create-or-replace) with
+                // the typed profile record carrying the display name.
+                .must_contain_body = "\"rkey\":\"self\"",
+                .status = .ok,
+                .body =
+                \\{"uri":"at://did:plc:cccccccccccccccccccccccc/app.zat4.actor.profile/self","cid":"bafyreiprofile"}
+                ,
+            },
+        },
+    });
+    defer thread.join();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    var url_buf: [48]u8 = undefined;
+    const pds = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}", .{bound.port});
+    var session = auth.Session{
+        .did = "did:plc:cccccccccccccccccccccccc",
+        .handle = "carol.test",
+        .pds_url = pds,
+        .access_jwt = "access-1",
+        .refresh_jwt = "refresh-1",
+    };
+
+    const saved = try putProfile(gpa, arena_state.allocator(), io, null, &session, "Connor A", 1_767_323_045);
+    try std.testing.expectEqualStrings("bafyreiprofile", saved.ok.cid);
 }
 
 /// Split an at-uri (`at://did/collection/rkey`) into its tail parts —

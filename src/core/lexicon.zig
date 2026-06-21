@@ -98,6 +98,7 @@ pub const method = struct {
     pub const refresh_session = "com.atproto.server.refreshSession";
     pub const get_session = "com.atproto.server.getSession";
     pub const create_record = "com.atproto.repo.createRecord";
+    pub const put_record = "com.atproto.repo.putRecord";
     pub const delete_record = "com.atproto.repo.deleteRecord";
     pub const list_records = "com.atproto.repo.listRecords";
     pub const resolve_handle = "com.atproto.identity.resolveHandle";
@@ -395,6 +396,19 @@ pub fn CreateRecordInput(comptime Record: type) type {
     return struct {
         repo: []const u8,
         collection: []const u8,
+        record: Record,
+    };
+}
+
+/// The putRecord envelope — create-or-REPLACE at a known rkey (used for the
+/// self-keyed profile record, rkey "self"). Same shape as createRecord plus
+/// the rkey, so editing the profile overwrites the one record rather than
+/// piling up new ones.
+pub fn PutRecordInput(comptime Record: type) type {
+    return struct {
+        repo: []const u8,
+        collection: []const u8,
+        rkey: []const u8,
         record: Record,
     };
 }

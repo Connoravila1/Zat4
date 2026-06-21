@@ -227,6 +227,10 @@ pub fn run(
     defer compose_arena_state.deinit();
     var reply_target: ?write.ReplyTarget = null;
     var reply_handle: []const u8 = "";
+    // The compose flow is reused for the profile editor: .post writes a feed
+    // post on send; .profile upserts the self profile record with the buffer as
+    // the display name. Set when the editor / composer is opened.
+    var compose_kind: ComposeKind = .post;
 
     // Reveal toggles: cids the user has opened past a moderation collapse.
     // Plain values handed to the core each frame (B5); freed here (C4/C5).
@@ -795,7 +799,25 @@ pub fn run(
                                             }
                                         },
                                         // New-post button → the composer (cell path for now).
-                                        .compose => mode = .compose,
+                                        .compose => {
+                                            compose_kind = .post;
+                                            mode = .compose;
+                                        },
+                                        // "Edit profile" → reuse the composer to set your
+                                        // display name; prefill the current one (when it's a
+                                        // real name, not the handle fallback). Saved via
+                                        // putProfile on send (handleComposeInput).
+                                        .edit_profile => {
+                                            compose_kind = .profile;
+                                            compose_buf.clearRetainingCapacity();
+                                            if (profile_header) |ph| {
+                                                const bare = if (ph.handle.len > 1) ph.handle[1..] else "";
+                                                if (ph.display_name.len > 0 and !std.mem.eql(u8, ph.display_name, bare))
+                                                    try compose_buf.appendSlice(gpa, ph.display_name);
+                                            }
+                                            mode = .compose;
+                                            status = "edit display name · Enter saves";
+                                        },
                                         // Like / boost: the SAME path the keyboard uses —
                                         // optimistic toggle (heart fills red), persist via
                                         // the worker, and fire the splash + heart-pop.
@@ -850,7 +872,7 @@ pub fn run(
             }
 
             if (mode == .compose) {
-                try handleComposeInput(gpa, arena, io, environ, session, out, backend, &prev, &next, &status, &status_buf, &mode, &compose_buf, &reply_target, &reply_handle, decoded.event, now);
+                try handleComposeInput(gpa, arena, io, environ, session, out, backend, &prev, &next, &status, &status_buf, &mode, &compose_buf, &reply_target, &reply_handle, compose_kind, decoded.event, now);
                 continue;
             }
 
@@ -1156,6 +1178,7 @@ fn handleComposeInput(
     compose_buf: *std.ArrayList(u8),
     reply_target: *?write.ReplyTarget,
     reply_handle: *[]const u8,
+    compose_kind: ComposeKind,
     ev: tui.InputEvent,
     now: i64,
 ) !void {
@@ -1176,7 +1199,33 @@ fn handleComposeInput(
         },
         .send => {
             if (compose_buf.items.len == 0) {
-                status.* = "nothing to post";
+                status.* = if (compose_kind == .profile) "name can't be empty" else "nothing to post";
+                return;
+            }
+            // Profile editor: upsert the self profile record, then return to the
+            // profile screen (mode→timeline re-enters it and re-fetches, so the
+            // new name shows once the AppView re-polls the record).
+            if (compose_kind == .profile) {
+                status.* = "saving...";
+                timeline_ui.buildComposeFrame(next, compose_buf.items, reply_handle.*, status.*);
+                try present(gpa, out, arena, prev, next, backend);
+                const saved = write.putProfile(gpa, arena, io, environ, session, compose_buf.items, now) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => {
+                        status.* = "network error";
+                        return;
+                    },
+                };
+                switch (saved) {
+                    .ok => {
+                        compose_buf.clearRetainingCapacity();
+                        mode.* = .timeline;
+                        status.* = "profile saved";
+                    },
+                    .failed => |failure| status.* = std.fmt.bufPrint(status_buf, "refused: {d} {s}", .{
+                        failure.status, failure.code,
+                    }) catch "refused",
+                }
                 return;
             }
             status.* = "posting...";
@@ -1227,6 +1276,10 @@ fn handleComposeInput(
 
 const Engagement = enum { like, repost };
 
+/// What the reused compose flow writes on send — a feed post, or the self
+/// profile record (the in-app profile editor reuses the composer's input).
+const ComposeKind = enum { post, profile };
+
 /// Build the ACTIVE view's posts over the SHARED store — Home's timeline, or
 /// the profile screen's author query. The single place "which view is showing"
 /// is decided, for both the main loop and engageSelected's optimistic repaint.
@@ -1250,6 +1303,7 @@ fn profileHeaderFor(arena: Allocator, session: *const auth.Session, screen: u8, 
         .display_name = name,
         .handle = try std.fmt.allocPrint(arena, "@{s}", .{handle_src}),
         .post_count = @intCast(view_items.len),
+        .editable = is_self, // your own profile gets the "Edit profile" button
     };
 }
 
