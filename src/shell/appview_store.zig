@@ -147,6 +147,20 @@ const EngEnvelope = struct {
     commit: EngCommit,
 };
 
+/// A7.2: cold struct, size guard waived — transient serialize source. The
+/// durable identity line: matches the firehose `identity` frame the reducer
+/// reads (a DID's handle), so replay restores handles via the same path.
+const IdentityRecord = struct {
+    did: []const u8,
+    handle: []const u8,
+};
+/// A7.2: cold struct, size guard waived — transient serialize source.
+const IdentityEnvelope = struct {
+    did: []const u8,
+    kind: []const u8 = "identity",
+    identity: IdentityRecord,
+};
+
 /// A7.2: cold struct, size guard waived — transient parse target (replay cid peek).
 const PeekCommit = struct {
     cid: []const u8 = "",
@@ -218,6 +232,15 @@ pub fn appendEngagement(
             .record = .{ .@"$type" = collection, .subject = .{ .cid = subject_cid }, .createdAt = "" },
         },
     };
+    writeEnvelope(store, arena, env);
+}
+
+/// Append a DID→handle identity line so the resolved handle survives a restart
+/// (replayed via the shared reducer's `identity` branch — no re-resolve on
+/// boot). A disabled store is a silent no-op. `arena` is stringify scratch.
+pub fn appendHandle(store: *Store, arena: Allocator, did: []const u8, handle: []const u8) void {
+    if (store.fd < 0 or did.len == 0 or handle.len == 0) return;
+    const env: IdentityEnvelope = .{ .did = did, .identity = .{ .did = did, .handle = handle } };
     writeEnvelope(store, arena, env);
 }
 

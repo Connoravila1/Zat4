@@ -128,6 +128,12 @@ pub const Index = struct {
     /// delete to unlike. Keyed by the interned pair so lookup is O(1) and
     /// survives post-row reordering. Set by `setLikeEdge`, idempotently.
     like_edges: std.AutoHashMapUnmanaged(u64, StrId) = .empty,
+
+    /// Author DID id → handle id (both interned). Lets the serve layer answer
+    /// a post's `author.handle` with the real handle (`connor.zat4.com`) instead
+    /// of echoing the DID. Resolved by the shell (describeRepo / identity
+    /// events) and persisted, so it survives a restart.
+    handles: std.AutoHashMapUnmanaged(StrId, StrId) = .empty,
 };
 
 pub fn deinit(gpa: Allocator, idx: *Index) void {
@@ -142,6 +148,7 @@ pub fn deinit(gpa: Allocator, idx: *Index) void {
     idx.post_by_cid.deinit(gpa);
     idx.pending_reposts.deinit(gpa);
     idx.like_edges.deinit(gpa);
+    idx.handles.deinit(gpa);
     idx.* = .{};
 }
 
@@ -335,6 +342,29 @@ pub fn clearLikeEdgesForActor(gpa: Allocator, idx: *Index, actor_did: []const u8
     }
 }
 
+/// Record `did`'s handle (e.g. `connor.zat4.com`), so a post can be served
+/// with its author's real handle instead of the DID. Idempotent — a re-resolve
+/// overwrites with the same id. C1. An empty argument is a no-op (E4).
+pub fn setHandle(gpa: Allocator, idx: *Index, did: []const u8, handle: []const u8) Allocator.Error!void {
+    if (did.len == 0 or handle.len == 0) return;
+    const did_id = try internStr(gpa, idx, did);
+    const handle_id = try internStr(gpa, idx, handle);
+    try idx.handles.put(gpa, did_id, handle_id);
+}
+
+/// The handle known for `did`, or "" if none is indexed yet (the serve layer
+/// falls back to the DID). Pure.
+pub fn handleFor(idx: *const Index, did: []const u8) []const u8 {
+    const did_id = idx.intern.get(did) orelse return "";
+    return handleForId(idx, did_id);
+}
+
+/// Internal: the handle for an already-interned DID id (what materializeRows
+/// holds), or "" if none.
+fn handleForId(idx: *const Index, did_id: StrId) []const u8 {
+    return if (idx.handles.get(did_id)) |h| str(idx, h) else "";
+}
+
 /// One row of an assembled timeline, as plain values crossing the boundary
 /// (A5: DIDs/CIDs, never the internal index). The shell serializes these into
 /// the lexicon's TimelinePage shape.
@@ -344,6 +374,9 @@ pub const TimelineRow = struct {
     cid: []const u8,
     uri: []const u8 = "", // built by the shell from author+cid if needed
     author_did: []const u8,
+    /// The author's handle (e.g. `connor.zat4.com`), or "" if not yet indexed
+    /// — the serve layer falls back to the DID for `author.handle` then.
+    author_handle: []const u8 = "",
     text: []const u8,
     created_at: i64,
     like_count: u32,
@@ -456,6 +489,7 @@ fn materializeRows(
         o.* = .{
             .cid = str(idx, cids[row]),
             .author_did = str(idx, authors[row]),
+            .author_handle = handleForId(idx, authors[row]),
             .text = blk: {
                 const s = texts[row];
                 break :blk idx.pool_bytes.items[s.off .. s.off + s.len];
@@ -608,6 +642,27 @@ test "author feed: one author's posts, reverse-chron, with the viewer's like; un
     // An unknown author is an empty feed, not an error.
     const none = try buildAuthorFeed(arena_state.allocator(), &idx, "did:ghost", "did:alice", 10);
     try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "handles: a post row carries the author's indexed handle; unknown stays empty" {
+    const gpa = testing.allocator;
+    var idx: Index = .{};
+    defer deinit(gpa, &idx);
+
+    _ = try indexPost(gpa, &idx, .{ .cid = "c1", .author_did = "did:plc:bob", .text = "hi", .created_at = 10 });
+    try setHandle(gpa, &idx, "did:plc:bob", "bob.zat4.com");
+    // Idempotent re-resolve overwrites with the same value (no growth, no dup).
+    try setHandle(gpa, &idx, "did:plc:bob", "bob.zat4.com");
+
+    try testing.expectEqualStrings("bob.zat4.com", handleFor(&idx, "did:plc:bob"));
+    try testing.expectEqualStrings("", handleFor(&idx, "did:plc:nobody"));
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const rows = try buildAuthorFeed(arena_state.allocator(), &idx, "did:plc:bob", "did:plc:bob", 10);
+    try testing.expectEqual(@as(usize, 1), rows.len);
+    try testing.expectEqualStrings("bob.zat4.com", rows[0].author_handle);
+    try testing.expectEqualStrings("did:plc:bob", rows[0].author_did);
 }
 
 test "engagement: likes are edge-counted (one per actor, deduped); reposts bump; unknown subject pends" {

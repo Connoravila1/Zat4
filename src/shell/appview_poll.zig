@@ -119,6 +119,31 @@ pub fn pollRepo(
 ) !usize {
     var added: usize = 0;
 
+    // Handle: resolve this author's DID → handle ONCE (describeRepo is a public
+    // read on the PDS), so posts serve `@handle` instead of the DID. Gated on
+    // "not yet known" so it costs one request per author for the AppView's life,
+    // not per poll cycle (G3). The verified handle is persisted (appendHandle)
+    // so a restart restores it via replay — no re-resolve on boot. A failed or
+    // unverified resolve simply leaves the DID showing (E2/E4).
+    {
+        lock.lock();
+        const known = appview.handleFor(idx, did).len > 0;
+        lock.unlock();
+        if (!known) {
+            const params = [_]xrpc.Param{.{ .name = "repo", .value = did }};
+            const outcome = xrpc.query(arena, io, environ, pds_url, lexicon.method.describe_repo, &params, lexicon.RepoDescription, .{}) catch null;
+            if (outcome) |o| switch (o) {
+                .ok => |desc| if (desc.handle.len > 0 and desc.handleIsCorrect) {
+                    lock.lock();
+                    appview.setHandle(gpa, idx, did, desc.handle) catch {};
+                    lock.unlock();
+                    store.appendHandle(log, arena, did, desc.handle);
+                },
+                .failed => {},
+            };
+        }
+    }
+
     // Posts — indexPost dedups by cid, so this is idempotent on its own. A
     // newly-indexed post is also appended to the durable log (keyed by its cid)
     // so it survives a restart without a re-poll. (The append rides inside the

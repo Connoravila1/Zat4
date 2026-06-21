@@ -228,7 +228,7 @@ fn serializeFeed(arena: Allocator, rows: []const appview.TimelineRow) RouteError
             .post = .{
                 .uri = uri,
                 .cid = r.cid,
-                .author = .{ .did = r.author_did, .handle = r.author_did },
+                .author = .{ .did = r.author_did, .handle = if (r.author_handle.len > 0) r.author_handle else r.author_did },
                 .record = .{ .text = r.text, .createdAt = created_at },
                 .likeCount = r.like_count,
                 .repostCount = r.repost_count,

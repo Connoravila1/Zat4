@@ -101,6 +101,18 @@ pub const method = struct {
     pub const delete_record = "com.atproto.repo.deleteRecord";
     pub const list_records = "com.atproto.repo.listRecords";
     pub const resolve_handle = "com.atproto.identity.resolveHandle";
+    pub const describe_repo = "com.atproto.repo.describeRepo";
+};
+
+/// Response of `com.atproto.repo.describeRepo` — the AppView reads a polled
+/// author's verified handle from it (DID → handle) so posts show `@handle`.
+/// `handleIsCorrect` is the PDS's bidirectional handle↔DID verification.
+/// A7.2: cold struct, size guard waived — transient parse target, one per
+/// repo per resolve.
+pub const RepoDescription = struct {
+    did: []const u8 = "",
+    handle: []const u8 = "",
+    handleIsCorrect: bool = false,
 };
 
 /// Record collections this client reads and writes — the wall itself.
@@ -427,6 +439,7 @@ test "wall: every content collection and owned method is app.zat4, never app.bsk
     // stay com.atproto so writes/identity keep working across the network.
     try testing.expect(std.mem.startsWith(u8, method.create_record, "com.atproto."));
     try testing.expect(std.mem.startsWith(u8, method.resolve_handle, "com.atproto."));
+    try testing.expect(std.mem.startsWith(u8, method.describe_repo, "com.atproto."));
 }
 
 test "round-trip: an app.zat4.feed.post survives build → JSON → struct" {

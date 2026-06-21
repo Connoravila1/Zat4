@@ -46,7 +46,7 @@ const lexicon = @import("../core/lexicon.zig");
 
 /// What a single event did to the index — returned so the pump (and tests)
 /// can count without re-inspecting the index. Plain enum, no payload.
-pub const Reduced = enum { post, follow, like, repost, ignored };
+pub const Reduced = enum { post, follow, like, repost, identity, ignored };
 
 /// Reduce one Jetstream event-JSON line into the index. PURE over (idx,
 /// json) aside from the index mutation it performs; no I/O, no clock. A line
@@ -71,6 +71,15 @@ pub fn ingestEvent(gpa: Allocator, arena: Allocator, idx: *appview.Index, event_
     const ev = std.json.parseFromSliceLeaky(GraphEvent, arena, event_json, .{
         .ignore_unknown_fields = true,
     }) catch return .ignored;
+    // Identity events carry a DID's handle (firehose `identity` frames + the
+    // durable handle line). Index it so posts serve `@handle`, not the DID.
+    if (std.mem.eql(u8, ev.kind, "identity")) {
+        const info = ev.identity orelse return .ignored;
+        const did = if (ev.did.len > 0) ev.did else info.did;
+        if (did.len == 0 or info.handle.len == 0) return .ignored;
+        try appview.setHandle(gpa, idx, did, info.handle);
+        return .identity;
+    }
     if (!std.mem.eql(u8, ev.kind, "commit")) return .ignored;
     const commit = ev.commit orelse return .ignored;
     if (!std.mem.eql(u8, commit.operation, "create")) return .ignored;
@@ -116,6 +125,14 @@ const GraphEvent = struct {
     time_us: i64 = 0,
     kind: []const u8 = "",
     commit: ?GraphCommitFlat = null,
+    identity: ?IdentityInfo = null,
+};
+
+/// A7.2: cold struct, size guard waived — transient parse target. The handle
+/// payload of an `identity` event (`did` is usually on the envelope too).
+const IdentityInfo = struct {
+    did: []const u8 = "",
+    handle: []const u8 = "",
 };
 
 /// A7.2: cold struct, size guard waived — transient parse target.
@@ -245,6 +262,20 @@ test "ingest: a like bumps the subject post's count; a non-zat4 event is ignored
     ;
     try testing.expectEqual(Reduced.ignored, try ingestEvent(gpa, arena, &idx, bsky));
     try testing.expectEqual(@as(usize, 1), idx.posts.len); // unchanged
+}
+
+test "ingest: an identity event indexes the author's handle" {
+    const gpa = testing.allocator;
+    var idx: appview.Index = .{};
+    defer appview.deinit(gpa, &idx);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    const ev =
+        \\{"did":"did:plc:bob","kind":"identity","identity":{"did":"did:plc:bob","handle":"bob.zat4.com"}}
+    ;
+    try testing.expectEqual(Reduced.identity, try ingestEvent(gpa, arena_state.allocator(), &idx, ev));
+    try testing.expectEqualStrings("bob.zat4.com", appview.handleFor(&idx, "did:plc:bob"));
 }
 
 test "ingest: ingestAll pumps newline-delimited events and counts" {
