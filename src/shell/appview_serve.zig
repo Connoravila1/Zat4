@@ -174,6 +174,9 @@ fn route(arena: Allocator, idx: *const appview.Index, cfg: ServeConfig, target: 
     if (std.mem.endsWith(u8, path, "app.zat4.feed.getTimeline")) {
         return getTimeline(arena, idx, cfg, target);
     }
+    if (std.mem.endsWith(u8, path, "app.zat4.feed.getAuthorFeed")) {
+        return getAuthorFeed(arena, idx, cfg, target);
+    }
     if (std.mem.endsWith(u8, path, "app.zat4.actor.getProfile")) {
         return getProfile(arena, idx, target);
     }
@@ -191,10 +194,28 @@ fn getTimeline(arena: Allocator, idx: *const appview.Index, cfg: ServeConfig, ta
     }
 
     const rows = try appview.buildTimeline(arena, idx, viewer, limit);
+    return serializeFeed(arena, rows);
+}
 
-    // Serialize into the lexicon's TimelinePage shape so the existing client
-    // parser consumes it unchanged (D3 — the AppView speaks the same wire the
-    // client already reads). Build FeedViewPost entries from the plain rows.
+fn getAuthorFeed(arena: Allocator, idx: *const appview.Index, cfg: ServeConfig, target: []const u8) RouteError![]const u8 {
+    // The profile screen's body: one author's posts. `actor` is whose feed;
+    // `viewer` is who is looking (their viewer.like is stamped on each row).
+    // Both are percent-encoded DIDs on the wire (see getTimeline).
+    const actor = (try queryValueDecoded(arena, target, "actor")) orelse "";
+    const viewer = (try queryValueDecoded(arena, target, "viewer")) orelse "";
+    var limit = cfg.default_limit;
+    if (queryValue(target, "limit")) |l| {
+        limit = @min(std.fmt.parseInt(usize, l, 10) catch cfg.default_limit, cfg.max_limit);
+    }
+
+    const rows = try appview.buildAuthorFeed(arena, idx, actor, viewer, limit);
+    return serializeFeed(arena, rows);
+}
+
+/// Serialize feed rows into the lexicon's TimelinePage shape so the existing
+/// client parser consumes them unchanged (D3 — the AppView speaks the same
+/// wire the client already reads). Shared by getTimeline and getAuthorFeed.
+fn serializeFeed(arena: Allocator, rows: []const appview.TimelineRow) RouteError![]const u8 {
     const feed_items = try arena.alloc(lexicon.FeedViewPost, rows.len);
     for (feed_items, rows) |*fv, r| {
         const uri_buf = try arena.alloc(u8, r.author_did.len + r.cid.len + 64);
@@ -324,6 +345,32 @@ test "route: a percent-encoded viewer DID resolves (client encodes ':' as %3A)" 
     const page = try std.json.parseFromSliceLeaky(lexicon.TimelinePage, arena, json, .{ .ignore_unknown_fields = true });
     try testing.expectEqual(@as(usize, 1), page.feed.len);
     try testing.expectEqualStrings("decoded ok", page.feed[0].post.record.text);
+}
+
+test "route: getAuthorFeed serves one author's posts with the viewer's like" {
+    const gpa = testing.allocator;
+    var idx: appview.Index = .{};
+    defer appview.deinit(gpa, &idx);
+
+    // Two authors post; the author feed must carry only the requested actor's,
+    // newest first — no follow edge needed (a profile is the author's own posts).
+    _ = try appview.indexPost(gpa, &idx, .{ .cid = "bafyc1", .author_did = "did:plc:author", .text = "older", .created_at = 100 });
+    _ = try appview.indexPost(gpa, &idx, .{ .cid = "bafyc2", .author_did = "did:plc:other", .text = "not mine", .created_at = 150 });
+    _ = try appview.indexPost(gpa, &idx, .{ .cid = "bafyc3", .author_did = "did:plc:author", .text = "newer", .created_at = 200 });
+    try appview.setLikeEdge(gpa, &idx, "did:plc:me", "bafyc3", "at://did:plc:me/app.zat4.feed.like/r1");
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const json = try route(arena, &idx, .{}, "/xrpc/app.zat4.feed.getAuthorFeed?actor=did%3Aplc%3Aauthor&viewer=did%3Aplc%3Ame&limit=10");
+    const page = try std.json.parseFromSliceLeaky(lexicon.TimelinePage, arena, json, .{ .ignore_unknown_fields = true });
+    try testing.expectEqual(@as(usize, 2), page.feed.len); // author's two, not other's
+    try testing.expectEqualStrings("newer", page.feed[0].post.record.text); // newest first
+    try testing.expectEqualStrings("older", page.feed[1].post.record.text);
+    // The viewer's like surfaces on the matching row, absent on the other.
+    try testing.expect(page.feed[0].post.viewer != null);
+    try testing.expect(page.feed[1].post.viewer == null);
 }
 
 test "auth: strict bearer gate — fail closed, exact match, reject the rest" {

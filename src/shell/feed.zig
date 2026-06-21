@@ -133,6 +133,48 @@ pub fn refreshTimeline(
     }
 }
 
+/// Load one author's posts into `store` — the profile screen's body. Same
+/// thin shape as `loadTimelinePage`: the only network seam is the
+/// authenticated getAuthorFeed call; the pure ingest does the rest. `actor`
+/// is whose feed; the viewer DID (session) is sent so the AppView stamps
+/// each row's viewer.like. The caller owns `store` and clears it between
+/// profiles (a profile is a fresh fetch, not paginated here — Cut 1).
+pub fn loadAuthorFeed(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    session: *auth.Session,
+    appview_url: []const u8,
+    store: *feed_core.Store,
+    actor: []const u8,
+    limit: u32,
+) !PageOutcome {
+    var limit_buf: [12]u8 = undefined;
+    const limit_str = std.fmt.bufPrint(&limit_buf, "{d}", .{limit}) catch unreachable;
+    const params = [_]xrpc.Param{
+        .{ .name = "actor", .value = actor },
+        .{ .name = "viewer", .value = session.did },
+        .{ .name = "limit", .value = limit_str },
+    };
+
+    const outcome = try auth.queryHost(
+        gpa,
+        arena,
+        io,
+        environ,
+        session,
+        appview_url,
+        lexicon.method.get_author_feed,
+        &params,
+        lexicon.TimelinePage,
+    );
+    switch (outcome) {
+        .failed => |failure| return .{ .failed = failure },
+        .ok => |page| return .{ .ok = try feed_core.ingestPage(gpa, store, page) },
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Loopback round trip — a scripted fixture PDS serves two timeline pages;
 // the second request must carry the first page's cursor on the wire, and a
@@ -291,4 +333,65 @@ test "loopback refresh: new rows land on top, the pagination cursor survives" {
     _ = arena_state.reset(.retain_capacity);
     const items = try feed_core.buildTimeline(arena_state.allocator(), &store);
     try std.testing.expectEqualStrings("the newest one", items[0].text);
+}
+
+// An author feed page — one author's posts (the profile body shape).
+const author_feed_body =
+    \\{"feed":[
+    \\ {"post":{"uri":"at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.zat4.feed.post/2",
+    \\          "cid":"bafyreialice2",
+    \\          "author":{"did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","handle":"alice.test","displayName":"Alice"},
+    \\          "record":{"$type":"app.zat4.feed.post","text":"my newest","createdAt":"2026-01-04T00:00:00Z"},
+    \\          "likeCount":2,"replyCount":0,"repostCount":0,"quoteCount":0}},
+    \\ {"post":{"uri":"at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.zat4.feed.post/1",
+    \\          "cid":"bafyreialice1",
+    \\          "author":{"did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","handle":"alice.test","displayName":"Alice"},
+    \\          "record":{"$type":"app.zat4.feed.post","text":"my first","createdAt":"2026-01-02T03:04:05Z"},
+    \\          "likeCount":3,"replyCount":0,"repostCount":0,"quoteCount":0}}
+    \\]}
+;
+
+test "loopback author feed: the actor + viewer ride the wire; posts land in the store" {
+    const gpa = std.testing.allocator; // C6
+    const io = std.testing.io;
+
+    var bound = try listenLoopback(io, 38744);
+    defer bound.server.deinit(io);
+    const thread = try std.Thread.spawn(.{}, serveScript, .{
+        &bound.server, io,
+        &[_]ScriptStep{
+            .{
+                .must_contain_head = "GET /xrpc/app.zat4.feed.getAuthorFeed?actor=did",
+                .must_contain_head_b = "viewer=did",
+                .status = .ok,
+                .body = author_feed_body,
+            },
+        },
+    });
+    defer thread.join();
+
+    var url_buf: [40]u8 = undefined;
+    const pds = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}", .{bound.port});
+    var session = auth.Session{
+        .did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+        .handle = "alice.test",
+        .pds_url = pds,
+        .access_jwt = "access-1",
+        .refresh_jwt = "refresh-1",
+    };
+    var store: feed_core.Store = .{};
+    defer feed_core.deinitStore(gpa, &store);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    const outcome = try loadAuthorFeed(gpa, arena_state.allocator(), io, null, &session, pds, &store, session.did, 30);
+    switch (outcome) {
+        .failed => return error.TestUnexpectedXrpcFailure,
+        .ok => |stats| try std.testing.expectEqual(@as(u32, 2), stats.posts_added),
+    }
+
+    const items = try feed_core.buildTimeline(arena_state.allocator(), &store);
+    try std.testing.expectEqual(@as(usize, 2), items.len);
+    try std.testing.expectEqualStrings("my newest", items[0].text);
 }

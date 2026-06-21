@@ -337,6 +337,12 @@ pub fn run(
     // The active top-level Screen (index into feed_view.nav_labels); the rail
     // sets it on a click. 0 = Home (the feed). Lives across frames in run().
     var gscreen: u8 = 0;
+    // The premium Profile screen's OWN post store (C4: its own memory), fetched
+    // lazily each time the screen is entered (read-only Cut 1). The home `store`
+    // stays the interactive feed. `on_profile_prev` detects the entry edge.
+    var profile_store: feed_core.Store = .{};
+    defer feed_core.deinitStore(gpa, &profile_store);
+    var on_profile_prev = false;
 
     // Phase 6.4: the GPU render path, brought up additively when the window is
     // open AND the font engine is live AND `gpu.init` succeeds. On any failure
@@ -496,13 +502,44 @@ pub fn run(
             }
         }
 
+        // Premium Profile screen: on ENTERING it (the rail click flips gscreen),
+        // fetch the viewed account's own posts into its own store — a fresh fetch
+        // each visit, read-only in Cut 1. Failure is contained to the status line
+        // (E2); only OOM is fatal. Gated to the timeline mode + window path.
+        const on_profile = mode == .timeline and gscreen == feed_view.screen_profile;
+        if (on_profile and !on_profile_prev) {
+            feed_core.deinitStore(gpa, &profile_store);
+            profile_store = .{};
+            const po = feed_shell.loadAuthorFeed(gpa, arena, io, environ, session, appview_url, &profile_store, session.did, 30) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => blk: {
+                    status = "profile: network error"; // contained
+                    break :blk null;
+                },
+            };
+            if (po) |result| switch (result) {
+                .ok => {},
+                .failed => status = "profile: unavailable",
+            };
+        }
+        on_profile_prev = on_profile;
+        // The profile view-models (and header) only when the screen is showing;
+        // an empty store on any other screen builds to an empty slice cheaply.
+        const profile_items: []const feed_core.TimelineItem =
+            if (on_profile) try feed_core.buildTimeline(arena, &profile_store) else &.{};
+        const profile_header: ?feed_view.ProfileHeader = if (on_profile) .{
+            .display_name = session.handle,
+            .handle = try std.fmt.allocPrint(arena, "@{s}", .{session.handle}),
+            .post_count = @intCast(profile_items.len),
+        } else null;
+
         const items = try feed_core.buildTimeline(arena, store);
         // pix exists exactly when a window backend has a live engine; the
         // composer and profile screens stay on the cell path this cut
         // (their pixel port is the recorded next slice).
         const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null } else null;
         switch (mode) {
-            .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, &state, revealed.items, now, session.handle, status),
+            .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, profile_items, profile_header, &state, revealed.items, now, session.handle, status),
             .compose => {
                 if (pix) |g| switch (backend) {
                     .window => |win| {
@@ -628,7 +665,7 @@ pub fn run(
                 // is folded into the loop's own re-render lap.)
                 if (pumped.exposed or pumped.resized) {
                     if (mode == .timeline) {
-                        try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, &state, revealed.items, now, session.handle, status);
+                        try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, profile_items, profile_header, &state, revealed.items, now, session.handle, status);
                     } else {
                         try present(gpa, out, arena, &prev, &next, backend);
                     }
@@ -713,7 +750,12 @@ pub fn run(
                                         // Like / boost: the SAME path the keyboard uses —
                                         // optimistic toggle (heart fills red), persist via
                                         // the worker, and fire the splash + heart-pop.
-                                        .like, .repost => if (hit.post < items.len) {
+                                        // Engagement is Home-only in Cut 1: the Profile
+                                        // screen's regions index its OWN posts, not `items`/
+                                        // `store`, so a tap there would engage the wrong
+                                        // record. Read-only until the profile gets its own
+                                        // engagement routing (recorded follow-up).
+                                        .like, .repost => if (gscreen == feed_view.screen_home and hit.post < items.len) {
                                             state.selected = hit.post;
                                             const ek: Engagement = if (hit.kind == .like) .like else .repost;
                                             const r = try engageSelected(ek, gpa, arena, session, store, items[hit.post], hit.post, &state, revealed.items, now, out, &prev, &next, backend, pix, writer);
@@ -777,12 +819,12 @@ pub fn run(
                 if (zc == '+' or zc == '=') {
                     gzoom = std.math.clamp(gzoom + 0.15, zoom_min, zoom_max);
                     status = "zoom in";
-                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, &state, revealed.items, now, session.handle, status);
+                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, profile_items, profile_header, &state, revealed.items, now, session.handle, status);
                     continue;
                 } else if (zc == '-' or zc == '_') {
                     gzoom = std.math.clamp(gzoom - 0.15, zoom_min, zoom_max);
                     status = "zoom out";
-                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, &state, revealed.items, now, session.handle, status);
+                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, profile_items, profile_header, &state, revealed.items, now, session.handle, status);
                     continue;
                 }
             };
@@ -791,7 +833,7 @@ pub fn run(
                 .quit => break :main_loop,
                 .refresh => {
                     status = "refreshing...";
-                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, &state, revealed.items, now, session.handle, status);
+                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, profile_items, profile_header, &state, revealed.items, now, session.handle, status);
 
                     const outcome = feed_shell.refreshTimeline(gpa, arena, io, environ, session, appview_url, store, 30) catch |err| switch (err) {
                         error.OutOfMemory => return err,
@@ -832,7 +874,7 @@ pub fn run(
                     }
                     // Paint the wait before paying it.
                     status = "loading...";
-                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, &state, revealed.items, now, session.handle, status);
+                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, profile_items, profile_header, &state, revealed.items, now, session.handle, status);
 
                     const outcome = feed_shell.loadTimelinePage(gpa, arena, io, environ, session, appview_url, store, 30) catch |err| switch (err) {
                         error.OutOfMemory => return err,
@@ -870,7 +912,7 @@ pub fn run(
                 .profile => if (items.len > 0) {
                     const item = items[state.selected];
                     status = "loading profile...";
-                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, &state, revealed.items, now, session.handle, status);
+                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, profile_items, profile_header, &state, revealed.items, now, session.handle, status);
                     const outcome = auth.queryHost(gpa, arena, io, environ, session, appview_url, lexicon.method.get_profile, &.{
                         .{ .name = "actor", .value = item.author_handle },
                     }, lexicon.ProfileViewDetailed) catch |err| switch (err) {
@@ -925,7 +967,7 @@ pub fn run(
                     const did = feed_core.authorDidForCid(store, item.cid);
                     if (did.len > 0) {
                         status = "following...";
-                        try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, &state, revealed.items, now, session.handle, status);
+                        try paintFrame(gpa, out, arena, &prev, &next, backend, pix, items, profile_items, profile_header, &state, revealed.items, now, session.handle, status);
                         const outcome = write.followAccount(gpa, arena, io, environ, session, did, now) catch |err| switch (err) {
                             error.OutOfMemory => return err,
                             else => {
@@ -1195,7 +1237,9 @@ fn engageSelected(
             @memcpy(record_uri, borrowed);
 
             const fresh = try feed_core.buildTimeline(arena, store);
-            try paintFrame(gpa, out, arena, prev, next, backend, pix, fresh, state, revealed_cids, now, session.handle, if (kind == .like) "unliking..." else "unboosting...");
+            // Engagement is Home-only, so this optimistic repaint is always the
+            // Home feed — no profile posts/header in play.
+            try paintFrame(gpa, out, arena, prev, next, backend, pix, fresh, &.{}, null, state, revealed_cids, now, session.handle, if (kind == .like) "unliking..." else "unboosting...");
             // Fire the drain effect at the post's heart cell (state is now
             // DISENGAGED → the cooler recipe). One trigger, derived from the
             // actual transition — no click-path race.
@@ -1223,7 +1267,7 @@ fn engageSelected(
     // Optimistic first: the bumped count paints now; the worker call
     // follows on its own thread; a refusal reverts (drained in the loop).
     const fresh = try feed_core.buildTimeline(arena, store);
-    try paintFrame(gpa, out, arena, prev, next, backend, pix, fresh, state, revealed_cids, now, session.handle, if (kind == .like) "liking..." else "boosting...");
+    try paintFrame(gpa, out, arena, prev, next, backend, pix, fresh, &.{}, null, state, revealed_cids, now, session.handle, if (kind == .like) "liking..." else "boosting...");
     // Fire the like/boost burst at the post's heart cell (state is now
     // ENGAGED). One trigger derived from the transition.
     if (pix) |g| fireEngageEffect(gpa, g, kind, target, true);
@@ -1597,6 +1641,11 @@ fn paintFrame(
     backend: Backend,
     pix: ?Grid,
     items: []const feed_core.TimelineItem,
+    /// The premium Profile screen's posts + header (the viewed account's own,
+    /// read-only Cut 1). Used only when the active Screen is the profile;
+    /// `profile_header` is null on every other screen.
+    profile_items: []const feed_core.TimelineItem,
+    profile_header: ?feed_view.ProfileHeader,
     state: *timeline_ui.UiState,
     revealed: []const []const u8,
     now: i64,
@@ -1605,11 +1654,15 @@ fn paintFrame(
 ) !void {
     if (pix) |g| switch (backend) {
         .window => |win| {
+            // The Profile screen renders its OWN post list; every other screen
+            // renders the home timeline (placeholders draw no posts at all).
+            const on_profile = g.screen.* == feed_view.screen_profile;
+            const active_items = if (on_profile) profile_items else items;
             if (items.len > 0 and state.selected >= items.len) state.selected = @intCast(items.len - 1);
             // Phase 6.4: when the GPU path is live, render the field + feed on
             // the GPU and return; the software path below is the fallback.
             if (g.gpu) |gs| {
-                try paintFrameGpu(gpa, arena, win, g, gs, items, now);
+                try paintFrameGpu(gpa, arena, win, g, gs, active_items, profile_header, now);
                 return;
             }
             // Cell size scales with the user zoom; the grid reflows to
@@ -1671,8 +1724,8 @@ fn paintFrame(
             // row, dividers) painted OVER the field as proportional items, fed
             // by the REAL timeline via a pure transform (B5). An empty timeline
             // renders the chrome with no posts — no placeholder content.
-            const feed_posts = feed_view.fromTimeline(arena, items, now) catch &[_]feed_view.PostView{};
-            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*) catch g.content_h.*;
+            const feed_posts = feed_view.fromTimeline(arena, active_items, now) catch &[_]feed_view.PostView{};
+            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*, profile_header) catch g.content_h.*;
             const t_layout = if (debug_frame_timing) clock_shell.monotonicNanos() else 0;
             window_shell.presentDrawList(win, gpa, g.engine, g.draw.slice(), field_core.background) catch {}; // E2: a lost blit is the next frame's problem
             if (debug_frame_timing) {
@@ -1703,6 +1756,10 @@ fn paintFrameGpu(
     g: Grid,
     gs: *GpuState,
     items: []const feed_core.TimelineItem,
+    /// Non-null on the Profile screen: its header band, and the signal to draw
+    /// hearts STATICALLY (the SDF in-place heart pass is the Home screen's, fed
+    /// by tap effects which only fire on Home).
+    profile_header: ?feed_view.ProfileHeader,
     now: i64,
 ) !void {
     const w: u32 = win.fb.width;
@@ -1750,7 +1807,9 @@ fn paintFrameGpu(
         }
         const lh = logicalH(w, h);
         g.draw.len = 0;
-        g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true, g.screen.*) catch g.content_h.*;
+        // skip_heart: Home draws hearts via the SDF in-place pass (skip here);
+        // the Profile screen has no tap-driven heart pass, so draw them statically.
+        g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, profile_header == null, g.screen.*, profile_header) catch g.content_h.*;
         gpu.feedBuild(&gs.feed, gpa, g.engine, g.draw.slice(), scale) catch {};
     }
 

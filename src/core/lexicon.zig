@@ -90,6 +90,7 @@ pub const method = struct {
     // Bluesky client.
     pub const get_profile = "app.zat4.actor.getProfile";
     pub const get_timeline = "app.zat4.feed.getTimeline";
+    pub const get_author_feed = "app.zat4.feed.getAuthorFeed";
 
     // Protocol methods — shared by every atproto app, NOT Bluesky content.
     // These stay exactly as they are (the wall self-check exempts them).
@@ -416,7 +417,7 @@ test "wall: every content collection and owned method is app.zat4, never app.bsk
         try testing.expect(std.mem.startsWith(u8, nsid, "app.zat4."));
         try testing.expect(std.mem.indexOf(u8, nsid, "app.bsky") == null);
     }
-    inline for (.{ method.get_profile, method.get_timeline }) |nsid| {
+    inline for (.{ method.get_profile, method.get_timeline, method.get_author_feed }) |nsid| {
         try testing.expect(std.mem.startsWith(u8, nsid, "app.zat4."));
     }
     inline for (.{ richtext.facet_link, richtext.facet_mention }) |nsid| {

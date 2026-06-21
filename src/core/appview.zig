@@ -382,13 +382,55 @@ pub fn buildTimeline(arena: Allocator, idx: *const Index, viewer_did: []const u8
 
     // Gather candidate rows: posts whose author is followed.
     const authors = idx.posts.items(.author);
-    const createds = idx.posts.items(.created_at);
     var rows: std.ArrayList(u32) = .empty;
     defer rows.deinit(arena);
     for (authors, 0..) |a, row| {
         if (followed.contains(a)) try rows.append(arena, @intCast(row));
     }
 
+    return materializeRows(arena, idx, viewer_id, rows.items, limit);
+}
+
+/// Build a reverse-chronological feed of a SINGLE author's posts — the
+/// profile screen's body. PURE (B2), same shape as `buildTimeline`: same
+/// (index, author, viewer, limit) ⇒ same rows, allocated in `arena`.
+///
+/// `viewer_did` is whose `viewer.like` state to stamp (the profile is shown
+/// to a logged-in viewer, who may have liked the author's posts). An unknown
+/// author yields an empty feed (E4, not an error); an unknown viewer simply
+/// yields no viewer.like on any row.
+pub fn buildAuthorFeed(
+    arena: Allocator,
+    idx: *const Index,
+    author_did: []const u8,
+    viewer_did: []const u8,
+    limit: usize,
+) Allocator.Error![]TimelineRow {
+    const author_id = idx.intern.get(author_did) orelse return &.{};
+    const viewer_id: ?StrId = idx.intern.get(viewer_did);
+
+    const authors = idx.posts.items(.author);
+    var rows: std.ArrayList(u32) = .empty;
+    defer rows.deinit(arena);
+    for (authors, 0..) |a, row| {
+        if (a == author_id) try rows.append(arena, @intCast(row));
+    }
+
+    return materializeRows(arena, idx, viewer_id, rows.items, limit);
+}
+
+/// Shared tail of both feed builders (D2/F4 — extracted once a SECOND caller
+/// appeared): sort the candidate post rows reverse-chron, take `limit`, and
+/// fill plain `TimelineRow`s, stamping each with `viewer_id`'s like record uri
+/// when present. `rows` is sorted in place (caller owns its arena backing).
+fn materializeRows(
+    arena: Allocator,
+    idx: *const Index,
+    viewer_id: ?StrId,
+    rows: []u32,
+    limit: usize,
+) Allocator.Error![]TimelineRow {
+    const createds = idx.posts.items(.created_at);
     // Reverse-chron: newest first. Sort row indices by created_at desc.
     const Ctx = struct {
         createds: []const i64,
@@ -396,18 +438,19 @@ pub fn buildTimeline(arena: Allocator, idx: *const Index, viewer_did: []const u8
             return ctx.createds[a] > ctx.createds[b]; // desc
         }
     };
-    std.sort.block(u32, rows.items, Ctx{ .createds = createds }, Ctx.lessThan);
+    std.sort.block(u32, rows, Ctx{ .createds = createds }, Ctx.lessThan);
 
-    const n = @min(limit, rows.items.len);
+    const n = @min(limit, rows.len);
     const out = try arena.alloc(TimelineRow, n);
+    const authors = idx.posts.items(.author);
     const cids = idx.posts.items(.cid);
     const texts = idx.posts.items(.text);
     const likes = idx.posts.items(.like_count);
     const reposts = idx.posts.items(.repost_count);
-    for (out, rows.items[0..n]) |*o, row| {
+    for (out, rows[0..n]) |*o, row| {
         // The viewer's own like record uri for this post (viewer.like), if any.
-        const viewer_like: []const u8 = if (idx.like_edges.get(edgeKey(viewer_id, cids[row]))) |uid|
-            str(idx, uid)
+        const viewer_like: []const u8 = if (viewer_id) |vid|
+            (if (idx.like_edges.get(edgeKey(vid, cids[row]))) |uid| str(idx, uid) else "")
         else
             "";
         o.* = .{
@@ -530,6 +573,41 @@ test "timeline: limit caps the rows; unknown viewer is empty (E4)" {
 
     const unknown = try buildTimeline(arena_state.allocator(), &idx, "did:nobody", 10);
     try testing.expectEqual(@as(usize, 0), unknown.len);
+}
+
+test "author feed: one author's posts, reverse-chron, with the viewer's like; unknown author empty (E4)" {
+    const gpa = testing.allocator;
+    var idx: Index = .{};
+    defer deinit(gpa, &idx);
+
+    // Two authors post; the feed must carry only bob's, newest first — no
+    // follow graph required (a profile is the author's own posts).
+    _ = try indexPost(gpa, &idx, .{ .cid = "c1", .author_did = "did:bob", .text = "bob old", .created_at = 10 });
+    _ = try indexPost(gpa, &idx, .{ .cid = "c2", .author_did = "did:carol", .text = "carol hidden", .created_at = 20 });
+    _ = try indexPost(gpa, &idx, .{ .cid = "c3", .author_did = "did:bob", .text = "bob new", .created_at = 30 });
+    // The viewing actor (alice) liked bob's newest post.
+    try setLikeEdge(gpa, &idx, "did:alice", "c3", "at://did:alice/app.zat4.feed.like/r1");
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    const rows = try buildAuthorFeed(arena_state.allocator(), &idx, "did:bob", "did:alice", 10);
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    try testing.expectEqualStrings("bob new", rows[0].text); // newest first
+    try testing.expectEqualStrings("bob old", rows[1].text);
+    for (rows) |r| try testing.expectEqualStrings("did:bob", r.author_did);
+    // The viewer's like edge surfaces as viewer.like on the matching row.
+    try testing.expectEqualStrings("at://did:alice/app.zat4.feed.like/r1", rows[0].viewer_like_uri);
+    try testing.expectEqualStrings("", rows[1].viewer_like_uri);
+
+    // An unknown viewer still sees the posts, just no viewer.like.
+    const anon = try buildAuthorFeed(arena_state.allocator(), &idx, "did:bob", "did:nobody", 10);
+    try testing.expectEqual(@as(usize, 2), anon.len);
+    try testing.expectEqualStrings("", anon[0].viewer_like_uri);
+
+    // An unknown author is an empty feed, not an error.
+    const none = try buildAuthorFeed(arena_state.allocator(), &idx, "did:ghost", "did:alice", 10);
+    try testing.expectEqual(@as(usize, 0), none.len);
 }
 
 test "engagement: likes are edge-counted (one per actor, deduped); reposts bump; unknown subject pends" {

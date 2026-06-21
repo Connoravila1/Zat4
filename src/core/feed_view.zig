@@ -65,6 +65,21 @@ pub const Action = enum(u8) { reply, repost, like, nav, compose };
 /// the body (the screen title), so the two never drift.
 pub const nav_labels = [_][]const u8{ "Home", "Explore", "Activity", "Messages", "Profile", "Settings" };
 
+/// Named screen indices into `nav_labels` (the two `layout` renders as real
+/// post lists rather than a placeholder). Keep in sync with `nav_labels`.
+pub const screen_home: u8 = 0;
+pub const screen_profile: u8 = 4;
+
+/// The profile screen's header band — the viewed account's identity over its
+/// post list. Plain data handed in by the shell (B5); the post count is the
+/// number of posts fetched for the profile. A7.2: cold struct — one per frame,
+/// never held in a collection, so no size guard.
+pub const ProfileHeader = struct {
+    display_name: []const u8,
+    handle: []const u8, // already "@handle" form, as the post rows carry it
+    post_count: u32,
+};
+
 /// One tappable button region in window pixels, tagged with the post it
 /// belongs to and the control. Emitted alongside the draw items so a click
 /// can be resolved without re-deriving the layout. HOT (a few per screen,
@@ -484,6 +499,11 @@ pub fn layout(
     /// placeholder for now) while the rail + sidebar chrome stay put. The rail
     /// highlights this index.
     active_screen: u8,
+    /// The profile header to draw when `active_screen == screen_profile`. The
+    /// posts in `posts` are then that account's own posts (read-only Cut 1).
+    /// Null on every other screen (Home draws the feed; the rest are
+    /// placeholders).
+    profile: ?ProfileHeader,
 ) error{OutOfMemory}!i32 {
     const m = metricsFor(width);
     if (regions) |rg| rg.clearRetainingCapacity();
@@ -520,10 +540,31 @@ pub fn layout(
         feed_y0 = 112;
     }
 
-    // Non-Home screens render a titled placeholder body for now — their real
-    // content (Explore, Activity, Messages, Profile, Settings) lands as each is
-    // built. The rail + sidebar chrome above already drew; fill the column.
-    if (active_screen != 0) {
+    // The Profile screen draws an identity header band, then falls through to
+    // the SAME post loop below (the posts handed in are this account's own —
+    // read-only in Cut 1). Every OTHER non-Home screen is still a titled
+    // placeholder until it is built.
+    if (active_screen == screen_profile) {
+        const ph = profile orelse ProfileHeader{ .display_name = "", .handle = "", .post_count = 0 };
+        const hx = m.lx;
+        const hy = feed_y0 + 4;
+        const hav: i32 = 64; // a larger avatar than the feed rows use
+        // avatar disc + initial
+        try rect(gpa, dl, hx, hy, hav, hav, tintFor(ph.handle), @intCast(hav >> 1));
+        const initial = initialOf(if (ph.display_name.len > 0) ph.display_name else ph.handle);
+        const iadv: i32 = @intCast(text.advance(e, .semibold, initial, 30));
+        _ = try glyph1(gpa, dl, e, .semibold, hx + @divTrunc(hav - iadv, 2), hy + 44, bg, 30, initial);
+        // display name, @handle, post count
+        _ = try str(gpa, dl, e, .semibold, hx, hy + hav + 30, ink, 24, ph.display_name);
+        _ = try str(gpa, dl, e, .regular, hx, hy + hav + 58, faint, 15, ph.handle);
+        var cb: [24]u8 = undefined;
+        const counts = std.fmt.bufPrint(&cb, "{d} posts", .{ph.post_count}) catch "0 posts";
+        _ = try str(gpa, dl, e, .regular, hx, hy + hav + 82, muted, 14, counts);
+        // divider under the header; the post list starts below it
+        const header_bottom = hy + hav + 100;
+        try rect(gpa, dl, m.col_x, header_bottom, m.col_w, 1, divider, 0);
+        feed_y0 = header_bottom + 14;
+    } else if (active_screen != 0) {
         const msg = "Coming soon";
         const tw: i32 = @intCast(text.measure(e, .regular, msg, 16));
         _ = try str(gpa, dl, e, .regular, m.col_x + @divTrunc(m.col_w - tw, 2), @divTrunc(height, 2), muted, 16, msg);
