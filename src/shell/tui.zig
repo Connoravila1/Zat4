@@ -2338,8 +2338,15 @@ fn drawEngagementHearts(g: Grid, gs: *GpuState, items: []const feed_core.Timelin
     const ays = s.items(.y);
     const stages = s.items(.stage);
     const stage_ts = s.items(.stage_t);
+    // The sticky header occludes the post text (it's painted over it in the feed
+    // draw list), but the heart is a SEPARATE pass on top — so it would bleed
+    // over the frosted header as a post scrolls up. Clip it: skip any heart whose
+    // row has crossed under the header band. (Logical coords; header heights
+    // mirror feed_view's drawTopBar / drawProfileHeader.)
+    const header_bottom: i32 = if (g.screen.* == feed_view.screen_profile) 116 else 111;
     for (g.regions.items) |r| {
         if (r.kind != .like or r.post >= items.len) continue;
+        if (@as(i32, r.y) + @divTrunc(@as(i32, r.h), 2) < header_bottom) continue;
         const liked = items[r.post].item_flags.viewer_liked;
         // Heart centre: the region starts at the heart's left edge; the icon box
         // is 16 logical wide, so the heart centres 8 in. Vertical centre of the
