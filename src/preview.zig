@@ -116,6 +116,16 @@ pub fn main(init: std.process.Init) !void {
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_thread.ppm");
     std.debug.print("wrote /tmp/zat_thread.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
+
+    // The Profile screen: the new COMPACT, STICKY identity header over the posts.
+    @memset(fb.pixels, clear);
+    dl.len = 0;
+    try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
+    const header: feed_view.ProfileHeader = .{ .display_name = "connor.zat4.com", .handle = "@connor.zat4.com", .post_count = 11, .editable = true };
+    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, feed_view.screen_profile, header, 0);
+    try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+    try writePpm(io, gpa, &fb, "/tmp/zat_profile.ppm");
+    std.debug.print("wrote /tmp/zat_profile.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
 }
 
 /// A thread PostView with an explicit nesting depth + focus flag (preview only).

@@ -172,6 +172,12 @@ pub const PostView = struct {
 const rail_w: i32 = 248;
 const feed_w: i32 = 604;
 const side_w: i32 = 352;
+/// Height of the sticky PROFILE identity header (the compact horizontal band:
+/// avatar + name + handle·count + Edit profile). Taller than the plain top bar
+/// to seat the avatar; still short enough to pin. A future profile-nav row
+/// (Links / Posts·Replies tabs) would extend this.
+const profile_header_h_wide: i32 = 116;
+const profile_header_h_narrow: i32 = 100;
 const wide_min: i32 = rail_w + feed_w + side_w + 40; // ~1244
 
 const panel: u32 = 0xCC1E1C16; // sidebar cards: mostly solid over the field
@@ -566,42 +572,12 @@ pub fn layout(
     // read-only in Cut 1). Every OTHER non-Home screen is still a titled
     // placeholder until it is built.
     if (active_screen == screen_profile) {
-        const ph = profile orelse ProfileHeader{ .display_name = "", .handle = "", .post_count = 0 };
-        const hx = m.lx;
-        const hav: i32 = 64; // a larger avatar than the feed rows use
-        // The identity band is CONTENT, above the posts — so it SCROLLS with
-        // them (only the top bar is sticky). Draw at the scrolled screen y; keep
-        // feed_y0 in scroll-independent CONTENT space (the post loop adds scroll).
-        // Without the scroll offset the band stayed pinned and the rising posts
-        // collided with it.
-        const content_top = feed_y0;
-        const hy = content_top + 4 + scroll;
-        // avatar disc + initial
-        try rect(gpa, dl, hx, hy, hav, hav, tintFor(ph.handle), @intCast(hav >> 1));
-        const initial = initialOf(if (ph.display_name.len > 0) ph.display_name else ph.handle);
-        const iadv: i32 = @intCast(text.advance(e, .semibold, initial, 30));
-        _ = try glyph1(gpa, dl, e, .semibold, hx + @divTrunc(hav - iadv, 2), hy + 44, bg, 30, initial);
-        // display name, @handle, post count
-        _ = try str(gpa, dl, e, .semibold, hx, hy + hav + 30, ink, 24, ph.display_name);
-        _ = try str(gpa, dl, e, .regular, hx, hy + hav + 58, faint, 15, ph.handle);
-        var cb: [24]u8 = undefined;
-        const counts = std.fmt.bufPrint(&cb, "{d} posts", .{ph.post_count}) catch "0 posts";
-        _ = try str(gpa, dl, e, .regular, hx, hy + hav + 82, muted, 14, counts);
-        // "Edit profile" pill on your OWN profile — a tappable .edit_profile
-        // region (no specific post). Sits at the top-right of the identity band.
-        if (ph.editable) {
-            const label = "Edit profile";
-            const lw: i32 = @intCast(text.measure(e, .semibold, label, 14));
-            const bw = lw + 28;
-            const bx2 = m.lx + m.cw - bw;
-            const by2 = hy + 10;
-            try rect(gpa, dl, bx2, by2, bw, 32, panel, 16);
-            _ = try str(gpa, dl, e, .semibold, bx2 + 14, by2 + 21, ink, 14, label);
-            try emitRegion(gpa, regions, bx2, by2, bw, 32, 0, .edit_profile);
-        }
-        // divider under the header (scrolled); the post list starts below it
-        try rect(gpa, dl, m.col_x, hy + hav + 100, m.col_w, 1, divider, 0);
-        feed_y0 = content_top + 4 + hav + 100 + 14;
+        // The identity band is now the STICKY header (drawn pinned in
+        // drawProfileHeader, called from drawTopBar) — posts scroll UNDER it, so
+        // the handle/name (and, later, profile-level nav like Links) stay visible
+        // without scrolling back up. Here we only fix where the post stack begins
+        // — just below the header's height.
+        feed_y0 = if (m.wide) profile_header_h_wide + 14 else profile_header_h_narrow + 12;
     } else if (active_screen == screen_thread) {
         // A post's thread: the `posts` handed in ARE the thread (ancestors, the
         // focused post, then replies, in that order) — fall through to the post
@@ -610,7 +586,7 @@ pub fn layout(
         const msg = "Coming soon";
         const tw: i32 = @intCast(text.measure(e, .regular, msg, 16));
         _ = try str(gpa, dl, e, .regular, m.col_x + @divTrunc(m.col_w - tw, 2), @divTrunc(height, 2), muted, 16, msg);
-        try drawTopBar(gpa, dl, e, m, active_screen, regions); // no posts scroll here, but keep the title consistent
+        try drawTopBar(gpa, dl, e, m, active_screen, regions, profile); // no posts scroll here, but keep the title consistent
         return height;
     }
 
@@ -760,7 +736,7 @@ pub fn layout(
     }
     // The sticky top bar, drawn LAST so the posts above scroll BEHIND its
     // frosted box with the title/tabs crisp on top.
-    try drawTopBar(gpa, dl, e, m, active_screen, regions);
+    try drawTopBar(gpa, dl, e, m, active_screen, regions, profile);
 
     // The "N new posts" pill (Home only): staged arrivals waiting to be revealed.
     // Pinned just below the header, centered; tapping it reveals + scrolls to top
@@ -918,7 +894,8 @@ pub fn layoutCompose(
 /// divider. Emitted AFTER the posts so they pass behind it (occluded + dimmed),
 /// the chrome reading crisply on top. The box spans the feed column width; the
 /// rail/sidebar live in their own columns and are untouched.
-fn drawTopBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, active_screen: u8, regions: ?*Regions) error{OutOfMemory}!void {
+fn drawTopBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, active_screen: u8, regions: ?*Regions, profile: ?ProfileHeader) error{OutOfMemory}!void {
+    if (active_screen == screen_profile) return drawProfileHeader(gpa, dl, e, m, regions, profile orelse .{ .display_name = "", .handle = "", .post_count = 0 });
     const is_thread = active_screen == screen_thread;
     // screen_thread is past nav_labels, so guard the index → a "Thread" title.
     const title: []const u8 = if (active_screen < nav_labels.len) nav_labels[active_screen] else "Thread";
@@ -962,6 +939,66 @@ fn drawTopBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Me
         try rect(gpa, dl, m.lx, 86, fw, 3, accent, 2);
         try rect(gpa, dl, m.col_x, 96, m.col_w, 1, divider, 0);
     }
+}
+
+/// The sticky PROFILE identity header: a compact HORIZONTAL band — avatar on the
+/// left, the name on line 1 and "@handle · N posts" on line 2 to its right, an
+/// Edit-profile pill far right — pinned so identity stays visible as posts scroll
+/// under it (the old band was tall, vertical, and scrolled away). The natural
+/// anchor for future profile-level nav (Links / Posts·Replies tabs): a row would
+/// attach below the identity line, growing `profile_header_h_*`.
+fn drawProfileHeader(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, regions: ?*Regions, ph: ProfileHeader) error{OutOfMemory}!void {
+    const name = if (ph.display_name.len > 0) ph.display_name else ph.handle;
+    var cb: [24]u8 = undefined;
+    const counts = std.fmt.bufPrint(&cb, "{d} posts", .{ph.post_count}) catch "0 posts";
+
+    if (m.wide) {
+        const band_h = profile_header_h_wide;
+        try rect(gpa, dl, m.col_x, 0, m.col_w, band_h, header_veil, 0);
+        const av: i32 = 56;
+        const ay: i32 = 26;
+        try rect(gpa, dl, m.lx, ay, av, av, tintFor(ph.handle), @intCast(av >> 1));
+        const iadv: i32 = @intCast(text.advance(e, .semibold, initialOf(name), 28));
+        _ = try glyph1(gpa, dl, e, .semibold, m.lx + @divTrunc(av - iadv, 2), ay + 38, bg, 28, initialOf(name));
+        const tx = m.lx + av + 16;
+        _ = try str(gpa, dl, e, .semibold, tx, 50, ink, 22, name);
+        var bx = try str(gpa, dl, e, .regular, tx, 78, faint, 15, ph.handle);
+        bx = try str(gpa, dl, e, .regular, bx + 8, 78, faint, 15, "·");
+        _ = try str(gpa, dl, e, .regular, bx + 8, 78, muted, 15, counts);
+        if (ph.editable) {
+            const label = "Edit profile";
+            const bw: i32 = @intCast(text.measure(e, .semibold, label, 14) + 28);
+            const bx2 = m.lx + m.cw - bw;
+            try rect(gpa, dl, bx2, 41, bw, 34, panel, 16);
+            _ = try str(gpa, dl, e, .semibold, bx2 + 14, 63, ink, 14, label);
+            try emitRegion(gpa, regions, bx2, 41, bw, 34, 0, .edit_profile);
+        }
+        try rect(gpa, dl, m.col_x, band_h - 1, m.col_w, 1, divider, 0);
+        return;
+    }
+
+    // Narrow (mobile) profile band — same idea, tighter.
+    const band_h = profile_header_h_narrow;
+    try rect(gpa, dl, m.col_x, 0, m.col_w, band_h, header_veil, 0);
+    const av: i32 = 44;
+    const ay: i32 = 14;
+    try rect(gpa, dl, m.lx, ay, av, av, tintFor(ph.handle), @intCast(av >> 1));
+    const iadv: i32 = @intCast(text.advance(e, .semibold, initialOf(name), 22));
+    _ = try glyph1(gpa, dl, e, .semibold, m.lx + @divTrunc(av - iadv, 2), ay + 30, bg, 22, initialOf(name));
+    const tx = m.lx + av + 12;
+    _ = try str(gpa, dl, e, .semibold, tx, 36, ink, 18, name);
+    var bx = try str(gpa, dl, e, .regular, tx, 58, faint, 13, ph.handle);
+    bx = try str(gpa, dl, e, .regular, bx + 6, 58, faint, 13, "·");
+    _ = try str(gpa, dl, e, .regular, bx + 6, 58, muted, 13, counts);
+    if (ph.editable) {
+        const label = "Edit";
+        const bw: i32 = @intCast(text.measure(e, .semibold, label, 13) + 22);
+        const bx2 = m.lx + m.cw - bw;
+        try rect(gpa, dl, bx2, 30, bw, 30, panel, 14);
+        _ = try str(gpa, dl, e, .semibold, bx2 + 11, 50, ink, 13, label);
+        try emitRegion(gpa, regions, bx2, 30, bw, 30, 0, .edit_profile);
+    }
+    try rect(gpa, dl, m.col_x, band_h - 1, m.col_w, 1, divider, 0);
 }
 
 fn emitRegion(gpa: Allocator, regions: ?*Regions, x: i32, y: i32, w: i32, h: u16, post: u16, kind: Action) !void {
