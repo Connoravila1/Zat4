@@ -115,6 +115,16 @@ pub const Index = struct {
     /// to bump a count, and a re-seen cid is deduped (A8).
     post_by_cid: std.AutoHashMapUnmanaged(StrId, u32) = .empty,
 
+    /// Per-post reply linkage, OUT OF BAND (A6): the hot `Post` is exactly 32
+    /// bytes with no spare room, so a post's reply parent / thread-root cid ids
+    /// ride in these arrays, parallel to `posts` and indexed by row. `no_str` ⇒
+    /// the post is not a reply. The child→parent edge lets a thread walk
+    /// ancestors; a post's direct replies (and its reply_count) are a scan over
+    /// `reply_parent`. Interned cid ids, so they match a parent post's own cid
+    /// id (internStr dedups) — the reverse lookup is exact.
+    reply_parent: std.ArrayList(StrId) = .empty,
+    reply_root: std.ArrayList(StrId) = .empty,
+
     /// REPOSTS whose subject post is not indexed YET (out-of-order ingest, e.g.
     /// across repos). Keyed by the subject's cid; `indexPost` drains these into
     /// the post's repost_count when it arrives, so an early repost is never lost.
@@ -152,6 +162,8 @@ pub fn deinit(gpa: Allocator, idx: *Index) void {
     while (kit.next()) |k| gpa.free(k.*);
     idx.intern.deinit(gpa);
     idx.post_by_cid.deinit(gpa);
+    idx.reply_parent.deinit(gpa);
+    idx.reply_root.deinit(gpa);
     idx.pending_reposts.deinit(gpa);
     idx.like_edges.deinit(gpa);
     idx.handles.deinit(gpa);
@@ -195,6 +207,10 @@ pub const PostInput = struct {
     author_did: []const u8,
     text: []const u8,
     created_at: i64,
+    /// The cid of the post this replies to (its immediate parent) and the
+    /// thread root. "" when the post is not a reply. Indexed out of band (A6).
+    reply_parent_cid: []const u8 = "",
+    reply_root_cid: []const u8 = "",
 };
 
 /// Index one post. A8: if the cid is already present, this is a no-op (same
@@ -207,6 +223,11 @@ pub fn indexPost(gpa: Allocator, idx: *Index, in: PostInput) Allocator.Error!boo
     const text_off: u32 = @intCast(idx.pool_bytes.items.len);
     try idx.pool_bytes.appendSlice(gpa, in.text);
     const text_span: Span = .{ .off = text_off, .len = @intCast(in.text.len) };
+
+    // Reply linkage (A6, out of band): intern the parent/root cids (or no_str
+    // when this isn't a reply) so they share the parent post's own cid id.
+    const reply_parent_id: StrId = if (in.reply_parent_cid.len > 0) try internStr(gpa, idx, in.reply_parent_cid) else no_str;
+    const reply_root_id: StrId = if (in.reply_root_cid.len > 0) try internStr(gpa, idx, in.reply_root_cid) else no_str;
 
     const row: u32 = @intCast(idx.posts.len);
     // Out-of-order ingest. Reposts were held PENDING against this cid (drained
@@ -223,6 +244,10 @@ pub fn indexPost(gpa: Allocator, idx: *Index, in: PostInput) Allocator.Error!boo
         .like_count = like_count,
         .repost_count = pending_repost,
     });
+    // Parallel to `posts`, one entry per row (A6 — kept in lockstep here, the
+    // sole appender of `posts`).
+    try idx.reply_parent.append(gpa, reply_parent_id);
+    try idx.reply_root.append(gpa, reply_root_id);
     try idx.post_by_cid.put(gpa, cid_id, row);
     return true;
 }
@@ -396,6 +421,21 @@ fn displayNameForId(idx: *const Index, did_id: StrId) []const u8 {
 /// the lexicon's TimelinePage shape.
 /// A7.2: cold struct, size guard waived — transient boundary value, arena-
 /// built per request and serialized immediately, never bulk-resident.
+/// A hydrated reply target (the parent or root of a reply) carried on a
+/// TimelineRow — enough for the client to show "replying to @handle" and to
+/// intern the referenced post. When the referenced post isn't indexed yet, only
+/// `cid` is set (the client still learns the post IS a reply).
+/// A7.2: cold struct, size guard waived — transient boundary value.
+pub const ReplyTargetRow = struct {
+    cid: []const u8 = "",
+    author_did: []const u8 = "",
+    author_handle: []const u8 = "",
+    author_display_name: []const u8 = "",
+    text: []const u8 = "",
+};
+
+/// A7.2: cold struct, size guard waived — transient boundary value, arena-built
+/// per request and serialized immediately, never bulk-resident.
 pub const TimelineRow = struct {
     cid: []const u8,
     uri: []const u8 = "", // built by the shell from author+cid if needed
@@ -414,6 +454,13 @@ pub const TimelineRow = struct {
     /// AppView's `viewer.like`. Empty when the viewer hasn't liked it. The
     /// client shows the filled heart from it AND deletes it to unlike.
     viewer_like_uri: []const u8 = "",
+    /// How many indexed posts reply directly to THIS post (derived from the
+    /// reply_parent edges). The feed's reply count.
+    reply_count: u32 = 0,
+    /// When this post is a reply: its immediate parent and thread root, hydrated
+    /// from the index. null ⇒ not a reply.
+    reply_parent: ?ReplyTargetRow = null,
+    reply_root: ?ReplyTargetRow = null,
 };
 
 /// Build a reverse-chronological timeline for `viewer_did`: the most recent
@@ -509,6 +556,19 @@ fn materializeRows(
     const texts = idx.posts.items(.text);
     const likes = idx.posts.items(.like_count);
     const reposts = idx.posts.items(.repost_count);
+
+    // Reply counts: one pass over ALL posts' parent edges → parent cid id ⇒
+    // number of direct replies. Keyed by the parent's interned cid id, which
+    // equals the parent post's own cid id (internStr dedups), so each output
+    // row reads its count by its own cid id. O(posts), built once per request.
+    var reply_counts: std.AutoHashMapUnmanaged(StrId, u32) = .empty;
+    defer reply_counts.deinit(arena);
+    for (idx.reply_parent.items) |pid| {
+        if (pid == no_str) continue;
+        const gop = try reply_counts.getOrPut(arena, pid);
+        gop.value_ptr.* = (if (gop.found_existing) gop.value_ptr.* else 0) + 1;
+    }
+
     for (out, rows[0..n]) |*o, row| {
         // The viewer's own like record uri for this post (viewer.like), if any.
         const viewer_like: []const u8 = if (viewer_id) |vid|
@@ -528,9 +588,32 @@ fn materializeRows(
             .like_count = likes[row],
             .repost_count = reposts[row],
             .viewer_like_uri = viewer_like,
+            .reply_count = reply_counts.get(cids[row]) orelse 0,
+            .reply_parent = hydrateReplyTarget(idx, idx.reply_parent.items[row]),
+            .reply_root = hydrateReplyTarget(idx, idx.reply_root.items[row]),
         };
     }
     return out;
+}
+
+/// Hydrate a reply target from an interned cid id: if the referenced post is
+/// indexed, fill its author + text; otherwise return cid-only (the client still
+/// learns the post is a reply). null for `no_str` (not a reply). PURE read.
+fn hydrateReplyTarget(idx: *const Index, cid_id: StrId) ?ReplyTargetRow {
+    if (cid_id == no_str) return null;
+    const cid_str = str(idx, cid_id);
+    if (idx.post_by_cid.get(cid_id)) |prow| {
+        const a = idx.posts.items(.author)[prow];
+        const s = idx.posts.items(.text)[prow];
+        return .{
+            .cid = cid_str,
+            .author_did = str(idx, a),
+            .author_handle = handleForId(idx, a),
+            .author_display_name = displayNameForId(idx, a),
+            .text = idx.pool_bytes.items[s.off .. s.off + s.len],
+        };
+    }
+    return .{ .cid = cid_str };
 }
 
 // ---------------------------------------------------------------------------
@@ -672,6 +755,44 @@ test "author feed: one author's posts, reverse-chron, with the viewer's like; un
     // An unknown author is an empty feed, not an error.
     const none = try buildAuthorFeed(arena_state.allocator(), &idx, "did:ghost", "did:alice", 10);
     try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "reply linkage: a reply bumps its parent's reply_count and carries a hydrated parent" {
+    const gpa = testing.allocator;
+    var idx: Index = .{};
+    defer deinit(gpa, &idx);
+
+    // bob posts; alice replies to it; the parent's handle is known.
+    _ = try indexPost(gpa, &idx, .{ .cid = "cParent", .author_did = "did:bob", .text = "the parent post", .created_at = 10 });
+    try setHandle(gpa, &idx, "did:bob", "bob.zat4.com");
+    _ = try indexPost(gpa, &idx, .{ .cid = "cReply", .author_did = "did:alice", .text = "a reply", .created_at = 20, .reply_parent_cid = "cParent", .reply_root_cid = "cParent" });
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    // The parent: reply_count == 1, not itself a reply.
+    const parent_feed = try buildAuthorFeed(arena_state.allocator(), &idx, "did:bob", "did:x", 10);
+    try testing.expectEqual(@as(usize, 1), parent_feed.len);
+    try testing.expectEqual(@as(u32, 1), parent_feed[0].reply_count);
+    try testing.expect(parent_feed[0].reply_parent == null);
+
+    // The reply: reply_count 0, and a parent target hydrated from the index.
+    const reply_feed = try buildAuthorFeed(arena_state.allocator(), &idx, "did:alice", "did:x", 10);
+    try testing.expectEqual(@as(usize, 1), reply_feed.len);
+    try testing.expectEqual(@as(u32, 0), reply_feed[0].reply_count);
+    const parent = reply_feed[0].reply_parent orelse return error.NoReplyParent;
+    try testing.expectEqualStrings("cParent", parent.cid);
+    try testing.expectEqualStrings("did:bob", parent.author_did);
+    try testing.expectEqualStrings("bob.zat4.com", parent.author_handle);
+    try testing.expectEqualStrings("the parent post", parent.text);
+
+    // A reply whose parent isn't indexed: cid-only target, still flagged a reply.
+    _ = try indexPost(gpa, &idx, .{ .cid = "cOrphan", .author_did = "did:alice", .text = "reply to the void", .created_at = 30, .reply_parent_cid = "cMissing", .reply_root_cid = "cMissing" });
+    const alice2 = try buildAuthorFeed(arena_state.allocator(), &idx, "did:alice", "did:x", 10);
+    // newest first → cOrphan is row 0
+    const orphan_parent = alice2[0].reply_parent orelse return error.NoReplyParent;
+    try testing.expectEqualStrings("cMissing", orphan_parent.cid);
+    try testing.expectEqualStrings("", orphan_parent.author_handle);
 }
 
 test "handles: a post row carries the author's indexed handle; unknown stays empty" {

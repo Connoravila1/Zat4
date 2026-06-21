@@ -178,15 +178,21 @@ pub fn pollRepo(
         defer lock.unlock();
         for (recs) |r| {
             if (r.cid.len == 0) continue;
+            const reply_parent_cid: []const u8 = if (r.value.reply) |rep| rep.parent.cid else "";
+            const reply_root_cid: []const u8 = if (r.value.reply) |rep| rep.root.cid else "";
             const is_new = appview.indexPost(gpa, idx, .{
                 .cid = r.cid,
                 .author_did = did,
                 .text = r.value.text,
                 .created_at = feed.parseTimestamp(r.value.createdAt) catch 0,
+                .reply_parent_cid = reply_parent_cid,
+                .reply_root_cid = reply_root_cid,
             }) catch false;
             if (is_new) {
                 added += 1;
-                store.appendPost(log, arena, did, rkeyFromUri(r.uri), r.cid, r.value.text, r.value.createdAt);
+                // Carry the reply refs into the durable log so a restart's
+                // replay (jetstream.reduce) restores the linkage too.
+                store.appendPost(log, arena, did, rkeyFromUri(r.uri), r.cid, r.value.text, r.value.createdAt, r.value.reply);
             }
         }
     }

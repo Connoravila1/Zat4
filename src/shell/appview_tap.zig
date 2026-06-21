@@ -40,6 +40,7 @@ const websocket = @import("../core/websocket.zig");
 const tap = @import("../core/tap.zig");
 const appview = @import("../core/appview.zig");
 const feed = @import("../core/feed.zig");
+const lexicon = @import("../core/lexicon.zig");
 const serve = @import("appview_serve.zig");
 const store = @import("appview_store.zig");
 
@@ -220,9 +221,19 @@ fn applyEvent(
                 .author_did = p.did,
                 .text = p.text,
                 .created_at = feed.parseTimestamp(p.created_at) catch 0,
+                .reply_parent_cid = p.reply_parent_cid,
+                .reply_root_cid = p.reply_root_cid,
             }) catch false;
             lock.unlock();
-            if (is_new) store.appendPost(log, arena, p.did, p.rkey, p.cid, p.text, p.created_at);
+            if (is_new) {
+                // Rebuild the reply refs (cid-only; the durable replay reads cids)
+                // so a restart restores the thread linkage.
+                const reply: ?lexicon.ReplyRefOut = if (p.reply_parent_cid.len > 0 or p.reply_root_cid.len > 0)
+                    .{ .root = .{ .cid = p.reply_root_cid }, .parent = .{ .cid = p.reply_parent_cid } }
+                else
+                    null;
+                store.appendPost(log, arena, p.did, p.rkey, p.cid, p.text, p.created_at, reply);
+            }
             return is_new;
         },
         .follow => |f| {

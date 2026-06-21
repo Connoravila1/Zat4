@@ -58,6 +58,8 @@ pub const Reduced = union(enum) {
         rkey: []const u8,
         text: []const u8,
         created_at: []const u8,
+        reply_parent_cid: []const u8 = "", // "" when not a reply
+        reply_root_cid: []const u8 = "",
     },
     follow: struct {
         did: []const u8, // follower
@@ -89,6 +91,8 @@ const InnerRecord = struct {
     text: []const u8 = "",
     createdAt: []const u8 = "",
     subject: std.json.Value = .null,
+    /// A post's reply refs (root + parent strong refs); null on a non-reply.
+    reply: ?lexicon.ReplyRefOut = null,
 };
 
 /// A7.2: cold struct, size guard waived — transient parse target.
@@ -149,6 +153,8 @@ pub fn reduce(arena: Allocator, message_json: []const u8) error{OutOfMemory}!?Ev
             .rkey = env.rkey,
             .text = rec.text,
             .created_at = rec.createdAt,
+            .reply_parent_cid = if (rec.reply) |rep| rep.parent.cid else "",
+            .reply_root_cid = if (rec.reply) |rep| rep.root.cid else "",
         } } };
     }
     if (std.mem.eql(u8, env.collection, lexicon.collection.follow)) {

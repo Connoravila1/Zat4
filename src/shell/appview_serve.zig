@@ -224,6 +224,12 @@ fn serializeFeed(arena: Allocator, rows: []const appview.TimelineRow) RouteError
         // createdAt parsed to epoch 0, hence the "2945w" ages).
         const ts_buf = try arena.alloc(u8, 32);
         const created_at = feed.formatTimestamp(ts_buf, r.created_at);
+        // The reply ref (when this post is a reply): hydrated parent/root post
+        // views so the client shows "replying to @handle" and can intern them.
+        const reply: ?lexicon.ReplyRef = if (r.reply_parent != null or r.reply_root != null) .{
+            .parent = if (r.reply_parent) |pt| try replyPostView(arena, pt) else .{},
+            .root = if (r.reply_root) |rt| try replyPostView(arena, rt) else .{},
+        } else null;
         fv.* = .{
             .post = .{
                 .uri = uri,
@@ -236,7 +242,7 @@ fn serializeFeed(arena: Allocator, rows: []const appview.TimelineRow) RouteError
                 .record = .{ .text = r.text, .createdAt = created_at },
                 .likeCount = r.like_count,
                 .repostCount = r.repost_count,
-                .replyCount = 0,
+                .replyCount = r.reply_count,
                 .quoteCount = 0,
                 .indexedAt = "",
                 // viewer.like: the viewer's own like record uri — the client
@@ -244,10 +250,32 @@ fn serializeFeed(arena: Allocator, rows: []const appview.TimelineRow) RouteError
                 // unlike. Absent (null) when the viewer hasn't liked this post.
                 .viewer = if (r.viewer_like_uri.len > 0) .{ .like = r.viewer_like_uri } else null,
             },
+            .reply = reply,
         };
     }
     const page: lexicon.TimelinePage = .{ .cursor = null, .feed = feed_items };
     return std.json.Stringify.valueAlloc(arena, page, .{ .emit_null_optional_fields = false });
+}
+
+/// Build a minimal hydrated PostView for a reply parent/root from its indexed
+/// row. The uri is set only when the author is known (an unindexed target is
+/// cid-only — the client still learns the post is a reply).
+fn replyPostView(arena: Allocator, t: appview.ReplyTargetRow) RouteError!lexicon.PostView {
+    var uri: []const u8 = "";
+    if (t.author_did.len > 0 and t.cid.len > 0) {
+        const buf = try arena.alloc(u8, t.author_did.len + t.cid.len + 64);
+        uri = std.fmt.bufPrint(buf, "at://{s}/{s}/{s}", .{ t.author_did, lexicon.collection.post, t.cid }) catch t.cid;
+    }
+    return .{
+        .uri = uri,
+        .cid = t.cid,
+        .author = .{
+            .did = t.author_did,
+            .handle = if (t.author_handle.len > 0) t.author_handle else t.author_did,
+            .displayName = if (t.author_display_name.len > 0) t.author_display_name else null,
+        },
+        .record = .{ .text = t.text, .createdAt = "" },
+    };
 }
 
 fn getProfile(arena: Allocator, idx: *const appview.Index, target: []const u8) RouteError![]const u8 {

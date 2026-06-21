@@ -62,6 +62,8 @@ pub fn ingestEvent(gpa: Allocator, arena: Allocator, idx: *appview.Index, event_
             .author_did = p.did,
             .text = p.text,
             .created_at = p.created_at,
+            .reply_parent_cid = p.reply_parent_cid,
+            .reply_root_cid = p.reply_root_cid,
         });
         return .post;
     }
