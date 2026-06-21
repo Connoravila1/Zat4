@@ -60,7 +60,9 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// effects/writes; the view only reports geometry (B5). `nav` (a left-rail
 /// destination; the region's `post` field carries the Screen index) and
 /// `compose` (the New-post button) route navigation rather than engagement.
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile };
+/// `compose_send` / `compose_cancel` are the premium composer's footer buttons
+/// (the shell turns a tap into the same control byte the keyboard sends).
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel };
 
 /// The six top-level rail destinations, in order. The `Screen` index a nav
 /// region carries is an index into this. Shared by the rail (draw + hit) and
@@ -84,6 +86,17 @@ pub const ProfileHeader = struct {
     /// button (a `.edit_profile` tap region) so they can set their display name.
     editable: bool = false,
 };
+
+/// The kind of composition the premium composer is hosting — sets the context
+/// line, the placeholder, and the send-button label. Reply is distinguished
+/// from a fresh post by a non-empty target handle (the shell already tracks the
+/// reply target separately; this only drives the look).
+pub const ComposeContext = enum(u8) { post, reply, profile };
+
+/// A pen position (where the next glyph — and so the text cursor — would land)
+/// returned by the draft wrapper. A7.2: cold — a single transient value per
+/// compose frame, never held in a collection.
+const Pen = struct { x: i32, baseline: i32 };
 
 /// One tappable button region in window pixels, tagged with the post it
 /// belongs to and the control. Emitted alongside the draw items so a click
@@ -682,6 +695,139 @@ pub fn layout(
     return y - scroll; // total content height (scroll-independent), for clamping
 }
 
+/// Word-wrap `draft` into `maxw`, honouring explicit '\n' line breaks, drawing
+/// as it goes. Returns the pen position after the last glyph — i.e. where the
+/// text cursor sits. The composer is append/backspace-only (no mid-text edit),
+/// so the cursor is always at the end; this is the one place that derives it.
+/// A word longer than the column is not split mid-word (it overhangs) — drafts
+/// are short and this keeps the wrapper a single honest pass.
+fn wrapDraft(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32, first_baseline: i32, maxw: i32, color: u32, px: u16, draft: []const u8, line_h: i32) !Pen {
+    var baseline = first_baseline;
+    var x = x0;
+    var word_start: usize = 0;
+    var i: usize = 0;
+    while (i <= draft.len) : (i += 1) {
+        const at_end = i == draft.len;
+        const ch: u8 = if (at_end) 0 else draft[i];
+        if (!at_end and ch != ' ' and ch != '\n') continue;
+        const word = draft[word_start..i];
+        if (word.len > 0) {
+            const ww: i32 = @intCast(text.measure(e, .regular, word, px));
+            if (x > x0 and x + ww > x0 + maxw) { // wrap BEFORE this word
+                baseline += line_h;
+                x = x0;
+            }
+            x = try str(gpa, dl, e, .regular, x, baseline, color, px, word);
+        }
+        if (at_end) break;
+        if (ch == ' ') {
+            if (x > x0) x += @intCast(text.advance(e, .regular, ' ', px)); // no leading space
+        } else { // '\n' — explicit break
+            baseline += line_h;
+            x = x0;
+        }
+        word_start = i + 1;
+    }
+    return .{ .x = x, .baseline = baseline };
+}
+
+/// The premium composer (PHASE C1): the New-post / reply / profile-editor input
+/// surface, rendered in the feed_view vocabulary over the living field instead
+/// of the cell-grid composer. Pure (B2): same draft + engine ⇒ same draw list.
+/// The shell keeps the draft buffer and the keyboard input path unchanged; this
+/// only renders it and emits the footer button regions (`compose_send` /
+/// `compose_cancel`) so a mouse can drive what Ctrl-D / Esc already do.
+pub fn layoutCompose(
+    gpa: Allocator,
+    e: *const text.Engine,
+    width: i32,
+    height: i32,
+    ctx: ComposeContext,
+    /// "@handle" of the post being replied to, when `ctx == .reply`; else "".
+    reply_handle: []const u8,
+    draft: []const u8,
+    /// A status / hint line shown in the footer (the shell's compose status).
+    status: []const u8,
+    dl: *raster.DrawList,
+    regions: ?*Regions,
+) error{OutOfMemory}!void {
+    const m = metricsFor(width);
+    if (regions) |rg| rg.clearRetainingCapacity();
+
+    // A heavy veil over the WHOLE surface dims the feed/field uniformly so the
+    // composer reads as a focused overlay; the field still glows faintly through.
+    try rect(gpa, dl, 0, 0, width, height, header_veil, 0);
+
+    // The card: centred in the feed column, a comfortable fixed height.
+    const cx0 = m.col_x + 16;
+    const cw = m.col_w - 32;
+    const card_y: i32 = 92;
+    const card_h: i32 = @min(height - card_y - 40, 380);
+    try rect(gpa, dl, cx0, card_y, cw, card_h, panel, 18);
+
+    const pad: i32 = 24;
+    const lx = cx0 + pad;
+    const inner_w = cw - pad * 2;
+
+    // Context line: who/what this is.
+    const send_label: []const u8 = switch (ctx) {
+        .reply => "Reply",
+        .post => "Post",
+        .profile => "Save",
+    };
+    const hx = try str(gpa, dl, e, .semibold, lx, card_y + 34, ink, 18, switch (ctx) {
+        .reply => "Replying to ",
+        .post => "New post",
+        .profile => "Edit your display name",
+    });
+    if (ctx == .reply and reply_handle.len > 0) _ = try str(gpa, dl, e, .semibold, hx, card_y + 34, accent, 18, reply_handle);
+    try rect(gpa, dl, cx0, card_y + 50, cw, 1, divider, 0);
+
+    // The draft (or a faint placeholder), wrapped from just under the divider.
+    const body_line: i32 = @max(24, @as(i32, @intCast(text.lineMetrics(e, .regular, 17).height)));
+    const text_top = card_y + 50 + 14 + body_line;
+    const cursor: Pen = if (draft.len == 0) blk: {
+        const ph: []const u8 = switch (ctx) {
+            .reply => "Write your reply…",
+            .post => "What's on the field?",
+            .profile => "Your display name",
+        };
+        _ = try str(gpa, dl, e, .regular, lx, text_top, faint, 17, ph);
+        break :blk .{ .x = lx, .baseline = text_top };
+    } else try wrapDraft(gpa, dl, e, lx, text_top, inner_w, body_c, 17, draft, body_line);
+
+    // The text cursor: a thin accent bar at the pen, one cap-height tall.
+    try rect(gpa, dl, cursor.x + 1, cursor.baseline - 15, 2, 19, accent, 1);
+
+    // Footer: Cancel (left, text) · char count · Send pill (right).
+    const fy = card_y + card_h - 46;
+    // Cancel
+    const cancel_w: i32 = @intCast(text.measure(e, .semibold, "Cancel", 14) + 28);
+    try rect(gpa, dl, lx, fy, cancel_w, 34, 0x33000000, 14);
+    _ = try str(gpa, dl, e, .semibold, lx + 14, fy + 22, muted, 14, "Cancel");
+    try emitRegion(gpa, regions, lx, fy, cancel_w, 34, 0, .compose_cancel);
+    // Send pill (accent, dark label).
+    const sw: i32 = @intCast(text.measure(e, .semibold, send_label, 14) + 40);
+    const sx = cx0 + cw - pad - sw;
+    try rect(gpa, dl, sx, fy, sw, 34, accent, 16);
+    _ = try str(gpa, dl, e, .semibold, sx + 20, fy + 22, bg, 14, send_label);
+    try emitRegion(gpa, regions, sx, fy, sw, 34, 0, .compose_send);
+    // Char count (posts/replies only) between the two buttons.
+    if (ctx != .profile) {
+        var cb: [16]u8 = undefined;
+        const n = std.unicode.utf8CountCodepoints(draft) catch draft.len;
+        const cc = std.fmt.bufPrint(&cb, "{d}/300", .{n}) catch "";
+        const over = n > 300;
+        _ = try str(gpa, dl, e, .regular, lx + cancel_w + 16, fy + 22, if (over) like_c else faint, 13, cc);
+    }
+    // Status / hint, just above the footer.
+    if (status.len > 0) {
+        _ = try str(gpa, dl, e, .regular, lx, fy - 14, muted, 13, status);
+    } else {
+        _ = try str(gpa, dl, e, .regular, lx, fy - 14, faint, 13, "Ctrl+D to send · Esc to cancel");
+    }
+}
+
 /// The feed column's sticky TOP BAR: a frosted box over the top strip, then the
 /// screen title (+ Following/Discover tabs on Home / mobile), then the hairline
 /// divider. Emitted AFTER the posts so they pass behind it (occluded + dimmed),
@@ -833,6 +979,40 @@ test "layout emits 4 tap regions per post (avatar + 3 engagement); hitTest resol
     try std.testing.expect(saw_author);
     // a click far outside every region resolves to nothing
     try std.testing.expect(hitTest(regions.items, 5, 5) == null);
+}
+
+test "layoutCompose emits send + cancel regions; multi-line draft + empty draft both render" {
+    const gpa = std.testing.allocator;
+    var engine = try text.initEngine();
+    defer text.deinitEngine(gpa, &engine);
+    var dl: raster.DrawList = .{};
+    defer dl.deinit(gpa);
+    var regions: Regions = .empty;
+    defer regions.deinit(gpa);
+
+    // A reply draft spanning an explicit newline (Enter inserts '\n').
+    try layoutCompose(gpa, &engine, 1300, 900, .reply, "@mara.zat", "line one\nline two is a bit longer so it wraps", "", &dl, &regions);
+    try std.testing.expect(dl.len > 0);
+    var saw_send = false;
+    var saw_cancel = false;
+    for (regions.items) |r| {
+        if (r.kind == .compose_send) saw_send = true;
+        if (r.kind == .compose_cancel) saw_cancel = true;
+    }
+    try std.testing.expect(saw_send);
+    try std.testing.expect(saw_cancel);
+    // Both buttons must hit-test back to themselves.
+    for (regions.items) |r| {
+        const cxp = @as(i32, r.x) + @divTrunc(@as(i32, r.w), 2);
+        const cyp = @as(i32, r.y) + @divTrunc(@as(i32, r.h), 2);
+        const hit = hitTest(regions.items, cxp, cyp) orelse return error.NoHit;
+        try std.testing.expectEqual(r.kind, hit.kind);
+    }
+
+    // An empty profile draft renders the placeholder path without crashing.
+    dl.len = 0;
+    try layoutCompose(gpa, &engine, 700, 800, .profile, "", "", "saving...", &dl, &regions);
+    try std.testing.expect(dl.len > 0);
 }
 
 test "long timeline does not overflow draw coordinates (off-screen posts skipped)" {

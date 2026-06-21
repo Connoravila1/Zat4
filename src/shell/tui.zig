@@ -578,22 +578,32 @@ pub fn run(
             .compose => {
                 if (pix) |g| switch (backend) {
                     .window => |win| {
-                        // Glyph-field composer (matches the timeline look).
-                        const cell = cellSize(win.fb.width, gzoom);
-                        const cols: u16 = @intCast(@max(16, win.fb.width / cell.w));
-                        const rows: u16 = @intCast(@max(6, win.fb.height / cell.h));
-                        if (gfield.cols != cols or gfield.rows != rows) {
-                            field_core.deinit(gpa, &gfield);
-                            try field_core.init(gpa, &gfield, cols, rows);
+                        if (g.gpu) |gs| {
+                            // Premium composer on the GPU (the living field behind
+                            // the card). Reply is distinguished by a non-empty
+                            // target handle; the profile editor reuses the same
+                            // surface with its own context line + "Save" label.
+                            const ctx: feed_view.ComposeContext = if (compose_kind == .profile)
+                                .profile
+                            else if (reply_handle.len > 0) .reply else .post;
+                            paintComposeGpu(gpa, win, g, gs, ctx, reply_handle, compose_buf.items, status) catch {};
+                        } else {
+                            // Software fallback: the glyph-field cell composer.
+                            const cell = cellSize(win.fb.width, gzoom);
+                            const cols: u16 = @intCast(@max(16, win.fb.width / cell.w));
+                            const rows: u16 = @intCast(@max(6, win.fb.height / cell.h));
+                            if (gfield.cols != cols or gfield.rows != rows) {
+                                field_core.deinit(gpa, &gfield);
+                                try field_core.init(gpa, &gfield, cols, rows);
+                            }
+                            const cc = timeline_ui.countCodepoints(compose_buf.items);
+                            const cursor = field_ui.buildCompose(&gfield, compose_buf.items, reply_handle, cc, status);
+                            try field_core.compose(gpa, &gfield, gparticles.slice(), .{ .x = @floatFromInt(cols / 2), .y = @floatFromInt(rows / 3), .radius = @floatFromInt(cols), .ambient = 0.7 }, cell.w, cell.h, &gdraw);
+                            // The cursor: a filled block at the insertion cell,
+                            // tinted with the app accent (alpha-blended).
+                            try gdraw.append(gpa, .{ .rect = .{ .x = @intCast(@min(cursor.x * cell.w, 32767)), .y = @intCast(@min(cursor.y * cell.h, 32767)), .w = cell.w, .h = cell.h, .color = 0x88000000 | (field_core.palette[field_ui.col_accent] & 0x00FFFFFF), .radius = 0 } });
+                            window_shell.presentDrawList(win, gpa, g.engine, gdraw.slice(), field_core.background) catch {};
                         }
-                        const cc = timeline_ui.countCodepoints(compose_buf.items);
-                        const cursor = field_ui.buildCompose(&gfield, compose_buf.items, reply_handle, cc, status);
-                        try field_core.compose(gpa, &gfield, gparticles.slice(), .{ .x = @floatFromInt(cols / 2), .y = @floatFromInt(rows / 3), .radius = @floatFromInt(cols), .ambient = 0.7 }, cell.w, cell.h, &gdraw);
-                        // The cursor: a filled block at the insertion cell,
-                        // tinted with the app accent (alpha-blended) rather
-                        // than a stray literal — one look, one source.
-                        try gdraw.append(gpa, .{ .rect = .{ .x = @intCast(@min(cursor.x * cell.w, 32767)), .y = @intCast(@min(cursor.y * cell.h, 32767)), .w = cell.w, .h = cell.h, .color = 0x88000000 | (field_core.palette[field_ui.col_accent] & 0x00FFFFFF), .radius = 0 } });
-                        window_shell.presentDrawList(win, gpa, g.engine, gdraw.slice(), field_core.background) catch {};
                     },
                     .terminal => {
                         timeline_ui.buildComposeFrame(&next, compose_buf.items, reply_handle, status);
@@ -830,8 +840,34 @@ pub fn run(
                                             const r = try engageSelected(ek, gpa, arena, session, store, view_items[hit.post], hit.post, gscreen, profile_target_did, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
                                             if (r.status.len > 0) status = r.status;
                                         },
-                                        // Reply → the thread/reply view (a later screen).
-                                        .reply => {},
+                                        // Reply → open the premium composer in reply
+                                        // mode for the TAPPED post (C2). Same sequence
+                                        // the cell-path keyboard reply proved: resolve
+                                        // the root/parent refs, copy them out of the
+                                        // store (the composer outlives this frame), set
+                                        // the target + handle, open compose.
+                                        .reply => if (hit.post < view_items.len) {
+                                            const item = view_items[hit.post];
+                                            if (feed_core.replyRefsForCid(store, item.cid)) |refs| {
+                                                _ = compose_arena_state.reset(.retain_capacity);
+                                                const compose_arena = compose_arena_state.allocator();
+                                                reply_target = .{
+                                                    .root_uri = try compose_arena.dupe(u8, refs.root_uri),
+                                                    .root_cid = try compose_arena.dupe(u8, refs.root_cid),
+                                                    .parent_uri = try compose_arena.dupe(u8, refs.parent_uri),
+                                                    .parent_cid = try compose_arena.dupe(u8, refs.parent_cid),
+                                                };
+                                                reply_handle = try compose_arena.dupe(u8, item.author_handle);
+                                                compose_kind = .post;
+                                                compose_buf.clearRetainingCapacity();
+                                                status = "";
+                                                mode = .compose;
+                                            }
+                                        },
+                                        // The composer's footer buttons never appear
+                                        // on the timeline; they are handled in compose
+                                        // mode below.
+                                        .compose_send, .compose_cancel => {},
                                     }
                                 } else if (field_ui.hitTest(cx, cy, g.hr.slice())) |hit| {
                                     if (hit.target != field_ui.no_target and hit.target < view_items.len) state.selected = hit.target;
@@ -842,6 +878,24 @@ pub fn run(
                             },
                             else => {},
                         }
+                    }
+                    if (pointer_events.items.len > 0) last_input_nanos = clock_shell.monotonicNanos();
+                };
+                // Compose mode: the premium composer's footer buttons. A tap is
+                // turned into the SAME control byte the keyboard sends — Ctrl-D
+                // (send) / Ctrl-C (cancel) — so handleComposeInput stays the one
+                // dispatch path (the timeline does the same trick for its rows).
+                if (mode == .compose) if (pix) |g| {
+                    const gpu_scale: f32 = if (g.gpu) |gs| gs.scale else 1.0;
+                    for (pointer_events.items) |pev| {
+                        if (pev.kind != .button_down or pev.button != 1) continue;
+                        const rx: i32 = if (g.gpu != null) @intFromFloat(@as(f32, @floatFromInt(pev.x)) / gpu_scale) else @intCast(pev.x);
+                        const ry: i32 = if (g.gpu != null) @intFromFloat(@as(f32, @floatFromInt(pev.y)) / gpu_scale) else @intCast(pev.y);
+                        if (feed_view.hitTest(g.regions.items, rx, ry)) |hit| switch (hit.kind) {
+                            .compose_send => try pumped_bytes.append(gpa, 4), // ctrl-D
+                            .compose_cancel => try pumped_bytes.append(gpa, 3), // ctrl-C
+                            else => {},
+                        };
                     }
                     if (pointer_events.items.len > 0) last_input_nanos = clock_shell.monotonicNanos();
                 };
@@ -872,7 +926,7 @@ pub fn run(
             }
 
             if (mode == .compose) {
-                try handleComposeInput(gpa, arena, io, environ, session, out, backend, &prev, &next, &status, &status_buf, &mode, &compose_buf, &reply_target, &reply_handle, compose_kind, decoded.event, now);
+                try handleComposeInput(gpa, arena, io, environ, session, out, backend, &prev, &next, &status, &status_buf, &mode, &compose_buf, &reply_target, &reply_handle, compose_kind, pix, decoded.event, now);
                 continue;
             }
 
@@ -1162,6 +1216,43 @@ fn handleProfileInput(
     }
 }
 
+/// Paint the composer's blocking-write status frame ("posting…" / "saving…").
+/// On the live GPU window it goes through the PREMIUM composer (so the card
+/// stays put with the status under it); otherwise the cell-grid composer is the
+/// terminal/software fallback. Without this the send path flashed the cell
+/// composer over the premium one for the whole network round-trip.
+fn composeBusyFrame(
+    gpa: Allocator,
+    arena: Allocator,
+    out: *std.Io.Writer,
+    backend: Backend,
+    prev: *tui.Surface,
+    next: *tui.Surface,
+    pix: ?Grid,
+    compose_kind: ComposeKind,
+    reply_handle: []const u8,
+    draft: []const u8,
+    status: []const u8,
+) !void {
+    switch (backend) {
+        .window => |win| {
+            if (pix) |g| if (g.gpu) |gs| {
+                const ctx: feed_view.ComposeContext = if (compose_kind == .profile)
+                    .profile
+                else if (reply_handle.len > 0) .reply else .post;
+                paintComposeGpu(gpa, win, g, gs, ctx, reply_handle, draft, status) catch {};
+                return;
+            };
+            timeline_ui.buildComposeFrame(next, draft, reply_handle, status);
+            try present(gpa, out, arena, prev, next, backend);
+        },
+        .terminal => {
+            timeline_ui.buildComposeFrame(next, draft, reply_handle, status);
+            try present(gpa, out, arena, prev, next, backend);
+        },
+    }
+}
+
 fn handleComposeInput(
     gpa: Allocator,
     arena: Allocator,
@@ -1179,6 +1270,10 @@ fn handleComposeInput(
     reply_target: *?write.ReplyTarget,
     reply_handle: *[]const u8,
     compose_kind: ComposeKind,
+    /// The live render grid, so the blocking-write "posting…/saving…" frame is
+    /// drawn through the PREMIUM composer when the GPU path is up — otherwise it
+    /// flashed the cell-grid composer for the duration of the network write.
+    pix: ?Grid,
     ev: tui.InputEvent,
     now: i64,
 ) !void {
@@ -1207,8 +1302,7 @@ fn handleComposeInput(
             // new name shows once the AppView re-polls the record).
             if (compose_kind == .profile) {
                 status.* = "saving...";
-                timeline_ui.buildComposeFrame(next, compose_buf.items, reply_handle.*, status.*);
-                try present(gpa, out, arena, prev, next, backend);
+                try composeBusyFrame(gpa, arena, out, backend, prev, next, pix, compose_kind, reply_handle.*, compose_buf.items, status.*);
                 const saved = write.putProfile(gpa, arena, io, environ, session, compose_buf.items, now) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => {
@@ -1229,8 +1323,7 @@ fn handleComposeInput(
                 return;
             }
             status.* = "posting...";
-            timeline_ui.buildComposeFrame(next, compose_buf.items, reply_handle.*, status.*);
-            try present(gpa, out, arena, prev, next, backend);
+            try composeBusyFrame(gpa, arena, out, backend, prev, next, pix, compose_kind, reply_handle.*, compose_buf.items, status.*);
             // Transport failure is contained to a status line —
             // a wifi blip must not take the screen down (E2).
             // Only OOM stays fatal.
@@ -1903,6 +1996,92 @@ fn paintFrame(
 }
 
 /// The GPU render route (Phase 6.4), one frame: step the living field, render
+/// Advance the glyph-field medium one fixed-timestep (≈60 Hz) tick, at most once
+/// per frame, so it evolves at a constant real-time rate regardless of how fast
+/// the loop spins. Stepping per loop-iteration coupled the sim to the INPUT rate
+/// (a mouse-motion flood drove the loop far above 60 fps → the whole field sped
+/// up while the pointer moved). With the clock gate, idle and active evolve
+/// identically; only the pointer's local splash is injected. Shared by the feed
+/// and composer paint paths so the field animates the same behind both.
+fn advanceField(gs: *GpuState, active: *effect_core.ActiveList) void {
+    const dt_ns: u64 = 16_666_667; // 1/60 s
+    const now_ns = clock_shell.monotonicNanos();
+    const due = gs.last_step_nanos == 0 or (now_ns -| gs.last_step_nanos) >= dt_ns;
+    if (!due) return;
+    // Fill the time-driven ambient bias (shell side → the core stays pure, B3):
+    // a slow drifting two-sine swell plus a finer term so the dense interior is
+    // an ASSORTMENT of glyphs, not a wall of one symbol.
+    var yy: u32 = 0;
+    while (yy < gs.rows) : (yy += 1) {
+        const fy: f32 = @floatFromInt(yy);
+        var xx: u32 = 0;
+        while (xx < gs.cols) : (xx += 1) {
+            const fx: f32 = @floatFromInt(xx);
+            const base = std.math.sin(fx * amb_scale + gs.t * amb_drift) *
+                std.math.sin(fy * amb_scale * 1.3 - gs.t * amb_drift * 0.8);
+            const fine = std.math.sin(fx * 0.21 - gs.t * 0.07) *
+                std.math.sin(fy * 0.18 + gs.t * 0.06);
+            gs.bias[yy * gs.cols + xx] = amb_amp * (base + 0.5 * fine);
+        }
+    }
+    // Advance the medium one step; queued splashes injected once.
+    glyph_field.step(&gs.field, .{}, gs.splashes.items, gs.bias);
+    gs.splashes.clearRetainingCapacity();
+    // Tick the like-heart animation clocks on the same 60 Hz step.
+    effect_core.advanceClocks(active, 1.0 / 60.0);
+    gs.t += 1.0 / 60.0;
+    // Advance the step clock by one tick; if we fell far behind (a stall), snap
+    // to now and DROP the backlog rather than fast-forward the field.
+    gs.last_step_nanos = if (gs.last_step_nanos == 0 or (now_ns -| gs.last_step_nanos) > dt_ns * 4)
+        now_ns
+    else
+        gs.last_step_nanos + dt_ns;
+}
+
+/// Render the premium composer (PHASE C1) on the GPU: the living field behind,
+/// the composer card on top, then swap — the same field-behind-content pipeline
+/// the feed uses, so New-post / reply / profile-edit share the feed's look and
+/// the field stays alive behind them. The composer verts are rebuilt every frame
+/// (the draft changes per keystroke) into the SAME `gs.feed` buffer; `feed_sig`
+/// is zeroed so the timeline rebuilds cleanly on return.
+fn paintComposeGpu(
+    gpa: Allocator,
+    win: *window_shell.Window,
+    g: Grid,
+    gs: *GpuState,
+    ctx: feed_view.ComposeContext,
+    reply_handle: []const u8,
+    draft: []const u8,
+    status: []const u8,
+) !void {
+    const w: u32 = win.fb.width;
+    const h: u32 = win.fb.height;
+    gpu.setViewport(@intCast(w), @intCast(h));
+    const want_cols: u32 = @max(8, w / field_cell_w);
+    const want_rows: u32 = @max(8, h / field_cell_h);
+    if (want_cols != gs.cols or want_rows != gs.rows) {
+        resizeGpuField(gpa, gs, w, h) catch {};
+    }
+    const scale = uiScale(w);
+    gs.scale = scale;
+
+    // Build the composer at the LOGICAL design width (scaled to fill), exactly as
+    // the feed lays out — so the emitted button regions map back through gs.scale.
+    const lh = logicalH(w, h);
+    g.draw.len = 0;
+    feed_view.layoutCompose(gpa, g.engine, @intCast(design_w), @intCast(lh), ctx, reply_handle, draft, status, g.draw, g.regions) catch {};
+    gpu.feedBuild(&gs.feed, gpa, g.engine, g.draw.slice(), scale) catch {};
+    gs.feed_sig = 0; // force a timeline rebuild when the composer closes
+
+    advanceField(gs, g.active);
+
+    gpu.uploadField(&gs.grid, gs.field.height, gs.field.dye, gs.field.cols, gs.field.rows);
+    gpu.clear(gpu_clear_r, gpu_clear_g, gpu_clear_b);
+    gpu.drawFieldGrid(&gs.grid, &gs.ramp, gs.mcx, gs.mcy, gs.t, @intCast(w), @intCast(h));
+    gpu.feedDraw(&gs.feed, @intCast(w), @intCast(h));
+    gpu.swap(&gs.g);
+}
+
 /// it grid-intensity, then the premium feed on top, and swap. The feed is laid
 /// out at the fixed LOGICAL design width and scaled to FILL the window (DPI),
 /// exactly as the preview does. No per-frame pixel blit — render + swap.
@@ -1969,48 +2148,7 @@ fn paintFrameGpu(
         gpu.feedBuild(&gs.feed, gpa, g.engine, g.draw.slice(), scale) catch {};
     }
 
-    // Advance the medium on a FIXED WALL-CLOCK timestep (≈60 Hz), at most once
-    // per frame, so the field evolves at a constant real-time rate regardless of
-    // how fast this loop spins. Stepping once per loop iteration coupled the sim
-    // to the INPUT rate: a stream of mouse-motion events drove the loop far above
-    // 60 fps, so the whole field's animation sped up whenever the pointer moved
-    // (every disturbance everywhere running fast in lockstep — the "far corners
-    // react too" symptom). With the clock gate, idle and active evolve
-    // identically; only the splash the pointer injects is local to it.
-    const dt_ns: u64 = 16_666_667; // 1/60 s
-    const now_ns = clock_shell.monotonicNanos();
-    const due = gs.last_step_nanos == 0 or (now_ns -| gs.last_step_nanos) >= dt_ns;
-    if (due) {
-        // Fill the time-driven ambient bias (shell side → the core stays pure,
-        // B3): a slow drifting two-sine swell plus a finer term so the dense
-        // interior is an ASSORTMENT of glyphs, not a wall of one symbol.
-        var yy: u32 = 0;
-        while (yy < gs.rows) : (yy += 1) {
-            const fy: f32 = @floatFromInt(yy);
-            var xx: u32 = 0;
-            while (xx < gs.cols) : (xx += 1) {
-                const fx: f32 = @floatFromInt(xx);
-                const base = std.math.sin(fx * amb_scale + gs.t * amb_drift) *
-                    std.math.sin(fy * amb_scale * 1.3 - gs.t * amb_drift * 0.8);
-                const fine = std.math.sin(fx * 0.21 - gs.t * 0.07) *
-                    std.math.sin(fy * 0.18 + gs.t * 0.06);
-                gs.bias[yy * gs.cols + xx] = amb_amp * (base + 0.5 * fine);
-            }
-        }
-        // Advance the medium one step; queued splashes injected once.
-        glyph_field.step(&gs.field, .{}, gs.splashes.items, gs.bias);
-        gs.splashes.clearRetainingCapacity();
-        // Tick the like-heart animation clocks on the same 60 Hz step (no
-        // field.zig coupling — the GPU heart pass draws them from this clock).
-        effect_core.advanceClocks(g.active, 1.0 / 60.0);
-        gs.t += 1.0 / 60.0;
-        // Advance the step clock by one tick; if we fell far behind (a stall),
-        // snap to now and DROP the backlog rather than fast-forward the field.
-        gs.last_step_nanos = if (gs.last_step_nanos == 0 or (now_ns -| gs.last_step_nanos) > dt_ns * 4)
-            now_ns
-        else
-            gs.last_step_nanos + dt_ns;
-    }
+    advanceField(gs, g.active);
 
     // Render: the living field behind, the feed on top, then swap.
     gpu.uploadField(&gs.grid, gs.field.height, gs.field.dye, gs.field.cols, gs.field.rows);

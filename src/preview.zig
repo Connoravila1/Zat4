@@ -84,6 +84,22 @@ pub fn main(init: std.process.Init) !void {
     _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, 0, null);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
 
+    const io = init.io;
+    try writePpm(io, gpa, &fb, "/tmp/zat_preview.ppm");
+    std.debug.print("wrote /tmp/zat_preview.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
+
+    // The premium composer (PHASE C1): same field background, the composer card
+    // over it via the REAL layoutCompose path → a second PPM proof.
+    @memset(fb.pixels, clear);
+    dl.len = 0;
+    try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
+    try feed_view.layoutCompose(gpa, &engine, @intCast(W), @intCast(H), .reply, "@mara.zat", "a small network is one where you can actually read the room — not weather, a room.", "", &dl, null);
+    try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+    try writePpm(io, gpa, &fb, "/tmp/zat_compose.ppm");
+    std.debug.print("wrote /tmp/zat_compose.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
+}
+
+fn writePpm(io: std.Io, gpa: std.mem.Allocator, fb: *const raster.Framebuffer, path: []const u8) !void {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(gpa);
     var hdr: [32]u8 = undefined;
@@ -93,14 +109,12 @@ pub fn main(init: std.process.Init) !void {
         try buf.append(gpa, @intCast((px >> 8) & 0xFF));
         try buf.append(gpa, @intCast(px & 0xFF));
     }
-    const io = init.io;
-    const file = try std.Io.Dir.createFileAbsolute(io, "/tmp/zat_preview.ppm", .{});
+    const file = try std.Io.Dir.createFileAbsolute(io, path, .{});
     defer file.close(io);
     var wbuf: [16384]u8 = undefined;
     var fw = file.writer(io, &wbuf);
     try fw.interface.writeAll(buf.items);
     try fw.interface.flush();
-    std.debug.print("wrote /tmp/zat_preview.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
 }
 
 fn mk(handle: []const u8, name: []const u8, body: []const u8, created: i64, like: u32, boost: u32, reply: u32, liked: bool, reposted: bool) feed.TimelineItem {
