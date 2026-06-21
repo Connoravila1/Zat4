@@ -347,10 +347,16 @@ pub fn run(
     var gscreen: u8 = 0;
     // The premium Profile screen is a VIEW over the ONE shared `store`, not a
     // second store (ZONES invariant 4 — the post is the post). Entering it
-    // fetches the author's posts as CONTENT into `store`; the view's ordering
-    // is a query (`feed_core.buildAuthorView`). `on_profile_prev` detects the
-    // entry edge so the fetch fires once per visit.
+    // fetches the viewed author's posts as CONTENT into `store`; the view's
+    // ordering is a query (`feed_core.buildAuthorView`). The profile shows ANY
+    // author: `profile_target_did` is whose profile (defaults to your own — the
+    // rail "Profile"; set to a post author's DID when you tap their avatar).
+    // `on_profile_prev` catches re-entry; `profile_dirty` catches a target
+    // change (tapping a new author while already on the profile).
     var on_profile_prev = false;
+    var profile_target_buf: [256]u8 = undefined;
+    var profile_target_did: []const u8 = session.did;
+    var profile_dirty = false;
 
     // Phase 6.4: the GPU render path, brought up additively when the window is
     // open AND the font engine is live AND `gpu.init` succeeds. On any failure
@@ -533,8 +539,8 @@ pub fn run(
         // fresh fetch each visit. Failure is contained to the status line (E2);
         // only OOM is fatal. Gated to the timeline mode + window path.
         const on_profile = mode == .timeline and gscreen == feed_view.screen_profile;
-        if (on_profile and !on_profile_prev) {
-            const po = feed_shell.loadAuthorFeed(gpa, arena, io, environ, session, appview_url, store, session.did, 30) catch |err| switch (err) {
+        if (on_profile and (!on_profile_prev or profile_dirty)) {
+            const po = feed_shell.loadAuthorFeed(gpa, arena, io, environ, session, appview_url, store, profile_target_did, 30) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => blk: {
                     status = "profile: network error"; // contained
@@ -545,19 +551,20 @@ pub fn run(
                 .ok => {},
                 .failed => status = "profile: unavailable",
             };
+            profile_dirty = false;
         }
         on_profile_prev = on_profile;
 
         // The ACTIVE view: Home (one ordering over the store) or — on the
-        // profile screen — a query for the viewed author's posts over the SAME
+        // profile screen — a query for the TARGET author's posts over the SAME
         // store. Either way it's one list of view-models the render + input +
         // engagement paths all key off; the post records (and so engagement and
         // identity) are shared (ZONES invariant 4).
         const view_items: []const feed_core.TimelineItem = if (on_profile)
-            try feed_core.buildAuthorView(arena, store, session.did)
+            try feed_core.buildAuthorView(arena, store, profile_target_did)
         else
             try feed_core.buildTimeline(arena, store);
-        const profile_header = try profileHeaderFor(arena, session, gscreen, view_items.len);
+        const profile_header = try profileHeaderFor(arena, session, gscreen, profile_target_did, view_items);
         // pix exists exactly when a window backend has a live engine; the
         // composer and profile screens stay on the cell path this cut
         // (their pixel port is the recorded next slice).
@@ -766,9 +773,27 @@ pub fn run(
                                 if (feed_view.hitTest(g.regions.items, rx, ry)) |hit| {
                                     switch (hit.kind) {
                                         // Left-rail destination: switch the active screen
-                                        // (post carries the Screen index). The next frame
-                                        // re-renders the body (sig folds in the screen).
-                                        .nav => gscreen = @intCast(hit.post),
+                                        // (post carries the Screen index). Selecting Profile
+                                        // targets YOUR own profile; the next frame re-renders.
+                                        .nav => {
+                                            gscreen = @intCast(hit.post);
+                                            if (gscreen == feed_view.screen_profile) {
+                                                profile_target_did = session.did;
+                                                profile_dirty = true;
+                                            }
+                                        },
+                                        // Avatar tap → open THAT author's profile (any author;
+                                        // the DID comes from the post's at-uri). A query over
+                                        // the shared store — same engagement/identity truth.
+                                        .author => if (hit.post < view_items.len) {
+                                            const did = authorDidFromUri(view_items[hit.post].uri);
+                                            if (did.len > 0 and did.len <= profile_target_buf.len) {
+                                                @memcpy(profile_target_buf[0..did.len], did);
+                                                profile_target_did = profile_target_buf[0..did.len];
+                                                gscreen = feed_view.screen_profile;
+                                                profile_dirty = true;
+                                            }
+                                        },
                                         // New-post button → the composer (cell path for now).
                                         .compose => mode = .compose,
                                         // Like / boost: the SAME path the keyboard uses —
@@ -780,7 +805,7 @@ pub fn run(
                                         .like, .repost => if (hit.post < view_items.len) {
                                             state.selected = hit.post;
                                             const ek: Engagement = if (hit.kind == .like) .like else .repost;
-                                            const r = try engageSelected(ek, gpa, arena, session, store, view_items[hit.post], hit.post, gscreen, session.did, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
+                                            const r = try engageSelected(ek, gpa, arena, session, store, view_items[hit.post], hit.post, gscreen, profile_target_did, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
                                             if (r.status.len > 0) status = r.status;
                                         },
                                         // Reply → the thread/reply view (a later screen).
@@ -922,12 +947,12 @@ pub fn run(
                     }
                 },
                 .like => if (view_items.len > 0) {
-                    const r = try engageSelected(.like, gpa, arena, session, store, view_items[state.selected], state.selected, gscreen, session.did, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
+                    const r = try engageSelected(.like, gpa, arena, session, store, view_items[state.selected], state.selected, gscreen, profile_target_did, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
                     if (r.status.len > 0) status = r.status;
                     if (r.skip_rest) continue;
                 },
                 .repost => if (view_items.len > 0) {
-                    const r = try engageSelected(.repost, gpa, arena, session, store, view_items[state.selected], state.selected, gscreen, session.did, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
+                    const r = try engageSelected(.repost, gpa, arena, session, store, view_items[state.selected], state.selected, gscreen, profile_target_did, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
                     if (r.status.len > 0) status = r.status;
                     if (r.skip_rest) continue;
                 },
@@ -1210,14 +1235,31 @@ fn buildActiveView(arena: Allocator, store: *feed_core.Store, screen: u8, profil
     return feed_core.buildTimeline(arena, store);
 }
 
-/// The profile header (handle + post count) on the profile screen, else null.
-fn profileHeaderFor(arena: Allocator, session: *const auth.Session, screen: u8, post_count: usize) error{OutOfMemory}!?feed_view.ProfileHeader {
+/// The profile header on the profile screen, else null. Derives the viewed
+/// account's identity from its posts (the handle/display name the AppView
+/// serves), falling back to your own session handle for an empty OWN profile,
+/// else the target DID. Works for any author (tap-to-profile).
+fn profileHeaderFor(arena: Allocator, session: *const auth.Session, screen: u8, target_did: []const u8, view_items: []const feed_core.TimelineItem) error{OutOfMemory}!?feed_view.ProfileHeader {
     if (screen != feed_view.screen_profile) return null;
+    const first_handle = if (view_items.len > 0) view_items[0].author_handle else "";
+    const first_name = if (view_items.len > 0) view_items[0].author_display_name else "";
+    const is_self = std.mem.eql(u8, target_did, session.did);
+    const handle_src = if (first_handle.len > 0) first_handle else if (is_self) session.handle else target_did;
+    const name = if (first_name.len > 0) first_name else handle_src;
     return .{
-        .display_name = session.handle,
-        .handle = try std.fmt.allocPrint(arena, "@{s}", .{session.handle}),
-        .post_count = @intCast(post_count),
+        .display_name = name,
+        .handle = try std.fmt.allocPrint(arena, "@{s}", .{handle_src}),
+        .post_count = @intCast(view_items.len),
     };
+}
+
+/// Pull the author DID out of an at-uri (`at://{did}/{collection}/{rkey}`),
+/// so a tap on a post's avatar can open that author's profile. "" if malformed.
+fn authorDidFromUri(uri: []const u8) []const u8 {
+    if (!std.mem.startsWith(u8, uri, "at://")) return "";
+    const rest = uri["at://".len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return rest;
+    return rest[0..slash];
 }
 
 const EngageResult = struct {
@@ -1285,7 +1327,7 @@ fn engageSelected(
                     const set = if (kind == .like) def_unlike else def_unrepost;
                     set.put(gpa, std.hash.Wyhash.hash(0, item.cid), {}) catch {};
                     const fresh = try buildActiveView(arena, store, screen, profile_did);
-                    const fresh_header = try profileHeaderFor(arena, session, screen, fresh.len);
+                    const fresh_header = try profileHeaderFor(arena, session, screen, profile_did, fresh);
                     try paintFrame(gpa, out, arena, prev, next, backend, pix, fresh, fresh_header, state, revealed_cids, now, session.handle, if (kind == .like) "unliking..." else "unboosting...");
                     if (pix) |g| fireEngageEffect(gpa, g, kind, target, false);
                     return .{ .status = if (kind == .like) "unliking..." else "unboosting..." };
@@ -1302,7 +1344,7 @@ fn engageSelected(
             @memcpy(record_uri, borrowed);
 
             const fresh = try buildActiveView(arena, store, screen, profile_did);
-            const fresh_header = try profileHeaderFor(arena, session, screen, fresh.len);
+            const fresh_header = try profileHeaderFor(arena, session, screen, profile_did, fresh);
             try paintFrame(gpa, out, arena, prev, next, backend, pix, fresh, fresh_header, state, revealed_cids, now, session.handle, if (kind == .like) "unliking..." else "unboosting...");
             // Fire the drain effect at the post's heart cell (state is now
             // DISENGAGED → the cooler recipe). One trigger, derived from the
@@ -1331,7 +1373,7 @@ fn engageSelected(
     // Optimistic first: the bumped count paints now; the worker call
     // follows on its own thread; a refusal reverts (drained in the loop).
     const fresh = try buildActiveView(arena, store, screen, profile_did);
-    const fresh_header = try profileHeaderFor(arena, session, screen, fresh.len);
+    const fresh_header = try profileHeaderFor(arena, session, screen, profile_did, fresh);
     try paintFrame(gpa, out, arena, prev, next, backend, pix, fresh, fresh_header, state, revealed_cids, now, session.handle, if (kind == .like) "liking..." else "boosting...");
     // Fire the like/boost burst at the post's heart cell (state is now
     // ENGAGED). One trigger derived from the transition.

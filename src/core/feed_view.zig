@@ -60,7 +60,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// effects/writes; the view only reports geometry (B5). `nav` (a left-rail
 /// destination; the region's `post` field carries the Screen index) and
 /// `compose` (the New-post button) route navigation rather than engagement.
-pub const Action = enum(u8) { reply, repost, like, nav, compose };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author };
 
 /// The six top-level rail destinations, in order. The `Screen` index a nav
 /// region carries is an index into this. Shared by the rail (draw + hit) and
@@ -607,10 +607,11 @@ pub fn layout(
         const visible = next_y > 0 and post_top < height;
 
         if (visible) {
-            // avatar disc + initial
+            // avatar disc + initial — tapping it opens that author's profile.
             try rect(gpa, dl, m.lx, post_top, av, av, p.tint, @intCast(av >> 1));
             const iadv: i32 = @intCast(text.advance(e, .semibold, p.initial, 22));
             _ = try glyph1(gpa, dl, e, .semibold, m.lx + @divTrunc(av - iadv, 2), post_top + 31, bg, 22, p.initial);
+            try emitRegion(gpa, regions, m.lx, post_top, av, av, @intCast(pi), .author);
 
             // name · handle · age
             var bx = try str(gpa, dl, e, .semibold, cx, post_top + 17, ink, 17, p.name);
@@ -786,7 +787,7 @@ test "fromTimeline: display-name fallback, counts, age, deterministic tint" {
     try std.testing.expectEqual(tintFor("mara.zat"), out[0].tint);
 }
 
-test "layout emits 3 tap regions per post; hitTest resolves each at its center" {
+test "layout emits 4 tap regions per post (avatar + 3 engagement); hitTest resolves each" {
     const gpa = std.testing.allocator;
     var engine = try text.initEngine();
     defer text.deinitEngine(gpa, &engine);
@@ -800,9 +801,10 @@ test "layout emits 3 tap regions per post; hitTest resolves each at its center" 
     };
     const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null);
     try std.testing.expect(h > 112); // content extends below the top bar
-    try std.testing.expectEqual(@as(usize, 3), regions.items.len);
+    try std.testing.expectEqual(@as(usize, 4), regions.items.len);
 
     var saw_like = false;
+    var saw_author = false;
     for (regions.items) |r| {
         const cxp = @as(i32, r.x) + @divTrunc(@as(i32, r.w), 2);
         const cyp = @as(i32, r.y) + @divTrunc(@as(i32, r.h), 2);
@@ -810,8 +812,10 @@ test "layout emits 3 tap regions per post; hitTest resolves each at its center" 
         try std.testing.expectEqual(r.kind, hit.kind);
         try std.testing.expectEqual(@as(u16, 0), hit.post);
         if (r.kind == .like) saw_like = true;
+        if (r.kind == .author) saw_author = true;
     }
     try std.testing.expect(saw_like);
+    try std.testing.expect(saw_author);
     // a click far outside every region resolves to nothing
     try std.testing.expect(hitTest(regions.items, 5, 5) == null);
 }
@@ -836,7 +840,7 @@ test "long timeline does not overflow draw coordinates (off-screen posts skipped
 
     const h = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, null, false, screen_home, null); // must not panic
     try std.testing.expect(h > 940 * 10); // height accounts for the whole list
-    try std.testing.expect(regions.items.len < 3 * 24); // only on-screen posts are tappable
+    try std.testing.expect(regions.items.len < 4 * 24); // only on-screen posts are tappable
 
     // The height cache (the scroll-lag fix) must yield IDENTICAL geometry. A
     // first pass with an all-(-1) cache measures + fills it; a second pass that
@@ -877,7 +881,7 @@ test "profile screen renders the author's posts under a header; other screens st
     // layer, but the geometry is identical).
     const hp = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_profile, header);
     try std.testing.expect(hp > 112);
-    try std.testing.expectEqual(@as(usize, 3), regions.items.len);
+    try std.testing.expectEqual(@as(usize, 4), regions.items.len);
 
     // A non-Home, non-Profile screen is a titled placeholder: no posts render,
     // so no tap regions, and the height clamps to the viewport (no post stack).

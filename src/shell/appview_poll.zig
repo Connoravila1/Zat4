@@ -131,20 +131,33 @@ pub fn pollRepo(
     // leaves the DID showing (E2/E4).
     {
         lock.lock();
-        const known = appview.handleFor(idx, did).len > 0;
+        const need_handle = appview.handleFor(idx, did).len == 0;
+        const need_name = appview.displayNameFor(idx, did).len == 0;
         lock.unlock();
-        if (!known) {
-            const params = [_]xrpc.Param{.{ .name = "repo", .value = did }};
-            const outcome = xrpc.query(arena, io, environ, pds_url, lexicon.method.describe_repo, &params, lexicon.RepoDescription, .{}) catch null;
-            const handle: []const u8 = if (outcome) |o| switch (o) {
-                .ok => |desc| if (desc.handle.len > 0 and desc.handleIsCorrect) desc.handle else "",
-                .failed => "",
-            } else "";
-            // Display name: the first record of the profile collection (the self
-            // profile). Absent/failed ⇒ "" (the client falls back to the handle).
+        // The HANDLE is resolved once (describeRepo — it won't change). The
+        // DISPLAY NAME is re-checked each poll WHILE still unknown, so a profile
+        // record added AFTER first contact is picked up (the profile fetch is
+        // tiny; appendIdentity no-ops when nothing new, so the log doesn't grow).
+        // Once both are known this whole block is skipped (G3). At network scale
+        // a "tried recently" marker would bound the nameless re-checks — noted.
+        if (need_handle or need_name) {
+            var handle: []const u8 = "";
+            if (need_handle) {
+                const params = [_]xrpc.Param{.{ .name = "repo", .value = did }};
+                const outcome = xrpc.query(arena, io, environ, pds_url, lexicon.method.describe_repo, &params, lexicon.RepoDescription, .{}) catch null;
+                if (outcome) |o| switch (o) {
+                    .ok => |desc| if (desc.handle.len > 0 and desc.handleIsCorrect) {
+                        handle = desc.handle;
+                    },
+                    .failed => {},
+                };
+            }
             var display_name: []const u8 = "";
-            if (try fetch(arena, io, environ, pds_url, did, lexicon.collection.profile, ProfileValue)) |recs| {
-                if (recs.len > 0) display_name = recs[0].value.displayName;
+            if (need_name) {
+                // The first record of the profile collection (the self profile).
+                if (try fetch(arena, io, environ, pds_url, did, lexicon.collection.profile, ProfileValue)) |recs| {
+                    if (recs.len > 0) display_name = recs[0].value.displayName;
+                }
             }
             if (handle.len > 0 or display_name.len > 0) {
                 lock.lock();
