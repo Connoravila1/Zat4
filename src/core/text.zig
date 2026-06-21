@@ -419,25 +419,23 @@ test "engine: faces parse, metrics are sane, 'A' has ink" {
 
     try testing.expect(advance(&e, .regular, 'A', 17) > 0);
     try testing.expect(measure(&e, .regular, "zat", 17) > measure(&e, .regular, "z", 17));
-    // The grid font is now MONOSPACE (JetBrains Mono): every glyph
-    // shares one advance. This is the property the fixed cell relies on
-    // — 'i' and 'W' occupy the same width — and it is what the prior
-    // proportional face violated. (If a proportional font is ever
-    // swapped back behind this interface, this expectation flips.)
-    try testing.expectEqual(advance(&e, .regular, 'i', 17), advance(&e, .regular, 'W', 17));
-    try testing.expectEqual(advance(&e, .regular, '.', 17), advance(&e, .regular, 'M', 17));
+    // The UI face is PROPORTIONAL (Inter): a narrow glyph advances less than a
+    // wide one. This is what the premium feed lays out against (real advances,
+    // not a fixed cell). The prior monospace face (JetBrains Mono) made these
+    // equal; the cell-path fallback's fixed-cell sizing assumes that uniformity,
+    // so it is the one surface a proportional face renders loosely on.
+    try testing.expect(advance(&e, .regular, 'i', 17) < advance(&e, .regular, 'W', 17));
+    try testing.expect(advance(&e, .regular, '.', 17) < advance(&e, .regular, 'M', 17));
 
-    // The advance-to-pixel-height RATIO is the load-bearing constant the
-    // shell's cell sizing uses for cell WIDTH (a cell any wider than the
-    // glyph advances floats each letter in empty space — the wide-spacing
-    // bug). JetBrains Mono advances ~0.46× its px height; pin it across a
-    // few sizes so a font swap that changed this would fail HERE, forcing
-    // the shell's `glyph_advance_ratio` to be re-measured rather than the
-    // text silently spreading out. Tolerance covers integer-rounding at
-    // small sizes; a real change (a wider/narrower face) breaks the band.
+    // The 'M' advance-to-pixel RATIO is the reference the shell's cell-path
+    // fallback uses for cell WIDTH (`glyph_advance_ratio`). Inter's 'M' (a wide
+    // glyph in a proportional face) advances ~0.765× its px height; pin it
+    // across a few sizes so a silent font swap that changed cell metrics fails
+    // HERE, forcing `glyph_advance_ratio` to be re-measured. (On the premium GPU
+    // path this is irrelevant — that path uses real per-glyph advances.)
     for ([_]u32{ 17, 28, 40 }) |px| {
         const ratio = @as(f32, @floatFromInt(advance(&e, .regular, 'M', px))) / @as(f32, @floatFromInt(px));
-        try testing.expect(ratio > 0.40 and ratio < 0.52);
+        try testing.expect(ratio > 0.70 and ratio < 0.82);
     }
 
     const g = try glyph(gpa, &e, .semibold, 'A', 17);

@@ -1827,20 +1827,20 @@ fn pushLikeSplash(gpa: Allocator, gs: *GpuState, gx: u32, gy: u32) void {
     }
 }
 
-/// THE single source of truth for the glyph cell size. Two facts drive
-/// it: (1) the cell HEIGHT is the pixel size the font rasterizes at, and
-/// (2) the cell WIDTH must equal the font's real glyph ADVANCE at that
-/// height — JetBrains Mono advances ~0.46× its pixel height (measured),
-/// so a cell any wider than that floats each glyph in empty space (the
-/// "F e l i c i a" wide-spacing bug). We therefore pick a target glyph
-/// HEIGHT from the window width and set the width to the true advance.
-/// A bigger window → taller glyphs → larger text, at a roughly constant
-/// column count. The engine caches per px (text.glyph keys on px).
+/// THE single source of truth for the glyph cell size for the CELL-PATH
+/// fallback. Two facts drive it: (1) the cell HEIGHT is the pixel size the
+/// font rasterizes at, and (2) the cell WIDTH is sized to a font advance at
+/// that height. The UI face is now PROPORTIONAL (Inter), which has no single
+/// advance; we size the cell to 'M' (~0.765× px, the wide reference) so the
+/// widest glyph never overflows its cell on this fallback — proportional text
+/// reads a little loose here, the accepted cost of the fallback (the premium
+/// GPU path uses real per-glyph advances and is unaffected). A bigger window →
+/// taller glyphs → larger text, at a roughly constant column count.
 ///
-/// The advance ratio is a stable font constant, so the pure cellSize can
-/// hold it without calling the engine (B2 preserved). It is asserted
-/// against the real metric in a shell test so it cannot silently drift.
-const glyph_advance_ratio: f32 = 0.46; // measured: advance(M)/px for JetBrains Mono
+/// The ratio is a stable font constant, so the pure cellSize can hold it
+/// without calling the engine (B2 preserved). It is asserted against the real
+/// 'M' metric in a core test (text.zig) so it cannot silently drift.
+const glyph_advance_ratio: f32 = 0.765; // measured: advance(M)/px for Inter
 /// Target columns the window aims to show at zoom 1.0 — cells scale so
 /// roughly this many fit, so widening the window scales text UP rather
 /// than packing in more small cells. [TUNE].

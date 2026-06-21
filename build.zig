@@ -208,15 +208,17 @@ pub fn build(b: *std.Build) void {
 /// live tests) — the C surface cannot drift between them.
 fn addFontEngine(b: *std.Build, mod: *std.Build.Module) void {
     // The embedded UI fonts ride as byte modules so core/text.zig can
-    // The window timeline is a GLYPH GRID, so it wants a font designed
-    // for the grid: JetBrains Mono (OFL, license beside the assets) —
-    // every glyph the same advance, which is what the fixed cell expects.
-    // (IBM Plex Sans, the prior proportional face, looked subtly off
-    // because its varied advances were forced into uniform cells.) This
-    // is a one-file swap behind text.zig's unchanged coverage interface,
-    // exactly the ringfenced font decision the GUI roadmap §4 promised.
-    mod.addImport("font_regular_ttf", b.createModule(.{ .root_source_file = b.path("assets/JetBrainsMono-Regular.ttf") }));
-    mod.addImport("font_semibold_ttf", b.createModule(.{ .root_source_file = b.path("assets/JetBrainsMono-SemiBold.ttf") }));
+    // @embedFile them. The premium feed lays out PROPORTIONALLY (real per-
+    // glyph advances, not a fixed cell), so it carries a proportional UI face:
+    // Inter (OFL, license beside the assets). This is a one-file swap behind
+    // text.zig's unchanged coverage interface — the ringfenced font decision
+    // the GUI roadmap §4 promised; not a dependency (bundled data, like the
+    // other faces in assets/). The legacy cell-path timeline + the glyph field
+    // are fixed-cell grids that historically preferred a mono face (JetBrains
+    // Mono is kept in assets/ for that); a follow-up can give the field its
+    // own mono source if Inter reads off there.
+    mod.addImport("font_regular_ttf", b.createModule(.{ .root_source_file = b.path("assets/Inter-Regular.ttf") }));
+    mod.addImport("font_semibold_ttf", b.createModule(.{ .root_source_file = b.path("assets/Inter-SemiBold.ttf") }));
     // The credential generator's root word list rides as a byte module the
     // same way the fonts do, so core/credential.zig can @embedFile it and
     // split it into the comptime pool. PUBLIC by design (entropy is in the
