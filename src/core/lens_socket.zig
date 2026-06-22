@@ -172,6 +172,11 @@ pub const TrayView = struct {
 pub const SocketUi = struct {
     // A7.2: cold — exactly one instance per render, never iterated. Waived.
     open: bool = false,
+    /// Eased open progress 0→1 (the shell springs it toward `open`). The tray
+    /// sweeps down by this and cards reveal top-to-bottom as it passes them —
+    /// so opening isn't a binary pop. 1 = fully open (forced on the always-open
+    /// loadout-page sockets).
+    open_t: f32 = 0,
     expanded: ?u32 = null, // card showing inline detail, or null (E4)
     picking: ?u32 = null, // card whose color-swatch picker is open, or null (§11.5)
     swap_phase: u8 = 0, // 0 = resting; 1..N = eject/seat animation (L.2)
@@ -302,7 +307,8 @@ pub fn seatedAccent(tray: TrayView) u32 {
 pub fn measuredHeight(tray: TrayView, ui: SocketUi, geom: Geometry) i32 {
     const sc = geom.scale;
     const sock_h = fxi(64 * sc);
-    if (!ui.open) return sock_h;
+    const op = @min(1.0, ui.open_t);
+    if (op <= 0.004) return sock_h;
     const box_pad = fxi(10 * sc);
     const hdr_h = fxi(26 * sc);
     const col_gap = fxi(8 * sc);
@@ -315,7 +321,8 @@ pub fn measuredHeight(tray: TrayView, ui: SocketUi, geom: Geometry) i32 {
     const grid_h = rows * card_h + @max(0, rows - 1) * col_gap +
         (if (expanded) detail_h + col_gap else 0);
     const box_h = hdr_h + grid_h + box_pad;
-    return sock_h + fxi(10 * sc) + box_h;
+    const sweep_h: i32 = if (op >= 0.999) box_h else fxi(@as(f32, @floatFromInt(box_h)) * op);
+    return sock_h + fxi(10 * sc) + sweep_h;
 }
 
 // ---------------------------------------------------------------------------
@@ -547,7 +554,10 @@ pub fn build(
     // the whole socket toggles the tray
     try pushHit(gpa, hits, x0, y0, w, sock_h, .toggle, "", 0);
 
-    if (!ui.open) return sock_h;
+    // Spring-open: the tray sweeps down by `op` (0→1) and cards reveal as it
+    // passes them. op≈1 = fully open. Below the threshold it's closed (resting).
+    const op = @min(1.0, ui.open_t);
+    if (op <= 0.004) return sock_h;
 
     // ---- 2. the open tray: header + 3-up grid ----
     const tray_top = y0 + sock_h + fxi(10 * sc);
@@ -574,22 +584,29 @@ pub fn build(
     const grid_h = rows * card_h + @max(0, rows - 1) * col_gap +
         (if (exp != null) detail_h + col_gap else 0);
     const box_h = hdr_h + grid_h + box_pad;
+    // The panel's currently-revealed height (sweeps down with `op`). Cards are
+    // drawn only once this sweep has passed them — the staggered reveal.
+    const sweep_h: i32 = if (op >= 0.999) box_h else fxi(@as(f32, @floatFromInt(box_h)) * op);
+    const reveal_bottom = tray_top + sweep_h;
 
     // Soft lift shadow under the tray — layered (low alpha, growing offset) to
     // fake a big, soft falloff, so the panel hovers above the feed.
-    try rect(gpa, dl, x0 - fxi(2 * sc), tray_top + fxi(10 * sc), w + fxi(4 * sc), box_h, soft(0x000000, 0x1C), radius);
-    try rect(gpa, dl, x0, tray_top + fxi(5 * sc), w, box_h, soft(0x000000, 0x22), radius);
-    try rect(gpa, dl, x0, tray_top, w, box_h, tray_panel, radius);
+    try rect(gpa, dl, x0 - fxi(2 * sc), tray_top + fxi(10 * sc), w + fxi(4 * sc), sweep_h, soft(0x000000, 0x1C), radius);
+    try rect(gpa, dl, x0, tray_top + fxi(5 * sc), w, sweep_h, soft(0x000000, 0x22), radius);
+    try rect(gpa, dl, x0, tray_top, w, sweep_h, tray_panel, radius);
     try rect(gpa, dl, x0, tray_top, w, fxi(1 * sc) + 1, hairline, radius); // top lit edge
 
-    // header: hint (uppercase, faint) + "+ get more" (accent)
+    // header: hint (uppercase, faint) + "+ get more" (accent) — once the sweep
+    // has revealed the header strip.
     const hint_px: u16 = @intCast(@max(1, fxi(11 * sc)));
-    _ = try str(gpa, dl, e, .regular, grid_x, tray_top + fxi(16 * sc), faint, hint_px, "YOUR TRAY \u{00B7} TAP TO SEAT \u{00B7} DRAG HANDLE TO REORDER");
-    const more_s = "+ get more";
-    const more_meas: i32 = @intCast(text.measure(e, .regular, more_s, hint_px));
-    const more_x = x0 + w - box_pad - more_meas;
-    _ = try str(gpa, dl, e, .regular, more_x, tray_top + fxi(16 * sc), acc, hint_px, more_s);
-    try pushHit(gpa, hits, more_x - fxi(4 * sc), tray_top, more_meas + fxi(8 * sc), hdr_h, .get_more, "", 0);
+    if (sweep_h > hdr_h - fxi(4 * sc)) {
+        _ = try str(gpa, dl, e, .regular, grid_x, tray_top + fxi(16 * sc), faint, hint_px, "YOUR TRAY \u{00B7} TAP TO SEAT \u{00B7} DRAG HANDLE TO REORDER");
+        const more_s = "+ get more";
+        const more_meas: i32 = @intCast(text.measure(e, .regular, more_s, hint_px));
+        const more_x = x0 + w - box_pad - more_meas;
+        _ = try str(gpa, dl, e, .regular, more_x, tray_top + fxi(16 * sc), acc, hint_px, more_s);
+        try pushHit(gpa, hits, more_x - fxi(4 * sc), tray_top, more_meas + fxi(8 * sc), hdr_h, .get_more, "", 0);
+    }
 
     // the grid
     const grid_top = tray_top + hdr_h;
@@ -621,6 +638,8 @@ pub fn build(
             cx = lerpi(home[0], np[0], t);
             cy = lerpi(home[1], np[1], t);
         }
+        // Staggered reveal: skip the card until the opening sweep has reached it.
+        if (cy + card_h > reveal_bottom + fxi(2 * sc)) continue;
 
         // card body. Unseated cards sit RAISED (a soft shadow lifts them);
         // the seated card sits RECESSED (darker, no shadow) with a thin
@@ -748,6 +767,7 @@ pub fn build(
             const row: i32 = @intCast(s / 3);
             const px2 = grid_x + col * (card_w + col_gap);
             const py2 = grid_top + row * (card_h + col_gap) + (if (exp != null and row > row_e) detail_h + col_gap else 0);
+            if (py2 + card_h > reveal_bottom + fxi(2 * sc)) continue; // not yet revealed by the sweep
             // a faint dashed border (four edges) + a soft "+" in the centre
             try dashedH(gpa, dl, px2 + fxi(6 * sc), px2 + card_w - fxi(6 * sc), py2 + fxi(2 * sc), rail, 1, fxi(7 * sc), fxi(5 * sc));
             try dashedH(gpa, dl, px2 + fxi(6 * sc), px2 + card_w - fxi(6 * sc), py2 + card_h - fxi(2 * sc), rail, 1, fxi(7 * sc), fxi(5 * sc));
@@ -800,6 +820,7 @@ pub fn build(
     // card, shows author / description / ranks / privacy / CID, and a seat +
     // close action. Does NOT seat by itself; does not leave the grid (§5.5).
     if (exp) |ex| {
+        if (grid_top + row_e * (card_h + col_gap) + card_h + col_gap + detail_h <= reveal_bottom + fxi(2 * sc)) {
         const card = tray.cards[ex];
         const card_acc = palette[@min(card.color, palette.len - 1)];
         const py = grid_top + row_e * (card_h + col_gap) + card_h + col_gap;
@@ -844,9 +865,10 @@ pub fn build(
             _ = try str(gpa, dl, e, .semibold, seat_x + fxi(14 * sc), btn_y + fxi(20 * sc), 0xFF181812, btn_px, seat_lbl);
             try pushHit(gpa, hits, seat_x, btn_y, seat_w, btn_h, .seat, span(tray, card.cid), 0);
         }
+        }
     }
 
-    return sock_h + fxi(10 * sc) + box_h;
+    return sock_h + fxi(10 * sc) + sweep_h;
 }
 
 /// The grid slot index under (ui.drag_x, ui.drag_y) — the drag's insertion
@@ -941,7 +963,7 @@ test "build is pure: same inputs produce identical draw lists" {
     defer text.deinitEngine(testing.allocator, &engine);
 
     const tray = try buildSampleTray(arena);
-    const ui: SocketUi = .{ .open = true };
+    const ui: SocketUi = .{ .open = true, .open_t = 1.0 };
     const geom: Geometry = .{ .x = 40, .y = 40, .w = 640, .scale = 1.0 };
 
     var dl1: raster.DrawList = .{};
@@ -970,7 +992,7 @@ test "resting socket is shorter than the open tray" {
 
     const closed = try build(testing.allocator, &engine, tray, .{ .open = false }, geom, &dl, null);
     dl.len = 0;
-    const open = try build(testing.allocator, &engine, tray, .{ .open = true }, geom, &dl, null);
+    const open = try build(testing.allocator, &engine, tray, .{ .open = true, .open_t = 1.0 }, geom, &dl, null);
     try testing.expect(open > closed);
 }
 
@@ -989,7 +1011,7 @@ test "hitTest: socket toggles, card seats with its CID, miss is null (E4)" {
     var hits: HitList = .empty;
     defer hits.deinit(testing.allocator);
 
-    _ = try build(testing.allocator, &engine, tray, .{ .open = true }, geom, &dl, &hits);
+    _ = try build(testing.allocator, &engine, tray, .{ .open = true, .open_t = 1.0 }, geom, &dl, &hits);
 
     // A click inside the socket band (y < 64) hits the toggle.
     const top = hitTest(hits.items, 300, 20) orelse return error.NoHit;
@@ -1057,15 +1079,15 @@ test "L.3 expand: panel grows the tray, ⓘ maps to expand, close collapses" {
     const geom: Geometry = .{ .x = 0, .y = 0, .w = 600, .scale = 1.0 };
 
     // Expanding a card makes the tray taller than the plain open tray.
-    const open_h = measuredHeight(tray, .{ .open = true }, geom);
-    const exp_h = measuredHeight(tray, .{ .open = true, .expanded = 0 }, geom);
+    const open_h = measuredHeight(tray, .{ .open = true, .open_t = 1.0 }, geom);
+    const exp_h = measuredHeight(tray, .{ .open = true, .open_t = 1.0, .expanded = 0 }, geom);
     try testing.expect(exp_h > open_h);
     // build agrees with measuredHeight when a card is expanded.
     var dl: raster.DrawList = .{};
     defer dl.deinit(testing.allocator);
     var hits: HitList = .empty;
     defer hits.deinit(testing.allocator);
-    const built = try build(testing.allocator, &engine, tray, .{ .open = true, .expanded = 0 }, geom, &dl, &hits);
+    const built = try build(testing.allocator, &engine, tray, .{ .open = true, .open_t = 1.0, .expanded = 0 }, geom, &dl, &hits);
     try testing.expectEqual(exp_h, built);
 
     // Some ⓘ corner maps to .expand carrying a CID; the detail's close button
@@ -1093,7 +1115,7 @@ test "L.4 reorder: non-seated cards emit a drag handle; the seated one does not"
     defer dl.deinit(testing.allocator);
     var hits: HitList = .empty;
     defer hits.deinit(testing.allocator);
-    _ = try build(testing.allocator, &engine, tray, .{ .open = true }, geom, &dl, &hits);
+    _ = try build(testing.allocator, &engine, tray, .{ .open = true, .open_t = 1.0 }, geom, &dl, &hits);
 
     var handles: usize = 0;
     var seated_has_handle = false;
@@ -1113,7 +1135,7 @@ test "L.4 reorder: non-seated cards emit a drag handle; the seated one does not"
 
     // A drag still renders (the ghost + hole) without panicking.
     dl.len = 0;
-    _ = try build(testing.allocator, &engine, tray, .{ .open = true, .drag_active = 2, .drag_x = 200, .drag_y = 300 }, geom, &dl, null);
+    _ = try build(testing.allocator, &engine, tray, .{ .open = true, .open_t = 1.0, .drag_active = 2, .drag_x = 200, .drag_y = 300 }, geom, &dl, null);
     try testing.expect(dl.len > 0);
 }
 
@@ -1132,7 +1154,7 @@ test "§11.5 recolor: swatch opens a picker; chips map to set_color over 9 color
     defer hits.deinit(testing.allocator);
 
     // Closed picker: every card offers a swatch_open target, no chips.
-    _ = try build(testing.allocator, &engine, tray, .{ .open = true }, geom, &dl, &hits);
+    _ = try build(testing.allocator, &engine, tray, .{ .open = true, .open_t = 1.0 }, geom, &dl, &hits);
     var opens: usize = 0;
     var chips: usize = 0;
     for (hits.items) |h| {
@@ -1145,7 +1167,7 @@ test "§11.5 recolor: swatch opens a picker; chips map to set_color over 9 color
     // Open the picker on card 2 → a full palette of color chips appears.
     hits.clearRetainingCapacity();
     dl.len = 0;
-    _ = try build(testing.allocator, &engine, tray, .{ .open = true, .picking = 2 }, geom, &dl, &hits);
+    _ = try build(testing.allocator, &engine, tray, .{ .open = true, .open_t = 1.0, .picking = 2 }, geom, &dl, &hits);
     var palette_chips: usize = 0;
     var seen_colors: [palette.len]bool = @splat(false);
     for (hits.items) |h| {
@@ -1178,7 +1200,7 @@ test "empty tray renders a valid socket, not an error (E4)" {
     const geom: Geometry = .{ .x = 0, .y = 0, .w = 500, .scale = 1.0 };
     var dl: raster.DrawList = .{};
     defer dl.deinit(testing.allocator);
-    const h = try build(testing.allocator, &engine, tray, .{ .open = true }, geom, &dl, null);
+    const h = try build(testing.allocator, &engine, tray, .{ .open = true, .open_t = 1.0 }, geom, &dl, null);
     try testing.expect(h > 0);
     try testing.expect(dl.len > 0);
 }

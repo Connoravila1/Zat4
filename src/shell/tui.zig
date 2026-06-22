@@ -732,6 +732,15 @@ pub fn run(
             gsocket_ui.swap_phase +|= 1;
             if (gsocket_ui.swap_phase > lens_socket.swap_total_frames) gsocket_ui.swap_phase = 0;
         }
+        // Spring-open: ease each switcher socket's open progress toward its open
+        // state. The widget sweeps the tray + reveals cards by this (page sockets
+        // force open_t=1 in their render, so this is a no-op there).
+        {
+            const oe: f32 = 0.34;
+            gsocket_ui.open_t += ((if (gsocket_ui.open) @as(f32, 1) else 0) - gsocket_ui.open_t) * oe;
+            reply_ui.open_t += ((if (reply_ui.open) @as(f32, 1) else 0) - reply_ui.open_t) * oe;
+            zone_ui.open_t += ((if (zone_ui.open) @as(f32, 1) else 0) - zone_ui.open_t) * oe;
+        }
         const home_tray: lens_socket.TrayView = .{ .cards = socket_cards, .text = socket_blob, .seated = gseated };
         // Advance the drag's LIVE REFLOW + lift + settle one step per frame (the
         // iOS "pick up and the others fill in" feel). The targets are pure
@@ -2881,6 +2890,9 @@ fn paintFrameGpu(
         (@as(u64, (g.socket_ui.expanded orelse 0xFFF) + 1) << 48) |
         (if (g.socket_tray) |t| @as(u64, t.seated) else 0);
     socket_sig ^= (@as(u64, (g.socket_ui.picking orelse 0xFF)) +% 1) *% 0xA24B_AED4_963E_E407;
+    // While the tray springs open/closed, open_t changes each frame — quantize
+    // it into the signature so the feed verts rebuild through the animation.
+    socket_sig ^= (@as(u64, @intFromFloat(@max(0, @min(1.0, g.socket_ui.open_t)) * 64)) +% 1) *% 0xCA6B_9576_3F1D_2E11;
     // While dragging, the ghost follows the pointer — fold the drag pointer in
     // so each move rebuilds the socket (the one time a per-move rebuild is wanted).
     if (g.socket_ui.drag_active) |d| {

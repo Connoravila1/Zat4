@@ -104,7 +104,7 @@ pub fn main(init: std.process.Init) !void {
     try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
     var blue_tray = home_tray;
     blue_tray.seated = 2; // Discover → blue
-    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, 0, null, 0, lens_socket.seatedAccent(blue_tray), blue_tray, .{ .open = true }, null);
+    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, 0, null, 0, lens_socket.seatedAccent(blue_tray), blue_tray, .{ .open = true, .open_t = 1.0 }, null);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_feed_open.ppm");
     std.debug.print("wrote /tmp/zat_feed_open.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
@@ -168,7 +168,7 @@ pub fn main(init: std.process.Init) !void {
     @memset(fb.pixels, clear);
     dl.len = 0;
     try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
-    _ = try lens_socket.build(arena, &engine, tray, .{ .open = true }, sock_geom, &dl, null);
+    _ = try lens_socket.build(arena, &engine, tray, .{ .open = true, .open_t = 1.0 }, sock_geom, &dl, null);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_socket_open.ppm");
     std.debug.print("wrote /tmp/zat_socket_open.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
@@ -178,7 +178,7 @@ pub fn main(init: std.process.Init) !void {
     @memset(fb.pixels, clear);
     dl.len = 0;
     try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
-    _ = try lens_socket.build(arena, &engine, tray, .{ .open = true, .expanded = 3 }, sock_geom, &dl, null);
+    _ = try lens_socket.build(arena, &engine, tray, .{ .open = true, .open_t = 1.0, .expanded = 3 }, sock_geom, &dl, null);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_socket_detail.ppm");
     std.debug.print("wrote /tmp/zat_socket_detail.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
@@ -194,7 +194,7 @@ pub fn main(init: std.process.Init) !void {
     drag_slide[1] = 1.0;
     drag_slide[2] = 1.0;
     drag_slide[3] = 1.0;
-    _ = try lens_socket.build(arena, &engine, tray, .{ .open = true, .drag_active = 4, .drag_x = sock_geom.x + 120, .drag_y = sock_geom.y + 130, .lift = 1.0, .slide = drag_slide }, sock_geom, &dl, null);
+    _ = try lens_socket.build(arena, &engine, tray, .{ .open = true, .open_t = 1.0, .drag_active = 4, .drag_x = sock_geom.x + 120, .drag_y = sock_geom.y + 130, .lift = 1.0, .slide = drag_slide }, sock_geom, &dl, null);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_socket_drag.ppm");
     std.debug.print("wrote /tmp/zat_socket_drag.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
@@ -203,7 +203,7 @@ pub fn main(init: std.process.Init) !void {
     @memset(fb.pixels, clear);
     dl.len = 0;
     try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
-    _ = try lens_socket.build(arena, &engine, tray, .{ .open = true, .picking = 2 }, sock_geom, &dl, null);
+    _ = try lens_socket.build(arena, &engine, tray, .{ .open = true, .open_t = 1.0, .picking = 2 }, sock_geom, &dl, null);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_socket_recolor.ppm");
     std.debug.print("wrote /tmp/zat_socket_recolor.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });

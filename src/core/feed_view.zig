@@ -1168,6 +1168,7 @@ pub fn layoutLoadout(
             y += 18;
             var ui = s.ui;
             ui.open = true; // always open on this page
+            ui.open_t = 1.0; // fully revealed (no spring-open on the page)
             const geom: lens_socket.Geometry = .{ .x = m.lx, .y = y, .w = m.cw, .scale = 1.0 };
             if (out_geoms) |g| g[i] = geom;
             const sh = try lens_socket.build(gpa, e, s.tray, ui, geom, dl, s.hits);
