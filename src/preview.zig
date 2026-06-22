@@ -131,7 +131,12 @@ pub fn main(init: std.process.Init) !void {
         tv("lune.zat", "lune", "weather you can't even reply to without getting rained on.", 0xFFA9B6D6, 'l', 2, true),
         tv("rune.zat", "rune", "this is why i kept the field on. it keeps the light at human scale.", 0xFFB5A9CC, 'r', 1, false),
     };
-    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), &thread, 0, &dl, null, null, false, feed_view.screen_thread, null, 0, feed_view.accent_house, null, .{}, null);
+    const trc, const trb = try lens_catalog.defaultReplyLoadout(arena);
+    const reply_t2: lens_socket.TrayView = .{ .cards = trc, .text = trb, .seated = lens_catalog.default_reply_seated };
+    var thr_hits: lens_socket.HitList = .empty;
+    defer thr_hits.deinit(gpa);
+    // All-same-author thread → the reply socket lands at the end (the screenshot case).
+    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), &thread, 0, &dl, null, null, false, feed_view.screen_thread, null, 0, feed_view.accent_house, reply_t2, .{}, &thr_hits);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_thread.ppm");
     std.debug.print("wrote /tmp/zat_thread.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });

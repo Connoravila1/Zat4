@@ -769,8 +769,9 @@ pub fn run(
         // Flush on the home tray CLOSING, or on LEAVING the loadout page (whose
         // sockets are always open, so there's no tray-close there).
         const left_loadout_page = prev_screen == feed_view.screen_loadout and gscreen != feed_view.screen_loadout;
+        const left_thread = prev_screen == feed_view.screen_thread and gscreen != feed_view.screen_thread;
         const tray_closed = socket_was_open and !gsocket_ui.open;
-        if ((tray_closed or left_loadout_page) and loadout_dirty) {
+        if ((tray_closed or left_loadout_page or left_thread) and loadout_dirty) {
             if (writer) |w| {
                 // Write the WHOLE record (all three surfaces) so one surface's
                 // edit doesn't clobber the others. ids slice into each surface's
@@ -790,7 +791,15 @@ pub fn run(
         // pix exists exactly when a window backend has a live engine; the
         // composer and profile screens stay on the cell path this cut
         // (their pixel port is the recorded next slice).
-        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = home_tray, .socket_ui = gsocket_ui, .socket_hits = &gsocket_hits, .accent = lens_socket.seatedAccent(home_tray), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .loadout_geoms = &page_geoms } else null;
+        // On the THREAD screen the socket-of-the-screen is the REPLY socket
+        // (drawn inline after the root + author self-thread). Elsewhere (home
+        // header, loadout page) it's the FEED socket. Accent stays feed-derived
+        // — reply seating never retints (owner rule).
+        const on_thread_screen = gscreen == feed_view.screen_thread;
+        const cur_socket_tray: lens_socket.TrayView = if (on_thread_screen) .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated } else home_tray;
+        const cur_socket_ui = if (on_thread_screen) reply_ui else gsocket_ui;
+        const cur_socket_hits = if (on_thread_screen) &reply_hits else &gsocket_hits;
+        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = lens_socket.seatedAccent(home_tray), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .loadout_geoms = &page_geoms } else null;
         switch (mode) {
             .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status),
             .compose => {
@@ -1117,6 +1126,31 @@ pub fn run(
                                             else => applyLoadoutAction(sact, zone_cards, zone_blob, &zone_seated, &zone_ui, &loadout_dirty),
                                         }
                                         socket_handled = true;
+                                    }
+                                } else if (gscreen == feed_view.screen_thread) {
+                                    // The inline REPLY socket on a thread: a switcher over the
+                                    // reply loadout (shared with the Algorithms page). Order-only,
+                                    // no view retint. Reorder lives on the Algorithms page.
+                                    if (lens_socket.hitTest(g.socket_hits.items, rx, ry)) |sact| {
+                                        socket_handled = true;
+                                        switch (sact) {
+                                            .toggle_tray => reply_ui.open = !reply_ui.open,
+                                            .seat => |cid| {
+                                                if (trayIndexOfCid(reply_cards, reply_blob, cid)) |idx| {
+                                                    reply_seated = idx;
+                                                    loadout_dirty = true;
+                                                }
+                                                reply_ui.open = false;
+                                                reply_ui.expanded = null;
+                                                reply_ui.picking = null;
+                                            },
+                                            .get_more => {
+                                                reply_ui.open = false;
+                                                gscreen = feed_view.screen_loadout;
+                                                gscroll_px = 0;
+                                            },
+                                            else => applyLoadoutAction(sact, reply_cards, reply_blob, &reply_seated, &reply_ui, &loadout_dirty),
+                                        }
                                     }
                                 } else if (lens_socket.hitTest(g.socket_hits.items, rx, ry)) |sact| {
                                     socket_handled = true;
@@ -2127,7 +2161,11 @@ fn applyLoadoutAction(sact: lens_socket.SocketAction, cards: []lens_socket.LensC
 fn pageDragDrop(cards: []lens_socket.LensCard, blob: []const u8, seated: *u32, ui: *lens_socket.SocketUi, geom: lens_socket.Geometry, dirty: *bool) void {
     if (ui.drag_active) |d| {
         const tray: lens_socket.TrayView = .{ .cards = cards, .text = blob, .seated = seated.* };
-        const to: u32 = lens_socket.dropIndex(tray, ui.*, geom) orelse d;
+        // Force open for the insertion math — the page socket renders open but
+        // its stored `open` is false (which dropIndex would reject).
+        var oui = ui.*;
+        oui.open = true;
+        const to: u32 = lens_socket.dropIndex(tray, oui, geom) orelse d;
         const seated_off = if (seated.* < cards.len) cards[seated.*].cid.off else 0;
         reorderTray(cards, d, to);
         for (cards, 0..) |c, ix| {
@@ -2161,7 +2199,12 @@ fn advanceSocketDrag(ui: *lens_socket.SocketUi, tray: lens_socket.TrayView, geom
         if (ui.settle_phase == 0) {
             // Active drag: lift the ghost; reflow neighbours toward the gap.
             ui.lift += (1.0 - ui.lift) * ease;
-            const ins: i32 = if (lens_socket.dropIndex(tray, ui.*, geom)) |x| @intCast(x) else @as(i32, @intCast(d));
+            // dropIndex early-returns null unless the socket is open; the page
+            // sockets are rendered open but their stored `open` is false, so
+            // force it for the insertion math (home is already open here).
+            var oui = ui.*;
+            oui.open = true;
+            const ins: i32 = if (lens_socket.dropIndex(tray, oui, geom)) |x| @intCast(x) else @as(i32, @intCast(d));
             var a: i32 = 0;
             while (a < n and a < @as(i32, @intCast(ui.slide.len))) : (a += 1) {
                 if (a == d) continue;

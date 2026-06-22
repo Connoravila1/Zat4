@@ -762,8 +762,30 @@ pub fn layout(
     const av_base: i32 = @divTrunc(av * 2, 3) + 1; // avatar-initial baseline within the disc
     const body_line: i32 = @max(23, @as(i32, @intCast(text.lineMetrics(e, .regular, 16).height)));
 
+    // THE REPLY SOCKET (thread screen). It sits after the root + the author's
+    // leading self-thread run (consecutive posts by the root author), before
+    // everyone else's replies. All-same-author → end of the thread. `*_at` is
+    // the post index it precedes; == posts.len means "after the last post".
+    const reply_socket_at: usize = blk: {
+        if (!is_thread or socket_tray == null or posts.len == 0) break :blk std.math.maxInt(usize);
+        var i: usize = 1;
+        while (i < posts.len) : (i += 1) {
+            if (!std.mem.eql(u8, posts[i].handle, posts[0].handle)) break :blk i;
+        }
+        break :blk posts.len; // all the same author → end of thread
+    };
+    // Narrower than the feed socket, inset to sit within the reply column.
+    const reply_inset: i32 = 26;
+
     var y: i32 = feed_y0 + scroll;
     for (posts, 0..) |p, pi| {
+        // The reply socket precedes this post (its seam in the thread).
+        if (pi == reply_socket_at) if (socket_tray) |st| {
+            const sg: lens_socket.Geometry = .{ .x = m.lx + reply_inset, .y = y, .w = m.cw - reply_inset * 2, .scale = 1.0 };
+            const sh = lens_socket.measuredHeight(st, socket_ui, sg);
+            if (y + sh > 0 and y < height) _ = try lens_socket.build(gpa, e, st, socket_ui, sg, dl, socket_hits);
+            y += sh + 18;
+        };
         var nb: [12]u8 = undefined;
         const post_top = y;
         // View-derived nesting geometry (thread screen only).
@@ -914,6 +936,13 @@ pub fn layout(
         }
         y = next_y;
     }
+    // All-same-author thread: the reply socket lands at the very end.
+    if (is_thread and reply_socket_at == posts.len) if (socket_tray) |st| {
+        const sg: lens_socket.Geometry = .{ .x = m.lx + reply_inset, .y = y, .w = m.cw - reply_inset * 2, .scale = 1.0 };
+        const sh = lens_socket.measuredHeight(st, socket_ui, sg);
+        if (y + sh > 0 and y < height) _ = try lens_socket.build(gpa, e, st, socket_ui, sg, dl, socket_hits);
+        y += sh + 18;
+    };
     // The sticky top bar, drawn LAST so the posts above scroll BEHIND its
     // frosted box with the title/tabs crisp on top.
     try drawTopBar(gpa, dl, e, m, active_screen, regions, profile, accent, socket_tray, socket_ui, socket_hits);
