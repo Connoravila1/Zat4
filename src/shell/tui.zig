@@ -438,6 +438,10 @@ pub fn run(
     var zone_ui: lens_socket.SocketUi = .{};
     var zone_hits: lens_socket.HitList = .empty;
     defer zone_hits.deinit(gpa);
+    // Drag on the loadout PAGE: each socket's on-page geometry (filled by
+    // layoutLoadout), and which surface is mid-drag (0 feed / 1 reply / 2 zone).
+    var page_geoms: [3]lens_socket.Geometry = .{ .{ .x = 0, .y = 0, .w = 0 }, .{ .x = 0, .y = 0, .w = 0 }, .{ .x = 0, .y = 0, .w = 0 } };
+    var page_drag_surface: ?u8 = null;
     // Previous frame's screen — flush the loadout when LEAVING the page (the
     // page's sockets are always open, so there's no tray-close beat there).
     var prev_screen: u8 = 0;
@@ -736,7 +740,26 @@ pub fn run(
             .window => |w| @intCast(w.fb.width),
             else => @intCast(design_w),
         };
-        advanceSocketDrag(&gsocket_ui, home_tray, feed_view.homeSocketGeom(socket_layout_w));
+        if (gscreen == feed_view.screen_loadout) {
+            // On the page, advance whichever surface is mid-drag, using its
+            // on-page geometry (from last frame's layoutLoadout). Clear the
+            // drag once its settle finishes (drag_active goes null).
+            if (page_drag_surface) |s| {
+                switch (s) {
+                    0 => advanceSocketDrag(&gsocket_ui, home_tray, page_geoms[0]),
+                    1 => advanceSocketDrag(&reply_ui, .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, page_geoms[1]),
+                    else => advanceSocketDrag(&zone_ui, .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, page_geoms[2]),
+                }
+                const ui_done = switch (s) {
+                    1 => reply_ui.drag_active == null,
+                    2 => zone_ui.drag_active == null,
+                    else => gsocket_ui.drag_active == null,
+                };
+                if (ui_done) page_drag_surface = null;
+            }
+        } else {
+            advanceSocketDrag(&gsocket_ui, home_tray, feed_view.homeSocketGeom(socket_layout_w));
+        }
         // Persist the loadout when the tray CLOSES (the "done editing" beat).
         // Hand it to the BACKGROUND write worker (the same thread that does
         // likes/reposts) so the putRecord never blocks the UI loop — this is
@@ -767,7 +790,7 @@ pub fn run(
         // pix exists exactly when a window backend has a live engine; the
         // composer and profile screens stay on the cell path this cut
         // (their pixel port is the recorded next slice).
-        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = home_tray, .socket_ui = gsocket_ui, .socket_hits = &gsocket_hits, .accent = lens_socket.seatedAccent(home_tray), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab } else null;
+        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = home_tray, .socket_ui = gsocket_ui, .socket_hits = &gsocket_hits, .accent = lens_socket.seatedAccent(home_tray), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .loadout_geoms = &page_geoms } else null;
         switch (mode) {
             .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status),
             .compose => {
@@ -1011,8 +1034,17 @@ pub fn run(
                                 // highlight (rx/ry are already mapped through scale).
                                 ghover_x = rx;
                                 ghover_y = ry;
-                                // A live drag: the ghost card follows the pointer.
-                                if (gsocket_ui.drag_active != null) {
+                                // A live drag: the ghost card follows the pointer. On the
+                                // loadout page the dragged surface may be reply/zone.
+                                if (page_drag_surface) |s| {
+                                    const ui = switch (s) {
+                                        1 => &reply_ui,
+                                        2 => &zone_ui,
+                                        else => &gsocket_ui,
+                                    };
+                                    ui.drag_x = rx;
+                                    ui.drag_y = ry;
+                                } else if (gsocket_ui.drag_active != null) {
                                     gsocket_ui.drag_x = rx;
                                     gsocket_ui.drag_y = ry;
                                 }
@@ -1049,16 +1081,41 @@ pub fn run(
                                 // engine (only Following exists today).
                                 var socket_handled = false;
                                 if (gscreen == feed_view.screen_loadout) {
-                                    // Loadout page: click-only edit of the surface under the
-                                    // cursor (feed / reply / zone). Drag-reorder here is later.
+                                    // Loadout page: edit the surface under the cursor (feed /
+                                    // reply / zone). A handle press (.reorder) starts a drag for
+                                    // that surface; everything else is a click edit.
                                     if (lens_socket.hitTest(g.socket_hits.items, rx, ry)) |sact| {
-                                        applyLoadoutAction(sact, socket_cards, socket_blob, &gseated, &gsocket_ui, &loadout_dirty);
+                                        switch (sact) {
+                                            .reorder => |r| {
+                                                page_drag_surface = 0;
+                                                gsocket_ui.drag_active = trayIndexOfCid(socket_cards, socket_blob, r.lens);
+                                                gsocket_ui.drag_x = rx;
+                                                gsocket_ui.drag_y = ry;
+                                            },
+                                            else => applyLoadoutAction(sact, socket_cards, socket_blob, &gseated, &gsocket_ui, &loadout_dirty),
+                                        }
                                         socket_handled = true;
                                     } else if (lens_socket.hitTest(reply_hits.items, rx, ry)) |sact| {
-                                        applyLoadoutAction(sact, reply_cards, reply_blob, &reply_seated, &reply_ui, &loadout_dirty);
+                                        switch (sact) {
+                                            .reorder => |r| {
+                                                page_drag_surface = 1;
+                                                reply_ui.drag_active = trayIndexOfCid(reply_cards, reply_blob, r.lens);
+                                                reply_ui.drag_x = rx;
+                                                reply_ui.drag_y = ry;
+                                            },
+                                            else => applyLoadoutAction(sact, reply_cards, reply_blob, &reply_seated, &reply_ui, &loadout_dirty),
+                                        }
                                         socket_handled = true;
                                     } else if (lens_socket.hitTest(zone_hits.items, rx, ry)) |sact| {
-                                        applyLoadoutAction(sact, zone_cards, zone_blob, &zone_seated, &zone_ui, &loadout_dirty);
+                                        switch (sact) {
+                                            .reorder => |r| {
+                                                page_drag_surface = 2;
+                                                zone_ui.drag_active = trayIndexOfCid(zone_cards, zone_blob, r.lens);
+                                                zone_ui.drag_x = rx;
+                                                zone_ui.drag_y = ry;
+                                            },
+                                            else => applyLoadoutAction(sact, zone_cards, zone_blob, &zone_seated, &zone_ui, &loadout_dirty),
+                                        }
                                         socket_handled = true;
                                     }
                                 } else if (lens_socket.hitTest(g.socket_hits.items, rx, ry)) |sact| {
@@ -1276,10 +1333,18 @@ pub fn run(
                             // carries its CID; the dragged card's own hole has none, so
                             // dropping back is a no-op. The seated card follows by CID.
                             .button_up => if (pev.button == 1) {
-                                if (gsocket_ui.drag_active) |d| {
-                                    // Drop rank = the insertion slot under the pointer (same
-                                    // math the reflow used). Reorder, keep the seated lens by
-                                    // CID, then SETTLE the ghost into its new slot.
+                                if (gscreen == feed_view.screen_loadout) {
+                                    // Loadout page: drop the dragged surface into its slot,
+                                    // using that socket's on-page geometry. page_drag_surface
+                                    // stays set so the settle keeps animating (cleared in the
+                                    // per-frame advance when the settle finishes).
+                                    if (page_drag_surface) |s| switch (s) {
+                                        0 => pageDragDrop(socket_cards, socket_blob, &gseated, &gsocket_ui, page_geoms[0], &loadout_dirty),
+                                        1 => pageDragDrop(reply_cards, reply_blob, &reply_seated, &reply_ui, page_geoms[1], &loadout_dirty),
+                                        else => pageDragDrop(zone_cards, zone_blob, &zone_seated, &zone_ui, page_geoms[2], &loadout_dirty),
+                                    };
+                                } else if (gsocket_ui.drag_active) |d| {
+                                    // Home feed socket drop.
                                     const geom = feed_view.homeSocketGeom(if (gpu_state != null) @as(i32, @intCast(design_w)) else @as(i32, @intCast(win.fb.width)));
                                     const to: u32 = lens_socket.dropIndex(home_tray, gsocket_ui, geom) orelse d;
                                     const seated_off = if (gseated < socket_cards.len) socket_cards[gseated].cid.off else 0;
@@ -2056,6 +2121,27 @@ fn applyLoadoutAction(sact: lens_socket.SocketAction, cards: []lens_socket.LensC
     }
 }
 
+/// Drop a dragged page socket: reorder the surface's cards to the slot under
+/// the pointer (using that socket's on-page geometry), keep the seated lens by
+/// CID, and start the settle. Flags dirty. Mirrors the home-feed drop.
+fn pageDragDrop(cards: []lens_socket.LensCard, blob: []const u8, seated: *u32, ui: *lens_socket.SocketUi, geom: lens_socket.Geometry, dirty: *bool) void {
+    if (ui.drag_active) |d| {
+        const tray: lens_socket.TrayView = .{ .cards = cards, .text = blob, .seated = seated.* };
+        const to: u32 = lens_socket.dropIndex(tray, ui.*, geom) orelse d;
+        const seated_off = if (seated.* < cards.len) cards[seated.*].cid.off else 0;
+        reorderTray(cards, d, to);
+        for (cards, 0..) |c, ix| {
+            if (c.cid.off == seated_off) {
+                seated.* = @intCast(ix);
+                break;
+            }
+        }
+        ui.drag_active = to;
+        ui.settle_phase = 1;
+        dirty.* = true;
+    }
+}
+
 /// Index of the card whose CID equals `cid` (a slice into `blob`), or null.
 fn trayIndexOfCid(cards: []const lens_socket.LensCard, blob: []const u8, cid: []const u8) ?u32 {
     for (cards, 0..) |c, i| {
@@ -2167,6 +2253,9 @@ const Grid = struct {
     zone_hits: *lens_socket.HitList = undefined,
     /// The active Algorithms-page sub-tab (0 Loadout / 1 Marketplace / 2 Create).
     loadout_tab: u8 = 0,
+    /// Out: layoutLoadout writes each page socket's geometry here for the
+    /// shell's drag math (feed / reply / zone).
+    loadout_geoms: *[3]lens_socket.Geometry = undefined,
     /// The GPU render path, present only when `gpu.init` succeeded on this
     /// window (else null → the software path renders, the rule's fallback).
     /// A pointer into run()'s `gpu_state` local; one-frame contract like the
@@ -2560,7 +2649,7 @@ fn paintFrame(
             const feed_posts = feed_view.fromTimeline(arena, view_items, now) catch &[_]feed_view.PostView{};
             if (g.screen.* == feed_view.screen_loadout) {
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
-                g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits) catch g.content_h.*;
+                g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits) catch g.content_h.*;
             } else {
                 g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits) catch g.content_h.*;
             }
@@ -2784,7 +2873,7 @@ fn paintFrameGpu(
         if (g.screen.* == feed_view.screen_loadout) {
             // The loadout page: three stacked sockets, its own render path.
             const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
-            g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits) catch g.content_h.*;
+            g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits) catch g.content_h.*;
         } else {
             // skip_heart=true on every screen: the SDF heart pass (drawEngagementHearts,
             // below) draws the heart in place for each visible like button of the

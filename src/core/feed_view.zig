@@ -1089,6 +1089,10 @@ pub fn layoutLoadout(
     accent: u32,
     scroll: i32, // pixel scroll (≤ 0); the socket stack rides under the sticky header
     tab: u8, // 0 = Loadout, 1 = Marketplace, 2 = Create
+    /// Out: each surface socket's on-page geometry (feed/reply/zone), so the
+    /// shell can run the drag math (dropIndex / reflow) at the right position.
+    /// Zeroed for surfaces not drawn (non-Loadout tab).
+    out_geoms: ?*[3]lens_socket.Geometry,
     feed_tray: lens_socket.TrayView,
     feed_ui: lens_socket.SocketUi,
     feed_hits: *lens_socket.HitList,
@@ -1105,6 +1109,7 @@ pub fn layoutLoadout(
     feed_hits.clearRetainingCapacity();
     reply_hits.clearRetainingCapacity();
     zone_hits.clearRetainingCapacity();
+    if (out_geoms) |g| g.* = .{ .{ .x = 0, .y = 0, .w = 0 }, .{ .x = 0, .y = 0, .w = 0 }, .{ .x = 0, .y = 0, .w = 0 } };
 
     // Glass column over the field + the flanking chrome (desktop three-pane).
     try rect(gpa, dl, m.col_x, 0, m.col_w, height, veil, 0);
@@ -1129,12 +1134,14 @@ pub fn layoutLoadout(
             .{ .label = "ZONES", .tray = zone_tray, .ui = zone_ui, .hits = zone_hits },
         };
         var y: i32 = content_top + scroll;
-        for (surfaces) |s| {
+        for (surfaces, 0..) |s, i| {
             _ = try str(gpa, dl, e, .semibold, m.lx, y + 4, faint, 12, s.label);
             y += 18;
             var ui = s.ui;
             ui.open = true; // always open on this page
-            const sh = try lens_socket.build(gpa, e, s.tray, ui, .{ .x = m.lx, .y = y, .w = m.cw, .scale = 1.0 }, dl, s.hits);
+            const geom: lens_socket.Geometry = .{ .x = m.lx, .y = y, .w = m.cw, .scale = 1.0 };
+            if (out_geoms) |g| g[i] = geom;
+            const sh = try lens_socket.build(gpa, e, s.tray, ui, geom, dl, s.hits);
             y += sh + 28;
         }
         content_h = (y - scroll) + 20; // total (unscrolled) height for scroll clamping

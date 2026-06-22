@@ -234,7 +234,7 @@ pub fn main(init: std.process.Init) !void {
     @memset(fb.pixels, clear);
     dl.len = 0;
     try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
-    _ = try feed_view.layoutLoadout(gpa, &engine, @intCast(W), @intCast(H), &dl, null, lens_socket.seatedAccent(feed_t), 0, 0, feed_t, .{}, &fh, reply_t, .{}, &rh, zone_t, .{}, &zh);
+    _ = try feed_view.layoutLoadout(gpa, &engine, @intCast(W), @intCast(H), &dl, null, lens_socket.seatedAccent(feed_t), 0, 0, null, feed_t, .{}, &fh, reply_t, .{}, &rh, zone_t, .{}, &zh);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_loadout.ppm");
     std.debug.print("wrote /tmp/zat_loadout.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
