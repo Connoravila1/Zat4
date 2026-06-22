@@ -181,6 +181,14 @@ const profile_header_h_narrow: i32 = 134;
 /// Profile-nav tabs (visual for now — the regions carry the tab index for a
 /// later slice; "Posts" is active). The Links page attaches as another tab.
 const profile_tabs = [_][]const u8{ "Posts", "Replies", "Media", "Likes" };
+
+/// The bottom edge (logical y) of the sticky header for a screen — the single
+/// source of truth so other passes (e.g. the GPU heart clip) can't drift from
+/// the header heights. The GPU feed lays out at the WIDE design width, so these
+/// are the wide values; the plain top bar is 111.
+pub fn headerBottom(active_screen: u8) i32 {
+    return if (active_screen == screen_profile) profile_header_h_wide else 111;
+}
 const wide_min: i32 = rail_w + feed_w + side_w + 40; // ~1244
 
 const panel: u32 = 0xCC1E1C16; // sidebar cards: mostly solid over the field

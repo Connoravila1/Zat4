@@ -2408,9 +2408,9 @@ fn drawEngagementHearts(g: Grid, gs: *GpuState, items: []const feed_core.Timelin
     // The sticky header occludes the post text (it's painted over it in the feed
     // draw list), but the heart is a SEPARATE pass on top — so it would bleed
     // over the frosted header as a post scrolls up. Clip it: skip any heart whose
-    // row has crossed under the header band. (Logical coords; header heights
-    // mirror feed_view's drawTopBar / drawProfileHeader.)
-    const header_bottom: i32 = if (g.screen.* == feed_view.screen_profile) 116 else 111;
+    // row has crossed under the header band. feed_view owns the exact height so
+    // this can't drift from it (the profile-tabs growth broke the old hardcode).
+    const header_bottom: i32 = feed_view.headerBottom(g.screen.*);
     for (g.regions.items) |r| {
         if (r.kind != .like or r.post >= items.len) continue;
         if (@as(i32, r.y) + @divTrunc(@as(i32, r.h), 2) < header_bottom) continue;
