@@ -380,6 +380,11 @@ pub fn run(
     var thread_dirty = false;
     var thread_return_screen: u8 = 0;
 
+    // The pointer's last position in LOGICAL coords (for the hover highlight),
+    // updated on every motion event; <0 until the first move.
+    var ghover_x: i32 = -1;
+    var ghover_y: i32 = -1;
+
     // Phase 6.4: the GPU render path, brought up additively when the window is
     // open AND the font engine is live AND `gpu.init` succeeds. On any failure
     // it stays null and the SOFTWARE path renders (E2: a plainer window, never
@@ -624,7 +629,7 @@ pub fn run(
         // pix exists exactly when a window backend has a live engine; the
         // composer and profile screens stay on the cell path this cut
         // (their pixel port is the recorded next slice).
-        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store) } else null;
+        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y } else null;
         switch (mode) {
             .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status),
             .compose => {
@@ -840,6 +845,10 @@ pub fn run(
                                 effect_core.shiftY(g.active, -delta);
                             },
                             .move => {
+                                // Track the pointer in LOGICAL coords for the hover
+                                // highlight (rx/ry are already mapped through scale).
+                                ghover_x = rx;
+                                ghover_y = ry;
                                 g.view.hover = if (field_ui.hitTest(cx, cy, g.hr.slice())) |hit| hit.target else field_ui.no_target;
                                 // GPU: the cursor lights the field (drawFieldGrid
                                 // halo) and leaves a gentle colourless wake.
@@ -1783,6 +1792,10 @@ const Grid = struct {
     /// Count of staged-but-unrevealed new posts this frame — drives the Home
     /// "N new posts" pill. A value (set per frame), not a pointer.
     pending_new: usize = 0,
+    /// The pointer's position in LOGICAL layout coords (the space regions live
+    /// in), or <0 when off-window — drives the hover highlight. Set per frame.
+    hover_x: i32 = -1,
+    hover_y: i32 = -1,
 };
 
 // ===========================================================================
@@ -1829,6 +1842,14 @@ const GpuState = struct {
     grid: gpu.FieldGrid,
     ramp: gpu.FieldRenderer,
     feed: gpu.Feed,
+    /// A small overlay vert buffer for the HOVER highlight (post wash + button
+    /// highlight), rebuilt each frame and drawn between the field and the feed so
+    /// the highlights sit BEHIND the post content. Separate from `feed` so a
+    /// pointer move never rebuilds the cached feed verts.
+    hover: gpu.Feed,
+    /// Eased hover opacity (0→1) so the highlight FADES in/out instead of
+    /// snapping — the "hover animation" feel.
+    hover_alpha: f32 = 0,
     /// The animated like-heart pass (SDF fill + pop + star burst), drawn over
     /// the feed for each active like effect this frame.
     heart: gpu.HeartRenderer,
@@ -1878,6 +1899,8 @@ fn initGpuState(gpa: Allocator, engine: *text_core.Engine, win: *window_shell.Wi
 
     var feed = try gpu.initFeed(gpa);
     errdefer gpu.feedDeinit(&feed, gpa);
+    var hover = try gpu.initFeed(gpa);
+    errdefer gpu.feedDeinit(&hover, gpa);
     const ramp = try gpu.initFieldRenderer(gpa, engine, field_cell_w, field_cell_h);
     const grid = try gpu.initFieldGrid();
     const heart = try gpu.initHeartRenderer();
@@ -1896,6 +1919,7 @@ fn initGpuState(gpa: Allocator, engine: *text_core.Engine, win: *window_shell.Wi
         .grid = grid,
         .ramp = ramp,
         .feed = feed,
+        .hover = hover,
         .heart = heart,
         .bias = bias,
         .splashes = .empty,
@@ -1941,6 +1965,7 @@ fn deinitGpuState(gpa: Allocator, gs: *GpuState) void {
     gpa.free(gs.bias);
     glyph_field.deinit(gpa, &gs.field);
     gpu.feedDeinit(&gs.feed, gpa);
+    gpu.feedDeinit(&gs.hover, gpa);
     gpu.deinit(&gs.g);
 }
 
@@ -2319,6 +2344,9 @@ fn paintFrameGpu(
     gpu.uploadField(&gs.grid, gs.field.height, gs.field.dye, gs.field.cols, gs.field.rows);
     gpu.clear(gpu_clear_r, gpu_clear_g, gpu_clear_b);
     gpu.drawFieldGrid(&gs.grid, &gs.ramp, gs.mcx, gs.mcy, gs.t, @intCast(w), @intCast(h));
+    // Hover highlight (post wash + button highlight), BEHIND the feed so the
+    // content draws on top — the app feels alive under the cursor.
+    drawHoverOverlay(gpa, g, gs, scale, @intCast(w), @intCast(h));
     // The feed verts persist across frames (rebuilt above only when the feed
     // changed); just draw them.
     gpu.feedDraw(&gs.feed, @intCast(w), @intCast(h));
@@ -2326,6 +2354,40 @@ fn paintFrameGpu(
     // PLACE (feed_view skips its own), so a like fills + pops the ACTUAL heart.
     drawEngagementHearts(g, gs, items, @intCast(w), @intCast(h));
     gpu.swap(&gs.g);
+}
+
+/// Build + draw the hover highlight: a subtle wash over the post under the
+/// cursor and a brighter highlight behind the specific button under it. Driven
+/// by g.hover_x/y (logical coords) hit-tested against THIS frame's regions, into
+/// a small overlay vert buffer — so a pointer move never rebuilds the feed.
+fn drawHoverOverlay(gpa: Allocator, g: Grid, gs: *GpuState, scale: f32, vw: i32, vh: i32) void {
+    var wash: ?feed_view.Region = null; // the post under the cursor
+    var button: ?feed_view.Region = null; // a button/control under the cursor
+    if (g.hover_x >= 0) {
+        for (g.regions.items) |r| {
+            if (g.hover_x < r.x or g.hover_x >= @as(i32, r.x) + r.w or g.hover_y < r.y or g.hover_y >= @as(i32, r.y) + r.h) continue;
+            switch (r.kind) {
+                .post_body => wash = r,
+                .compose_send, .compose_cancel => {},
+                else => button = r, // engagement, avatar, nav, tabs, edit, pill, back…
+            }
+        }
+    }
+    // Ease toward present/absent so the highlight fades rather than snaps.
+    const target: f32 = if (wash != null or button != null) 1.0 else 0.0;
+    gs.hover_alpha += (target - gs.hover_alpha) * 0.30;
+    if (gs.hover_alpha < 0.02) return;
+
+    // Scale each highlight's alpha byte by the eased opacity.
+    const wash_a: u32 = @intFromFloat(@as(f32, 0x0E) * gs.hover_alpha);
+    const btn_a: u32 = @intFromFloat(@as(f32, 0x1C) * gs.hover_alpha);
+    var hd: raster_core.DrawList = .{};
+    defer hd.deinit(gpa);
+    if (wash) |r| hd.append(gpa, .{ .rect = .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h, .color = (wash_a << 24) | 0x00FFFFFF, .radius = 0 } }) catch {};
+    if (button) |r| hd.append(gpa, .{ .rect = .{ .x = @intCast(@as(i32, r.x) - 4), .y = r.y, .w = r.w + 8, .h = r.h, .color = (btn_a << 24) | 0x00FFFFFF, .radius = 12 } }) catch {};
+    if (hd.len == 0) return;
+    gpu.feedBuild(&gs.hover, gpa, g.engine, hd.slice(), scale) catch return;
+    gpu.feedDraw(&gs.hover, vw, vh);
 }
 
 /// Draw the engagement heart for EVERY visible like button as an SDF heart, at
