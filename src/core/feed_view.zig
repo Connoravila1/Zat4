@@ -172,12 +172,15 @@ pub const PostView = struct {
 const rail_w: i32 = 248;
 const feed_w: i32 = 604;
 const side_w: i32 = 352;
-/// Height of the sticky PROFILE identity header (the compact horizontal band:
-/// avatar + name + handle·count + Edit profile). Taller than the plain top bar
-/// to seat the avatar; still short enough to pin. A future profile-nav row
-/// (Links / Posts·Replies tabs) would extend this.
-const profile_header_h_wide: i32 = 116;
-const profile_header_h_narrow: i32 = 100;
+/// Height of the sticky PROFILE identity header: the compact horizontal identity
+/// band (avatar + name + handle·count + Edit profile) PLUS a profile-nav tab row
+/// (Posts · Replies · Media · Likes) below it. Both stay pinned so identity AND
+/// the tabs remain visible while posts scroll under them.
+const profile_header_h_wide: i32 = 152;
+const profile_header_h_narrow: i32 = 134;
+/// Profile-nav tabs (visual for now — the regions carry the tab index for a
+/// later slice; "Posts" is active). The Links page attaches as another tab.
+const profile_tabs = [_][]const u8{ "Posts", "Replies", "Media", "Likes" };
 const wide_min: i32 = rail_w + feed_w + side_w + 40; // ~1244
 
 const panel: u32 = 0xCC1E1C16; // sidebar cards: mostly solid over the field
@@ -1033,6 +1036,8 @@ fn drawProfileHeader(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine
             _ = try str(gpa, dl, e, .semibold, bx2 + 14, 63, ink, 14, label);
             try emitRegion(gpa, regions, bx2, 41, bw, 34, 0, .edit_profile);
         }
+        // Profile-nav tabs row, below the identity line (Posts active).
+        try drawProfileTabs(gpa, dl, e, m.lx, 116, 15, regions);
         try rect(gpa, dl, m.col_x, band_h - 1, m.col_w, 1, divider, 0);
         return;
     }
@@ -1058,7 +1063,24 @@ fn drawProfileHeader(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine
         _ = try str(gpa, dl, e, .semibold, bx2 + 11, 50, ink, 13, label);
         try emitRegion(gpa, regions, bx2, 30, bw, 30, 0, .edit_profile);
     }
+    try drawProfileTabs(gpa, dl, e, m.lx, 100, 14, regions);
     try rect(gpa, dl, m.col_x, band_h - 1, m.col_w, 1, divider, 0);
+}
+
+/// The profile-nav tab row (Posts · Replies · Media · Likes). "Posts" is active
+/// (ink + an accent underline); the rest are muted. Each emits a `.profile_tab`
+/// region carrying its index — visual for now, wired by a later slice (the Links
+/// page attaches here too). `baseline` is the tab-label baseline.
+fn drawProfileTabs(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32, baseline: i32, px: u16, regions: ?*Regions) error{OutOfMemory}!void {
+    var tx = x0;
+    for (profile_tabs, 0..) |tab, i| {
+        const on = i == 0;
+        const tw: i32 = @intCast(text.measure(e, .semibold, tab, px));
+        _ = try str(gpa, dl, e, .semibold, tx, baseline, if (on) ink else muted, px, tab);
+        if (on) try rect(gpa, dl, tx, baseline + 8, tw, 3, accent, 2);
+        try emitRegion(gpa, regions, tx - 6, baseline - @as(i32, px) - 4, tw + 12, 30, @intCast(i), .profile_tab);
+        tx += tw + 30;
+    }
 }
 
 fn emitRegion(gpa: Allocator, regions: ?*Regions, x: i32, y: i32, w: i32, h: u16, post: u16, kind: Action) !void {
@@ -1291,12 +1313,12 @@ test "profile screen renders the author's posts under a header; other screens st
     };
     const header: ProfileHeader = .{ .display_name = "connor.zat4.com", .handle = "@connor.zat4.com", .post_count = 1 };
 
-    // Profile screen: the author's post renders below the header band — same
-    // post loop as Home, so it emits the 8 post tap regions (body + avatar +
-    // reply/repost/like + bookmark/share/more; the header here isn't editable).
+    // Profile screen: 8 post tap regions (body + avatar + reply/repost/like +
+    // bookmark/share/more) + 4 profile-nav tab regions in the sticky header
+    // (the header here isn't editable, so no edit-profile region).
     const hp = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_profile, header, 0);
     try std.testing.expect(hp > 112);
-    try std.testing.expectEqual(@as(usize, 8), regions.items.len);
+    try std.testing.expectEqual(@as(usize, 12), regions.items.len);
 
     // A non-Home, non-Profile screen is a titled placeholder: no posts render,
     // so no tap regions, and the height clamps to the viewport (no post stack).
