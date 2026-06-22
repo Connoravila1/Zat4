@@ -92,12 +92,33 @@ pub fn save(
     seated: u32,
     now_epoch: i64,
 ) !void {
-    const lenses = try arena.alloc(lexicon.LoadoutLensOut, cards.len);
+    const ids = try arena.alloc([]const u8, cards.len);
+    const colors = try arena.alloc(u8, cards.len);
     for (cards, 0..) |c, i| {
         const end = @min(blob.len, @as(usize, c.cid.off) + c.cid.len);
-        const id = if (c.cid.off <= blob.len) blob[@min(c.cid.off, blob.len)..end] else "";
-        lenses[i] = .{ .algo = id, .color = c.color };
+        ids[i] = if (c.cid.off <= blob.len) blob[@min(c.cid.off, blob.len)..end] else "";
+        colors[i] = c.color;
     }
+    return saveEntries(gpa, arena, io, environ, session, ids, colors, seated, now_epoch);
+}
+
+/// Write the feed loadout from parallel id/color arrays — the form the
+/// background write_worker carries (it has no `LensCard`s). `ids[i]` is the
+/// algorithm ref, `colors[i]` its color; both arrays are the same length.
+pub fn saveEntries(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    session: *auth.Session,
+    ids: []const []const u8,
+    colors: []const u8,
+    seated: u32,
+    now_epoch: i64,
+) !void {
+    const n = @min(ids.len, colors.len);
+    const lenses = try arena.alloc(lexicon.LoadoutLensOut, n);
+    for (0..n) |i| lenses[i] = .{ .algo = ids[i], .color = colors[i] };
     var ts_buf: [24]u8 = undefined;
     const record = lexicon.LoadoutRecordOut{
         .feed = .{ .lenses = lenses, .seated = seated },

@@ -41,6 +41,7 @@ const Allocator = std.mem.Allocator;
 const auth = @import("auth.zig");
 const write = @import("write.zig");
 const clock = @import("clock.zig");
+const loadout_store = @import("loadout.zig");
 
 // ---------------------------------------------------------------------------
 // The messages — plain data, the only thing that crosses the boundary (E1)
@@ -68,7 +69,15 @@ pub const Request = struct {
     /// so the worker reads no clock of its own for this value.
     now: i64,
 
-    pub const Kind = enum(u8) { like, unlike, repost, unrepost };
+    /// For a `.loadout` write only: the feed loadout to persist — parallel
+    /// id/color arrays (owned copies) + the seated index. Empty otherwise.
+    /// This is why the freeze went away: the loadout `putRecord` runs HERE,
+    /// off the UI loop, instead of blocking it on tray-close.
+    loadout_ids: []const []const u8 = &.{},
+    loadout_colors: []const u8 = &.{},
+    loadout_seated: u32 = 0,
+
+    pub const Kind = enum(u8) { like, unlike, repost, unrepost, loadout };
 };
 
 /// What the worker reports back. `cid` matches the request's post so the
@@ -102,6 +111,9 @@ fn freeRequest(gpa: Allocator, r: Request) void {
     gpa.free(r.subject_uri);
     gpa.free(r.subject_cid);
     gpa.free(r.record_uri);
+    for (r.loadout_ids) |id| gpa.free(id);
+    gpa.free(r.loadout_ids);
+    gpa.free(r.loadout_colors);
 }
 
 pub fn freeResult(gpa: Allocator, r: Result) void {
@@ -232,6 +244,47 @@ pub fn submit(
     return true;
 }
 
+/// Enqueue a loadout persist (the feed loadout's id/color order + seated).
+/// Copies the ids/colors into gpa, so the caller may free its originals
+/// immediately. Fire-and-forget — no result is posted (a lost save is the
+/// next save's problem, E2). Returns false only on OOM.
+pub fn submitLoadout(worker: *Worker, ids: []const []const u8, colors: []const u8, seated: u32, now: i64) bool {
+    const gpa = worker.gpa;
+    const n = @min(ids.len, colors.len);
+    const ids_c = gpa.alloc([]const u8, n) catch return false;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        ids_c[i] = gpa.dupe(u8, ids[i]) catch {
+            for (ids_c[0..i]) |s| gpa.free(s);
+            gpa.free(ids_c);
+            return false;
+        };
+    }
+    const colors_c = gpa.dupe(u8, colors[0..n]) catch {
+        for (ids_c[0..n]) |s| gpa.free(s);
+        gpa.free(ids_c);
+        return false;
+    };
+    // The post fields are unused for a loadout write; empty slices free as a
+    // no-op in freeRequest (Allocator.free returns early on len 0).
+    const req: Request = .{
+        .kind = .loadout,
+        .cid = "",
+        .subject_uri = "",
+        .subject_cid = "",
+        .record_uri = "",
+        .now = now,
+        .loadout_ids = ids_c,
+        .loadout_colors = colors_c,
+        .loadout_seated = seated,
+    };
+    if (!worker.inbox.push(gpa, req)) {
+        freeRequest(gpa, req);
+        return false;
+    }
+    return true;
+}
+
 pub fn start(
     gpa: Allocator,
     io: std.Io,
@@ -316,11 +369,19 @@ fn processOne(worker: *Worker, req: Request) void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    // Loadout persist: fire-and-forget, no result to match back (it has no
+    // optimistic UI state to reconcile). Done here so the UI never blocks.
+    if (req.kind == .loadout) {
+        loadout_store.saveEntries(gpa, arena, worker.io, worker.environ, worker.session, req.loadout_ids, req.loadout_colors, req.loadout_seated, req.now) catch {};
+        return;
+    }
+
     const call = switch (req.kind) {
         .like => write.likePost(gpa, arena, worker.io, worker.environ, worker.session, req.subject_uri, req.subject_cid, req.now),
         .repost => write.repostPost(gpa, arena, worker.io, worker.environ, worker.session, req.subject_uri, req.subject_cid, req.now),
         .unlike => write.unlikePost(gpa, arena, worker.io, worker.environ, worker.session, req.record_uri),
         .unrepost => write.unrepostPost(gpa, arena, worker.io, worker.environ, worker.session, req.record_uri),
+        .loadout => unreachable, // handled above
     };
 
     const outcome: Result.Outcome = if (call) |wo| switch (wo) {

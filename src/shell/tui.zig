@@ -548,6 +548,7 @@ pub fn run(
                 .like => &deferred_unlike,
                 .repost => &deferred_unrepost,
                 .unlike, .unrepost => null,
+                .loadout => null, // loadout writes post no result; defensive only
             };
             if (deferred) |set| {
                 if (set.remove(std.hash.Wyhash.hash(0, res.cid))) {
@@ -566,7 +567,7 @@ pub fn run(
                     if (uri.len > 0) switch (res.kind) {
                         .like => feed_core.setLikeUri(gpa, store, res.cid, uri) catch {},
                         .repost => feed_core.setRepostUri(gpa, store, res.cid, uri) catch {},
-                        .unlike, .unrepost => {},
+                        .unlike, .unrepost, .loadout => {},
                     };
                 },
                 .refused => |f| {
@@ -696,12 +697,24 @@ pub fn run(
             else => @intCast(design_w),
         };
         advanceSocketDrag(&gsocket_ui, home_tray, feed_view.homeSocketGeom(socket_layout_w));
-        // Persist the loadout when the tray CLOSES (the "done editing" beat) —
-        // recolor/reorder/seat set `loadout_dirty`; here it flushes once, so
-        // editing never blocks per-click. One putRecord; failure is the next
-        // flush's problem (E2). (`now` + the frame arena are in scope here.)
+        // Persist the loadout when the tray CLOSES (the "done editing" beat).
+        // Hand it to the BACKGROUND write worker (the same thread that does
+        // likes/reposts) so the putRecord never blocks the UI loop — this is
+        // the fix for the freeze on cartridge-switch (seating closes the tray,
+        // which used to do a synchronous network write right here). The ids
+        // are slices into socket_blob; submitLoadout dupes them.
         if (socket_was_open and !gsocket_ui.open and loadout_dirty) {
-            loadout_store.save(gpa, arena, io, environ, session, socket_cards, socket_blob, gseated, now) catch {};
+            if (writer) |w| {
+                var ids_buf: [lens_socket.max_lenses][]const u8 = undefined;
+                var cols_buf: [lens_socket.max_lenses]u8 = undefined;
+                const m = @min(socket_cards.len, lens_socket.max_lenses);
+                for (socket_cards[0..m], 0..) |c, i| {
+                    const end = @min(socket_blob.len, @as(usize, c.cid.off) + c.cid.len);
+                    ids_buf[i] = if (c.cid.off <= socket_blob.len) socket_blob[@min(c.cid.off, socket_blob.len)..end] else "";
+                    cols_buf[i] = c.color;
+                }
+                _ = write_worker.submitLoadout(w, ids_buf[0..m], cols_buf[0..m], gseated, now);
+            }
             loadout_dirty = false;
         }
         socket_was_open = gsocket_ui.open;
@@ -1881,6 +1894,7 @@ fn revertWrite(kind: write_worker.Request.Kind, gpa: Allocator, store: *feed_cor
         .repost => feed_core.revertRepost(store, cid),
         .unlike => try feed_core.revertUnlike(gpa, store, cid, revert_uri),
         .unrepost => try feed_core.revertUnrepost(gpa, store, cid, revert_uri),
+        .loadout => {}, // loadout writes are not optimistic; nothing to revert
     }
 }
 
