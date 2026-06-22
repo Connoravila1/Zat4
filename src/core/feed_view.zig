@@ -62,7 +62,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// `compose` (the New-post button) route navigation rather than engagement.
 /// `compose_send` / `compose_cancel` are the premium composer's footer buttons
 /// (the shell turns a tap into the same control byte the keyboard sends).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab };
 
 /// The six top-level rail destinations, in order. The `Screen` index a nav
 /// region carries is an index into this. Shared by the rail (draw + hit) and
@@ -304,6 +304,48 @@ fn iconRepost(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, s: i32, colo
     try line(gpa, dl, x + fxi(f * 0.18), y + fxi(f * 0.70), x + fxi(f * 0.94), y + fxi(f * 0.70), color, 2);
     try line(gpa, dl, x + fxi(f * 0.18), y + fxi(f * 0.70), x + fxi(f * 0.38), y + fxi(f * 0.52), color, 2);
     try line(gpa, dl, x + fxi(f * 0.18), y + fxi(f * 0.70), x + fxi(f * 0.38), y + fxi(f * 0.88), color, 2);
+}
+
+/// Bookmark: an outline tag with a V-notch at the bottom.
+fn iconBookmark(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, s: i32, c: u32) !void {
+    const f: f32 = @floatFromInt(s);
+    const left = x + fxi(f * 0.24);
+    const right = x + fxi(f * 0.76);
+    const top = y + fxi(f * 0.08);
+    const bot = y + fxi(f * 0.92);
+    const mid = x + fxi(f * 0.5);
+    const notch = y + fxi(f * 0.64);
+    try line(gpa, dl, left, top, right, top, c, 2);
+    try line(gpa, dl, left, top, left, bot, c, 2);
+    try line(gpa, dl, right, top, right, bot, c, 2);
+    try line(gpa, dl, left, bot, mid, notch, c, 2);
+    try line(gpa, dl, right, bot, mid, notch, c, 2);
+}
+
+/// Share: an up-arrow rising out of an open tray (the familiar share glyph).
+fn iconShare(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, s: i32, c: u32) !void {
+    const f: f32 = @floatFromInt(s);
+    const cx = x + fxi(f * 0.5);
+    try line(gpa, dl, cx, y + fxi(f * 0.06), cx, y + fxi(f * 0.62), c, 2); // shaft
+    try line(gpa, dl, cx, y + fxi(f * 0.06), x + fxi(f * 0.28), y + fxi(f * 0.30), c, 2); // left head
+    try line(gpa, dl, cx, y + fxi(f * 0.06), x + fxi(f * 0.72), y + fxi(f * 0.30), c, 2); // right head
+    const left = x + fxi(f * 0.20);
+    const right = x + fxi(f * 0.80);
+    const ttop = y + fxi(f * 0.46);
+    const bot = y + fxi(f * 0.92);
+    try line(gpa, dl, left, ttop, left, bot, c, 2);
+    try line(gpa, dl, right, ttop, right, bot, c, 2);
+    try line(gpa, dl, left, bot, right, bot, c, 2);
+}
+
+/// More: three dots (⋯).
+fn iconMore(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, s: i32, c: u32) !void {
+    const f: f32 = @floatFromInt(s);
+    const r = @max(1, fxi(f * 0.09));
+    const cy = y + fxi(f * 0.5);
+    for ([_]f32{ 0.16, 0.5, 0.84 }) |px| {
+        try rect(gpa, dl, x + fxi(f * px) - r, cy - r, r * 2, r * 2, c, @intCast(r));
+    }
 }
 
 fn iconHeart(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, s: i32, color: u32) !void {
@@ -635,16 +677,19 @@ pub fn layout(
         var next_y: i32 = undefined;
         if (cached) |adv| {
             next_y = post_top + adv;
-            body_end = next_y - 48;
+            body_end = next_y - 60;
         } else {
             body_end = try wrapBody(gpa, dl, e, cx, post_top + 18 + reply_h + body_line, content_w, body_c, 16, p.body, body_line, false);
-            next_y = body_end + 48;
+            next_y = body_end + 60;
             if (heights) |hh| if (pi < hh.len) {
                 hh[pi] = next_y - post_top;
             };
         }
-        const erow = body_end + 16;
-        const bottom = erow + 20;
+        // Roomier vertical rhythm (was 48): more air between body→actions and
+        // post→post, so the feed doesn't read cramped. body_end + 60 = erow(+22)
+        // + row(+22) + gap(+16). Keep the cache reconstruction above in sync.
+        const erow = body_end + 22;
+        const bottom = erow + 22;
         const visible = next_y > 0 and post_top < height;
 
         if (visible) {
@@ -680,49 +725,64 @@ pub fn layout(
             bx = try str(gpa, dl, e, .regular, bx + 7, post_top + 17, faint, 14, "·");
             _ = try str(gpa, dl, e, .regular, bx + 7, post_top + 17, faint, 14, p.age);
 
-            // "Replying to @x" — only on a reply, so it doesn't read as a
-            // standalone post (Twitter/Bluesky parity). Muted label, accent handle.
+            // "Replying to @x" with a subtle ↳ hook — reads as a threaded reply
+            // rather than a standalone post (Twitter/Bluesky parity).
             if (show_reply_to) {
-                const rx = try str(gpa, dl, e, .regular, cx, post_top + 36, muted, 13, "Replying to ");
-                _ = try str(gpa, dl, e, .regular, rx, post_top + 36, accent, 13, p.replying_to);
+                const hk = try str(gpa, dl, e, .regular, cx, post_top + 36, faint, 13, "\xE2\x86\xB3 ");
+                const rl = try str(gpa, dl, e, .regular, hk, post_top + 36, muted, 13, "Replying to ");
+                _ = try str(gpa, dl, e, .regular, rl, post_top + 36, accent, 13, p.replying_to);
             }
 
             // body (draw)
             _ = try wrapBody(gpa, dl, e, cx, post_top + 18 + reply_h + body_line, content_w, body_c, 16, p.body, body_line, true);
 
-            // engagement row — vector icons + counts (+ tap regions)
-            const is: i32 = 16;
+            // Engagement row — roomier spacing + a fuller action set. LEFT group:
+            // reply · repost · like (icon + count); RIGHT group: bookmark · share ·
+            // more, right-aligned (decorative for now — the regions carry the post
+            // so hover can highlight them and a later slice can wire them).
+            const is: i32 = 17;
             const iy = erow - 13;
-            const tap_h: u16 = 30;
-            const tap_y: i32 = erow - 20;
+            const tap_h: u16 = 32;
+            const tap_y: i32 = erow - 21;
+            const cgap: i32 = 9; // icon → count
+            const ggap: i32 = 36; // count → next group's icon (the "less cramped" gap)
+            const slot_w: i32 = is + cgap + 18; // generous tap target per item
             var ex = cx;
-            try iconReply(gpa, dl, ex, iy, is, icon_grey);
             const reply_x = ex;
-            ex += is + 7;
+            try iconReply(gpa, dl, ex, iy, is, icon_grey);
+            ex += is + cgap;
             ex = try str(gpa, dl, e, .regular, ex, erow, muted, 13, std.fmt.bufPrint(&nb, "{d}", .{p.reply}) catch "0");
-            try emitRegion(gpa, regions, reply_x, tap_y, ex - reply_x, tap_h, @intCast(pi), .reply);
-            ex += 22;
-            try iconRepost(gpa, dl, ex, iy, is, if (p.boosted) boost_c else icon_grey);
+            try emitRegion(gpa, regions, reply_x, tap_y, slot_w, tap_h, @intCast(pi), .reply);
+            ex = reply_x + slot_w + ggap;
             const rt_x = ex;
-            ex += is + 7;
-            ex = try str(gpa, dl, e, .regular, ex, erow, if (p.boosted) boost_c else muted, 13, std.fmt.bufPrint(&nb, "{d}", .{p.boost}) catch "0");
-            try emitRegion(gpa, regions, rt_x, tap_y, ex - rt_x, tap_h, @intCast(pi), .repost);
-            ex += 22;
-            // Liked → a FILLED red heart; unliked → a HOLLOW outline so the tap
-            // visibly fills it. On the GPU path this is SKIPPED — the SDF heart
-            // pass draws it instead, so it fills + pops IN PLACE (no offset
-            // overlay). Software/preview still draw it here.
+            try iconRepost(gpa, dl, ex, iy, is, if (p.boosted) boost_c else icon_grey);
+            ex += is + cgap;
+            _ = try str(gpa, dl, e, .regular, ex, erow, if (p.boosted) boost_c else muted, 13, std.fmt.bufPrint(&nb, "{d}", .{p.boost}) catch "0");
+            try emitRegion(gpa, regions, rt_x, tap_y, slot_w, tap_h, @intCast(pi), .repost);
+            const like_x = rt_x + slot_w + ggap;
+            // Liked → FILLED red heart; unliked → HOLLOW outline. On the GPU path
+            // this is SKIPPED — the SDF heart pass draws it in place.
             if (!skip_heart) {
                 if (p.liked) {
-                    try iconHeart(gpa, dl, ex, iy, is, like_c);
+                    try iconHeart(gpa, dl, like_x, iy, is, like_c);
                 } else {
-                    try iconHeartHollow(gpa, dl, ex, iy, is, icon_grey);
+                    try iconHeartHollow(gpa, dl, like_x, iy, is, icon_grey);
                 }
             }
-            const like_x = ex;
-            ex += is + 7;
-            ex = try str(gpa, dl, e, .regular, ex, erow, if (p.liked) like_c else muted, 13, std.fmt.bufPrint(&nb, "{d}", .{p.like}) catch "0");
-            try emitRegion(gpa, regions, like_x, tap_y, ex - like_x, tap_h, @intCast(pi), .like);
+            _ = try str(gpa, dl, e, .regular, like_x + is + cgap, erow, if (p.liked) like_c else muted, 13, std.fmt.bufPrint(&nb, "{d}", .{p.like}) catch "0");
+            try emitRegion(gpa, regions, like_x, tap_y, slot_w, tap_h, @intCast(pi), .like);
+
+            // RIGHT group: bookmark · share · more, right-aligned at the content edge.
+            const rgap: i32 = 32;
+            var rxp = cx + content_w - is;
+            try iconMore(gpa, dl, rxp, iy, is, icon_grey);
+            try emitRegion(gpa, regions, rxp - 7, tap_y, is + 14, tap_h, @intCast(pi), .more);
+            rxp -= rgap;
+            try iconShare(gpa, dl, rxp, iy, is, icon_grey);
+            try emitRegion(gpa, regions, rxp - 7, tap_y, is + 14, tap_h, @intCast(pi), .share);
+            rxp -= rgap;
+            try iconBookmark(gpa, dl, rxp, iy, is, icon_grey);
+            try emitRegion(gpa, regions, rxp - 7, tap_y, is + 14, tap_h, @intCast(pi), .bookmark);
 
             // divider — full-width on the flat feed; the thread uses its rails
             // for separation, so only a short divider under the indented content.
@@ -1113,8 +1173,8 @@ test "layout emits 4 tap regions per post (avatar + 3 engagement); hitTest resol
     };
     const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0);
     try std.testing.expect(h > 112); // content extends below the top bar
-    // 5 regions per post: the whole-post body tap + the avatar + 3 engagement.
-    try std.testing.expectEqual(@as(usize, 5), regions.items.len);
+    // 8 regions per post: body tap + avatar + reply/repost/like + bookmark/share/more.
+    try std.testing.expectEqual(@as(usize, 8), regions.items.len);
 
     var saw_like = false;
     var saw_author = false;
@@ -1232,11 +1292,11 @@ test "profile screen renders the author's posts under a header; other screens st
     const header: ProfileHeader = .{ .display_name = "connor.zat4.com", .handle = "@connor.zat4.com", .post_count = 1 };
 
     // Profile screen: the author's post renders below the header band — same
-    // post loop as Home, so it emits the 5 tap regions (post body + avatar + 3
-    // engagement; the header here isn't editable, so no edit-profile region).
+    // post loop as Home, so it emits the 8 post tap regions (body + avatar +
+    // reply/repost/like + bookmark/share/more; the header here isn't editable).
     const hp = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_profile, header, 0);
     try std.testing.expect(hp > 112);
-    try std.testing.expectEqual(@as(usize, 5), regions.items.len);
+    try std.testing.expectEqual(@as(usize, 8), regions.items.len);
 
     // A non-Home, non-Profile screen is a titled placeholder: no posts render,
     // so no tap regions, and the height clamps to the viewport (no post stack).

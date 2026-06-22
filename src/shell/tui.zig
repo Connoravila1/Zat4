@@ -984,6 +984,11 @@ pub fn run(
                                         // on the timeline; they are handled in compose
                                         // mode below.
                                         .compose_send, .compose_cancel => {},
+                                        // Not wired yet — drawn for the fuller row /
+                                        // profile tabs; their regions exist so hover
+                                        // can highlight them and a later slice wires
+                                        // them. A tap is a no-op for now.
+                                        .bookmark, .share, .more, .profile_tab => {},
                                     }
                                 } else if (field_ui.hitTest(cx, cy, g.hr.slice())) |hit| {
                                     if (hit.target != field_ui.no_target and hit.target < view_items.len) state.selected = hit.target;
