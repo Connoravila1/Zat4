@@ -340,6 +340,15 @@ fn lerpi(a: i32, b: i32, t: f32) i32 {
     return a + fxi(@as(f32, @floatFromInt(b - a)) * t);
 }
 
+/// Spring-ish ease that OVERSHOOTS past 1 then settles back — the "it springs,
+/// it doesn't snap" feel (§3). t in [0,1].
+fn easeOutBack(t: f32) f32 {
+    const c1: f32 = 1.70158;
+    const c3: f32 = c1 + 1.0;
+    const u = t - 1.0;
+    return 1.0 + c3 * u * u * u + c1 * u * u;
+}
+
 fn rect(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, w: i32, h: i32, color: u32, radius: u8) !void {
     try dl.append(gpa, .{ .rect = .{
         .x = @intCast(x),
@@ -452,7 +461,7 @@ pub fn build(
         } else if (p <= seg * 2) { // drop-in: new lens descends, fades in, glow rises
             disp_idx = ui.swap_to;
             const u = @as(f32, @floatFromInt(p - seg)) / @as(f32, @floatFromInt(seg));
-            cart_dy = fxi(14 * (1 - u) * sc);
+            cart_dy = fxi(14 * (1 - easeOutBack(u)) * sc); // springs into the slot (slight overshoot)
             cart_alpha = @intCast(@min(255, fxi(255 * u)));
             glow = @intCast(@min(255, fxi(255 * u)));
         } else { // settle: cartridge home, seat-glow decays
@@ -566,6 +575,10 @@ pub fn build(
         (if (exp != null) detail_h + col_gap else 0);
     const box_h = hdr_h + grid_h + box_pad;
 
+    // Soft lift shadow under the tray — layered (low alpha, growing offset) to
+    // fake a big, soft falloff, so the panel hovers above the feed.
+    try rect(gpa, dl, x0 - fxi(2 * sc), tray_top + fxi(10 * sc), w + fxi(4 * sc), box_h, soft(0x000000, 0x1C), radius);
+    try rect(gpa, dl, x0, tray_top + fxi(5 * sc), w, box_h, soft(0x000000, 0x22), radius);
     try rect(gpa, dl, x0, tray_top, w, box_h, tray_panel, radius);
     try rect(gpa, dl, x0, tray_top, w, fxi(1 * sc) + 1, hairline, radius); // top lit edge
 
@@ -609,11 +622,15 @@ pub fn build(
             cy = lerpi(home[1], np[1], t);
         }
 
-        // card body
-        const fill = if (seated) soft(card_acc, 0x22) else pill_bg;
-        const edge = if (seated) soft(card_acc, 0x70) else pill_edge;
+        // card body. Unseated cards sit RAISED (a soft shadow lifts them);
+        // the seated card sits RECESSED (darker, no shadow) with a thin
+        // glowing accent rule down its left edge — "found its home" (§2).
+        if (!seated) try rect(gpa, dl, cx, cy + fxi(3 * sc), card_w, card_h, soft(0x000000, 0x26), cart_radius);
+        const fill = if (seated) soft(0x000000, 0x33) else pill_bg;
+        const edge = if (seated) soft(card_acc, 0x3A) else pill_edge;
         try rect(gpa, dl, cx, cy, card_w, card_h, fill, cart_radius);
         try rect(gpa, dl, cx, cy, card_w, fxi(1 * sc) + 1, edge, cart_radius);
+        if (seated) try rect(gpa, dl, cx, cy + fxi(7 * sc), @max(2, fxi(3 * sc)), card_h - fxi(14 * sc), card_acc, @intCast(@max(1, fxi(2 * sc))));
 
         const in_x = cx + fxi(11 * sc);
         // top row: privacy chip (glyph + label) at left.
@@ -734,12 +751,15 @@ pub fn build(
             // a faint dashed border (four edges) + a soft "+" in the centre
             try dashedH(gpa, dl, px2 + fxi(6 * sc), px2 + card_w - fxi(6 * sc), py2 + fxi(2 * sc), rail, 1, fxi(7 * sc), fxi(5 * sc));
             try dashedH(gpa, dl, px2 + fxi(6 * sc), px2 + card_w - fxi(6 * sc), py2 + card_h - fxi(2 * sc), rail, 1, fxi(7 * sc), fxi(5 * sc));
+            // Quiet: dimmer than `faint` so the placeholders whisper, sitting
+            // clearly below the real cards (§4) — they brighten on hover later.
+            const ghost = soft(0xFFFFFF, 0x1C);
             const plus_px: u16 = @intCast(@max(1, fxi(20 * sc)));
             const plus_w: i32 = @intCast(text.measure(e, .regular, "+", plus_px));
-            _ = try str(gpa, dl, e, .regular, px2 + @divTrunc(card_w - plus_w, 2), py2 + @divTrunc(card_h, 2), faint, plus_px, "+");
+            _ = try str(gpa, dl, e, .regular, px2 + @divTrunc(card_w - plus_w, 2), py2 + @divTrunc(card_h, 2), ghost, plus_px, "+");
             const add_px: u16 = @intCast(@max(1, fxi(10.5 * sc)));
             const add_w: i32 = @intCast(text.measure(e, .regular, "add a lens", add_px));
-            _ = try str(gpa, dl, e, .regular, px2 + @divTrunc(card_w - add_w, 2), py2 + @divTrunc(card_h, 2) + fxi(20 * sc), faint, add_px, "add a lens");
+            _ = try str(gpa, dl, e, .regular, px2 + @divTrunc(card_w - add_w, 2), py2 + @divTrunc(card_h, 2) + fxi(20 * sc), ghost, add_px, "add a lens");
             try pushHit(gpa, hits, px2, py2, card_w, card_h, .get_more, "", 0);
         }
     }
@@ -758,7 +778,7 @@ pub fn build(
             // ease from the release point into the card's home slot
             const home = slotXY(@intCast(d), grid_x, grid_top, card_w, card_h, col_gap, detail_h, expanded, row_e);
             const raw = @as(f32, @floatFromInt(@min(ui.settle_phase, settle_total_frames))) / @as(f32, @floatFromInt(settle_total_frames));
-            const t = raw * (2.0 - raw); // easeOutQuad
+            const t = easeOutBack(raw); // spring overshoot, then settle
             gx = lerpi(from_x, home[0], t);
             gy = lerpi(from_y, home[1], t);
         }
