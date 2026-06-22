@@ -100,6 +100,7 @@ pub const method = struct {
     pub const get_session = "com.atproto.server.getSession";
     pub const create_record = "com.atproto.repo.createRecord";
     pub const put_record = "com.atproto.repo.putRecord";
+    pub const get_record = "com.atproto.repo.getRecord";
     pub const delete_record = "com.atproto.repo.deleteRecord";
     pub const list_records = "com.atproto.repo.listRecords";
     pub const resolve_handle = "com.atproto.identity.resolveHandle";
@@ -132,6 +133,10 @@ pub const collection = struct {
     /// optional one-time import at enrollment may prefill its fields, but the
     /// record is ours and depends on nothing in app.bsky.
     pub const profile = "app.zat4.actor.profile";
+    /// The user's carried lens-socket loadout (SOCKET_LOADOUT_AND_MARKETPLACE
+    /// §10). A singleton (rkey "self") in the user's own repo, so it travels
+    /// with the account — invariant 12 made literal.
+    pub const loadout = "app.zat4.socket.loadout";
 };
 
 /// Richtext facet `$type` discriminators. Zat4 defines its own richtext
@@ -430,6 +435,57 @@ pub const ResolveHandleResponse = struct {
     did: []const u8 = "",
 };
 
+// ── The lens-socket loadout record (app.zat4.socket.loadout, rkey "self").
+// Phase 1b persists the FEED loadout (order + per-lens color + seated). The
+// reply/zone surfaces and the marketplace `library` join the record when
+// those exist (SOCKET_LOADOUT_AND_MARKETPLACE §10). Two type families per
+// the codebase convention: `*Out` for the write (no defaults — every field
+// is set), the bare names for the read parse (all defaulted — absent fields
+// degrade to an empty/default loadout, E4). A7.2: cold parse/build targets.
+
+/// One seated lens on a surface: a ref to the algorithm + the user's color.
+// A7.2: cold build target, size guard waived.
+pub const LoadoutLensOut = struct {
+    algo: []const u8, // the algorithm ref (a built-in id today; a strong-ref uri later)
+    color: u8,
+};
+// A7.2: cold build target, size guard waived.
+pub const LoadoutSurfaceOut = struct {
+    lenses: []const LoadoutLensOut,
+    seated: u32,
+};
+// A7.2: cold build target, size guard waived.
+pub const LoadoutRecordOut = struct {
+    @"$type": []const u8 = collection.loadout,
+    feed: LoadoutSurfaceOut,
+    createdAt: []const u8,
+};
+
+// A7.2: cold parse target, size guard waived.
+pub const LoadoutLens = struct {
+    algo: []const u8 = "",
+    color: u8 = 0,
+};
+// A7.2: cold parse target, size guard waived.
+pub const LoadoutSurface = struct {
+    lenses: []const LoadoutLens = &.{},
+    seated: u32 = 0,
+};
+// A7.2: cold parse target, size guard waived.
+pub const LoadoutRecord = struct {
+    feed: LoadoutSurface = .{},
+    createdAt: []const u8 = "",
+};
+
+/// `com.atproto.repo.getRecord` response envelope over a record value type.
+pub fn GetRecordResponse(comptime Record: type) type {
+    return struct {
+        uri: []const u8 = "",
+        cid: []const u8 = "",
+        value: Record = .{},
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Phase A exit-criterion tests (STANDALONE_ROADMAP). The schemas round-trip
 // (build → serialize → parse → struct) under a leak-checked allocator (C6),
@@ -465,6 +521,31 @@ test "wall: every content collection and owned method is app.zat4, never app.bsk
     try testing.expect(std.mem.startsWith(u8, method.create_record, "com.atproto."));
     try testing.expect(std.mem.startsWith(u8, method.resolve_handle, "com.atproto."));
     try testing.expect(std.mem.startsWith(u8, method.describe_repo, "com.atproto."));
+}
+
+test "round-trip: a loadout record (write type → JSON → read type) preserves order, colors, seated" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator); // C6
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const lenses = [_]LoadoutLensOut{
+        .{ .algo = "zat4:discover", .color = 0 },
+        .{ .algo = "zat4:following", .color = 5 }, // user recolored
+        .{ .algo = "zat4:private-discover", .color = 1 },
+    };
+    const out = LoadoutRecordOut{
+        .feed = .{ .lenses = &lenses, .seated = 2 },
+        .createdAt = "2026-06-22T09:00:00Z",
+    };
+    // Serialize the WRITE type, parse back as the READ type (the real wire path).
+    const json = try std.json.Stringify.valueAlloc(arena, out, .{ .emit_null_optional_fields = false });
+    const back = try std.json.parseFromSliceLeaky(LoadoutRecord, arena, json, .{ .ignore_unknown_fields = true });
+    try testing.expectEqual(@as(usize, 3), back.feed.lenses.len);
+    try testing.expectEqual(@as(u32, 2), back.feed.seated);
+    try testing.expectEqualStrings("zat4:following", back.feed.lenses[1].algo);
+    try testing.expectEqual(@as(u8, 5), back.feed.lenses[1].color);
+    // The $type discriminator rides the wire.
+    try testing.expect(std.mem.indexOf(u8, json, "app.zat4.socket.loadout") != null);
 }
 
 test "round-trip: an app.zat4.feed.post survives build → JSON → struct" {

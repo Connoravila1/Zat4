@@ -55,6 +55,9 @@ const text_core = @import("../core/text.zig");
 const field_core = @import("../core/field.zig");
 const field_ui = @import("../core/field_ui.zig");
 const feed_view = @import("../core/feed_view.zig");
+const lens_socket = @import("../core/lens_socket.zig");
+const lens_catalog = @import("../core/lens_catalog.zig");
+const loadout_store = @import("loadout.zig");
 const effect_core = @import("../core/effect.zig");
 const clock_shell = @import("clock.zig");
 const write = @import("write.zig");
@@ -354,6 +357,53 @@ pub fn run(
     var gcontent_h: i32 = 0;
     var gregions: feed_view.Regions = .empty;
     defer gregions.deinit(gpa);
+    // THE LENS SOCKET state, living across frames in run(). The placeholder
+    // tray (cards + text blob) is built once and owned here, so the CID
+    // slices the socket emits into `gsocket_hits` stay valid into the next
+    // frame's click test (B-split: persistent, not per-frame arena). Real
+    // algorithms are a later track; for now seating re-tints + animates but
+    // does not yet re-rank the feed (only Following exists).
+    var empty_cards = [_]lens_socket.LensCard{};
+    var socket_cards: []lens_socket.LensCard = &empty_cards;
+    var socket_blob: []const u8 = "";
+    var gseated: u32 = 0;
+    // Phase 1b — restore the user's PERSISTED feed loadout (order, colors,
+    // seated) from `app.zat4.socket.loadout`. Absent (first run) or a failed
+    // read falls back to the catalog default, which we then write so the
+    // record exists going forward. The seam stays clean: this is the one
+    // place the tray's SOURCE is chosen (placeholder → record).
+    {
+        var load_arena = std.heap.ArenaAllocator.init(gpa);
+        defer load_arena.deinit();
+        const loaded: ?loadout_store.Loaded = loadout_store.load(gpa, load_arena.allocator(), io, environ, session) catch null;
+        if (loaded) |ld| {
+            if (lens_catalog.loadoutFromEntries(gpa, ld.entries)) |t| {
+                socket_cards = t[0];
+                socket_blob = t[1];
+                gseated = ld.seated;
+            } else |_| {}
+        }
+        if (socket_cards.len == 0) {
+            if (buildHomeTray(gpa)) |t| {
+                socket_cards = t[0];
+                socket_blob = t[1];
+                gseated = lens_catalog.default_feed_seated;
+                // First run: persist the default so the record exists.
+                loadout_store.save(gpa, load_arena.allocator(), io, environ, session, socket_cards, socket_blob, gseated, clock_shell.unixSeconds()) catch {};
+            } else |_| {}
+        }
+    }
+    if (socket_cards.len > 0) gseated = @min(gseated, @as(u32, @intCast(socket_cards.len - 1)));
+    defer if (socket_cards.len > 0) gpa.free(socket_cards);
+    defer if (socket_blob.len > 0) gpa.free(socket_blob);
+    // Set when the loadout changes (recolor / reorder / seat); the change is
+    // flushed to the PDS when the tray closes (a natural "done editing" beat),
+    // so editing never blocks per-click. (A worker offload is a later option.)
+    var loadout_dirty = false;
+    var socket_was_open = false;
+    var gsocket_ui: lens_socket.SocketUi = .{};
+    var gsocket_hits: lens_socket.HitList = .empty;
+    defer gsocket_hits.deinit(gpa);
     // The active top-level Screen (index into feed_view.nav_labels); the rail
     // sets it on a click. 0 = Home (the feed). Lives across frames in run().
     var gscreen: u8 = 0;
@@ -630,10 +680,35 @@ pub fn run(
         else
             try feed_core.buildTimeline(arena, store);
         const profile_header = try profileHeaderFor(arena, session, gscreen, profile_target_did, view_items);
+        // Advance the seat animation one step per painted frame, resetting at
+        // the end of the swap (the field animates continuously, so frames
+        // flow). The widget maps swap_phase→geometry purely (B4).
+        if (gsocket_ui.swap_phase > 0) {
+            gsocket_ui.swap_phase +|= 1;
+            if (gsocket_ui.swap_phase > lens_socket.swap_total_frames) gsocket_ui.swap_phase = 0;
+        }
+        const home_tray: lens_socket.TrayView = .{ .cards = socket_cards, .text = socket_blob, .seated = gseated };
+        // Advance the drag's LIVE REFLOW + lift + settle one step per frame (the
+        // iOS "pick up and the others fill in" feel). The targets are pure
+        // integer slot math; positions are eased here, drawn by the widget.
+        const socket_layout_w: i32 = if (gpu_state != null) @intCast(design_w) else switch (backend) {
+            .window => |w| @intCast(w.fb.width),
+            else => @intCast(design_w),
+        };
+        advanceSocketDrag(&gsocket_ui, home_tray, feed_view.homeSocketGeom(socket_layout_w));
+        // Persist the loadout when the tray CLOSES (the "done editing" beat) —
+        // recolor/reorder/seat set `loadout_dirty`; here it flushes once, so
+        // editing never blocks per-click. One putRecord; failure is the next
+        // flush's problem (E2). (`now` + the frame arena are in scope here.)
+        if (socket_was_open and !gsocket_ui.open and loadout_dirty) {
+            loadout_store.save(gpa, arena, io, environ, session, socket_cards, socket_blob, gseated, now) catch {};
+            loadout_dirty = false;
+        }
+        socket_was_open = gsocket_ui.open;
         // pix exists exactly when a window backend has a live engine; the
         // composer and profile screens stay on the cell path this cut
         // (their pixel port is the recorded next slice).
-        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y } else null;
+        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = home_tray, .socket_ui = gsocket_ui, .socket_hits = &gsocket_hits, .accent = lens_socket.seatedAccent(home_tray) } else null;
         switch (mode) {
             .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status),
             .compose => {
@@ -877,6 +952,11 @@ pub fn run(
                                 // highlight (rx/ry are already mapped through scale).
                                 ghover_x = rx;
                                 ghover_y = ry;
+                                // A live drag: the ghost card follows the pointer.
+                                if (gsocket_ui.drag_active != null) {
+                                    gsocket_ui.drag_x = rx;
+                                    gsocket_ui.drag_y = ry;
+                                }
                                 g.view.hover = if (field_ui.hitTest(cx, cy, g.hr.slice())) |hit| hit.target else field_ui.no_target;
                                 // GPU: the cursor lights the field (drawFieldGrid
                                 // halo) and leaves a gentle colourless wake.
@@ -902,7 +982,75 @@ pub fn run(
                                 // like persists and bursts via fireEngageEffect.)
                                 // If nothing premium is hit, fall through to the
                                 // legacy cell hit rects.
-                                if (feed_view.hitTest(g.regions.items, rx, ry)) |hit| {
+                                //
+                                // THE LENS SOCKET is tested FIRST — it sits in the
+                                // sticky header, on top of the feed (its hits live
+                                // in their own space). Seating re-tints + animates
+                                // the swap; re-ranking the feed awaits the discover
+                                // engine (only Following exists today).
+                                if (lens_socket.hitTest(g.socket_hits.items, rx, ry)) |sact| {
+                                    // Any socket action other than opening/using the picker
+                                    // closes it (the open/set arms re-open or keep as needed).
+                                    switch (sact) {
+                                        .open_swatch, .set_color => {},
+                                        else => gsocket_ui.picking = null,
+                                    }
+                                    switch (sact) {
+                                        .toggle_tray => gsocket_ui.open = !gsocket_ui.open,
+                                        .seat => |cid| {
+                                            if (trayIndexOfCid(socket_cards, socket_blob, cid)) |ni| {
+                                                if (ni != gseated) {
+                                                    gsocket_ui.swap_from = gseated;
+                                                    gsocket_ui.swap_to = ni;
+                                                    gsocket_ui.swap_phase = 1;
+                                                    gseated = ni;
+                                                    // Seat = re-rank now, scroll to top (owner decision
+                                                    // 2026-06-22). The visible gesture today; the actual
+                                                    // lens re-ordering is the discover-engine track —
+                                                    // THIS is the seam it plugs into (re-rank the feed by
+                                                    // the seated lens here, then reset scroll).
+                                                    gscroll_px = 0;
+                                                }
+                                            }
+                                            gsocket_ui.expanded = null;
+                                            gsocket_ui.open = false; // watch it plug in, then the tray retracts
+                                            loadout_dirty = true;
+                                        },
+                                        // ⓘ → expand inline detail; tapping the open one collapses it.
+                                        .expand => |cid| {
+                                            if (trayIndexOfCid(socket_cards, socket_blob, cid)) |idx| {
+                                                gsocket_ui.expanded = if (gsocket_ui.expanded == idx) null else idx;
+                                            }
+                                        },
+                                        .collapse => gsocket_ui.expanded = null,
+                                        // Press on a drag handle → start dragging that lens (the
+                                        // seated one has no handle, §7.3). The ghost follows the
+                                        // pointer; the drop lands on button_up.
+                                        .reorder => |r| {
+                                            gsocket_ui.picking = null;
+                                            gsocket_ui.drag_active = trayIndexOfCid(socket_cards, socket_blob, r.lens);
+                                            gsocket_ui.drag_x = rx;
+                                            gsocket_ui.drag_y = ry;
+                                        },
+                                        // Tap a card's swatch → open/close its color picker (§11.5).
+                                        .open_swatch => |cid| {
+                                            const idx = trayIndexOfCid(socket_cards, socket_blob, cid);
+                                            gsocket_ui.picking = if (gsocket_ui.picking == idx) null else idx;
+                                        },
+                                        // Pick a color → recolor that lens (totally the user's
+                                        // call; duplicates allowed). If it's the seated lens, the
+                                        // whole-UI accent follows next frame (seatedAccent).
+                                        .set_color => |sc2| {
+                                            if (trayIndexOfCid(socket_cards, socket_blob, sc2.lens)) |idx| {
+                                                if (idx < socket_cards.len) socket_cards[idx].color = sc2.color;
+                                                loadout_dirty = true;
+                                            }
+                                            gsocket_ui.picking = null;
+                                        },
+                                        else => {}, // get_more: marketplace (no page yet)
+                                    }
+                                } else if (feed_view.hitTest(g.regions.items, rx, ry)) |hit| {
+                                    gsocket_ui.picking = null; // a click off the socket closes the picker
                                     switch (hit.kind) {
                                         // Left-rail destination: switch the active screen
                                         // (post carries the Screen index). Selecting Profile
@@ -1032,6 +1180,30 @@ pub fn run(
                                     if (hit.action != .none) if (timeline_ui.keyFor(hit.action)) |byte| {
                                         try pumped_bytes.append(gpa, byte);
                                     };
+                                }
+                            },
+                            // L.4 drop: release over a card reorders the dragged lens
+                            // to that card's rank. Any of the target card's hit regions
+                            // carries its CID; the dragged card's own hole has none, so
+                            // dropping back is a no-op. The seated card follows by CID.
+                            .button_up => if (pev.button == 1) {
+                                if (gsocket_ui.drag_active) |d| {
+                                    // Drop rank = the insertion slot under the pointer (same
+                                    // math the reflow used). Reorder, keep the seated lens by
+                                    // CID, then SETTLE the ghost into its new slot.
+                                    const geom = feed_view.homeSocketGeom(if (gpu_state != null) @as(i32, @intCast(design_w)) else @as(i32, @intCast(win.fb.width)));
+                                    const to: u32 = lens_socket.dropIndex(home_tray, gsocket_ui, geom) orelse d;
+                                    const seated_off = if (gseated < socket_cards.len) socket_cards[gseated].cid.off else 0;
+                                    reorderTray(socket_cards, d, to);
+                                    for (socket_cards, 0..) |c, ix| {
+                                        if (c.cid.off == seated_off) {
+                                            gseated = @intCast(ix);
+                                            break;
+                                        }
+                                    }
+                                    gsocket_ui.drag_active = to; // the card now lives at `to`
+                                    gsocket_ui.settle_phase = 1; // ghost eases from release point into its slot
+                                    loadout_dirty = true;
                                 }
                             },
                             else => {},
@@ -1733,6 +1905,82 @@ fn revertEngagement(kind: Engagement, store: *feed_core.Store, cid: []const u8) 
 /// the UI (every glyph a physics cell); active are the playing effects;
 /// particles the transient agents; hr the click map; view the
 /// scroll/selection; spawn_buf scratch for the events effects emit.
+/// Build the home socket's tray. Today this is the default FEED loadout from
+/// the built-in catalog (lens_catalog) — the onboarding-equipped default
+/// (Zat4 Discover · Following · Zat4 Private Discover) until Phase 1b reads
+/// the user's persisted `app.zat4.socket.loadout` record. Returns mutable
+/// cards (recolor/reorder edit them in place) + the text blob their spans
+/// point into; the caller owns and frees both.
+fn buildHomeTray(gpa: Allocator) !struct { []lens_socket.LensCard, []const u8 } {
+    return lens_catalog.defaultFeedLoadout(gpa);
+}
+
+/// Index of the card whose CID equals `cid` (a slice into `blob`), or null.
+fn trayIndexOfCid(cards: []const lens_socket.LensCard, blob: []const u8, cid: []const u8) ?u32 {
+    for (cards, 0..) |c, i| {
+        const s = blob[c.cid.off..][0..c.cid.len];
+        if (std.mem.eql(u8, s, cid)) return @intCast(i);
+    }
+    return null;
+}
+
+/// Advance the socket's drag animation one frame: lift, the per-card reflow
+/// (others slide to open a gap at the insertion slot), and the drop-settle.
+/// Pure easing over the persistent SocketUi state; the widget draws the result.
+fn advanceSocketDrag(ui: *lens_socket.SocketUi, tray: lens_socket.TrayView, geom: lens_socket.Geometry) void {
+    const ease = 0.30; // per-frame approach factor (~150ms feel at 60fps)
+    const n: i32 = @intCast(tray.cards.len);
+    if (ui.drag_active) |d| {
+        if (ui.settle_phase == 0) {
+            // Active drag: lift the ghost; reflow neighbours toward the gap.
+            ui.lift += (1.0 - ui.lift) * ease;
+            const ins: i32 = if (lens_socket.dropIndex(tray, ui.*, geom)) |x| @intCast(x) else @as(i32, @intCast(d));
+            var a: i32 = 0;
+            while (a < n and a < @as(i32, @intCast(ui.slide.len))) : (a += 1) {
+                if (a == d) continue;
+                // target slot of card a when d is pulled out and re-inserted at ins
+                const r = if (a < @as(i32, @intCast(d))) a else a - 1;
+                const target = if (r < ins) r else r + 1;
+                const desired: f32 = @floatFromInt(target - a); // -1, 0, or +1
+                ui.slide[@intCast(a)] += (desired - ui.slide[@intCast(a)]) * ease;
+            }
+        } else {
+            // Settling: drop the lift, glide the reflow back to home, finish.
+            ui.lift += (0.0 - ui.lift) * ease;
+            for (&ui.slide) |*s| s.* += (0.0 - s.*) * ease;
+            ui.settle_phase +|= 1;
+            if (ui.settle_phase > lens_socket.settle_total_frames) {
+                ui.drag_active = null;
+                ui.settle_phase = 0;
+                ui.lift = 0;
+                ui.slide = [_]f32{0} ** lens_socket.max_lenses;
+            }
+        }
+    } else {
+        // Not dragging: relax any residual offsets back to rest.
+        ui.lift += (0.0 - ui.lift) * ease;
+        for (&ui.slide) |*s| s.* += (0.0 - s.*) * ease;
+    }
+}
+
+/// Move the card at `from` to rank `to`, sliding the rest — the L.4 reorder.
+/// The CID spans travel with the moved structs (the blob is unchanged), so a
+/// caller can re-find the seated card by its CID offset afterward.
+fn reorderTray(cards: []lens_socket.LensCard, from: u32, to: u32) void {
+    if (from == to or from >= cards.len or to >= cards.len) return;
+    const moved = cards[from];
+    if (from < to) {
+        var k = from;
+        while (k < to) : (k += 1) cards[k] = cards[k + 1];
+    } else {
+        var k = from;
+        while (k > to) : (k -= 1) cards[k] = cards[k - 1];
+    }
+    cards[to] = moved;
+}
+
+/// A7.2: cold struct, waived — one per run(), the per-frame bundle of
+/// shared pointers the paint path and input handler both read.
 const Grid = struct {
     engine: *text_core.Engine,
     field: *field_core.Field,
@@ -1760,6 +2008,15 @@ const Grid = struct {
     /// (the feed); the rail switches it on a click. Shared (a pointer to a run()
     /// local) so paint and the click handler agree on the same value.
     screen: *u8,
+    /// THE LENS SOCKET (Home). The tray is the user's carried lens set
+    /// (invariant 12); `socket_ui` is the transient open/swap state; the
+    /// socket's tap targets land in `socket_hits` (its own space, tested
+    /// before the feed regions). `accent` is the seated lens's palette
+    /// color (§11.5), the app accent token this frame.
+    socket_tray: ?lens_socket.TrayView = null,
+    socket_ui: lens_socket.SocketUi = .{},
+    socket_hits: *lens_socket.HitList,
+    accent: u32 = feed_view.accent_house,
     /// The GPU render path, present only when `gpu.init` succeeded on this
     /// window (else null → the software path renders, the rule's fallback).
     /// A pointer into run()'s `gpu_state` local; one-frame contract like the
@@ -2151,7 +2408,7 @@ fn paintFrame(
             // by the REAL timeline via a pure transform (B5). An empty timeline
             // renders the chrome with no posts — no placeholder content.
             const feed_posts = feed_view.fromTimeline(arena, view_items, now) catch &[_]feed_view.PostView{};
-            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*, profile_header, g.pending_new) catch g.content_h.*;
+            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits) catch g.content_h.*;
             const t_layout = if (debug_frame_timing) clock_shell.monotonicNanos() else 0;
             window_shell.presentDrawList(win, gpa, g.engine, g.draw.slice(), field_core.background) catch {}; // E2: a lost blit is the next frame's problem
             if (debug_frame_timing) {
@@ -2329,8 +2586,26 @@ fn paintFrameGpu(
     // them. (G1/G3: this is the measured-cause fix for the live lag.)
     // Fold the active screen into the dirty signature: switching screens
     // changes the rendered body, so the cached feed verts must rebuild.
-    const sig = feedSignature(items, g.scroll.*, w, h) ^ (@as(u64, g.screen.*) *% 0x9E37_79B9_7F4A_7C15);
-    if (sig != gs.feed_sig or gs.feed.verts.items.len == 0) {
+    // Fold the socket's live state into the dirty signature: opening the
+    // tray, the seat animation advancing, or a re-seat all change what the
+    // header draws, so the cached feed verts must rebuild those frames.
+    var socket_sig: u64 = (@as(u64, @intFromBool(g.socket_ui.open)) << 40) |
+        (@as(u64, g.socket_ui.swap_phase) << 32) | (@as(u64, g.socket_ui.swap_to) << 16) |
+        (@as(u64, (g.socket_ui.expanded orelse 0xFFF) + 1) << 48) |
+        (if (g.socket_tray) |t| @as(u64, t.seated) else 0);
+    socket_sig ^= (@as(u64, (g.socket_ui.picking orelse 0xFF)) +% 1) *% 0xA24B_AED4_963E_E407;
+    // While dragging, the ghost follows the pointer — fold the drag pointer in
+    // so each move rebuilds the socket (the one time a per-move rebuild is wanted).
+    if (g.socket_ui.drag_active) |d| {
+        socket_sig ^= (@as(u64, d) +% 1) *% 0x2545_F491_4F6C_DD1D;
+        socket_sig ^= @as(u64, @bitCast(@as(i64, g.socket_ui.drag_x))) *% 0x9E37_79B1;
+        socket_sig ^= @as(u64, @bitCast(@as(i64, g.socket_ui.drag_y))) *% 0x85EB_CA77;
+    }
+    const sig = feedSignature(items, g.scroll.*, w, h) ^ (@as(u64, g.screen.*) *% 0x9E37_79B9_7F4A_7C15) ^ (socket_sig *% 0xD1B5_4A32_D192_ED03);
+    // A drag/settle animates the socket every frame (lift, reflow, ghost), so
+    // bypass the feed cache while it runs — a brief interaction, and the field
+    // already rebuilds every frame anyway.
+    if (sig != gs.feed_sig or gs.feed.verts.items.len == 0 or g.socket_ui.drag_active != null) {
         gs.feed_sig = sig;
         // An empty timeline renders the chrome with no posts (no placeholders).
         const feed_posts = feed_view.fromTimeline(arena, items, now) catch &[_]feed_view.PostView{};
@@ -2354,7 +2629,7 @@ fn paintFrameGpu(
         // skip_heart=true on every screen: the SDF heart pass (drawEngagementHearts,
         // below) draws the heart in place for each visible like button of the
         // ACTIVE view, so layout never draws its own — one heart, one pipeline.
-        g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true, g.screen.*, profile_header, g.pending_new) catch g.content_h.*;
+        g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits) catch g.content_h.*;
         gpu.feedBuild(&gs.feed, gpa, g.engine, g.draw.slice(), scale) catch {};
     }
 
@@ -2435,7 +2710,13 @@ fn drawEngagementHearts(g: Grid, gs: *GpuState, items: []const feed_core.Timelin
     // over the frosted header as a post scrolls up. Clip it: skip any heart whose
     // row has crossed under the header band. feed_view owns the exact height so
     // this can't drift from it (the profile-tabs growth broke the old hardcode).
-    const header_bottom: i32 = feed_view.headerBottom(g.screen.*);
+    // On Home, the OPEN lens-socket tray drops over the posts; clip hearts to
+    // its bottom too, or they bleed over it (the socket only draws once, on
+    // top, but the heart pass is separate).
+    const header_bottom: i32 = if (g.screen.* == feed_view.screen_home)
+        feed_view.homeSocketBottom(g.socket_tray, g.socket_ui)
+    else
+        feed_view.headerBottom(g.screen.*);
     for (g.regions.items) |r| {
         if (r.kind != .like or r.post >= items.len) continue;
         if (@as(i32, r.y) + @divTrunc(@as(i32, r.h), 2) < header_bottom) continue;

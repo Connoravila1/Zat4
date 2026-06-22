@@ -35,6 +35,7 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const text = @import("text.zig");
 const raster = @import("raster.zig");
+const lens_socket = @import("lens_socket.zig");
 
 // Palette, copied from field.zig so the view never reaches across a module
 // for a constant (D4: only the value crosses, by copy). ARGB.
@@ -43,7 +44,11 @@ const ink: u32 = 0xFFEDEAE0;
 const body_c: u32 = 0xFFD8D3C8;
 const muted: u32 = 0xFF9A968A;
 const faint: u32 = 0xFF6A655A;
-const accent: u32 = 0xFFE8B84B;
+/// The HOUSE accent (amber) — the default and the composer's fixed accent.
+/// On Home the live accent is the SEATED LENS's palette color (§11.5),
+/// threaded into `layout` as `accent` and passed down to the chrome; this
+/// const is the fallback for surfaces with no seated lens.
+pub const accent_house: u32 = 0xFFE8B84B;
 const like_c: u32 = 0xFFF0617A;
 const boost_c: u32 = 0xFF8FD18F;
 /// Resting engagement-icon colour — a cool blueish grey matching the SDF
@@ -178,6 +183,13 @@ const side_w: i32 = 352;
 /// the tabs remain visible while posts scroll under them.
 const profile_header_h_wide: i32 = 152;
 const profile_header_h_narrow: i32 = 134;
+/// Home's sticky header grew to seat the LENS SOCKET (it replaces the old
+/// Following/Discover tab labels). Title on top, the resting socket below,
+/// then the divider — posts start beneath it (feed_y0).
+const home_header_h_wide: i32 = 140;
+const home_header_h_narrow: i32 = 122;
+const socket_y_wide: i32 = 66; // socket top, under the "Home" title
+const socket_y_narrow: i32 = 52; // socket top, under the wordmark
 /// Profile-nav tabs (visual for now — the regions carry the tab index for a
 /// later slice; "Posts" is active). The Links page attaches as another tab.
 const profile_tabs = [_][]const u8{ "Posts", "Replies", "Media", "Likes" };
@@ -187,7 +199,29 @@ const profile_tabs = [_][]const u8{ "Posts", "Replies", "Media", "Likes" };
 /// the header heights. The GPU feed lays out at the WIDE design width, so these
 /// are the wide values; the plain top bar is 111.
 pub fn headerBottom(active_screen: u8) i32 {
-    return if (active_screen == screen_profile) profile_header_h_wide else 111;
+    if (active_screen == screen_profile) return profile_header_h_wide;
+    if (active_screen == screen_home) return home_header_h_wide;
+    return 111;
+}
+
+/// The logical y the HOME header occludes down to, accounting for the lens
+/// socket's OPEN tray (which drops over the posts). The shell clips the
+/// separate GPU heart pass to this so hearts behind the open tray don't
+/// bleed over it. Resting → the plain home header height. (Wide layout —
+/// the GPU path lays out at the design width.)
+pub fn homeSocketBottom(socket_tray: ?lens_socket.TrayView, socket_ui: lens_socket.SocketUi) i32 {
+    const base = home_header_h_wide;
+    const tray = socket_tray orelse return base;
+    if (!socket_ui.open) return base;
+    return @max(base, socket_y_wide + lens_socket.measuredHeight(tray, socket_ui, homeSocketGeom(wide_min)));
+}
+
+/// The exact geometry the Home header lays the socket out at, for a given
+/// layout width — so the shell can run `lens_socket.dropIndex` (the drag
+/// insertion math) against the same grid the widget drew.
+pub fn homeSocketGeom(width: i32) lens_socket.Geometry {
+    const m = metricsFor(width);
+    return .{ .x = m.lx, .y = if (m.wide) socket_y_wide else socket_y_narrow, .w = m.cw, .scale = 1.0 };
 }
 const wide_min: i32 = rail_w + feed_w + side_w + 40; // ~1244
 
@@ -468,7 +502,7 @@ fn navIcon(idx: usize, gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, s: 
     }
 }
 
-fn drawRail(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, rx: i32, height: i32, active: usize, regions: ?*Regions) !void {
+fn drawRail(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, rx: i32, height: i32, active: usize, regions: ?*Regions, accent: u32) !void {
     const x0 = rx + 14;
     const wm = try str(gpa, dl, e, .semibold, x0 + 8, 58, accent, 26, "zat4");
     _ = try str(gpa, dl, e, .semibold, wm, 58, ink, 26, ".");
@@ -482,7 +516,7 @@ fn drawRail(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, rx: i32
         const on = idx == active;
         const col = if (on) ink else muted;
         // A faint accent pill marks the active destination.
-        if (on) try rect(gpa, dl, x0 + 2, ny - 8, rail_w - 32, 42, 0x1FE8B84B, 12);
+        if (on) try rect(gpa, dl, x0 + 2, ny - 8, rail_w - 32, 42, (0x1F << 24) | (accent & 0x00FFFFFF), 12);
         try navIcon(idx, gpa, dl, x0 + 10, ny, 22, if (on) accent else muted);
         _ = try str(gpa, dl, e, if (on) .semibold else .regular, x0 + 48, ny + 17, col, 16, label);
         // Full-row tap target → the Screen at this index (post carries it).
@@ -604,9 +638,24 @@ pub fn layout(
     /// Count of staged-but-unrevealed new posts. When > 0 on Home, a pinned
     /// "N new posts" pill is drawn below the header (a `.reveal_new` tap region).
     pending_new: usize,
+    /// The app accent token — the SEATED LENS's palette color on Home
+    /// (§11.5), else the house amber. Threaded down to all the chrome that
+    /// re-tints (wordmark, active-nav pill + icon, New-post, tab underline,
+    /// the socket cartridge). Neutrals (glass, ink, field) ignore it.
+    accent: u32,
+    /// The home feed's lens tray (the user's carried set, invariant 12);
+    /// null = no socket on this surface. On Home it is drawn in the header
+    /// — it REPLACES the Following/Discover tab labels (there is no tab
+    /// strip; the seated lens is the feed's order).
+    socket_tray: ?lens_socket.TrayView,
+    socket_ui: lens_socket.SocketUi,
+    /// The socket's tap targets for this frame (its own hit space, distinct
+    /// from the feed `regions`); the shell tests these first. Null = draw-only.
+    socket_hits: ?*lens_socket.HitList,
 ) error{OutOfMemory}!i32 {
     const m = metricsFor(width);
     if (regions) |rg| rg.clearRetainingCapacity();
+    if (socket_hits) |sh| sh.clearRetainingCapacity();
 
     // 1. The content column as GLASS floating over the field (P.0, layout layer).
     //    A soft slab shadow falls off both gutter edges so the column reads as a
@@ -640,11 +689,15 @@ pub fn layout(
         // 2a. Desktop three-pane: nav rail + sidebar flank the feed. Each
         // SECTION draws its own box (the nav group, the account card, the
         // sidebar cards) so the field stays visible between them.
-        try drawRail(gpa, dl, e, m.rail_x, height, active_screen, regions);
+        try drawRail(gpa, dl, e, m.rail_x, height, active_screen, regions, accent);
         try drawSidebar(gpa, dl, e, m.side_x, height);
         feed_y0 = 126;
     } else {
         feed_y0 = 112;
+    }
+    // Home seats the socket in its header, so the post stack starts below it.
+    if (active_screen == screen_home and socket_tray != null) {
+        feed_y0 = if (m.wide) home_header_h_wide + 14 else home_header_h_narrow + 12;
     }
 
     // The Profile screen draws an identity header band, then falls through to
@@ -666,7 +719,7 @@ pub fn layout(
         const msg = "Coming soon";
         const tw: i32 = @intCast(text.measure(e, .regular, msg, 16));
         _ = try str(gpa, dl, e, .regular, m.col_x + @divTrunc(m.col_w - tw, 2), @divTrunc(height, 2), muted, 16, msg);
-        try drawTopBar(gpa, dl, e, m, active_screen, regions, profile); // no posts scroll here, but keep the title consistent
+        try drawTopBar(gpa, dl, e, m, active_screen, regions, profile, accent, socket_tray, socket_ui, socket_hits); // no posts scroll here, but keep the title consistent
         return height;
     }
 
@@ -837,7 +890,7 @@ pub fn layout(
     }
     // The sticky top bar, drawn LAST so the posts above scroll BEHIND its
     // frosted box with the title/tabs crisp on top.
-    try drawTopBar(gpa, dl, e, m, active_screen, regions, profile);
+    try drawTopBar(gpa, dl, e, m, active_screen, regions, profile, accent, socket_tray, socket_ui, socket_hits);
 
     // The "N new posts" pill (Home only): staged arrivals waiting to be revealed.
     // Pinned just below the header, centered; tapping it reveals + scrolls to top
@@ -942,7 +995,7 @@ pub fn layoutCompose(
         .post => "New post",
         .profile => "Edit your display name",
     });
-    if (ctx == .reply and reply_handle.len > 0) _ = try str(gpa, dl, e, .semibold, hx, card_y + 34, accent, 18, reply_handle);
+    if (ctx == .reply and reply_handle.len > 0) _ = try str(gpa, dl, e, .semibold, hx, card_y + 34, accent_house, 18, reply_handle);
     try rect(gpa, dl, cx0, card_y + 50, cw, 1, divider, 0);
 
     // The draft (or a faint placeholder), wrapped from just under the divider.
@@ -959,7 +1012,7 @@ pub fn layoutCompose(
     } else try wrapDraft(gpa, dl, e, lx, text_top, inner_w, body_c, 17, draft, body_line);
 
     // The text cursor: a thin accent bar at the pen, one cap-height tall.
-    try rect(gpa, dl, cursor.x + 1, cursor.baseline - 15, 2, 19, accent, 1);
+    try rect(gpa, dl, cursor.x + 1, cursor.baseline - 15, 2, 19, accent_house, 1);
 
     // Footer: Cancel (left, text) · char count · Send pill (right).
     const fy = card_y + card_h - 46;
@@ -971,7 +1024,7 @@ pub fn layoutCompose(
     // Send pill (accent, dark label).
     const sw: i32 = @intCast(text.measure(e, .semibold, send_label, 14) + 40);
     const sx = cx0 + cw - pad - sw;
-    try rect(gpa, dl, sx, fy, sw, 34, accent, 16);
+    try rect(gpa, dl, sx, fy, sw, 34, accent_house, 16);
     _ = try str(gpa, dl, e, .semibold, sx + 20, fy + 22, bg, 14, send_label);
     try emitRegion(gpa, regions, sx, fy, sw, 34, 0, .compose_send);
     // Char count (posts/replies only) between the two buttons.
@@ -995,13 +1048,15 @@ pub fn layoutCompose(
 /// divider. Emitted AFTER the posts so they pass behind it (occluded + dimmed),
 /// the chrome reading crisply on top. The box spans the feed column width; the
 /// rail/sidebar live in their own columns and are untouched.
-fn drawTopBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, active_screen: u8, regions: ?*Regions, profile: ?ProfileHeader) error{OutOfMemory}!void {
-    if (active_screen == screen_profile) return drawProfileHeader(gpa, dl, e, m, regions, profile orelse .{ .display_name = "", .handle = "", .post_count = 0 });
+fn drawTopBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, active_screen: u8, regions: ?*Regions, profile: ?ProfileHeader, accent: u32, socket_tray: ?lens_socket.TrayView, socket_ui: lens_socket.SocketUi, socket_hits: ?*lens_socket.HitList) error{OutOfMemory}!void {
+    if (active_screen == screen_profile) return drawProfileHeader(gpa, dl, e, m, regions, profile orelse .{ .display_name = "", .handle = "", .post_count = 0 }, accent);
     const is_thread = active_screen == screen_thread;
     // screen_thread is past nav_labels, so guard the index → a "Thread" title.
     const title: []const u8 = if (active_screen < nav_labels.len) nav_labels[active_screen] else "Thread";
+    const is_home = active_screen == screen_home;
     if (m.wide) {
-        try rect(gpa, dl, m.col_x, 0, m.col_w, 111, header_veil, 0);
+        const box_h: i32 = if (is_home) home_header_h_wide else 111;
+        try rect(gpa, dl, m.col_x, 0, m.col_w, box_h, header_veil, 0);
         // The thread screen gets a back button on the left; the title sits after.
         var tx = m.lx;
         if (is_thread) {
@@ -1013,15 +1068,15 @@ fn drawTopBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Me
             tx = m.lx + blw + 22;
         }
         _ = try str(gpa, dl, e, .semibold, tx, 50, ink, 27, title);
-        if (active_screen == screen_home) {
-            _ = try str(gpa, dl, e, .semibold, m.lx, 88, ink, 16, "Following");
-            const fw2: i32 = @intCast(text.measure(e, .semibold, "Following", 16));
-            _ = try str(gpa, dl, e, .regular, m.lx + fw2 + 28, 88, faint, 16, "Discover");
-            try rect(gpa, dl, m.lx, 98, fw2, 3, accent, 2);
-        }
-        try rect(gpa, dl, m.col_x, 110, m.col_w, 1, divider, 0);
+        // THE LENS SOCKET seats here, replacing the Following/Discover tabs.
+        if (is_home) if (socket_tray) |tray| {
+            const geom: lens_socket.Geometry = .{ .x = m.lx, .y = socket_y_wide, .w = m.cw, .scale = 1.0 };
+            _ = try lens_socket.build(gpa, e, tray, socket_ui, geom, dl, socket_hits);
+        };
+        try rect(gpa, dl, m.col_x, box_h - 1, m.col_w, 1, divider, 0);
     } else {
-        try rect(gpa, dl, m.col_x, 0, m.col_w, 97, header_veil, 0);
+        const box_h: i32 = if (is_home) home_header_h_narrow else 97;
+        try rect(gpa, dl, m.col_x, 0, m.col_w, box_h, header_veil, 0);
         if (is_thread) {
             const bl = "<  Back";
             const blw: i32 = @intCast(text.measure(e, .semibold, bl, 14) + 22);
@@ -1034,11 +1089,11 @@ fn drawTopBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Me
         }
         const wm = try str(gpa, dl, e, .semibold, m.lx, 42, accent, 22, "zat4");
         _ = try str(gpa, dl, e, .semibold, wm, 42, ink, 22, ".");
-        _ = try str(gpa, dl, e, .semibold, m.lx, 76, ink, 15, "Following");
-        const fw: i32 = @intCast(text.measure(e, .semibold, "Following", 15));
-        _ = try str(gpa, dl, e, .regular, m.lx + fw + 26, 76, faint, 15, "Discover");
-        try rect(gpa, dl, m.lx, 86, fw, 3, accent, 2);
-        try rect(gpa, dl, m.col_x, 96, m.col_w, 1, divider, 0);
+        if (is_home) if (socket_tray) |tray| {
+            const geom: lens_socket.Geometry = .{ .x = m.lx, .y = socket_y_narrow, .w = m.cw, .scale = 1.0 };
+            _ = try lens_socket.build(gpa, e, tray, socket_ui, geom, dl, socket_hits);
+        };
+        try rect(gpa, dl, m.col_x, box_h - 1, m.col_w, 1, divider, 0);
     }
 }
 
@@ -1048,7 +1103,7 @@ fn drawTopBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Me
 /// under it (the old band was tall, vertical, and scrolled away). The natural
 /// anchor for future profile-level nav (Links / Posts·Replies tabs): a row would
 /// attach below the identity line, growing `profile_header_h_*`.
-fn drawProfileHeader(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, regions: ?*Regions, ph: ProfileHeader) error{OutOfMemory}!void {
+fn drawProfileHeader(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, regions: ?*Regions, ph: ProfileHeader, accent: u32) error{OutOfMemory}!void {
     const name = if (ph.display_name.len > 0) ph.display_name else ph.handle;
     var cb: [24]u8 = undefined;
     const counts = std.fmt.bufPrint(&cb, "{d} posts", .{ph.post_count}) catch "0 posts";
@@ -1075,7 +1130,7 @@ fn drawProfileHeader(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine
             try emitRegion(gpa, regions, bx2, 41, bw, 34, 0, .edit_profile);
         }
         // Profile-nav tabs row, below the identity line (Posts active).
-        try drawProfileTabs(gpa, dl, e, m.lx, 116, 15, regions);
+        try drawProfileTabs(gpa, dl, e, m.lx, 116, 15, regions, accent);
         try rect(gpa, dl, m.col_x, band_h - 1, m.col_w, 1, divider, 0);
         return;
     }
@@ -1101,7 +1156,7 @@ fn drawProfileHeader(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine
         _ = try str(gpa, dl, e, .semibold, bx2 + 11, 50, ink, 13, label);
         try emitRegion(gpa, regions, bx2, 30, bw, 30, 0, .edit_profile);
     }
-    try drawProfileTabs(gpa, dl, e, m.lx, 100, 14, regions);
+    try drawProfileTabs(gpa, dl, e, m.lx, 100, 14, regions, accent);
     try rect(gpa, dl, m.col_x, band_h - 1, m.col_w, 1, divider, 0);
 }
 
@@ -1109,7 +1164,7 @@ fn drawProfileHeader(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine
 /// (ink + an accent underline); the rest are muted. Each emits a `.profile_tab`
 /// region carrying its index — visual for now, wired by a later slice (the Links
 /// page attaches here too). `baseline` is the tab-label baseline.
-fn drawProfileTabs(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32, baseline: i32, px: u16, regions: ?*Regions) error{OutOfMemory}!void {
+fn drawProfileTabs(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32, baseline: i32, px: u16, regions: ?*Regions, accent: u32) error{OutOfMemory}!void {
     var tx = x0;
     for (profile_tabs, 0..) |tab, i| {
         const on = i == 0;
@@ -1231,7 +1286,7 @@ test "layout emits 4 tap regions per post (avatar + 3 engagement); hitTest resol
     const posts = [_]PostView{
         .{ .name = "A", .handle = "@a.zat", .age = "1m", .body = "hello there field", .tint = 0xFFAAAAAA, .reply = 1, .boost = 2, .like = 3, .initial = 'A', .liked = true, .boosted = false },
     };
-    const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0);
+    const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null);
     try std.testing.expect(h > 112); // content extends below the top bar
     // 8 regions per post: body tap + avatar + reply/repost/like + bookmark/share/more.
     try std.testing.expectEqual(@as(usize, 8), regions.items.len);
@@ -1313,7 +1368,7 @@ test "long timeline does not overflow draw coordinates (off-screen posts skipped
     const posts = try arena.alloc(PostView, n);
     for (posts) |*pv| pv.* = .{ .name = "x", .handle = "@x.zat", .age = "1m", .body = "a body line that wraps a little across the feed column width here", .tint = 0xFF888888, .reply = 1, .boost = 2, .like = 3, .initial = 'x', .liked = false, .boosted = false };
 
-    const h = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, null, false, screen_home, null, 0); // must not panic
+    const h = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null); // must not panic
     try std.testing.expect(h > 940 * 10); // height accounts for the whole list
     try std.testing.expect(regions.items.len < 4 * 24); // only on-screen posts are tappable
 
@@ -1327,11 +1382,11 @@ test "long timeline does not overflow draw coordinates (off-screen posts skipped
     @memset(heights, -1);
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h_fill = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0);
+    const h_fill = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null);
     const fill_regions = regions.items.len;
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h_cached = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0);
+    const h_cached = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null);
     try std.testing.expectEqual(h, h_fill);
     try std.testing.expectEqual(h, h_cached);
     try std.testing.expectEqual(fill_regions, regions.items.len);
@@ -1354,7 +1409,7 @@ test "profile screen renders the author's posts under a header; other screens st
     // Profile screen: 8 post tap regions (body + avatar + reply/repost/like +
     // bookmark/share/more) + 4 profile-nav tab regions in the sticky header
     // (the header here isn't editable, so no edit-profile region).
-    const hp = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_profile, header, 0);
+    const hp = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_profile, header, 0, accent_house, null, .{}, null);
     try std.testing.expect(hp > 112);
     try std.testing.expectEqual(@as(usize, 12), regions.items.len);
 
@@ -1362,7 +1417,7 @@ test "profile screen renders the author's posts under a header; other screens st
     // so no tap regions, and the height clamps to the viewport (no post stack).
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const he = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, 1, null, 0); // Explore
+    const he = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, 1, null, 0, accent_house, null, .{}, null); // Explore
     try std.testing.expectEqual(@as(i32, 940), he);
     try std.testing.expectEqual(@as(usize, 0), regions.items.len);
 }

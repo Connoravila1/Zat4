@@ -27,6 +27,8 @@ const raster = @import("core/raster.zig");
 const feed_view = @import("core/feed_view.zig");
 const feed = @import("core/feed.zig");
 const field = @import("core/field.zig");
+const lens_socket = @import("core/lens_socket.zig");
+const lens_catalog = @import("core/lens_catalog.zig");
 
 const W: u32 = 1280;
 const H: u32 = 880;
@@ -83,12 +85,29 @@ pub fn main(init: std.process.Init) !void {
     items[1].replying_to_handle = "mara.zat";
     const posts = try feed_view.fromTimeline(arena, &items, now);
 
-    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, 0, null, 3);
+    // The integrated home feed uses the REAL default loadout (the catalog),
+    // so the proof matches what the live app loads with.
+    const hc, const hb = try lens_catalog.defaultFeedLoadout(arena);
+    const home_tray: lens_socket.TrayView = .{ .cards = hc, .text = hb, .seated = lens_catalog.default_feed_seated };
+    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, 0, null, 3, lens_socket.seatedAccent(home_tray), home_tray, .{}, null);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
 
     const io = init.io;
     try writePpm(io, gpa, &fb, "/tmp/zat_preview.ppm");
     std.debug.print("wrote /tmp/zat_preview.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
+
+    // The socket OPEN on the feed, with Discover (blue) seated — proof that
+    // seating re-tints the WHOLE UI (wordmark, active nav, New post) to the
+    // seated lens's palette color (§11.5), the open tray over the posts.
+    @memset(fb.pixels, clear);
+    dl.len = 0;
+    try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
+    var blue_tray = home_tray;
+    blue_tray.seated = 2; // Discover → blue
+    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, 0, null, 0, lens_socket.seatedAccent(blue_tray), blue_tray, .{ .open = true }, null);
+    try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+    try writePpm(io, gpa, &fb, "/tmp/zat_feed_open.ppm");
+    std.debug.print("wrote /tmp/zat_feed_open.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
 
     // The premium composer (PHASE C1): same field background, the composer card
     // over it via the REAL layoutCompose path → a second PPM proof.
@@ -112,7 +131,7 @@ pub fn main(init: std.process.Init) !void {
         tv("lune.zat", "lune", "weather you can't even reply to without getting rained on.", 0xFFA9B6D6, 'l', 2, true),
         tv("rune.zat", "rune", "this is why i kept the field on. it keeps the light at human scale.", 0xFFB5A9CC, 'r', 1, false),
     };
-    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), &thread, 0, &dl, null, null, false, feed_view.screen_thread, null, 0);
+    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), &thread, 0, &dl, null, null, false, feed_view.screen_thread, null, 0, feed_view.accent_house, null, .{}, null);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_thread.ppm");
     std.debug.print("wrote /tmp/zat_thread.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
@@ -122,10 +141,120 @@ pub fn main(init: std.process.Init) !void {
     dl.len = 0;
     try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
     const header: feed_view.ProfileHeader = .{ .display_name = "connor.zat4.com", .handle = "@connor.zat4.com", .post_count = 11, .editable = true };
-    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, feed_view.screen_profile, header, 0);
+    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, feed_view.screen_profile, header, 0, feed_view.accent_house, null, .{}, null);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_profile.ppm");
     std.debug.print("wrote /tmp/zat_profile.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
+
+    // THE LENS SOCKET (L.0 resting + L.1 open) over the living field, the
+    // real pure path: lens_socket.build → raster.paint. A few placeholder
+    // lenses; the socket replaces the feed's Following/Discover tab labels.
+    const tray = try sampleTray(arena);
+    const sock_geom: lens_socket.Geometry = .{ .x = 300, .y = 60, .w = 680, .scale = 1.0 };
+
+    @memset(fb.pixels, clear);
+    dl.len = 0;
+    try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
+    _ = try lens_socket.build(arena, &engine, tray, .{ .open = false }, sock_geom, &dl, null);
+    try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+    try writePpm(io, gpa, &fb, "/tmp/zat_socket_rest.ppm");
+    std.debug.print("wrote /tmp/zat_socket_rest.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
+
+    @memset(fb.pixels, clear);
+    dl.len = 0;
+    try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
+    _ = try lens_socket.build(arena, &engine, tray, .{ .open = true }, sock_geom, &dl, null);
+    try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+    try writePpm(io, gpa, &fb, "/tmp/zat_socket_open.ppm");
+    std.debug.print("wrote /tmp/zat_socket_open.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
+
+    // L.3 — a card EXPANDED: the inline detail panel under Quiet Mode (index 3),
+    // showing author / description / ranks / privacy / CID + seat + close.
+    @memset(fb.pixels, clear);
+    dl.len = 0;
+    try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
+    _ = try lens_socket.build(arena, &engine, tray, .{ .open = true, .expanded = 3 }, sock_geom, &dl, null);
+    try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+    try writePpm(io, gpa, &fb, "/tmp/zat_socket_detail.ppm");
+    std.debug.print("wrote /tmp/zat_socket_detail.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
+
+    // L.4 — a card mid-DRAG: Zig Only (index 4) lifted, its slot a hole, the
+    // ghost following the cursor, the slot under the cursor (Following) marked.
+    @memset(fb.pixels, clear);
+    dl.len = 0;
+    try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
+    // slide reflects mid-drag of card 4 with the gap opening at slot 1:
+    // cards 1,2,3 have slid right one slot; the ghost is lifted at the cursor.
+    var drag_slide = [_]f32{0} ** lens_socket.max_lenses;
+    drag_slide[1] = 1.0;
+    drag_slide[2] = 1.0;
+    drag_slide[3] = 1.0;
+    _ = try lens_socket.build(arena, &engine, tray, .{ .open = true, .drag_active = 4, .drag_x = sock_geom.x + 120, .drag_y = sock_geom.y + 130, .lift = 1.0, .slide = drag_slide }, sock_geom, &dl, null);
+    try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+    try writePpm(io, gpa, &fb, "/tmp/zat_socket_drag.ppm");
+    std.debug.print("wrote /tmp/zat_socket_drag.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
+
+    // §11.5 — the color PICKER open on Discover (index 2): a 3×3 palette popover.
+    @memset(fb.pixels, clear);
+    dl.len = 0;
+    try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
+    _ = try lens_socket.build(arena, &engine, tray, .{ .open = true, .picking = 2 }, sock_geom, &dl, null);
+    try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+    try writePpm(io, gpa, &fb, "/tmp/zat_socket_recolor.ppm");
+    std.debug.print("wrote /tmp/zat_socket_recolor.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
+
+    // The seat animation (L.2): a still at the plug-in moment — seating
+    // lens index 2 (Discover, blue), mid drop-in with the seat-glow rising.
+    // swap_from = 0 (For You, amber) → swap_to = 2 (Discover, blue).
+    var swap_tray = tray;
+    swap_tray.seated = 2;
+    const swap_ui: lens_socket.SocketUi = .{ .open = false, .swap_phase = 13, .swap_from = 0, .swap_to = 2 };
+    @memset(fb.pixels, clear);
+    dl.len = 0;
+    try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
+    _ = try lens_socket.build(arena, &engine, swap_tray, swap_ui, sock_geom, &dl, null);
+    try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+    try writePpm(io, gpa, &fb, "/tmp/zat_socket_seat.ppm");
+    std.debug.print("wrote /tmp/zat_socket_seat.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
+}
+
+/// A few placeholder lenses (preview-only sample data, shell side). Builds
+/// the SoA tray + text blob the pure widget reads. Colors mirror §11.5:
+/// For You = amber, Following = grey, Discover = blue.
+fn sampleTray(arena: std.mem.Allocator) !lens_socket.TrayView {
+    var blob: std.ArrayListUnmanaged(u8) = .empty;
+    const Spec = struct {
+        name: []const u8,
+        author: []const u8,
+        ranks: []const u8,
+        desc: []const u8,
+        cid: []const u8,
+        color: u8,
+        flags: lens_socket.LensFlags,
+    };
+    const specs = [_]Spec{
+        .{ .name = "For You", .author = "zat4 default", .ranks = "engagement + recency", .desc = "The adaptive default.", .cid = "bafy7x2a", .color = 0, .flags = .{ .learns = true, .is_default = true } },
+        .{ .name = "Following", .author = "zat4 default", .ranks = "chronological", .desc = "Reverse-chron of your follows.", .cid = "bafy0c11", .color = 2, .flags = .{ .is_default = true } },
+        .{ .name = "Discover", .author = "zat4 default", .ranks = "popularity + topics", .desc = "Strong posts beyond your follows.", .cid = "bafy9f3d", .color = 1, .flags = .{ .learns = true } },
+        .{ .name = "Quiet Mode", .author = "@desh.zat", .ranks = "low-velocity first", .desc = "Down-ranks pile-ons.", .cid = "bafy4a8e", .color = 7, .flags = .{} },
+        .{ .name = "Zig Only", .author = "@atlas.zat", .ranks = "tag: zig", .desc = "A topic lens for the zig tag.", .cid = "bafy2b6c", .color = 4, .flags = .{} },
+        // 5 lenses in a 6-slot socket → one empty "add a lens" placeholder shows.
+    };
+    const cards = try arena.alloc(lens_socket.LensCard, specs.len);
+    for (specs, 0..) |s, i| {
+        const name: lens_socket.TextSpan = .{ .off = @intCast(blob.items.len), .len = @intCast(s.name.len) };
+        try blob.appendSlice(arena, s.name);
+        const author: lens_socket.TextSpan = .{ .off = @intCast(blob.items.len), .len = @intCast(s.author.len) };
+        try blob.appendSlice(arena, s.author);
+        const ranks: lens_socket.TextSpan = .{ .off = @intCast(blob.items.len), .len = @intCast(s.ranks.len) };
+        try blob.appendSlice(arena, s.ranks);
+        const desc: lens_socket.TextSpan = .{ .off = @intCast(blob.items.len), .len = @intCast(s.desc.len) };
+        try blob.appendSlice(arena, s.desc);
+        const cid: lens_socket.TextSpan = .{ .off = @intCast(blob.items.len), .len = @intCast(s.cid.len) };
+        try blob.appendSlice(arena, s.cid);
+        cards[i] = .{ .cid = cid, .name = name, .author = author, .ranks = ranks, .desc = desc, .color = s.color, .flags = s.flags };
+    }
+    return .{ .cards = cards, .text = blob.items, .seated = 0 };
 }
 
 /// A thread PostView with an explicit nesting depth + focus flag (preview only).
