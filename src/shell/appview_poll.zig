@@ -132,40 +132,36 @@ pub fn pollRepo(
     {
         lock.lock();
         const need_handle = appview.handleFor(idx, did).len == 0;
-        const need_name = appview.displayNameFor(idx, did).len == 0;
         lock.unlock();
-        // The HANDLE is resolved once (describeRepo — it won't change). The
-        // DISPLAY NAME is re-checked each poll WHILE still unknown, so a profile
-        // record added AFTER first contact is picked up (the profile fetch is
-        // tiny; appendIdentity no-ops when nothing new, so the log doesn't grow).
-        // Once both are known this whole block is skipped (G3). At network scale
-        // a "tried recently" marker would bound the nameless re-checks — noted.
-        if (need_handle or need_name) {
-            var handle: []const u8 = "";
-            if (need_handle) {
-                const params = [_]xrpc.Param{.{ .name = "repo", .value = did }};
-                const outcome = xrpc.query(arena, io, environ, pds_url, lexicon.method.describe_repo, &params, lexicon.RepoDescription, .{}) catch null;
-                if (outcome) |o| switch (o) {
-                    .ok => |desc| if (desc.handle.len > 0 and desc.handleIsCorrect) {
-                        handle = desc.handle;
-                    },
-                    .failed => {},
-                };
-            }
-            var display_name: []const u8 = "";
-            if (need_name) {
-                // The first record of the profile collection (the self profile).
-                if (try fetch(arena, io, environ, pds_url, did, lexicon.collection.profile, ProfileValue)) |recs| {
-                    if (recs.len > 0) display_name = recs[0].value.displayName;
-                }
-            }
-            if (handle.len > 0 or display_name.len > 0) {
-                lock.lock();
-                if (handle.len > 0) appview.setHandle(gpa, idx, did, handle) catch {};
-                if (display_name.len > 0) appview.setDisplayName(gpa, idx, did, display_name) catch {};
-                lock.unlock();
-                store.appendIdentity(log, arena, did, handle, display_name);
-            }
+        // The HANDLE resolves once (describeRepo — it won't change). The DISPLAY
+        // NAME is re-fetched EACH cycle so a CHANGED profile name propagates (not
+        // just a first-time one — the in-app editor relies on this), but it is
+        // only WRITTEN when it actually differs, so setDisplayName + appendIdentity
+        // (and the durable log) don't churn. One tiny listRecords per author per
+        // cycle; throttle-able with a "tried recently" marker at network scale.
+        var handle: []const u8 = "";
+        if (need_handle) {
+            const params = [_]xrpc.Param{.{ .name = "repo", .value = did }};
+            const outcome = xrpc.query(arena, io, environ, pds_url, lexicon.method.describe_repo, &params, lexicon.RepoDescription, .{}) catch null;
+            if (outcome) |o| switch (o) {
+                .ok => |desc| if (desc.handle.len > 0 and desc.handleIsCorrect) {
+                    handle = desc.handle;
+                },
+                .failed => {},
+            };
+        }
+        var fetched_name: []const u8 = "";
+        if (try fetch(arena, io, environ, pds_url, did, lexicon.collection.profile, ProfileValue)) |recs| {
+            if (recs.len > 0) fetched_name = recs[0].value.displayName;
+        }
+        if (handle.len > 0 or fetched_name.len > 0) {
+            lock.lock();
+            if (handle.len > 0) appview.setHandle(gpa, idx, did, handle) catch {};
+            // Compare under the lock; only write (and log) a genuine change.
+            const name_changed = fetched_name.len > 0 and !std.mem.eql(u8, appview.displayNameFor(idx, did), fetched_name);
+            if (name_changed) appview.setDisplayName(gpa, idx, did, fetched_name) catch {};
+            lock.unlock();
+            if (handle.len > 0 or name_changed) store.appendIdentity(log, arena, did, handle, if (name_changed) fetched_name else "");
         }
     }
 

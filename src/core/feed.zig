@@ -228,6 +228,19 @@ pub const Store = struct {
     /// known. (Old cursors orphan a few bytes in the append-only buffer per
     /// page — accepted, same trade the compiler's string table makes.)
     next_cursor: TextSpan = .empty,
+    /// An optimistically-set OWN display name awaiting server confirmation.
+    /// While armed, `internAuthor` will NOT overwrite this author's name from a
+    /// re-ingest (the 5s refresh carries the OLD name until the AppView re-polls
+    /// the profile) — so the new name shows at 0ms and doesn't flicker back. It
+    /// clears when the server serves the matching name. (Same shape as the
+    /// like_pending guard.)
+    pending_display: ?PendingDisplay = null,
+};
+
+/// A7.2: cold struct, size guard waived — at most one in flight, transient.
+pub const PendingDisplay = struct {
+    author: u32,
+    name: TextSpan,
 };
 
 /// Release everything the store owns (C4: this subsystem frees its own
@@ -464,8 +477,20 @@ fn internAuthor(
             authors.items(.handle)[ai] = try appendString(gpa, store, profile.handle);
         }
         if (profile.displayName) |dn| {
-            if (dn.len > 0 and !std.mem.eql(u8, sliceSpan(store, authors.items(.display_name)[ai]), dn))
-                authors.items(.display_name)[ai] = try appendString(gpa, store, dn);
+            if (dn.len > 0) {
+                // Optimistic own-name guard: while a name change for THIS author
+                // is pending, keep the optimistic value (don't let a stale
+                // refresh overwrite it). When the server finally serves the
+                // matching name, the change has landed — release the guard.
+                if (store.pending_display) |pd| {
+                    if (pd.author == ai) {
+                        if (std.mem.eql(u8, sliceSpan(store, pd.name), dn)) store.pending_display = null;
+                        return @enumFromInt(ai); // either way, don't overwrite
+                    }
+                }
+                if (!std.mem.eql(u8, sliceSpan(store, authors.items(.display_name)[ai]), dn))
+                    authors.items(.display_name)[ai] = try appendString(gpa, store, dn);
+            }
         }
         return @enumFromInt(ai);
     }
@@ -978,6 +1003,23 @@ fn optionalIndexForCid(store: *const Store, cid_bytes: []const u8) OptionalPostI
 pub fn bumpReplyCount(store: *Store, cid_bytes: []const u8) void {
     const index = lookupCid(store, cid_bytes) orelse return;
     store.posts.items(.reply_count)[index] += 1;
+}
+
+/// Optimistically set an author's (your own) display name so it shows at 0ms,
+/// arming the guard so a stale refresh can't overwrite it before the server
+/// catches up. No-op if the author isn't resident. The server reconciles it (and
+/// releases the guard) once it re-polls the profile and serves the new name.
+pub fn setOwnDisplayName(gpa: Allocator, store: *Store, did: []const u8, name: []const u8) error{OutOfMemory}!void {
+    const ai = store.author_by_did.getAdapted(did, std.hash_map.StringIndexAdapter{ .bytes = &store.string_bytes }) orelse return;
+    const span = try appendString(gpa, store, name);
+    store.authors.items(.display_name)[ai] = span;
+    store.pending_display = .{ .author = ai, .name = span };
+}
+
+/// Release the optimistic display-name guard (e.g. the write failed) so the next
+/// refresh restores the server's name.
+pub fn clearPendingDisplay(store: *Store) void {
+    store.pending_display = null;
 }
 
 /// Reconcile an OPTIMISTICALLY-inserted post (under a temporary cid) to its real
@@ -1862,6 +1904,49 @@ test "a reply's hydrated parent ref does NOT clobber the parent's real counts" {
     } };
     _ = try ingestPosts(gpa, &store, .{ .feed = &.{parent_now} });
     try testing.expectEqual(@as(u32, 3), store.posts.items(.reply_count)[p]); // authoritative view updates
+}
+
+test "optimistic display name: a stale refresh can't clobber it until the server catches up" {
+    const gpa = testing.allocator;
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+
+    const mk = struct {
+        fn post(cid: []const u8, name: []const u8) lexicon.FeedViewPost {
+            return .{ .post = .{
+                .uri = "at://did:me/app.zat4.feed.post/x",
+                .cid = cid,
+                .author = .{ .did = "did:me", .handle = "me.zat", .displayName = name },
+                .record = .{ .text = "hi" },
+            } };
+        }
+    };
+    _ = try ingestPosts(gpa, &store, .{ .feed = &.{mk.post("c1", "Old")} });
+    const ai = store.author_by_did.getAdapted("did:me", std.hash_map.StringIndexAdapter{ .bytes = &store.string_bytes }).?;
+    const dn = struct {
+        fn get(s: *const Store, a: u32) []const u8 {
+            return sliceSpan(s, s.authors.items(.display_name)[a]);
+        }
+    }.get;
+    try testing.expectEqualStrings("Old", dn(&store, ai));
+
+    // Optimistically rename to "New" — shows instantly, guard armed.
+    try setOwnDisplayName(gpa, &store, "did:me", "New");
+    try testing.expectEqualStrings("New", dn(&store, ai));
+
+    // A stale refresh still carrying "Old" must NOT clobber the optimistic name.
+    _ = try ingestPosts(gpa, &store, .{ .feed = &.{mk.post("c1", "Old")} });
+    try testing.expectEqualStrings("New", dn(&store, ai));
+    try testing.expect(store.pending_display != null);
+
+    // The server catches up (serves "New") → the guard releases.
+    _ = try ingestPosts(gpa, &store, .{ .feed = &.{mk.post("c2", "New")} });
+    try testing.expectEqualStrings("New", dn(&store, ai));
+    try testing.expect(store.pending_display == null);
+
+    // A genuine later change now propagates normally (no guard).
+    _ = try ingestPosts(gpa, &store, .{ .feed = &.{mk.post("c3", "Newer")} });
+    try testing.expectEqualStrings("Newer", dn(&store, ai));
 }
 
 test "optimistic post: reconcile re-keys temp→real; drop detaches on failure" {

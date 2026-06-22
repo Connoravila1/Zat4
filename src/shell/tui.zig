@@ -235,6 +235,10 @@ pub fn run(
     // run after the post is on screen (0ms posting). At most one in flight.
     var pending_send: ?SendJob = null;
     defer if (pending_send) |job| freeSendJob(gpa, job);
+    // A queued profile-edit save (the display name to putProfile after it's
+    // shown optimistically). gpa-owned; at most one in flight.
+    var pending_profile_save: ?[]const u8 = null;
+    defer if (pending_profile_save) |n| gpa.free(n);
 
     // Reveal toggles: cids the user has opened past a moderation collapse.
     // Plain values handed to the core each frame (B5); freed here (C4/C5).
@@ -725,6 +729,30 @@ pub fn run(
             };
         }
 
+        // 0ms profile-name save: the name is already shown optimistically (and
+        // guarded); run the putProfile write now, reverting the guard on failure
+        // so the next refresh restores the server name. On success the guard
+        // releases when the AppView re-polls + serves the new name.
+        if (pending_profile_save) |name| {
+            pending_profile_save = null;
+            defer gpa.free(name);
+            const saved = write.putProfile(gpa, arena, io, environ, session, name, now) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => blk: {
+                    feed_core.clearPendingDisplay(store);
+                    status = "name save failed";
+                    break :blk null;
+                },
+            };
+            if (saved) |s| switch (s) {
+                .ok => {},
+                .failed => |f| {
+                    feed_core.clearPendingDisplay(store);
+                    status = std.fmt.bufPrint(&status_buf, "name refused: {d} {s}", .{ f.status, f.code }) catch "refused";
+                },
+            };
+        }
+
         // Wait for input; the timeout re-renders so relative ages stay
         // honest on an idle screen. 500 ms: the mailbox drains and
         // relative ages tick at human latency; two wakeups a second is
@@ -1056,7 +1084,7 @@ pub fn run(
             }
 
             if (mode == .compose) {
-                try handleComposeInput(gpa, arena, io, environ, session, out, backend, &prev, &next, &status, &status_buf, &mode, store, &compose_buf, &reply_target, &reply_handle, compose_kind, pix, &pending_send, decoded.event, now);
+                try handleComposeInput(gpa, session, &status, &mode, store, &compose_buf, &reply_target, &reply_handle, compose_kind, pix, &pending_send, &pending_profile_save, decoded.event, now);
                 continue;
             }
 
@@ -1381,70 +1409,29 @@ fn freeSendJob(gpa: Allocator, job: SendJob) void {
     }
 }
 
-/// Paint the composer's blocking-write status frame ("posting…" / "saving…").
-/// On the live GPU window it goes through the PREMIUM composer (so the card
-/// stays put with the status under it); otherwise the cell-grid composer is the
-/// terminal/software fallback. Without this the send path flashed the cell
-/// composer over the premium one for the whole network round-trip.
-fn composeBusyFrame(
-    gpa: Allocator,
-    arena: Allocator,
-    out: *std.Io.Writer,
-    backend: Backend,
-    prev: *tui.Surface,
-    next: *tui.Surface,
-    pix: ?Grid,
-    compose_kind: ComposeKind,
-    reply_handle: []const u8,
-    draft: []const u8,
-    status: []const u8,
-) !void {
-    switch (backend) {
-        .window => |win| {
-            if (pix) |g| if (g.gpu) |gs| {
-                const ctx: feed_view.ComposeContext = if (compose_kind == .profile)
-                    .profile
-                else if (reply_handle.len > 0) .reply else .post;
-                paintComposeGpu(gpa, win, g, gs, ctx, reply_handle, draft, status) catch {};
-                return;
-            };
-            timeline_ui.buildComposeFrame(next, draft, reply_handle, status);
-            try present(gpa, out, arena, prev, next, backend);
-        },
-        .terminal => {
-            timeline_ui.buildComposeFrame(next, draft, reply_handle, status);
-            try present(gpa, out, arena, prev, next, backend);
-        },
-    }
-}
-
+// Input handling only mutates draft/compose state and QUEUES network writes
+// (pending_send / pending_profile_save) for the loop to run after the
+// optimistic UI is on screen — so it takes no I/O args of its own.
 fn handleComposeInput(
     gpa: Allocator,
-    arena: Allocator,
-    io: std.Io,
-    environ: ?*const std.process.Environ.Map,
     session: *auth.Session,
-    out: *std.Io.Writer,
-    backend: Backend,
-    prev: *tui.Surface,
-    next: *tui.Surface,
     status: *[]const u8,
-    status_buf: []u8,
     mode: *Mode,
-    /// The shared store — a successful post/reply is optimistically ingested
-    /// into it so it shows INSTANTLY (the 5s refresh would otherwise gate it).
+    /// The shared store — a send is optimistically ingested into it so it shows
+    /// INSTANTLY (the 5s refresh would otherwise gate it).
     store: *feed_core.Store,
     compose_buf: *std.ArrayList(u8),
     reply_target: *?write.ReplyTarget,
     reply_handle: *[]const u8,
     compose_kind: ComposeKind,
-    /// The live render grid, so the blocking-write "posting…/saving…" frame is
-    /// drawn through the PREMIUM composer when the GPU path is up — otherwise it
-    /// flashed the cell-grid composer for the duration of the network write.
+    /// The live render grid (for the post-send scroll-to-top).
     pix: ?Grid,
     /// Set by a post/reply send: the queued create-write the loop performs AFTER
     /// the optimistic post is on screen (0ms). Null when nothing is queued.
     pending_send: *?SendJob,
+    /// Set by a profile-edit save: the display name to putProfile, run by the
+    /// loop after the name is optimistically shown. gpa-owned; null when idle.
+    pending_profile_save: *?[]const u8,
     ev: tui.InputEvent,
     now: i64,
 ) !void {
@@ -1472,25 +1459,14 @@ fn handleComposeInput(
             // profile screen (mode→timeline re-enters it and re-fetches, so the
             // new name shows once the AppView re-polls the record).
             if (compose_kind == .profile) {
-                status.* = "saving...";
-                try composeBusyFrame(gpa, arena, out, backend, prev, next, pix, compose_kind, reply_handle.*, compose_buf.items, status.*);
-                const saved = write.putProfile(gpa, arena, io, environ, session, compose_buf.items, now) catch |err| switch (err) {
-                    error.OutOfMemory => return err,
-                    else => {
-                        status.* = "network error";
-                        return;
-                    },
-                };
-                switch (saved) {
-                    .ok => {
-                        compose_buf.clearRetainingCapacity();
-                        mode.* = .timeline;
-                        status.* = "profile saved";
-                    },
-                    .failed => |failure| status.* = std.fmt.bufPrint(status_buf, "refused: {d} {s}", .{
-                        failure.status, failure.code,
-                    }) catch "refused",
-                }
+                // 0ms: set the display name locally NOW (guarded against a stale
+                // refresh), close to the profile, and queue the putProfile write
+                // for the loop to run after — the new name shows instantly.
+                feed_core.setOwnDisplayName(gpa, store, session.did, compose_buf.items) catch {};
+                pending_profile_save.* = gpa.dupe(u8, compose_buf.items) catch null;
+                compose_buf.clearRetainingCapacity();
+                mode.* = .timeline;
+                status.* = "name updated";
                 return;
             }
             // TRULY 0ms: seat the post in the store under a TEMPORARY cid and
