@@ -216,6 +216,28 @@ pub fn main(init: std.process.Init) !void {
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_socket_seat.ppm");
     std.debug.print("wrote /tmp/zat_socket_seat.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
+
+    // PHASE 2 — the loadout PAGE: three stacked sockets (Feed / Replies / Zones)
+    // from the catalog defaults, over the field, via the real layoutLoadout path.
+    const lf_c, const lf_b = try lens_catalog.defaultFeedLoadout(arena);
+    const lr_c, const lr_b = try lens_catalog.defaultReplyLoadout(arena);
+    const lz_c, const lz_b = try lens_catalog.defaultZoneLoadout(arena);
+    const feed_t: lens_socket.TrayView = .{ .cards = lf_c, .text = lf_b, .seated = lens_catalog.default_feed_seated };
+    const reply_t: lens_socket.TrayView = .{ .cards = lr_c, .text = lr_b, .seated = lens_catalog.default_reply_seated };
+    const zone_t: lens_socket.TrayView = .{ .cards = lz_c, .text = lz_b, .seated = lens_catalog.default_zone_seated };
+    var fh: lens_socket.HitList = .empty;
+    defer fh.deinit(gpa);
+    var rh: lens_socket.HitList = .empty;
+    defer rh.deinit(gpa);
+    var zh: lens_socket.HitList = .empty;
+    defer zh.deinit(gpa);
+    @memset(fb.pixels, clear);
+    dl.len = 0;
+    try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
+    try feed_view.layoutLoadout(gpa, &engine, @intCast(W), @intCast(H), &dl, null, lens_socket.seatedAccent(feed_t), feed_t, .{}, &fh, reply_t, .{}, &rh, zone_t, .{}, &zh);
+    try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+    try writePpm(io, gpa, &fb, "/tmp/zat_loadout.ppm");
+    std.debug.print("wrote /tmp/zat_loadout.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
 }
 
 /// A few placeholder lenses (preview-only sample data, shell side). Builds

@@ -430,6 +430,17 @@ pub fn run(
     var gsocket_ui: lens_socket.SocketUi = .{};
     var gsocket_hits: lens_socket.HitList = .empty;
     defer gsocket_hits.deinit(gpa);
+    // The reply/zone sockets, shown on the loadout PAGE (the feed surface reuses
+    // gsocket_ui/gsocket_hits above). Their transient UI + per-frame hit lists.
+    var reply_ui: lens_socket.SocketUi = .{};
+    var reply_hits: lens_socket.HitList = .empty;
+    defer reply_hits.deinit(gpa);
+    var zone_ui: lens_socket.SocketUi = .{};
+    var zone_hits: lens_socket.HitList = .empty;
+    defer zone_hits.deinit(gpa);
+    // Previous frame's screen — flush the loadout when LEAVING the page (the
+    // page's sockets are always open, so there's no tray-close beat there).
+    var prev_screen: u8 = 0;
     // The active top-level Screen (index into feed_view.nav_labels); the rail
     // sets it on a click. 0 = Home (the feed). Lives across frames in run().
     var gscreen: u8 = 0;
@@ -729,11 +740,15 @@ pub fn run(
         // the fix for the freeze on cartridge-switch (seating closes the tray,
         // which used to do a synchronous network write right here). The ids
         // are slices into socket_blob; submitLoadout dupes them.
-        if (socket_was_open and !gsocket_ui.open and loadout_dirty) {
+        // Flush on the home tray CLOSING, or on LEAVING the loadout page (whose
+        // sockets are always open, so there's no tray-close there).
+        const left_loadout_page = prev_screen == feed_view.screen_loadout and gscreen != feed_view.screen_loadout;
+        const tray_closed = socket_was_open and !gsocket_ui.open;
+        if ((tray_closed or left_loadout_page) and loadout_dirty) {
             if (writer) |w| {
-                // Write the WHOLE record (all three surfaces) so the feed save
-                // doesn't clobber reply/zone. ids slice into each surface's blob;
-                // submitLoadout dupes them onto the worker.
+                // Write the WHOLE record (all three surfaces) so one surface's
+                // edit doesn't clobber the others. ids slice into each surface's
+                // blob; submitLoadout dupes them onto the worker.
                 _ = write_worker.submitLoadout(
                     w,
                     surfaceDataOf(arena, socket_cards, socket_blob, gseated),
@@ -745,10 +760,11 @@ pub fn run(
             loadout_dirty = false;
         }
         socket_was_open = gsocket_ui.open;
+        prev_screen = gscreen;
         // pix exists exactly when a window backend has a live engine; the
         // composer and profile screens stay on the cell path this cut
         // (their pixel port is the recorded next slice).
-        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = home_tray, .socket_ui = gsocket_ui, .socket_hits = &gsocket_hits, .accent = lens_socket.seatedAccent(home_tray) } else null;
+        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = home_tray, .socket_ui = gsocket_ui, .socket_hits = &gsocket_hits, .accent = lens_socket.seatedAccent(home_tray), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits } else null;
         switch (mode) {
             .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status),
             .compose => {
@@ -1028,7 +1044,22 @@ pub fn run(
                                 // in their own space). Seating re-tints + animates
                                 // the swap; re-ranking the feed awaits the discover
                                 // engine (only Following exists today).
-                                if (lens_socket.hitTest(g.socket_hits.items, rx, ry)) |sact| {
+                                var socket_handled = false;
+                                if (gscreen == feed_view.screen_loadout) {
+                                    // Loadout page: click-only edit of the surface under the
+                                    // cursor (feed / reply / zone). Drag-reorder here is later.
+                                    if (lens_socket.hitTest(g.socket_hits.items, rx, ry)) |sact| {
+                                        applyLoadoutAction(sact, socket_cards, socket_blob, &gseated, &gsocket_ui, &loadout_dirty);
+                                        socket_handled = true;
+                                    } else if (lens_socket.hitTest(reply_hits.items, rx, ry)) |sact| {
+                                        applyLoadoutAction(sact, reply_cards, reply_blob, &reply_seated, &reply_ui, &loadout_dirty);
+                                        socket_handled = true;
+                                    } else if (lens_socket.hitTest(zone_hits.items, rx, ry)) |sact| {
+                                        applyLoadoutAction(sact, zone_cards, zone_blob, &zone_seated, &zone_ui, &loadout_dirty);
+                                        socket_handled = true;
+                                    }
+                                } else if (lens_socket.hitTest(g.socket_hits.items, rx, ry)) |sact| {
+                                    socket_handled = true;
                                     // Any socket action other than opening/using the picker
                                     // closes it (the open/set arms re-open or keep as needed).
                                     switch (sact) {
@@ -1087,9 +1118,16 @@ pub fn run(
                                             }
                                             gsocket_ui.picking = null;
                                         },
-                                        else => {}, // get_more: marketplace (no page yet)
+                                        // "get more" → the Algorithms (loadout) page.
+                                        .get_more => {
+                                            gsocket_ui.picking = null;
+                                            gsocket_ui.open = false;
+                                            gscreen = feed_view.screen_loadout;
+                                        },
                                     }
-                                } else if (feed_view.hitTest(g.regions.items, rx, ry)) |hit| {
+                                }
+                                if (!socket_handled) {
+                                    if (feed_view.hitTest(g.regions.items, rx, ry)) |hit| {
                                     gsocket_ui.picking = null; // a click off the socket closes the picker
                                     switch (hit.kind) {
                                         // Left-rail destination: switch the active screen
@@ -1220,6 +1258,7 @@ pub fn run(
                                     if (hit.action != .none) if (timeline_ui.keyFor(hit.action)) |byte| {
                                         try pumped_bytes.append(gpa, byte);
                                     };
+                                }
                                 }
                             },
                             // L.4 drop: release over a card reorders the dragged lens
@@ -1972,6 +2011,41 @@ fn surfaceDataOf(arena: Allocator, cards: []const lens_socket.LensCard, blob: []
     return .{ .ids = ids, .colors = colors, .seated = seated };
 }
 
+/// Apply a socket action to a surface on the LOADOUT PAGE (click-only: seat,
+/// recolor, expand — drag-reorder on the page is a later slice). Mutates the
+/// surface's seated/color/ui and flags it dirty. Unlike the home feed handler
+/// there is no scroll/close/plug-in animation — the page socket is always open.
+fn applyLoadoutAction(sact: lens_socket.SocketAction, cards: []lens_socket.LensCard, blob: []const u8, seated: *u32, ui: *lens_socket.SocketUi, dirty: *bool) void {
+    switch (sact) {
+        .seat => |cid| {
+            if (trayIndexOfCid(cards, blob, cid)) |idx| {
+                seated.* = idx;
+                dirty.* = true;
+            }
+            ui.expanded = null;
+            ui.picking = null;
+        },
+        .expand => |cid| {
+            if (trayIndexOfCid(cards, blob, cid)) |idx| {
+                ui.expanded = if (ui.expanded == idx) null else idx;
+            }
+        },
+        .collapse => ui.expanded = null,
+        .open_swatch => |cid| {
+            const idx = trayIndexOfCid(cards, blob, cid);
+            ui.picking = if (ui.picking == idx) null else idx;
+        },
+        .set_color => |sc2| {
+            if (trayIndexOfCid(cards, blob, sc2.lens)) |idx| {
+                if (idx < cards.len) cards[idx].color = sc2.color;
+                dirty.* = true;
+            }
+            ui.picking = null;
+        },
+        else => {}, // toggle_tray / reorder / get_more: not used on the page
+    }
+}
+
 /// Index of the card whose CID equals `cid` (a slice into `blob`), or null.
 fn trayIndexOfCid(cards: []const lens_socket.LensCard, blob: []const u8, cid: []const u8) ?u32 {
     for (cards, 0..) |c, i| {
@@ -2074,6 +2148,13 @@ const Grid = struct {
     socket_ui: lens_socket.SocketUi = .{},
     socket_hits: *lens_socket.HitList,
     accent: u32 = feed_view.accent_house,
+    /// The reply/zone sockets — only drawn on the loadout page (screen_loadout).
+    reply_tray: lens_socket.TrayView = .{ .cards = &.{}, .text = "", .seated = 0 },
+    reply_ui: lens_socket.SocketUi = .{},
+    reply_hits: *lens_socket.HitList = undefined,
+    zone_tray: lens_socket.TrayView = .{ .cards = &.{}, .text = "", .seated = 0 },
+    zone_ui: lens_socket.SocketUi = .{},
+    zone_hits: *lens_socket.HitList = undefined,
     /// The GPU render path, present only when `gpu.init` succeeded on this
     /// window (else null → the software path renders, the rule's fallback).
     /// A pointer into run()'s `gpu_state` local; one-frame contract like the
@@ -2465,7 +2546,12 @@ fn paintFrame(
             // by the REAL timeline via a pure transform (B5). An empty timeline
             // renders the chrome with no posts — no placeholder content.
             const feed_posts = feed_view.fromTimeline(arena, view_items, now) catch &[_]feed_view.PostView{};
-            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits) catch g.content_h.*;
+            if (g.screen.* == feed_view.screen_loadout) {
+                const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
+                feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits) catch {};
+            } else {
+                g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits) catch g.content_h.*;
+            }
             const t_layout = if (debug_frame_timing) clock_shell.monotonicNanos() else 0;
             window_shell.presentDrawList(win, gpa, g.engine, g.draw.slice(), field_core.background) catch {}; // E2: a lost blit is the next frame's problem
             if (debug_frame_timing) {
@@ -2662,7 +2748,7 @@ fn paintFrameGpu(
     // A drag/settle animates the socket every frame (lift, reflow, ghost), so
     // bypass the feed cache while it runs — a brief interaction, and the field
     // already rebuilds every frame anyway.
-    if (sig != gs.feed_sig or gs.feed.verts.items.len == 0 or g.socket_ui.drag_active != null) {
+    if (sig != gs.feed_sig or gs.feed.verts.items.len == 0 or g.socket_ui.drag_active != null or g.screen.* == feed_view.screen_loadout) {
         gs.feed_sig = sig;
         // An empty timeline renders the chrome with no posts (no placeholders).
         const feed_posts = feed_view.fromTimeline(arena, items, now) catch &[_]feed_view.PostView{};
@@ -2683,10 +2769,17 @@ fn paintFrameGpu(
         }
         const lh = logicalH(w, h);
         g.draw.len = 0;
-        // skip_heart=true on every screen: the SDF heart pass (drawEngagementHearts,
-        // below) draws the heart in place for each visible like button of the
-        // ACTIVE view, so layout never draws its own — one heart, one pipeline.
-        g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits) catch g.content_h.*;
+        if (g.screen.* == feed_view.screen_loadout) {
+            // The loadout page: three stacked sockets, its own render path.
+            const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
+            feed_view.layoutLoadout(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits) catch {};
+            g.content_h.* = @intCast(lh);
+        } else {
+            // skip_heart=true on every screen: the SDF heart pass (drawEngagementHearts,
+            // below) draws the heart in place for each visible like button of the
+            // ACTIVE view, so layout never draws its own — one heart, one pipeline.
+            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits) catch g.content_h.*;
+        }
         gpu.feedBuild(&gs.feed, gpa, g.engine, g.draw.slice(), scale) catch {};
     }
 

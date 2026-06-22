@@ -72,15 +72,23 @@ pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_pr
 /// The six top-level rail destinations, in order. The `Screen` index a nav
 /// region carries is an index into this. Shared by the rail (draw + hit) and
 /// the body (the screen title), so the two never drift.
-pub const nav_labels = [_][]const u8{ "Home", "Explore", "Activity", "Messages", "Profile", "Settings" };
+/// Rail destinations. Slot 4 is "Algorithms" (the loadout page) — it took the
+/// old Profile slot, since the bottom-left "you" card already opens Profile.
+pub const nav_labels = [_][]const u8{ "Home", "Explore", "Activity", "Messages", "Algorithms", "Settings" };
 
-/// Named screen indices into `nav_labels` (the two `layout` renders as real
-/// post lists rather than a placeholder). Keep in sync with `nav_labels`.
+/// Named screen indices. The rail nav posts its index as the screen; slots
+/// rendered as real surfaces (home, loadout) have their own branch, the rest
+/// fall through to a placeholder.
 pub const screen_home: u8 = 0;
-pub const screen_profile: u8 = 4;
+/// The loadout page — the rail's "Algorithms" slot (index 4). Renders the
+/// three per-surface sockets (feed / replies / zones) stacked for editing.
+pub const screen_loadout: u8 = 4;
 /// A transient sub-screen (not a rail destination): a post's thread, shown when
-/// a post body is tapped. One past the nav labels, so the rail highlights none.
+/// a post body is tapped. Past the nav labels, so the rail highlights none.
 pub const screen_thread: u8 = 6;
+/// Profile is no longer a rail slot; reached via the bottom-left "you" card
+/// and avatar taps (which set this screen explicitly). Off the rail range.
+pub const screen_profile: u8 = 7;
 
 /// The profile screen's header band — the viewed account's identity over its
 /// post list. Plain data handed in by the shell (B5); the post count is the
@@ -536,8 +544,9 @@ fn drawRail(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, rx: i32
     try rect(gpa, dl, x0 + 6, by, 38, 38, 0xFF3F3B2D, 19);
     _ = try str(gpa, dl, e, .semibold, x0 + 54, by + 16, ink, 14, "you");
     _ = try str(gpa, dl, e, .regular, x0 + 54, by + 33, faint, 12, "@you.zat");
-    // The "you" card opens the Profile screen (index 4).
-    try emitRegion(gpa, regions, x0 + 6, by - 4, rail_w - 40, 46, 4, .nav);
+    // The "you" card opens the Profile screen (Profile is no longer a rail
+    // slot — this card is its entry point, alongside avatar taps).
+    try emitRegion(gpa, regions, x0 + 6, by - 4, rail_w - 40, 46, screen_profile, .nav);
 }
 
 fn drawSidebar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, sx: i32, height: i32) !void {
@@ -1040,6 +1049,67 @@ pub fn layoutCompose(
         _ = try str(gpa, dl, e, .regular, lx, fy - 14, muted, 13, status);
     } else {
         _ = try str(gpa, dl, e, .regular, lx, fy - 14, faint, 13, "Ctrl+D to send · Esc to cancel");
+    }
+}
+
+/// THE LOADOUT PAGE (screen_loadout / the rail's "Algorithms"). Renders the
+/// three per-surface sockets — Feed, Replies, Zones — stacked and OPEN for
+/// editing, over the same glass column + rail + sidebar chrome. Each socket
+/// is the SAME portable widget; only the tray/ui/hits differ per surface
+/// (invariant 12). A separate entry point (like layoutCompose) so `layout`'s
+/// signature stays lean. Each surface's tap targets go to its own hit list.
+pub fn layoutLoadout(
+    gpa: Allocator,
+    e: *const text.Engine,
+    width: i32,
+    height: i32,
+    dl: *raster.DrawList,
+    regions: ?*Regions,
+    accent: u32,
+    feed_tray: lens_socket.TrayView,
+    feed_ui: lens_socket.SocketUi,
+    feed_hits: *lens_socket.HitList,
+    reply_tray: lens_socket.TrayView,
+    reply_ui: lens_socket.SocketUi,
+    reply_hits: *lens_socket.HitList,
+    zone_tray: lens_socket.TrayView,
+    zone_ui: lens_socket.SocketUi,
+    zone_hits: *lens_socket.HitList,
+) error{OutOfMemory}!void {
+    const m = metricsFor(width);
+    if (regions) |rg| rg.clearRetainingCapacity();
+
+    // Glass column over the field + the flanking chrome (desktop three-pane).
+    try rect(gpa, dl, m.col_x, 0, m.col_w, height, veil, 0);
+    if (m.wide) {
+        try rect(gpa, dl, m.col_x, 0, 1, height, 0x24EDEAE0, 0);
+        try rect(gpa, dl, m.col_x + m.col_w - 1, 0, 1, height, 0x24EDEAE0, 0);
+        try drawRail(gpa, dl, e, m.rail_x, height, screen_loadout, regions, accent);
+        try drawSidebar(gpa, dl, e, m.side_x, height);
+    }
+
+    // Header.
+    try rect(gpa, dl, m.col_x, 0, m.col_w, 92, header_veil, 0);
+    _ = try str(gpa, dl, e, .semibold, m.lx, 50, ink, 27, "Algorithms");
+    _ = try str(gpa, dl, e, .regular, m.lx, 76, muted, 13, "Your lenses for each surface \u{00B7} tap to seat \u{00B7} drag to reorder \u{00B7} tap a swatch to recolor");
+    try rect(gpa, dl, m.col_x, 98, m.col_w, 1, divider, 0);
+
+    // The three sockets, stacked and forced open for editing.
+    const Surface = struct { label: []const u8, tray: lens_socket.TrayView, ui: lens_socket.SocketUi, hits: *lens_socket.HitList };
+    const surfaces = [_]Surface{
+        .{ .label = "FEED", .tray = feed_tray, .ui = feed_ui, .hits = feed_hits },
+        .{ .label = "REPLIES", .tray = reply_tray, .ui = reply_ui, .hits = reply_hits },
+        .{ .label = "ZONES", .tray = zone_tray, .ui = zone_ui, .hits = zone_hits },
+    };
+    var y: i32 = 116;
+    for (surfaces) |s| {
+        s.hits.clearRetainingCapacity();
+        _ = try str(gpa, dl, e, .semibold, m.lx, y, faint, 12, s.label);
+        y += 14;
+        var ui = s.ui;
+        ui.open = true; // always open on this page
+        const h = try lens_socket.build(gpa, e, s.tray, ui, .{ .x = m.lx, .y = y, .w = m.cw, .scale = 1.0 }, dl, s.hits);
+        y += h + 26;
     }
 }
 
