@@ -932,6 +932,7 @@ const field_grid_frag_src: [:0]const GLchar =
     \\uniform float uGain;       // |height| → intensity scale (look knob)
     \\uniform vec2 uMouse;       // cursor in cells (x<0 ⇒ no cursor)
     \\uniform sampler2D uDye;    // R32F persistent colour charge, cols×rows
+    \\uniform vec2 uPanel;       // content-column x-range in px (l,r); l>=r ⇒ none
     \\void main() {
     \\  vec2 px = vec2(gl_FragCoord.x, uViewport.y - gl_FragCoord.y); // top-down
     \\  vec2 cell = floor(px / uCell);
@@ -967,6 +968,17 @@ const field_grid_frag_src: [:0]const GLchar =
     \\  vec3 base = mix(vec3(84.0, 89.0, 102.0) / 255.0, vec3(166.0, 172.0, 186.0) / 255.0, clamp(0.28 + b * 0.5, 0.0, 1.0));
     \\  vec3 col = mix(base, vec3(245.0, 80.0, 110.0) / 255.0, dyev);
     \\  lum = max(lum, dyev);                   // red reads even in quiet areas
+    \\  // GLASS: under the content column, drop the SHARP glyph for a soft, dim
+    \\  // field wash — so what glows through the panel reads as a blurred backdrop
+    \\  // (depth), while the gutters keep their crisp glyphs. A cheap, FBO-free
+    \\  // backdrop blur. The dye is dimmed WITH the field here, not exempt: a
+    \\  // fully-exempt dye stays at 100% while the field drops to 55%, so a like
+    \\  // SPOTLIGHTS against the muted panel (reads too large/loud). Letting the
+    \\  // glass dim it too keeps the like legible as a frosted red without the pop.
+    \\  float in_panel = step(uPanel.x, px.x) * step(px.x, uPanel.y) * (1.0 - step(uPanel.y, uPanel.x));
+    \\  float soft_cov = clamp(dn, 0.0, 1.0);   // smooth per-cell wash, no glyph edges
+    \\  cov = mix(cov, max(soft_cov * 0.55, dyev), in_panel);
+    \\  lum = lum * mix(1.0, 0.55, in_panel);
     \\  gl_FragColor = vec4(col * lum, cov);
     \\}
 ;
@@ -993,6 +1005,7 @@ pub const FieldGrid = struct {
     u_gain: GLint,
     u_mouse: GLint,
     u_dye: GLint,
+    u_panel: GLint,
 };
 
 pub fn initFieldGrid() Error!FieldGrid {
@@ -1055,6 +1068,7 @@ pub fn initFieldGrid() Error!FieldGrid {
         .u_gain = glGetUniformLocation(prog, "uGain"),
         .u_mouse = glGetUniformLocation(prog, "uMouse"),
         .u_dye = glGetUniformLocation(prog, "uDye"),
+        .u_panel = glGetUniformLocation(prog, "uPanel"),
     };
 }
 
@@ -1075,7 +1089,7 @@ pub fn uploadField(fg: *FieldGrid, height: []const f32, dye: []const f32, cols: 
 /// Draw the field grid-intensity. `fr` supplies the ramp texture + cell metrics
 /// (built by initFieldRenderer); `uploadField` must have run this frame.
 /// `mx`,`my` are the cursor in cells (top-down); pass mx<0 for no cursor.
-pub fn drawFieldGrid(fg: *FieldGrid, fr: *FieldRenderer, mx: f32, my: f32, time: f32, vw: i32, vh: i32) void {
+pub fn drawFieldGrid(fg: *FieldGrid, fr: *FieldRenderer, mx: f32, my: f32, time: f32, vw: i32, vh: i32, panel_l: f32, panel_r: f32) void {
     glUseProgram(fg.program);
     glBindBuffer(GL_ARRAY_BUFFER, fg.vbo);
     bindAttrib(fg.a_pos, 2, 2 * @sizeOf(f32), 0);
@@ -1095,6 +1109,7 @@ pub fn drawFieldGrid(fg: *FieldGrid, fr: *FieldRenderer, mx: f32, my: f32, time:
     glUniform2f(fg.u_fieldsize, @floatFromInt(fg.field_w), @floatFromInt(fg.field_h));
     glUniform1f(fg.u_gain, fg.gain);
     glUniform2f(fg.u_mouse, mx, my);
+    glUniform2f(fg.u_panel, panel_l, panel_r);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDrawArrays(GL_TRIANGLES, 0, 3);

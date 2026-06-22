@@ -218,6 +218,13 @@ fn metricsFor(width: i32) Metrics {
     return .{ .rail_x = 0, .col_x = col_x, .col_w = col_w, .lx = col_x + 18, .cw = col_w - 36, .side_x = 0, .wide = false };
 }
 
+/// The content column's x-range (logical px) at a given window width — the panel
+/// the GPU field softens beneath (the glass backdrop blur). Mirrors metricsFor.
+pub fn contentColumn(width: i32) struct { x: i32, w: i32 } {
+    const m = metricsFor(width);
+    return .{ .x = m.col_x, .w = m.col_w };
+}
+
 fn rect(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, w: i32, h: i32, color: u32, radius: u8) !void {
     try dl.append(gpa, .{ .rect = .{
         .x = @intCast(x),
@@ -601,8 +608,28 @@ pub fn layout(
     const m = metricsFor(width);
     if (regions) |rg| rg.clearRetainingCapacity();
 
-    // 1. Feed column readability panel.
-    try rect(gpa, dl, m.col_x, 0, m.col_w, height, veil, 0);
+    // 1. The content column as GLASS floating over the field (P.0, layout layer).
+    //    A soft slab shadow falls off both gutter edges so the column reads as a
+    //    raised plane (the figure/ground fix), then the glass fill, then a 1px lit
+    //    inner edge — the universal "raised surface" cue. (The GPU backdrop blur
+    //    of the field UNDER the glass is the finishing layer on the GPU path.)
+    if (m.wide) {
+        const sw: i32 = 20;
+        const steps: i32 = 5;
+        const step = @divTrunc(sw, steps);
+        var k: i32 = 0;
+        while (k < steps) : (k += 1) {
+            const t = @as(f32, @floatFromInt(steps - k)) / @as(f32, @floatFromInt(steps));
+            const shade: u32 = @as(u32, @intFromFloat(74.0 * t)) << 24; // black, fading out
+            try rect(gpa, dl, m.col_x - (k + 1) * step, 0, step, height, shade, 0); // left gutter
+            try rect(gpa, dl, m.col_x + m.col_w + k * step, 0, step, height, shade, 0); // right gutter
+        }
+    }
+    try rect(gpa, dl, m.col_x, 0, m.col_w, height, veil, 0); // glass fill
+    if (m.wide) {
+        try rect(gpa, dl, m.col_x, 0, 1, height, 0x24EDEAE0, 0); // left lit edge
+        try rect(gpa, dl, m.col_x + m.col_w - 1, 0, 1, height, 0x24EDEAE0, 0); // right lit edge
+    }
 
     // The feed-column TOP BAR (title, tabs, divider, and its frosted box) is
     // drawn LAST — see drawTopBar at the end — so the posts scroll BEHIND it.
@@ -730,11 +757,14 @@ pub fn layout(
             _ = try glyph1(gpa, dl, e, .semibold, ax + @divTrunc(av - iadv, 2), post_top + av_base, bg, init_px, p.initial);
             try emitRegion(gpa, regions, ax, post_top, av, @intCast(av), @intCast(pi), .author);
 
-            // name · handle · age
-            var bx = try str(gpa, dl, e, .semibold, cx, post_top + 17, ink, 17, p.name);
-            bx = try str(gpa, dl, e, .regular, bx + 8, post_top + 17, faint, 14, p.handle);
-            bx = try str(gpa, dl, e, .regular, bx + 7, post_top + 17, faint, 14, "·");
-            _ = try str(gpa, dl, e, .regular, bx + 7, post_top + 17, faint, 14, p.age);
+            // name · handle · age — three weight TIERS, baseline-aligned (P.1):
+            // the name is STRONG (heaviest, brightest, biggest 18px) so the eye
+            // lands there first; handle + · + age are MUTED metadata (faint,
+            // smaller 13px) that recede. Body is the PRIMARY tier below.
+            var bx = try str(gpa, dl, e, .semibold, cx, post_top + 18, ink, 18, p.name);
+            bx = try str(gpa, dl, e, .regular, bx + 9, post_top + 18, faint, 13, p.handle);
+            bx = try str(gpa, dl, e, .regular, bx + 7, post_top + 18, faint, 13, "·");
+            _ = try str(gpa, dl, e, .regular, bx + 7, post_top + 18, faint, 13, p.age);
 
             // "Replying to @x" with a subtle ↳ hook — reads as a threaded reply
             // rather than a standalone post (Twitter/Bluesky parity).

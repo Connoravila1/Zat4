@@ -1826,6 +1826,12 @@ const GpuState = struct {
     /// Eased hover opacity (0→1) so the highlight FADES in/out instead of
     /// snapping — the "hover animation" feel.
     hover_alpha: f32 = 0,
+    /// A like's red dye REVEALED gradually (synced to the spark animation) rather
+    /// than blipping in: while frames>0, advanceField injects a fraction of the
+    /// dye ring at (cx,cy) each step. Defaults so they ride the struct literal.
+    dye_reveal_cx: u32 = 0,
+    dye_reveal_cy: u32 = 0,
+    dye_reveal_frames: u32 = 0,
     /// The animated like-heart pass (SDF fill + pop + star burst), drawn over
     /// the feed for each active like effect this frame.
     heart: gpu.HeartRenderer,
@@ -1973,14 +1979,14 @@ fn pushLikeSplash(gpa: Allocator, gs: *GpuState, gx: u32, gy: u32) void {
     if (gs.cols == 0 or gs.rows == 0) return;
     const sx = @min(gx, gs.cols - 1);
     const sy = @min(gy, gs.rows - 1);
-    // A strong central splash THROWS the wave; two concentric rings of dyed
-    // splashes carry the red OUTWARD on it, so a like visibly shoots out and
-    // ripples — not a faint local blush. [TUNE: amp = wave reach, dye = red.]
-    gs.splashes.append(gpa, .{ .x = sx, .y = sy, .radius = 6, .amp = 3.6, .dye = 1.0 }) catch {};
+    // A strong central splash THROWS the wave; two concentric rings carry it
+    // OUTWARD, so a like visibly shoots out and ripples. The WAVE fires once here
+    // (dye = 0); the RED is faded in separately over the next ~18 steps (armed
+    // below), synced to the spark — so the colour grows in instead of blipping.
+    gs.splashes.append(gpa, .{ .x = sx, .y = sy, .radius = 6, .amp = 3.6, .dye = 0 }) catch {};
     const ring_dist = [_]f32{ 5.0, 9.0 };
     const ring_amp = [_]f32{ 1.8, 1.1 };
-    const ring_dye = [_]f32{ 0.9, 0.6 };
-    for (ring_dist, ring_amp, ring_dye) |dist, amp, dye| {
+    for (ring_dist, ring_amp) |dist, amp| {
         var k: u32 = 0;
         while (k < 8) : (k += 1) {
             const ang = @as(f32, @floatFromInt(k)) * (6.2831853 / 8.0);
@@ -1988,9 +1994,13 @@ fn pushLikeSplash(gpa: Allocator, gs: *GpuState, gx: u32, gy: u32) void {
             const oy: i32 = @intFromFloat(@sin(ang) * dist);
             const rx = std.math.clamp(@as(i32, @intCast(sx)) + ox, 0, @as(i32, @intCast(gs.cols - 1)));
             const ry = std.math.clamp(@as(i32, @intCast(sy)) + oy, 0, @as(i32, @intCast(gs.rows - 1)));
-            gs.splashes.append(gpa, .{ .x = @intCast(rx), .y = @intCast(ry), .radius = 3, .amp = amp, .dye = dye }) catch {};
+            gs.splashes.append(gpa, .{ .x = @intCast(rx), .y = @intCast(ry), .radius = 3, .amp = amp, .dye = 0 }) catch {};
         }
     }
+    // Arm the gradual dye reveal at the like centre.
+    gs.dye_reveal_cx = sx;
+    gs.dye_reveal_cy = sy;
+    gs.dye_reveal_frames = dye_reveal_frames_total;
 }
 
 /// THE single source of truth for the glyph cell size for the CELL-PATH
@@ -2169,7 +2179,33 @@ fn paintFrame(
 /// up while the pointer moved). With the clock gate, idle and active evolve
 /// identically; only the pointer's local splash is injected. Shared by the feed
 /// and composer paint paths so the field animates the same behind both.
-fn advanceField(gs: *GpuState, active: *effect_core.ActiveList) void {
+/// How many sim steps the like's red dye fades in over — ~0.3s at 60 Hz, timed
+/// to land with the heart's spark burst.
+const dye_reveal_frames_total: u32 = 18;
+
+/// Inject one increment (`frac` of the full charge) of a like's dye ring —
+/// centre + two concentric rings — as DYE-ONLY splashes (amp 0), so the red
+/// FADES in across the splat instead of blipping. Mirrors pushLikeSplash's
+/// spatial pattern. A queue-full append is dropped (E4).
+fn injectLikeDye(gpa: Allocator, gs: *GpuState, cx: u32, cy: u32, frac: f32) void {
+    if (gs.cols == 0 or gs.rows == 0) return;
+    gs.splashes.append(gpa, .{ .x = cx, .y = cy, .radius = 6, .amp = 0, .dye = 1.0 * frac }) catch {};
+    const ring_dist = [_]f32{ 5.0, 9.0 };
+    const ring_dye = [_]f32{ 0.9, 0.6 };
+    for (ring_dist, ring_dye) |dist, dye| {
+        var k: u32 = 0;
+        while (k < 8) : (k += 1) {
+            const ang = @as(f32, @floatFromInt(k)) * (6.2831853 / 8.0);
+            const ox: i32 = @intFromFloat(@cos(ang) * dist);
+            const oy: i32 = @intFromFloat(@sin(ang) * dist);
+            const rx = std.math.clamp(@as(i32, @intCast(cx)) + ox, 0, @as(i32, @intCast(gs.cols - 1)));
+            const ry = std.math.clamp(@as(i32, @intCast(cy)) + oy, 0, @as(i32, @intCast(gs.rows - 1)));
+            gs.splashes.append(gpa, .{ .x = @intCast(rx), .y = @intCast(ry), .radius = 3, .amp = 0, .dye = dye * frac }) catch {};
+        }
+    }
+}
+
+fn advanceField(gpa: Allocator, gs: *GpuState, active: *effect_core.ActiveList) void {
     const dt_ns: u64 = 16_666_667; // 1/60 s
     const now_ns = clock_shell.monotonicNanos();
     const due = gs.last_step_nanos == 0 or (now_ns -| gs.last_step_nanos) >= dt_ns;
@@ -2189,6 +2225,14 @@ fn advanceField(gs: *GpuState, active: *effect_core.ActiveList) void {
                 std.math.sin(fy * 0.18 + gs.t * 0.06);
             gs.bias[yy * gs.cols + xx] = amb_amp * (base + 0.5 * fine);
         }
+    }
+    // A like's red DYE is revealed gradually (synced to the spark animation)
+    // rather than blipping in: inject a fraction of the dye ring each step until
+    // the window closes. The wave (the ripple) already fired once in
+    // pushLikeSplash; this only fades the colour in.
+    if (gs.dye_reveal_frames > 0) {
+        injectLikeDye(gpa, gs, gs.dye_reveal_cx, gs.dye_reveal_cy, 1.0 / @as(f32, @floatFromInt(dye_reveal_frames_total)));
+        gs.dye_reveal_frames -= 1;
     }
     // Advance the medium one step; queued splashes injected once.
     glyph_field.step(&gs.field, .{}, gs.splashes.items, gs.bias);
@@ -2239,11 +2283,11 @@ fn paintComposeGpu(
     gpu.feedBuild(&gs.feed, gpa, g.engine, g.draw.slice(), scale) catch {};
     gs.feed_sig = 0; // force a timeline rebuild when the composer closes
 
-    advanceField(gs, g.active);
+    advanceField(gpa, gs, g.active);
 
     gpu.uploadField(&gs.grid, gs.field.height, gs.field.dye, gs.field.cols, gs.field.rows);
     gpu.clear(gpu_clear_r, gpu_clear_g, gpu_clear_b);
-    gpu.drawFieldGrid(&gs.grid, &gs.ramp, gs.mcx, gs.mcy, gs.t, @intCast(w), @intCast(h));
+    gpu.drawFieldGrid(&gs.grid, &gs.ramp, gs.mcx, gs.mcy, gs.t, @intCast(w), @intCast(h), 0, 0); // composer: no panel softening
     gpu.feedDraw(&gs.feed, @intCast(w), @intCast(h));
     gpu.swap(&gs.g);
 }
@@ -2314,12 +2358,17 @@ fn paintFrameGpu(
         gpu.feedBuild(&gs.feed, gpa, g.engine, g.draw.slice(), scale) catch {};
     }
 
-    advanceField(gs, g.active);
+    advanceField(gpa, gs, g.active);
 
     // Render: the living field behind, the feed on top, then swap.
     gpu.uploadField(&gs.grid, gs.field.height, gs.field.dye, gs.field.cols, gs.field.rows);
     gpu.clear(gpu_clear_r, gpu_clear_g, gpu_clear_b);
-    gpu.drawFieldGrid(&gs.grid, &gs.ramp, gs.mcx, gs.mcy, gs.t, @intCast(w), @intCast(h));
+    // Soften the field UNDER the content column (glass backdrop). The feed lays
+    // out at the logical design width; map the column's x-range to physical px.
+    const cc = feed_view.contentColumn(@intCast(design_w));
+    const panel_l = @as(f32, @floatFromInt(cc.x)) * scale;
+    const panel_r = @as(f32, @floatFromInt(cc.x + cc.w)) * scale;
+    gpu.drawFieldGrid(&gs.grid, &gs.ramp, gs.mcx, gs.mcy, gs.t, @intCast(w), @intCast(h), panel_l, panel_r);
     // Hover highlight (post wash + button highlight), BEHIND the feed so the
     // content draws on top — the app feels alive under the cursor.
     drawHoverOverlay(gpa, g, gs, scale, @intCast(w), @intCast(h));
