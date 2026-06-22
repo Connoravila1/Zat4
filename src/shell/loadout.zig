@@ -32,18 +32,38 @@ const lens_socket = @import("../core/lens_socket.zig");
 const lens_catalog = @import("../core/lens_catalog.zig");
 const feed_core = @import("../core/feed.zig");
 
-/// A loaded loadout: the resolved entries (id + color, in saved order) plus
-/// the seated index. Slices live in the arena the caller passed to `load`.
-/// A7.2: cold — one per login.
-pub const Loaded = struct {
-    entries: []const lens_catalog.Entry,
-    seated: u32,
+/// A7.2: cold — one per surface per login. The resolved entries (id + color,
+/// in saved order) + the seated index. Slices live in the caller's arena.
+pub const SurfaceEntries = struct {
+    entries: []const lens_catalog.Entry = &.{},
+    seated: u32 = 0,
 };
 
-/// Read the user's persisted FEED loadout from their repo. Returns null when
-/// there is no record yet (first run) or the read fails — an ordinary result,
-/// so the caller falls back to the catalog default (E4). Entries point into
-/// `arena`.
+/// A7.2: cold — the three per-surface loadouts read from the record.
+pub const Loaded = struct {
+    feed: SurfaceEntries = .{},
+    reply: SurfaceEntries = .{},
+    zone: SurfaceEntries = .{},
+};
+
+/// A surface's loadout as parallel id/color arrays + seated — the form the
+/// background write worker carries (no `LensCard`s). A7.2: cold.
+pub const SurfaceData = struct {
+    ids: []const []const u8 = &.{},
+    colors: []const u8 = &.{},
+    seated: u32 = 0,
+};
+
+fn parseSurface(arena: Allocator, s: lexicon.LoadoutSurface) !SurfaceEntries {
+    const entries = try arena.alloc(lens_catalog.Entry, s.lenses.len);
+    for (s.lenses, 0..) |l, i| entries[i] = .{ .id = l.algo, .color = l.color };
+    return .{ .entries = entries, .seated = s.seated };
+}
+
+/// Read the user's persisted loadout (all three surfaces) from their repo.
+/// Returns null when there is no record yet (first run) or the read fails —
+/// an ordinary result, so the caller falls back to the catalog defaults (E4).
+/// Entries point into `arena`.
 pub fn load(
     gpa: Allocator,
     arena: Allocator,
@@ -66,62 +86,45 @@ pub fn load(
         &params,
         lexicon.GetRecordResponse(lexicon.LoadoutRecord),
     );
-    const resp = switch (outcome) {
-        .ok => |r| r,
-        .failed => return null, // 404 (no record) or any read failure → use the default
+    const v = switch (outcome) {
+        .ok => |r| r.value,
+        .failed => return null, // 404 (no record) or any read failure → use the defaults
     };
-    const lenses = resp.value.feed.lenses;
-    if (lenses.len == 0) return null;
-    const entries = try arena.alloc(lens_catalog.Entry, lenses.len);
-    for (lenses, 0..) |l, i| entries[i] = .{ .id = l.algo, .color = l.color };
-    return .{ .entries = entries, .seated = resp.value.feed.seated };
+    if (v.feed.lenses.len == 0 and v.reply.lenses.len == 0 and v.zone.lenses.len == 0) return null;
+    return .{
+        .feed = try parseSurface(arena, v.feed),
+        .reply = try parseSurface(arena, v.reply),
+        .zone = try parseSurface(arena, v.zone),
+    };
 }
 
-/// Write the current FEED loadout (the live `cards` order + each card's color,
-/// and which is seated) to the user's repo, upserting the singleton record.
-/// `blob` backs the cards' CID spans (the algorithm ids). Best-effort: the
-/// caller swallows failures (a lost save is the next save's problem, E2).
-pub fn save(
-    gpa: Allocator,
-    arena: Allocator,
-    io: std.Io,
-    environ: ?*const std.process.Environ.Map,
-    session: *auth.Session,
-    cards: []const lens_socket.LensCard,
-    blob: []const u8,
-    seated: u32,
-    now_epoch: i64,
-) !void {
-    const ids = try arena.alloc([]const u8, cards.len);
-    const colors = try arena.alloc(u8, cards.len);
-    for (cards, 0..) |c, i| {
-        const end = @min(blob.len, @as(usize, c.cid.off) + c.cid.len);
-        ids[i] = if (c.cid.off <= blob.len) blob[@min(c.cid.off, blob.len)..end] else "";
-        colors[i] = c.color;
-    }
-    return saveEntries(gpa, arena, io, environ, session, ids, colors, seated, now_epoch);
-}
-
-/// Write the feed loadout from parallel id/color arrays — the form the
-/// background write_worker carries (it has no `LensCard`s). `ids[i]` is the
-/// algorithm ref, `colors[i]` its color; both arrays are the same length.
-pub fn saveEntries(
-    gpa: Allocator,
-    arena: Allocator,
-    io: std.Io,
-    environ: ?*const std.process.Environ.Map,
-    session: *auth.Session,
-    ids: []const []const u8,
-    colors: []const u8,
-    seated: u32,
-    now_epoch: i64,
-) !void {
-    const n = @min(ids.len, colors.len);
+fn surfaceOut(arena: Allocator, s: SurfaceData) !lexicon.LoadoutSurfaceOut {
+    const n = @min(s.ids.len, s.colors.len);
     const lenses = try arena.alloc(lexicon.LoadoutLensOut, n);
-    for (0..n) |i| lenses[i] = .{ .algo = ids[i], .color = colors[i] };
+    for (0..n) |i| lenses[i] = .{ .algo = s.ids[i], .color = s.colors[i] };
+    return .{ .lenses = lenses, .seated = s.seated };
+}
+
+/// Write all three surface loadouts to the user's repo, upserting the
+/// singleton record. Always writes the full record (the three surfaces are
+/// one document — a partial write would clobber the others). Best-effort:
+/// the caller swallows failures (a lost save is the next save's problem, E2).
+pub fn saveAll(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    session: *auth.Session,
+    feed: SurfaceData,
+    reply: SurfaceData,
+    zone: SurfaceData,
+    now_epoch: i64,
+) !void {
     var ts_buf: [24]u8 = undefined;
     const record = lexicon.LoadoutRecordOut{
-        .feed = .{ .lenses = lenses, .seated = seated },
+        .feed = try surfaceOut(arena, feed),
+        .reply = try surfaceOut(arena, reply),
+        .zone = try surfaceOut(arena, zone),
         .createdAt = feed_core.formatTimestamp(&ts_buf, now_epoch),
     };
     const input = lexicon.PutRecordInput(@TypeOf(record)){

@@ -69,13 +69,11 @@ pub const Request = struct {
     /// so the worker reads no clock of its own for this value.
     now: i64,
 
-    /// For a `.loadout` write only: the feed loadout to persist — parallel
-    /// id/color arrays (owned copies) + the seated index. Empty otherwise.
-    /// This is why the freeze went away: the loadout `putRecord` runs HERE,
-    /// off the UI loop, instead of blocking it on tray-close.
-    loadout_ids: []const []const u8 = &.{},
-    loadout_colors: []const u8 = &.{},
-    loadout_seated: u32 = 0,
+    /// For a `.loadout` write only: the three per-surface loadouts to persist
+    /// (feed, reply, zone), as owned id/color arrays. Empty otherwise. This is
+    /// why the freeze went away: the loadout `putRecord` runs HERE, off the UI
+    /// loop, instead of blocking it on tray-close. Indices: 0=feed,1=reply,2=zone.
+    loadout: [3]loadout_store.SurfaceData = .{ .{}, .{}, .{} },
 
     pub const Kind = enum(u8) { like, unlike, repost, unrepost, loadout };
 };
@@ -111,9 +109,11 @@ fn freeRequest(gpa: Allocator, r: Request) void {
     gpa.free(r.subject_uri);
     gpa.free(r.subject_cid);
     gpa.free(r.record_uri);
-    for (r.loadout_ids) |id| gpa.free(id);
-    gpa.free(r.loadout_ids);
-    gpa.free(r.loadout_colors);
+    for (r.loadout) |surf| {
+        for (surf.ids) |id| gpa.free(id);
+        gpa.free(surf.ids);
+        gpa.free(surf.colors);
+    }
 }
 
 pub fn freeResult(gpa: Allocator, r: Result) void {
@@ -244,25 +244,46 @@ pub fn submit(
     return true;
 }
 
-/// Enqueue a loadout persist (the feed loadout's id/color order + seated).
-/// Copies the ids/colors into gpa, so the caller may free its originals
-/// immediately. Fire-and-forget — no result is posted (a lost save is the
-/// next save's problem, E2). Returns false only on OOM.
-pub fn submitLoadout(worker: *Worker, ids: []const []const u8, colors: []const u8, seated: u32, now: i64) bool {
-    const gpa = worker.gpa;
-    const n = @min(ids.len, colors.len);
-    const ids_c = gpa.alloc([]const u8, n) catch return false;
+/// Deep-copy a surface's id/color arrays into gpa (owned by the request).
+/// Returns the owned copy, or null on OOM (caller aborts + cleans up).
+fn dupeSurface(gpa: Allocator, s: loadout_store.SurfaceData) ?loadout_store.SurfaceData {
+    const n = @min(s.ids.len, s.colors.len);
+    const ids_c = gpa.alloc([]const u8, n) catch return null;
     var i: usize = 0;
     while (i < n) : (i += 1) {
-        ids_c[i] = gpa.dupe(u8, ids[i]) catch {
-            for (ids_c[0..i]) |s| gpa.free(s);
+        ids_c[i] = gpa.dupe(u8, s.ids[i]) catch {
+            for (ids_c[0..i]) |x| gpa.free(x);
             gpa.free(ids_c);
-            return false;
+            return null;
         };
     }
-    const colors_c = gpa.dupe(u8, colors[0..n]) catch {
-        for (ids_c[0..n]) |s| gpa.free(s);
+    const colors_c = gpa.dupe(u8, s.colors[0..n]) catch {
+        for (ids_c[0..n]) |x| gpa.free(x);
         gpa.free(ids_c);
+        return null;
+    };
+    return .{ .ids = ids_c, .colors = colors_c, .seated = s.seated };
+}
+
+fn freeSurface(gpa: Allocator, s: loadout_store.SurfaceData) void {
+    for (s.ids) |id| gpa.free(id);
+    gpa.free(s.ids);
+    gpa.free(s.colors);
+}
+
+/// Enqueue a loadout persist — all three per-surface loadouts at once (the
+/// record is one document). Copies the ids/colors into gpa, so the caller may
+/// free its originals immediately. Fire-and-forget (E2). False only on OOM.
+pub fn submitLoadout(worker: *Worker, feed: loadout_store.SurfaceData, reply: loadout_store.SurfaceData, zone: loadout_store.SurfaceData, now: i64) bool {
+    const gpa = worker.gpa;
+    const f = dupeSurface(gpa, feed) orelse return false;
+    const r = dupeSurface(gpa, reply) orelse {
+        freeSurface(gpa, f);
+        return false;
+    };
+    const z = dupeSurface(gpa, zone) orelse {
+        freeSurface(gpa, f);
+        freeSurface(gpa, r);
         return false;
     };
     // The post fields are unused for a loadout write; empty slices free as a
@@ -274,9 +295,7 @@ pub fn submitLoadout(worker: *Worker, ids: []const []const u8, colors: []const u
         .subject_cid = "",
         .record_uri = "",
         .now = now,
-        .loadout_ids = ids_c,
-        .loadout_colors = colors_c,
-        .loadout_seated = seated,
+        .loadout = .{ f, r, z },
     };
     if (!worker.inbox.push(gpa, req)) {
         freeRequest(gpa, req);
@@ -372,7 +391,7 @@ fn processOne(worker: *Worker, req: Request) void {
     // Loadout persist: fire-and-forget, no result to match back (it has no
     // optimistic UI state to reconcile). Done here so the UI never blocks.
     if (req.kind == .loadout) {
-        loadout_store.saveEntries(gpa, arena, worker.io, worker.environ, worker.session, req.loadout_ids, req.loadout_colors, req.loadout_seated, req.now) catch {};
+        loadout_store.saveAll(gpa, arena, worker.io, worker.environ, worker.session, req.loadout[0], req.loadout[1], req.loadout[2], req.now) catch {};
         return;
     }
 

@@ -357,48 +357,74 @@ pub fn run(
     var gcontent_h: i32 = 0;
     var gregions: feed_view.Regions = .empty;
     defer gregions.deinit(gpa);
-    // THE LENS SOCKET state, living across frames in run(). The placeholder
-    // tray (cards + text blob) is built once and owned here, so the CID
-    // slices the socket emits into `gsocket_hits` stay valid into the next
-    // frame's click test (B-split: persistent, not per-frame arena). Real
-    // algorithms are a later track; for now seating re-tints + animates but
-    // does not yet re-rank the feed (only Following exists).
+    // THE LENS SOCKET loadouts — THREE surfaces (feed / reply / zone),
+    // SOCKET_LOADOUT §10. The FEED surface is interactive in the home header;
+    // reply/zone are held so a save writes the whole record without clobbering
+    // them (the loadout PAGE makes them editable). Cards + blob are gpa-owned
+    // so the CID slices the socket emits stay valid across frames (B-split).
     var empty_cards = [_]lens_socket.LensCard{};
     var socket_cards: []lens_socket.LensCard = &empty_cards;
     var socket_blob: []const u8 = "";
     var gseated: u32 = 0;
-    // Phase 1b — restore the user's PERSISTED feed loadout (order, colors,
-    // seated) from `app.zat4.socket.loadout`. Absent (first run) or a failed
-    // read falls back to the catalog default, which we then write so the
-    // record exists going forward. The seam stays clean: this is the one
-    // place the tray's SOURCE is chosen (placeholder → record).
+    var reply_cards: []lens_socket.LensCard = &empty_cards;
+    var reply_blob: []const u8 = "";
+    var reply_seated: u32 = 0;
+    var zone_cards: []lens_socket.LensCard = &empty_cards;
+    var zone_blob: []const u8 = "";
+    var zone_seated: u32 = 0;
+    // Restore the persisted loadouts from `app.zat4.socket.loadout`; absent
+    // (first run) or a failed read falls back to the catalog defaults, which
+    // we then write so the record exists going forward.
     {
         var load_arena = std.heap.ArenaAllocator.init(gpa);
         defer load_arena.deinit();
         const loaded: ?loadout_store.Loaded = loadout_store.load(gpa, load_arena.allocator(), io, environ, session) catch null;
         if (loaded) |ld| {
-            if (lens_catalog.loadoutFromEntries(gpa, ld.entries)) |t| {
-                socket_cards = t[0];
-                socket_blob = t[1];
-                gseated = ld.seated;
-            } else |_| {}
+            buildSurfaceFromEntries(gpa, ld.feed, &socket_cards, &socket_blob, &gseated);
+            buildSurfaceFromEntries(gpa, ld.reply, &reply_cards, &reply_blob, &reply_seated);
+            buildSurfaceFromEntries(gpa, ld.zone, &zone_cards, &zone_blob, &zone_seated);
         }
-        if (socket_cards.len == 0) {
-            if (buildHomeTray(gpa)) |t| {
-                socket_cards = t[0];
-                socket_blob = t[1];
-                gseated = lens_catalog.default_feed_seated;
-                // First run: persist the default so the record exists.
-                loadout_store.save(gpa, load_arena.allocator(), io, environ, session, socket_cards, socket_blob, gseated, clock_shell.unixSeconds()) catch {};
-            } else |_| {}
+        // Any surface that didn't resolve from the record → its catalog default.
+        if (socket_cards.len == 0) if (lens_catalog.defaultFeedLoadout(gpa)) |t| {
+            socket_cards = t[0];
+            socket_blob = t[1];
+            gseated = lens_catalog.default_feed_seated;
+        } else |_| {};
+        if (reply_cards.len == 0) if (lens_catalog.defaultReplyLoadout(gpa)) |t| {
+            reply_cards = t[0];
+            reply_blob = t[1];
+            reply_seated = lens_catalog.default_reply_seated;
+        } else |_| {};
+        if (zone_cards.len == 0) if (lens_catalog.defaultZoneLoadout(gpa)) |t| {
+            zone_cards = t[0];
+            zone_blob = t[1];
+            zone_seated = lens_catalog.default_zone_seated;
+        } else |_| {};
+        // First run (no record): persist the defaults once (synchronous here is
+        // fine — it's startup, before the loop).
+        if (loaded == null) {
+            loadout_store.saveAll(
+                gpa,
+                load_arena.allocator(),
+                io,
+                environ,
+                session,
+                surfaceDataOf(load_arena.allocator(), socket_cards, socket_blob, gseated),
+                surfaceDataOf(load_arena.allocator(), reply_cards, reply_blob, reply_seated),
+                surfaceDataOf(load_arena.allocator(), zone_cards, zone_blob, zone_seated),
+                clock_shell.unixSeconds(),
+            ) catch {};
         }
     }
     if (socket_cards.len > 0) gseated = @min(gseated, @as(u32, @intCast(socket_cards.len - 1)));
     defer if (socket_cards.len > 0) gpa.free(socket_cards);
     defer if (socket_blob.len > 0) gpa.free(socket_blob);
-    // Set when the loadout changes (recolor / reorder / seat); the change is
-    // flushed to the PDS when the tray closes (a natural "done editing" beat),
-    // so editing never blocks per-click. (A worker offload is a later option.)
+    defer if (reply_cards.len > 0) gpa.free(reply_cards);
+    defer if (reply_blob.len > 0) gpa.free(reply_blob);
+    defer if (zone_cards.len > 0) gpa.free(zone_cards);
+    defer if (zone_blob.len > 0) gpa.free(zone_blob);
+    // Set when the loadout changes (recolor / reorder / seat); flushed to the
+    // background worker when the tray closes (so editing never blocks).
     var loadout_dirty = false;
     var socket_was_open = false;
     var gsocket_ui: lens_socket.SocketUi = .{};
@@ -705,15 +731,16 @@ pub fn run(
         // are slices into socket_blob; submitLoadout dupes them.
         if (socket_was_open and !gsocket_ui.open and loadout_dirty) {
             if (writer) |w| {
-                var ids_buf: [lens_socket.max_lenses][]const u8 = undefined;
-                var cols_buf: [lens_socket.max_lenses]u8 = undefined;
-                const m = @min(socket_cards.len, lens_socket.max_lenses);
-                for (socket_cards[0..m], 0..) |c, i| {
-                    const end = @min(socket_blob.len, @as(usize, c.cid.off) + c.cid.len);
-                    ids_buf[i] = if (c.cid.off <= socket_blob.len) socket_blob[@min(c.cid.off, socket_blob.len)..end] else "";
-                    cols_buf[i] = c.color;
-                }
-                _ = write_worker.submitLoadout(w, ids_buf[0..m], cols_buf[0..m], gseated, now);
+                // Write the WHOLE record (all three surfaces) so the feed save
+                // doesn't clobber reply/zone. ids slice into each surface's blob;
+                // submitLoadout dupes them onto the worker.
+                _ = write_worker.submitLoadout(
+                    w,
+                    surfaceDataOf(arena, socket_cards, socket_blob, gseated),
+                    surfaceDataOf(arena, reply_cards, reply_blob, reply_seated),
+                    surfaceDataOf(arena, zone_cards, zone_blob, zone_seated),
+                    now,
+                );
             }
             loadout_dirty = false;
         }
@@ -1919,14 +1946,30 @@ fn revertEngagement(kind: Engagement, store: *feed_core.Store, cid: []const u8) 
 /// the UI (every glyph a physics cell); active are the playing effects;
 /// particles the transient agents; hr the click map; view the
 /// scroll/selection; spawn_buf scratch for the events effects emit.
-/// Build the home socket's tray. Today this is the default FEED loadout from
-/// the built-in catalog (lens_catalog) — the onboarding-equipped default
-/// (Zat4 Discover · Following · Zat4 Private Discover) until Phase 1b reads
-/// the user's persisted `app.zat4.socket.loadout` record. Returns mutable
-/// cards (recolor/reorder edit them in place) + the text blob their spans
-/// point into; the caller owns and frees both.
-fn buildHomeTray(gpa: Allocator) !struct { []lens_socket.LensCard, []const u8 } {
-    return lens_catalog.defaultFeedLoadout(gpa);
+/// Resolve a persisted surface (id/color entries → gpa-owned cards + blob) via
+/// the catalog. No-op when the surface has no entries (caller then uses the
+/// default). Sets `cards`/`blob`/`seated` on success.
+fn buildSurfaceFromEntries(gpa: Allocator, se: loadout_store.SurfaceEntries, cards: *[]lens_socket.LensCard, blob: *[]const u8, seated: *u32) void {
+    if (se.entries.len == 0) return;
+    if (lens_catalog.loadoutFromEntries(gpa, se.entries)) |t| {
+        cards.* = t[0];
+        blob.* = t[1];
+        seated.* = se.seated;
+    } else |_| {}
+}
+
+/// Extract a surface's persist form (parallel id/color arrays + seated) from
+/// its live cards + blob, into `arena`. The ids are slices into `blob`; the
+/// caller (worker submit / saveAll) copies them as needed.
+fn surfaceDataOf(arena: Allocator, cards: []const lens_socket.LensCard, blob: []const u8, seated: u32) loadout_store.SurfaceData {
+    const ids = arena.alloc([]const u8, cards.len) catch return .{};
+    const colors = arena.alloc(u8, cards.len) catch return .{};
+    for (cards, 0..) |c, i| {
+        const end = @min(blob.len, @as(usize, c.cid.off) + c.cid.len);
+        ids[i] = if (c.cid.off <= blob.len) blob[@min(c.cid.off, blob.len)..end] else "";
+        colors[i] = c.color;
+    }
+    return .{ .ids = ids, .colors = colors, .seated = seated };
 }
 
 /// Index of the card whose CID equals `cid` (a slice into `blob`), or null.

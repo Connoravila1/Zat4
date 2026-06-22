@@ -53,40 +53,76 @@ const Builtin = struct {
     flags: lens_socket.LensFlags,
 };
 
-/// The default FEED loadout the app ships with — three lenses, in tray order
-/// (index 0 = front). Following is the honest "nothing shaping you" option;
-/// Zat4 Discover is the well-rounded adaptive default (Twitter-like, learns
-/// ON-DEVICE); Zat4 Private Discover is well-rounded with ZERO behavioral
-/// data. This is the onboarding-equipped default until the user edits it.
-pub const feed_builtins = [_]Builtin{
-    .{
-        .id = "zat4:discover",
-        .name = "Zat4 Discover",
-        .ranks = "engagement + topics",
-        .desc = "The well-rounded default: a strong, Twitter-style feed that learns what you engage with — on your device, never sent anywhere.",
-        .color = 0, // amber (house accent)
-        .flags = .{ .learns = true, .is_default = true },
-    },
-    .{
-        .id = "zat4:following",
-        .name = "Following",
-        .ranks = "chronological",
-        .desc = "Plain reverse-chronological of the accounts you follow. No scoring, no suggestions — nothing shaping you.",
-        .color = 2, // grey (neutral = no shaping)
-        .flags = .{ .is_default = true },
-    },
-    .{
-        .id = "zat4:private-discover",
-        .name = "Zat4 Private Discover",
-        .ranks = "popularity + topics",
-        .desc = "Surfaces strong posts beyond your follows, well-rounded — with ZERO behavioral data. Candidate-side only.",
-        .color = 1, // blue (the calm/private tier)
-        .flags = .{},
-    },
+// The first-party algorithms, named once so the per-surface default loadouts
+// below can compose them. Most Recent / Most Liked / Calm are the simplest
+// configs in the one config space (SOCKET_LOADOUT §2), not a separate tier.
+const b_discover = Builtin{
+    .id = "zat4:discover",
+    .name = "Zat4 Discover",
+    .ranks = "engagement + topics",
+    .desc = "The well-rounded default: a strong, Twitter-style feed that learns what you engage with — on your device, never sent anywhere.",
+    .color = 0, // amber (house accent)
+    .flags = .{ .learns = true, .is_default = true },
+};
+const b_following = Builtin{
+    .id = "zat4:following",
+    .name = "Following",
+    .ranks = "chronological",
+    .desc = "Plain reverse-chronological of the accounts you follow. No scoring, no suggestions — nothing shaping you.",
+    .color = 2, // grey (neutral = no shaping)
+    .flags = .{ .is_default = true },
+};
+const b_private = Builtin{
+    .id = "zat4:private-discover",
+    .name = "Zat4 Private Discover",
+    .ranks = "popularity + topics",
+    .desc = "Surfaces strong posts beyond your follows, well-rounded — with ZERO behavioral data. Candidate-side only.",
+    .color = 1, // blue (the calm/private tier)
+    .flags = .{},
+};
+const b_most_recent = Builtin{
+    .id = "zat4:most-recent",
+    .name = "Most Recent",
+    .ranks = "newest first",
+    .desc = "Chronological — the latest replies first. No scoring, no behavioral data.",
+    .color = 2, // grey
+    .flags = .{ .is_default = true },
+};
+const b_most_liked = Builtin{
+    .id = "zat4:most-liked",
+    .name = "Most Liked",
+    .ranks = "by likes",
+    .desc = "The most-liked replies first. A simple popularity sort; no behavioral data.",
+    .color = 5, // rose
+    .flags = .{},
+};
+const b_calm = Builtin{
+    .id = "zat4:calm",
+    .name = "Calm",
+    .ranks = "low-velocity first",
+    .desc = "Down-ranks pile-ons and high-velocity threads. Candidate-side only; no behavioral data.",
+    .color = 7, // teal
+    .flags = .{},
 };
 
-/// Default seated index into `feed_builtins` — the adaptive Zat4 Discover.
+/// Every distinct built-in — what `findById` resolves a persisted ref against.
+const all_builtins = [_]Builtin{ b_discover, b_following, b_private, b_most_recent, b_most_liked, b_calm };
+
+/// The default FEED loadout (onboarding-equipped, editable after): the
+/// adaptive Zat4 Discover (seated), honest Following, and the zero-behavioral
+/// Zat4 Private Discover.
+pub const feed_builtins = [_]Builtin{ b_discover, b_following, b_private };
 pub const default_feed_seated: u32 = 0;
+
+/// Default REPLY loadout: Most Recent (seated) + Most Liked. Threading
+/// (structure) is a SEPARATE adjacent control, never a tray lens (invariants
+/// 13/14), so it is not in this list.
+pub const reply_builtins = [_]Builtin{ b_most_recent, b_most_liked };
+pub const default_reply_seated: u32 = 0;
+
+/// Default ZONE loadout: Zat4 Discover (seated) + Calm.
+pub const zone_builtins = [_]Builtin{ b_discover, b_calm };
+pub const default_zone_seated: u32 = 0;
 
 /// Build a `TrayView` (mutable cards + the text blob their spans point into)
 /// from a built-in catalog slice, into `gpa` (caller owns and frees both).
@@ -113,14 +149,20 @@ pub fn loadoutFrom(gpa: Allocator, builtins: []const Builtin) !struct { []lens_s
     return .{ cards, try blob.toOwnedSlice(gpa) };
 }
 
-/// The default feed loadout (the three first-party lenses above).
+/// The default per-surface loadouts (the first-party lenses for each).
 pub fn defaultFeedLoadout(gpa: Allocator) !struct { []lens_socket.LensCard, []const u8 } {
     return loadoutFrom(gpa, &feed_builtins);
+}
+pub fn defaultReplyLoadout(gpa: Allocator) !struct { []lens_socket.LensCard, []const u8 } {
+    return loadoutFrom(gpa, &reply_builtins);
+}
+pub fn defaultZoneLoadout(gpa: Allocator) !struct { []lens_socket.LensCard, []const u8 } {
+    return loadoutFrom(gpa, &zone_builtins);
 }
 
 /// The built-in catalog entry for a stable id (e.g. "zat4:discover"), or null.
 pub fn findById(id: []const u8) ?Builtin {
-    for (feed_builtins) |b| {
+    for (all_builtins) |b| {
         if (std.mem.eql(u8, b.id, id)) return b;
     }
     return null;

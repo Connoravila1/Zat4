@@ -458,6 +458,8 @@ pub const LoadoutSurfaceOut = struct {
 pub const LoadoutRecordOut = struct {
     @"$type": []const u8 = collection.loadout,
     feed: LoadoutSurfaceOut,
+    reply: LoadoutSurfaceOut,
+    zone: LoadoutSurfaceOut,
     createdAt: []const u8,
 };
 
@@ -474,6 +476,8 @@ pub const LoadoutSurface = struct {
 // A7.2: cold parse target, size guard waived.
 pub const LoadoutRecord = struct {
     feed: LoadoutSurface = .{},
+    reply: LoadoutSurface = .{},
+    zone: LoadoutSurface = .{},
     createdAt: []const u8 = "",
 };
 
@@ -533,8 +537,11 @@ test "round-trip: a loadout record (write type → JSON → read type) preserves
         .{ .algo = "zat4:following", .color = 5 }, // user recolored
         .{ .algo = "zat4:private-discover", .color = 1 },
     };
+    const reply_lenses = [_]LoadoutLensOut{.{ .algo = "zat4:most-recent", .color = 2 }};
     const out = LoadoutRecordOut{
         .feed = .{ .lenses = &lenses, .seated = 2 },
+        .reply = .{ .lenses = &reply_lenses, .seated = 0 },
+        .zone = .{ .lenses = &.{}, .seated = 0 },
         .createdAt = "2026-06-22T09:00:00Z",
     };
     // Serialize the WRITE type, parse back as the READ type (the real wire path).
@@ -542,6 +549,9 @@ test "round-trip: a loadout record (write type → JSON → read type) preserves
     const back = try std.json.parseFromSliceLeaky(LoadoutRecord, arena, json, .{ .ignore_unknown_fields = true });
     try testing.expectEqual(@as(usize, 3), back.feed.lenses.len);
     try testing.expectEqual(@as(u32, 2), back.feed.seated);
+    try testing.expectEqual(@as(usize, 1), back.reply.lenses.len);
+    try testing.expectEqualStrings("zat4:most-recent", back.reply.lenses[0].algo);
+    try testing.expectEqual(@as(usize, 0), back.zone.lenses.len);
     try testing.expectEqualStrings("zat4:following", back.feed.lenses[1].algo);
     try testing.expectEqual(@as(u8, 5), back.feed.lenses[1].color);
     // The $type discriminator rides the wire.
