@@ -441,6 +441,9 @@ pub fn run(
     // Previous frame's screen — flush the loadout when LEAVING the page (the
     // page's sockets are always open, so there's no tray-close beat there).
     var prev_screen: u8 = 0;
+    // The active sub-tab on the Algorithms page: 0 = Loadout, 1 = Marketplace,
+    // 2 = Create (the latter two are placeholders for now).
+    var gloadout_tab: u8 = 0;
     // The active top-level Screen (index into feed_view.nav_labels); the rail
     // sets it on a click. 0 = Home (the feed). Lives across frames in run().
     var gscreen: u8 = 0;
@@ -764,7 +767,7 @@ pub fn run(
         // pix exists exactly when a window backend has a live engine; the
         // composer and profile screens stay on the cell path this cut
         // (their pixel port is the recorded next slice).
-        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = home_tray, .socket_ui = gsocket_ui, .socket_hits = &gsocket_hits, .accent = lens_socket.seatedAccent(home_tray), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits } else null;
+        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = home_tray, .socket_ui = gsocket_ui, .socket_hits = &gsocket_hits, .accent = lens_socket.seatedAccent(home_tray), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab } else null;
         switch (mode) {
             .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status),
             .compose => {
@@ -1139,6 +1142,8 @@ pub fn run(
                                                 profile_target_did = session.did;
                                                 profile_dirty = true;
                                             }
+                                            // Each screen starts at the top (scroll is shared).
+                                            gscroll_px = 0;
                                         },
                                         // Avatar tap → open THAT author's profile (any author;
                                         // the DID comes from the post's at-uri). A query over
@@ -1251,6 +1256,11 @@ pub fn run(
                                         // profile tabs; their regions exist so hover
                                         // can highlight them and a later slice wires
                                         // them. A tap is a no-op for now.
+                                        // Algorithms-page sub-tab (Loadout / Marketplace / Create).
+                                        .loadout_tab => {
+                                            gloadout_tab = @intCast(hit.post);
+                                            gscroll_px = 0; // top of the newly-selected tab
+                                        },
                                         .bookmark, .share, .more, .profile_tab => {},
                                     }
                                 } else if (field_ui.hitTest(cx, cy, g.hr.slice())) |hit| {
@@ -2155,6 +2165,8 @@ const Grid = struct {
     zone_tray: lens_socket.TrayView = .{ .cards = &.{}, .text = "", .seated = 0 },
     zone_ui: lens_socket.SocketUi = .{},
     zone_hits: *lens_socket.HitList = undefined,
+    /// The active Algorithms-page sub-tab (0 Loadout / 1 Marketplace / 2 Create).
+    loadout_tab: u8 = 0,
     /// The GPU render path, present only when `gpu.init` succeeded on this
     /// window (else null → the software path renders, the rule's fallback).
     /// A pointer into run()'s `gpu_state` local; one-frame contract like the
@@ -2548,7 +2560,7 @@ fn paintFrame(
             const feed_posts = feed_view.fromTimeline(arena, view_items, now) catch &[_]feed_view.PostView{};
             if (g.screen.* == feed_view.screen_loadout) {
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
-                feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits) catch {};
+                g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits) catch g.content_h.*;
             } else {
                 g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits) catch g.content_h.*;
             }
@@ -2772,8 +2784,7 @@ fn paintFrameGpu(
         if (g.screen.* == feed_view.screen_loadout) {
             // The loadout page: three stacked sockets, its own render path.
             const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
-            feed_view.layoutLoadout(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits) catch {};
-            g.content_h.* = @intCast(lh);
+            g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits) catch g.content_h.*;
         } else {
             // skip_heart=true on every screen: the SDF heart pass (drawEngagementHearts,
             // below) draws the heart in place for each visible like button of the

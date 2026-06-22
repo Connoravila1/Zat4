@@ -67,7 +67,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// `compose` (the New-post button) route navigation rather than engagement.
 /// `compose_send` / `compose_cancel` are the premium composer's footer buttons
 /// (the shell turns a tap into the same control byte the keyboard sends).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab };
 
 /// The six top-level rail destinations, in order. The `Screen` index a nav
 /// region carries is an index into this. Shared by the rail (draw + hit) and
@@ -499,13 +499,30 @@ fn iconGear(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, s: i32, c: u32
     try rect(gpa, dl, cx - fxi(f * 0.09), cy - fxi(f * 0.09), fxi(f * 0.18), fxi(f * 0.18), c, @intCast(fxi(f * 0.09)));
 }
 
+/// Sliders / equalizer — "Algorithms" (tuning your lenses). Three rails, each
+/// with a knob at a different position, so it reads as adjustable controls.
+fn iconAlgorithms(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, s: i32, c: u32) !void {
+    const f: f32 = @floatFromInt(s);
+    const x0 = x + fxi(f * 0.10);
+    const x1 = x + fxi(f * 0.90);
+    const kr = @max(3, fxi(f * 0.16));
+    const rows = [_]f32{ 0.24, 0.5, 0.76 };
+    const knobs = [_]f32{ 0.66, 0.34, 0.58 };
+    for (rows, knobs) |ry, kx| {
+        const yy = y + fxi(f * ry);
+        try line(gpa, dl, x0, yy, x1, yy, c, 2);
+        const cx = x + fxi(f * kx);
+        try rect(gpa, dl, cx - @divTrunc(kr, 2), yy - @divTrunc(kr, 2), kr, kr, c, @intCast(@divTrunc(kr, 2)));
+    }
+}
+
 fn navIcon(idx: usize, gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, s: i32, c: u32) !void {
     switch (idx) {
         0 => try iconHome(gpa, dl, x, y, s, c),
         1 => try iconSearch(gpa, dl, x, y, s, c),
         2 => try iconHeartHollow(gpa, dl, x, y, s, c),
         3 => try iconReply(gpa, dl, x, y, s, c),
-        4 => try iconPerson(gpa, dl, x, y, s, c),
+        4 => try iconAlgorithms(gpa, dl, x, y, s, c), // the "Algorithms" loadout page
         else => try iconGear(gpa, dl, x, y, s, c),
     }
 }
@@ -1058,6 +1075,10 @@ pub fn layoutCompose(
 /// is the SAME portable widget; only the tray/ui/hits differ per surface
 /// (invariant 12). A separate entry point (like layoutCompose) so `layout`'s
 /// signature stays lean. Each surface's tap targets go to its own hit list.
+/// Loadout-page sub-tabs (the row under the title). Loadout is built; the
+/// other two are placeholders for later tracks.
+pub const loadout_tabs = [_][]const u8{ "Loadout", "Marketplace", "Create" };
+
 pub fn layoutLoadout(
     gpa: Allocator,
     e: *const text.Engine,
@@ -1066,6 +1087,8 @@ pub fn layoutLoadout(
     dl: *raster.DrawList,
     regions: ?*Regions,
     accent: u32,
+    scroll: i32, // pixel scroll (≤ 0); the socket stack rides under the sticky header
+    tab: u8, // 0 = Loadout, 1 = Marketplace, 2 = Create
     feed_tray: lens_socket.TrayView,
     feed_ui: lens_socket.SocketUi,
     feed_hits: *lens_socket.HitList,
@@ -1075,9 +1098,13 @@ pub fn layoutLoadout(
     zone_tray: lens_socket.TrayView,
     zone_ui: lens_socket.SocketUi,
     zone_hits: *lens_socket.HitList,
-) error{OutOfMemory}!void {
+) error{OutOfMemory}!i32 {
     const m = metricsFor(width);
     if (regions) |rg| rg.clearRetainingCapacity();
+    // Sockets are only built (and so only hit-testable) on the Loadout tab.
+    feed_hits.clearRetainingCapacity();
+    reply_hits.clearRetainingCapacity();
+    zone_hits.clearRetainingCapacity();
 
     // Glass column over the field + the flanking chrome (desktop three-pane).
     try rect(gpa, dl, m.col_x, 0, m.col_w, height, veil, 0);
@@ -1088,29 +1115,51 @@ pub fn layoutLoadout(
         try drawSidebar(gpa, dl, e, m.side_x, height);
     }
 
-    // Header.
-    try rect(gpa, dl, m.col_x, 0, m.col_w, 92, header_veil, 0);
-    _ = try str(gpa, dl, e, .semibold, m.lx, 50, ink, 27, "Algorithms");
-    _ = try str(gpa, dl, e, .regular, m.lx, 76, muted, 13, "Your lenses for each surface \u{00B7} tap to seat \u{00B7} drag to reorder \u{00B7} tap a swatch to recolor");
-    try rect(gpa, dl, m.col_x, 98, m.col_w, 1, divider, 0);
+    const header_h: i32 = 130;
+    const content_top: i32 = header_h + 10;
+    var content_h: i32 = content_top;
 
-    // The three sockets, stacked and forced open for editing.
-    const Surface = struct { label: []const u8, tray: lens_socket.TrayView, ui: lens_socket.SocketUi, hits: *lens_socket.HitList };
-    const surfaces = [_]Surface{
-        .{ .label = "FEED", .tray = feed_tray, .ui = feed_ui, .hits = feed_hits },
-        .{ .label = "REPLIES", .tray = reply_tray, .ui = reply_ui, .hits = reply_hits },
-        .{ .label = "ZONES", .tray = zone_tray, .ui = zone_ui, .hits = zone_hits },
-    };
-    var y: i32 = 116;
-    for (surfaces) |s| {
-        s.hits.clearRetainingCapacity();
-        _ = try str(gpa, dl, e, .semibold, m.lx, y, faint, 12, s.label);
-        y += 14;
-        var ui = s.ui;
-        ui.open = true; // always open on this page
-        const h = try lens_socket.build(gpa, e, s.tray, ui, .{ .x = m.lx, .y = y, .w = m.cw, .scale = 1.0 }, dl, s.hits);
-        y += h + 26;
+    // The active sub-view, drawn FIRST + scrolled so it passes under the sticky
+    // header (drawn last). Only the Loadout tab scrolls / has sockets.
+    if (tab == 0) {
+        const Surface = struct { label: []const u8, tray: lens_socket.TrayView, ui: lens_socket.SocketUi, hits: *lens_socket.HitList };
+        const surfaces = [_]Surface{
+            .{ .label = "FEED", .tray = feed_tray, .ui = feed_ui, .hits = feed_hits },
+            .{ .label = "REPLIES", .tray = reply_tray, .ui = reply_ui, .hits = reply_hits },
+            .{ .label = "ZONES", .tray = zone_tray, .ui = zone_ui, .hits = zone_hits },
+        };
+        var y: i32 = content_top + scroll;
+        for (surfaces) |s| {
+            _ = try str(gpa, dl, e, .semibold, m.lx, y + 4, faint, 12, s.label);
+            y += 18;
+            var ui = s.ui;
+            ui.open = true; // always open on this page
+            const sh = try lens_socket.build(gpa, e, s.tray, ui, .{ .x = m.lx, .y = y, .w = m.cw, .scale = 1.0 }, dl, s.hits);
+            y += sh + 28;
+        }
+        content_h = (y - scroll) + 20; // total (unscrolled) height for scroll clamping
+    } else {
+        const msg = if (tab == 1) "Marketplace" else "Create an algorithm";
+        _ = try str(gpa, dl, e, .semibold, m.lx, content_top + 70, ink, 19, msg);
+        _ = try str(gpa, dl, e, .regular, m.lx, content_top + 98, muted, 14, "Coming soon.");
+        content_h = height; // nothing to scroll
     }
+
+    // Sticky header: frosted box, title, the tab row, divider — drawn LAST.
+    try rect(gpa, dl, m.col_x, 0, m.col_w, header_h, header_veil, 0);
+    _ = try str(gpa, dl, e, .semibold, m.lx, 50, ink, 27, "Algorithms");
+    var tx = m.lx;
+    const tab_baseline: i32 = 96;
+    for (loadout_tabs, 0..) |label, i| {
+        const on = i == tab;
+        const tw: i32 = @intCast(text.measure(e, .semibold, label, 15));
+        _ = try str(gpa, dl, e, .semibold, tx, tab_baseline, if (on) ink else muted, 15, label);
+        if (on) try rect(gpa, dl, tx, tab_baseline + 9, tw, 3, accent, 2);
+        try emitRegion(gpa, regions, tx - 8, tab_baseline - 19, tw + 16, 32, @intCast(i), .loadout_tab);
+        tx += tw + 28;
+    }
+    try rect(gpa, dl, m.col_x, header_h - 1, m.col_w, 1, divider, 0);
+    return content_h;
 }
 
 /// The feed column's sticky TOP BAR: a frosted box over the top strip, then the
