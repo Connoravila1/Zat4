@@ -2955,10 +2955,31 @@ fn paintFrameGpu(
     // The feed verts persist across frames (rebuilt above only when the feed
     // changed); just draw them.
     gpu.feedDraw(&gs.feed, @intCast(w), @intCast(h));
+    // The socket hover highlight rides ON TOP of the feed (its panels are
+    // opaque, so it can't sit behind like the post wash does).
+    drawSocketHoverTop(gpa, g, gs, scale, @intCast(w), @intCast(h));
     // The engagement hearts: one SDF heart per visible like button, drawn IN
     // PLACE (feed_view skips its own), so a like fills + pops the ACTUAL heart.
     drawEngagementHearts(g, gs, items, @intCast(w), @intCast(h));
     gpu.swap(&gs.g);
+}
+
+/// Scan one socket HitList for the rect under the pointer, splitting it the
+/// same way the feed does: a `.seat` (the whole lens card) is the wash; every
+/// other control (toggle/expand/reorder/swatch/get_more…) is the brighter
+/// button. Forward iteration means the last (topmost-drawn) match wins, so a
+/// sub-control over its card highlights the control AND washes the card.
+fn scanSocketHits(hits: []const lens_socket.HitRect, hx: i32, hy: i32, wash: *?lens_socket.HitRect, button: *?lens_socket.HitRect) void {
+    for (hits) |r| {
+        if (hx < r.x or hx >= @as(i32, r.x) + r.w or hy < r.y or hy >= @as(i32, r.y) + r.h) continue;
+        switch (r.target) {
+            .seat => wash.* = r, // the whole lens card
+            // The whole-bar toggle is clickable but should NOT wash on hover —
+            // only its chevron (the .caret sub-hit) lights up.
+            .toggle => {},
+            else => button.* = r, // caret, expand, reorder, swatch_open, get_more…
+        }
+    }
 }
 
 /// Build + draw the hover highlight: a subtle wash over the post under the
@@ -2968,6 +2989,11 @@ fn paintFrameGpu(
 fn drawHoverOverlay(gpa: Allocator, g: Grid, gs: *GpuState, scale: f32, vw: i32, vh: i32) void {
     var wash: ?feed_view.Region = null; // the post under the cursor
     var button: ?feed_view.Region = null; // a button/control under the cursor
+    // Socket tap targets live in their own HitLists (not g.regions), so scan
+    // them too: a `.seat` (whole card) reads as the wash, sub-controls as the
+    // brighter button — the same wash/button split the feed uses.
+    var sock_wash: ?lens_socket.HitRect = null;
+    var sock_button: ?lens_socket.HitRect = null;
     if (g.hover_x >= 0) {
         for (g.regions.items) |r| {
             if (g.hover_x < r.x or g.hover_x >= @as(i32, r.x) + r.w or g.hover_y < r.y or g.hover_y >= @as(i32, r.y) + r.h) continue;
@@ -2977,9 +3003,17 @@ fn drawHoverOverlay(gpa: Allocator, g: Grid, gs: *GpuState, scale: f32, vw: i32,
                 else => button = r, // engagement, avatar, nav, tabs, edit, pill, back…
             }
         }
+        // The active socket (feed on home, reply on the thread, feed on the
+        // loadout page) is always live; the reply/zone sockets are only laid
+        // out by layoutLoadout, so scan them only on that screen.
+        scanSocketHits(g.socket_hits.items, g.hover_x, g.hover_y, &sock_wash, &sock_button);
+        if (g.screen.* == feed_view.screen_loadout) {
+            scanSocketHits(g.reply_hits.items, g.hover_x, g.hover_y, &sock_wash, &sock_button);
+            scanSocketHits(g.zone_hits.items, g.hover_x, g.hover_y, &sock_wash, &sock_button);
+        }
     }
     // Ease toward present/absent so the highlight fades rather than snaps.
-    const target: f32 = if (wash != null or button != null) 1.0 else 0.0;
+    const target: f32 = if (wash != null or button != null or sock_wash != null or sock_button != null) 1.0 else 0.0;
     gs.hover_alpha += (target - gs.hover_alpha) * 0.30;
     if (gs.hover_alpha < 0.02) return;
 
@@ -2988,8 +3022,42 @@ fn drawHoverOverlay(gpa: Allocator, g: Grid, gs: *GpuState, scale: f32, vw: i32,
     const btn_a: u32 = @intFromFloat(@as(f32, 0x1C) * gs.hover_alpha);
     var hd: raster_core.DrawList = .{};
     defer hd.deinit(gpa);
+    // The feed wash/button sit BEHIND the feed: posts are translucent glass over
+    // the field, so the highlight shows through. The socket is NOT drawn here —
+    // its panels are opaque, so a highlight behind them is occluded. It draws in
+    // drawSocketHoverTop (after the feed) instead; the sock_* detection above
+    // only feeds the easing target so the alpha rises while over the socket.
     if (wash) |r| hd.append(gpa, .{ .rect = .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h, .color = (wash_a << 24) | 0x00FFFFFF, .radius = 0 } }) catch {};
     if (button) |r| hd.append(gpa, .{ .rect = .{ .x = @intCast(@as(i32, r.x) - 4), .y = r.y, .w = r.w + 8, .h = r.h, .color = (btn_a << 24) | 0x00FFFFFF, .radius = 12 } }) catch {};
+    if (hd.len == 0) return;
+    gpu.feedBuild(&gs.hover, gpa, g.engine, hd.slice(), scale) catch return;
+    gpu.feedDraw(&gs.hover, vw, vh);
+}
+
+/// The socket half of the hover highlight, drawn AFTER the feed (on top): the
+/// socket panels are opaque, so its wash/button can't go behind the feed like
+/// the post highlight does. Reuses the eased `gs.hover_alpha` set this frame by
+/// drawHoverOverlay (which already folded the socket into its target), and the
+/// same gs.hover vert buffer — built+drawn after the feed so it lands on top.
+fn drawSocketHoverTop(gpa: Allocator, g: Grid, gs: *GpuState, scale: f32, vw: i32, vh: i32) void {
+    if (g.hover_x < 0 or gs.hover_alpha < 0.02) return;
+    var sock_wash: ?lens_socket.HitRect = null;
+    var sock_button: ?lens_socket.HitRect = null;
+    scanSocketHits(g.socket_hits.items, g.hover_x, g.hover_y, &sock_wash, &sock_button);
+    if (g.screen.* == feed_view.screen_loadout) {
+        scanSocketHits(g.reply_hits.items, g.hover_x, g.hover_y, &sock_wash, &sock_button);
+        scanSocketHits(g.zone_hits.items, g.hover_x, g.hover_y, &sock_wash, &sock_button);
+    }
+    if (sock_wash == null and sock_button == null) return;
+
+    const wash_a: u32 = @intFromFloat(@as(f32, 0x0E) * gs.hover_alpha);
+    const btn_a: u32 = @intFromFloat(@as(f32, 0x1C) * gs.hover_alpha);
+    var hd: raster_core.DrawList = .{};
+    defer hd.deinit(gpa);
+    // Card wash is rounded to match the cards; the sub-control highlight is the
+    // feed's pill. Both translucent white on top — a lift, not a veil.
+    if (sock_wash) |r| hd.append(gpa, .{ .rect = .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h, .color = (wash_a << 24) | 0x00FFFFFF, .radius = 10 } }) catch {};
+    if (sock_button) |r| hd.append(gpa, .{ .rect = .{ .x = @intCast(@as(i32, r.x) - 4), .y = r.y, .w = r.w + 8, .h = r.h, .color = (btn_a << 24) | 0x00FFFFFF, .radius = 12 } }) catch {};
     if (hd.len == 0) return;
     gpu.feedBuild(&gs.hover, gpa, g.engine, hd.slice(), scale) catch return;
     gpu.feedDraw(&gs.hover, vw, vh);

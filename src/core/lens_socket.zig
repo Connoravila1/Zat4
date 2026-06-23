@@ -212,7 +212,7 @@ pub const Geometry = struct {
 
 /// What a hit-rect maps to. The CID (not an index) rides the rect, so
 /// hitTest can answer with a CID-bearing action from `hits` alone (A5).
-pub const HitTarget = enum(u8) { toggle, seat, expand, collapse, reorder_handle, get_more, swatch, swatch_open };
+pub const HitTarget = enum(u8) { toggle, seat, expand, collapse, reorder_handle, get_more, swatch, swatch_open, caret };
 
 /// One tap target. HOT-ish (iterated in hitTest); guarded (A7). It carries
 /// the lens's CID slice (into the shell-owned, frame-stable tray blob) so
@@ -517,18 +517,9 @@ pub fn build(
     try rect(gpa, dl, cart_x, cart_y, cart_w, cart_h, alphaScale(soft(acc, 0x24), a), cart_radius);
     try rect(gpa, dl, cart_x, cart_y, cart_w, fxi(1 * sc) + 1, alphaScale(soft(acc, 0x70), a), cart_radius);
 
-    // contact pins on the cartridge's left edge
-    var pin_y = cart_y + fxi(10 * sc);
-    const pin_w = fxi(9 * sc);
-    var pin_i: usize = 0;
-    while (pin_i < 3) : (pin_i += 1) {
-        try rect(gpa, dl, cart_x + fxi(8 * sc), pin_y, pin_w, @max(1, fxi(2 * sc)), alphaScale(soft(acc, 0xCC), a), 1);
-        pin_y += fxi(5 * sc);
-    }
-
     // privacy glyph (a dot) — always visible (invariant 6)
     const glyph_d = @max(2, fxi(9 * sc));
-    const glyph_x = cart_x + fxi(24 * sc);
+    const glyph_x = cart_x + fxi(14 * sc);
     const glyph_cy = cart_y + @divTrunc(cart_h, 2);
     try rect(gpa, dl, glyph_x, glyph_cy - @divTrunc(glyph_d, 2), glyph_d, glyph_d, alphaScale(privColor(seat.flags), a), @intCast(@divTrunc(glyph_d, 2)));
 
@@ -551,8 +542,12 @@ pub fn build(
     _ = try str(gpa, dl, e, .regular, chev_x - fxi(16 * sc) - count_meas, strip_cy + @divTrunc(count_px, 3), faint, count_px, count_s);
     try chevron(gpa, dl, chev_x, strip_cy, fxi(4 * sc), acc, @intCast(@max(1, fxi(1.5 * sc))), ui.open);
 
-    // the whole socket toggles the tray
+    // the whole socket toggles the tray (clickable anywhere)…
     try pushHit(gpa, hits, x0, y0, w, sock_h, .toggle, "", 0);
+    // …but only the chevron HIGHLIGHTS on hover — a small box around it, pushed
+    // after the bar so the hover scan (last-match-wins) prefers it.
+    const caret_box = fxi(30 * sc);
+    try pushHit(gpa, hits, chev_x - @divTrunc(caret_box, 2), strip_cy - @divTrunc(caret_box, 2), caret_box, caret_box, .caret, "", 0);
 
     // Spring-open: the tray sweeps down by `op` (0→1) and cards reveal as it
     // passes them. op≈1 = fully open. Below the threshold it's closed (resting).
@@ -907,7 +902,7 @@ pub fn hitTest(hits: []const HitRect, px: i32, py: i32) ?SocketAction {
         const r = hits[i];
         if (px >= r.x and px < @as(i32, r.x) + r.w and py >= r.y and py < @as(i32, r.y) + r.h) {
             return switch (r.target) {
-                .toggle => .toggle_tray,
+                .toggle, .caret => .toggle_tray,
                 .seat => .{ .seat = r.cid },
                 .expand => .{ .expand = r.cid },
                 .collapse => .collapse,
