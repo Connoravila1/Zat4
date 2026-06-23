@@ -958,16 +958,35 @@ const field_grid_frag_src: [:0]const GLchar =
     \\  float dyev = clamp(dye * 2.4, 0.0, 1.0);
     \\  float dn = clamp(intensity * min(1.2, b), 0.0, 1.0);
     \\  dn = max(dn, dyev * 0.9);                // red charge lights its glyphs strongly
-    \\  if (dn < 0.04) discard;                 // the mockup's sparse cull
+    \\  // CHEAP BLOOM: bright neighbour cells bleed a soft halo into this one, so
+    \\  // lit glyphs read as EMITTING light (not printed). 4-tap, light-gated.
+    \\  // [REVERT: delete gsum/glow + the halo/lum adds + restore the plain cull]
+    \\  float gsum = abs(texture2D(uField, (cell + vec2(1.5, 0.5)) / uFieldSize).r)
+    \\             + abs(texture2D(uField, (cell + vec2(-0.5, 0.5)) / uFieldSize).r)
+    \\             + abs(texture2D(uField, (cell + vec2(0.5, 1.5)) / uFieldSize).r)
+    \\             + abs(texture2D(uField, (cell + vec2(0.5, -0.5)) / uFieldSize).r);
+    \\  float glow = clamp(gsum * uGain * b * 0.22, 0.0, 0.7);
+    \\  if (max(dn, glow) < 0.04) discard;      // sparse cull, bloom-aware
     \\  float idx = floor(dn * (uRampN - 1.0) + 0.5);
     \\  vec2 local = fract(px / uCell);
     \\  vec2 ruv = vec2((idx + local.x) / uRampN, local.y);
     \\  float cov = texture2D(uRamp, ruv).r;
+    \\  cov = max(cov, glow * 0.5);             // bloom: soft halo beyond the glyphs
     \\  // cool grey-white, dimmer; tinting to the rose 'like' colour where dyed.
     \\  float lum = clamp(0.35 + b * 0.45 + intensity * 0.30, 0.0, 1.05);
+    \\  // VIGNETTE: dim the ambient field toward the screen edges for depth +
+    \\  // focus (the missing 'lighting'). Centre full, corners ~55%. Applied
+    \\  // BEFORE the dye floor below, so red likes stay vivid even at the edges.
+    \\  vec2 vn = gl_FragCoord.xy / uViewport;
+    \\  lum *= mix(0.5, 1.0, smoothstep(0.85, 0.15, distance(vn, vec2(0.5))));
+    \\  // DEPTH: a slow large-scale undulation so the field reads as a VOLUME with
+    \\  // near/far regions, not one flat plane. [REVERT: delete this line]
+    \\  lum *= 0.86 + 0.14 * sin(cell.x * 0.06 + uTime * 0.025) * sin(cell.y * 0.08 - uTime * 0.02);
+    \\  // cool grey-white glyphs (the original palette, warmth reverted).
     \\  vec3 base = mix(vec3(84.0, 89.0, 102.0) / 255.0, vec3(166.0, 172.0, 186.0) / 255.0, clamp(0.28 + b * 0.5, 0.0, 1.0));
     \\  vec3 col = mix(base, vec3(245.0, 80.0, 110.0) / 255.0, dyev);
     \\  lum = max(lum, dyev);                   // red reads even in quiet areas
+    \\  lum += glow * 0.45;                     // bloom brightens around lit clusters
     \\  // GLASS: under the content column, drop the SHARP glyph for a soft, dim
     \\  // field wash — so what glows through the panel reads as a blurred backdrop
     \\  // (depth), while the gutters keep their crisp glyphs. A cheap, FBO-free

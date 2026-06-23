@@ -29,6 +29,7 @@ const feed = @import("core/feed.zig");
 const field = @import("core/field.zig");
 const lens_socket = @import("core/lens_socket.zig");
 const lens_catalog = @import("core/lens_catalog.zig");
+const enroll_view = @import("core/enroll_view.zig");
 
 const W: u32 = 1280;
 const H: u32 = 880;
@@ -243,6 +244,64 @@ pub fn main(init: std.process.Init) !void {
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_loadout.ppm");
     std.debug.print("wrote /tmp/zat_loadout.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
+
+    // ── THE ENROLLMENT SURFACE — the calm card over a DETUNED field ──
+    // A wispier field: bigger cells (wider spacing), lower ambient, smaller
+    // light radius — present but quiet, not the feed's full material.
+    const ecw: u16 = 20;
+    const ech: u16 = 28;
+    const ecols: u16 = @intCast(W / ecw);
+    const erows: u16 = @intCast(H / ech);
+    var ef: field.Field = .{};
+    try field.init(gpa, &ef, ecols, erows);
+    defer field.deinit(gpa, &ef);
+    field.fillAmbient(&ef);
+    const elight: field.Light = .{
+        .x = @floatFromInt(ecols / 2),
+        .y = @floatFromInt(erows / 3),
+        .radius = @floatFromInt(ecols / 2),
+        .ambient = 0.14,
+    };
+
+    const pw = "River-Anchor-Velvet-Tide";
+    const EStep = struct { name: []const u8, view: enroll_view.EnrollView };
+    const esteps = [_]EStep{
+        .{ .name = "enroll_0_provenance", .view = .{ .step = .provenance } },
+        .{ .name = "enroll_0_hover", .view = .{ .step = .provenance, .hover_on = true, .hover = .choose_new, .hover_t = 1.0 } },
+        .{ .name = "enroll_1_new", .view = .{ .step = .identity, .branch = .new, .username = "connor", .email = "connor@example.com", .age_ok = true, .tos_ok = true, .focus = .username } },
+        .{ .name = "enroll_1_new_recovery", .view = .{ .step = .identity, .branch = .new, .username = "connor", .use_email = false } }, // consent unchecked → button disabled
+        .{ .name = "enroll_1_tos", .view = .{ .step = .identity, .branch = .new, .username = "connor", .info = .tos } },
+        .{ .name = "enroll_1_existing", .view = .{ .step = .identity, .branch = .existing, .handle = "connor.bsky.social", .age_ok = true, .tos_ok = true, .focus = .handle } },
+        .{ .name = "enroll_2_membership", .view = .{ .step = .membership, .branch = .new } }, // nothing selected yet
+        .{ .name = "enroll_2_secure", .view = .{ .step = .membership, .branch = .new, .tier = .secure, .tier_chosen = true, .bar_t = 1.0 } },
+        .{ .name = "enroll_2_super", .view = .{ .step = .membership, .branch = .new, .tier = .super_secure, .tier_chosen = true, .bar_t = 1.0 } },
+        .{ .name = "enroll_2_overkill", .view = .{ .step = .membership, .branch = .new, .tier = .ultra_secure, .tier_chosen = true, .bar_t = 1.0, .bar_phase = 2.0 } },
+        .{ .name = "enroll_2_popover", .view = .{ .step = .membership, .branch = .new, .hover_on = true, .hover = .tier_overkill, .hover_t = 1.0 } },
+        .{ .name = "enroll_2_info", .view = .{ .step = .membership, .branch = .new, .tier = .secure, .tier_chosen = true, .bar_t = 1.0, .info = .membership } },
+        .{ .name = "enroll_2_deposit", .view = .{ .step = .membership, .branch = .new, .tier = .super_secure, .tier_chosen = true, .bar_t = 1.0, .hover_on = true, .hover = .deposit, .hover_t = 1.0 } },
+        .{ .name = "enroll_3_password", .view = .{ .step = .password, .branch = .new, .password = pw, .saved = true } },
+        .{ .name = "enroll_3_overkill", .view = .{ .step = .password, .branch = .new, .password = "Lanky-Giddy-Fiber-Routing-Rundown-Dweeb-Ageless-Cactus-Garage", .saved = true } },
+        .{ .name = "enroll_3_crafting", .view = .{ .step = .password, .branch = .new, .password = "Lanky-Giddy-Fiber-Routing-Rundown-Dweeb-Ageless-Cactus-Garage", .craft_t = 0.45 } },
+        .{ .name = "enroll_4_confirm_spot", .view = .{ .step = .confirm, .branch = .new, .confirm_stage = .spot, .spot_positions = .{ 2, 4, 6 }, .spot = .{ "anchor", "", "" }, .focus = .spot0 } },
+        .{ .name = "enroll_4_confirm_full", .view = .{ .step = .confirm, .branch = .new, .confirm_stage = .full, .full = "River-Anchor-Velvet", .focus = .full } },
+        .{ .name = "enroll_4_confirm_error", .view = .{ .step = .confirm, .branch = .new, .confirm_stage = .spot, .spot_positions = .{ 1, 3, 5 }, .confirm_error = true } },
+        .{ .name = "enroll_4b_recovery", .view = .{ .step = .recovery, .branch = .new, .use_email = false, .recovery_key = "8F2A-1C9B-44D7-E013-A6B5-2F8C-90D1-7E4A", .rec_saved = true } },
+        .{ .name = "enroll_5_done", .view = .{ .step = .done, .branch = .new, .did = "did:plc:7mock4example", .final_handle = "connor.zat4.com" } },
+        .{ .name = "enroll_6_verifying", .view = .{ .step = .verifying, .pow_t = 0.62, .bar_phase = 2.0 } },
+        .{ .name = "enroll_6_verified", .view = .{ .step = .verifying, .pow_t = 1.0 } },
+        .{ .name = "enroll_6_seal", .view = .{ .step = .verifying, .pow_t = 1.0, .seal_t = 0.74 } },
+    };
+    var epath_buf: [64]u8 = undefined;
+    for (esteps) |es| {
+        @memset(fb.pixels, clear);
+        dl.len = 0;
+        try field.compose(gpa, &ef, particles.slice(), elight, ecw, ech, &dl);
+        try enroll_view.layout(gpa, &engine, @intCast(W), @intCast(H), es.view, &dl, null);
+        try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+        const path = try std.fmt.bufPrint(&epath_buf, "/tmp/zat_{s}.ppm", .{es.name});
+        try writePpm(io, gpa, &fb, path);
+        std.debug.print("wrote {s} ({d} items)\n", .{ path, dl.len });
+    }
 }
 
 /// A few placeholder lenses (preview-only sample data, shell side). Builds

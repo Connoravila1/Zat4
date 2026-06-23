@@ -421,6 +421,7 @@ test {
     _ = @import("shell/credential.zig");
     _ = @import("core/membership.zig");
     _ = @import("shell/membership.zig");
+    _ = @import("core/enroll_view.zig");
     _ = @import("shell/feed.zig");
     _ = @import("shell/tui.zig");
 }

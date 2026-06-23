@@ -181,6 +181,23 @@ pub fn build(b: *std.Build) void {
     const gpu_preview_step = b.step("gpu-preview", "Render the premium feed through the GPU on the real window (Phase 6.1 parity)");
     gpu_preview_step.dependOn(&run_gpu_preview.step);
 
+    // ENROLLMENT harness (`zig build enroll`): the interactive "Join Zat4" flow
+    // on the real window — clickable steps, real CSPRNG password mint, calm
+    // field — with NO session / network, so the feel can be tested in isolation.
+    // Same GPU dependency posture (EGL/GLESv2 dlopen'd; libc via the font
+    // engine). Needs a display+GPU.
+    const enroll_mod = b.createModule(.{
+        .root_source_file = b.path("src/enroll_harness.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addFontEngine(b, enroll_mod);
+    const enroll_exe = b.addExecutable(.{ .name = "zat-enroll", .root_module = enroll_mod });
+    const run_enroll = b.addRunArtifact(enroll_exe);
+    if (b.args) |args| run_enroll.addArgs(args);
+    const enroll_step = b.step("enroll", "Drive the interactive enrollment flow on the real window (no session/network)");
+    enroll_step.dependOn(&run_enroll.step);
+
     // Convenience: wipe the local build cache. The cache GROWING is
     // correct, not a bug — Zig keeps content-hashed artifacts so
     // incremental rebuilds are fast, and it cannot auto-delete old
