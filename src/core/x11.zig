@@ -53,9 +53,15 @@ const opcode_create_window: u8 = 1;
 const opcode_map_window: u8 = 8;
 const opcode_intern_atom: u8 = 16;
 const opcode_change_property: u8 = 18;
+const opcode_set_selection_owner: u8 = 22;
+const opcode_send_event: u8 = 25;
 const opcode_create_gc: u8 = 55;
 const opcode_put_image: u8 = 72;
 const opcode_get_keyboard_mapping: u8 = 101;
+
+/// Event codes we send/parse beyond input (clipboard = the selection dance).
+pub const event_selection_request: u8 = 30;
+const event_selection_notify: u8 = 31;
 
 // ---------------------------------------------------------------------------
 // Little-endian byte plumbing
@@ -250,6 +256,95 @@ pub fn createGC(buf: []u8, gc: u32, drawable: u32) []const u8 {
     put32(buf, 4, gc);
     put32(buf, 8, drawable);
     return buf[0..16];
+}
+
+// ---------------------------------------------------------------------------
+// Selections (the clipboard) — own CLIPBOARD, then serve paste requests.
+// ---------------------------------------------------------------------------
+
+/// Claim ownership of a selection (e.g. CLIPBOARD) for `owner`. After this the
+/// server routes paste requests to `owner` as SelectionRequest events. `time`
+/// of 0 is CurrentTime (accepted for SetSelectionOwner).
+pub fn setSelectionOwner(buf: []u8, selection: u32, owner: u32, time: u32) []const u8 {
+    const total = 16;
+    assert(buf.len >= total);
+    @memset(buf[0..total], 0);
+    buf[0] = opcode_set_selection_owner;
+    put16(buf, 2, total / 4);
+    put32(buf, 4, owner);
+    put32(buf, 8, selection);
+    put32(buf, 12, time);
+    return buf[0..total];
+}
+
+/// ChangeProperty in full generality: write `data` (raw bytes) as `count`
+/// units of `format` bits, typed `type_atom`, onto ANY window `wid` (the paste
+/// requestor, not necessarily ours). `changePropertyString`/`...Atom` are the
+/// fixed-shape conveniences; this serves the clipboard's UTF8_STRING + TARGETS.
+pub fn changePropertyData(buf: []u8, wid: u32, property: u32, type_atom: u32, format: u8, data: []const u8, count: u32) []const u8 {
+    const total = 24 + padded4(data.len);
+    assert(buf.len >= total);
+    @memset(buf[0..total], 0);
+    buf[0] = opcode_change_property;
+    buf[1] = 0; // mode: Replace
+    put16(buf, 2, @intCast(total / 4));
+    put32(buf, 4, wid);
+    put32(buf, 8, property);
+    put32(buf, 12, type_atom);
+    buf[16] = format;
+    put32(buf, 20, count);
+    @memcpy(buf[24..][0..data.len], data);
+    return buf[0..total];
+}
+
+/// SendEvent a SelectionNotify back to a paste `requestor` — telling it the
+/// data has been written to `property` (or `property` = 0 to refuse). This is
+/// the reply that completes the selection transfer handshake.
+pub fn sendSelectionNotify(buf: []u8, requestor: u32, selection: u32, target: u32, property: u32, time: u32) []const u8 {
+    const total = 44; // 12-byte SendEvent header + the 32-byte event
+    assert(buf.len >= total);
+    @memset(buf[0..total], 0);
+    buf[0] = opcode_send_event;
+    buf[1] = 0; // propagate = false
+    put16(buf, 2, total / 4); // 11 units
+    put32(buf, 4, requestor); // destination window
+    put32(buf, 8, 0); // event-mask 0 → deliver to the requestor's client
+    // the 32-byte SelectionNotify event begins at offset 12
+    buf[12] = event_selection_notify;
+    put32(buf, 16, time);
+    put32(buf, 20, requestor);
+    put32(buf, 24, selection);
+    put32(buf, 28, target);
+    put32(buf, 32, property);
+    return buf[0..total];
+}
+
+/// A paste request from another app (decoded from a SelectionRequest event).
+/// COLD: one transient per paste, handled immediately — never held or iterated.
+/// Its six 32-bit fields don't fit the hot 12-byte `Event`, so it has its own
+/// parse path; the size guard keeps the wire layout honest (A7).
+pub const SelectionRequest = struct {
+    time: u32,
+    owner: u32,
+    requestor: u32,
+    selection: u32,
+    target: u32,
+    property: u32,
+
+    comptime {
+        assert(@sizeOf(SelectionRequest) == 24); // 6 × u32, exact
+    }
+};
+
+pub fn parseSelectionRequest(bytes: *const [32]u8) SelectionRequest {
+    return .{
+        .time = get32(bytes, 4),
+        .owner = get32(bytes, 8),
+        .requestor = get32(bytes, 12),
+        .selection = get32(bytes, 16),
+        .target = get32(bytes, 20),
+        .property = get32(bytes, 24),
+    };
 }
 
 /// The 24-byte PutImage header; the caller streams `width * rows * 4`
@@ -733,4 +828,65 @@ test "x11: keysym resolution and terminal bytes" {
     // Ctrl with a non-letter falls through to the normal mapping.
     try testing.expectEqual(@as(usize, 1), keyBytes('1', true, &out));
     try testing.expectEqual(@as(u8, '1'), out[0]);
+}
+
+test "x11: clipboard encoders pinned by golden bytes" {
+    var buf: [128]u8 = undefined;
+
+    // SetSelectionOwner(selection=0xAA, owner=0xBB, time=0): 16 bytes, opcode 22.
+    {
+        const r = setSelectionOwner(&buf, 0xAA, 0xBB, 0);
+        try testing.expectEqual(@as(usize, 16), r.len);
+        try testing.expectEqual(@as(u8, 22), r[0]);
+        try testing.expectEqual(@as(u16, 4), get16(r, 2)); // length in units
+        try testing.expectEqual(@as(u32, 0xBB), get32(r, 4)); // owner
+        try testing.expectEqual(@as(u32, 0xAA), get32(r, 8)); // selection
+        try testing.expectEqual(@as(u32, 0), get32(r, 12)); // time
+    }
+
+    // ChangeProperty (UTF8_STRING text "abc"): header 24 + padded("abc")=4 → 28.
+    {
+        const r = changePropertyData(&buf, 0x10, 0x20, 0x30, 8, "abc", 3);
+        try testing.expectEqual(@as(usize, 28), r.len);
+        try testing.expectEqual(@as(u8, 18), r[0]); // ChangeProperty
+        try testing.expectEqual(@as(u32, 0x10), get32(r, 4)); // requestor window
+        try testing.expectEqual(@as(u32, 0x20), get32(r, 8)); // property
+        try testing.expectEqual(@as(u32, 0x30), get32(r, 12)); // type atom
+        try testing.expectEqual(@as(u8, 8), r[16]); // format
+        try testing.expectEqual(@as(u32, 3), get32(r, 20)); // length in units
+        try testing.expectEqualSlices(u8, "abc", r[24..27]);
+    }
+
+    // SendEvent(SelectionNotify): 44 bytes; the inner event begins at offset 12.
+    {
+        const r = sendSelectionNotify(&buf, 0x11, 0x22, 0x33, 0x44, 0x55);
+        try testing.expectEqual(@as(usize, 44), r.len);
+        try testing.expectEqual(@as(u8, 25), r[0]); // SendEvent
+        try testing.expectEqual(@as(u16, 11), get16(r, 2)); // 44/4 units
+        try testing.expectEqual(@as(u32, 0x11), get32(r, 4)); // destination
+        try testing.expectEqual(@as(u8, 31), r[12]); // SelectionNotify code
+        try testing.expectEqual(@as(u32, 0x55), get32(r, 16)); // time
+        try testing.expectEqual(@as(u32, 0x11), get32(r, 20)); // requestor
+        try testing.expectEqual(@as(u32, 0x22), get32(r, 24)); // selection
+        try testing.expectEqual(@as(u32, 0x33), get32(r, 28)); // target
+        try testing.expectEqual(@as(u32, 0x44), get32(r, 32)); // property
+    }
+
+    // SelectionRequest round-trips through the parser at the pinned offsets.
+    {
+        var ev = [_]u8{0} ** 32;
+        ev[0] = 30;
+        std.mem.writeInt(u32, ev[4..8], 0x1234, .little); // time
+        std.mem.writeInt(u32, ev[8..12], 0xAAAA, .little); // owner
+        std.mem.writeInt(u32, ev[12..16], 0xBBBB, .little); // requestor
+        std.mem.writeInt(u32, ev[16..20], 0xCCCC, .little); // selection
+        std.mem.writeInt(u32, ev[20..24], 0xDDDD, .little); // target
+        std.mem.writeInt(u32, ev[24..28], 0xEEEE, .little); // property
+        const sr = parseSelectionRequest(&ev);
+        try testing.expectEqual(@as(u32, 0x1234), sr.time);
+        try testing.expectEqual(@as(u32, 0xBBBB), sr.requestor);
+        try testing.expectEqual(@as(u32, 0xCCCC), sr.selection);
+        try testing.expectEqual(@as(u32, 0xDDDD), sr.target);
+        try testing.expectEqual(@as(u32, 0xEEEE), sr.property);
+    }
 }

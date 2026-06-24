@@ -27,6 +27,9 @@ const raster = @import("core/raster.zig");
 const enroll_view = @import("core/enroll_view.zig");
 const credential_core = @import("core/credential.zig");
 const credential_shell = @import("shell/credential.zig");
+const membership_shell = @import("shell/membership.zig");
+const pow = @import("core/pow.zig");
+const pow_shell = @import("shell/pow.zig");
 const glyph_field = @import("core/glyph_field.zig");
 const clock_shell = @import("shell/clock.zig");
 
@@ -79,8 +82,8 @@ const State = struct {
     tos_ok: bool = false, // identity-step consent: Terms + Privacy
     tier: credential_core.Tier = .super_secure,
     saved: bool = false,
-    // Recovery-key step (new + no-email). Stand-in for the did:plc rotation key.
-    recovery_key: [48]u8 = undefined,
+    // Recovery-key step (new + no-email): the REAL P-256 private key, grouped hex.
+    recovery_key: [96]u8 = undefined,
     recovery_len: usize = 0,
     rec_saved: bool = false,
     focus: enroll_view.Focus = .none,
@@ -94,6 +97,7 @@ const State = struct {
     spot: [3]TextField = .{ .{}, .{}, .{} },
     full: TextField = .{},
     confirm_error: bool = false,
+    mem_verifying: bool = false, // Stage B: the off-thread Argon2id verify is in flight
     prev_confirm_stage: enroll_view.ConfirmStage = .spot,
     cred: credential_core.Credential = undefined,
     has_pw: bool = false,
@@ -109,6 +113,9 @@ const State = struct {
     pow_t: f32 = 0.0, // proof-of-work progress on the verifying step
     seal_t: f32 = 0.0, // completion seal/star-burst progress
     pow_start_ns: u64 = 0,
+    seal_start_ns: u64 = 0, // when the ring actually completed (max(floor, real solve))
+    copied_ns: u64 = 0, // when Copy was last clicked (drives the "Copied" toast)
+    copied_t: f32 = 0.0, // toast strength 0→1 (computed in the loop from copied_ns)
     final_handle: [80]u8 = undefined,
     final_handle_len: usize = 0,
     // Transition (A): ease the card height + slide the body in on step change.
@@ -171,6 +178,27 @@ pub fn main(init: std.process.Init) !void {
     defer events.deinit(gpa);
 
     var state: State = .{};
+
+    // REAL membership store (Argon2id). The minted password's verifier is
+    // enrolled here on each mint; the confirm step's full-entry stage verifies
+    // against it (the actual login path) — the password lifecycle is genuine,
+    // not a text compare. The store uses a THREAD-SAFE allocator because the
+    // enroll/verify hashing runs on the background worker (`memjob`), not the UI
+    // thread — the main render allocator never touches it concurrently.
+    var mstore = membership_shell.init(std.heap.page_allocator);
+    defer membership_shell.deinit(&mstore);
+
+    // REAL proof-of-work, run on a background thread so the proof-ring stays
+    // smooth (and, on mobile, so the OS doesn't kill a UI-blocking app). The
+    // ring tracks max(animation floor, real solve time).
+    var powjob: PowJob = .{};
+    defer stopPow(&powjob); // join any in-flight solve before exit
+
+    // The membership Argon2id hash (enroll at mint, verify at confirm) also runs
+    // off the UI thread on this worker — no Generate/Confirm hitch. The enroll
+    // finishes during the ~1.9s password decode; the verify behind "Checking…".
+    var memjob: MemJob = .{};
+    defer joinMem(&memjob); // join any in-flight hash before exit (runs before mstore deinit)
 
     var t: f32 = 0;
     var last_step_ns: u64 = 0;
@@ -264,15 +292,47 @@ pub fn main(init: std.process.Init) !void {
             enroll_view.cardHeight(state.step, state.branch));
         state.card_h = if (state.card_h < 1.0) target_h else state.card_h + (target_h - state.card_h) * 0.28;
 
-        // Proof-of-work gate: pow_t eases 0→1 (easeOutCubic so the last bit
-        // grinds), holds ~1.5 s on "Verified", then the demo loops to the start.
+        // Proof-of-work gate (REAL): a background worker runs pow.solve. The ring
+        // CREEPS (a decelerating exponential of elapsed time) the whole way — the
+        // motion is spread across the entire unknown solve, slowing as it climbs,
+        // never quite reaching the top — so it always reads as "working," not a
+        // fast fill then a dead stall near the end. It honors a min floor and only
+        // finishes + seals when the genuine solution actually lands.
         if (state.step == .verifying) {
+            if (!powjob.active) startPow(&powjob, &state, io);
             const el: f32 = @floatFromInt(frame_ns -| state.pow_start_ns);
-            const lin = @min(1.0, el / 3_200_000_000.0);
-            const inv = 1.0 - lin;
-            state.pow_t = 1.0 - inv * inv * inv;
+            const floor_ns: f32 = 3_200_000_000.0;
+            const solved = powjob.done.load(.acquire);
+            const complete = solved and el >= floor_ns;
+
+            if (complete) {
+                // Finish home: ease the ring from wherever the creep left it up
+                // to 1.0 (a smooth snap, not a jump), then the seal fires.
+                state.pow_t += (1.0 - state.pow_t) * 0.16;
+                if (state.pow_t > 0.999) state.pow_t = 1.0;
+            } else {
+                // DECELERATING CREEP tied to elapsed time: always moving, the
+                // climb spread across the WHOLE (unknown) solve, slowing as it
+                // rises, never reaching 1 until the real solution lands. The
+                // motion IS the work — no fill-fast-then-stall-at-the-end. The
+                // floor (min duration) is honored because `complete` can't be
+                // true before it. tau ≈ a typical few-second solve.
+                const tau: f32 = 2_800_000_000.0;
+                const creep = 1.0 - @exp(-el / tau);
+                state.pow_t = @min(0.97, creep);
+            }
+
+            // The seal fires only once the ring is genuinely FULL (work done +
+            // finished home), so the bright sweep + burst land on completion.
             const prev_seal = state.seal_t;
-            state.seal_t = if (lin >= 1.0) @min(1.0, (el - 3_200_000_000.0) / 800_000_000.0) else 0.0;
+            if (state.pow_t >= 0.999) {
+                if (state.seal_start_ns == 0) state.seal_start_ns = frame_ns;
+                const sel: f32 = @floatFromInt(frame_ns -| state.seal_start_ns);
+                state.seal_t = @min(1.0, sel / 800_000_000.0);
+            } else {
+                state.seal_t = 0.0;
+                state.seal_start_ns = 0;
+            }
 
             const fcx = @as(f32, @floatFromInt(gcols)) * 0.5;
             const fcy = @as(f32, @floatFromInt(grows)) * 0.5;
@@ -295,10 +355,35 @@ pub fn main(init: std.process.Init) !void {
                     splashes.append(gpa, .{ .x = bx, .y = by, .radius = 4, .amp = 1.6 }) catch {};
                 }
             }
-            if (el > 5_200_000_000.0) reset(&state); // welcome beat, then loop
+            // loop the demo ~1.5 s after the seal finishes (0.8 s seal + beat)
+            if (state.seal_t >= 1.0 and (frame_ns -| state.seal_start_ns) > 2_300_000_000) {
+                stopPow(&powjob);
+                reset(&state);
+            }
         } else {
+            if (powjob.active) stopPow(&powjob);
             state.pow_t = 0.0;
             state.seal_t = 0.0;
+        }
+
+        // "Copied" toast: hold ~1.1 s after a copy, then fade over ~0.35 s.
+        if (state.copied_ns != 0) {
+            const cel: f32 = @floatFromInt(frame_ns -| state.copied_ns);
+            state.copied_t = if (cel < 1_100_000_000.0) 1.0 else @max(0.0, 1.0 - (cel - 1_100_000_000.0) / 350_000_000.0);
+        } else {
+            state.copied_t = 0.0;
+        }
+
+        // Off-thread membership verify (Stage B): when the worker lands, advance
+        // (or flag the mismatch). The UI stayed live + animating the whole time.
+        if (state.step == .confirm and state.mem_verifying and memjob.done.load(.acquire)) {
+            joinMem(&memjob);
+            state.mem_verifying = false;
+            if (memjob.verify_ok) {
+                confirmSucceed(&state, io, &mstore);
+            } else {
+                state.confirm_error = true;
+            }
         }
 
         // Lay out the current state → draw list + hit rects.
@@ -311,7 +396,21 @@ pub fn main(init: std.process.Init) !void {
                 const lx: i32 = @intFromFloat(@as(f32, @floatFromInt(ev.x)) / scale);
                 const ly: i32 = @intFromFloat(@as(f32, @floatFromInt(ev.y)) / scale);
                 if (enroll_view.hitTest(hits.items, lx, ly)) |target| {
-                    apply(&state, target, io, frame_ns);
+                    // Copy → real X11 clipboard (the password on the password
+                    // step, the private key on the recovery step) + the toast.
+                    if (target == .copy) {
+                        const clip_text: []const u8 = if (state.step == .recovery)
+                            state.recovery_key[0..state.recovery_len]
+                        else if (state.has_pw)
+                            state.cred.bytes[0..state.cred.len]
+                        else
+                            "";
+                        if (clip_text.len > 0) {
+                            window_shell.setClipboard(win, clip_text);
+                            state.copied_ns = frame_ns;
+                        }
+                    }
+                    apply(&state, target, io, frame_ns, &mstore, &memjob);
                     const sx: u32 = @intFromFloat(std.math.clamp(@as(f32, @floatFromInt(ev.x)) / @as(f32, @floatFromInt(cell_w)), 0, @as(f32, @floatFromInt(gcols - 1))));
                     const sy: u32 = @intFromFloat(std.math.clamp(@as(f32, @floatFromInt(ev.y)) / @as(f32, @floatFromInt(cell_h)), 0, @as(f32, @floatFromInt(grows - 1))));
                     splashes.append(gpa, .{ .x = sx, .y = sy, .radius = 3, .amp = 0.6 }) catch {};
@@ -374,11 +473,13 @@ fn snapshot(s: *const State) enroll_view.EnrollView {
         .saved = s.saved,
         .recovery_key = s.recovery_key[0..s.recovery_len],
         .rec_saved = s.rec_saved,
+        .copied_t = s.copied_t,
         .confirm_stage = s.confirm_stage,
         .spot_positions = s.spot_positions,
         .spot = .{ s.spot[0].slice(), s.spot[1].slice(), s.spot[2].slice() },
         .full = s.full.slice(),
         .confirm_error = s.confirm_error,
+        .confirm_checking = s.mem_verifying,
         .focus = s.focus,
         .craft_t = s.craft_t,
         .hover = s.hover,
@@ -433,7 +534,7 @@ fn focusedField(s: *State) ?*TextField {
     };
 }
 
-fn apply(s: *State, target: enroll_view.HitTarget, io: std.Io, now_ns: u64) void {
+fn apply(s: *State, target: enroll_view.HitTarget, io: std.Io, now_ns: u64, mstore: *membership_shell.Store, memjob: *MemJob) void {
     switch (target) {
         .choose_existing => {
             s.branch = .existing;
@@ -457,7 +558,7 @@ fn apply(s: *State, target: enroll_view.HitTarget, io: std.Io, now_ns: u64) void
                 s.focus = .none;
             },
             .membership => {
-                mint(s, io);
+                mint(s, io, mstore, memjob);
                 s.craft_start_ns = now_ns; // begin the decode
                 s.saved = false;
                 s.step = .password;
@@ -472,7 +573,7 @@ fn apply(s: *State, target: enroll_view.HitTarget, io: std.Io, now_ns: u64) void
                 s.confirm_error = false;
                 s.focus = .spot0;
             },
-            .confirm => confirmSubmit(s, io),
+            .confirm => confirmSubmit(s, io, mstore, memjob),
             .recovery => {
                 s.step = .done;
                 s.focus = .none;
@@ -489,7 +590,7 @@ fn apply(s: *State, target: enroll_view.HitTarget, io: std.Io, now_ns: u64) void
         .tier_overkill => selectTier(s, .ultra_secure, now_ns),
         .copy => {}, // no clipboard in the harness
         .reroll => {
-            mint(s, io);
+            mint(s, io, mstore, memjob);
             s.craft_start_ns = now_ns; // re-run the decode
             s.saved = false;
         },
@@ -509,13 +610,14 @@ fn apply(s: *State, target: enroll_view.HitTarget, io: std.Io, now_ns: u64) void
         .field_full => s.focus = .full,
         .regen_password => {
             // Didn't save it → mint a fresh password and go back to copy it.
-            mint(s, io);
+            mint(s, io, mstore, memjob);
             s.craft_start_ns = now_ns;
             s.saved = false;
             s.confirm_stage = .spot;
             s.spot = .{ .{}, .{}, .{} };
             s.full = .{};
             s.confirm_error = false;
+            s.mem_verifying = false; // abandon any in-flight verify; the new mint re-enrolls
             s.step = .password;
             s.focus = .none;
         },
@@ -533,14 +635,20 @@ fn selectTier(s: *State, tier: credential_core.Tier, now_ns: u64) void {
     s.bar_sel_ns = now_ns; // restart the fill from 0 → re-springs the bar
 }
 
+/// The DID the harness enrolls its membership under. No network here, so a
+/// stable synthetic id is enough — verifyLogin keys off the same one.
+const harness_did = "did:zat4:harness-local";
+
 /// Mint a real password at the chosen tier (the one place randomness enters —
-/// shell-side, as the rules require). On failure leave the old one.
-fn mint(s: *State, io: std.Io) void {
+/// shell-side, as the rules require), then kick off the REAL Argon2id enroll on
+/// the background worker. On failure leave the old one.
+fn mint(s: *State, io: std.Io, mstore: *membership_shell.Store, memjob: *MemJob) void {
     if (credential_shell.generate(io, s.tier)) |c| {
         s.cred = c;
         s.has_pw = true;
         // Fresh spot-check positions for this password (per-enrollment random).
         s.spot_positions = pickSpotPositions(io, credential_core.wordCount(s.tier));
+        startEnroll(memjob, s, io, mstore); // off-thread; finishes during the decode
     } else |_| {}
 }
 
@@ -570,12 +678,14 @@ fn pickSpotPositions(io: std.Io, word_count: u8) [3]u8 {
     return out;
 }
 
-/// Validate the current confirm stage. Stage A: every spot-check answer must
-/// match the word at its position → advance to stage B. Stage B: the full
-/// entry must match the whole password (normalized) → finalize. A mismatch
-/// raises the inline hint and stays put.
-fn confirmSubmit(s: *State, io: std.Io) void {
-    if (!s.has_pw) return; // nothing to check against
+/// Validate the current confirm stage. Stage A spot-check: every answer must
+/// match the word at its position (a partial check against the in-memory
+/// plaintext — you can't Argon2-verify a single word against the whole-password
+/// hash). Stage B: kick off the REAL Argon2id verify (`membership.verifyLogin`)
+/// on the background worker; the render loop calls `confirmSucceed` (or flags the
+/// error) when it lands. A spot mismatch raises the inline hint and stays put.
+fn confirmSubmit(s: *State, io: std.Io, mstore: *membership_shell.Store, memjob: *MemJob) void {
+    if (!s.has_pw or s.mem_verifying) return; // nothing to check / already verifying
     const pw = s.cred.bytes[0..s.cred.len];
     if (s.confirm_stage == .spot) {
         var i: usize = 0;
@@ -589,37 +699,50 @@ fn confirmSubmit(s: *State, io: std.Io) void {
         s.confirm_stage = .full;
         s.confirm_error = false;
         s.focus = .full;
-    } else if (enroll_view.confirmMatch(s.full.slice(), pw)) {
-        finalize(s);
-        // A new, no-email account gets its recovery key revealed before finishing.
-        if (s.branch == .new and !s.use_email) {
-            genRecoveryKey(s, io);
-            s.rec_saved = false;
-            s.step = .recovery;
-        } else {
-            s.step = .done;
-        }
-        s.focus = .none;
     } else {
-        s.confirm_error = true;
+        // Stage B: the full-password verify runs off-thread (the UI stays live,
+        // the button shows "Checking…"); the render loop picks up the result.
+        startVerify(memjob, s, io, mstore);
+        s.confirm_error = false;
+        s.mem_verifying = true;
     }
 }
 
-/// Generate a representative account recovery key: 16 CSPRNG bytes → grouped
-/// uppercase hex ("XXXX-XXXX-…"). In the live app this is the user's `did:plc`
-/// ROTATION key (the real atproto recovery primitive); the harness mints a
-/// real-looking stand-in so the reveal screen has a secret to show + save.
+/// Called from the render loop when the off-thread Stage-B verify PASSES:
+/// activate the membership (fast, main-thread) and advance the flow.
+fn confirmSucceed(s: *State, io: std.Io, mstore: *membership_shell.Store) void {
+    membership_shell.activate(mstore, harness_did) catch {}; // real → active member
+    finalize(s);
+    // A new, no-email account gets its recovery key revealed before finishing.
+    if (s.branch == .new and !s.use_email) {
+        genRecoveryKey(s, io);
+        s.rec_saved = false;
+        s.step = .recovery;
+    } else {
+        s.step = .done;
+    }
+    s.focus = .none;
+}
+
+/// The recovery keypair scheme: P-256, an atproto `did:key` key type. The PUBLIC
+/// key would register as the user's `did:plc` ROTATION key; the PRIVATE key
+/// (shown, grouped hex) is the secret they must save.
+const RecoveryScheme = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+
+/// Generate a REAL account recovery keypair (not a stand-in). `generate(io)`
+/// draws its seed from the shell's CSPRNG (B3) and returns a valid P-256
+/// keypair; we display the 32-byte PRIVATE scalar as grouped uppercase hex — the
+/// genuine secret a user keeps. In the live app the matching PUBLIC key is
+/// written into the DID document as the rotation key, completing the recovery
+/// primitive; here there is no network, so only the key material is real.
 fn genRecoveryKey(s: *State, io: std.Io) void {
-    var raw: [16]u8 = undefined;
-    io.randomSecure(&raw) catch {
-        s.recovery_len = 0;
-        return;
-    };
+    const kp = RecoveryScheme.KeyPair.generate(io);
+    const priv = kp.secret_key.toBytes(); // the real private scalar (32 bytes)
     const hexd = "0123456789ABCDEF";
     var n: usize = 0;
-    for (raw, 0..) |b, i| {
+    for (priv, 0..) |b, i| {
         if (i != 0 and i % 2 == 0) {
-            s.recovery_key[n] = '-';
+            s.recovery_key[n] = ' '; // space every 4 hex chars (wraps to 2 lines)
             n += 1;
         }
         s.recovery_key[n] = hexd[b >> 4];
@@ -628,6 +751,153 @@ fn genRecoveryKey(s: *State, io: std.Io) void {
         n += 1;
     }
     s.recovery_len = n;
+}
+
+// ── REAL proof-of-work (background worker) ──────────────────────────────────
+//
+// [CALIBRATE] enrollment difficulty: memory is FIXED + phone-safe (the one knob
+// that can OOM a device — never adaptive, per ANTIBOT_DESIGN); only the attempt
+// target (leading_zero_bits) would adapt in production. Here, tuned for a few
+// visible seconds on a dev box. No-email pays more (the design's invisible tax).
+// Production swaps these for a SERVER-ISSUED, risk-adaptive difficulty.
+const enroll_pow: pow.Difficulty = .{ .mem_kib = 32 * 1024, .iters = 1, .lanes = 1, .leading_zero_bits = 6 };
+const enroll_pow_hard: pow.Difficulty = .{ .mem_kib = 32 * 1024, .iters = 1, .lanes = 1, .leading_zero_bits = 7 };
+
+/// The background PoW job. Lives in `main` (NOT in `State`, which gets reset),
+/// so the worker thread + its atomics outlive a state reset cleanly.
+const PowJob = struct {
+    // A7.2: cold struct (one live instance, holds a thread + lifecycle), size guard waived.
+    thread: ?std.Thread = null,
+    cancel: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+    ok: bool = false, // solution verified (informational; completion gates on `done`)
+    solution: pow.Solution = .{ .nonce = 0 },
+    challenge: pow.Challenge = undefined,
+    difficulty: pow.Difficulty = enroll_pow,
+    active: bool = false, // a job is running for this verifying session
+};
+
+/// Worker body: the genuine memory-hard solve, off the UI thread. Uses the
+/// thread-safe page allocator for Argon2's buffers (no contention with the main
+/// render allocator). Publishes the result via `done` (release/acquire fences
+/// the plain `solution`/`ok` writes).
+fn powWorker(job: *PowJob, io: std.Io) void {
+    const a = std.heap.page_allocator;
+    if (pow_shell.solve(a, io, job.challenge, job.difficulty, &job.cancel)) |sol| {
+        job.solution = sol;
+        job.ok = pow_shell.verify(a, io, job.challenge, sol, job.difficulty) catch false;
+    } else |_| {
+        job.ok = false; // canceled or errored — don't hang the UI
+    }
+    job.done.store(true, .release);
+}
+
+/// Spawn the solve for this verifying session. The challenge seed binds to the
+/// account (the would-be handle) so the work proves effort for THIS entry.
+fn startPow(job: *PowJob, s: *State, io: std.Io) void {
+    const who = if (s.final_handle_len > 0) s.final_handle[0..s.final_handle_len] else "zat4-enroll";
+    const seed = pow.seedForPost(who, 0);
+    job.challenge = pow.challengeFor(seed, .heavy);
+    job.difficulty = if (s.branch == .new and !s.use_email) enroll_pow_hard else enroll_pow;
+    job.cancel.store(false, .monotonic);
+    job.done.store(false, .monotonic);
+    job.ok = false;
+    job.active = true;
+    job.thread = std.Thread.spawn(.{}, powWorker, .{ job, io }) catch null;
+    if (job.thread == null) job.done.store(true, .release); // spawn failed → complete anyway
+}
+
+/// Cancel + join any in-flight solve (cooperative; the worker checks `cancel`
+/// each attempt). Safe to call when idle.
+fn stopPow(job: *PowJob) void {
+    if (job.thread) |th| {
+        job.cancel.store(true, .release);
+        th.join();
+        job.thread = null;
+    }
+    job.active = false;
+}
+
+// ── REAL membership hashing (background worker) ─────────────────────────────
+//
+// The Argon2id enroll/verify (64 MiB hashes, ~hundreds of ms) run here, off the
+// UI thread, so Generate/Confirm never freeze. enroll and verify never overlap
+// in time (different steps), so one worker serializes both; `startVerify` joins
+// any in-flight enroll first, guaranteeing the verifier is stored before it's read.
+
+/// The background membership job (one live instance — A7.2 cold, guard waived).
+const MemJob = struct {
+    // A7.2: cold struct (one live instance, holds a thread + lifecycle), size guard waived.
+    thread: ?std.Thread = null,
+    done: std.atomic.Value(bool) = .init(false),
+    kind: Kind = .enroll,
+    verify_ok: bool = false, // verify result (read after join / done-acquire)
+    store: *membership_shell.Store = undefined,
+    io: std.Io = undefined,
+    tier: credential_core.Tier = .super_secure,
+    pw: [80]u8 = undefined, // copied input (≤ max credential / TextField length)
+    pw_len: u8 = 0,
+    const Kind = enum { enroll, verify };
+};
+
+/// Worker body, off the UI thread. enroll resets the single-member store then
+/// stores the genuine Argon2id verifier; verify checks the typed password against
+/// it. Argon2's buffers come from the store's (thread-safe page) allocator.
+fn memWorker(job: *MemJob) void {
+    const pwd = job.pw[0..job.pw_len];
+    switch (job.kind) {
+        .enroll => {
+            membership_shell.deinit(job.store);
+            job.store.* = membership_shell.init(job.store.gpa);
+            membership_shell.enroll(job.store, job.io, harness_did, job.tier, pwd, 0) catch {};
+        },
+        .verify => {
+            job.verify_ok = membership_shell.verifyLogin(job.store, job.io, harness_did, pwd) catch false;
+        },
+    }
+    job.done.store(true, .release);
+}
+
+/// Join any in-flight membership job (cooperative end — these are short hashes,
+/// not a cancellable loop, so we just wait). Safe to call when idle.
+fn joinMem(job: *MemJob) void {
+    if (job.thread) |th| {
+        th.join();
+        job.thread = null;
+    }
+}
+
+fn spawnMem(job: *MemJob, kind: MemJob.Kind, store: *membership_shell.Store, io: std.Io) void {
+    job.kind = kind;
+    job.store = store;
+    job.io = io;
+    job.verify_ok = false;
+    job.done.store(false, .monotonic);
+    job.thread = std.Thread.spawn(.{}, memWorker, .{job}) catch null;
+    if (job.thread == null) job.done.store(true, .release); // spawn failed → "done" (no hang)
+}
+
+/// Kick off the REAL enroll of the freshly-minted password (off-thread). Joins
+/// any prior op first so a reroll/regen replaces the verifier without a race.
+fn startEnroll(job: *MemJob, s: *State, io: std.Io, mstore: *membership_shell.Store) void {
+    if (!s.has_pw) return;
+    joinMem(job);
+    const pwd = s.cred.bytes[0..s.cred.len];
+    @memcpy(job.pw[0..pwd.len], pwd);
+    job.pw_len = @intCast(pwd.len);
+    job.tier = s.tier;
+    spawnMem(job, .enroll, mstore, io);
+}
+
+/// Kick off the REAL Stage-B verify (off-thread). Joins any in-flight enroll
+/// first so the verifier is guaranteed stored before it's read.
+fn startVerify(job: *MemJob, s: *State, io: std.Io, mstore: *membership_shell.Store) void {
+    joinMem(job);
+    const typed = s.full.slice();
+    const n = @min(typed.len, job.pw.len);
+    @memcpy(job.pw[0..n], typed[0..n]);
+    job.pw_len = @intCast(n);
+    spawnMem(job, .verify, mstore, io);
 }
 
 /// Compose the final handle for the done screen from the branch + inputs.

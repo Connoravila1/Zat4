@@ -98,6 +98,17 @@ pub const Window = struct {
     /// rejected blit repeats every frame and would otherwise flood stderr
     /// with thousands of identical lines. One clear line is the diagnostic.
     x_error_reported: bool,
+    /// Clipboard: the atoms we serve + the text we currently own. `setClipboard`
+    /// claims the CLIPBOARD selection and stores the text HERE; `pump` answers
+    /// other apps' paste requests from it. The value lives only while the app
+    /// runs (X selection semantics) — the realistic "paste into your password
+    /// manager now" window. gpa-free (inline buffer; ≥ the 71-char password +
+    /// the 79-char recovery key).
+    clipboard_atom: u32,
+    utf8_atom: u32,
+    targets_atom: u32,
+    clip_buf: [128]u8,
+    clip_len: usize,
 };
 
 pub const PumpResult = struct {
@@ -340,6 +351,15 @@ pub fn openAt(
     try writeAll(fd, x11.internAtom(&req_buf, "WM_DELETE_WINDOW"));
     const wm_delete = try awaitAtom(fd);
     try writeAll(fd, x11.changePropertyAtom(&req_buf, wid, wm_protocols, wm_delete));
+
+    // Clipboard atoms (the selection-ownership dance — see Window.clip_buf).
+    try writeAll(fd, x11.internAtom(&req_buf, "CLIPBOARD"));
+    const clipboard_atom = try awaitAtom(fd);
+    try writeAll(fd, x11.internAtom(&req_buf, "UTF8_STRING"));
+    const utf8_atom = try awaitAtom(fd);
+    try writeAll(fd, x11.internAtom(&req_buf, "TARGETS"));
+    const targets_atom = try awaitAtom(fd);
+
     try writeAll(fd, x11.createGC(&req_buf, gc, wid));
 
     // --- the keyboard table, fetched once ---
@@ -386,6 +406,11 @@ pub fn openAt(
         .shadow_w = 0,
         .shadow_h = 0,
         .dirty_all = true, // first blit paints the whole window
+        .clipboard_atom = clipboard_atom,
+        .utf8_atom = utf8_atom,
+        .targets_atom = targets_atom,
+        .clip_buf = undefined,
+        .clip_len = 0,
     };
     raster.resize(gpa, &window.fb, width, height, layout.palette_bg) catch return error.OutOfMemory;
     return window;
@@ -413,6 +438,48 @@ pub fn close(window: *Window) void {
     window.draw_list.deinit(gpa);
     raster.deinit(gpa, &window.fb);
     gpa.destroy(window);
+}
+
+// ---------------------------------------------------------------------------
+// Clipboard — own CLIPBOARD, serve paste requests from `pump`
+// ---------------------------------------------------------------------------
+
+/// Put `text` on the system clipboard: store it on the window and claim the
+/// CLIPBOARD selection. From here, paste requests arrive as SelectionRequest
+/// events and are answered by `answerSelection` inside `pump`. A best-effort
+/// I/O op — a failed socket write just means the copy didn't take (E4: not an
+/// error path the caller must handle; the "Copied" toast is the shell's cue).
+pub fn setClipboard(window: *Window, data: []const u8) void {
+    const n = @min(data.len, window.clip_buf.len);
+    @memcpy(window.clip_buf[0..n], data[0..n]);
+    window.clip_len = n;
+    var buf: [16]u8 = undefined;
+    writeAll(window.fd, x11.setSelectionOwner(&buf, window.clipboard_atom, window.wid, 0)) catch {};
+}
+
+/// Answer a paste request (a SelectionRequest in `window.carry`): write the
+/// requested representation into the requestor's property, then SelectionNotify
+/// it. We serve TARGETS (the format list), UTF8_STRING, and STRING; anything
+/// else is refused (property = None in the notify).
+fn answerSelection(window: *Window) void {
+    const sr = x11.parseSelectionRequest(&window.carry);
+    var prop = sr.property;
+    if (prop == 0) prop = sr.target; // obsolete clients: property defaults to target
+    var buf: [256]u8 = undefined;
+    if (sr.target == window.targets_atom) {
+        var tlist: [12]u8 = undefined; // three atoms we offer
+        std.mem.writeInt(u32, tlist[0..4], window.targets_atom, .little);
+        std.mem.writeInt(u32, tlist[4..8], window.utf8_atom, .little);
+        std.mem.writeInt(u32, tlist[8..12], x11.atom_string, .little);
+        writeAll(window.fd, x11.changePropertyData(&buf, sr.requestor, prop, x11.atom_atom, 32, &tlist, 3)) catch {};
+    } else if (sr.target == window.utf8_atom or sr.target == x11.atom_string) {
+        const value = window.clip_buf[0..window.clip_len];
+        writeAll(window.fd, x11.changePropertyData(&buf, sr.requestor, prop, window.utf8_atom, 8, value, @intCast(window.clip_len))) catch {};
+    } else {
+        prop = 0; // unsupported target → refuse
+    }
+    var nbuf: [64]u8 = undefined;
+    writeAll(window.fd, x11.sendSelectionNotify(&nbuf, sr.requestor, sr.selection, sr.target, prop, sr.time)) catch {};
 }
 
 // ---------------------------------------------------------------------------
@@ -470,15 +537,29 @@ pub fn pump(
             window.skip_bytes = x11.replyExtraBytes(&window.carry);
             continue;
         }
+        // A paste request for our clipboard — serve it here (its six 32-bit
+        // fields don't fit the hot Event, so it has its own path).
+        if ((window.carry[0] & 0x7F) == x11.event_selection_request) {
+            answerSelection(window);
+            continue;
+        }
         const event = x11.parseEvent(&window.carry, window.wm_protocols, window.wm_delete);
         switch (event.kind) {
             .key_press => {
                 const shifted = event.state & x11.shift_mask != 0;
                 const ctrl = event.state & x11.control_mask != 0;
                 const sym = x11.keysymFor(window.keysyms, window.syms_per_keycode, window.min_keycode, event.detail, shifted);
-                var key_buf: [8]u8 = undefined;
-                const len = x11.keyBytes(sym, ctrl, &key_buf);
-                if (len > 0) try out.appendSlice(gpa, key_buf[0..len]);
+                // Ctrl+V → inject the clipboard text WE own as typed bytes (the
+                // copy-here-then-paste-here flow). Real cross-app paste (pasting
+                // from a password manager) needs a ConvertSelection round-trip —
+                // a deferred slice-3 add; this serves the in-app confirm flow.
+                if (ctrl and (sym == 'v' or sym == 'V') and window.clip_len > 0) {
+                    try out.appendSlice(gpa, window.clip_buf[0..window.clip_len]);
+                } else {
+                    var key_buf: [8]u8 = undefined;
+                    const len = x11.keyBytes(sym, ctrl, &key_buf);
+                    if (len > 0) try out.appendSlice(gpa, key_buf[0..len]);
+                }
             },
             // Pointer events become the OS-agnostic InputEvent and ride
             // their own channel; key bytes keep the terminal channel.

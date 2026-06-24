@@ -102,6 +102,8 @@ pub const EnrollView = struct {
     // CSPRNG key. `rec_saved` is its save-gate. (ENROLLMENT_BUILD §9 B.)
     recovery_key: []const u8 = "",
     rec_saved: bool = false,
+    /// "Copied" toast strength 0→1 by the Copy button (shell-driven, fades out).
+    copied_t: f32 = 0.0,
     // step 4 confirmation. STAGE A spot-check: three CSPRNG-chosen 1-based word
     // positions and the three typed answers. STAGE B: the whole password typed
     // back. `confirm_error` flips on a failed submit to show the hint.
@@ -110,6 +112,7 @@ pub const EnrollView = struct {
     spot: [3][]const u8 = .{ "", "", "" },
     full: []const u8 = "",
     confirm_error: bool = false,
+    confirm_checking: bool = false, // Stage B: the real Argon2id verify is in flight (off-thread)
     focus: Focus = .none,
     /// PoW progress 0→1 (the proof ring); the shell drives it from real work.
     /// Slice 1 leaves it static; the ring animation is slice 2.
@@ -496,6 +499,7 @@ fn stepPassword(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, ix:
         const bw = @divTrunc(iw - gap, 2);
         try labelButton(gpa, dl, e, ix, bw, y, "Copy", true, hits, .copy);
         try labelButton(gpa, dl, e, ix + bw + gap, bw, y, "Reroll", false, hits, .reroll);
+        try copiedToast(gpa, dl, e, ix + @divTrunc(iw, 2), y - 34, view.copied_t);
         y += 44 + 6;
     }
 
@@ -537,7 +541,11 @@ fn stepConfirm(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, ix: 
         y += 4;
     }
     y += 6;
-    try primaryButton(gpa, dl, e, ix, iw, y, if (view.confirm_stage == .spot) "Continue" else "Confirm", true, hits);
+    // Stage B disables + relabels the button while the real Argon2id verify runs
+    // off-thread (so the UI never freezes and you can't double-submit).
+    const checking = view.confirm_stage == .full and view.confirm_checking;
+    const blabel = if (view.confirm_stage == .spot) "Continue" else if (checking) "Checking\u{2026}" else "Confirm";
+    try primaryButton(gpa, dl, e, ix, iw, y, blabel, !checking, hits);
 
     // Escape hatch: didn't save the password (so can't reproduce it)? Mint a
     // fresh one and go back a step to copy it again.
@@ -556,21 +564,33 @@ fn stepRecovery(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, ix:
     y = try wrap(gpa, dl, e, ix, y, iw, muted, 14, "You chose no email, so this key is your ONLY way back into your account if you ever lose your password. There's no reset without it.");
     y += 14;
 
-    // The key in an accent-ringed box (a ring drawn behind the fill, per the
-    // rect()-fills gotcha). Visually DISTINCT from the word-password so the two
+    // The real P-256 private key in an accent-ringed box (ring behind the fill,
+    // per the rect()-fills gotcha). Grouped hex, wrapped to two centred lines
+    // (it's 64 hex chars). Visually DISTINCT from the word-password so the two
     // secrets don't blur together.
     {
-        const bh: i32 = 56;
+        const bh: i32 = 70;
         try rect(gpa, dl, ix - 1, y - 1, iw + 2, bh + 2, soft(accentRGB(), 0x55), 11);
         try rect(gpa, dl, ix, y, iw, bh, field_fill, 10);
-        const key = if (view.recovery_key.len > 0) view.recovery_key else "A1B2-C3D4-E5F6-7890-A1B2-C3D4-E5F6-7890";
-        try centerStr(gpa, dl, e, ix, iw, y + 34, ink, 16, key);
+        const key = if (view.recovery_key.len > 0) view.recovery_key else "A1B2 C3D4 E5F6 7890 A1B2 C3D4 E5F6 7890 A1B2 C3D4 E5F6 7890 A1B2 C3D4 E5F6 7890";
+        // split at the space nearest the middle → two balanced lines
+        var sp = key.len / 2;
+        while (sp < key.len and key[sp] != ' ') sp += 1;
+        const line1 = key[0..@min(sp, key.len)]; // sp lands on the space → no trailing space
+        const line2 = if (sp + 1 < key.len) key[sp + 1 ..] else "";
+        if (line2.len == 0) {
+            try centerStr(gpa, dl, e, ix, iw, y + 42, ink, 15, line1);
+        } else {
+            try centerStr(gpa, dl, e, ix, iw, y + 30, ink, 15, line1);
+            try centerStr(gpa, dl, e, ix, iw, y + 52, ink, 15, line2);
+        }
         y += bh + 12;
     }
     y = try wrapCenter(gpa, dl, e, ix, y, iw, faint, 12, "Tied to your account's recovery (rotation) key. Save it to your password manager or write it down somewhere safe.");
     y += 12;
 
     try labelButton(gpa, dl, e, ix, iw, y, "Copy recovery key", true, hits, .copy);
+    try copiedToast(gpa, dl, e, ix + @divTrunc(iw, 2), y - 34, view.copied_t);
     y += 44 + 8;
     y = try checkbox(gpa, dl, e, ix, y, "I've saved my recovery key", view.rec_saved, hits, .toggle_rec_saved);
     y += 18;
@@ -1036,6 +1056,20 @@ fn consentAgreeRow(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, 
     return y + s;
 }
 
+/// A small "✓ Copied" pill, centred on `cx`, sitting at `y` — pops above the
+/// Copy button after a successful clipboard copy and fades (shell drives `t`).
+fn copiedToast(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, cx: i32, y: i32, t: f32) !void {
+    if (t <= 0.01) return;
+    const label = "\u{2713} Copied";
+    const tw: i32 = @intCast(text.measure(e, .semibold, label, 13));
+    const pw = tw + 26;
+    const px = cx - @divTrunc(pw, 2);
+    const fa: u8 = @intFromFloat(@min(255.0, 235.0 * t));
+    try rect(gpa, dl, px, y, pw, 28, soft(accentRGB(), fa), 14);
+    const ta: u32 = @intFromFloat(@min(255.0, 255.0 * t));
+    try centerStr(gpa, dl, e, px, pw, y + 19, (ta << 24) | 0x1A1A1A, 13, label);
+}
+
 fn primaryButton(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, ix: i32, iw: i32, y: i32, label: []const u8, enabled: bool, hits: ?*HitList) !void {
     const bh: i32 = 46;
     const fill = if (enabled) accent else soft(accentRGB(), 0x55);
@@ -1228,7 +1262,7 @@ pub fn cardHeight(step: Step, branch: Branch) i32 {
         .membership => 582,
         .password => 466,
         .confirm => confirmHeight(.spot), // fallback (card_h==0): the taller stage
-        .recovery => 470,
+        .recovery => 484,
         .done => 380,
         .verifying => 402,
     };

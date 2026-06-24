@@ -168,3 +168,38 @@ test "wipe zeroes the plaintext and length" {
     try std.testing.expectEqual(@as(u8, 0), c.len);
     for (c.bytes) |b| try std.testing.expectEqual(@as(u8, 0), b);
 }
+
+test "real CSPRNG draws fill the 4096-word pool uniformly (no bias, no gaps)" {
+    // The load-bearing security test (DESIGN §0): pull a large block of REAL
+    // OS entropy and reduce each 16-bit slice with the SAME unbiased mask the
+    // generator uses (`pickIndex`). This exercises BOTH pillars of the claim at
+    // once — the CSPRNG source (`Io.randomSecure`, a syscall, no stored state)
+    // and the power-of-two mask (zero modulo bias). A biased, stuck, or
+    // low-entropy generator would skew the histogram or leave buckets empty; a
+    // true uniform source fills every one of the 4096 buckets inside a tight
+    // band. The bounds are ~8σ-loose, so a real source never flakes but a broken
+    // one fails loudly.
+    const K: u32 = 64; // expected hits per pool index (mean of each bucket)
+    const target: usize = @as(usize, cred.root_count) * K; // 4096 * 64 = 262,144 picks
+    var hist = [_]u32{0} ** cred.root_count;
+    var picks: usize = 0;
+    var buf: [4096]u8 = undefined; // 2048 picks per chunk (2 bytes each)
+    while (picks < target) {
+        try std.testing.io.randomSecure(&buf);
+        var i: usize = 0;
+        while (i + 1 < buf.len) : (i += 2) {
+            const raw = std.mem.readInt(u16, buf[i..][0..2], .little);
+            hist[cred.pickIndex(raw)] += 1;
+            picks += 1;
+        }
+    }
+    var min_c: u32 = std.math.maxInt(u32);
+    var max_c: u32 = 0;
+    for (hist) |c| {
+        min_c = @min(min_c, c);
+        max_c = @max(max_c, c);
+    }
+    try std.testing.expect(min_c > 0); // every word reachable — no entropy gaps
+    try std.testing.expect(min_c > K / 4); // no word grossly under-represented
+    try std.testing.expect(max_c < K * 4); // no word grossly over-represented
+}
