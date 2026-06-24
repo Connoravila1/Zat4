@@ -49,6 +49,8 @@ const faint: u32 = 0xFF6A655A;
 /// threaded into `layout` as `accent` and passed down to the chrome; this
 /// const is the fallback for surfaces with no seated lens.
 pub const accent_house: u32 = 0xFFE8B84B;
+/// Text-selection highlight (translucent steel, drawn behind selected glyphs).
+const sel_fill: u32 = 0x553A6EA5;
 const like_c: u32 = 0xFFF0617A;
 const boost_c: u32 = 0xFF8FD18F;
 /// Resting engagement-icon colour — a cool blueish grey matching the SDF
@@ -67,7 +69,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// `compose` (the New-post button) route navigation rather than engagement.
 /// `compose_send` / `compose_cancel` are the premium composer's footer buttons
 /// (the shell turns a tap into the same control byte the keyboard sends).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse };
 
 /// The six top-level rail destinations, in order. The `Screen` index a nav
 /// region carries is an index into this. Shared by the rail (draw + hit) and
@@ -134,6 +136,19 @@ pub const Region = struct {
 
 pub const Regions = std.ArrayListUnmanaged(Region);
 
+/// The chain (OP stitched self-thread) extent, reported by `layout` so the shell
+/// can draw the sticky "chain header" that pins while you scroll the chain and is
+/// pushed out at its end. Offsets are CONTENT-space (scroll-independent): the
+/// shell computes screen-y as `off + scroll`. A7.2: cold — one transient per
+/// layout call, never collected.
+pub const ChainSticky = struct {
+    present: bool = false,
+    head_index: u32 = 0, // index into `posts` for the chain header's identity
+    top_off: i32 = 0, // chain header content top
+    bottom_off: i32 = 0, // chain end content top (first non-chain post, or thread end)
+    pin_y: i32 = 0, // where the sticky pins (the feed origin, below the top bar)
+};
+
 /// First region (in reverse paint order) containing the pixel, or null.
 pub fn hitTest(regions: []const Region, px: i32, py: i32) ?Region {
     var i: usize = regions.len;
@@ -171,10 +186,16 @@ pub const PostView = struct {
     /// ride the tail padding, so the size is unchanged.
     depth: u8 = 0,
     is_focus: bool = false,
+    /// The root author's self-reply continuation — render STITCHED (no header,
+    /// flush, thin separator) into one continuous post. Rides the tail padding.
+    stitched: bool = false,
+    /// Thread lens: this post has replies, and the reader has collapsed it.
+    has_kids: bool = false,
+    collapsed: bool = false,
 
     comptime {
-        // Budget: 5 slices (5×16=80) + 4 u32 (16) + 5 bytes (initial/liked/
-        // boosted/depth/is_focus), padded to the 8-byte slice alignment = 104.
+        // Budget: 5 slices (5×16=80) + 4 u32 (16) + 8 bytes (initial/liked/boosted/
+        // depth/is_focus/stitched/has_kids/collapsed) = 104, no padding.
         // (A7.1 raise 88 → 104: the `replying_to` handle is a real view field —
         // the feed's reply-context line needs the parent handle on the
         // view-model. Built for a handful of visible rows, so the +16 is fine.)
@@ -678,6 +699,9 @@ pub fn layout(
     /// The socket's tap targets for this frame (its own hit space, distinct
     /// from the feed `regions`); the shell tests these first. Null = draw-only.
     socket_hits: ?*lens_socket.HitList,
+    /// Out: the chain (OP self-thread) extent for the sticky chain header (thread
+    /// screen). Null = don't report.
+    chain_out: ?*ChainSticky,
 ) error{OutOfMemory}!i32 {
     const m = metricsFor(width);
     if (regions) |rg| rg.clearRetainingCapacity();
@@ -777,6 +801,13 @@ pub fn layout(
     // Narrower than the feed socket, inset to sit within the reply column.
     const reply_inset: i32 = 26;
 
+    // Chain (OP self-thread) extent tracking for the sticky chain header.
+    var chain_seen_head = false;
+    var chain_ended = false;
+    var chain_top_off: i32 = 0;
+    var chain_bottom_off: i32 = 0;
+    var chain_head_idx: u32 = 0;
+
     var y: i32 = feed_y0 + scroll;
     for (posts, 0..) |p, pi| {
         // The reply socket precedes this post (its seam in the thread).
@@ -788,6 +819,59 @@ pub fn layout(
         };
         var nb: [12]u8 = undefined;
         const post_top = y;
+
+        // Re-root ANCESTOR (condensed context above the re-rooted post): a smaller
+        // avatar + dimmed name/body, tappable to re-root on it, linked by a thin
+        // connector down the chain. Drawn compact; skips the full post render.
+        if (is_thread and p.depth == feed.thread_ancestor_depth) {
+            const aav: i32 = 22;
+            const agap: i32 = 10;
+            const aax = m.lx;
+            const acx = aax + aav + agap;
+            const acw = m.cw - aav - agap;
+            const aline: i32 = @max(19, @as(i32, @intCast(text.lineMetrics(e, .regular, 13).height)));
+            const abody_top: i32 = post_top + 14 + aline;
+            const acached: ?i32 = if (heights) |hh| (if (pi < hh.len and hh[pi] >= 0) hh[pi] else null) else null;
+            var anext_y: i32 = undefined;
+            if (acached) |adv| {
+                anext_y = post_top + adv;
+            } else {
+                const abe = try wrapBody(gpa, dl, e, acx, abody_top, acw, muted, 13, p.body, aline, false);
+                anext_y = abe + 16;
+                if (heights) |hh| if (pi < hh.len) {
+                    hh[pi] = anext_y - post_top;
+                };
+            }
+            if (anext_y > 0 and post_top < height) {
+                try emitRegion(gpa, regions, m.col_x, post_top, m.col_w, @intCast(@max(0, @min(32767, anext_y - post_top))), @intCast(pi), .post_body);
+                try rect(gpa, dl, aax, post_top, aav, aav, p.tint, @intCast(aav >> 1));
+                const aiadv: i32 = @intCast(text.advance(e, .semibold, p.initial, 13));
+                _ = try glyph1(gpa, dl, e, .semibold, aax + @divTrunc(aav - aiadv, 2), post_top + 16, bg, 13, p.initial);
+                try emitRegion(gpa, regions, aax, post_top, aav, @intCast(aav), @intCast(pi), .author);
+                const abx = try str(gpa, dl, e, .semibold, acx, post_top + 13, muted, 14, p.name);
+                _ = try str(gpa, dl, e, .regular, abx + 7, post_top + 13, faint, 11, p.handle);
+                _ = try wrapBody(gpa, dl, e, acx, abody_top, acw, muted, 13, p.body, aline, true);
+                // Connector down the avatar column linking the chain to the focus.
+                try rect(gpa, dl, aax + @divTrunc(aav, 2) - 1, post_top + aav, 2, anext_y - (post_top + aav), 0x44B7B3A8, 0);
+            }
+            y = anext_y;
+            continue;
+        }
+
+        // Chain extent: the first non-ancestor post is the chain HEAD; the chain
+        // runs through its stitched continuation; the first non-stitched post
+        // after it ends the chain (where the regular replies begin).
+        if (is_thread) {
+            if (!chain_seen_head) {
+                chain_seen_head = true;
+                chain_head_idx = @intCast(pi);
+                chain_top_off = post_top - scroll;
+            } else if (!p.stitched and !chain_ended) {
+                chain_bottom_off = post_top - scroll;
+                chain_ended = true;
+            }
+        }
+
         // View-derived nesting geometry (thread screen only).
         const dep: i32 = if (is_thread) @min(@as(i32, p.depth), max_levels) else 0;
         const indent: i32 = dep * indent_step;
@@ -799,6 +883,17 @@ pub fn layout(
         // the relationship. Stable per post, so the height cache stays valid.
         const show_reply_to = !is_thread and p.replying_to.len > 0;
         const reply_h: i32 = if (show_reply_to) 19 else 0;
+        // A stitched segment (the root author continuing their own thread) drops
+        // the header — no avatar, no name row — and starts the body near the top,
+        // joined to the post above by a thin separator. Non-stitched posts keep
+        // the name row above the body.
+        const stitch = is_thread and p.stitched;
+        const body_top_off: i32 = if (stitch) (14 + body_line) else (18 + reply_h + body_line);
+        // "Chain" = the OP's stitched self-thread. A post is in the chain if it is
+        // a stitched segment OR the header immediately above one. Chain posts use
+        // the vertical stem + per-post elbow instead of a horizontal divider.
+        const next_stitched = is_thread and pi + 1 < posts.len and posts[pi + 1].stitched;
+        const in_chain = is_thread and (p.stitched or next_stitched);
 
         // Measure the post's height WITHOUT drawing (no i16 casts), so we can
         // both advance the scroll accounting and decide visibility. Only posts
@@ -818,7 +913,7 @@ pub fn layout(
             next_y = post_top + adv;
             body_end = next_y - 60;
         } else {
-            body_end = try wrapBody(gpa, dl, e, cx, post_top + 18 + reply_h + body_line, content_w, body_c, 16, p.body, body_line, false);
+            body_end = try wrapBody(gpa, dl, e, cx, post_top + body_top_off, content_w, body_c, 16, p.body, body_line, false);
             next_y = body_end + 60;
             if (heights) |hh| if (pi < hh.len) {
                 hh[pi] = next_y - post_top;
@@ -834,7 +929,25 @@ pub fn layout(
         if (visible) {
             // The focused post (thread screen): a faint accent wash behind it,
             // drawn first so everything else sits on top.
-            if (p.is_focus) try rect(gpa, dl, m.col_x, post_top - 6, m.col_w, (next_y - post_top), 0x16E8B84B, 8);
+            if (p.is_focus) try rect(gpa, dl, m.col_x, post_top - 6, m.col_w, (next_y - post_top), (0x16 << 24) | (accent & 0x00FFFFFF), 8);
+
+            // Chain stem + elbow: a continuous vertical line at the OP avatar
+            // column runs down through the headerless continuation segments
+            // (tying them into one post), and turns with a SHARP right-angle
+            // elbow into each segment. The header (avatar present) anchors the top
+            // of the stem; segments branch off it. No horizontal divider in the
+            // chain (handled below) — the stem + elbow are the structure.
+            if (in_chain) {
+                const sx = m.lx + @divTrunc(av, 2) - 1;
+                const top = if (p.stitched) post_top else post_top + av; // stitched: row top; header: avatar bottom
+                try rect(gpa, dl, sx, top, 2, next_y - top, 0x44B7B3A8, 0); // vertical spine
+                if (p.stitched) {
+                    // Elbow: turn right from the spine into this segment's body
+                    // (sharp corner — two rects meeting, no curve).
+                    const ey = post_top + body_top_off - body_line + 4; // ~first body line
+                    try rect(gpa, dl, sx, ey, (cx - 10) - sx, 2, 0x44B7B3A8, 0);
+                }
+            }
 
             // Whole-post tap target → open this post's thread. Emitted FIRST so
             // the avatar + engagement regions (emitted after, found first in the
@@ -852,31 +965,50 @@ pub fn layout(
                 }
             }
 
-            // avatar disc + initial — tapping it opens that author's profile.
-            try rect(gpa, dl, ax, post_top, av, av, p.tint, @intCast(av >> 1));
-            const iadv: i32 = @intCast(text.advance(e, .semibold, p.initial, init_px));
-            _ = try glyph1(gpa, dl, e, .semibold, ax + @divTrunc(av - iadv, 2), post_top + av_base, bg, init_px, p.initial);
-            try emitRegion(gpa, regions, ax, post_top, av, @intCast(av), @intCast(pi), .author);
+            // Stitched continuation (root author's own chain): NO header — no
+            // avatar, no name row — so the body flows directly under the previous
+            // segment in the OP's column (the avatar gutter stays empty, reading as
+            // one continuous post). The thin separator between segments is the
+            // per-post bottom divider below (each segment sits at depth 0).
+            if (!stitch) {
+                // avatar disc + initial — tapping it opens that author's profile.
+                try rect(gpa, dl, ax, post_top, av, av, p.tint, @intCast(av >> 1));
+                const iadv: i32 = @intCast(text.advance(e, .semibold, p.initial, init_px));
+                _ = try glyph1(gpa, dl, e, .semibold, ax + @divTrunc(av - iadv, 2), post_top + av_base, bg, init_px, p.initial);
+                try emitRegion(gpa, regions, ax, post_top, av, @intCast(av), @intCast(pi), .author);
 
-            // name · handle · age — three weight TIERS, baseline-aligned (P.1):
-            // the name is STRONG (heaviest, brightest, biggest 18px) so the eye
-            // lands there first; handle + · + age are MUTED metadata (faint,
-            // smaller 13px) that recede. Body is the PRIMARY tier below.
-            var bx = try str(gpa, dl, e, .semibold, cx, post_top + 18, ink, 18, p.name);
-            bx = try str(gpa, dl, e, .regular, bx + 9, post_top + 18, faint, 13, p.handle);
-            bx = try str(gpa, dl, e, .regular, bx + 7, post_top + 18, faint, 13, "·");
-            _ = try str(gpa, dl, e, .regular, bx + 7, post_top + 18, faint, 13, p.age);
+                // name · handle · age — three weight TIERS, baseline-aligned (P.1):
+                // the name is STRONG (heaviest, brightest, biggest 18px) so the eye
+                // lands there first; handle + · + age are MUTED metadata (faint,
+                // smaller 13px) that recede. Body is the PRIMARY tier below.
+                var bx = try str(gpa, dl, e, .semibold, cx, post_top + 18, ink, 18, p.name);
+                bx = try str(gpa, dl, e, .regular, bx + 9, post_top + 18, faint, 13, p.handle);
+                bx = try str(gpa, dl, e, .regular, bx + 7, post_top + 18, faint, 13, "·");
+                _ = try str(gpa, dl, e, .regular, bx + 7, post_top + 18, faint, 13, p.age);
 
-            // "Replying to @x" with a subtle ↳ hook — reads as a threaded reply
-            // rather than a standalone post (Twitter/Bluesky parity).
-            if (show_reply_to) {
-                const hk = try str(gpa, dl, e, .regular, cx, post_top + 36, faint, 13, "\xE2\x86\xB3 ");
-                const rl = try str(gpa, dl, e, .regular, hk, post_top + 36, muted, 13, "Replying to ");
-                _ = try str(gpa, dl, e, .regular, rl, post_top + 36, accent, 13, p.replying_to);
+                // "Replying to @x" with a subtle ↳ hook — reads as a threaded reply
+                // rather than a standalone post (Twitter/Bluesky parity).
+                if (show_reply_to) {
+                    const hk = try str(gpa, dl, e, .regular, cx, post_top + 36, faint, 13, "\xE2\x86\xB3 ");
+                    const rl = try str(gpa, dl, e, .regular, hk, post_top + 36, muted, 13, "Replying to ");
+                    _ = try str(gpa, dl, e, .regular, rl, post_top + 36, accent, 13, p.replying_to);
+                }
+            }
+
+            // Collapse toggle (Reddit-style): a nested reply WITH replies gets a
+            // small −/+ on its thread-line column; tapping it hides/shows the
+            // subtree (per-view state, never on the post). Stitched OP segments
+            // are one continuous post, so they have no toggle.
+            if (is_thread and !stitch and dep > 0 and p.has_kids) {
+                const tgx = ax + @divTrunc(av, 2);
+                const sym: u21 = if (p.collapsed) '+' else '-';
+                const sadv: i32 = @intCast(text.advance(e, .semibold, sym, 15));
+                _ = try glyph1(gpa, dl, e, .semibold, tgx - @divTrunc(sadv, 2), post_top + av + 16, muted, 15, sym);
+                try emitRegion(gpa, regions, tgx - 12, post_top + av + 2, 24, 24, @intCast(pi), .collapse);
             }
 
             // body (draw)
-            _ = try wrapBody(gpa, dl, e, cx, post_top + 18 + reply_h + body_line, content_w, body_c, 16, p.body, body_line, true);
+            _ = try wrapBody(gpa, dl, e, cx, post_top + body_top_off, content_w, body_c, 16, p.body, body_line, true);
 
             // Engagement row — roomier spacing + a fuller action set. LEFT group:
             // reply · repost · like (icon + count); RIGHT group: bookmark · share ·
@@ -914,22 +1046,27 @@ pub fn layout(
             _ = try str(gpa, dl, e, .regular, like_x + is + cgap, erow, if (p.liked) like_c else muted, 13, std.fmt.bufPrint(&nb, "{d}", .{p.like}) catch "0");
             try emitRegion(gpa, regions, like_x, tap_y, slot_w, tap_h, @intCast(pi), .like);
 
-            // RIGHT group: bookmark · share · more, right-aligned at the content edge.
-            const rgap: i32 = 32;
-            var rxp = cx + content_w - is;
-            try iconMore(gpa, dl, rxp, iy, is, icon_grey);
-            try emitRegion(gpa, regions, rxp - 7, tap_y, is + 14, tap_h, @intCast(pi), .more);
-            rxp -= rgap;
-            try iconShare(gpa, dl, rxp, iy, is, icon_grey);
-            try emitRegion(gpa, regions, rxp - 7, tap_y, is + 14, tap_h, @intCast(pi), .share);
-            rxp -= rgap;
-            try iconBookmark(gpa, dl, rxp, iy, is, icon_grey);
-            try emitRegion(gpa, regions, rxp - 7, tap_y, is + 14, tap_h, @intCast(pi), .bookmark);
+            // RIGHT group: bookmark · share · more, right-aligned at the content
+            // edge. A stitched segment shows the COMPACT row (reply/repost/like
+            // only — image #2), so the right group is omitted there.
+            if (!stitch) {
+                const rgap: i32 = 32;
+                var rxp = cx + content_w - is;
+                try iconMore(gpa, dl, rxp, iy, is, icon_grey);
+                try emitRegion(gpa, regions, rxp - 7, tap_y, is + 14, tap_h, @intCast(pi), .more);
+                rxp -= rgap;
+                try iconShare(gpa, dl, rxp, iy, is, icon_grey);
+                try emitRegion(gpa, regions, rxp - 7, tap_y, is + 14, tap_h, @intCast(pi), .share);
+                rxp -= rgap;
+                try iconBookmark(gpa, dl, rxp, iy, is, icon_grey);
+                try emitRegion(gpa, regions, rxp - 7, tap_y, is + 14, tap_h, @intCast(pi), .bookmark);
+            }
 
-            // divider — full-width on the flat feed; the thread uses its rails
-            // for separation, so only a short divider under the indented content.
+            // divider — full-width on the flat feed; the thread uses a short
+            // divider under the indented content. CHAIN posts get NO horizontal
+            // divider — the vertical stem + elbow are their separation instead.
             if (is_thread) {
-                try rect(gpa, dl, ax, bottom, m.col_x + m.col_w - ax - 4, 1, divider, 0);
+                if (!in_chain) try rect(gpa, dl, ax, bottom, m.col_x + m.col_w - ax - 4, 1, divider, 0);
             } else {
                 try rect(gpa, dl, m.col_x, bottom, m.col_w, 1, divider, 0);
             }
@@ -962,18 +1099,71 @@ pub fn layout(
         _ = try str(gpa, dl, e, .semibold, px + 20, py + 25, bg, 14, label);
         try emitRegion(gpa, regions, px, py, pw, pill_h, 0, .reveal_new);
     }
+    if (chain_out) |co| co.* = .{
+        .present = is_thread and chain_seen_head,
+        .head_index = chain_head_idx,
+        .top_off = chain_top_off,
+        .bottom_off = if (chain_ended) chain_bottom_off else (y - scroll), // all-chain → thread end
+        .pin_y = feed_y0,
+    };
     return y - scroll; // total content height (scroll-independent), for clamping
 }
 
+/// Scale a color's alpha by `al` (0..1), keeping its RGB — for fading an overlay.
+fn aScale(c: u32, al: f32) u32 {
+    const a8: u32 = @intFromFloat(@as(f32, @floatFromInt(c >> 24)) * std.math.clamp(al, 0.0, 1.0));
+    return (a8 << 24) | (c & 0x00FFFFFF);
+}
+
+/// Draw the sticky CHAIN header bar into `dl` (a shell overlay): a frosted band
+/// across the feed column with the chain author's avatar + display name + @handle,
+/// faded by `alpha`. The bar is clamped to start at `pin_y` (so it grows out from
+/// under the top bar during the catch-up rather than covering it); the avatar +
+/// text center vertically in the visible band. The shell positions `draw_y` (the
+/// pure-sticky + catch-up math) and animates `alpha`.
+pub fn buildChainHeaderBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, width: i32, draw_y: i32, header_h: i32, pin_y: i32, tint: u32, initial: u21, name: []const u8, handle: []const u8, accent: u32, alpha: f32) error{OutOfMemory}!void {
+    _ = accent;
+    _ = pin_y;
+    const m = metricsFor(width);
+    // The frosted band fills from the thread top bar's BOTTOM (drawTopBar box_h:
+    // 111 wide / 96 narrow) down to the header — so it CONNECTS to the "Thread"
+    // bar with no gap (the content still rides at `draw_y` for the seamless seam).
+    const band_top: i32 = if (m.wide) 111 else 96;
+    const band_bottom = draw_y + header_h;
+    if (band_bottom > band_top) {
+        try rect(gpa, dl, m.col_x, band_top, m.col_w, band_bottom - band_top, aScale(header_veil, alpha), 0);
+        try rect(gpa, dl, m.col_x, band_bottom - 1, m.col_w, 1, aScale((0x66 << 24) | (divider & 0x00FFFFFF), alpha), 0);
+    }
+    // Avatar + name + @handle drawn at the EXACT geometry of the inline thread
+    // header (av=32, gap=13, avatar initial baseline +22 @17px, name +18 @18px ink,
+    // handle @13px faint) so when `draw_y` == the inline post_top the pinned bar is
+    // pixel-identical to the original — the scroll-up handoff has no seam.
+    const av: i32 = 32;
+    const gap: i32 = 13;
+    const ax = m.lx;
+    try rect(gpa, dl, ax, draw_y, av, av, aScale(tint, alpha), @intCast(av >> 1));
+    const iadv: i32 = @intCast(text.advance(e, .semibold, initial, 17));
+    _ = try glyph1(gpa, dl, e, .semibold, ax + @divTrunc(av - iadv, 2), draw_y + 22, aScale(bg, alpha), 17, initial);
+    const cx = ax + av + gap;
+    const nx = try str(gpa, dl, e, .semibold, cx, draw_y + 18, aScale(ink, alpha), 18, name);
+    _ = try str(gpa, dl, e, .regular, nx + 9, draw_y + 18, aScale(faint, alpha), 13, handle);
+}
+
+/// The end pen and the caret pen returned by the draft wrapper.
+/// A7.2: cold — a single transient value per compose frame, never collected.
+const DraftPens = struct { end: Pen, caret: Pen };
+
 /// Word-wrap `draft` into `maxw`, honouring explicit '\n' line breaks, drawing
-/// as it goes. Returns the pen position after the last glyph — i.e. where the
-/// text cursor sits. The composer is append/backspace-only (no mid-text edit),
-/// so the cursor is always at the end; this is the one place that derives it.
-/// A word longer than the column is not split mid-word (it overhangs) — drafts
-/// are short and this keeps the wrapper a single honest pass.
-fn wrapDraft(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32, first_baseline: i32, maxw: i32, color: u32, px: u16, draft: []const u8, line_h: i32) !Pen {
+/// as it goes. Returns the pen after the last glyph AND the pen at byte offset
+/// `caret_at` — the composer now supports mid-text editing, so the caret can sit
+/// anywhere, not only at the end. A word longer than the column is not split
+/// mid-word (it overhangs) — drafts are short and this keeps the wrapper a single
+/// honest pass. The inverse query (a click → byte offset) is `composeCaretAtPoint`
+/// below; the two share the wrap rule and must stay in step.
+fn wrapDraft(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32, first_baseline: i32, maxw: i32, color: u32, px: u16, draft: []const u8, line_h: i32, caret_at: usize, sel_start: usize, sel_end: usize) !DraftPens {
     var baseline = first_baseline;
     var x = x0;
+    var caret_pen: Pen = .{ .x = x0, .baseline = first_baseline };
     var word_start: usize = 0;
     var i: usize = 0;
     while (i <= draft.len) : (i += 1) {
@@ -987,18 +1177,119 @@ fn wrapDraft(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i3
                 baseline += line_h;
                 x = x0;
             }
+            // Selection highlight behind the selected sub-run of this word.
+            if (sel_end > sel_start) {
+                const ss = @max(sel_start, word_start);
+                const se = @min(sel_end, i);
+                if (se > ss) {
+                    const hx0 = x + @as(i32, @intCast(text.measure(e, .regular, draft[word_start..ss], px)));
+                    const hx1 = x + @as(i32, @intCast(text.measure(e, .regular, draft[word_start..se], px)));
+                    try rect(gpa, dl, hx0, baseline - 15, hx1 - hx0, 20, sel_fill, 2);
+                }
+            }
+            // Caret inside this word (or at its edges): measure the sub-run.
+            if (caret_at >= word_start and caret_at <= i) {
+                const sw: i32 = @intCast(text.measure(e, .regular, draft[word_start..caret_at], px));
+                caret_pen = .{ .x = x + sw, .baseline = baseline };
+            }
             x = try str(gpa, dl, e, .regular, x, baseline, color, px, word);
+        } else if (caret_at == word_start) {
+            // Empty segment (leading/again-consecutive separator): caret here.
+            caret_pen = .{ .x = x, .baseline = baseline };
         }
         if (at_end) break;
         if (ch == ' ') {
-            if (x > x0) x += @intCast(text.advance(e, .regular, ' ', px)); // no leading space
+            if (x > x0) {
+                // A selected space gets its own highlight cell.
+                if (sel_end > sel_start and i >= sel_start and i < sel_end)
+                    try rect(gpa, dl, x, baseline - 15, @intCast(text.advance(e, .regular, ' ', px)), 20, sel_fill, 2);
+                x += @intCast(text.advance(e, .regular, ' ', px)); // no leading space
+            }
         } else { // '\n' — explicit break
             baseline += line_h;
             x = x0;
         }
         word_start = i + 1;
     }
-    return .{ .x = x, .baseline = baseline };
+    return .{ .end = .{ .x = x, .baseline = baseline }, .caret = caret_pen };
+}
+
+/// The composer text-box geometry, shared by `layoutCompose` (drawing + caret)
+/// and `composeCaretAtPoint` (click → offset) so the two never drift.
+/// A7.2: cold — a single transient value computed per compose frame.
+const ComposeGeom = struct { lx: i32, text_top: i32, inner_w: i32, line_h: i32 };
+fn composeGeom(e: *const text.Engine, width: i32) ComposeGeom {
+    const m = metricsFor(width);
+    const cx0 = m.col_x + 16;
+    const cw = m.col_w - 32;
+    const card_y: i32 = 92;
+    const pad: i32 = 24;
+    const body_line: i32 = @max(24, @as(i32, @intCast(text.lineMetrics(e, .regular, 17).height)));
+    return .{ .lx = cx0 + pad, .text_top = card_y + 50 + 14 + body_line, .inner_w = cw - pad * 2, .line_h = body_line };
+}
+
+/// Keep the candidate boundary nearest the hit point — line distance dominates
+/// (scaled), then horizontal distance breaks ties within the line.
+fn nearerBoundary(off: u32, bx: i32, bbaseline: i32, hx: i32, hy: i32, best_off: *u32, best_score: *i64) void {
+    const dy: i64 = @intCast(@abs(@as(i64, bbaseline) - hy));
+    const dx: i64 = @intCast(@abs(@as(i64, bx) - hx));
+    const score = dy * 4096 + dx;
+    if (score < best_score.*) {
+        best_score.* = score;
+        best_off.* = off;
+    }
+}
+
+/// Map a click at logical (`hx`,`hy`) to the nearest caret byte offset in
+/// `draft`, replaying the same wrap as `wrapDraft`/`layoutCompose`. Pure: the
+/// shell calls it on a composer click, then `textedit.setCaret`.
+pub fn composeCaretAtPoint(e: *const text.Engine, width: i32, draft: []const u8, hx: i32, hy: i32) u32 {
+    if (draft.len == 0) return 0;
+    const px: u16 = 17;
+    const g = composeGeom(e, width);
+    var baseline = g.text_top;
+    var x = g.lx;
+    var best_off: u32 = 0;
+    var best_score: i64 = std.math.maxInt(i64);
+    var word_start: usize = 0;
+    var i: usize = 0;
+    while (i <= draft.len) : (i += 1) {
+        const at_end = i == draft.len;
+        const ch: u8 = if (at_end) 0 else draft[i];
+        if (!at_end and ch != ' ' and ch != '\n') continue;
+        const word = draft[word_start..i];
+        if (word.len > 0) {
+            const ww: i32 = @intCast(text.measure(e, .regular, word, px));
+            if (x > g.lx and x + ww > g.lx + g.inner_w) {
+                baseline += g.line_h;
+                x = g.lx;
+            }
+            // Boundary before the word, then after each codepoint within it.
+            nearerBoundary(@intCast(word_start), x, baseline, hx, hy, &best_off, &best_score);
+            var k: usize = word_start;
+            var wx = x;
+            while (k < i) {
+                const clen: usize = std.unicode.utf8ByteSequenceLength(draft[k]) catch 1;
+                const adv: i32 = @intCast(text.measure(e, .regular, draft[k .. k + clen], px));
+                wx += adv;
+                k += clen;
+                nearerBoundary(@intCast(k), wx, baseline, hx, hy, &best_off, &best_score);
+            }
+            x += ww;
+        } else {
+            nearerBoundary(@intCast(word_start), x, baseline, hx, hy, &best_off, &best_score);
+        }
+        if (at_end) break;
+        if (ch == ' ') {
+            if (x > g.lx) x += @intCast(text.advance(e, .regular, ' ', px));
+        } else {
+            baseline += g.line_h;
+            x = g.lx;
+        }
+        nearerBoundary(@intCast(i + 1), x, baseline, hx, hy, &best_off, &best_score);
+        word_start = i + 1;
+    }
+    return best_off;
 }
 
 /// The premium composer (PHASE C1): the New-post / reply / profile-editor input
@@ -1012,10 +1303,20 @@ pub fn layoutCompose(
     e: *const text.Engine,
     width: i32,
     height: i32,
+    /// The app's live accent (the seated lens's color) — so the composer matches
+    /// the rest of the site, not the static house amber.
+    accent: u32,
     ctx: ComposeContext,
     /// "@handle" of the post being replied to, when `ctx == .reply`; else "".
     reply_handle: []const u8,
     draft: []const u8,
+    /// Byte offset of the insertion point in `draft` (the textedit caret).
+    caret: usize,
+    /// Selected byte range `[sel_start, sel_end)` (equal ⇒ no selection).
+    sel_start: usize,
+    sel_end: usize,
+    /// Whether to paint the caret this frame (the shell's blink clock).
+    blink_on: bool,
     /// A status / hint line shown in the footer (the shell's compose status).
     status: []const u8,
     dl: *raster.DrawList,
@@ -1050,7 +1351,7 @@ pub fn layoutCompose(
         .post => "New post",
         .profile => "Edit your display name",
     });
-    if (ctx == .reply and reply_handle.len > 0) _ = try str(gpa, dl, e, .semibold, hx, card_y + 34, accent_house, 18, reply_handle);
+    if (ctx == .reply and reply_handle.len > 0) _ = try str(gpa, dl, e, .semibold, hx, card_y + 34, accent, 18, reply_handle);
     try rect(gpa, dl, cx0, card_y + 50, cw, 1, divider, 0);
 
     // The draft (or a faint placeholder), wrapped from just under the divider.
@@ -1064,10 +1365,11 @@ pub fn layoutCompose(
         };
         _ = try str(gpa, dl, e, .regular, lx, text_top, faint, 17, ph);
         break :blk .{ .x = lx, .baseline = text_top };
-    } else try wrapDraft(gpa, dl, e, lx, text_top, inner_w, body_c, 17, draft, body_line);
+    } else (try wrapDraft(gpa, dl, e, lx, text_top, inner_w, body_c, 17, draft, body_line, caret, sel_start, sel_end)).caret;
 
-    // The text cursor: a thin accent bar at the pen, one cap-height tall.
-    try rect(gpa, dl, cursor.x + 1, cursor.baseline - 15, 2, 19, accent_house, 1);
+    // The text cursor: a thin accent bar at the caret, one cap-height tall —
+    // painted only on the "on" half of the shell's blink cycle.
+    if (blink_on) try rect(gpa, dl, cursor.x + 1, cursor.baseline - 15, 2, 19, accent, 1);
 
     // Footer: Cancel (left, text) · char count · Send pill (right).
     const fy = card_y + card_h - 46;
@@ -1079,7 +1381,7 @@ pub fn layoutCompose(
     // Send pill (accent, dark label).
     const sw: i32 = @intCast(text.measure(e, .semibold, send_label, 14) + 40);
     const sx = cx0 + cw - pad - sw;
-    try rect(gpa, dl, sx, fy, sw, 34, accent_house, 16);
+    try rect(gpa, dl, sx, fy, sw, 34, accent, 16);
     _ = try str(gpa, dl, e, .semibold, sx + 20, fy + 22, bg, 14, send_label);
     try emitRegion(gpa, regions, sx, fy, sw, 34, 0, .compose_send);
     // Char count (posts/replies only) between the two buttons.
@@ -1370,6 +1672,9 @@ pub fn fromTimeline(arena: Allocator, items: []const feed.TimelineItem, now: i64
             .boosted = it.item_flags.viewer_reposted,
             .depth = it.depth,
             .is_focus = it.is_focus,
+            .stitched = it.stitched,
+            .has_kids = it.has_kids,
+            .collapsed = it.collapsed,
         };
     }
     return out;
@@ -1442,7 +1747,7 @@ test "layout emits 4 tap regions per post (avatar + 3 engagement); hitTest resol
     const posts = [_]PostView{
         .{ .name = "A", .handle = "@a.zat", .age = "1m", .body = "hello there field", .tint = 0xFFAAAAAA, .reply = 1, .boost = 2, .like = 3, .initial = 'A', .liked = true, .boosted = false },
     };
-    const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null);
+    const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null);
     try std.testing.expect(h > 112); // content extends below the top bar
     // 8 regions per post: body tap + avatar + reply/repost/like + bookmark/share/more.
     try std.testing.expectEqual(@as(usize, 8), regions.items.len);
@@ -1482,7 +1787,8 @@ test "layoutCompose emits send + cancel regions; multi-line draft + empty draft 
     defer regions.deinit(gpa);
 
     // A reply draft spanning an explicit newline (Enter inserts '\n').
-    try layoutCompose(gpa, &engine, 1300, 900, .reply, "@mara.zat", "line one\nline two is a bit longer so it wraps", "", &dl, &regions);
+    const draft_ml = "line one\nline two is a bit longer so it wraps";
+    try layoutCompose(gpa, &engine, 1300, 900, accent_house, .reply, "@mara.zat", draft_ml, 5, 9, 17, true, "", &dl, &regions);
     try std.testing.expect(dl.len > 0);
     var saw_send = false;
     var saw_cancel = false;
@@ -1502,8 +1808,13 @@ test "layoutCompose emits send + cancel regions; multi-line draft + empty draft 
 
     // An empty profile draft renders the placeholder path without crashing.
     dl.len = 0;
-    try layoutCompose(gpa, &engine, 700, 800, .profile, "", "", "saving...", &dl, &regions);
+    try layoutCompose(gpa, &engine, 700, 800, accent_house, .profile, "", "", 0, 0, 0, true, "saving...", &dl, &regions);
     try std.testing.expect(dl.len > 0);
+
+    // The inverse (click → caret offset) replays the same wrap: a click far
+    // before the text lands at 0; a click far past it lands at the end.
+    try std.testing.expectEqual(@as(u32, 0), composeCaretAtPoint(&engine, 1300, draft_ml, -10000, -10000));
+    try std.testing.expectEqual(@as(u32, draft_ml.len), composeCaretAtPoint(&engine, 1300, draft_ml, 1_000_000, 1_000_000));
 }
 
 test "long timeline does not overflow draw coordinates (off-screen posts skipped)" {
@@ -1524,7 +1835,7 @@ test "long timeline does not overflow draw coordinates (off-screen posts skipped
     const posts = try arena.alloc(PostView, n);
     for (posts) |*pv| pv.* = .{ .name = "x", .handle = "@x.zat", .age = "1m", .body = "a body line that wraps a little across the feed column width here", .tint = 0xFF888888, .reply = 1, .boost = 2, .like = 3, .initial = 'x', .liked = false, .boosted = false };
 
-    const h = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null); // must not panic
+    const h = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null); // must not panic
     try std.testing.expect(h > 940 * 10); // height accounts for the whole list
     try std.testing.expect(regions.items.len < 4 * 24); // only on-screen posts are tappable
 
@@ -1538,11 +1849,11 @@ test "long timeline does not overflow draw coordinates (off-screen posts skipped
     @memset(heights, -1);
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h_fill = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null);
+    const h_fill = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null);
     const fill_regions = regions.items.len;
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h_cached = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null);
+    const h_cached = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null);
     try std.testing.expectEqual(h, h_fill);
     try std.testing.expectEqual(h, h_cached);
     try std.testing.expectEqual(fill_regions, regions.items.len);
@@ -1565,7 +1876,7 @@ test "profile screen renders the author's posts under a header; other screens st
     // Profile screen: 8 post tap regions (body + avatar + reply/repost/like +
     // bookmark/share/more) + 4 profile-nav tab regions in the sticky header
     // (the header here isn't editable, so no edit-profile region).
-    const hp = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_profile, header, 0, accent_house, null, .{}, null);
+    const hp = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_profile, header, 0, accent_house, null, .{}, null, null);
     try std.testing.expect(hp > 112);
     try std.testing.expectEqual(@as(usize, 12), regions.items.len);
 
@@ -1573,7 +1884,7 @@ test "profile screen renders the author's posts under a header; other screens st
     // so no tap regions, and the height clamps to the viewport (no post stack).
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const he = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, 1, null, 0, accent_house, null, .{}, null); // Explore
+    const he = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, 1, null, 0, accent_house, null, .{}, null, null); // Explore
     try std.testing.expectEqual(@as(i32, 940), he);
     try std.testing.expectEqual(@as(usize, 0), regions.items.len);
 }

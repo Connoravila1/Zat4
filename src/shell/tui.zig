@@ -55,6 +55,7 @@ const text_core = @import("../core/text.zig");
 const field_core = @import("../core/field.zig");
 const field_ui = @import("../core/field_ui.zig");
 const feed_view = @import("../core/feed_view.zig");
+const textedit = @import("../core/textedit.zig");
 const lens_socket = @import("../core/lens_socket.zig");
 const lens_catalog = @import("../core/lens_catalog.zig");
 const loadout_store = @import("loadout.zig");
@@ -224,8 +225,36 @@ pub fn run(
     // the reply target's strings are copied into their own arena, reset at
     // each composer open (C3: one composition, one unit of work).
     var mode: Mode = .timeline;
-    var compose_buf: std.ArrayList(u8) = .empty;
-    defer compose_buf.deinit(gpa);
+    // Composer text: a fixed backing buffer (the draft is capped at 300
+    // codepoints — ≤1200 UTF-8 bytes) wrapped in the shared editable-text model,
+    // so the composer gets caret-aware editing (click-to-place, ←/→, Home/End,
+    // mid-text insert/delete) instead of append-only. Caller-owned: no deinit.
+    var compose_store: [1200]u8 = undefined;
+    var compose: textedit.Field = .{ .buf = &compose_store };
+    // The caret blink anchor: reset on every edit/move so the caret stays solid
+    // while the user is active, then blinks when idle (B3: the clock is shell).
+    var caret_anchor_ns: u64 = 0;
+    // True between a press and release in the composer text area — a drag extends
+    // the selection (textedit anchor stays, caret follows the pointer).
+    var compose_drag: bool = false;
+    // Multi-click tracking (double = word, triple = line): consecutive presses
+    // close in time and position step the count.
+    var last_click_ns: u64 = 0;
+    var last_click_x: i32 = -1000;
+    var last_click_y: i32 = -1000;
+    var click_count: u8 = 0;
+    // Release-activation (the premium standard): a tap is ARMED on press and
+    // FIRES on release only if the release lands on the same target (press then
+    // slide off = cancel). The press records the target; the release re-hit-tests
+    // and fires the feed switch / legacy cell / composer button if it matches.
+    // (Caret placement + socket drag stay on press; the lens socket's own taps
+    // are unchanged for now — its drag/drop model is separate.)
+    var armed_kind: ?feed_view.Action = null;
+    var armed_post: u16 = 0;
+    var armed_legacy: bool = false;
+    var armed_cx: u16 = 0;
+    var armed_cy: u16 = 0;
+    var armed_compose: ?feed_view.Action = null; // composer Send/Cancel armed on press
     var compose_arena_state = std.heap.ArenaAllocator.init(gpa);
     defer compose_arena_state.deinit();
     var reply_target: ?write.ReplyTarget = null;
@@ -477,6 +506,17 @@ pub fn run(
     var thread_focus_uri: []const u8 = "";
     var thread_dirty = false;
     var thread_return_screen: u8 = 0;
+    // RE-ROOT mode: false when a thread is opened from the timeline (show the WHOLE
+    // thread, scroll to the focus); true when a reply is tapped INSIDE the thread
+    // (re-root on it: condensed ancestors above + the focus + its subtree).
+    var thread_rerooted = false;
+    // Collapsed reply CIDs (Reddit-style) — per-view state (ZONES inv. 4: never
+    // on the post). gpa-owned dupes; cleared on exit. Passed to buildThreadView.
+    var gcollapsed: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (gcollapsed.items) |c| gpa.free(c);
+        gcollapsed.deinit(gpa);
+    }
 
     // The pointer's last position in LOGICAL coords (for the hover highlight),
     // updated on every motion event; <0 until the first move.
@@ -719,7 +759,7 @@ pub fn run(
         // paths all key off; the post records (and so engagement + identity) are
         // shared (ZONES invariant 4).
         const view_items: []const feed_core.TimelineItem = if (on_thread)
-            try feed_core.buildThreadView(arena, store, thread_focus_cid)
+            try feed_core.buildThreadView(arena, store, thread_focus_cid, thread_rerooted, gcollapsed.items)
         else if (on_profile)
             try feed_core.buildAuthorView(arena, store, profile_target_did)
         else
@@ -822,7 +862,7 @@ pub fn run(
                             const ctx: feed_view.ComposeContext = if (compose_kind == .profile)
                                 .profile
                             else if (reply_handle.len > 0) .reply else .post;
-                            paintComposeGpu(gpa, win, g, gs, ctx, reply_handle, compose_buf.items, status) catch {};
+                            paintComposeGpu(gpa, win, g, gs, ctx, reply_handle, textedit.view(&compose), compose.caret, textedit.selStart(&compose), textedit.selEnd(&compose), composeBlinkOn(caret_anchor_ns), status) catch {};
                         } else {
                             // Software fallback: the glyph-field cell composer.
                             const cell = cellSize(win.fb.width, gzoom);
@@ -832,8 +872,11 @@ pub fn run(
                                 field_core.deinit(gpa, &gfield);
                                 try field_core.init(gpa, &gfield, cols, rows);
                             }
-                            const cc = timeline_ui.countCodepoints(compose_buf.items);
-                            const cursor = field_ui.buildCompose(&gfield, compose_buf.items, reply_handle, cc, status);
+                            const cc = timeline_ui.countCodepoints(textedit.view(&compose));
+                            // Software fallback keeps an end-of-text cursor (the
+                            // GPU path owns the caret-aware bar); the model still
+                            // edits at the caret either way.
+                            const cursor = field_ui.buildCompose(&gfield, textedit.view(&compose), reply_handle, cc, status);
                             try field_core.compose(gpa, &gfield, gparticles.slice(), .{ .x = @floatFromInt(cols / 2), .y = @floatFromInt(rows / 3), .radius = @floatFromInt(cols), .ambient = 0.7 }, cell.w, cell.h, &gdraw);
                             // The cursor: a filled block at the insertion cell,
                             // tinted with the app accent (alpha-blended).
@@ -842,11 +885,11 @@ pub fn run(
                         }
                     },
                     .terminal => {
-                        timeline_ui.buildComposeFrame(&next, compose_buf.items, reply_handle, status);
+                        timeline_ui.buildComposeFrame(&next, textedit.view(&compose), reply_handle, status);
                         try present(gpa, out, arena, &prev, &next, backend);
                     },
                 } else {
-                    timeline_ui.buildComposeFrame(&next, compose_buf.items, reply_handle, status);
+                    timeline_ui.buildComposeFrame(&next, textedit.view(&compose), reply_handle, status);
                     try present(gpa, out, arena, &prev, &next, backend);
                 }
             },
@@ -1230,9 +1273,54 @@ pub fn run(
                                     }
                                 }
                                 if (!socket_handled) {
+                                    // Release-activation: ARM the tap (don't fire). It
+                                    // fires on button_up only if the release lands on
+                                    // the same target — press-then-slide-off cancels.
                                     if (feed_view.hitTest(g.regions.items, rx, ry)) |hit| {
-                                    gsocket_ui.picking = null; // a click off the socket closes the picker
-                                    switch (hit.kind) {
+                                        gsocket_ui.picking = null; // a click off the socket closes the picker
+                                        armed_kind = hit.kind;
+                                        armed_post = hit.post;
+                                    } else if (field_ui.hitTest(cx, cy, g.hr.slice())) |_| {
+                                        armed_legacy = true;
+                                        armed_cx = cx;
+                                        armed_cy = cy;
+                                    }
+                                }
+                            },
+                            // Release-activation: the armed tap fires here (see the
+                            // button_down arm). Placed after the drag-drop handling so
+                            // a drag never also triggers a tap.
+                            .button_up => if (pev.button == 1) {
+                                // Finish any drag with a drop first (the press began it).
+                                if (gscreen == feed_view.screen_loadout) {
+                                    if (page_drag_surface) |s| switch (s) {
+                                        0 => pageDragDrop(socket_cards, socket_blob, &gseated, &gsocket_ui, page_geoms[0], &loadout_dirty),
+                                        1 => pageDragDrop(reply_cards, reply_blob, &reply_seated, &reply_ui, page_geoms[1], &loadout_dirty),
+                                        else => pageDragDrop(zone_cards, zone_blob, &zone_seated, &zone_ui, page_geoms[2], &loadout_dirty),
+                                    };
+                                } else if (gsocket_ui.drag_active) |d| {
+                                    const geom = feed_view.homeSocketGeom(if (gpu_state != null) @as(i32, @intCast(design_w)) else @as(i32, @intCast(win.fb.width)));
+                                    const to: u32 = lens_socket.dropIndex(home_tray, gsocket_ui, geom) orelse d;
+                                    const seated_off = if (gseated < socket_cards.len) socket_cards[gseated].cid.off else 0;
+                                    reorderTray(socket_cards, d, to);
+                                    for (socket_cards, 0..) |c, ix| {
+                                        if (c.cid.off == seated_off) {
+                                            gseated = @intCast(ix);
+                                            break;
+                                        }
+                                    }
+                                    gsocket_ui.drag_active = to; // the card now lives at `to`
+                                    gsocket_ui.settle_phase = 1; // ghost eases from release point into its slot
+                                    loadout_dirty = true;
+                                }
+                                // Release-activation: fire the armed feed tap ONLY if the
+                                // release lands on the same target the press armed. A press
+                                // that began a drag never armed a tap, so a drag never also
+                                // fires one.
+                                if (armed_kind) |ak| {
+                                    if (feed_view.hitTest(g.regions.items, rx, ry)) |hit| {
+                                        if (hit.kind == ak and hit.post == armed_post) {
+                                            switch (hit.kind) {
                                         // Left-rail destination: switch the active screen
                                         // (post carries the Screen index). Selecting Profile
                                         // targets YOUR own profile; the next frame re-renders.
@@ -1268,11 +1356,11 @@ pub fn run(
                                         // putProfile on send (handleComposeInput).
                                         .edit_profile => {
                                             compose_kind = .profile;
-                                            compose_buf.clearRetainingCapacity();
+                                            textedit.clear(&compose);
                                             if (profile_header) |ph| {
                                                 const bare = if (ph.handle.len > 1) ph.handle[1..] else "";
                                                 if (ph.display_name.len > 0 and !std.mem.eql(u8, ph.display_name, bare))
-                                                    try compose_buf.appendSlice(gpa, ph.display_name);
+                                                    textedit.set(&compose, ph.display_name);
                                             }
                                             mode = .compose;
                                             status = "edit display name · Enter saves";
@@ -1286,7 +1374,7 @@ pub fn run(
                                         .like, .repost => if (hit.post < view_items.len) {
                                             state.selected = hit.post;
                                             const ek: Engagement = if (hit.kind == .like) .like else .repost;
-                                            const r = try engageSelected(ek, gpa, arena, session, store, view_items[hit.post], hit.post, gscreen, profile_target_did, thread_focus_cid, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
+                                            const r = try engageSelected(ek, gpa, arena, session, store, view_items[hit.post], hit.post, gscreen, profile_target_did, thread_focus_cid, thread_rerooted, gcollapsed.items, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
                                             if (r.status.len > 0) status = r.status;
                                         },
                                         // Reply → open the premium composer in reply
@@ -1308,7 +1396,7 @@ pub fn run(
                                                 };
                                                 reply_handle = try compose_arena.dupe(u8, item.author_handle);
                                                 compose_kind = .post;
-                                                compose_buf.clearRetainingCapacity();
+                                                textedit.clear(&compose);
                                                 status = "";
                                                 mode = .compose;
                                             }
@@ -1327,10 +1415,19 @@ pub fn run(
                                                 thread_focus_cid = thread_focus_cid_buf[0..item.cid.len];
                                                 @memcpy(thread_focus_uri_buf[0..item.uri.len], item.uri);
                                                 thread_focus_uri = thread_focus_uri_buf[0..item.uri.len];
-                                                if (gscreen != feed_view.screen_thread) thread_return_screen = gscreen;
+                                                const was_in_thread = gscreen == feed_view.screen_thread;
+                                                if (!was_in_thread) thread_return_screen = gscreen;
                                                 gscreen = feed_view.screen_thread;
                                                 thread_dirty = true;
-                                                g.scroll.* = 0; // top of the thread
+                                                // First tap from the timeline = WHOLE thread; a tap
+                                                // INSIDE the thread = RE-ROOT (condensed ancestors
+                                                // above the focus). EITHER way, land ON the tapped
+                                                // post (it's the new root) — ancestors sit above,
+                                                // scrollable up — so a deep-chain tap doesn't dump
+                                                // you at the top to scroll back down.
+                                                thread_rerooted = was_in_thread;
+                                                g.scroll.* = 0;
+                                                if (g.gpu) |gs| gs.scroll_to_focus = true;
                                             }
                                         },
                                         // Back (thread top bar) → the prior screen.
@@ -1361,47 +1458,38 @@ pub fn run(
                                             gloadout_tab = @intCast(hit.post);
                                             gscroll_px = 0; // top of the newly-selected tab
                                         },
+                                        // Reddit-style collapse: toggle this reply's CID in the
+                                        // per-view collapsed set (no network — buildThreadView
+                                        // re-derives the view next frame; ZONES inv. 4).
+                                        .collapse => if (hit.post < view_items.len) {
+                                            const cid = view_items[hit.post].cid;
+                                            var found: ?usize = null;
+                                            for (gcollapsed.items, 0..) |c, ix| if (std.mem.eql(u8, c, cid)) {
+                                                found = ix;
+                                                break;
+                                            };
+                                            if (found) |ix| {
+                                                gpa.free(gcollapsed.items[ix]);
+                                                _ = gcollapsed.swapRemove(ix);
+                                            } else if (gpa.dupe(u8, cid)) |d| {
+                                                gcollapsed.append(gpa, d) catch gpa.free(d);
+                                            } else |_| {}
+                                        },
                                         .bookmark, .share, .more, .profile_tab => {},
-                                    }
-                                } else if (field_ui.hitTest(cx, cy, g.hr.slice())) |hit| {
-                                    if (hit.target != field_ui.no_target and hit.target < view_items.len) state.selected = hit.target;
-                                    if (hit.action != .none) if (timeline_ui.keyFor(hit.action)) |byte| {
-                                        try pumped_bytes.append(gpa, byte);
-                                    };
-                                }
-                                }
-                            },
-                            // L.4 drop: release over a card reorders the dragged lens
-                            // to that card's rank. Any of the target card's hit regions
-                            // carries its CID; the dragged card's own hole has none, so
-                            // dropping back is a no-op. The seated card follows by CID.
-                            .button_up => if (pev.button == 1) {
-                                if (gscreen == feed_view.screen_loadout) {
-                                    // Loadout page: drop the dragged surface into its slot,
-                                    // using that socket's on-page geometry. page_drag_surface
-                                    // stays set so the settle keeps animating (cleared in the
-                                    // per-frame advance when the settle finishes).
-                                    if (page_drag_surface) |s| switch (s) {
-                                        0 => pageDragDrop(socket_cards, socket_blob, &gseated, &gsocket_ui, page_geoms[0], &loadout_dirty),
-                                        1 => pageDragDrop(reply_cards, reply_blob, &reply_seated, &reply_ui, page_geoms[1], &loadout_dirty),
-                                        else => pageDragDrop(zone_cards, zone_blob, &zone_seated, &zone_ui, page_geoms[2], &loadout_dirty),
-                                    };
-                                } else if (gsocket_ui.drag_active) |d| {
-                                    // Home feed socket drop.
-                                    const geom = feed_view.homeSocketGeom(if (gpu_state != null) @as(i32, @intCast(design_w)) else @as(i32, @intCast(win.fb.width)));
-                                    const to: u32 = lens_socket.dropIndex(home_tray, gsocket_ui, geom) orelse d;
-                                    const seated_off = if (gseated < socket_cards.len) socket_cards[gseated].cid.off else 0;
-                                    reorderTray(socket_cards, d, to);
-                                    for (socket_cards, 0..) |c, ix| {
-                                        if (c.cid.off == seated_off) {
-                                            gseated = @intCast(ix);
-                                            break;
+                                            }
                                         }
                                     }
-                                    gsocket_ui.drag_active = to; // the card now lives at `to`
-                                    gsocket_ui.settle_phase = 1; // ghost eases from release point into its slot
-                                    loadout_dirty = true;
+                                } else if (armed_legacy and cx == armed_cx and cy == armed_cy) {
+                                    // Legacy (software cell) tap: same target on release.
+                                    if (field_ui.hitTest(cx, cy, g.hr.slice())) |hit| {
+                                        if (hit.target != field_ui.no_target and hit.target < view_items.len) state.selected = hit.target;
+                                        if (hit.action != .none) if (timeline_ui.keyFor(hit.action)) |byte| {
+                                            try pumped_bytes.append(gpa, byte);
+                                        };
+                                    }
                                 }
+                                armed_kind = null;
+                                armed_legacy = false;
                             },
                             else => {},
                         }
@@ -1415,14 +1503,61 @@ pub fn run(
                 if (mode == .compose) if (pix) |g| {
                     const gpu_scale: f32 = if (g.gpu) |gs| gs.scale else 1.0;
                     for (pointer_events.items) |pev| {
-                        if (pev.kind != .button_down or pev.button != 1) continue;
                         const rx: i32 = if (g.gpu != null) @intFromFloat(@as(f32, @floatFromInt(pev.x)) / gpu_scale) else @intCast(pev.x);
                         const ry: i32 = if (g.gpu != null) @intFromFloat(@as(f32, @floatFromInt(pev.y)) / gpu_scale) else @intCast(pev.y);
-                        if (feed_view.hitTest(g.regions.items, rx, ry)) |hit| switch (hit.kind) {
-                            .compose_send => try pumped_bytes.append(gpa, 4), // ctrl-D
-                            .compose_cancel => try pumped_bytes.append(gpa, 3), // ctrl-C
+                        switch (pev.kind) {
+                            .button_down => {
+                                if (pev.button != 1) continue;
+                                if (feed_view.hitTest(g.regions.items, rx, ry)) |hit| switch (hit.kind) {
+                                    // Release-activation: arm the footer button; it fires
+                                    // on button_up if the release is still on it.
+                                    .compose_send, .compose_cancel => armed_compose = hit.kind,
+                                    else => {},
+                                } else {
+                                    // Press in the text area. Count consecutive
+                                    // presses close in time + place: 1 = caret +
+                                    // drag, 2 = select word, 3 = select line.
+                                    const now_ns = clock_shell.monotonicNanos();
+                                    const near = @abs(rx - last_click_x) <= 3 and @abs(ry - last_click_y) <= 3;
+                                    click_count = if (now_ns -| last_click_ns < 400_000_000 and near) click_count + 1 else 1;
+                                    last_click_ns = now_ns;
+                                    last_click_x = rx;
+                                    last_click_y = ry;
+                                    const off = feed_view.composeCaretAtPoint(g.engine, @intCast(design_w), textedit.view(&compose), rx, ry);
+                                    switch (@min(click_count, @as(u8, 3))) {
+                                        1 => {
+                                            textedit.setCaret(&compose, off);
+                                            compose_drag = true; // single press → drag-select
+                                        },
+                                        2 => textedit.selectWord(&compose, off),
+                                        else => textedit.selectLine(&compose, off),
+                                    }
+                                    caret_anchor_ns = now_ns;
+                                }
+                            },
+                            .move => if (compose_drag) {
+                                // Drag extends the selection to the pointer.
+                                const off = feed_view.composeCaretAtPoint(g.engine, @intCast(design_w), textedit.view(&compose), rx, ry);
+                                textedit.extendTo(&compose, off);
+                                caret_anchor_ns = clock_shell.monotonicNanos();
+                            },
+                            .button_up => if (pev.button == 1) {
+                                compose_drag = false;
+                                // Fire the armed footer button only if the release is
+                                // still over the same button (slide-off cancels).
+                                if (armed_compose) |ac| {
+                                    if (feed_view.hitTest(g.regions.items, rx, ry)) |hit| {
+                                        if (hit.kind == ac) switch (ac) {
+                                            .compose_send => try pumped_bytes.append(gpa, 4), // ctrl-D
+                                            .compose_cancel => try pumped_bytes.append(gpa, 3), // ctrl-C
+                                            else => {},
+                                        };
+                                    }
+                                }
+                                armed_compose = null;
+                            },
                             else => {},
-                        };
+                        }
                     }
                     if (pointer_events.items.len > 0) last_input_nanos = clock_shell.monotonicNanos();
                 };
@@ -1453,7 +1588,25 @@ pub fn run(
             }
 
             if (mode == .compose) {
-                try handleComposeInput(gpa, session, &status, &mode, store, &compose_buf, &reply_target, &reply_handle, compose_kind, pix, &pending_send, &pending_profile_save, decoded.event, now);
+                // Copy (Ctrl+C) / Cut (Ctrl+X) on a selection — handled here
+                // because the clipboard write needs the window. With a selection,
+                // Ctrl+C copies (not cancel); Ctrl+X copies then deletes.
+                const ctrl_char: ?u21 = switch (decoded.event) {
+                    .char => |c| c,
+                    else => null,
+                };
+                if (ctrl_char) |c| if ((c == 3 or c == 24) and textedit.hasSelection(&compose)) {
+                    switch (backend) {
+                        .window => |w| window_shell.setClipboard(w, textedit.selView(&compose)),
+                        .terminal => {},
+                    }
+                    if (c == 24) textedit.deleteSelection(&compose);
+                    caret_anchor_ns = clock_shell.monotonicNanos();
+                    continue;
+                };
+                try handleComposeInput(gpa, session, &status, &mode, store, &compose, &reply_target, &reply_handle, compose_kind, pix, &pending_send, &pending_profile_save, decoded.event, now);
+                if (mode != .compose) compose_drag = false; // composer closed → end any drag
+                caret_anchor_ns = clock_shell.monotonicNanos(); // keystroke/move → solid caret
                 continue;
             }
 
@@ -1552,12 +1705,12 @@ pub fn run(
                     }
                 },
                 .like => if (view_items.len > 0) {
-                    const r = try engageSelected(.like, gpa, arena, session, store, view_items[state.selected], state.selected, gscreen, profile_target_did, thread_focus_cid, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
+                    const r = try engageSelected(.like, gpa, arena, session, store, view_items[state.selected], state.selected, gscreen, profile_target_did, thread_focus_cid, thread_rerooted, gcollapsed.items, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
                     if (r.status.len > 0) status = r.status;
                     if (r.skip_rest) continue;
                 },
                 .repost => if (view_items.len > 0) {
-                    const r = try engageSelected(.repost, gpa, arena, session, store, view_items[state.selected], state.selected, gscreen, profile_target_did, thread_focus_cid, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
+                    const r = try engageSelected(.repost, gpa, arena, session, store, view_items[state.selected], state.selected, gscreen, profile_target_did, thread_focus_cid, thread_rerooted, gcollapsed.items, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
                     if (r.status.len > 0) status = r.status;
                     if (r.skip_rest) continue;
                 },
@@ -1650,7 +1803,7 @@ pub fn run(
                             .parent_cid = try compose_arena.dupe(u8, refs.parent_cid),
                         };
                         reply_handle = try compose_arena.dupe(u8, item.author_handle);
-                        compose_buf.clearRetainingCapacity();
+                        textedit.clear(&compose);
                         status = "";
                         mode = .compose;
                     }
@@ -1658,7 +1811,7 @@ pub fn run(
                 .new_post => {
                     reply_target = null;
                     reply_handle = "";
-                    compose_buf.clearRetainingCapacity();
+                    textedit.clear(&compose);
                     status = "";
                     mode = .compose;
                 },
@@ -1677,12 +1830,10 @@ pub fn run(
     }
 }
 
-/// Remove the last codepoint from the draft (UTF-8-aware backspace).
-fn popCodepoint(buf: *std.ArrayList(u8)) void {
-    if (buf.items.len == 0) return;
-    var end = buf.items.len - 1;
-    while (end > 0 and (buf.items[end] & 0xC0) == 0x80) end -= 1;
-    buf.shrinkRetainingCapacity(end);
+/// The caret blink phase: solid for the ~530 ms after the last edit/move
+/// (anchor), then a 530 ms on/off cycle while idle. B3: the clock is the shell's.
+fn composeBlinkOn(anchor_ns: u64) bool {
+    return ((clock_shell.monotonicNanos() -| anchor_ns) / 530_000_000) % 2 == 0;
 }
 
 /// Diff, write, flush, and bring `prev` up to date with what is on screen.
@@ -1789,7 +1940,7 @@ fn handleComposeInput(
     /// The shared store — a send is optimistically ingested into it so it shows
     /// INSTANTLY (the 5s refresh would otherwise gate it).
     store: *feed_core.Store,
-    compose_buf: *std.ArrayList(u8),
+    compose: *textedit.Field,
     reply_target: *?write.ReplyTarget,
     reply_handle: *[]const u8,
     compose_kind: ComposeKind,
@@ -1809,18 +1960,23 @@ fn handleComposeInput(
             mode.* = .timeline;
             status.* = "cancelled";
         },
-        .backspace => popCodepoint(compose_buf),
+        .backspace => textedit.backspace(compose),
+        .delete_fwd => textedit.deleteForward(compose),
+        .left => textedit.left(compose),
+        .right => textedit.right(compose),
+        .home => textedit.home(compose),
+        .end => textedit.end(compose),
         .insert => |cp| {
-            if (timeline_ui.countCodepoints(compose_buf.items) >= 300) {
+            if (timeline_ui.countCodepoints(textedit.view(compose)) >= 300) {
                 status.* = "300 character limit";
             } else {
                 var utf8_buf: [4]u8 = undefined;
                 const len = std.unicode.utf8Encode(cp, &utf8_buf) catch 0;
-                if (len > 0) try compose_buf.appendSlice(gpa, utf8_buf[0..len]);
+                if (len > 0) textedit.insert(compose, utf8_buf[0..len]);
             }
         },
         .send => {
-            if (compose_buf.items.len == 0) {
+            if (compose.len == 0) {
                 status.* = if (compose_kind == .profile) "name can't be empty" else "nothing to post";
                 return;
             }
@@ -1831,9 +1987,9 @@ fn handleComposeInput(
                 // 0ms: set the display name locally NOW (guarded against a stale
                 // refresh), close to the profile, and queue the putProfile write
                 // for the loop to run after — the new name shows instantly.
-                feed_core.setOwnDisplayName(gpa, store, session.did, compose_buf.items) catch {};
-                pending_profile_save.* = gpa.dupe(u8, compose_buf.items) catch null;
-                compose_buf.clearRetainingCapacity();
+                feed_core.setOwnDisplayName(gpa, store, session.did, textedit.view(compose)) catch {};
+                pending_profile_save.* = gpa.dupe(u8, textedit.view(compose)) catch null;
+                textedit.clear(compose);
                 mode.* = .timeline;
                 status.* = "name updated";
                 return;
@@ -1851,7 +2007,7 @@ fn handleComposeInput(
                 .handle = session.handle,
                 .uri = "",
                 .cid = temp_cid,
-                .text = compose_buf.items,
+                .text = textedit.view(compose),
                 .reply_parent_cid = if (target) |t| t.parent_cid else "",
                 .reply_root_cid = if (target) |t| t.root_cid else "",
                 .created_at = now,
@@ -1859,10 +2015,10 @@ fn handleComposeInput(
             if (target) |t| feed_core.bumpReplyCount(store, t.parent_cid);
             pending_send.* = .{
                 .temp_cid = temp_cid,
-                .text = try gpa.dupe(u8, compose_buf.items),
+                .text = try gpa.dupe(u8, textedit.view(compose)),
                 .target = try dupeTarget(gpa, target),
             };
-            compose_buf.clearRetainingCapacity();
+            textedit.clear(compose);
             reply_target.* = null;
             reply_handle.* = "";
             mode.* = .timeline;
@@ -1889,8 +2045,8 @@ const ComposeKind = enum { post, profile };
 /// profile screen's author query, or a post's thread. The single place "which
 /// view is showing" is decided, for both the main loop and engageSelected's
 /// optimistic repaint.
-fn buildActiveView(arena: Allocator, store: *feed_core.Store, screen: u8, profile_did: []const u8, thread_cid: []const u8) error{OutOfMemory}![]feed_core.TimelineItem {
-    if (screen == feed_view.screen_thread) return feed_core.buildThreadView(arena, store, thread_cid);
+fn buildActiveView(arena: Allocator, store: *feed_core.Store, screen: u8, profile_did: []const u8, thread_cid: []const u8, rerooted: bool, collapsed: []const []const u8) error{OutOfMemory}![]feed_core.TimelineItem {
+    if (screen == feed_view.screen_thread) return feed_core.buildThreadView(arena, store, thread_cid, rerooted, collapsed);
     if (screen == feed_view.screen_profile) return feed_core.buildAuthorView(arena, store, profile_did);
     return feed_core.buildTimeline(arena, store);
 }
@@ -1947,6 +2103,8 @@ fn engageSelected(
     screen: u8,
     profile_did: []const u8,
     thread_cid: []const u8,
+    thread_rerooted: bool,
+    collapsed_cids: []const []const u8,
     state: *timeline_ui.UiState,
     revealed_cids: []const []const u8,
     now: i64,
@@ -1989,7 +2147,7 @@ fn engageSelected(
                     if (!acted) return .{ .status = "" };
                     const set = if (kind == .like) def_unlike else def_unrepost;
                     set.put(gpa, std.hash.Wyhash.hash(0, item.cid), {}) catch {};
-                    const fresh = try buildActiveView(arena, store, screen, profile_did, thread_cid);
+                    const fresh = try buildActiveView(arena, store, screen, profile_did, thread_cid, thread_rerooted, collapsed_cids);
                     const fresh_header = try profileHeaderFor(arena, session, screen, profile_did, fresh);
                     try paintFrame(gpa, out, arena, prev, next, backend, pix, fresh, fresh_header, state, revealed_cids, now, session.handle, if (kind == .like) "unliking..." else "unboosting...");
                     if (pix) |g| fireEngageEffect(gpa, g, kind, target, false);
@@ -2006,7 +2164,7 @@ fn engageSelected(
             const record_uri = uri_buf[0..borrowed.len];
             @memcpy(record_uri, borrowed);
 
-            const fresh = try buildActiveView(arena, store, screen, profile_did, thread_cid);
+            const fresh = try buildActiveView(arena, store, screen, profile_did, thread_cid, thread_rerooted, collapsed_cids);
             const fresh_header = try profileHeaderFor(arena, session, screen, profile_did, fresh);
             try paintFrame(gpa, out, arena, prev, next, backend, pix, fresh, fresh_header, state, revealed_cids, now, session.handle, if (kind == .like) "unliking..." else "unboosting...");
             // Fire the drain effect at the post's heart cell (state is now
@@ -2035,7 +2193,7 @@ fn engageSelected(
 
     // Optimistic first: the bumped count paints now; the worker call
     // follows on its own thread; a refusal reverts (drained in the loop).
-    const fresh = try buildActiveView(arena, store, screen, profile_did, thread_cid);
+    const fresh = try buildActiveView(arena, store, screen, profile_did, thread_cid, thread_rerooted, collapsed_cids);
     const fresh_header = try profileHeaderFor(arena, session, screen, profile_did, fresh);
     try paintFrame(gpa, out, arena, prev, next, backend, pix, fresh, fresh_header, state, revealed_cids, now, session.handle, if (kind == .like) "liking..." else "boosting...");
     // Fire the like/boost burst at the post's heart cell (state is now
@@ -2415,6 +2573,26 @@ const GpuState = struct {
     /// stepped the sim every lap and the WHOLE field's motion sped up while the
     /// pointer moved. 0 until the first frame.
     last_step_nanos: u64,
+    /// Set when a thread is opened / re-focused: paintFrameGpu scrolls the
+    /// focused post to the top (ancestors remain above, scrollable up) once the
+    /// per-post heights are valid, then clears it. (Thread view only.)
+    scroll_to_focus: bool = false,
+    /// Sticky CHAIN header (thread "chain"): the extent + identity are captured on
+    /// the feed rebuild (content-space offsets, scroll-independent); the per-frame
+    /// overlay uses them + the live scroll to pin / catch-up / push-out. Identity
+    /// is OWNED (copied) so it survives across non-rebuild frames.
+    chain_present: bool = false,
+    chain_top_off: i32 = 0,
+    chain_bottom_off: i32 = 0,
+    chain_pin_y: i32 = 0,
+    chain_tint: u32 = 0,
+    chain_initial: u21 = ' ',
+    chain_name: [64]u8 = undefined,
+    chain_name_len: u8 = 0,
+    chain_handle: [80]u8 = undefined,
+    chain_handle_len: u8 = 0,
+    chain_catchup_t: f32 = 0, // 0 = above/hidden, 1 = settled at the pin
+    chain_was_pinned: bool = false, // edge-detect the scroll-down pin to fire the catch-up
 };
 
 /// Bring up the GPU path on the live window. Any failure (no GL, shader/pack
@@ -2485,6 +2663,13 @@ fn feedSignature(items: []const feed_core.TimelineItem, scroll: i32, w: u32, h: 
         hh.update(std.mem.asBytes(&it.repost_count));
         hh.update(std.mem.asBytes(&it.reply_count));
         hh.update(std.mem.asBytes(&it.item_flags));
+        // Thread view-state: focus moving / collapse / stitch all change the
+        // render, so fold them in (else tapping a different post in the same
+        // thread wouldn't rebuild the cached feed verts).
+        hh.update(std.mem.asBytes(&it.is_focus));
+        hh.update(std.mem.asBytes(&it.depth));
+        hh.update(std.mem.asBytes(&it.stitched));
+        hh.update(std.mem.asBytes(&it.collapsed));
     }
     return hh.final();
 }
@@ -2703,7 +2888,7 @@ fn paintFrame(
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
                 g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits) catch g.content_h.*;
             } else {
-                g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits) catch g.content_h.*;
+                g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, null) catch g.content_h.*;
             }
             const t_layout = if (debug_frame_timing) clock_shell.monotonicNanos() else 0;
             window_shell.presentDrawList(win, gpa, g.engine, g.draw.slice(), field_core.background) catch {}; // E2: a lost blit is the next frame's problem
@@ -2815,6 +3000,10 @@ fn paintComposeGpu(
     ctx: feed_view.ComposeContext,
     reply_handle: []const u8,
     draft: []const u8,
+    caret: usize,
+    sel_start: usize,
+    sel_end: usize,
+    blink_on: bool,
     status: []const u8,
 ) !void {
     const w: u32 = win.fb.width;
@@ -2832,7 +3021,7 @@ fn paintComposeGpu(
     // the feed lays out — so the emitted button regions map back through gs.scale.
     const lh = logicalH(w, h);
     g.draw.len = 0;
-    feed_view.layoutCompose(gpa, g.engine, @intCast(design_w), @intCast(lh), ctx, reply_handle, draft, status, g.draw, g.regions) catch {};
+    feed_view.layoutCompose(gpa, g.engine, @intCast(design_w), @intCast(lh), g.accent, ctx, reply_handle, draft, caret, sel_start, sel_end, blink_on, status, g.draw, g.regions) catch {};
     gpu.feedBuild(&gs.feed, gpa, g.engine, g.draw.slice(), scale) catch {};
     gs.feed_sig = 0; // force a timeline rebuild when the composer closes
 
@@ -2872,6 +3061,29 @@ fn paintFrameGpu(
 
     const scale = uiScale(w);
     gs.scale = scale;
+
+    // Auto-scroll a freshly-opened/re-focused THREAD so the focused post lands at
+    // the top (ancestors above, scrollable up — Bluesky parity). Uses the per-post
+    // height cache from the prior layout (valid when its length matches this
+    // view); done BEFORE the rebuild so the new scroll takes effect THIS frame.
+    if (gs.scroll_to_focus and g.screen.* == feed_view.screen_thread and gs.heights.len == items.len) {
+        var off: i32 = 0;
+        var measured = true; // only apply once the preceding posts' heights exist
+        for (items, 0..) |it, ix| {
+            if (it.is_focus) break;
+            if (gs.heights[ix] > 0) off += gs.heights[ix] else {
+                measured = false;
+                break;
+            }
+        }
+        if (measured) {
+            const lh_view = logicalH(w, h);
+            const min_scroll: i32 = @min(0, @as(i32, @intCast(lh_view)) - g.content_h.* - 24);
+            g.scroll.* = @max(min_scroll, @min(0, -off));
+            gs.scroll_to_focus = false; // applied; wait for heights next frame otherwise
+        }
+    }
+
     // Rebuild the feed ONLY when it changed (scroll / window size / any post's
     // identity, counts, or flags). The field below animates every frame, but
     // this pipeline — fromTimeline + feed_view.layout (which MEASURES every
@@ -2925,6 +3137,7 @@ fn paintFrameGpu(
         }
         const lh = logicalH(w, h);
         g.draw.len = 0;
+        var chain_info: feed_view.ChainSticky = .{};
         if (g.screen.* == feed_view.screen_loadout) {
             // The loadout page: three stacked sockets, its own render path.
             const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
@@ -2933,9 +3146,28 @@ fn paintFrameGpu(
             // skip_heart=true on every screen: the SDF heart pass (drawEngagementHearts,
             // below) draws the heart in place for each visible like button of the
             // ACTIVE view, so layout never draws its own — one heart, one pipeline.
-            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits) catch g.content_h.*;
+            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, &chain_info) catch g.content_h.*;
         }
         gpu.feedBuild(&gs.feed, gpa, g.engine, g.draw.slice(), scale) catch {};
+
+        // Capture the chain extent + identity (OWNED copies) for the sticky chain
+        // header overlay — valid across the non-rebuild frames until the next
+        // content change (offsets are scroll-independent).
+        gs.chain_present = chain_info.present and chain_info.head_index < feed_posts.len;
+        if (gs.chain_present) {
+            const head = feed_posts[chain_info.head_index];
+            gs.chain_top_off = chain_info.top_off;
+            gs.chain_bottom_off = chain_info.bottom_off;
+            gs.chain_pin_y = chain_info.pin_y;
+            gs.chain_tint = head.tint;
+            gs.chain_initial = head.initial;
+            const nl = @min(head.name.len, gs.chain_name.len);
+            @memcpy(gs.chain_name[0..nl], head.name[0..nl]);
+            gs.chain_name_len = @intCast(nl);
+            const hl = @min(head.handle.len, gs.chain_handle.len);
+            @memcpy(gs.chain_handle[0..hl], head.handle[0..hl]);
+            gs.chain_handle_len = @intCast(hl);
+        }
     }
 
     advanceField(gpa, gs, g.active);
@@ -2961,7 +3193,55 @@ fn paintFrameGpu(
     // The engagement hearts: one SDF heart per visible like button, drawn IN
     // PLACE (feed_view skips its own), so a like fills + pops the ACTUAL heart.
     drawEngagementHearts(g, gs, items, @intCast(w), @intCast(h));
+    // The sticky CHAIN header: pins while scrolling the chain, catches up on
+    // scroll-down, pushed out at the chain's end. Drawn LAST (on top), per-frame.
+    drawChainSticky(gpa, g, gs, scale, @intCast(w), @intCast(h));
     gpu.swap(&gs.g);
+}
+
+/// The sticky chain header overlay (thread "chain"). Pure-sticky base
+/// (`y = min(max(inlineY, pinY), chainBottom − h)`) so the scroll-UP handoff to
+/// the inline header is seamless by construction; a scroll-DOWN-only catch-up
+/// (brief fade + slide-down) is layered on top and never affects the up seam.
+fn drawChainSticky(gpa: Allocator, g: Grid, gs: *GpuState, scale: f32, vw: i32, vh: i32) void {
+    if (!gs.chain_present or g.screen.* != feed_view.screen_thread) {
+        gs.chain_catchup_t = 0;
+        gs.chain_was_pinned = false;
+        return;
+    }
+    const scroll = g.scroll.*;
+    const pin_y = gs.chain_pin_y;
+    const header_h: i32 = 46;
+    const inline_y = gs.chain_top_off + scroll; // screen y of the inline header
+    const bottom_y = gs.chain_bottom_off + scroll; // screen y of the chain end
+    const pinned = inline_y < pin_y; // the inline header has scrolled above the pin
+    // Catch-up edge: newly pinned (scrolled down past) → restart the entrance.
+    if (pinned and !gs.chain_was_pinned) gs.chain_catchup_t = 0;
+    gs.chain_was_pinned = pinned;
+    if (!pinned) {
+        gs.chain_catchup_t = 0; // inline header is in view; the feed draws it
+        return;
+    }
+    gs.chain_catchup_t += (1.0 - gs.chain_catchup_t) * 0.16;
+    const t = gs.chain_catchup_t;
+    // Pure-sticky base, pushed up by the chain's end (continuous → seamless).
+    var base_y = pin_y;
+    const pushed = bottom_y - header_h;
+    if (pushed < base_y) base_y = pushed;
+    // Catch-up: a small downward slide settling to base_y + a fade.
+    const slide: i32 = @intFromFloat((1.0 - t) * 16.0);
+    const draw_y = base_y - slide;
+    // Fully pushed out above the pin → nothing to show.
+    if (base_y + header_h <= pin_y) return;
+    const alpha: f32 = t * std.math.clamp(@as(f32, @floatFromInt(base_y + header_h - pin_y)) / @as(f32, @floatFromInt(header_h)), 0.0, 1.0);
+    if (alpha <= 0.02) return;
+
+    var hd: raster_core.DrawList = .{};
+    defer hd.deinit(gpa);
+    feed_view.buildChainHeaderBar(gpa, &hd, g.engine, @intCast(design_w), draw_y, header_h, pin_y, gs.chain_tint, gs.chain_initial, gs.chain_name[0..gs.chain_name_len], gs.chain_handle[0..gs.chain_handle_len], g.accent, alpha) catch return;
+    if (hd.len == 0) return;
+    gpu.feedBuild(&gs.hover, gpa, g.engine, hd.slice(), scale) catch return;
+    gpu.feedDraw(&gs.hover, vw, vh);
 }
 
 /// Scan one socket HitList for the rect under the pointer, splitting it the
@@ -3018,7 +3298,9 @@ fn drawHoverOverlay(gpa: Allocator, g: Grid, gs: *GpuState, scale: f32, vw: i32,
     if (gs.hover_alpha < 0.02) return;
 
     // Scale each highlight's alpha byte by the eased opacity.
-    const wash_a: u32 = @intFromFloat(@as(f32, 0x0E) * gs.hover_alpha);
+    // Post wash bumped 0x0E → 0x16 (~1.6×): the large post area read too faint at
+    // 5.5% while the smaller icon/nav highlights (0x1C) looked right.
+    const wash_a: u32 = @intFromFloat(@as(f32, 0x16) * gs.hover_alpha);
     const btn_a: u32 = @intFromFloat(@as(f32, 0x1C) * gs.hover_alpha);
     var hd: raster_core.DrawList = .{};
     defer hd.deinit(gpa);

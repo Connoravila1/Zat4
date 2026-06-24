@@ -699,6 +699,16 @@ pub const TimelineItem = struct {
     /// never on the stored Post). Both default off, riding the tail padding.
     depth: u8 = 0,
     is_focus: bool = false,
+    /// VIEW-DERIVED (thread lens): this post is the root author's self-reply
+    /// continuation — render it STITCHED (headerless, flush, thin separator)
+    /// into one coherent post. Never on the stored Post (ZONES inv. 4); rides
+    /// the tail padding like depth/is_focus.
+    stitched: bool = false,
+    /// VIEW-DERIVED (thread lens): this post has at least one reply, and the
+    /// reader has collapsed it (its subtree is hidden in this view). Per-view
+    /// state, never on the post. Ride the last of the tail padding.
+    has_kids: bool = false,
+    collapsed: bool = false,
 
     comptime {
         // Produced in bulk every build — hot, so guarded (A7). Slices make
@@ -814,32 +824,57 @@ pub fn buildAuthorView(
 }
 
 /// Build a post's THREAD as a Reddit-style NESTED view over the shared store
-/// (ZONES inv. 4 — a query, not a container): walk `reply_parent` up to the
-/// thread root, then DFS the whole descendant tree in preorder (siblings
-/// chronological), stamping each item's view-derived `depth` (root = 0) and
-/// marking the focused post. The store already holds the reply linkage (every
-/// ingested post interns its reply refs), so the nesting is derived locally —
-/// engagement/identity stay unified with every other view, and the nesting is a
-/// LENS over the same records, never a property of the post. An unknown focus
-/// cid is an empty view (E4). Allocates in `arena`.
+/// (ZONES inv. 4 — a query, not a container): walk up to the absolute root, then
+/// DFS the whole descendant tree in preorder (siblings chronological), stamping
+/// each item's view-derived `depth` (root = 0), `is_focus` (the `focus_cid` post,
+/// which the shell scrolls to the top — ancestors remain above), and `stitched`.
+/// The root author's consecutive self-reply chain is `stitched` (one continuous
+/// post, flush at depth 0); everyone else nests one level deeper. The
+/// store already holds the reply linkage (every ingested post interns its reply
+/// refs), so the structure is derived locally — engagement/identity stay unified
+/// with every other view, and the whole shape is a LENS over the same records,
+/// never a property of the post. An unknown focus cid is an empty view (E4).
+/// Allocates in `arena`.
+/// Sentinel `depth` for a re-rooted view's ANCESTOR posts (the condensed context
+/// chain shown above the re-rooted post). The renderer keys the smaller/dimmed
+/// "ancestor" style off this — no extra per-item flag needed (keeps the hot
+/// struct's size). A real depth never reaches this (the indent caps far below).
+pub const thread_ancestor_depth: u8 = 255;
+
 pub fn buildThreadView(
     arena: Allocator,
     store: *const Store,
     focus_cid: []const u8,
+    /// When true (a tap INSIDE the thread), RE-ROOT on the focus: show its
+    /// ancestors as a condensed chain above it, then the focus + its subtree.
+    /// When false (the first tap from the timeline), show the WHOLE thread.
+    rerooted: bool,
+    /// CIDs the reader has collapsed (per-view state, never on the post): a
+    /// collapsed post is emitted but its descendants are skipped.
+    collapsed: []const []const u8,
 ) error{OutOfMemory}![]TimelineItem {
     const focus_usize = lookupCid(store, focus_cid) orelse return &.{};
     const focus: u32 = @intCast(focus_usize);
     const posts = store.posts.slice();
     const parents = posts.items(.reply_parent);
     const createds = posts.items(.created_at);
+    const post_authors = posts.items(.author);
 
-    // Walk up to the thread root (cycle-guarded).
-    var root: u32 = focus;
+    // Walk up to the ABSOLUTE thread root (cycle-guarded) so the whole thread
+    // shows — ancestors ABOVE the focus, which the reader can scroll up to (the
+    // shell auto-scrolls so the focused post lands at the top). Each post is its
+    // own thing (ZONES inv. 4); the focus is just where you entered.
+    var abs_root: u32 = focus;
     var guard: usize = 0;
     while (guard < 4096) : (guard += 1) {
-        const p = parents[root].unwrap() orelse break;
-        root = @intFromEnum(p);
+        const pp = parents[abs_root].unwrap() orelse break;
+        abs_root = @intFromEnum(pp);
     }
+    // The DFS root: the whole thread roots at the absolute root; a re-rooted view
+    // roots at the focus (its ancestors are emitted condensed, above). The view's
+    // "OP" — whose self-reply chain STITCHES — is the author of the DFS root.
+    const root: u32 = if (rerooted) focus else abs_root;
+    const op = post_authors[root];
 
     // parent row → child rows (the tree, built from the exact parent edges).
     var children: std.AutoHashMapUnmanaged(u32, std.ArrayListUnmanaged(u32)) = .empty;
@@ -867,24 +902,61 @@ pub fn buildThreadView(
     // DFS preorder via an explicit stack: pop a node, emit it, push its children
     // in REVERSE chronological order so the oldest pops (and renders) first —
     // each subtree fully emitted before the next sibling (the nested order).
-    const Frame = struct { row: u32, depth: u8 };
+    const Frame = struct { row: u32, depth: u8, stitched: bool };
     var out: std.ArrayList(TimelineItem) = .empty;
     defer out.deinit(arena);
     var stack: std.ArrayList(Frame) = .empty;
     defer stack.deinit(arena);
-    try stack.append(arena, .{ .row = root, .depth = 0 });
+
+    // Re-rooted: emit the ancestor chain (focus's parents up to the absolute
+    // root) FIRST, in root-first order, flagged condensed via the sentinel depth
+    // — the "what this is replying to" context above the re-rooted post.
+    if (rerooted and root != abs_root) {
+        var chain: std.ArrayList(u32) = .empty;
+        defer chain.deinit(arena);
+        var cur = parents[focus].unwrap();
+        while (cur) |pidx| {
+            try chain.append(arena, @intFromEnum(pidx));
+            cur = parents[@intFromEnum(pidx)].unwrap();
+        }
+        std.mem.reverse(u32, chain.items); // root → parent-of-focus
+        for (chain.items) |arow| {
+            var aitem = fillTimelineItem(store, arow, .none);
+            aitem.depth = thread_ancestor_depth;
+            try out.append(arena, aitem);
+        }
+    }
+
+    try stack.append(arena, .{ .row = root, .depth = 0, .stitched = false });
     while (stack.pop()) |fr| {
         var item = fillTimelineItem(store, fr.row, .none);
         item.depth = fr.depth;
         item.is_focus = fr.row == focus;
+        item.stitched = fr.stitched;
+        const kids_here: bool = if (children.get(fr.row)) |k| k.items.len > 0 else false;
+        item.has_kids = kids_here;
+        // Collapsed (per-view): emit the post, skip its descendants.
+        var is_collapsed = false;
+        for (collapsed) |c| if (std.mem.eql(u8, c, item.cid)) {
+            is_collapsed = true;
+            break;
+        };
+        item.collapsed = is_collapsed and kids_here;
         try out.append(arena, item);
+        if (item.collapsed) continue; // hide the subtree
         if (children.get(fr.row)) |kids| {
             const ks = try arena.dupe(u32, kids.items);
             std.sort.block(u32, ks, Asc{ .createds = createds }, Asc.lessThan);
             var i = ks.len;
             while (i > 0) {
                 i -= 1;
-                try stack.append(arena, .{ .row = ks[i], .depth = fr.depth +| 1 });
+                // A child STITCHES (the OP continuing their own chain) when it AND
+                // its parent are the OP. Stitched segments stay flush at depth 0
+                // (one continuous post); everyone else nests one level deeper.
+                const child = ks[i];
+                const child_stitch = post_authors[child] == op and post_authors[fr.row] == op;
+                const cd: u8 = if (child_stitch) 0 else fr.depth +| 1;
+                try stack.append(arena, .{ .row = child, .depth = cd, .stitched = child_stitch });
             }
         }
     }
@@ -1981,11 +2053,11 @@ test "optimistic post: reconcile re-keys temp→real; drop detaches on failure" 
     // The thread of the (real) parent no longer contains the dropped reply.
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    const thread = try buildThreadView(arena_state.allocator(), &store, "bafyreal");
+    const thread = try buildThreadView(arena_state.allocator(), &store, "bafyreal", false, &.{});
     try testing.expectEqual(@as(usize, 1), thread.len); // just the parent
 }
 
-test "buildThreadView: nested preorder with view-derived depth + focus" {
+test "buildThreadView: whole thread, focus marked; OP self-chain stitches, others nest" {
     const gpa = testing.allocator;
     var store: Store = .{};
     defer deinitStore(gpa, &store);
@@ -1993,13 +2065,14 @@ test "buildThreadView: nested preorder with view-derived depth + focus" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // root <- childA <- grandchild ; root <- childB (childA older than childB).
+    // OP "a" stitches a self-thread (cRoot -> cA1 -> cA2); "b" replies to the
+    // root (cB); then "a" replies into b's subthread (cBR).
     const mk = struct {
-        fn p(g: Allocator, s: *Store, cid: []const u8, text: []const u8, parent: []const u8, created: i64) !void {
+        fn p(g: Allocator, s: *Store, did: []const u8, handle: []const u8, cid: []const u8, text: []const u8, parent: []const u8, created: i64) !void {
             _ = try ingestLivePost(g, s, .{
-                .did = "did:plc:a",
-                .handle = "a.zat4.com",
-                .uri = "at://did:plc:a/app.zat4.feed.post/x",
+                .did = did,
+                .handle = handle,
+                .uri = cid, // unique per post is enough for the store key here
                 .cid = cid,
                 .text = text,
                 .reply_parent_cid = parent,
@@ -2008,30 +2081,67 @@ test "buildThreadView: nested preorder with view-derived depth + focus" {
             });
         }
     }.p;
-    try mk(gpa, &store, "cRoot", "root", "", 10);
-    try mk(gpa, &store, "cA", "child A", "cRoot", 20);
-    try mk(gpa, &store, "cB", "child B", "cRoot", 25);
-    try mk(gpa, &store, "cG", "grandchild", "cA", 30);
+    try mk(gpa, &store, "did:plc:a", "a.zat4.com", "cRoot", "root", "", 10);
+    try mk(gpa, &store, "did:plc:a", "a.zat4.com", "cA1", "self 1", "cRoot", 20);
+    try mk(gpa, &store, "did:plc:b", "b.zat4.com", "cB", "b reply", "cRoot", 25);
+    try mk(gpa, &store, "did:plc:a", "a.zat4.com", "cA2", "self 2", "cA1", 30);
+    try mk(gpa, &store, "did:plc:a", "a.zat4.com", "cBR", "a into b", "cB", 40);
 
-    // Focus the grandchild; the view is the WHOLE thread from the root, nested.
-    const t = try buildThreadView(arena, &store, "cG");
-    try testing.expectEqual(@as(usize, 4), t.len);
-    // Preorder, siblings chronological: root(0), childA(1), grandchild(2), childB(1).
+    // Focus the root: the whole tree, preorder, siblings chronological.
+    const t = try buildThreadView(arena, &store, "cRoot", false, &.{});
+    try testing.expectEqual(@as(usize, 5), t.len);
+    // root(0,—), self1(0,stitch), self2(0,stitch), b reply(1,nest), a-into-b(2,nest).
     try testing.expectEqualStrings("root", t[0].text);
     try testing.expectEqual(@as(u8, 0), t[0].depth);
-    try testing.expectEqualStrings("child A", t[1].text);
-    try testing.expectEqual(@as(u8, 1), t[1].depth);
-    try testing.expectEqualStrings("grandchild", t[2].text);
-    try testing.expectEqual(@as(u8, 2), t[2].depth);
-    try testing.expect(t[2].is_focus); // the focused post is marked
-    try testing.expectEqualStrings("child B", t[3].text);
+    try testing.expect(!t[0].stitched and t[0].is_focus);
+    try testing.expectEqualStrings("self 1", t[1].text);
+    try testing.expectEqual(@as(u8, 0), t[1].depth);
+    try testing.expect(t[1].stitched);
+    try testing.expectEqualStrings("self 2", t[2].text);
+    try testing.expectEqual(@as(u8, 0), t[2].depth);
+    try testing.expect(t[2].stitched);
+    try testing.expectEqualStrings("b reply", t[3].text);
     try testing.expectEqual(@as(u8, 1), t[3].depth);
-    // Only the focus is flagged.
-    var focus_count: usize = 0;
-    for (t) |it| {
-        if (it.is_focus) focus_count += 1;
+    try testing.expect(!t[3].stitched);
+    try testing.expectEqualStrings("a into b", t[4].text);
+    try testing.expectEqual(@as(u8, 2), t[4].depth); // a replying into b's subtree → nests
+    try testing.expect(!t[4].stitched);
+
+    // Collapsing cB hides its subtree (cBR) but keeps cB, flagged collapsed.
+    const tc = try buildThreadView(arena, &store, "cRoot", false, &.{"cB"});
+    try testing.expectEqual(@as(usize, 4), tc.len); // cBR is hidden
+    var saw_cb = false;
+    for (tc) |it| {
+        try testing.expect(!std.mem.eql(u8, it.cid, "cBR")); // subtree gone
+        if (std.mem.eql(u8, it.cid, "cB")) {
+            saw_cb = true;
+            try testing.expect(it.collapsed and it.has_kids);
+        }
     }
-    try testing.expectEqual(@as(usize, 1), focus_count);
+    try testing.expect(saw_cb);
+
+    // Focusing the b reply still shows the WHOLE thread (ancestors above), with
+    // cB marked as the focus — the shell scrolls to it; the tree is unchanged.
+    const t2 = try buildThreadView(arena, &store, "cB", false, &.{});
+    try testing.expectEqual(@as(usize, 5), t2.len);
+    try testing.expectEqualStrings("root", t2[0].text); // ancestors are above the focus
+    var f_idx: ?usize = null;
+    for (t2, 0..) |it, ix| if (it.is_focus) {
+        f_idx = ix;
+    };
+    try testing.expect(f_idx != null);
+    try testing.expectEqualStrings("b reply", t2[f_idx.?].text);
+
+    // RE-ROOTED on cB: its ancestor (cRoot) is emitted CONDENSED (sentinel depth)
+    // above, then cB (focus, depth 0) + its subtree (cBR, depth 1).
+    const tr = try buildThreadView(arena, &store, "cB", true, &.{});
+    try testing.expectEqual(@as(usize, 3), tr.len);
+    try testing.expectEqualStrings("root", tr[0].text);
+    try testing.expectEqual(thread_ancestor_depth, tr[0].depth); // condensed ancestor
+    try testing.expectEqualStrings("b reply", tr[1].text);
+    try testing.expect(tr[1].is_focus and tr[1].depth == 0);
+    try testing.expectEqualStrings("a into b", tr[2].text);
+    try testing.expectEqual(@as(u8, 1), tr[2].depth);
 }
 
 test "view model: a profile view is a query over the shared store; engagement is unified" {

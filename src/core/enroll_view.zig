@@ -114,6 +114,11 @@ pub const EnrollView = struct {
     confirm_error: bool = false,
     confirm_checking: bool = false, // Stage B: the real Argon2id verify is in flight (off-thread)
     focus: Focus = .none,
+    /// Byte offset of the caret WITHIN the focused field (textedit caret). Only
+    /// meaningful for the field `focus` names; ignored for the others.
+    caret: u32 = 0,
+    /// Whether to paint the caret this frame (the shell's blink clock; B3).
+    blink_on: bool = true,
     /// PoW progress 0→1 (the proof ring); the shell drives it from real work.
     /// Slice 1 leaves it static; the ring animation is slice 2.
     pow_t: f32 = 0.0,
@@ -340,7 +345,7 @@ fn stepIdentity(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, ix:
         y += 36;
         y = try wrap(gpa, dl, e, ix, y, iw, muted, 14, "Enter your handle. We verify you control it. We never see your password.");
         y += 14;
-        y = try field(gpa, dl, e, ix, iw, y, "Your handle", view.handle, "connor.bsky.social", "", view.focus == .handle, hits, .field_handle);
+        y = try field(gpa, dl, e, ix, iw, y, "Your handle", view.handle, "connor.bsky.social", "", view.focus == .handle, view.caret, view.blink_on, hits, .field_handle);
         y += 14;
         y = try note(gpa, dl, e, ix, iw, y, "You'll confirm on your own provider, then come straight back. Zat4 only learns your DID — a scoped, revocable token, never your password.");
         label = "Verify & continue";
@@ -349,14 +354,14 @@ fn stepIdentity(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, ix:
         y += 36;
         y = try wrap(gpa, dl, e, ix, y, iw, muted, 14, "Pick a name. This becomes your handle across the whole network.");
         y += 14;
-        y = try field(gpa, dl, e, ix, iw, y, "Username", view.username, "connor", ".zat4.com", view.focus == .username, hits, .field_username);
+        y = try field(gpa, dl, e, ix, iw, y, "Username", view.username, "connor", ".zat4.com", view.focus == .username, view.caret, view.blink_on, hits, .field_username);
         y += 12;
         // Email OR recovery key — a small two-way toggle. No-email costs more
         // proof-of-work, invisibly; the user only chooses how to recover.
         y = try recoveryToggle(gpa, dl, e, ix, iw, y, view.use_email, hits);
         y += 10;
         if (view.use_email) {
-            y = try field(gpa, dl, e, ix, iw, y, "Email", view.email, "you@example.com", "", view.focus == .email, hits, .field_email);
+            y = try field(gpa, dl, e, ix, iw, y, "Email", view.email, "you@example.com", "", view.focus == .email, view.caret, view.blink_on, hits, .field_email);
         } else {
             y = try note(gpa, dl, e, ix, iw, y, "No email — so we'll give you a recovery key before you finish. It's the only way back into your account if you forget your password, so keep it somewhere safe.");
         }
@@ -523,7 +528,7 @@ fn stepConfirm(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, ix: 
         while (i < 3) : (i += 1) {
             var lb: [16]u8 = undefined;
             const label = std.fmt.bufPrint(&lb, "Word {d}", .{view.spot_positions[i]}) catch "Word";
-            y = try field(gpa, dl, e, ix, iw, y, label, view.spot[i], "", "", view.focus == focuses[i], hits, targets[i]);
+            y = try field(gpa, dl, e, ix, iw, y, label, view.spot[i], "", "", view.focus == focuses[i], view.caret, view.blink_on, hits, targets[i]);
             y += 14;
         }
     } else {
@@ -533,7 +538,7 @@ fn stepConfirm(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, ix: 
         y += 36;
         y = try wrap(gpa, dl, e, ix, y, iw, muted, 14, "Now type the whole password, exactly as shown with the dashes. Pasting from your password manager is easiest.");
         y += 14;
-        y = try field(gpa, dl, e, ix, iw, y, "Full password", view.full, "Your full password", "", view.focus == .full, hits, .field_full);
+        y = try field(gpa, dl, e, ix, iw, y, "Full password", view.full, "Your full password", "", view.focus == .full, view.caret, view.blink_on, hits, .field_full);
         y += 14;
     }
     if (view.confirm_error) {
@@ -795,7 +800,7 @@ fn choice(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, ix: i32, 
     return y + bh;
 }
 
-fn field(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, ix: i32, iw: i32, y: i32, label: []const u8, value: []const u8, placeholder: []const u8, suffix: []const u8, focused: bool, hits: ?*HitList, target: HitTarget) !i32 {
+fn field(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, ix: i32, iw: i32, y: i32, label: []const u8, value: []const u8, placeholder: []const u8, suffix: []const u8, focused: bool, caret: usize, blink_on: bool, hits: ?*HitList, target: HitTarget) !i32 {
     var yy = y;
     if (label.len > 0) {
         _ = try str(gpa, dl, e, .regular, ix, yy + 12, muted, 13, label);
@@ -810,8 +815,16 @@ fn field(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, ix: i32, i
     const show = if (value.len > 0) value else placeholder;
     const col = if (value.len > 0) ink else faint;
     const tx = ix + 14;
-    const end = try str(gpa, dl, e, .regular, tx, yy + 28, col, 15, show);
-    if (focused) try line(gpa, dl, end + 1, yy + 13, end + 1, yy + 31, accent, 2); // caret
+    _ = try str(gpa, dl, e, .regular, tx, yy + 28, col, 15, show);
+    // Caret at the byte offset within the value (placeholder shows none), painted
+    // only on the "on" half of the blink cycle.
+    if (focused and blink_on) {
+        const cx = tx + if (value.len > 0)
+            @as(i32, @intCast(text.measure(e, .regular, value[0..@min(caret, value.len)], 15)))
+        else
+            0;
+        try line(gpa, dl, cx + 1, yy + 13, cx + 1, yy + 31, accent, 2);
+    }
     if (suffix.len > 0) {
         const sw: i32 = @intCast(text.measure(e, .regular, suffix, 15));
         _ = try str(gpa, dl, e, .regular, ix + iw - 14 - sw, yy + 28, muted, 15, suffix);

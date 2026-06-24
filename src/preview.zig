@@ -90,7 +90,7 @@ pub fn main(init: std.process.Init) !void {
     // so the proof matches what the live app loads with.
     const hc, const hb = try lens_catalog.defaultFeedLoadout(arena);
     const home_tray: lens_socket.TrayView = .{ .cards = hc, .text = hb, .seated = lens_catalog.default_feed_seated };
-    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, 0, null, 3, lens_socket.seatedAccent(home_tray), home_tray, .{}, null);
+    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, 0, null, 3, lens_socket.seatedAccent(home_tray), home_tray, .{}, null, null);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
 
     const io = init.io;
@@ -105,7 +105,7 @@ pub fn main(init: std.process.Init) !void {
     try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
     var blue_tray = home_tray;
     blue_tray.seated = 2; // Discover → blue
-    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, 0, null, 0, lens_socket.seatedAccent(blue_tray), blue_tray, .{ .open = true, .open_t = 1.0 }, null);
+    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, 0, null, 0, lens_socket.seatedAccent(blue_tray), blue_tray, .{ .open = true, .open_t = 1.0 }, null, null);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_feed_open.ppm");
     std.debug.print("wrote /tmp/zat_feed_open.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
@@ -115,29 +115,38 @@ pub fn main(init: std.process.Init) !void {
     @memset(fb.pixels, clear);
     dl.len = 0;
     try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
-    try feed_view.layoutCompose(gpa, &engine, @intCast(W), @intCast(H), .reply, "@mara.zat", "a small network is one where you can actually read the room — not weather, a room.", "", &dl, null);
+    const draft_demo = "a small network is one where you can actually read the room — not weather, a room.";
+    try feed_view.layoutCompose(gpa, &engine, @intCast(W), @intCast(H), feed_view.accent_house, .reply, "@mara.zat", draft_demo, draft_demo.len, 0, 0, true, "", &dl, null);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_compose.ppm");
     std.debug.print("wrote /tmp/zat_compose.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
 
-    // The thread view (PHASE C4): Reddit-style NESTED. A small tree with depths
-    // (the view-derived nesting buildThreadView produces) — root, two replies,
-    // a reply-to-a-reply — to show the indent + guide rails + focus highlight.
+    // The thread view: the root author's self-thread STITCHES (one continuous
+    // post — header once, segments flow, thin separators), while replies from
+    // OTHER users nest Reddit-style (indent + guide rail). Mara is the OP here:
+    // root + two self-continuations, then two nested replies from others.
     @memset(fb.pixels, clear);
     dl.len = 0;
     try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
+    // A RE-ROOTED view: a condensed ancestor (sentinel depth) on top, then the
+    // re-rooted post (focus) + its stitched chain, then a nested reply. Shows the
+    // condensed-ancestor style, the stem + sharp elbow, and the nesting together.
     const thread = [_]feed_view.PostView{
-        tv("mara.zat", "Mara Vesper", "the whole point of a small network is that you can actually read the room.", 0xFFCAA3A8, 'M', 0, false),
-        tv("oko.zat", "Okonkwo", "agreed — ten thousand strangers isn't a room, it's weather.", 0xFF9FC7A0, 'O', 1, false),
-        tv("lune.zat", "lune", "weather you can't even reply to without getting rained on.", 0xFFA9B6D6, 'l', 2, true),
-        tv("rune.zat", "rune", "this is why i kept the field on. it keeps the light at human scale.", 0xFFB5A9CC, 'r', 1, false),
+        tv("desh.zat", "Desh", "what's the plan for the algorithm marketplace? curious how creators get paid.", 0xFFB6C2D6, 'D', feed.thread_ancestor_depth, false, false, false),
+        tv("mara.zat", "Mara Vesper", "the whole point of a small network is that you can actually read the room.", 0xFFCAA3A8, 'M', 0, true, false, false),
+        tv("mara.zat", "Mara Vesper", "you stop performing for an audience and start talking to people.", 0xFFCAA3A8, 'M', 0, false, true, false),
+        tv("mara.zat", "Mara Vesper", "and the field keeps the light at human scale — nobody shouts louder by being wider.", 0xFFCAA3A8, 'M', 0, false, true, false),
+        tv("oko.zat", "Okonkwo", "agreed — ten thousand strangers isn't a room, it's weather.", 0xFF9FC7A0, 'O', 1, false, false, true),
+        tv("lune.zat", "lune", "weather you can't even reply to without getting rained on.", 0xFFA9B6D6, 'l', 2, false, false, false),
     };
     const trc, const trb = try lens_catalog.defaultReplyLoadout(arena);
     const reply_t2: lens_socket.TrayView = .{ .cards = trc, .text = trb, .seated = lens_catalog.default_reply_seated };
     var thr_hits: lens_socket.HitList = .empty;
     defer thr_hits.deinit(gpa);
     // All-same-author thread → the reply socket lands at the end (the screenshot case).
-    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), &thread, 0, &dl, null, null, false, feed_view.screen_thread, null, 0, feed_view.accent_house, reply_t2, .{}, &thr_hits);
+    // Use a BLUE accent here to prove the seated-lens color flows to the focus
+    // wash (and everywhere else), not the static house amber.
+    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), &thread, 0, &dl, null, null, false, feed_view.screen_thread, null, 0, 0xFF4DA3FF, reply_t2, .{}, &thr_hits, null);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_thread.ppm");
     std.debug.print("wrote /tmp/zat_thread.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
@@ -147,7 +156,7 @@ pub fn main(init: std.process.Init) !void {
     dl.len = 0;
     try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
     const header: feed_view.ProfileHeader = .{ .display_name = "connor.zat4.com", .handle = "@connor.zat4.com", .post_count = 11, .editable = true };
-    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, feed_view.screen_profile, header, 0, feed_view.accent_house, null, .{}, null);
+    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, feed_view.screen_profile, header, 0, feed_view.accent_house, null, .{}, null, null);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_profile.ppm");
     std.debug.print("wrote /tmp/zat_profile.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
@@ -344,8 +353,8 @@ fn sampleTray(arena: std.mem.Allocator) !lens_socket.TrayView {
     return .{ .cards = cards, .text = blob.items, .seated = 0 };
 }
 
-/// A thread PostView with an explicit nesting depth + focus flag (preview only).
-fn tv(handle: []const u8, name: []const u8, body: []const u8, tint: u32, initial: u8, depth: u8, is_focus: bool) feed_view.PostView {
+/// A thread PostView with an explicit nesting depth + focus + stitched flag (preview only).
+fn tv(handle: []const u8, name: []const u8, body: []const u8, tint: u32, initial: u8, depth: u8, is_focus: bool, stitched: bool, has_kids: bool) feed_view.PostView {
     _ = handle;
     return .{
         .name = name,
@@ -353,7 +362,7 @@ fn tv(handle: []const u8, name: []const u8, body: []const u8, tint: u32, initial
         .age = "2h",
         .body = body,
         .tint = tint,
-        .reply = 0,
+        .reply = 1,
         .boost = 0,
         .like = 0,
         .initial = initial,
@@ -361,6 +370,8 @@ fn tv(handle: []const u8, name: []const u8, body: []const u8, tint: u32, initial
         .boosted = false,
         .depth = depth,
         .is_focus = is_focus,
+        .stitched = stitched,
+        .has_kids = has_kids,
     };
 }
 

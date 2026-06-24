@@ -626,6 +626,25 @@ pub fn keyBytes(keysym: u32, ctrl: bool, out: *[8]u8) usize {
             };
             return 3;
         },
+        0xFF50, 0xFF57 => { // Home, End → ESC [ H / ESC [ F (decoded upstream)
+            out[0] = 0x1B;
+            out[1] = '[';
+            out[2] = if (keysym == 0xFF50) 'H' else 'F';
+            return 3;
+        },
+        0xFFFF => { // Delete (forward) → ESC [ 3 ~
+            out[0] = 0x1B;
+            out[1] = '[';
+            out[2] = '3';
+            out[3] = '~';
+            return 4;
+        },
+        0xFE20 => { // ISO_Left_Tab (Shift+Tab) → ESC [ Z
+            out[0] = 0x1B;
+            out[1] = '[';
+            out[2] = 'Z';
+            return 3;
+        },
         else => return 0,
     }
 }

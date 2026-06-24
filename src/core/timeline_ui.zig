@@ -154,6 +154,11 @@ test "keyFor round-trips through actionFor: clicks and keys cannot drift" {
 pub const ComposeAction = union(enum) {
     insert: u21,
     backspace,
+    delete_fwd, // forward Delete (at the caret)
+    left,
+    right,
+    home,
+    end,
     send,
     cancel,
     none,
@@ -163,6 +168,11 @@ pub fn actionForCompose(event: tui.InputEvent) ComposeAction {
     return switch (event) {
         .escape => .cancel,
         .enter => .{ .insert = '\n' },
+        .left => .left,
+        .right => .right,
+        .home => .home,
+        .end_key => .end,
+        .delete => .delete_fwd,
         .char => |c| switch (c) {
             4 => .send, // ctrl-d
             3 => .cancel, // ctrl-c

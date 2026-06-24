@@ -33,12 +33,28 @@ const auth = @import("shell/auth.zig");
 const feed_shell = @import("shell/feed.zig");
 const feed_core = @import("core/feed.zig");
 const shell_tui = @import("shell/tui.zig");
+const enroll_run = @import("shell/enroll_run.zig");
 const cache_shell = @import("shell/cache.zig");
 const config = @import("shell/config.zig");
 const window_shell = @import("shell/native.zig");
 const lexicon = @import("core/lexicon.zig");
 const write = @import("shell/write.zig");
 const clock_shell = @import("shell/clock.zig");
+
+/// Is there a usable cached session on disk? A cheap pre-auth probe: a new user
+/// (no cache) is sent to enrollment; a returning user (cache present) falls
+/// through to the normal cached-session run path. Loads and frees the tiny 0600
+/// file once — negligible, and it runs at most once per launch.
+fn hasCachedSession(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) bool {
+    var buf: [512]u8 = undefined;
+    const sp = cache_shell.sessionPath(&buf, env) orelse return false;
+    if (cache_shell.loadSessionAt(gpa, sp)) |cached| {
+        var s = cached;
+        cache_shell.freeSession(gpa, &s);
+        return true;
+    }
+    return false;
+}
 
 /// Trim display text to `max` bytes without splitting a UTF-8 sequence.
 fn truncate(text: []const u8, max: usize) []const u8 {
@@ -116,6 +132,19 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    const env = init.environ_map;
+
+    // Pre-auth front door: a window launch with NO credentials and NO cached
+    // session is a new user — show the "Join Zat4" flow instead of resolving a
+    // handle or demanding a password. A returning user (cache present, or a
+    // password supplied) falls through to the normal login/run paths below.
+    // Slice 3: this is the LOCAL enrollment surface in the live app; the
+    // networked createAccount + hand-off-to-feed legs are a later slice.
+    if (window_mode and env.get("ZAT_APP_PASSWORD") == null and !hasCachedSession(gpa, env)) {
+        try enroll_run.run(gpa, io, env);
+        return;
+    }
+
     var stdout_buffer: [1024]u8 = undefined;
     var stdout_writer: std.Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const out = &stdout_writer.interface;
@@ -137,7 +166,6 @@ pub fn main(init: std.process.Init) !void {
     //   ZAT_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx zat your.handle
     // ZAT_IDENTIFIER overrides the login identifier if it differs from the
     // resolved handle.
-    const env = init.environ_map;
 
     // Phase B: the one endpoint-config seat. Reads (timeline, profile) go to
     // the Zat4 AppView at this URL; writes/auth stay on the user's own PDS.
@@ -405,6 +433,7 @@ test {
     _ = @import("core/x11.zig");
     _ = @import("core/win32.zig");
     _ = @import("core/textinput.zig");
+    _ = @import("core/textedit.zig");
     _ = @import("core/appkit.zig");
     _ = @import("shell/cache.zig");
     _ = @import("shell/config.zig");
@@ -422,6 +451,7 @@ test {
     _ = @import("core/membership.zig");
     _ = @import("shell/membership.zig");
     _ = @import("core/enroll_view.zig");
+    _ = @import("shell/enroll_run.zig");
     _ = @import("shell/feed.zig");
     _ = @import("shell/tui.zig");
 }

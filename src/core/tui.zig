@@ -301,6 +301,8 @@ pub const InputEvent = union(enum) {
     page_down,
     home,
     end_key,
+    delete,
+    back_tab, // Shift+Tab (CSI Z) — reverse focus traversal
     enter,
     escape,
     none,
@@ -333,11 +335,13 @@ pub fn decodeInput(bytes: []const u8) DecodedInput {
                 'D' => return .{ .event = .left, .consumed = 3 },
                 'H' => return .{ .event = .home, .consumed = 3 },
                 'F' => return .{ .event = .end_key, .consumed = 3 },
-                '5', '6', '1', '4' => if (bytes.len >= 4 and bytes[3] == '~') {
+                'Z' => return .{ .event = .back_tab, .consumed = 3 }, // Shift+Tab
+                '5', '6', '1', '3', '4' => if (bytes.len >= 4 and bytes[3] == '~') {
                     const event: InputEvent = switch (bytes[2]) {
                         '5' => .page_up,
                         '6' => .page_down,
                         '1' => .home,
+                        '3' => .delete,
                         else => .end_key,
                     };
                     return .{ .event = event, .consumed = 4 };
