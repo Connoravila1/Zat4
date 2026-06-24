@@ -1,20 +1,20 @@
 # Zat4
 
-Zat4 is a social client I am building from scratch in Zig on the AT Protocol, with zero third-party dependencies.
+Zat4 is a social client built from scratch in Zig on the AT Protocol, with zero third-party dependencies.
 
-It speaks atproto and runs as its own environment. It reads and writes its own `app.zat4.*` record namespace and is served by its own indexer, so it carries the protocol's portable identities while standing as a distinct network. I hand-built nearly all of it: the GUI renderer, the X11, Win32, and AppKit window backends, the WebSocket and HTTP layers, font rasterization, the GPU path, and the server-side indexer. The only library I link is libc. TLS comes from the Zig standard library, and GL/EGL loads at runtime through `dlopen`.
+It speaks atproto and runs as its own environment. It reads and writes its own `app.zat4.*` record namespace and is served by its own indexer, so it carries the protocol's portable identities while standing as a distinct network. Nearly all of it is hand-built: the GUI renderer, the X11, Win32, and AppKit window backends, the WebSocket and HTTP layers, font rasterization, the GPU path, and the server-side indexer. The only linked library is libc. TLS comes from the Zig standard library, and GL/EGL loads at runtime through `dlopen`.
 
 ## What's inside
 
-- **A hand-rolled immediate-mode GUI** with a distinctive look: a living "glyph field," ASCII characters lit like a material by a real neighbour-coupled wave simulation, sitting behind a premium, proportionally typeset feed. I wrote the renderer myself, with both a software rasterizer and an EGL/GLES GPU backend.
-- **Native window backends spoken as raw protocol.** I talk X11 directly over a Unix socket on Linux, a Win32 backend on Windows, and a runtime-bound AppKit backend on macOS, each selected per OS at comptime and cross-compiled from one toolchain.
-- **A full atproto stack written from scratch:** identity resolution (handle to DID to PDS, verified both ways), XRPC, app-password sessions with reactive token refresh, a struct-of-arrays feed store, rich-text facets, and a live firehose subscription over my own WebSocket layer.
+- **A hand-rolled immediate-mode GUI** with a distinctive look: a living "glyph field," ASCII characters lit like a material by a real neighbour-coupled wave simulation, sitting behind a premium, proportionally typeset feed. The renderer is purpose-built, with both a software rasterizer and an EGL/GLES GPU backend.
+- **Native window backends spoken as raw protocol.** X11 over a Unix socket on Linux, a Win32 backend on Windows, and a runtime-bound AppKit backend on macOS, each selected per OS at comptime and cross-compiled from one toolchain.
+- **A full atproto stack written from scratch:** identity resolution (handle to DID to PDS, verified both ways), XRPC, app-password sessions with reactive token refresh, a struct-of-arrays feed store, rich-text facets, and a live firehose subscription over a hand-built WebSocket layer.
 - **Caret-aware text and threads.** A shared editable-text core gives every input (the composer, the profile editor, the sign-up fields) click-to-place caret, motion and Home/End/Delete keys, double-click word and triple-click line selection, and drag-to-highlight with copy, cut, and paste. The thread view stitches an author's run of self-replies into one continuous "chain," nests everyone else's replies Reddit-style with collapse, and pins a catch-up author header as you scroll the chain.
-- **Its own network layer.** A standalone AppView (indexer) ingests `app.zat4.*` records from the firehose, indexes them, and serves timelines, backed by a durable append-only event log, a bearer-auth gate, and idempotent replay. I mint new accounts on a project-run PDS with `*.zat4.com` handles, and existing atproto users can bring their own identity.
+- **Its own network layer.** A standalone AppView (indexer) ingests `app.zat4.*` records from the firehose, indexes them, and serves timelines, backed by a durable append-only event log, a bearer-auth gate, and idempotent replay. New accounts are minted on a project-run PDS with `*.zat4.com` handles, and existing atproto users can bring their own identity.
 
 ## Design
 
-I build Zat4 data-first. Records are plain data held in struct-of-arrays, cross-record references are `u32` indexes rather than pointers, and every hot struct carries an exact compile-time size assertion, so the build fails the moment a layout regresses. The core is pure and the shell is thin, with all I/O kept at the edges. Allocators are explicit everywhere, and I hold a firm line on adding dependencies. The result is a large, fast, fully owned codebase.
+Zat4 is built data-first. Records are plain data held in struct-of-arrays, cross-record references are `u32` indexes rather than pointers, and every hot struct carries an exact compile-time size assertion, so the build fails the moment a layout regresses. The core is pure and the shell is thin, with all I/O kept at the edges. Allocators are explicit everywhere, and the project holds a firm line on adding dependencies. The result is a large, fast, fully owned codebase.
 
 ## Build and run
 
@@ -59,6 +59,6 @@ Active development. The client side is working: identity, auth, feed, live timel
 
 Zat4 is free software, licensed under the GNU Affero General Public License, version 3 or (at your option) any later version (AGPL-3.0-or-later). The full text lives in [`LICENSE`](LICENSE), and every source file carries the licence header.
 
-Because Zat4 runs over a network, the AGPL's section 13 applies: anyone who interacts with a running instance is offered its Corresponding Source. I honor this with a persistent, visible source link in the UI (the sidebar footer) that points back to this repository at `codeberg.org/connoravila/Zat4`. If you deploy a modified version, keep that link pointing at your modified source.
+Because Zat4 runs over a network, the AGPL's section 13 applies: anyone who interacts with a running instance is offered its Corresponding Source. Zat4 honors this with a persistent, visible source link in the UI (the sidebar footer) that points back to this repository at `codeberg.org/connoravila/Zat4`. A deployed modification should keep that link pointing at its own modified source.
 
 Bundled components keep their own licences, retained in their files: the `stb_truetype` rasterizer (`vendor/`, public domain) and the embedded UI font (BSD-2-Clause, notice in `src/core/font.zig`). Both are compatible with the AGPL and leave the licensing of the project's own code unchanged.
