@@ -369,3 +369,20 @@ test "verify: wrong key rejects a good signature" {
     const keyB = PublicKey{ .curve = .p256, .point = kpB.public_key.toCompressedSec1() };
     try testing.expect(!verify(keyB, msg, &sig.toBytes()));
 }
+
+test "fuzz: decodeMultikey + verify tolerate arbitrary bytes (no crash)" {
+    const fuzzgen = @import("fuzzgen.zig");
+    var g = fuzzgen.Gen.init(0x51A);
+    var buf: [256]u8 = undefined;
+    const seeds = [_][]const u8{
+        "did:key:zQ3shqwJEJyMBsBXCWyCBpUBMqxcon9oHB7mCvx4sSpMdLJwc", "zDnaem", "z", "did:key:z",
+    };
+    const fixed_key = decodeMultikey("did:key:zQ3shqwJEJyMBsBXCWyCBpUBMqxcon9oHB7mCvx4sSpMdLJwc") catch unreachable;
+    var i: usize = 0;
+    while (i < 4000) : (i += 1) {
+        const input = g.next(&buf, &seeds, "did:key:zQ3shDna234567ABCabc", i);
+        _ = decodeMultikey(input) catch {};
+        // arbitrary bytes as both message and signature — must never crash.
+        _ = verify(fixed_key, input, input);
+    }
+}

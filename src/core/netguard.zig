@@ -351,3 +351,20 @@ test "parseIpv6Host: compression and embedded v4 round-trips through the classif
     try testing.expect(parseIpv6Host("not:::valid") == null);
     try testing.expect(parseIpv6Host("plainname") == null);
 }
+
+test "fuzz: URL/IP parsing tolerates arbitrary bytes (no crash)" {
+    const fuzzgen = @import("fuzzgen.zig");
+    var g = fuzzgen.Gen.init(0x5E7);
+    var buf: [256]u8 = undefined;
+    const seeds = [_][]const u8{
+        "https://example.com:8443/x", "http://[::1]:80/", "169.254.169.254", "::ffff:10.0.0.1",
+    };
+    var i: usize = 0;
+    while (i < 4000) : (i += 1) {
+        const input = g.next(&buf, &seeds, "htps:/.[]@:0123456789abcdefz", i);
+        _ = isAllowedScheme(input);
+        if (hostOf(input)) |h| _ = ipLiteralVerdict(h);
+        _ = parseIpv4(input);
+        _ = parseIpv6Host(input);
+    }
+}

@@ -175,3 +175,18 @@ test "verifyRecordCid: malformed input is an explicit error, never a false-posit
     try testing.expectError(error.MalformedLink, verifyRecordCid(testing.allocator, "{\"$link\":\"not-a-cid\"}", hello_cid));
     try testing.expectError(error.MalformedBytes, verifyRecordCid(testing.allocator, "{\"$bytes\":\"!!!!\"}", hello_cid));
 }
+
+test "fuzz: verifyRecordCid tolerates arbitrary JSON-ish bytes (no crash, no leak)" {
+    const fuzzgen = @import("fuzzgen.zig");
+    var g = fuzzgen.Gen.init(0xDA6);
+    var buf: [256]u8 = undefined;
+    const seeds = [_][]const u8{
+        "{\"hello\":\"world\"}", "{\"a\":1,\"b\":[1,2,3]}", "{\"x\":{\"$link\":\"bafyrei\"}}", "[]",
+    };
+    var i: usize = 0;
+    while (i < 3000) : (i += 1) {
+        const input = g.next(&buf, &seeds, "{}[]\":,$linkbytes-0123 abe", i);
+        // Leak-checked: a malformed record must error/return, never leak its arena.
+        _ = verifyRecordCid(testing.allocator, input, hello_cid) catch {};
+    }
+}

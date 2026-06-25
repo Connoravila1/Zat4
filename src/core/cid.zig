@@ -238,3 +238,17 @@ test "parse: errors are explicit and total" {
     try testing.expectError(error.BadLength, parse("bmzxw6", &out)); // valid base32, too short
     try parse(hello_world_cid, &out); // the real one parses cleanly
 }
+
+test "fuzz: parse/verify tolerate arbitrary bytes (no crash, no leak)" {
+    const fuzzgen = @import("fuzzgen.zig");
+    var g = fuzzgen.Gen.init(0xC1D5);
+    var buf: [256]u8 = undefined;
+    const seeds = [_][]const u8{ hello_world_cid, "bafyreih", "b", "z" };
+    var i: usize = 0;
+    while (i < 4000) : (i += 1) {
+        const input = g.next(&buf, &seeds, "bafyrei234567zxdmqABCDEF", i);
+        var out: [binary_len]u8 = undefined;
+        _ = parse(input, &out) catch {};
+        _ = verifyBlock(&hello_world_dagcbor, input);
+    }
+}

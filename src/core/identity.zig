@@ -537,3 +537,24 @@ test "DID document: missing pieces produce specific errors" {
 
     try testing.expectError(error.MalformedDidDocument, parseDidDocument(arena, "not json", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", null));
 }
+
+test "fuzz: identity parsers tolerate arbitrary bytes (no crash, no leak)" {
+    const fuzzgen = @import("fuzzgen.zig");
+    var g = fuzzgen.Gen.init(0x1DE);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var buf: [256]u8 = undefined;
+    const doc_seed = "{\"id\":\"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa\",\"alsoKnownAs\":[\"at://a.test\"],\"verificationMethod\":[{\"id\":\"#atproto\",\"publicKeyMultibase\":\"zQ3sh\"}],\"service\":[{\"id\":\"#atproto_pds\",\"type\":\"AtprotoPersonalDataServer\",\"serviceEndpoint\":\"https://pds.test\"}]}";
+    const seeds = [_][]const u8{ doc_seed, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", "alice.test", "{\"Answer\":[{\"data\":\"did:plc:x\"}]}" };
+    var i: usize = 0;
+    while (i < 2500) : (i += 1) {
+        const input = g.next(&buf, &seeds, "{}[]\":,didplcwebkey0123 .-z", i);
+        _ = arena_state.reset(.retain_capacity);
+        const a = arena_state.allocator();
+        _ = parseDidDocument(a, input, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", null) catch {};
+        _ = didFromWellKnown(input) catch {};
+        _ = didFromDohJson(a, input) catch {};
+        _ = validateHandle(input) catch {};
+        _ = validateDid(input) catch {};
+    }
+}

@@ -258,3 +258,18 @@ test "reduce: real-world createdAt with fractional seconds parses" {
     const live = (try reduce(arena_state.allocator(), event)).?;
     try testing.expectEqual(@as(i64, 1_767_323_045), live.created_at);
 }
+
+test "fuzz: reduce tolerates arbitrary bytes (no crash, no leak)" {
+    const fuzzgen = @import("fuzzgen.zig");
+    var g = fuzzgen.Gen.init(0x7E7);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var buf: [256]u8 = undefined;
+    const seeds = [_][]const u8{ post_event, reply_event, "{}", "{\"kind\":\"commit\"}" };
+    var i: usize = 0;
+    while (i < 2500) : (i += 1) {
+        const input = g.next(&buf, &seeds, "{}[]\":,kindcommitrecord0123 .Tz", i);
+        _ = arena_state.reset(.retain_capacity);
+        _ = reduce(arena_state.allocator(), input) catch {};
+    }
+}
