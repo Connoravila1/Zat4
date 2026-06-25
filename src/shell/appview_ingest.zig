@@ -283,6 +283,31 @@ test "ingest: an identity event indexes the author's handle" {
     try testing.expectEqualStrings("bob.zat4.com", appview.handleFor(&idx, "did:plc:bob"));
 }
 
+test "isolation: foreign-namespace records never cross the ingest wall (Phase 7)" {
+    const gpa = testing.allocator;
+    var idx: appview.Index = .{};
+    defer appview.deinit(gpa, &idx);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Well-formed records under FOREIGN lexicons — a Bluesky post, follow, like,
+    // repost, and a third-party custom NSID — must ALL reduce to .ignored. The
+    // index is structurally incapable of holding non-app.zat4 content.
+    const foreign = [_][]const u8{
+        "{\"did\":\"did:plc:c\",\"time_us\":1,\"kind\":\"commit\",\"commit\":{\"operation\":\"create\",\"collection\":\"app.bsky.feed.post\",\"rkey\":\"x\",\"cid\":\"b1\",\"record\":{\"$type\":\"app.bsky.feed.post\",\"text\":\"hi\",\"createdAt\":\"2026-06-14T00:00:00Z\"}}}",
+        "{\"did\":\"did:plc:c\",\"time_us\":2,\"kind\":\"commit\",\"commit\":{\"operation\":\"create\",\"collection\":\"app.bsky.graph.follow\",\"rkey\":\"x\",\"cid\":\"b2\",\"record\":{\"subject\":\"did:plc:z\"}}}",
+        "{\"did\":\"did:plc:c\",\"time_us\":3,\"kind\":\"commit\",\"commit\":{\"operation\":\"create\",\"collection\":\"app.bsky.feed.like\",\"rkey\":\"x\",\"cid\":\"b3\",\"record\":{\"subject\":{\"cid\":\"q\",\"uri\":\"at://x\"}}}}",
+        "{\"did\":\"did:plc:c\",\"time_us\":4,\"kind\":\"commit\",\"commit\":{\"operation\":\"create\",\"collection\":\"app.bsky.feed.repost\",\"rkey\":\"x\",\"cid\":\"b4\",\"record\":{\"subject\":{\"cid\":\"q\",\"uri\":\"at://x\"}}}}",
+        "{\"did\":\"did:plc:c\",\"time_us\":5,\"kind\":\"commit\",\"commit\":{\"operation\":\"create\",\"collection\":\"com.example.custom\",\"rkey\":\"x\",\"cid\":\"b5\",\"record\":{\"text\":\"x\"}}}",
+    };
+    for (foreign) |ev| {
+        try testing.expectEqual(Reduced.ignored, try ingestEvent(gpa, arena, &idx, ev));
+    }
+    try testing.expectEqual(@as(usize, 0), idx.posts.len);
+    try testing.expectEqual(@as(usize, 0), idx.follows.len);
+}
+
 test "ingest: ingestAll pumps newline-delimited events and counts" {
     const gpa = testing.allocator;
     var idx: appview.Index = .{};

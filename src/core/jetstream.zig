@@ -273,3 +273,27 @@ test "fuzz: reduce tolerates arbitrary bytes (no crash, no leak)" {
         _ = reduce(arena_state.allocator(), input) catch {};
     }
 }
+
+test "isolation: a well-formed foreign-NSID record never becomes a LivePost (ingress)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // A genuine Bluesky post (identical shape, foreign collection) is rejected,
+    // as is any third-party NSID — the reducer keys on the exact app.zat4 NSID.
+    const bsky = "{\"did\":\"did:plc:x\",\"time_us\":1,\"kind\":\"commit\",\"commit\":{\"operation\":\"create\",\"collection\":\"app.bsky.feed.post\",\"rkey\":\"r\",\"cid\":\"c\",\"record\":{\"$type\":\"app.bsky.feed.post\",\"text\":\"hi\",\"createdAt\":\"2026-01-02T03:04:05Z\"}}}";
+    try testing.expectEqual(@as(?LivePost, null), try reduce(a, bsky));
+    const custom = "{\"did\":\"did:plc:x\",\"time_us\":1,\"kind\":\"commit\",\"commit\":{\"operation\":\"create\",\"collection\":\"com.example.post\",\"rkey\":\"r\",\"cid\":\"c\",\"record\":{\"text\":\"hi\",\"createdAt\":\"2026-01-02T03:04:05Z\"}}}";
+    try testing.expectEqual(@as(?LivePost, null), try reduce(a, custom));
+}
+
+test "isolation: every write collection is in the app.zat4 namespace (egress)" {
+    // A future typo pointing a write at another network would leak Zat4 content
+    // OUT; this freezes the wall on the egress side too (Phase 7).
+    inline for (.{
+        lexicon.collection.post,    lexicon.collection.like,
+        lexicon.collection.repost,  lexicon.collection.follow,
+        lexicon.collection.profile, lexicon.collection.loadout,
+    }) |nsid| {
+        try testing.expect(std.mem.startsWith(u8, nsid, "app.zat4."));
+    }
+}
