@@ -404,6 +404,7 @@ test {
     // comptime guards (A7) are semantically analyzed on every `zig build test`.
     _ = @import("core/identity.zig");
     _ = @import("core/sigverify.zig");
+    _ = @import("core/dagcbor.zig");
     _ = @import("core/lexicon.zig");
     _ = @import("core/xrpc.zig");
     _ = @import("shell/http.zig");
