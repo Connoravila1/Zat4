@@ -147,7 +147,9 @@ fn didForHandle(
     }
 
     const url = try core.buildWellKnownUrl(scratch, handle);
-    const resp = try http.request(scratch, io, environ, url, .{});
+    // The host here is the handle itself — a network-derived, attacker-influenced
+    // value — so this fetch carries the SSRF guard (Phase 1).
+    const resp = try http.request(scratch, io, environ, url, .{ .guard = .untrusted });
     if (resp.status != 200) return error.HandleResolutionFailed;
     return core.didFromWellKnown(resp.body);
 }

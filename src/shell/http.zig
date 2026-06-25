@@ -44,6 +44,17 @@
 //! network dominates regardless).
 
 const std = @import("std");
+const netguard = @import("../core/netguard.zig");
+
+/// SSRF trust posture for a request (Phase 1). `.trusted` is for
+/// operator-configured endpoints (the AppView, the DoH resolver, the PLC
+/// directory — any of which may legitimately be loopback in dev). `.untrusted`
+/// is for a fetch whose host is network-derived / attacker-influenced (a
+/// handle's `.well-known`, a `did:web` document, a DID-document
+/// `serviceEndpoint`): the scheme must be https and an IP-literal host in a
+/// private / loopback / link-local / reserved range is refused before any
+/// connection is attempted.
+pub const Guard = enum { trusted, untrusted };
 
 /// Plain-data result of a request (A1: fields only; behavior lives in free
 /// functions). `body` is owned by the caller's allocator — the caller frees
@@ -73,6 +84,10 @@ pub const RequestOptions = struct {
     /// `error.ResponseTooLarge`, not an unbounded allocation: a misbehaving
     /// or hostile server cannot balloon our memory (E2 at the process edge).
     max_response_bytes: usize = default_max_response_bytes,
+    /// SSRF posture (Phase 1). Defaults to `.trusted` so operator-configured
+    /// callers (incl. the dev loopback AppView) are unaffected; a caller
+    /// fetching a network-derived host passes `.untrusted` to enable the guard.
+    guard: Guard = .trusted,
 };
 
 /// XRPC JSON pages with embeds run tens-to-hundreds of KB; 4 MiB is generous
@@ -105,6 +120,19 @@ pub fn request(
     url: []const u8,
     options: RequestOptions,
 ) !Response {
+    // SSRF gate (Phase 1): for an untrusted (network-derived) host, refuse a
+    // non-https scheme or an IP-literal host in a blocked range BEFORE opening
+    // any connection. The classification is pure (`core/netguard.zig`); a host
+    // *name* (verdict null) is left to the connection's own DNS — resolving the
+    // name and classifying every returned address is the next hardening step.
+    if (options.guard == .untrusted) {
+        if (!netguard.isAllowedScheme(url)) return error.BlockedScheme;
+        const host = netguard.hostOf(url) orelse return error.BlockedAddress;
+        if (netguard.ipLiteralVerdict(host)) |blocked| {
+            if (blocked) return error.BlockedAddress;
+        }
+    }
+
     var scratch_state = std.heap.ArenaAllocator.init(gpa); // C5: cleanup at acquisition
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
@@ -245,4 +273,21 @@ test "loopback: the response budget is a hard cap, surfaced as the module's own 
 
     const result = request(gpa, io, null, url, .{ .max_response_bytes = 1024 });
     try std.testing.expectError(error.ResponseTooLarge, result);
+}
+
+test "ssrf guard: an untrusted IP-literal host in a blocked range is refused before connecting" {
+    const gpa = std.testing.allocator; // C6
+    const io = std.testing.io;
+    // No server is started: the guard must fire before any connection attempt.
+    try std.testing.expectError(error.BlockedAddress, request(gpa, io, null, "https://127.0.0.1:9/x", .{ .guard = .untrusted }));
+    try std.testing.expectError(error.BlockedAddress, request(gpa, io, null, "https://169.254.169.254/latest/meta-data", .{ .guard = .untrusted }));
+    try std.testing.expectError(error.BlockedAddress, request(gpa, io, null, "https://[::1]/x", .{ .guard = .untrusted }));
+    try std.testing.expectError(error.BlockedAddress, request(gpa, io, null, "https://10.0.0.5/x", .{ .guard = .untrusted }));
+}
+
+test "ssrf guard: an untrusted request must be https" {
+    const gpa = std.testing.allocator; // C6
+    const io = std.testing.io;
+    try std.testing.expectError(error.BlockedScheme, request(gpa, io, null, "http://example.com/x", .{ .guard = .untrusted }));
+    try std.testing.expectError(error.BlockedScheme, request(gpa, io, null, "file:///etc/passwd", .{ .guard = .untrusted }));
 }
