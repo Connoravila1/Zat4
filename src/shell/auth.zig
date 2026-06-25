@@ -95,13 +95,24 @@ pub fn login(
     }
 }
 
-/// Free a `Session` produced by `login` (A1: behavior as a free function).
+/// Scrub a secret token's bytes before returning them to the allocator, so a
+/// freed JWT cannot linger in a crash dump or swapped-out page (SECURITY_ROADMAP
+/// Phase 0). `secureZero` is the erase the optimizer will not drop. The bytes
+/// were allocated by us (`gpa.dupe`), so casting away const to zero our own
+/// buffer is sound — the scrub happens at the point of release (C5).
+fn freeSecret(gpa: Allocator, secret: []const u8) void {
+    std.crypto.secureZero(u8, @constCast(secret));
+    gpa.free(secret);
+}
+
+/// Free a `Session` produced by `login` (A1: behavior as a free function). The
+/// JWTs are session secrets, so they are scrubbed before release.
 pub fn freeSession(gpa: Allocator, session: Session) void {
     gpa.free(session.did);
     gpa.free(session.handle);
     gpa.free(session.pds_url);
-    gpa.free(session.access_jwt);
-    gpa.free(session.refresh_jwt);
+    freeSecret(gpa, session.access_jwt);
+    freeSecret(gpa, session.refresh_jwt);
 }
 
 /// Authenticated XRPC query against the session's own PDS. On
@@ -245,8 +256,9 @@ fn refreshInPlace(
             const new_access = try gpa.dupe(u8, resp.accessJwt);
             errdefer gpa.free(new_access);
             const new_refresh = try gpa.dupe(u8, resp.refreshJwt);
-            gpa.free(session.access_jwt);
-            gpa.free(session.refresh_jwt);
+            // Scrub the rotated-out tokens — they are now spent secrets.
+            freeSecret(gpa, session.access_jwt);
+            freeSecret(gpa, session.refresh_jwt);
             session.access_jwt = new_access;
             session.refresh_jwt = new_refresh;
             return .{ .ok = {} };
