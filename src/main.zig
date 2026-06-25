@@ -403,6 +403,7 @@ test {
     // Pull every source file into the test build so its tests run and its
     // comptime guards (A7) are semantically analyzed on every `zig build test`.
     _ = @import("core/identity.zig");
+    _ = @import("core/sigverify.zig");
     _ = @import("core/lexicon.zig");
     _ = @import("core/xrpc.zig");
     _ = @import("shell/http.zig");
