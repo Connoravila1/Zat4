@@ -51,9 +51,10 @@ const netguard = @import("../core/netguard.zig");
 /// directory — any of which may legitimately be loopback in dev). `.untrusted`
 /// is for a fetch whose host is network-derived / attacker-influenced (a
 /// handle's `.well-known`, a `did:web` document, a DID-document
-/// `serviceEndpoint`): the scheme must be https and an IP-literal host in a
+/// `serviceEndpoint`): the scheme must be https, an IP-literal host in a
 /// private / loopback / link-local / reserved range is refused before any
-/// connection is attempted.
+/// connection is attempted, AND redirects are not followed (so a public host
+/// can't 302 to an internal one and slip past that gate).
 pub const Guard = enum { trusted, untrusted };
 
 /// Plain-data result of a request (A1: fields only; behavior lives in free
@@ -178,6 +179,14 @@ pub fn request(
             .authorization = if (options.authorization) |auth| .{ .override = auth } else .default,
         },
         .extra_headers = extra_headers_buf[0..extra_headers_len],
+        // SSRF (Phase 1), the redirect half: the up-front IP/scheme gate above
+        // only sees the FIRST URL — std follows redirects internally, so a
+        // public attacker host could 302 to `http://169.254.169.254/` and slip
+        // past it. For an `.untrusted` fetch we therefore DON'T follow redirects
+        // (`.unhandled` returns the 3xx as-is); the caller's non-2xx check
+        // rejects it. Trusted/operator-configured fetches keep the default
+        // follow behavior.
+        .redirect_behavior = if (options.guard == .untrusted) .unhandled else null,
     }) catch |err| switch (err) {
         // With a fixed response writer, a write failure / overlong stream
         // during the body phase means the body blew the budget (request-side
