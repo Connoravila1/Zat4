@@ -39,6 +39,7 @@
 const std = @import("std");
 const dagcbor = @import("dagcbor.zig");
 const cid = @import("cid.zig");
+const jsonguard = @import("jsonguard.zig");
 
 /// Recursion bound for the conversion, matching the encoder's, so adversarial
 /// nesting is a clean error rather than a stack overflow (Phase 2).
@@ -69,6 +70,7 @@ pub fn verifyRecordCid(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    if (!jsonguard.depthWithinLimit(record_json, jsonguard.max_json_depth)) return error.MalformedJson;
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, record_json, .{}) catch
         return error.MalformedJson;
     const value = try convert(arena, parsed, 0);

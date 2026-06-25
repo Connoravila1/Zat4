@@ -43,6 +43,7 @@ const Allocator = std.mem.Allocator;
 const appview = @import("../core/appview.zig");
 const jetstream = @import("../core/jetstream.zig");
 const lexicon = @import("../core/lexicon.zig");
+const jsonguard = @import("../core/jsonguard.zig");
 
 /// What a single event did to the index — returned so the pump (and tests)
 /// can count without re-inspecting the index. Plain enum, no payload.
@@ -54,6 +55,8 @@ pub const Reduced = enum { post, follow, like, repost, identity, ignored };
 /// uninteresting event is an ordinary state, not an error). C1: takes gpa
 /// for the index's growth and `arena` for transient parse scratch.
 pub fn ingestEvent(gpa: Allocator, arena: Allocator, idx: *appview.Index, event_json: []const u8) Allocator.Error!Reduced {
+    // Reject a deeply-nested event before any recursive parse runs on it.
+    if (!jsonguard.depthWithinLimit(event_json, jsonguard.max_json_depth)) return .ignored;
     // Posts go through the existing, tested jetstream reducer (it already
     // filters to lexicon.collection.post and parses reply refs).
     if (try jetstream.reduce(arena, event_json)) |p| {

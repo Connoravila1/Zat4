@@ -31,6 +31,7 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const lexicon = @import("lexicon.zig");
 const feed = @import("feed.zig");
+const jsonguard = @import("jsonguard.zig");
 
 // --- Wire shapes (transient parse targets, all A7.2) ---
 
@@ -76,6 +77,7 @@ pub const LivePost = struct {
 /// client does not (yet) consume — malformed JSON included: one bad event
 /// must not drop the stream (E2/E4).
 pub fn reduce(arena: Allocator, event_json: []const u8) error{OutOfMemory}!?LivePost {
+    if (!jsonguard.depthWithinLimit(event_json, jsonguard.max_json_depth)) return null;
     const event = std.json.parseFromSliceLeaky(Event, arena, event_json, .{
         .ignore_unknown_fields = true,
     }) catch |err| switch (err) {

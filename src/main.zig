@@ -408,6 +408,7 @@ test {
     _ = @import("core/cid.zig");
     _ = @import("core/dagjson.zig");
     _ = @import("core/netguard.zig");
+    _ = @import("core/jsonguard.zig");
     _ = @import("core/lexicon.zig");
     _ = @import("core/xrpc.zig");
     _ = @import("shell/http.zig");

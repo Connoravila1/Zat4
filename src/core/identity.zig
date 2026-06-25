@@ -39,6 +39,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const jsonguard = @import("jsonguard.zig");
 
 // ---------------------------------------------------------------------------
 // Handles
@@ -198,6 +199,7 @@ pub const DohError = error{ MalformedDohResponse, OutOfMemory } || DidError;
 /// `arena` must be an arena (leaky JSON parse); the returned slice points
 /// into it.
 pub fn didFromDohJson(arena: Allocator, body: []const u8) DohError!?[]const u8 {
+    if (!jsonguard.depthWithinLimit(body, jsonguard.max_json_depth)) return null;
     const resp = std.json.parseFromSliceLeaky(DohResponse, arena, body, .{
         .ignore_unknown_fields = true,
     }) catch |err| switch (err) {
@@ -293,6 +295,8 @@ pub fn parseDidDocument(
     expected_did: []const u8,
     expected_handle: ?[]const u8,
 ) DocError!ParsedDoc {
+    // Reject a deeply-nested document before the recursive parser sees it.
+    if (!jsonguard.depthWithinLimit(body, jsonguard.max_json_depth)) return error.MalformedDidDocument;
     const doc = std.json.parseFromSliceLeaky(DidDocJson, arena, body, .{
         .ignore_unknown_fields = true,
     }) catch |err| switch (err) {
@@ -557,4 +561,12 @@ test "fuzz: identity parsers tolerate arbitrary bytes (no crash, no leak)" {
         _ = validateHandle(input) catch {};
         _ = validateDid(input) catch {};
     }
+}
+
+test "guard: a depth-bomb DID document is rejected before the recursive parse" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var bomb: [256]u8 = undefined;
+    @memset(&bomb, '['); // 256 levels, far past the depth cap (would recurse-crash std.json)
+    try testing.expectError(error.MalformedDidDocument, parseDidDocument(arena_state.allocator(), &bomb, "did:plc:x", null));
 }
