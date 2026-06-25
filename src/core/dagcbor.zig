@@ -223,6 +223,168 @@ fn writeHead(
 }
 
 // ---------------------------------------------------------------------------
+// Decoding — strict DAG-CBOR. There is exactly ONE valid encoding of a value,
+// and this decoder REJECTS every other form: non-minimal ints/lengths,
+// indefinite lengths, unsorted or duplicate map keys, non-text keys, tags
+// other than 42, non-float64 floats, undefined, and trailing bytes. Strictness
+// is the security property — a lenient decoder paired with the canonical
+// encoder would let a hostile server present two byte sequences that decode to
+// the same value, muddying the CID identity the protocol rests on. Leaf
+// bytes / strings / CID payloads borrow from the input; only list and map
+// arrays allocate, in `arena`, so the caller frees them wholesale (C3).
+// ---------------------------------------------------------------------------
+
+pub const DecodeError = error{
+    Truncated, // input ended mid-value
+    TooDeep, // nesting beyond max_depth
+    NotCanonical, // a non-minimal int/length, a non-text key, or an out-of-order/duplicate key
+    Unsupported, // a CBOR feature DAG-CBOR forbids (indefinite, undefined, non-f64 float, tag != 42, out-of-int64 int)
+    InvalidUtf8, // a text string / key that isn't valid UTF-8
+    BadCidLink, // tag 42 not wrapping a 0x00-prefixed byte string
+    TrailingBytes, // bytes remain after the single top-level value
+} || Allocator.Error;
+
+/// Decode exactly one canonical DAG-CBOR value from `bytes`; the whole input
+/// must be that single value (trailing bytes are an error). `arena` holds the
+/// decoded list/map arrays, while byte/text/link payloads borrow from `bytes`,
+/// so `bytes` must outlive the returned Value.
+pub fn decode(arena: Allocator, bytes: []const u8) DecodeError!Value {
+    var d = Decoder{ .bytes = bytes, .pos = 0, .arena = arena };
+    const v = try d.value(0);
+    if (d.pos != bytes.len) return error.TrailingBytes;
+    return v;
+}
+
+const Decoder = struct {
+    // A7.2: cold struct — a transient parse cursor (one per `decode` call),
+    // never held in quantity or processed in a loop; size guard waived.
+    bytes: []const u8,
+    pos: usize,
+    arena: Allocator,
+
+    fn take(d: *Decoder, n: usize) DecodeError![]const u8 {
+        if (n > d.bytes.len - d.pos) return error.Truncated;
+        const s = d.bytes[d.pos .. d.pos + n];
+        d.pos += n;
+        return s;
+    }
+
+    fn byte(d: *Decoder) DecodeError!u8 {
+        return (try d.take(1))[0];
+    }
+
+    /// Read a head's argument from its 5-bit additional info, enforcing the
+    /// SHORTEST encoding (so a non-minimal int or length is rejected).
+    fn argument(d: *Decoder, additional: u5) DecodeError!u64 {
+        if (additional < 24) return additional;
+        switch (additional) {
+            24 => {
+                const v = (try d.take(1))[0];
+                if (v < 24) return error.NotCanonical;
+                return v;
+            },
+            25 => {
+                const v = std.mem.readInt(u16, (try d.take(2))[0..2], .big);
+                if (v <= 0xff) return error.NotCanonical;
+                return v;
+            },
+            26 => {
+                const v = std.mem.readInt(u32, (try d.take(4))[0..4], .big);
+                if (v <= 0xffff) return error.NotCanonical;
+                return v;
+            },
+            27 => {
+                const v = std.mem.readInt(u64, (try d.take(8))[0..8], .big);
+                if (v <= 0xffffffff) return error.NotCanonical;
+                return v;
+            },
+            else => return error.Unsupported, // 28..31: reserved / indefinite
+        }
+    }
+
+    fn value(d: *Decoder, depth: usize) DecodeError!Value {
+        if (depth >= max_depth) return error.TooDeep;
+        const head = try d.byte();
+        const major: u3 = @intCast(head >> 5);
+        const additional: u5 = @intCast(head & 0x1f);
+        switch (major) {
+            0 => { // unsigned int (IPLD ints are the int64 range)
+                const arg = try d.argument(additional);
+                if (arg > std.math.maxInt(i64)) return error.Unsupported;
+                return .{ .int = @intCast(arg) };
+            },
+            1 => { // negative int: -1 - arg
+                const arg = try d.argument(additional);
+                const n = -1 - @as(i128, arg);
+                if (n < std.math.minInt(i64)) return error.Unsupported;
+                return .{ .int = @intCast(n) };
+            },
+            2 => { // byte string
+                const len = try d.argument(additional);
+                return .{ .bytes = try d.take(@intCast(len)) };
+            },
+            3 => { // text string
+                const len = try d.argument(additional);
+                const s = try d.take(@intCast(len));
+                if (!std.unicode.utf8ValidateSlice(s)) return error.InvalidUtf8;
+                return .{ .string = s };
+            },
+            4 => { // array
+                const len = try d.argument(additional);
+                if (len > d.bytes.len - d.pos) return error.Truncated; // each item is >= 1 byte
+                const items = try d.arena.alloc(Value, @intCast(len));
+                for (items) |*it| it.* = try d.value(depth + 1);
+                return .{ .list = items };
+            },
+            5 => { // map (keys must be text, strictly ascending in canonical order)
+                const len = try d.argument(additional);
+                if (len > d.bytes.len - d.pos) return error.Truncated;
+                const entries = try d.arena.alloc(Entry, @intCast(len));
+                var prev: ?[]const u8 = null;
+                for (entries) |*e| {
+                    const key = try d.textKey();
+                    if (prev) |p| if (keyOrder(p, key) != .lt) return error.NotCanonical;
+                    prev = key;
+                    e.* = .{ .key = key, .value = try d.value(depth + 1) };
+                }
+                return .{ .map = entries };
+            },
+            6 => { // tag — DAG-CBOR permits ONLY tag 42, a CID link
+                const tag = try d.argument(additional);
+                if (tag != 42) return error.Unsupported;
+                const inner = try d.value(depth + 1);
+                const raw = switch (inner) {
+                    .bytes => |b| b,
+                    else => return error.BadCidLink,
+                };
+                if (raw.len == 0 or raw[0] != 0x00) return error.BadCidLink;
+                return .{ .link = raw[1..] };
+            },
+            7 => switch (additional) { // simple values + float64
+                20 => return .{ .bool = false },
+                21 => return .{ .bool = true },
+                22 => return .null,
+                27 => {
+                    const f: f64 = @bitCast(std.mem.readInt(u64, (try d.take(8))[0..8], .big));
+                    if (!std.math.isFinite(f)) return error.Unsupported;
+                    return .{ .float = f };
+                },
+                else => return error.Unsupported, // undefined, 16/32-bit float, reserved
+            },
+        }
+    }
+
+    /// A map key MUST be a text string in DAG-CBOR.
+    fn textKey(d: *Decoder) DecodeError![]const u8 {
+        const head = try d.byte();
+        if (head >> 5 != 3) return error.NotCanonical; // not major type 3 (text)
+        const s = try d.take(@intCast(try d.argument(@intCast(head & 0x1f))));
+        if (!std.unicode.utf8ValidateSlice(s)) return error.InvalidUtf8;
+        return s;
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Tests (C6). Vectors are hand-derived from the DAG-CBOR / CBOR spec; the
 // {"hello":"world"} case is the exact byte sequence the atproto interop
 // signature fixtures use as their signed message (oWVoZWxsb2V3b3JsZA base64),
@@ -324,4 +486,104 @@ test "depth bound: adversarial nesting is rejected, not a stack overflow" {
 test "float64: a finite float encodes as an 8-byte head" {
     // 1.5 = 0x3FF8000000000000 big-endian.
     try expectEncodes(.{ .float = 1.5 }, &.{ 0xfb, 0x3f, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
+}
+
+fn valueEql(a: Value, b: Value) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .null => true,
+        .bool => |x| x == b.bool,
+        .int => |x| x == b.int,
+        .float => |x| x == b.float,
+        .bytes => |x| std.mem.eql(u8, x, b.bytes),
+        .string => |x| std.mem.eql(u8, x, b.string),
+        .link => |x| std.mem.eql(u8, x, b.link),
+        .list => |x| blk: {
+            if (x.len != b.list.len) break :blk false;
+            for (x, b.list) |ai, bi| if (!valueEql(ai, bi)) break :blk false;
+            break :blk true;
+        },
+        .map => |x| blk: {
+            if (x.len != b.map.len) break :blk false;
+            for (x, b.map) |ae, be| {
+                if (!std.mem.eql(u8, ae.key, be.key) or !valueEql(ae.value, be.value)) break :blk false;
+            }
+            break :blk true;
+        },
+    };
+}
+
+test "decode: round-trips the encoder across every value kind" {
+    const cid_bytes = [_]u8{ 0x01, 0x71, 0x12, 0x20, 0xaa };
+    const inner = [_]Entry{
+        .{ .key = "n", .value = .{ .int = -7 } },
+        .{ .key = "s", .value = .{ .string = "hi" } },
+    };
+    const items = [_]Value{ .{ .int = 0 }, .{ .int = 1000000 }, .{ .bool = true }, .null };
+    // Keys already in canonical order so the decoded tree compares equal.
+    const top = [_]Entry{
+        .{ .key = "b", .value = .{ .bytes = &.{ 1, 2, 3 } } },
+        .{ .key = "f", .value = .{ .float = 1.5 } },
+        .{ .key = "k", .value = .{ .link = &cid_bytes } },
+        .{ .key = "l", .value = .{ .list = &items } },
+        .{ .key = "m", .value = .{ .map = &inner } },
+    };
+    const v = Value{ .map = &top };
+
+    const bytes = try encode(testing.allocator, v);
+    defer testing.allocator.free(bytes);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const decoded = try decode(arena.allocator(), bytes);
+
+    try testing.expect(valueEql(decoded, v));
+    // And re-encoding the decoded value reproduces the exact canonical bytes.
+    const bytes2 = try encode(testing.allocator, decoded);
+    defer testing.allocator.free(bytes2);
+    try testing.expectEqualSlices(u8, bytes, bytes2);
+}
+
+test "decode: the {\"hello\":\"world\"} vector" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const bytes = [_]u8{ 0xa1, 0x65, 'h', 'e', 'l', 'l', 'o', 0x65, 'w', 'o', 'r', 'l', 'd' };
+    const v = try decode(arena.allocator(), &bytes);
+    try testing.expectEqual(@as(usize, 1), v.map.len);
+    try testing.expectEqualStrings("hello", v.map[0].key);
+    try testing.expectEqualStrings("world", v.map[0].value.string);
+}
+
+test "decode: strict — every non-canonical or forbidden form is rejected" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectError(error.NotCanonical, decode(a, &.{ 0x18, 0x05 })); // uint 5 in 2 bytes
+    try testing.expectError(error.Unsupported, decode(a, &.{ 0x9f, 0xff })); // indefinite array
+    try testing.expectError(error.TrailingBytes, decode(a, &.{ 0x00, 0x00 })); // two top-level values
+    try testing.expectError(error.Truncated, decode(a, &.{0x18})); // arg byte missing
+    try testing.expectError(error.Unsupported, decode(a, &.{ 0xc0, 0x00 })); // tag 0 (only 42 allowed)
+    try testing.expectError(error.Unsupported, decode(a, &.{ 0xfb, 0x7f, 0xf0, 0, 0, 0, 0, 0, 0 })); // +Inf
+    try testing.expectError(error.Unsupported, decode(a, &.{ 0xfa, 0, 0, 0, 0 })); // 32-bit float
+    try testing.expectError(error.NotCanonical, decode(a, &.{ 0xa2, 0x61, 'b', 0x00, 0x61, 'a', 0x00 })); // keys out of order
+    try testing.expectError(error.NotCanonical, decode(a, &.{ 0xa2, 0x61, 'a', 0x00, 0x61, 'a', 0x00 })); // duplicate key
+    try testing.expectError(error.NotCanonical, decode(a, &.{ 0xa1, 0x00, 0x00 })); // non-text key
+    try testing.expectError(error.BadCidLink, decode(a, &.{ 0xd8, 0x2a, 0x42, 0x01, 0x02 })); // tag 42, no 0x00 prefix
+}
+
+test "fuzz: decode tolerates arbitrary bytes (no crash, no leak)" {
+    const fuzzgen = @import("fuzzgen.zig");
+    var g = fuzzgen.Gen.init(0xCB0);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var buf: [256]u8 = undefined;
+    const hw = [_]u8{ 0xa1, 0x65, 'h', 'e', 'l', 'l', 'o', 0x65, 'w', 'o', 'r', 'l', 'd' };
+    const seeds = [_][]const u8{ &hw, &.{ 0x83, 0x01, 0x02, 0x03 }, &.{0xa0}, &.{0x00} };
+    // A charset of CBOR head bytes reaches deep into the major-type branches.
+    const heads = [_]u8{ 0xa0, 0xa1, 0x82, 0x83, 0x65, 0x40, 0x18, 0x19, 0xff, 0x00, 0x01, 0x20, 0xd8, 0x2a, 0xfb, 0xf4, 0xf6 };
+    var i: usize = 0;
+    while (i < 4000) : (i += 1) {
+        const input = g.next(&buf, &seeds, &heads, i);
+        _ = arena_state.reset(.retain_capacity);
+        _ = decode(arena_state.allocator(), input) catch {};
+    }
 }
