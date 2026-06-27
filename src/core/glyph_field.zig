@@ -49,6 +49,12 @@ pub const Field = struct {
     vel: []f32, // len == cols*rows
     dye: []f32, // per-cell colour charge 0..1 (effects stain it; it persists)
     dye_tmp: []f32, // double-buffer scratch for the dye transport sweep
+    // Latch: false until the FIRST dye is ever stamped (a like). While false the
+    // medium is provably dye-free everywhere, so the transport sweep is a no-op
+    // over zeros — skip it. Once a like stains the field, dye persists (never
+    // decays) and spreads, so this stays true for the session and the sweep runs
+    // as before. A pure cost gate; the result is identical either way.
+    dye_present: bool,
     cols: u32,
     rows: u32,
 };
@@ -108,7 +114,7 @@ pub fn init(gpa: Allocator, field: *Field, cols: u32, rows: u32) Allocator.Error
     @memset(vel, 0);
     @memset(dye, 0);
     @memset(dye_tmp, 0);
-    field.* = .{ .height = height, .vel = vel, .dye = dye, .dye_tmp = dye_tmp, .cols = cols, .rows = rows };
+    field.* = .{ .height = height, .vel = vel, .dye = dye, .dye_tmp = dye_tmp, .dye_present = false, .cols = cols, .rows = rows };
 }
 
 pub fn deinit(gpa: Allocator, field: *Field) void {
@@ -168,6 +174,9 @@ pub fn step(field: *Field, p: Params, splashes: []const Splash, ambient_bias: []
     // 5. DYE transport — colour charge stamped by effects drifts DOWNHILL, so
     //    the wave troughs CARRY it (the physics moves it), with a little
     //    diffusion, and NO decay (it persists for the session). Double-buffered.
+    //    Skipped entirely while the medium has never been stained (dye all zero,
+    //    sweep is a no-op) — identical result, no per-cell work until a like.
+    if (!field.dye_present) return;
     const dye = field.dye;
     const dst = field.dye_tmp;
     var dy: u32 = 0;
@@ -214,6 +223,8 @@ fn applySplash(field: *Field, s: Splash) void {
     const rf: f32 = @floatFromInt(r);
     const cx: i32 = @intCast(s.x);
     const cy: i32 = @intCast(s.y);
+    // Latch the dye gate the moment any effect stains the medium (§5 skip).
+    if (s.dye != 0) field.dye_present = true;
     var dy: i32 = -r;
     while (dy <= r) : (dy += 1) {
         const yy = cy + dy;
