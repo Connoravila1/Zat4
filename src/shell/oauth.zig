@@ -161,10 +161,10 @@ pub fn login(
     const dpop_kp = Scheme.KeyPair.generate(io);
     const secret = dpop_kp.secret_key.toBytes();
     var pkce_entropy: [32]u8 = undefined;
-    std.crypto.random.bytes(&pkce_entropy);
+    try io.randomSecure(&pkce_entropy);
     const verifier = pkce.verifierFromEntropy(pkce_entropy);
     const challenge = pkce.challengeS256(&verifier);
-    const state = try randomToken(scratch, 24);
+    const state = try randomToken(io, scratch, 24);
 
     // 3. The loopback catcher MUST be listening before we send its URL in PAR.
     var lb = try openLoopback(io);
@@ -238,7 +238,7 @@ fn dpopPost(
     var nonce = nonce_in;
     var attempt: u8 = 0;
     while (attempt < 2) : (attempt += 1) {
-        const jti = try randomToken(scratch, 16);
+        const jti = try randomToken(io, scratch, 16);
         const proof = try dpop.buildProof(scratch, .{
             .secret_key = secret,
             .htm = "POST",
@@ -335,9 +335,10 @@ fn openBrowser(io: std.Io, url: []const u8) !void {
 }
 
 /// `n` CSPRNG bytes as base64url (unreserved, URL-safe) — for `state` and `jti`.
-fn randomToken(scratch: Allocator, comptime n: usize) ![]u8 {
+/// Uses `io.randomSecure` (the same syscall CSPRNG the credential gen uses).
+fn randomToken(io: std.Io, scratch: Allocator, comptime n: usize) ![]u8 {
     var raw: [n]u8 = undefined;
-    std.crypto.random.bytes(&raw);
+    try io.randomSecure(&raw);
     const enc_len = std.base64.url_safe_no_pad.Encoder.calcSize(n);
     const out = try scratch.alloc(u8, enc_len);
     _ = std.base64.url_safe_no_pad.Encoder.encode(out, &raw);

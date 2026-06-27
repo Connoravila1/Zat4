@@ -1,7 +1,6 @@
 {
   "client_id": "https://pds.zat4.com/client-metadata.json",
   "client_name": "Zat4",
-  "client_uri": "https://zat4.com",
   "application_type": "native",
   "dpop_bound_access_tokens": true,
   "grant_types": ["authorization_code", "refresh_token"],
