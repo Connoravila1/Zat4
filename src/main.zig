@@ -482,6 +482,7 @@ test {
     _ = @import("core/jws.zig");
     _ = @import("core/pkce.zig");
     _ = @import("core/dpop.zig");
+    _ = @import("core/oauth.zig");
     _ = @import("core/dagcbor.zig");
     _ = @import("core/cid.zig");
     _ = @import("core/dagjson.zig");
@@ -491,6 +492,7 @@ test {
     _ = @import("core/xrpc.zig");
     _ = @import("shell/http.zig");
     _ = @import("shell/identity.zig");
+    _ = @import("shell/oauth.zig");
     _ = @import("shell/xrpc.zig");
     _ = @import("shell/auth.zig");
     _ = @import("core/feed.zig");
