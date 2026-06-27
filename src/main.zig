@@ -30,6 +30,7 @@
 const std = @import("std");
 const identity = @import("shell/identity.zig");
 const auth = @import("shell/auth.zig");
+const oauth_shell = @import("shell/oauth.zig");
 const feed_shell = @import("shell/feed.zig");
 const feed_core = @import("core/feed.zig");
 const shell_tui = @import("shell/tui.zig");
@@ -117,6 +118,10 @@ pub fn main(init: std.process.Init) !void {
     var create_account_user: ?[]const u8 = null;
     var email_arg: ?[]const u8 = null;
     var invite_arg: ?[]const u8 = null;
+    // Headless OAuth login test (OAuth slice 3): `--oauth-login <handle>` runs the
+    // full browser authorization-code flow against the account's PDS and prints
+    // the DPoP-bound result, then exits. Opens the system browser; needs one sign-in.
+    var oauth_login_handle: ?[]const u8 = null;
     var ai: usize = 1;
     while (ai < args.len) : (ai += 1) {
         const arg = args[ai];
@@ -134,6 +139,11 @@ pub fn main(init: std.process.Init) !void {
             if (ai + 1 < args.len) {
                 ai += 1;
                 invite_arg = args[ai];
+            }
+        } else if (std.mem.eql(u8, arg, "--oauth-login")) {
+            if (ai + 1 < args.len) {
+                ai += 1;
+                oauth_login_handle = args[ai];
             }
         } else if (std.mem.eql(u8, arg, "--tui")) {
             tui_mode = true;
@@ -219,6 +229,38 @@ pub fn main(init: std.process.Init) !void {
             },
             .refused => |f| try out.print("createAccount refused: status {d} {s}: {s}\n", .{ f.status, f.code, f.message }),
         }
+        try out.flush();
+        return;
+    }
+
+    // Headless OAuth login: resolve the handle to its PDS, run the full browser
+    // flow, and print the DPoP-bound result. Only a prefix of the access token is
+    // shown — it's a bearer secret.
+    if (oauth_login_handle) |oh| {
+        const oid = identity.resolve(arena, io, env, .{}, oh) catch |err| {
+            try out.print("--oauth-login: could not resolve {s}: {s}\n", .{ oh, @errorName(err) });
+            try out.flush();
+            return err;
+        };
+        try out.print("[oauth] {s} -> {s}\n[oauth] opening browser to sign in...\n", .{ oid.handle, oid.pds_url });
+        try out.flush();
+        const result = oauth_shell.login(gpa, io, env, arena, oid.pds_url, oid.handle) catch |err| {
+            try out.print("--oauth-login failed: {s}\n", .{@errorName(err)});
+            try out.flush();
+            return err;
+        };
+        defer oauth_shell.freeLoginResult(gpa, result);
+        const at = result.tokens.access_token;
+        try out.print(
+            \\OAuth login complete — tokens are DPoP-bound.
+            \\  did:        {s}
+            \\  scope:      {s}
+            \\  expires_in: {d}s
+            \\  issuer:     {s}
+            \\  access:     {s}... ({d} bytes)
+            \\  refresh:    present ({d} bytes)
+            \\
+        , .{ result.tokens.sub, result.tokens.scope, result.tokens.expires_in, result.issuer, at[0..@min(12, at.len)], at.len, result.tokens.refresh_token.len });
         try out.flush();
         return;
     }

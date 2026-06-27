@@ -89,6 +89,18 @@ pub const RequestOptions = struct {
     /// callers (incl. the dev loopback AppView) are unaffected; a caller
     /// fetching a network-derived host passes `.untrusted` to enable the guard.
     guard: Guard = .trusted,
+    /// Extra request headers beyond accept/content-type/authorization — e.g. the
+    /// OAuth `DPoP` proof header. Empty for ordinary calls.
+    extra_headers: []const std.http.Header = &.{},
+};
+
+/// A response plus one captured response header (see `requestCapturing`). The
+/// `captured` value and `body` are owned by the caller's allocator.
+/// A7.2: cold struct, size guard waived — one per request.
+pub const CapturedResponse = struct {
+    status: u16,
+    body: []u8,
+    captured: ?[]u8,
 };
 
 /// XRPC JSON pages with embeds run tens-to-hundreds of KB; 4 MiB is generous
@@ -202,6 +214,114 @@ pub fn request(
     };
 }
 
+/// Like `request`, but also returns one named response header (case-insensitive),
+/// which the convenience `fetch` path discards. The OAuth flow needs the
+/// `DPoP-Nonce` header to drive its retry. Same SSRF posture, budget, and
+/// header handling as `request`; it uses the lower-level send/receive
+/// primitives (mirroring std's own `fetch`) so the response head stays visible.
+/// `body`, and `captured` when present, are owned by `gpa`.
+pub fn requestCapturing(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    url: []const u8,
+    options: RequestOptions,
+    capture: []const u8,
+) !CapturedResponse {
+    if (options.guard == .untrusted) {
+        if (!netguard.isAllowedScheme(url)) return error.BlockedScheme;
+        const host = netguard.hostOf(url) orelse return error.BlockedAddress;
+        if (netguard.ipLiteralVerdict(host)) |blocked| {
+            if (blocked) return error.BlockedAddress;
+        }
+    }
+
+    var scratch_state = std.heap.ArenaAllocator.init(gpa);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+
+    var client: std.http.Client = .{ .allocator = scratch, .io = io };
+    defer client.deinit();
+    if (environ) |env| try client.initDefaultProxies(scratch, env);
+
+    const uri = std.Uri.parse(url) catch return error.BlockedAddress;
+
+    // accept (if any) + the caller's extra headers (e.g. the DPoP proof).
+    var hdr_buf: [4]std.http.Header = undefined;
+    var hdr_len: usize = 0;
+    if (options.accept) |a| {
+        hdr_buf[hdr_len] = .{ .name = "accept", .value = a };
+        hdr_len += 1;
+    }
+    for (options.extra_headers) |h| {
+        if (hdr_len >= hdr_buf.len) break;
+        hdr_buf[hdr_len] = h;
+        hdr_len += 1;
+    }
+
+    const unhandled = options.guard == .untrusted; // SSRF: don't follow redirects (Phase 1)
+    var req = try client.request(options.method, uri, .{
+        .redirect_behavior = if (unhandled) .unhandled else @enumFromInt(3),
+        .headers = .{
+            .user_agent = .{ .override = user_agent },
+            .content_type = if (options.content_type) |ct| .{ .override = ct } else .default,
+            .authorization = if (options.authorization) |auth| .{ .override = auth } else .default,
+        },
+        .extra_headers = hdr_buf[0..hdr_len],
+    });
+    defer req.deinit();
+
+    const payload: ?[]const u8 = if (options.body) |b| b else if (options.method.requestHasBody()) "" else null;
+    if (payload) |p| {
+        req.transfer_encoding = .{ .content_length = p.len };
+        var body = try req.sendBodyUnflushed(&.{});
+        try body.writer.writeAll(p);
+        try body.end();
+        try req.connection.?.flush();
+    } else {
+        try req.sendBodiless();
+    }
+
+    const redirect_buffer: []u8 = if (unhandled) &.{} else try scratch.alloc(u8, 8 * 1024);
+    var response = try req.receiveHead(redirect_buffer);
+
+    // Capture the requested header before consuming the body.
+    var captured: ?[]u8 = null;
+    {
+        var it = response.head.iterateHeaders();
+        while (it.next()) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, capture)) {
+                captured = try gpa.dupe(u8, h.value);
+                break;
+            }
+        }
+    }
+    errdefer if (captured) |c| gpa.free(c);
+
+    // Budget-bounded body read: the fixed writer IS the cap (as in `request`).
+    const staging = try scratch.alloc(u8, options.max_response_bytes);
+    var body_writer: std.Io.Writer = .fixed(staging);
+    const decompress_buffer: []u8 = switch (response.head.content_encoding) {
+        .identity => &.{},
+        .zstd => try scratch.alloc(u8, std.compress.zstd.default_window_len),
+        .deflate, .gzip => try scratch.alloc(u8, std.compress.flate.max_window_len),
+        .compress => return error.ResponseTooLarge,
+    };
+    var transfer_buffer: [64]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+    _ = reader.streamRemaining(&body_writer) catch |err| switch (err) {
+        error.WriteFailed => return error.ResponseTooLarge, // fixed writer full = budget hit
+        error.ReadFailed => return response.bodyErr().?,
+    };
+
+    return .{
+        .status = @intFromEnum(response.head.status),
+        .body = try gpa.dupe(u8, body_writer.buffered()),
+        .captured = captured,
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Loopback tests — real sockets pin the transport's new behavior: header
 // pass-through and the response budget. Client-side assertions are the
@@ -247,6 +367,57 @@ test "loopback: authorization and accept reach the wire verbatim" {
     });
     defer gpa.free(resp.body); // C5
     try std.testing.expectEqual(@as(u16, 200), resp.status);
+}
+
+fn serveWithNonceOnce(server: *std.Io.net.Server, io: std.Io) void {
+    const stream = server.accept(io) catch return;
+    defer stream.close(io);
+    var read_buf: [8192]u8 = undefined;
+    var write_buf: [8192]u8 = undefined;
+    var stream_reader = stream.reader(io, &read_buf);
+    var stream_writer = stream.writer(io, &write_buf);
+    var http_server: std.http.Server = .init(&stream_reader.interface, &stream_writer.interface);
+    var req = http_server.receiveHead() catch return;
+    const head = req.head_buffer;
+    // The DPoP proof header and the form content-type must reach the wire.
+    const ok = std.ascii.indexOfIgnoreCase(head, "dpop: proof-abc") != null and
+        std.ascii.indexOfIgnoreCase(head, "content-type: application/x-www-form-urlencoded") != null;
+    req.respond("{\"ok\":true}", .{
+        .status = if (ok) .ok else .bad_request,
+        .extra_headers = &.{.{ .name = "DPoP-Nonce", .value = "nonce-xyz" }},
+    }) catch return;
+}
+
+test "loopback: requestCapturing returns the DPoP-Nonce header and the body" {
+    const gpa = std.testing.allocator; // C6
+    const io = std.testing.io;
+
+    var port: u16 = 38570;
+    var address: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+    var server = address.listen(io, .{ .reuse_address = true }) catch blk: {
+        port += 13;
+        address = .{ .ip4 = .loopback(port) };
+        break :blk try address.listen(io, .{ .reuse_address = true });
+    };
+    defer server.deinit(io);
+    const thread = try std.Thread.spawn(.{}, serveWithNonceOnce, .{ &server, io });
+    defer thread.join();
+
+    var url_buf: [48]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/par", .{port});
+
+    const resp = try requestCapturing(gpa, io, null, url, .{
+        .method = .POST,
+        .body = "grant_type=authorization_code",
+        .content_type = "application/x-www-form-urlencoded",
+        .extra_headers = &.{.{ .name = "DPoP", .value = "proof-abc" }},
+    }, "DPoP-Nonce");
+    defer gpa.free(resp.body); // C5
+    defer if (resp.captured) |c| gpa.free(c);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("{\"ok\":true}", resp.body);
+    try std.testing.expect(resp.captured != null);
+    try std.testing.expectEqualStrings("nonce-xyz", resp.captured.?);
 }
 
 fn serveOversizedOnce(server: *std.Io.net.Server, io: std.Io) void {

@@ -54,6 +54,13 @@ pub const appview_env_var = "ZAT4_APPVIEW";
 pub const default_pds_url = "https://pds.zat4.com";
 pub const pds_env_var = "ZAT_PDS";
 
+/// Zat4's OAuth client identity. `oauth_client_id` MUST equal the URL the
+/// client metadata is hosted at (the spec requires it); it is served on the box
+/// (see `deploy/zat4-client-metadata.json`). The scope is what the feature set
+/// needs: identity plus full record read/write during the atproto transition.
+pub const oauth_client_id = "https://pds.zat4.com/client-metadata.json";
+pub const oauth_scope = "atproto transition:generic";
+
 /// Endpoint configuration. A7.2: cold config — one per process, constructed
 /// once at startup, never in a hot loop. Holds borrowed slices (either the
 /// comptime default literal or a slice into the environment block); it owns
