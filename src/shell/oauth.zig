@@ -290,25 +290,47 @@ fn openLoopback(io: std.Io) !Loopback {
     return error.NoFreePort;
 }
 
-/// Accept one connection, read the callback request line, and answer the
-/// browser with a small "you're signed in" page (which tries to close itself —
-/// the max-smooth touch). Returns the callback query string (`scratch`-owned).
+/// Wait for the real callback request and answer the browser with a small
+/// "you're signed in" page (which tries to close itself — the max-smooth touch).
+/// Returns the callback query string (`scratch`-owned).
+///
+/// Loops over connections rather than accepting just one: browsers (Firefox/
+/// LibreWolf especially) open *speculative* preconnections that send no data,
+/// and may also fetch `/favicon.ico`. A single-shot accept races those and can
+/// close the listener before the genuine `GET /callback?...` arrives — exactly
+/// the "Unable to connect" failure. So we ignore empty/non-callback connections
+/// and keep listening until the callback (carrying a query) shows up.
 fn awaitCallback(scratch: Allocator, io: std.Io, server: *std.Io.net.Server) ![]u8 {
-    const stream = try server.accept(io);
-    defer stream.close(io);
-    var read_buf: [16 * 1024]u8 = undefined;
-    var write_buf: [4 * 1024]u8 = undefined;
-    var stream_reader = stream.reader(io, &read_buf);
-    var stream_writer = stream.writer(io, &write_buf);
-    var hs: std.http.Server = .init(&stream_reader.interface, &stream_writer.interface);
-    var req = hs.receiveHead() catch return error.CallbackFailed;
-    const target = req.head.target; // e.g. "/callback?code=...&state=...&iss=..."
-    const q = if (std.mem.indexOfScalar(u8, target, '?')) |idx| target[idx + 1 ..] else "";
-    const query = try scratch.dupe(u8, q);
-    req.respond(success_page, .{
-        .extra_headers = &.{.{ .name = "content-type", .value = "text/html; charset=utf-8" }},
-    }) catch {};
-    return query;
+    var seen: u32 = 0;
+    while (seen < 64) : (seen += 1) {
+        const stream = server.accept(io) catch return error.CallbackFailed;
+        var read_buf: [16 * 1024]u8 = undefined;
+        var write_buf: [4 * 1024]u8 = undefined;
+        var stream_reader = stream.reader(io, &read_buf);
+        var stream_writer = stream.writer(io, &write_buf);
+        var hs: std.http.Server = .init(&stream_reader.interface, &stream_writer.interface);
+        var req = hs.receiveHead() catch {
+            // A speculative/empty connection (no complete request) — discard it
+            // and wait for the next, keeping the listener open.
+            stream.close(io);
+            continue;
+        };
+        const target = req.head.target; // e.g. "/callback?code=...&state=...&iss=..."
+        const qpos = std.mem.indexOfScalar(u8, target, '?');
+        if (!std.mem.startsWith(u8, target, "/callback") or qpos == null) {
+            // Not the callback (a preconnect GET /, /favicon.ico, etc.).
+            req.respond("", .{ .status = .not_found }) catch {};
+            stream.close(io);
+            continue;
+        }
+        const query = try scratch.dupe(u8, target[qpos.? + 1 ..]);
+        req.respond(success_page, .{
+            .extra_headers = &.{.{ .name = "content-type", .value = "text/html; charset=utf-8" }},
+        }) catch {};
+        stream.close(io);
+        return query;
+    }
+    return error.CallbackFailed;
 }
 
 const success_page =
@@ -316,10 +338,10 @@ const success_page =
     \\<meta name="viewport" content="width=device-width,initial-scale=1"><title>Zat4</title>
     \\<style>html,body{height:100%;margin:0}body{display:flex;align-items:center;justify-content:center;
     \\background:#181812;color:#e9e6df;font:500 16px/1.5 system-ui,sans-serif}
-    \\.c{text-align:center;padding:2rem}.z{color:#F58C0F;font-weight:700;font-size:1.4rem}
-    \\p{opacity:.7}</style></head><body><div class="c">
-    \\<div class="z">Signed in to Zat4</div><p>You can close this tab and return to the app.</p>
-    \\</div><script>setTimeout(function(){window.close();},800);</script></body></html>
+    \\.c{text-align:center;padding:2rem}.z{color:#F58C0F;font-weight:700;font-size:1.4rem;margin-bottom:.4rem}
+    \\p{opacity:.7;margin:0}</style></head><body><div class="c">
+    \\<div class="z">Signed in to Zat4</div><p>You're all set — you can close this tab and return to the app.</p>
+    \\</div></body></html>
 ;
 
 /// Open `url` in the system browser. Linux: `xdg-open`. (mac `open` / win
