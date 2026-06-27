@@ -483,6 +483,7 @@ test {
     _ = @import("core/pkce.zig");
     _ = @import("core/dpop.zig");
     _ = @import("core/oauth.zig");
+    _ = @import("core/oauth_flow.zig");
     _ = @import("core/dagcbor.zig");
     _ = @import("core/cid.zig");
     _ = @import("core/dagjson.zig");
