@@ -34,6 +34,7 @@ const feed_shell = @import("shell/feed.zig");
 const feed_core = @import("core/feed.zig");
 const shell_tui = @import("shell/tui.zig");
 const enroll_run = @import("shell/enroll_run.zig");
+const credential_shell = @import("shell/credential.zig");
 const cache_shell = @import("shell/cache.zig");
 const config = @import("shell/config.zig");
 const window_shell = @import("shell/native.zig");
@@ -107,10 +108,34 @@ pub fn main(init: std.process.Init) !void {
     // app.zat4.graph.follow from the logged-in account (the positional handle)
     // to the target and exits. The value is the next argument.
     var follow_target: ?[]const u8 = null;
+    // Headless sign-up test (enrollment 3b): `--create-account <username>` mints
+    // <username>.zat4.com on the PDS with a fresh CSPRNG password and exits,
+    // printing the handle/DID/password. No GUI, no display, no tunnel (the PDS is
+    // a public HTTPS host). `--email` and `--invite` set those; the invite falls
+    // back to ZAT_INVITE_CODE. This exercises the same `auth.createAccount` the
+    // GUI flow uses, so the network leg can be verified in one command.
+    var create_account_user: ?[]const u8 = null;
+    var email_arg: ?[]const u8 = null;
+    var invite_arg: ?[]const u8 = null;
     var ai: usize = 1;
     while (ai < args.len) : (ai += 1) {
         const arg = args[ai];
-        if (std.mem.eql(u8, arg, "--tui")) {
+        if (std.mem.eql(u8, arg, "--create-account")) {
+            if (ai + 1 < args.len) {
+                ai += 1;
+                create_account_user = args[ai];
+            }
+        } else if (std.mem.eql(u8, arg, "--email")) {
+            if (ai + 1 < args.len) {
+                ai += 1;
+                email_arg = args[ai];
+            }
+        } else if (std.mem.eql(u8, arg, "--invite")) {
+            if (ai + 1 < args.len) {
+                ai += 1;
+                invite_arg = args[ai];
+            }
+        } else if (std.mem.eql(u8, arg, "--tui")) {
             tui_mode = true;
         } else if (std.mem.eql(u8, arg, "--window")) {
             // The same screens in an X11 window; --window implies the
@@ -135,19 +160,68 @@ pub fn main(init: std.process.Init) !void {
     const env = init.environ_map;
 
     // Pre-auth front door: a window launch with NO credentials and NO cached
-    // session is a new user — show the "Join Zat4" flow instead of resolving a
+    // session is a new user, so show the "Join Zat4" flow instead of resolving a
     // handle or demanding a password. A returning user (cache present, or a
     // password supplied) falls through to the normal login/run paths below.
-    // Slice 3: this is the LOCAL enrollment surface in the live app; the
-    // networked createAccount + hand-off-to-feed legs are a later slice.
+    // On a completed sign-up, the flow hands back a session: cache it (so the
+    // next launch goes straight to the feed) and drop into the feed now.
     if (window_mode and env.get("ZAT_APP_PASSWORD") == null and !hasCachedSession(gpa, env)) {
-        try enroll_run.run(gpa, io, env);
+        if (try enroll_run.run(gpa, io, env)) |new_session| {
+            var session = new_session;
+            defer auth.freeSession(gpa, session);
+            var sp_buf: [512]u8 = undefined;
+            if (cache_shell.sessionPath(&sp_buf, env)) |sp| _ = cache_shell.saveSessionAt(gpa, sp, &session);
+            var store = cache_shell.loadStore(gpa, env) orelse feed_core.Store{};
+            defer feed_core.deinitStore(gpa, &store);
+            defer _ = cache_shell.saveStore(gpa, env, &store);
+            const eps = config.fromEnv(env);
+            const win = window_shell.open(gpa, env, "zat", 110, 32) catch return;
+            defer window_shell.close(win);
+            shell_tui.run(gpa, io, env, &session, eps.appview_url, &store, .{ .window = win }) catch {};
+        }
         return;
     }
 
     var stdout_buffer: [1024]u8 = undefined;
     var stdout_writer: std.Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const out = &stdout_writer.interface;
+
+    // Headless sign-up: mint a new account and print its credentials, then exit.
+    // The same `auth.createAccount` the Join flow uses, driven from the terminal.
+    if (create_account_user) |uname| {
+        var cred = credential_shell.generate(io, .super_secure) catch |err| {
+            try out.print("--create-account: could not generate a password: {s}\n", .{@errorName(err)});
+            try out.flush();
+            return err;
+        };
+        defer credential_shell.wipe(&cred);
+        const password = cred.bytes[0..cred.len];
+        var hbuf: [128]u8 = undefined;
+        const new_handle = try std.fmt.bufPrint(&hbuf, "{s}.zat4.com", .{uname});
+        const invite = invite_arg orelse env.get("ZAT_INVITE_CODE");
+        const pds = config.fromEnv(env).pds_url;
+        const outcome = try auth.createAccount(gpa, arena, io, env, pds, .{
+            .handle = new_handle,
+            .password = password,
+            .email = email_arg,
+            .inviteCode = invite,
+        });
+        switch (outcome) {
+            .ok => |session| {
+                defer auth.freeSession(gpa, session);
+                try out.print(
+                    \\created account on {s}
+                    \\  handle:   {s}
+                    \\  did:      {s}
+                    \\  password: {s}   (save it, this is the login)
+                    \\
+                , .{ pds, session.handle, session.did, password });
+            },
+            .refused => |f| try out.print("createAccount refused: status {d} {s}: {s}\n", .{ f.status, f.code, f.message }),
+        }
+        try out.flush();
+        return;
+    }
 
     const id = try identity.resolve(arena, io, init.environ_map, .{}, handle);
 
@@ -435,6 +509,8 @@ test {
     _ = @import("core/layout.zig");
     _ = @import("core/raster.zig");
     _ = @import("core/text.zig");
+    _ = @import("core/text_select.zig");
+    _ = @import("core/xcursor.zig");
     _ = @import("core/atlas.zig");
     _ = @import("core/glyph_field.zig");
     _ = @import("core/x11.zig");

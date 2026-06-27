@@ -96,6 +96,7 @@ pub const method = struct {
     // Protocol methods — shared by every atproto app, NOT Bluesky content.
     // These stay exactly as they are (the wall self-check exempts them).
     pub const create_session = "com.atproto.server.createSession";
+    pub const create_account = "com.atproto.server.createAccount";
     pub const refresh_session = "com.atproto.server.refreshSession";
     pub const get_session = "com.atproto.server.getSession";
     pub const create_record = "com.atproto.repo.createRecord";
@@ -179,6 +180,17 @@ pub const CreateSessionInput = struct {
     password: []const u8,
     /// Email 2FA code; omitted from the wire when null.
     authFactorToken: ?[]const u8 = null,
+};
+
+/// Input for `com.atproto.server.createAccount`. The optional fields are omitted
+/// from the wire when null (handle + password are the minimum; the PDS gates on
+/// `inviteCode` while invite-only). Recovery-key / DID binding are a later slice.
+/// A7.2: cold struct, size guard waived — one per sign-up attempt.
+pub const CreateAccountInput = struct {
+    handle: []const u8,
+    password: []const u8,
+    email: ?[]const u8 = null,
+    inviteCode: ?[]const u8 = null,
 };
 
 /// Response of createSession AND refreshSession (same shape on the wire).

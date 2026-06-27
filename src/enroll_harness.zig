@@ -14,7 +14,12 @@
 
 const std = @import("std");
 const enroll_run = @import("shell/enroll_run.zig");
+const auth = @import("shell/auth.zig");
 
 pub fn main(init: std.process.Init) !void {
-    try enroll_run.run(init.gpa, init.io, init.environ_map);
+    // The dev harness drives the surface only; it discards any session the flow
+    // returns (sign-up needs an invite + network, which the live app supplies).
+    if (try enroll_run.run(init.gpa, init.io, init.environ_map)) |session| {
+        auth.freeSession(init.gpa, session);
+    }
 }

@@ -26,6 +26,7 @@ zig build run -- your.handle --tui                  # the client, in the termina
 zig build run -- your.handle                        # resolve a handle and print it
 zig build run -- you.zat4.com --post "…"            # headless: publish one post
 zig build run -- you.zat4.com --follow h.zat4.com   # headless: publish one follow
+zig build run -- --create-account name --email a@b.c # headless: mint name.zat4.com (invite via ZAT_INVITE_CODE)
 zig build appview                                   # run the AppView (ingest → serve timelines)
 zig build test                                      # offline unit tests, leak-checked
 zig build test-appview                              # the AppView's offline tests

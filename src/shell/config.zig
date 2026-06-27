@@ -49,6 +49,11 @@ pub const default_appview_url = "http://127.0.0.1:2584";
 /// point at a real AppView without a recompile.
 pub const appview_env_var = "ZAT4_APPVIEW";
 
+/// The PDS that mints new `*.zat4.com` accounts (where enrollment's
+/// `createAccount` is sent). `ZAT_PDS` overrides it without a recompile.
+pub const default_pds_url = "https://pds.zat4.com";
+pub const pds_env_var = "ZAT_PDS";
+
 /// Endpoint configuration. A7.2: cold config — one per process, constructed
 /// once at startup, never in a hot loop. Holds borrowed slices (either the
 /// comptime default literal or a slice into the environment block); it owns
@@ -56,19 +61,24 @@ pub const appview_env_var = "ZAT4_APPVIEW";
 pub const Endpoints = struct {
     /// Where authenticated AppView reads (timeline, profile) are sent.
     appview_url: []const u8 = default_appview_url,
+    /// The PDS new accounts are minted on (enrollment `createAccount`).
+    pds_url: []const u8 = default_pds_url,
 };
 
 /// Build the endpoint config from the environment (B3 — reads an impure
-/// source, so this is shell). `ZAT4_APPVIEW`, if set and non-empty, wins;
-/// otherwise the loopback stub default holds. An absent variable is an
-/// ordinary state (E4), not an error — the default is the answer.
+/// source, so this is shell). A set, non-empty override wins; otherwise the
+/// default holds. An absent variable is an ordinary state (E4), not an error.
 pub fn fromEnv(environ: ?*const std.process.Environ.Map) Endpoints {
+    var out: Endpoints = .{};
     if (environ) |env| {
         if (env.get(appview_env_var)) |val| {
-            if (val.len > 0) return .{ .appview_url = val };
+            if (val.len > 0) out.appview_url = val;
+        }
+        if (env.get(pds_env_var)) |val| {
+            if (val.len > 0) out.pds_url = val;
         }
     }
-    return .{};
+    return out;
 }
 
 // ---------------------------------------------------------------------------

@@ -95,6 +95,35 @@ pub fn login(
     }
 }
 
+/// Create a NEW account on `pds_url` via `com.atproto.server.createAccount` and
+/// return its session (same shape as login). The PDS gates on `inviteCode` while
+/// invite-only; a refusal (taken handle, bad/again-used invite, missing email)
+/// comes back as `refused` for the caller to surface (E4). `refused` strings live
+/// in `arena`; the returned session is owned by `gpa`.
+pub fn createAccount(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    pds_url: []const u8,
+    input: lexicon.CreateAccountInput,
+) !LoginOutcome {
+    const outcome = try xrpc.procedure(
+        arena,
+        io,
+        environ,
+        pds_url,
+        lexicon.method.create_account,
+        input,
+        lexicon.SessionResponse,
+        .{},
+    );
+    switch (outcome) {
+        .failed => |failure| return .{ .refused = failure },
+        .ok => |resp| return .{ .ok = try dupeSession(gpa, pds_url, resp) },
+    }
+}
+
 /// Scrub a secret token's bytes before returning them to the allocator, so a
 /// freed JWT cannot linger in a crash dump or swapped-out page (SECURITY_ROADMAP
 /// Phase 0). `secureZero` is the erase the optimizer will not drop. The bytes

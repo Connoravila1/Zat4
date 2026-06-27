@@ -34,6 +34,9 @@ const enroll_view = @import("../core/enroll_view.zig");
 const credential_core = @import("../core/credential.zig");
 const credential_shell = @import("credential.zig");
 const membership_shell = @import("membership.zig");
+const auth = @import("auth.zig"); // createAccount + Session (the network hand-off)
+const config = @import("config.zig"); // the PDS host new accounts are minted on
+const lexicon = @import("../core/lexicon.zig");
 const pow = @import("../core/pow.zig");
 const pow_shell = @import("pow.zig");
 const glyph_field = @import("../core/glyph_field.zig");
@@ -145,7 +148,9 @@ const craft_dur_ns: f32 = 1_900_000_000;
 /// Open a window and run the enrollment flow to exit (window close / Esc). The
 /// module owns the window lifecycle so callers (the live app pre-auth front door
 /// and the dev `enroll` step) just ask it to run. No session, no network.
-pub fn run(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map) !void {
+/// Run the Join flow. Returns the new account's `Session` when sign-up completes
+/// (the caller drops into the feed), or null when the window is closed / Esc.
+pub fn run(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map) !?auth.Session {
     const win = window_shell.open(gpa, env, "zat - join", 150, 52) catch |err| {
         std.debug.print("window.open failed: {s} (on X11, is DISPLAY set?)\n", .{@errorName(err)});
         return err;
@@ -220,6 +225,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     // the release lands on the same target (press-then-slide-off cancels). The
     // press gives an immediate ripple; the action commits on release.
     var armed_target: ?enroll_view.HitTarget = null;
+    // Guards the one-shot account creation when the proof seals (reset whenever we
+    // leave the verifying step, so a failed attempt can be retried).
+    var signup_attempted = false;
     var mcx: f32 = -1;
     var mcy: f32 = -1;
     const amb_amp: f32 = 0.006; // calmer than the feed (0.010)
@@ -376,10 +384,20 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
                     splashes.append(gpa, .{ .x = bx, .y = by, .radius = 4, .amp = 1.6 }) catch {};
                 }
             }
-            // loop the flow ~1.5 s after the seal finishes (0.8 s seal + beat).
-            // Slice 3 (no network): completion returns to the start — the
-            // networked createAccount + hand-off-to-feed legs replace this.
-            if (state.seal_t >= 1.0 and (frame_ns -| state.seal_start_ns) > 2_300_000_000) {
+            // Proof sealed → mint the account (slice 3b). A NEW account is created
+            // on the PDS once; on success the session is handed back to the caller
+            // (the feed), on failure we drop to the done screen for a retry. The
+            // existing-identity verify path is a later slice (it loops for now).
+            if (state.branch == .new) {
+                if (state.seal_t >= 1.0 and !signup_attempted) {
+                    signup_attempted = true;
+                    if (createZatAccount(gpa, io, env, &state)) |sess| {
+                        stopPow(&powjob);
+                        return sess; // signed up → drop into the feed
+                    }
+                    state.step = .done; // failed (printed); let them retry
+                }
+            } else if (state.seal_t >= 1.0 and (frame_ns -| state.seal_start_ns) > 2_300_000_000) {
                 stopPow(&powjob);
                 reset(&state);
             }
@@ -387,6 +405,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
             if (powjob.active) stopPow(&powjob);
             state.pow_t = 0.0;
             state.seal_t = 0.0;
+            signup_attempted = false; // left verifying → allow a fresh attempt
         }
 
         // "Copied" toast: hold ~1.1 s after a copy, then fade over ~0.35 s.
@@ -486,6 +505,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         gpu.feedDraw(&feed_path, @intCast(W), @intCast(H));
         gpu.swap(&g);
     }
+    return null; // window closed / Esc without signing up
 }
 
 /// Build the pure snapshot the view renders from the mutable state.
@@ -1077,4 +1097,42 @@ fn finalize(s: *State) void {
 fn reset(s: *State) void {
     if (s.has_pw) credential_shell.wipe(&s.cred);
     s.* = .{};
+}
+
+/// Mint the NEW `.zat4.com` account on the PDS (slice 3b-#1). The minted
+/// credential is the account password; the handle is `<username>.zat4.com`; the
+/// invite code comes from `ZAT_INVITE_CODE` (the PDS is invite-gated while
+/// bootstrapping). Returns the gpa-owned session on success, or null on a refusal
+/// / transport error (printed). Email path for now; the no-email / recovery-DID
+/// binding is a later sub-slice. A transient arena holds the request strings.
+fn createZatAccount(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, s: *State) ?auth.Session {
+    if (!s.has_pw) return null;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var hbuf: [128]u8 = undefined;
+    const uname = tfView(&s.username);
+    if (uname.len == 0) return null;
+    const handle = std.fmt.bufPrint(&hbuf, "{s}.zat4.com", .{uname}) catch return null;
+    const email: ?[]const u8 = if (s.use_email and s.email.len > 0) tfView(&s.email) else null;
+    const invite: ?[]const u8 = if (env) |e| e.get("ZAT_INVITE_CODE") else null;
+    const pds = config.fromEnv(env).pds_url;
+
+    const outcome = auth.createAccount(gpa, arena, io, env, pds, lexicon.CreateAccountInput{
+        .handle = handle,
+        .password = s.cred.bytes[0..s.cred.len],
+        .email = email,
+        .inviteCode = invite,
+    }) catch |err| {
+        std.debug.print("[enroll] createAccount error: {s}\n", .{@errorName(err)});
+        return null;
+    };
+    switch (outcome) {
+        .ok => |sess| return sess,
+        .refused => |f| {
+            std.debug.print("[enroll] createAccount refused: {d} {s}: {s}\n", .{ f.status, f.code, f.message });
+            return null;
+        },
+    }
 }
