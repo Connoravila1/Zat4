@@ -479,6 +479,9 @@ test {
     _ = @import("core/identity.zig");
     _ = @import("core/sigverify.zig");
     _ = @import("core/commit.zig");
+    _ = @import("core/jws.zig");
+    _ = @import("core/pkce.zig");
+    _ = @import("core/dpop.zig");
     _ = @import("core/dagcbor.zig");
     _ = @import("core/cid.zig");
     _ = @import("core/dagjson.zig");
