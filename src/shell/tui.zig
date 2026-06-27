@@ -55,6 +55,7 @@ const text_core = @import("../core/text.zig");
 const field_core = @import("../core/field.zig");
 const field_ui = @import("../core/field_ui.zig");
 const feed_view = @import("../core/feed_view.zig");
+const text_select = @import("../core/text_select.zig");
 const textedit = @import("../core/textedit.zig");
 const lens_socket = @import("../core/lens_socket.zig");
 const lens_catalog = @import("../core/lens_catalog.zig");
@@ -1073,6 +1074,7 @@ pub fn run(
                         const ry: i32 = if (g.gpu != null) @intFromFloat(@as(f32, @floatFromInt(pev.y)) / gpu_scale) else @intCast(pev.y);
                         switch (pev.kind) {
                             .wheel => {
+                                if (g.gpu) |gs| gs.menu_open = false; // scrolling dismisses the menu
                                 const delta: i32 = if (pev.button == 5) 3 else -3;
                                 g.view.scroll_rows += delta;
                                 // The premium feed scrolls in PIXELS. Wheel down
@@ -1109,7 +1111,44 @@ pub fn run(
                                     gsocket_ui.drag_x = rx;
                                     gsocket_ui.drag_y = ry;
                                 }
-                                g.view.hover = if (field_ui.hitTest(cx, cy, g.hr.slice())) |hit| hit.target else field_ui.no_target;
+                                const field_hit = field_ui.hitTest(cx, cy, g.hr.slice());
+                                g.view.hover = if (field_hit) |hit| hit.target else field_ui.no_target;
+                                // Pointer affordance: the hand cursor over anything
+                                // clickable, the arrow otherwise. The SAME hit-tests
+                                // the click path below consults — feed regions, the
+                                // lens socket, on the Algorithms page the reply/zone
+                                // sockets too, and the legacy cell rects — so the
+                                // cursor and the click always agree on what is tappable.
+                                const over_clickable =
+                                    feed_view.hitTest(g.regions.items, rx, ry) != null or
+                                    lens_socket.hitTest(g.socket_hits.items, rx, ry) != null or
+                                    (gscreen == feed_view.screen_loadout and
+                                        (lens_socket.hitTest(reply_hits.items, rx, ry) != null or
+                                            lens_socket.hitTest(zone_hits.items, rx, ry) != null)) or
+                                    field_hit != null;
+                                // A live text-selection drag over the rooted post:
+                                // extend the selection to the caret under the pointer.
+                                if (g.gpu) |gs| if (gs.sel_dragging) {
+                                    gs.sel_focus = text_select.caretAtPoint(gs.sel_glyphs.items, rx, ry);
+                                };
+                                // Cursor shape, by priority: grab while dragging a lens
+                                // card; the I-beam over the rooted post's selectable body
+                                // (or mid text-drag); the hand over anything else
+                                // clickable; the arrow otherwise.
+                                const dragging_card = page_drag_surface != null or gsocket_ui.drag_active != null;
+                                const over_focus_text = gscreen == feed_view.screen_thread and blk: {
+                                    const h = feed_view.hitTest(g.regions.items, rx, ry) orelse break :blk false;
+                                    break :blk h.kind == .post_body and h.post < view_items.len and view_items[h.post].is_focus;
+                                };
+                                const sel_dragging = if (g.gpu) |gs| gs.sel_dragging else false;
+                                window_shell.setCursor(win, if (dragging_card)
+                                    .grab
+                                else if (over_focus_text or sel_dragging)
+                                    .text
+                                else if (over_clickable)
+                                    .pointer
+                                else
+                                    .default);
                                 // GPU: the cursor lights the field (drawFieldGrid
                                 // halo) and leaves a gentle colourless wake.
                                 if (g.gpu) |gs| {
@@ -1123,7 +1162,17 @@ pub fn run(
                                     }
                                 }
                             },
-                            .button_down => if (pev.button == 1) {
+                            .button_down => {
+                                // Right-click → the context menu over the rooted
+                                // post body. Left-click while the menu is open hits
+                                // an item or dismisses it (never the feed beneath).
+                                if (pev.button == 3) {
+                                    if (g.gpu) |gs| openContextMenu(gs, gscreen, view_items, g.regions.items, rx, ry);
+                                } else if (pev.button == 1) {
+                                    if (g.gpu) |gs| if (gs.menu_open) {
+                                        menuClick(gpa, gs, backend, rx, ry);
+                                        continue;
+                                    };
                                 // Premium buttons are hit-tested against the
                                 // regions the feed emitted this frame. A like/
                                 // repost tap blooms the burst right at the icon:
@@ -1278,19 +1327,34 @@ pub fn run(
                                     // the same target — press-then-slide-off cancels.
                                     if (feed_view.hitTest(g.regions.items, rx, ry)) |hit| {
                                         gsocket_ui.picking = null; // a click off the socket closes the picker
-                                        armed_kind = hit.kind;
-                                        armed_post = hit.post;
+                                        // The ROOTED post's body is selectable, not a
+                                        // re-root target: a press there places the caret
+                                        // and begins a text selection (web-style — a
+                                        // release without a drag clears it). Don't arm a tap.
+                                        const is_focus_body = gscreen == feed_view.screen_thread and hit.kind == .post_body and
+                                            hit.post < view_items.len and view_items[hit.post].is_focus;
+                                        if (is_focus_body) {
+                                            if (g.gpu) |gs| selectPress(gs, rx, ry, &last_click_ns, &last_click_x, &last_click_y, &click_count, clock_shell.monotonicNanos());
+                                        } else {
+                                            armed_kind = hit.kind;
+                                            armed_post = hit.post;
+                                        }
                                     } else if (field_ui.hitTest(cx, cy, g.hr.slice())) |_| {
                                         armed_legacy = true;
                                         armed_cx = cx;
                                         armed_cy = cy;
                                     }
                                 }
+                                }
                             },
                             // Release-activation: the armed tap fires here (see the
                             // button_down arm). Placed after the drag-drop handling so
                             // a drag never also triggers a tap.
                             .button_up => if (pev.button == 1) {
+                                // End a text-selection drag (the selection itself
+                                // persists until the next press; a no-drag press left
+                                // anchor==focus, i.e. an empty selection = cleared).
+                                if (g.gpu) |gs| gs.sel_dragging = false;
                                 // Finish any drag with a drop first (the press began it).
                                 if (gscreen == feed_view.screen_loadout) {
                                     if (page_drag_surface) |s| switch (s) {
@@ -1427,7 +1491,15 @@ pub fn run(
                                                 // you at the top to scroll back down.
                                                 thread_rerooted = was_in_thread;
                                                 g.scroll.* = 0;
-                                                if (g.gpu) |gs| gs.scroll_to_focus = true;
+                                                if (g.gpu) |gs| {
+                                                    gs.scroll_to_focus = true;
+                                                    // The rooted post (and so the
+                                                    // selectable body) changed — drop any
+                                                    // stale selection.
+                                                    gs.sel_anchor = 0;
+                                                    gs.sel_focus = 0;
+                                                    gs.sel_dragging = false;
+                                                }
                                             }
                                         },
                                         // Back (thread top bar) → the prior screen.
@@ -1535,11 +1607,19 @@ pub fn run(
                                     caret_anchor_ns = now_ns;
                                 }
                             },
-                            .move => if (compose_drag) {
-                                // Drag extends the selection to the pointer.
-                                const off = feed_view.composeCaretAtPoint(g.engine, @intCast(design_w), textedit.view(&compose), rx, ry);
-                                textedit.extendTo(&compose, off);
-                                caret_anchor_ns = clock_shell.monotonicNanos();
+                            .move => {
+                                // Affordance: the hand over the composer's footer
+                                // buttons (the only regions it emits), the I-beam over
+                                // the editable text area otherwise — so a tap into the
+                                // composer doesn't leave the hand from the button that
+                                // opened it, and editable text reads as selectable.
+                                window_shell.setCursor(win, if (feed_view.hitTest(g.regions.items, rx, ry) != null) .pointer else .text);
+                                if (compose_drag) {
+                                    // Drag extends the selection to the pointer.
+                                    const off = feed_view.composeCaretAtPoint(g.engine, @intCast(design_w), textedit.view(&compose), rx, ry);
+                                    textedit.extendTo(&compose, off);
+                                    caret_anchor_ns = clock_shell.monotonicNanos();
+                                }
                             },
                             .button_up => if (pev.button == 1) {
                                 compose_drag = false;
@@ -1586,6 +1666,29 @@ pub fn run(
                 try handleProfileInput(gpa, arena, io, environ, session, out, backend, &prev, &next, &status, &status_buf, &mode, &profile_info, decoded.event, now);
                 continue;
             }
+
+            // Timeline: Escape dismisses an open context menu; Ctrl+C copies the
+            // rooted post's text selection. Both need the shell (menu state /
+            // clipboard). Ctrl+C only CONSUMES the key when a selection exists, so
+            // with none it still falls through to its normal handling.
+            if (mode == .timeline) if (pix) |g| if (g.gpu) |gs| {
+                if (decoded.event == .escape and gs.menu_open) {
+                    gs.menu_open = false;
+                    continue;
+                }
+                const ch: ?u21 = switch (decoded.event) {
+                    .char => |c| c,
+                    else => null,
+                };
+                if (ch == 3) {
+                    const r = text_select.range(gs.sel_glyphs.items.len, gs.sel_anchor, gs.sel_focus);
+                    if (r.hi > r.lo) {
+                        copySelection(gpa, gs, backend);
+                        status = "Copied";
+                        continue;
+                    }
+                }
+            };
 
             if (mode == .compose) {
                 // Copy (Ctrl+C) / Cut (Ctrl+X) on a selection — handled here
@@ -2532,6 +2635,25 @@ const GpuState = struct {
     /// Eased hover opacity (0→1) so the highlight FADES in/out instead of
     /// snapping — the "hover animation" feel.
     hover_alpha: f32 = 0,
+    /// Read-only text selection of the ROOTED post's body (thread screen). `sel`
+    /// is its own overlay vert buffer (the highlight rects, drawn BEHIND the feed
+    /// text like the hover wash); `sel_glyphs` is the rooted body's glyph geometry
+    /// captured on each feed rebuild (feed_view.SelGlyphs — the one selectable
+    /// post, ZONES inv. 4). `sel_anchor`/`sel_focus` are caret indices into it
+    /// (0..len), equal = no selection; `sel_dragging` while the button is held.
+    sel: gpu.Feed,
+    sel_glyphs: feed_view.SelGlyphs = .empty,
+    sel_anchor: u32 = 0,
+    sel_focus: u32 = 0,
+    sel_dragging: bool = false,
+    /// The right-click context menu (Copy / Select all) over the rooted post.
+    /// `menu` is its own overlay vert buffer (drawn last, on top of everything);
+    /// `menu_x`/`menu_y` are its top-left in logical pixels. Closed by an item
+    /// click, a click outside, Escape, or a scroll.
+    menu: gpu.Feed,
+    menu_open: bool = false,
+    menu_x: i32 = 0,
+    menu_y: i32 = 0,
     /// A like's red dye REVEALED gradually (synced to the spark animation) rather
     /// than blipping in: while frames>0, advanceField injects a fraction of the
     /// dye ring at (cx,cy) each step. Defaults so they ride the struct literal.
@@ -2541,6 +2663,9 @@ const GpuState = struct {
     /// The animated like-heart pass (SDF fill + pop + star burst), drawn over
     /// the feed for each active like effect this frame.
     heart: gpu.HeartRenderer,
+    /// The SDF-icon pass (the heart's technique generalised) — crisp engagement /
+    /// nav icons, one draw call each, replacing the aliased line-art.
+    icon: gpu.IconRenderer,
     bias: []f32,
     splashes: std.ArrayList(glyph_field.Splash),
     cols: u32,
@@ -2609,9 +2734,14 @@ fn initGpuState(gpa: Allocator, engine: *text_core.Engine, win: *window_shell.Wi
     errdefer gpu.feedDeinit(&feed, gpa);
     var hover = try gpu.initFeed(gpa);
     errdefer gpu.feedDeinit(&hover, gpa);
+    var sel = try gpu.initFeed(gpa);
+    errdefer gpu.feedDeinit(&sel, gpa);
+    var menu = try gpu.initFeed(gpa);
+    errdefer gpu.feedDeinit(&menu, gpa);
     const ramp = try gpu.initFieldRenderer(gpa, engine, field_cell_w, field_cell_h);
     const grid = try gpu.initFieldGrid();
     const heart = try gpu.initHeartRenderer();
+    const icon_r = try gpu.initIconRenderer();
 
     const cols: u32 = @max(8, w / field_cell_w);
     const rows: u32 = @max(8, h / field_cell_h);
@@ -2628,7 +2758,10 @@ fn initGpuState(gpa: Allocator, engine: *text_core.Engine, win: *window_shell.Wi
         .ramp = ramp,
         .feed = feed,
         .hover = hover,
+        .sel = sel,
+        .menu = menu,
         .heart = heart,
+        .icon = icon_r,
         .bias = bias,
         .splashes = .empty,
         .cols = cols,
@@ -2681,6 +2814,9 @@ fn deinitGpuState(gpa: Allocator, gs: *GpuState) void {
     glyph_field.deinit(gpa, &gs.field);
     gpu.feedDeinit(&gs.feed, gpa);
     gpu.feedDeinit(&gs.hover, gpa);
+    gpu.feedDeinit(&gs.sel, gpa);
+    gpu.feedDeinit(&gs.menu, gpa);
+    gs.sel_glyphs.deinit(gpa);
     gpu.deinit(&gs.g);
 }
 
@@ -2708,7 +2844,7 @@ fn resizeGpuField(gpa: Allocator, gs: *GpuState, w: u32, h: u32) !void {
 /// This is the heart-burst as energy injected into the field (design §1). A
 /// queue-full append is dropped silently (E4: a missed effect must never break
 /// the action). Mirrors the preview's recipe + the spec's tuning.
-fn pushLikeSplash(gpa: Allocator, gs: *GpuState, gx: u32, gy: u32) void {
+fn pushLikeSplash(gpa: Allocator, gs: *GpuState, gx: u32, gy: u32, with_dye: bool) void {
     if (gs.cols == 0 or gs.rows == 0) return;
     const sx = @min(gx, gs.cols - 1);
     const sy = @min(gy, gs.rows - 1);
@@ -2730,10 +2866,14 @@ fn pushLikeSplash(gpa: Allocator, gs: *GpuState, gx: u32, gy: u32) void {
             gs.splashes.append(gpa, .{ .x = @intCast(rx), .y = @intCast(ry), .radius = 3, .amp = amp, .dye = 0 }) catch {};
         }
     }
-    // Arm the gradual dye reveal at the like centre.
-    gs.dye_reveal_cx = sx;
-    gs.dye_reveal_cy = sy;
-    gs.dye_reveal_frames = dye_reveal_frames_total;
+    // Arm the gradual dye reveal at the centre — but ONLY for a like. The red
+    // dye is the heart's alone (repost gets the colourless ripple above, no
+    // stain; a boost-green dye is future per-effect work, GLYPH_FIELD spec).
+    if (with_dye) {
+        gs.dye_reveal_cx = sx;
+        gs.dye_reveal_cy = sy;
+        gs.dye_reveal_frames = dye_reveal_frames_total;
+    }
 }
 
 /// THE single source of truth for the glyph cell size for the CELL-PATH
@@ -2888,7 +3028,7 @@ fn paintFrame(
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
                 g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits) catch g.content_h.*;
             } else {
-                g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, null) catch g.content_h.*;
+                g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, null, null) catch g.content_h.*;
             }
             const t_layout = if (debug_frame_timing) clock_shell.monotonicNanos() else 0;
             window_shell.presentDrawList(win, gpa, g.engine, g.draw.slice(), field_core.background) catch {}; // E2: a lost blit is the next frame's problem
@@ -2920,7 +3060,6 @@ fn paintFrame(
 /// How many sim steps the like's red dye fades in over — ~0.3s at 60 Hz, timed
 /// to land with the heart's spark burst.
 const dye_reveal_frames_total: u32 = 18;
-
 /// Inject one increment (`frac` of the full charge) of a like's dye ring —
 /// centre + two concentric rings — as DYE-ONLY splashes (amp 0), so the red
 /// FADES in across the splat instead of blipping. Mirrors pushLikeSplash's
@@ -2951,17 +3090,57 @@ fn advanceField(gpa: Allocator, gs: *GpuState, active: *effect_core.ActiveList) 
     // Fill the time-driven ambient bias (shell side → the core stays pure, B3):
     // a slow drifting two-sine swell plus a finer term so the dense interior is
     // an ASSORTMENT of glyphs, not a wall of one symbol.
-    var yy: u32 = 0;
-    while (yy < gs.rows) : (yy += 1) {
-        const fy: f32 = @floatFromInt(yy);
+    //
+    // Both terms are SEPARABLE products — sin(of x,t)·sin(of y,t) — so the value
+    // factors into a per-COLUMN part and a per-ROW part. Precompute those 1D
+    // tables once (≈2·(cols+rows) sins) and the inner loop is pure multiplies,
+    // instead of 4 sins PER CELL (≈4·cols·rows). The arithmetic is the same
+    // operands in the same order, so `bias` is bit-identical to the naive form;
+    // this is a cost change only. Falls back to per-cell sins if the grid ever
+    // exceeds the table cap (no realistic monitor does at a 13×17 px cell).
+    const amb_cap = 2048;
+    if (gs.cols <= amb_cap and gs.rows <= amb_cap) {
+        var ax: [amb_cap]f32 = undefined; // base x-factor:  sin(fx·s + t·d)
+        var cx: [amb_cap]f32 = undefined; // fine x-factor:  sin(fx·0.21 − t·0.07)
+        var by: [amb_cap]f32 = undefined; // base y-factor:  sin(fy·s·1.3 − t·d·0.8)
+        var dy: [amb_cap]f32 = undefined; // fine y-factor:  sin(fy·0.18 + t·0.06)
         var xx: u32 = 0;
         while (xx < gs.cols) : (xx += 1) {
             const fx: f32 = @floatFromInt(xx);
-            const base = std.math.sin(fx * amb_scale + gs.t * amb_drift) *
-                std.math.sin(fy * amb_scale * 1.3 - gs.t * amb_drift * 0.8);
-            const fine = std.math.sin(fx * 0.21 - gs.t * 0.07) *
-                std.math.sin(fy * 0.18 + gs.t * 0.06);
-            gs.bias[yy * gs.cols + xx] = amb_amp * (base + 0.5 * fine);
+            ax[xx] = std.math.sin(fx * amb_scale + gs.t * amb_drift);
+            cx[xx] = std.math.sin(fx * 0.21 - gs.t * 0.07);
+        }
+        var yy: u32 = 0;
+        while (yy < gs.rows) : (yy += 1) {
+            const fy: f32 = @floatFromInt(yy);
+            by[yy] = std.math.sin(fy * amb_scale * 1.3 - gs.t * amb_drift * 0.8);
+            dy[yy] = std.math.sin(fy * 0.18 + gs.t * 0.06);
+        }
+        yy = 0;
+        while (yy < gs.rows) : (yy += 1) {
+            const row = yy * gs.cols;
+            const byy = by[yy];
+            const dyy = dy[yy];
+            xx = 0;
+            while (xx < gs.cols) : (xx += 1) {
+                const base = ax[xx] * byy;
+                const fine = cx[xx] * dyy;
+                gs.bias[row + xx] = amb_amp * (base + 0.5 * fine);
+            }
+        }
+    } else {
+        var yy: u32 = 0;
+        while (yy < gs.rows) : (yy += 1) {
+            const fy: f32 = @floatFromInt(yy);
+            var xx: u32 = 0;
+            while (xx < gs.cols) : (xx += 1) {
+                const fx: f32 = @floatFromInt(xx);
+                const base = std.math.sin(fx * amb_scale + gs.t * amb_drift) *
+                    std.math.sin(fy * amb_scale * 1.3 - gs.t * amb_drift * 0.8);
+                const fine = std.math.sin(fx * 0.21 - gs.t * 0.07) *
+                    std.math.sin(fy * 0.18 + gs.t * 0.06);
+                gs.bias[yy * gs.cols + xx] = amb_amp * (base + 0.5 * fine);
+            }
         }
     }
     // A like's red DYE is revealed gradually (synced to the spark animation)
@@ -3146,7 +3325,7 @@ fn paintFrameGpu(
             // skip_heart=true on every screen: the SDF heart pass (drawEngagementHearts,
             // below) draws the heart in place for each visible like button of the
             // ACTIVE view, so layout never draws its own — one heart, one pipeline.
-            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, &chain_info) catch g.content_h.*;
+            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, &chain_info, &gs.sel_glyphs) catch g.content_h.*;
         }
         gpu.feedBuild(&gs.feed, gpa, g.engine, g.draw.slice(), scale) catch {};
 
@@ -3187,15 +3366,24 @@ fn paintFrameGpu(
     // The feed verts persist across frames (rebuilt above only when the feed
     // changed); just draw them.
     gpu.feedDraw(&gs.feed, @intCast(w), @intCast(h));
+    // The rooted post's read-only text selection — a translucent band drawn ON TOP
+    // of the feed text (a highlighter, not an occluder). It must sit above the
+    // post's glass fill, so it draws AFTER the feed, not behind it (behind, the
+    // glass swallowed it — the "selection does nothing" report).
+    drawSelectionOverlay(gpa, g, gs, scale, @intCast(w), @intCast(h));
     // The socket hover highlight rides ON TOP of the feed (its panels are
     // opaque, so it can't sit behind like the post wash does).
     drawSocketHoverTop(gpa, g, gs, scale, @intCast(w), @intCast(h));
     // The engagement hearts: one SDF heart per visible like button, drawn IN
     // PLACE (feed_view skips its own), so a like fills + pops the ACTUAL heart.
     drawEngagementHearts(g, gs, items, @intCast(w), @intCast(h));
+    // The SDF icons (repost, gear) — crisp, drawn in place of the line-art.
+    drawSdfIcons(g, gs, items, @intCast(w), @intCast(h));
     // The sticky CHAIN header: pins while scrolling the chain, catches up on
     // scroll-down, pushed out at the chain's end. Drawn LAST (on top), per-frame.
     drawChainSticky(gpa, g, gs, scale, @intCast(w), @intCast(h));
+    // The right-click context menu sits ABOVE everything else.
+    drawContextMenu(gpa, g, gs, scale, @intCast(w), @intCast(h));
     gpu.swap(&gs.g);
 }
 
@@ -3316,6 +3504,199 @@ fn drawHoverOverlay(gpa: Allocator, g: Grid, gs: *GpuState, scale: f32, vw: i32,
     gpu.feedDraw(&gs.hover, vw, vh);
 }
 
+/// A press on the rooted post's body: place the caret + begin a drag (single
+/// click), or select the word (double) / line (triple) under it — the standard
+/// text affordances, counted by the same time+proximity rule the composer uses.
+fn selectPress(gs: *GpuState, rx: i32, ry: i32, last_ns: *u64, last_x: *i32, last_y: *i32, count: *u8, now_ns: u64) void {
+    const near = @abs(rx - last_x.*) <= 3 and @abs(ry - last_y.*) <= 3;
+    count.* = if (now_ns -| last_ns.* < 400_000_000 and near) count.* + 1 else 1;
+    last_ns.* = now_ns;
+    last_x.* = rx;
+    last_y.* = ry;
+    const caret = text_select.caretAtPoint(gs.sel_glyphs.items, rx, ry);
+    switch (@min(count.*, @as(u8, 3))) {
+        1 => {
+            gs.sel_anchor = caret;
+            gs.sel_focus = caret;
+            gs.sel_dragging = true; // single click → drag-extend
+        },
+        2 => {
+            const s = text_select.wordAt(gs.sel_glyphs.items, caret);
+            gs.sel_anchor = s.lo;
+            gs.sel_focus = s.hi;
+            gs.sel_dragging = false;
+        },
+        else => {
+            // Triple click → the WHOLE post. A wrapped "line" is just a layout
+            // break here, not a meaningful unit, so word → post is the ladder.
+            gs.sel_anchor = 0;
+            gs.sel_focus = @intCast(gs.sel_glyphs.items.len);
+            gs.sel_dragging = false;
+        },
+    }
+}
+
+// The right-click context menu over a rooted post's selectable text.
+const menu_w: i32 = 184;
+const menu_row_h: i32 = 30;
+const menu_pad_y: i32 = 6;
+const menu_items = [_][]const u8{ "Copy", "Select all" };
+
+fn clampI16(v: i32) i16 {
+    return @intCast(std.math.clamp(v, -32768, 32767));
+}
+fn clampU16(v: i32) u16 {
+    return @intCast(std.math.clamp(v, 0, 65535));
+}
+
+/// Right-click on the rooted post body opens the menu at the cursor. With no
+/// selection yet, it first selects the word under the cursor so Copy has a
+/// target (browser behaviour). A miss (not the rooted body) does nothing.
+fn openContextMenu(gs: *GpuState, screen: u8, view_items: []const feed_core.TimelineItem, regions: []const feed_view.Region, rx: i32, ry: i32) void {
+    if (screen != feed_view.screen_thread) return;
+    const hit = feed_view.hitTest(regions, rx, ry) orelse return;
+    if (hit.kind != .post_body or hit.post >= view_items.len or !view_items[hit.post].is_focus) return;
+    const r = text_select.range(gs.sel_glyphs.items.len, gs.sel_anchor, gs.sel_focus);
+    if (r.hi <= r.lo) {
+        const caret = text_select.caretAtPoint(gs.sel_glyphs.items, rx, ry);
+        const w = text_select.wordAt(gs.sel_glyphs.items, caret);
+        gs.sel_anchor = w.lo;
+        gs.sel_focus = w.hi;
+    }
+    gs.menu_open = true;
+    gs.menu_x = std.math.clamp(rx, 0, @as(i32, @intCast(design_w)) - menu_w);
+    gs.menu_y = @max(0, ry);
+}
+
+/// The menu item (0=Copy, 1=Select all) under the pointer, or null.
+fn menuItemAt(gs: *const GpuState, rx: i32, ry: i32) ?u8 {
+    if (rx < gs.menu_x or rx >= gs.menu_x + menu_w) return null;
+    var i: u8 = 0;
+    while (i < menu_items.len) : (i += 1) {
+        const iy = gs.menu_y + menu_pad_y + @as(i32, i) * menu_row_h;
+        if (ry >= iy and ry < iy + menu_row_h) return i;
+    }
+    return null;
+}
+
+/// A click while the menu is open: run the item under the pointer (or just close
+/// on a click outside). Always closes the menu.
+fn menuClick(gpa: Allocator, gs: *GpuState, backend: Backend, rx: i32, ry: i32) void {
+    defer gs.menu_open = false;
+    const item = menuItemAt(gs, rx, ry) orelse return;
+    switch (item) {
+        0 => copySelection(gpa, gs, backend),
+        1 => {
+            gs.sel_anchor = 0;
+            gs.sel_focus = @intCast(gs.sel_glyphs.items.len);
+        },
+        else => {},
+    }
+}
+
+/// Copy the current selection to the clipboard (no-op if empty). Shared by the
+/// menu's Copy and the Ctrl+C key path.
+fn copySelection(gpa: Allocator, gs: *GpuState, backend: Backend) void {
+    const r = text_select.range(gs.sel_glyphs.items.len, gs.sel_anchor, gs.sel_focus);
+    if (r.hi <= r.lo) return;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    text_select.copyInto(gpa, &buf, gs.sel_glyphs.items, gs.sel_anchor, gs.sel_focus) catch return;
+    if (buf.items.len == 0) return;
+    switch (backend) {
+        .window => |w| window_shell.setClipboard(w, buf.items),
+        .terminal => {},
+    }
+}
+
+/// Append a UTF-8 run as proportional glyph items (the shell's own little text
+/// emitter for the menu — feed_view owns the feed's text; this is just chrome).
+fn menuText(dl: *raster_core.DrawList, gpa: Allocator, engine: *const text_core.Engine, x: i32, baseline: i32, color: u32, px: u16, s: []const u8) void {
+    var pen = x;
+    var it = (std.unicode.Utf8View.init(s) catch return).iterator();
+    while (it.nextCodepoint()) |cp| {
+        dl.append(gpa, .{ .text = .{ .x = clampI16(pen), .baseline = clampI16(baseline), .codepoint = cp, .color = color, .px = px, .weight = 0 } }) catch return;
+        pen += @intCast(text_core.advance(engine, .regular, cp, px));
+    }
+}
+
+/// Draw the context menu on top of everything: a rounded slab, a row hover
+/// highlight, and the item labels (Copy dim when there's nothing selected).
+fn drawContextMenu(gpa: Allocator, g: Grid, gs: *GpuState, scale: f32, vw: i32, vh: i32) void {
+    if (!gs.menu_open) return;
+    const x = gs.menu_x;
+    const y = gs.menu_y;
+    const h: i32 = menu_pad_y * 2 + menu_row_h * @as(i32, menu_items.len);
+    var dl: raster_core.DrawList = .{};
+    defer dl.deinit(gpa);
+    dl.append(gpa, .{ .rect = .{ .x = clampI16(x), .y = clampI16(y), .w = clampU16(menu_w), .h = clampU16(h), .color = 0xF21C1E26, .radius = 10 } }) catch {};
+    const has_sel = blk: {
+        const r = text_select.range(gs.sel_glyphs.items.len, gs.sel_anchor, gs.sel_focus);
+        break :blk r.hi > r.lo;
+    };
+    for (menu_items, 0..) |label, i| {
+        const iy = y + menu_pad_y + @as(i32, @intCast(i)) * menu_row_h;
+        const hovered = g.hover_x >= x and g.hover_x < x + menu_w and g.hover_y >= iy and g.hover_y < iy + menu_row_h;
+        if (hovered) dl.append(gpa, .{ .rect = .{ .x = clampI16(x + 4), .y = clampI16(iy + 2), .w = clampU16(menu_w - 8), .h = clampU16(menu_row_h - 4), .color = 0x24FFFFFF, .radius = 6 } }) catch {};
+        const dim = i == 0 and !has_sel; // Copy is dim with no selection
+        const color: u32 = if (dim) 0x66E8EAED else 0xFFE8EAED;
+        menuText(&dl, gpa, g.engine, x + 14, iy + 20, color, 15, label);
+    }
+    gpu.feedBuild(&gs.menu, gpa, g.engine, dl.slice(), scale) catch return;
+    gpu.feedDraw(&gs.menu, vw, vh);
+}
+
+/// The rooted post's read-only text selection: one translucent accent band per
+/// selected line, drawn BEHIND the feed text (the glyphs land on top, so it
+/// reads as a highlight). The bands come from the pure `text_select` core over
+/// the body glyphs captured this rebuild; the indices are clamped there, so a
+/// just-shrunk glyph run can't read out of bounds. Thread screen only.
+fn drawSelectionOverlay(gpa: Allocator, g: Grid, gs: *GpuState, scale: f32, vw: i32, vh: i32) void {
+    if (g.screen.* != feed_view.screen_thread) return;
+    const r = text_select.range(gs.sel_glyphs.items.len, gs.sel_anchor, gs.sel_focus);
+    if (r.hi <= r.lo) return;
+    var rects: std.ArrayListUnmanaged(text_select.Rect) = .empty;
+    defer rects.deinit(gpa);
+    // Body text is 16px: ~14px above the baseline, ~4px below, covers the band.
+    text_select.highlightRects(gpa, &rects, gs.sel_glyphs.items, gs.sel_anchor, gs.sel_focus, 14, 4) catch return;
+    if (rects.items.len == 0) return;
+    var hd: raster_core.DrawList = .{};
+    defer hd.deinit(gpa);
+    const accent = g.accent & 0x00FFFFFF;
+    // One CONTINUOUS selection: each wrapped line's band is extended down to the
+    // next line's top so they abut (no gaps, no per-line pills), with only a
+    // gentle uniform softening. A whole-selection breath on the fill keeps a bit
+    // of life without the busy per-line glow that read as disjointed blobs.
+    const pulse: f32 = 0.5 + 0.5 * @sin(gs.t * 1.8);
+    const fill_a: u32 = @intFromFloat(@as(f32, 0x44) + pulse * @as(f32, 0x12)); // ~68..86
+    for (rects.items, 0..) |rc, i| {
+        // Abut: a non-last line fills the leading down to the next line's top.
+        const h: i32 = if (i + 1 < rects.items.len) rects.items[i + 1].y - rc.y else rc.h;
+        hd.append(gpa, .{ .rect = .{
+            .x = clampI16(rc.x),
+            .y = clampI16(rc.y),
+            .w = clampU16(rc.w),
+            .h = clampU16(h),
+            .color = (fill_a << 24) | accent,
+            .radius = 2,
+        } }) catch {};
+    }
+    // Bracket beams: a crisp bright accent bar at the selection's exact start and
+    // end (the | | the owner pictured) — drawn ON TOP of the fill so they read as
+    // clean range markers. They sit at the first/last glyphs' edges and span the
+    // text line height (not the abutted leading).
+    if (rects.items.len > 0) {
+        const first = rects.items[0];
+        const last = rects.items[rects.items.len - 1];
+        const beam: u32 = (@as(u32, 0xCC) << 24) | accent;
+        hd.append(gpa, .{ .rect = .{ .x = clampI16(first.x - 1), .y = clampI16(first.y), .w = 2, .h = clampU16(first.h), .color = beam, .radius = 1 } }) catch {};
+        hd.append(gpa, .{ .rect = .{ .x = clampI16(last.x + last.w - 1), .y = clampI16(last.y), .w = 2, .h = clampU16(last.h), .color = beam, .radius = 1 } }) catch {};
+    }
+    if (hd.len == 0) return;
+    gpu.feedBuild(&gs.sel, gpa, g.engine, hd.slice(), scale) catch return;
+    gpu.feedDraw(&gs.sel, vw, vh);
+}
+
 /// The socket half of the hover highlight, drawn AFTER the feed (on top): the
 /// socket panels are opaque, so its wash/button can't go behind the feed like
 /// the post highlight does. Reuses the eased `gs.hover_alpha` set this frame by
@@ -3352,6 +3733,74 @@ fn drawSocketHoverTop(gpa: Allocator, g: Grid, gs: *GpuState, scale: f32, vw: i3
 /// live for that post it ANIMATES (bottom-up fill + scale pop + star burst) from
 /// the pure, tested `effect.heartVisual`. This is the ONE heart on the GPU path
 /// (feed_view skips its own), so the fill happens IN PLACE. No allocation.
+/// The SDF-icon pass: crisp engagement / nav icons drawn in place (feed_view
+/// skips the line-art for these on the GPU path). Prototype set — the repost
+/// (per .repost region, green when the viewer reposted) and the gear (the
+/// Settings rail slot). Positions mirror feed_view's icon offsets; the full
+/// rollout will have feed_view emit exact placements.
+fn drawSdfIcons(g: Grid, gs: *GpuState, items: []const feed_core.TimelineItem, vw: i32, vh: i32) void {
+    const scale = gs.scale;
+    const header_bottom: i32 = if (g.screen.* == feed_view.screen_home)
+        feed_view.homeSocketBottom(g.socket_tray, g.socket_ui)
+    else
+        feed_view.headerBottom(g.screen.*);
+    const grey: u32 = 0xFFB4B1A8; // feed_view.icon_grey (soft white)
+    const muted: u32 = 0xFF9A968A; // feed_view.muted (inactive nav)
+    const green: u32 = 0xFF8FD18F; // feed_view.boost_c (reposted)
+    const eng: f32 = 9.5 * scale; // engagement icon half-extent
+    const nav: f32 = 11.0 * scale; // rail icon half-extent (line-art was 22 box)
+    // Engagement icons scroll under the sticky header; clip them there.
+    const clipped = struct {
+        fn f(r: feed_view.Region, hb: i32) bool {
+            return @as(i32, r.y) + @divTrunc(@as(i32, r.h), 2) < hb;
+        }
+    }.f;
+    for (g.regions.items) |r| {
+        const cy = (@as(f32, @floatFromInt(r.y)) + @as(f32, @floatFromInt(r.h)) * 0.5) * scale;
+        switch (r.kind) {
+            // LEFT engagement group — the icon sits at region.x + is/2 (8.5).
+            .reply => {
+                if (clipped(r, header_bottom)) continue;
+                gpu.drawIcon(&gs.icon, gpu.icon_reply, (@as(f32, @floatFromInt(r.x)) + 8.5) * scale, cy, eng, grey, vw, vh);
+            },
+            .repost => {
+                if (clipped(r, header_bottom) or r.post >= items.len) continue;
+                const col = if (items[r.post].item_flags.viewer_reposted) green else grey;
+                gpu.drawIcon(&gs.icon, gpu.icon_repost, (@as(f32, @floatFromInt(r.x)) + 8.5) * scale, cy, eng, col, vw, vh);
+            },
+            // RIGHT engagement group — the icon centres in its (narrower) region.
+            .bookmark, .share, .more => {
+                if (clipped(r, header_bottom)) continue;
+                const cx = (@as(f32, @floatFromInt(r.x)) + @as(f32, @floatFromInt(r.w)) * 0.5) * scale;
+                const id: i32 = switch (r.kind) {
+                    .bookmark => gpu.icon_bookmark,
+                    .share => gpu.icon_share,
+                    else => gpu.icon_more,
+                };
+                gpu.drawIcon(&gs.icon, id, cx, cy, eng, grey, vw, vh);
+            },
+            // The nav rail (mirrors drawRail's icon at region.x+10, size 22 →
+            // centre +21 / +19). Skipped on the loadout page, which keeps line-art.
+            .nav => if (g.screen.* != feed_view.screen_loadout) {
+                const id: i32 = switch (r.post) {
+                    0 => gpu.icon_home,
+                    1 => gpu.icon_search,
+                    2 => gpu.icon_heart, // Activity
+                    3 => gpu.icon_reply, // Messages
+                    4 => gpu.icon_sliders, // Algorithms
+                    5 => gpu.icon_gear, // Settings
+                    else => continue, // the "you" card (post 7) is an avatar, not an icon
+                };
+                const cx = (@as(f32, @floatFromInt(r.x)) + 21.0) * scale;
+                const ncy = (@as(f32, @floatFromInt(r.y)) + 19.0) * scale;
+                const col: u32 = if (@as(u16, g.screen.*) == r.post) g.accent else muted;
+                gpu.drawIcon(&gs.icon, id, cx, ncy, nav, col, vw, vh);
+            },
+            else => {},
+        }
+    }
+}
+
 fn drawEngagementHearts(g: Grid, gs: *GpuState, items: []const feed_core.TimelineItem, vw: i32, vh: i32) void {
     const scale = gs.scale;
     const s = g.active.slice();
@@ -3379,9 +3828,9 @@ fn drawEngagementHearts(g: Grid, gs: *GpuState, items: []const feed_core.Timelin
         // Heart centre: the region starts at the heart's left edge; the icon box
         // is 16 logical wide, so the heart centres 8 in. Vertical centre of the
         // region row. [TUNE] 8 = is/2; size 9 = half the icon box.
-        const cx: f32 = (@as(f32, @floatFromInt(r.x)) + 8.0) * scale;
+        const cx: f32 = (@as(f32, @floatFromInt(r.x)) + 8.5) * scale; // icon box is 17 wide
         const cy: f32 = (@as(f32, @floatFromInt(r.y)) + @as(f32, @floatFromInt(r.h)) * 0.5) * scale;
-        const size: f32 = 9.0 * scale;
+        const size: f32 = 11.0 * scale; // was 9 — the heart read small next to the line icons
         // Static fill from the liked state; overridden by the live animation if
         // a like effect for this post is playing (matched by its heart cell).
         var vis = effect_core.HeartVisual{ .fill = if (liked) 1.0 else 0.0, .scale = 1.0, .glow = 0.0, .burst = 0.0 };
@@ -3420,15 +3869,15 @@ fn fireEngageEffect(gpa: Allocator, g: Grid, kind: Engagement, target: u32, now_
             const hy: u16 = @intCast(@min(cell.y, std.math.maxInt(u16)));
             if (now_liked or kind == .repost) {
                 // Like / boost: splash the field, and (for a like) pop the heart.
-                // The pop/drain are drawn by the GPU heart pass in paintFrameGpu;
-                // triggering here lets advanceClocks tick them.
-                pushLikeSplash(gpa, gs, cell.x, cell.y);
+                // The RED dye is the like's alone — a repost gets only the
+                // colourless ripple (no dye stain).
+                pushLikeSplash(gpa, gs, cell.x, cell.y, now_liked and kind == .like);
                 if (now_liked and kind == .like) {
                     effect_core.trigger(gpa, g.active, &effect_core.like_heart, hx, hy, 1.0) catch {};
                 }
             } else if (kind == .like) {
                 // Unlike: DRAIN the heart back to hollow (no field splash — the
-                // red dye is permanent ink in the medium by design).
+                // dye is permanent ink in the medium by design).
                 effect_core.trigger(gpa, g.active, &effect_core.unlike_heart, hx, hy, 1.0) catch {};
             }
         }

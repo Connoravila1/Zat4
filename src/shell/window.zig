@@ -32,6 +32,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const linux = std.os.linux;
 const x11 = @import("../core/x11.zig");
+const xcursor = @import("../core/xcursor.zig");
 const layout = @import("../core/layout.zig");
 const raster = @import("../core/raster.zig");
 const text_core = @import("../core/text.zig");
@@ -102,13 +103,26 @@ pub const Window = struct {
     /// claims the CLIPBOARD selection and stores the text HERE; `pump` answers
     /// other apps' paste requests from it. The value lives only while the app
     /// runs (X selection semantics) — the realistic "paste into your password
-    /// manager now" window. gpa-free (inline buffer; ≥ the 71-char password +
-    /// the 79-char recovery key).
+    /// manager now" window. gpa-free (inline buffer). Sized at 1024 to also hold
+    /// a copied feed text selection (a full post body + multi-byte glyphs), not
+    /// just the 71-char password / 79-char recovery key; a longer selection is
+    /// truncated to this, which is fine for the in-app copy flow.
     clipboard_atom: u32,
     utf8_atom: u32,
     targets_atom: u32,
-    clip_buf: [128]u8,
+    clip_buf: [1024]u8,
     clip_len: usize,
+    /// The pointer shapes, built once from the server "cursor" glyph font at
+    /// open: the hand (over clickable), the I-beam (over selectable text), the
+    /// move/grab hand (while dragging). `setCursor` swaps the requested shape
+    /// onto the window — `.default` restores None (the inherited arrow).
+    /// `cursor_shape` latches the current shape so a motion flood costs one
+    /// request per CHANGE, not per event (B3: the swap is I/O; the WHICH-cursor
+    /// decision is made in the shell loop from the same hit-tests a click uses).
+    hand_cursor: u32,
+    text_cursor: u32,
+    grab_cursor: u32,
+    cursor_shape: layout.Cursor,
 };
 
 pub const PumpResult = struct {
@@ -220,7 +234,7 @@ fn loadCookie(gpa: Allocator, environ: ?*const std.process.Environ.Map, display_
         const home = env.get("HOME") orelse return cookie;
         break :blk std.fmt.bufPrint(&path_buf, "{s}/.Xauthority", .{home}) catch return cookie;
     };
-    const bytes = readSmallFile(gpa, path) orelse return cookie;
+    const bytes = readSmallFile(gpa, path, 64 * 1024) orelse return cookie;
     defer gpa.free(bytes);
 
     var at: usize = 0;
@@ -255,7 +269,7 @@ fn takeField(bytes: []const u8, at: *usize) ?[]const u8 {
     return field;
 }
 
-fn readSmallFile(gpa: Allocator, path: []const u8) ?[]u8 {
+fn readSmallFile(gpa: Allocator, path: []const u8, max_bytes: usize) ?[]u8 {
     var z: [512]u8 = undefined;
     if (path.len == 0 or path.len >= z.len) return null;
     @memcpy(z[0..path.len], path);
@@ -267,7 +281,7 @@ fn readSmallFile(gpa: Allocator, path: []const u8) ?[]u8 {
     defer _ = linux.close(fd);
     var out: std.ArrayList(u8) = .empty;
     var chunk: [4096]u8 = undefined;
-    while (out.items.len < 64 * 1024) {
+    while (out.items.len < max_bytes) {
         const n_rc = linux.read(fd, &chunk, chunk.len);
         const n: isize = @bitCast(n_rc);
         if (n < 0) {
@@ -306,11 +320,14 @@ pub fn open(
     var digits = display[std.mem.indexOfScalar(u8, display, ':').? + 1 ..];
     if (std.mem.indexOfScalar(u8, digits, '.')) |dot| digits = digits[0..dot];
     const cookie = loadCookie(gpa, environ, digits);
-    return openAt(gpa, path, cookie.name(), cookie.data(), title, cols, rows);
+    return openAt(gpa, environ, path, cookie.name(), cookie.data(), title, cols, rows);
 }
 
 pub fn openAt(
     gpa: Allocator,
+    /// For the cursor-theme lookup (HOME, XCURSOR_*). Null skips themed cursors
+    /// — the font cursors stand in (the test path passes null).
+    environ: ?*const std.process.Environ.Map,
     socket_path: []const u8,
     auth_name: []const u8,
     auth_data: []const u8,
@@ -362,6 +379,20 @@ pub fn openAt(
 
     try writeAll(fd, x11.createGC(&req_buf, gc, wid));
 
+    // --- the pointer cursors: bind the "cursor" glyph font, build the shapes ---
+    // The window's default cursor is None (it inherits the root's arrow);
+    // setCursor swaps in the hand / I-beam / grab over the right targets.
+    // Best-effort: a server without the cursor font just leaves the writes inert
+    // and the arrow stays — no error path the caller must handle (E4).
+    const cursor_font = setup.resource_id_base | 3;
+    const hand_cursor = setup.resource_id_base | 4;
+    const text_cursor = setup.resource_id_base | 5;
+    const grab_cursor = setup.resource_id_base | 6;
+    try writeAll(fd, x11.openFont(&req_buf, cursor_font, "cursor"));
+    try writeAll(fd, x11.createGlyphCursor(&req_buf, hand_cursor, cursor_font, cursor_font, x11.cursor_hand, x11.cursor_hand + 1));
+    try writeAll(fd, x11.createGlyphCursor(&req_buf, text_cursor, cursor_font, cursor_font, x11.cursor_xterm, x11.cursor_xterm + 1));
+    try writeAll(fd, x11.createGlyphCursor(&req_buf, grab_cursor, cursor_font, cursor_font, x11.cursor_fleur, x11.cursor_fleur + 1));
+
     // --- the keyboard table, fetched once ---
     const key_count: u8 = setup.max_keycode - setup.min_keycode + 1;
     try writeAll(fd, x11.getKeyboardMapping(&req_buf, setup.min_keycode, key_count));
@@ -375,6 +406,14 @@ pub fn openAt(
     const keysyms = gpa.alloc(u32, extra_len / 4) catch return error.OutOfMemory;
     errdefer gpa.free(keysyms);
     _ = x11.keyboardMappingSyms(extra, keysyms);
+
+    // --- themed cursors (X Render): upgrade the font cursors to the system
+    // theme's properly-sized ARGB cursors when the server has RENDER and the
+    // theme is found. Runs BEFORE mapWindow so its three query REPLIES aren't
+    // interleaved with window events (the uploads are fire-and-forget). Any
+    // failure leaves `themed` null and the font cursors stand in (E4).
+    var themed: ThemedCursors = .{};
+    loadThemedCursors(gpa, fd, environ, setup, &req_buf, &themed);
 
     try writeAll(fd, x11.mapWindow(&req_buf, wid));
 
@@ -411,9 +450,210 @@ pub fn openAt(
         .targets_atom = targets_atom,
         .clip_buf = undefined,
         .clip_len = 0,
+        // Themed (system theme) cursors when they loaded; the font cursors
+        // otherwise — setCursor reads these ids without caring which won.
+        .hand_cursor = themed.hand orelse hand_cursor,
+        .text_cursor = themed.text orelse text_cursor,
+        .grab_cursor = themed.grab orelse grab_cursor,
+        .cursor_shape = .default,
     };
     raster.resize(gpa, &window.fb, width, height, layout.palette_bg) catch return error.OutOfMemory;
     return window;
+}
+
+// ---------------------------------------------------------------------------
+// Themed cursors — load the system cursor theme's ARGB cursors via X Render.
+// Pure protocol/parsing lives in core (x11.zig request builders, xcursor.zig
+// file parser); this is the I/O glue: theme-file discovery, the read, and the
+// upload request stream. Best-effort end to end — every failure is a quiet
+// fall-back to the font cursors (E4), never an error the caller must handle.
+// ---------------------------------------------------------------------------
+
+// A7.2: cold struct, size guard waived — one transient per window open.
+const ThemedCursors = struct { hand: ?u32 = null, text: ?u32 = null, grab: ?u32 = null };
+
+const hand_names = [_][]const u8{ "pointer", "hand2", "hand1", "hand" };
+const text_names = [_][]const u8{ "xterm", "text", "ibeam" };
+const grab_names = [_][]const u8{ "fleur", "move", "grabbing", "closedhand", "all-scroll" };
+
+fn loadThemedCursors(
+    gpa: Allocator,
+    fd: i32,
+    environ: ?*const std.process.Environ.Map,
+    setup: x11.Setup,
+    req_buf: []u8,
+    out: *ThemedCursors,
+) void {
+    const env = environ orelse return;
+    // ARGB byte order assumes an LSBFirst server; the rare MSBFirst path keeps
+    // the font cursors rather than byte-swap a cursor image.
+    if (setup.image_byte_order != 0) return;
+
+    // 1. Does the server speak RENDER?
+    writeAll(fd, x11.queryExtension(req_buf, "RENDER")) catch return;
+    var reply: [32]u8 = undefined;
+    awaitReply(fd, &reply) catch return;
+    const ext = x11.queryExtensionReply(&reply);
+    if (!ext.present) return;
+    const rmaj = ext.major_opcode;
+
+    // 2. Announce our Render version (consume the reply).
+    writeAll(fd, x11.renderQueryVersion(req_buf, rmaj)) catch return;
+    awaitReply(fd, &reply) catch return;
+
+    // 3. The standard ARGB32 picture format id.
+    writeAll(fd, x11.renderQueryPictFormats(req_buf, rmaj)) catch return;
+    awaitReply(fd, &reply) catch return;
+    const extra_len = x11.replyExtraBytes(&reply);
+    const extra = gpa.alloc(u8, extra_len) catch return;
+    defer gpa.free(extra);
+    readExact(fd, extra) catch return;
+    const fmt = x11.argb32Format(&reply, extra) orelse return;
+
+    const size = resolveCursorSize(gpa, fd, env, setup, req_buf);
+    const base = setup.resource_id_base;
+    // Reusable temp ids for the upload (freed after each cursor); themed cursor
+    // ids at | 7..9 (the font cursors hold | 3..6).
+    out.hand = uploadThemeCursor(gpa, fd, env, rmaj, fmt, setup, base | 7, size, &hand_names);
+    out.text = uploadThemeCursor(gpa, fd, env, rmaj, fmt, setup, base | 8, size, &text_names);
+    out.grab = uploadThemeCursor(gpa, fd, env, rmaj, fmt, setup, base | 9, size, &grab_names);
+}
+
+/// Find one of `names` in the system theme, parse the nearest-size image, and
+/// upload it as cursor `cid` via Render. Returns `cid` on success, null on any
+/// miss (no file, parse fail, oversized) — caller falls back to the font cursor.
+fn uploadThemeCursor(
+    gpa: Allocator,
+    fd: i32,
+    env: *const std.process.Environ.Map,
+    rmaj: u8,
+    fmt: u32,
+    setup: x11.Setup,
+    cid: u32,
+    size: u32,
+    names: []const []const u8,
+) ?u32 {
+    const bytes = findCursorFile(gpa, env, names) orelse return null;
+    defer gpa.free(bytes);
+    const img = xcursor.bestImage(bytes, size) orelse return null;
+    // Keep the pixel upload inside a single PutImage: decline an image whose
+    // data wouldn't fit the server's max request (rather than chunk it). A
+    // normal cursor (≤ ~96px) fits with room to spare.
+    if (@as(u32, img.width) * img.height + 6 > setup.max_request_units) return null;
+
+    const base = setup.resource_id_base;
+    const pixmap = base | 10;
+    const cgc = base | 11;
+    const picture = base | 12;
+    const w: u16 = @intCast(img.width);
+    const h: u16 = @intCast(img.height);
+
+    var b: [32]u8 = undefined;
+    writeAll(fd, x11.createPixmap(&b, 32, pixmap, setup.root_window, w, h)) catch return null;
+    writeAll(fd, x11.createGC(&b, cgc, pixmap)) catch return null;
+    writeAll(fd, x11.putImageHeader(&b, pixmap, cgc, w, h, 0, 32)) catch return null;
+    writeAll(fd, img.pixels) catch return null;
+    writeAll(fd, x11.renderCreatePicture(&b, rmaj, picture, pixmap, fmt)) catch return null;
+    writeAll(fd, x11.renderCreateCursor(&b, rmaj, cid, picture, @intCast(img.xhot), @intCast(img.yhot))) catch return null;
+    writeAll(fd, x11.renderFreePicture(&b, rmaj, picture)) catch return null;
+    writeAll(fd, x11.freeGC(&b, cgc)) catch return null;
+    writeAll(fd, x11.freePixmap(&b, pixmap)) catch return null;
+    return cid;
+}
+
+/// The desired cursor size, matched to the system: $XCURSOR_SIZE first, then the
+/// root window's RESOURCE_MANAGER `Xcursor.size` (the xrdb setting most desktops
+/// write), else 48 — all clamped to [16,256]. (The font cursors looked tiny
+/// precisely because they ignore this; the themed cursors honour it.)
+fn resolveCursorSize(gpa: Allocator, fd: i32, env: *const std.process.Environ.Map, setup: x11.Setup, req_buf: []u8) u32 {
+    if (env.get("XCURSOR_SIZE")) |s| {
+        if (parseSize(s)) |n| return std.math.clamp(n, 16, 256);
+    }
+    if (cursorSizeFromResources(gpa, fd, setup, req_buf)) |n| return std.math.clamp(n, 16, 256);
+    return 48;
+}
+
+fn parseSize(s: []const u8) ?u32 {
+    const trimmed = std.mem.trim(u8, s, " \t\r\n");
+    return std.fmt.parseInt(u32, trimmed, 10) catch null;
+}
+
+/// Read the root window's RESOURCE_MANAGER (the xrdb string) and pull
+/// `Xcursor.size` out of it. Best-effort: any miss is a null (E4).
+fn cursorSizeFromResources(gpa: Allocator, fd: i32, setup: x11.Setup, req_buf: []u8) ?u32 {
+    writeAll(fd, x11.internAtom(req_buf, "RESOURCE_MANAGER")) catch return null;
+    const atom = awaitAtom(fd) catch return null;
+    if (atom == 0) return null;
+    writeAll(fd, x11.getProperty(req_buf, setup.root_window, atom, 0x4000)) catch return null;
+    var reply: [32]u8 = undefined;
+    awaitReply(fd, &reply) catch return null;
+    const value_len = x11.getPropertyValueLen(&reply);
+    const extra_len = x11.replyExtraBytes(&reply);
+    if (extra_len == 0) return null;
+    const extra = gpa.alloc(u8, extra_len) catch return null;
+    defer gpa.free(extra);
+    readExact(fd, extra) catch return null;
+    const value = extra[0..@min(value_len, extra.len)];
+    return findResourceSize(value, "Xcursor.size:");
+}
+
+/// Find `key` in an xrdb resource string and parse the integer after it (xrdb
+/// lines read `key:\tVALUE`). Returns null if absent or unparsable.
+fn findResourceSize(rm: []const u8, key: []const u8) ?u32 {
+    const at = std.mem.indexOf(u8, rm, key) orelse return null;
+    var i = at + key.len;
+    while (i < rm.len and (rm[i] == ' ' or rm[i] == '\t')) : (i += 1) {}
+    var j = i;
+    while (j < rm.len and rm[j] >= '0' and rm[j] <= '9') : (j += 1) {}
+    if (j == i) return null;
+    return std.fmt.parseInt(u32, rm[i..j], 10) catch null;
+}
+
+/// Read the first existing theme file matching any of `names`, searching the
+/// configured/default theme(s) across the standard icon directories. gpa-owned
+/// bytes on success (caller frees), null if nothing matched.
+fn findCursorFile(gpa: Allocator, env: *const std.process.Environ.Map, names: []const []const u8) ?[]u8 {
+    const home = env.get("HOME") orelse "";
+    // Theme candidates, in order: the configured theme, then common fallbacks.
+    const themes = [_][]const u8{ env.get("XCURSOR_THEME") orelse "", "default", "Adwaita" };
+    var path_buf: [512]u8 = undefined;
+
+    for (themes) |theme| {
+        if (theme.len == 0) continue;
+        // Directories: $XCURSOR_PATH if set (':'-separated), else the defaults.
+        if (env.get("XCURSOR_PATH")) |xpath| {
+            var it = std.mem.splitScalar(u8, xpath, ':');
+            while (it.next()) |dir| {
+                if (tryThemeDirs(gpa, &path_buf, dir, home, theme, names)) |b| return b;
+            }
+        } else {
+            const defaults = [_][]const u8{
+                "~/.local/share/icons", "~/.icons",
+                "/usr/share/icons",     "/usr/local/share/icons",
+                "/usr/share/pixmaps",
+            };
+            for (defaults) |dir| {
+                if (tryThemeDirs(gpa, &path_buf, dir, home, theme, names)) |b| return b;
+            }
+        }
+    }
+    return null;
+}
+
+/// Try `<dir>/<theme>/cursors/<name>` for each name (a leading "~/" is expanded
+/// to HOME). Returns the file bytes on the first hit.
+fn tryThemeDirs(gpa: Allocator, path_buf: []u8, dir: []const u8, home: []const u8, theme: []const u8, names: []const []const u8) ?[]u8 {
+    for (names) |name| {
+        const path = blk: {
+            if (std.mem.startsWith(u8, dir, "~/")) {
+                if (home.len == 0) continue;
+                break :blk std.fmt.bufPrint(path_buf, "{s}/{s}/{s}/cursors/{s}", .{ home, dir[2..], theme, name }) catch continue;
+            }
+            break :blk std.fmt.bufPrint(path_buf, "{s}/{s}/cursors/{s}", .{ dir, theme, name }) catch continue;
+        };
+        if (readSmallFile(gpa, path, 4 * 1024 * 1024)) |b| return b;
+    }
+    return null;
 }
 
 /// During open, only replies and errors can arrive (the window is not
@@ -449,6 +689,24 @@ pub fn close(window: *Window) void {
 /// events and are answered by `answerSelection` inside `pump`. A best-effort
 /// I/O op — a failed socket write just means the copy didn't take (E4: not an
 /// error path the caller must handle; the "Copied" toast is the shell's cue).
+/// Swap the pointer shape. The shell calls this on pointer motion with the
+/// shape it derived from the frame's hit-tests, so the cursor and the click
+/// agree on what is tappable / selectable. The `cursor_shape` latch makes a
+/// no-change call free, so a motion flood costs one request per shape CHANGE.
+/// Best-effort I/O (E4 — a failed write just leaves the shape unchanged).
+pub fn setCursor(window: *Window, shape: layout.Cursor) void {
+    if (shape == window.cursor_shape) return;
+    window.cursor_shape = shape;
+    var buf: [16]u8 = undefined;
+    const cursor: u32 = switch (shape) {
+        .default => 0, // None → inherit the root's arrow
+        .pointer => window.hand_cursor,
+        .text => window.text_cursor,
+        .grab => window.grab_cursor,
+    };
+    writeAll(window.fd, x11.changeWindowCursor(&buf, window.wid, cursor)) catch {};
+}
+
 pub fn setClipboard(window: *Window, data: []const u8) void {
     const n = @min(data.len, window.clip_buf.len);
     @memcpy(window.clip_buf[0..n], data[0..n]);
@@ -766,6 +1024,14 @@ fn writeSwapped(window: *Window, pixels: []const u32) error{ OutOfMemory, Protoc
 
 const testing = std.testing;
 
+test "findResourceSize pulls Xcursor.size out of an xrdb string" {
+    const rm = "Xft.dpi:\t192\nXcursor.theme:\tAdwaita\nXcursor.size:\t48\n";
+    try testing.expectEqual(@as(?u32, 48), findResourceSize(rm, "Xcursor.size:"));
+    try testing.expectEqual(@as(?u32, null), findResourceSize("Xft.dpi:\t96\n", "Xcursor.size:"));
+    try testing.expectEqual(@as(?u32, null), findResourceSize("Xcursor.size:\t\n", "Xcursor.size:"));
+    try testing.expectEqual(@as(?u32, 64), parseSize(" 64\n"));
+}
+
 const FakeResult = struct {
     /// Diagnostic checkpoint for flake hunts: 1 setup-sent, 2 map-seen,
     /// 3 events-sent, 4 blit-parsed, 5 close-sent.
@@ -1000,7 +1266,7 @@ test "window loopback: fake X server — open, a key becomes 'q', a blit lands, 
     const server = try std.Thread.spawn(.{}, serveFakeX, .{ listen_fd, &result });
     defer server.join();
 
-    const window = try openAt(gpa, path, "", "", "zat-test", 8, 2);
+    const window = try openAt(gpa, null, path, "", "", "zat-test", 8, 2);
     defer close(window);
     try testing.expectEqual(@as(u16, 8), window.cols);
     try testing.expectEqual(@as(u8, 24), window.root_depth);

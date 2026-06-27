@@ -36,6 +36,7 @@ const Allocator = std.mem.Allocator;
 const text = @import("text.zig");
 const raster = @import("raster.zig");
 const lens_socket = @import("lens_socket.zig");
+const text_select = @import("text_select.zig");
 
 // Palette, copied from field.zig so the view never reaches across a module
 // for a constant (D4: only the value crosses, by copy). ARGB.
@@ -53,10 +54,10 @@ pub const accent_house: u32 = 0xFFE8B84B;
 const sel_fill: u32 = 0x553A6EA5;
 const like_c: u32 = 0xFFF0617A;
 const boost_c: u32 = 0xFF8FD18F;
-/// Resting engagement-icon colour — a cool blueish grey matching the SDF
-/// heart's outline (shader grey vec3(0.46,0.48,0.56)), so the reply, repost,
-/// and hollow-heart icons read as one set.
-const icon_grey: u32 = 0xFF757A8F;
+/// Resting engagement-icon colour — a soft neutral grey-white (no blue cast),
+/// so the reply, repost, and hollow-heart icons read as one calm set without
+/// pulling cool/blue or going bright white.
+const icon_grey: u32 = 0xFFB4B1A8;
 const veil: u32 = 0xD4181812; // ~83% over the field — texture glows faintly through
 const header_veil: u32 = 0xF2181812; // ~95%: the sticky top bar, drawn OVER the posts so
 // they scroll BEHIND it (firmly dimmed), the title/tabs crisp on top — a frosted header
@@ -85,6 +86,8 @@ pub const screen_home: u8 = 0;
 /// The loadout page — the rail's "Algorithms" slot (index 4). Renders the
 /// three per-surface sockets (feed / replies / zones) stacked for editing.
 pub const screen_loadout: u8 = 4;
+/// The rail's "Settings" slot (index 5) — the gear nav icon.
+pub const screen_settings: u8 = 5;
 /// A transient sub-screen (not a rail destination): a post's thread, shown when
 /// a post body is tapped. Past the nav labels, so the rail highlights none.
 pub const screen_thread: u8 = 6;
@@ -135,6 +138,12 @@ pub const Region = struct {
 };
 
 pub const Regions = std.ArrayListUnmanaged(Region);
+
+/// The rooted post's body glyphs, for read-only text selection, are produced
+/// here and consumed by `text_select` (the deep module that owns the selection
+/// math); the glyph vocabulary lives there, aliased here for the producers.
+pub const SelGlyph = text_select.Glyph;
+pub const SelGlyphs = text_select.Glyphs;
 
 /// The chain (OP stitched self-thread) extent, reported by `layout` so the shell
 /// can draw the sticky "chain header" that pins while you scroll the chain and is
@@ -353,6 +362,36 @@ fn wrapBody(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32
     return baseline;
 }
 
+/// Record the body glyphs just appended to `dl` (the range [from, dl.len)) into
+/// `out`: the `.text` items only, each with its advance width and a line index
+/// that rises on every baseline jump (so copy can reinsert the line breaks).
+/// Pure — called for the rooted post's body alone. Replaces whatever `out` held.
+fn captureBody(out: *SelGlyphs, gpa: Allocator, e: *const text.Engine, dl: *const raster.DrawList, from: usize) !void {
+    out.clearRetainingCapacity();
+    var lineno: u16 = 0;
+    var prev_baseline: ?i16 = null;
+    var i: usize = from;
+    while (i < dl.len) : (i += 1) {
+        switch (dl.get(i)) {
+            .text => |t| {
+                if (prev_baseline) |pb| {
+                    if (t.baseline != pb) lineno += 1;
+                }
+                prev_baseline = t.baseline;
+                const adv = text.advance(e, @enumFromInt(t.weight), t.codepoint, t.px);
+                try out.append(gpa, .{
+                    .cp = t.codepoint,
+                    .x = t.x,
+                    .baseline = t.baseline,
+                    .w = @intCast(@min(@as(u32, std.math.maxInt(u16)), adv)),
+                    .line = lineno,
+                });
+            },
+            else => {},
+        }
+    }
+}
+
 fn fxi(v: f32) i32 {
     return @intFromFloat(@round(v));
 }
@@ -548,7 +587,7 @@ fn navIcon(idx: usize, gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, s: 
     }
 }
 
-fn drawRail(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, rx: i32, height: i32, active: usize, regions: ?*Regions, accent: u32) !void {
+fn drawRail(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, rx: i32, height: i32, active: usize, regions: ?*Regions, accent: u32, skip_nav: bool) !void {
     const x0 = rx + 14;
     const wm = try str(gpa, dl, e, .semibold, x0 + 8, 58, accent, 26, "zat4");
     _ = try str(gpa, dl, e, .semibold, wm, 58, ink, 26, ".");
@@ -563,7 +602,9 @@ fn drawRail(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, rx: i32
         const col = if (on) ink else muted;
         // A faint accent pill marks the active destination.
         if (on) try rect(gpa, dl, x0 + 2, ny - 8, rail_w - 32, 42, (0x1F << 24) | (accent & 0x00FFFFFF), 12);
-        try navIcon(idx, gpa, dl, x0 + 10, ny, 22, if (on) accent else muted);
+        // GPU path: all nav icons are drawn by the SDF-icon pass; only software
+        // strokes the line-art. (The active-pill + label + region still emit.)
+        if (!skip_nav) try navIcon(idx, gpa, dl, x0 + 10, ny, 22, if (on) accent else muted);
         _ = try str(gpa, dl, e, if (on) .semibold else .regular, x0 + 48, ny + 17, col, 16, label);
         // Full-row tap target → the Screen at this index (post carries it).
         try emitRegion(gpa, regions, rx + 14, ny - 8, rail_w - 28, 42, @intCast(idx), .nav);
@@ -702,10 +743,18 @@ pub fn layout(
     /// Out: the chain (OP self-thread) extent for the sticky chain header (thread
     /// screen). Null = don't report.
     chain_out: ?*ChainSticky,
+    /// Out: the ROOTED post's body glyphs, for read-only text selection (thread
+    /// screen only — the rooted post is the one selectable post, ZONES inv. 4).
+    /// Filled when the focused post is laid out; cleared otherwise. Null = the
+    /// caller doesn't support selection (software path / preview / tests).
+    sel_out: ?*SelGlyphs,
 ) error{OutOfMemory}!i32 {
     const m = metricsFor(width);
     if (regions) |rg| rg.clearRetainingCapacity();
     if (socket_hits) |sh| sh.clearRetainingCapacity();
+    // No focused post laid out this frame ⇒ no selectable body. Cleared up front;
+    // refilled only if the rooted post's body is drawn below.
+    if (sel_out) |so| so.clearRetainingCapacity();
 
     // 1. The content column as GLASS floating over the field (P.0, layout layer).
     //    A soft slab shadow falls off both gutter edges so the column reads as a
@@ -739,7 +788,7 @@ pub fn layout(
         // 2a. Desktop three-pane: nav rail + sidebar flank the feed. Each
         // SECTION draws its own box (the nav group, the account card, the
         // sidebar cards) so the field stays visible between them.
-        try drawRail(gpa, dl, e, m.rail_x, height, active_screen, regions, accent);
+        try drawRail(gpa, dl, e, m.rail_x, height, active_screen, regions, accent, skip_heart);
         try drawSidebar(gpa, dl, e, m.side_x, height);
         feed_y0 = 126;
     } else {
@@ -927,9 +976,12 @@ pub fn layout(
         const visible = next_y > 0 and post_top < height;
 
         if (visible) {
-            // The focused post (thread screen): a faint accent wash behind it,
-            // drawn first so everything else sits on top.
-            if (p.is_focus) try rect(gpa, dl, m.col_x, post_top - 6, m.col_w, (next_y - post_top), (0x16 << 24) | (accent & 0x00FFFFFF), 8);
+            // The focused post (thread screen): a neutral light-grey wash behind
+            // it (NOT the accent — that clashed with the socket colour and muddied
+            // the accent selection drawn on top). A touch stronger than the hover
+            // wash (~0x16 white) so the focus still reads. Drawn first; everything
+            // else sits on top.
+            if (p.is_focus) try rect(gpa, dl, m.col_x, post_top - 6, m.col_w, (next_y - post_top), (0x1A << 24) | 0x00FFFFFF, 8);
 
             // Chain stem + elbow: a continuous vertical line at the OP avatar
             // column runs down through the headerless continuation segments
@@ -1008,7 +1060,12 @@ pub fn layout(
             }
 
             // body (draw)
+            const body_from = dl.len;
             _ = try wrapBody(gpa, dl, e, cx, post_top + body_top_off, content_w, body_c, 16, p.body, body_line, true);
+            // The rooted post (thread screen) is the one selectable post: capture
+            // its body glyphs for the read-only selection layer (ZONES inv. 4 —
+            // selection is a query over this transient map, never a stored copy).
+            if (is_thread and p.is_focus) if (sel_out) |so| try captureBody(so, gpa, e, dl, body_from);
 
             // Engagement row — roomier spacing + a fuller action set. LEFT group:
             // reply · repost · like (icon + count); RIGHT group: bookmark · share ·
@@ -1023,13 +1080,18 @@ pub fn layout(
             const slot_w: i32 = is + cgap + 18; // generous tap target per item
             var ex = cx;
             const reply_x = ex;
-            try iconReply(gpa, dl, ex, iy, is, icon_grey);
+            // GPU path: the SDF-icon pass draws all these crisply in place; only
+            // the software path strokes the line-art. Counts + regions still emit.
+            if (!skip_heart) try iconReply(gpa, dl, ex, iy, is, icon_grey);
             ex += is + cgap;
             ex = try str(gpa, dl, e, .regular, ex, erow, muted, 13, std.fmt.bufPrint(&nb, "{d}", .{p.reply}) catch "0");
             try emitRegion(gpa, regions, reply_x, tap_y, slot_w, tap_h, @intCast(pi), .reply);
             ex = reply_x + slot_w + ggap;
             const rt_x = ex;
-            try iconRepost(gpa, dl, ex, iy, is, if (p.boosted) boost_c else icon_grey);
+            // On the GPU path (skip_heart) the SDF-icon pass draws the repost
+            // crisply in place — like the heart; here only the software path
+            // strokes the line-art version. The count + region still emit below.
+            if (!skip_heart) try iconRepost(gpa, dl, ex, iy, is, if (p.boosted) boost_c else icon_grey);
             ex += is + cgap;
             _ = try str(gpa, dl, e, .regular, ex, erow, if (p.boosted) boost_c else muted, 13, std.fmt.bufPrint(&nb, "{d}", .{p.boost}) catch "0");
             try emitRegion(gpa, regions, rt_x, tap_y, slot_w, tap_h, @intCast(pi), .repost);
@@ -1052,13 +1114,13 @@ pub fn layout(
             if (!stitch) {
                 const rgap: i32 = 32;
                 var rxp = cx + content_w - is;
-                try iconMore(gpa, dl, rxp, iy, is, icon_grey);
+                if (!skip_heart) try iconMore(gpa, dl, rxp, iy, is, icon_grey);
                 try emitRegion(gpa, regions, rxp - 7, tap_y, is + 14, tap_h, @intCast(pi), .more);
                 rxp -= rgap;
-                try iconShare(gpa, dl, rxp, iy, is, icon_grey);
+                if (!skip_heart) try iconShare(gpa, dl, rxp, iy, is, icon_grey);
                 try emitRegion(gpa, regions, rxp - 7, tap_y, is + 14, tap_h, @intCast(pi), .share);
                 rxp -= rgap;
-                try iconBookmark(gpa, dl, rxp, iy, is, icon_grey);
+                if (!skip_heart) try iconBookmark(gpa, dl, rxp, iy, is, icon_grey);
                 try emitRegion(gpa, regions, rxp - 7, tap_y, is + 14, tap_h, @intCast(pi), .bookmark);
             }
 
@@ -1447,7 +1509,7 @@ pub fn layoutLoadout(
     if (m.wide) {
         try rect(gpa, dl, m.col_x, 0, 1, height, 0x24EDEAE0, 0);
         try rect(gpa, dl, m.col_x + m.col_w - 1, 0, 1, height, 0x24EDEAE0, 0);
-        try drawRail(gpa, dl, e, m.rail_x, height, screen_loadout, regions, accent);
+        try drawRail(gpa, dl, e, m.rail_x, height, screen_loadout, regions, accent, false);
         try drawSidebar(gpa, dl, e, m.side_x, height);
     }
 
@@ -1747,7 +1809,7 @@ test "layout emits 4 tap regions per post (avatar + 3 engagement); hitTest resol
     const posts = [_]PostView{
         .{ .name = "A", .handle = "@a.zat", .age = "1m", .body = "hello there field", .tint = 0xFFAAAAAA, .reply = 1, .boost = 2, .like = 3, .initial = 'A', .liked = true, .boosted = false },
     };
-    const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null);
+    const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null);
     try std.testing.expect(h > 112); // content extends below the top bar
     // 8 regions per post: body tap + avatar + reply/repost/like + bookmark/share/more.
     try std.testing.expectEqual(@as(usize, 8), regions.items.len);
@@ -1775,6 +1837,32 @@ test "layout emits 4 tap regions per post (avatar + 3 engagement); hitTest resol
     // opens the thread.
     // a click far outside every region (above the first post) resolves to nothing
     try std.testing.expect(hitTest(regions.items, 5, 5) == null);
+}
+
+test "layout captures the rooted post's body glyphs for selection (thread screen)" {
+    const gpa = std.testing.allocator;
+    var engine = try text.initEngine();
+    defer text.deinitEngine(gpa, &engine);
+    var dl: raster.DrawList = .{};
+    defer dl.deinit(gpa);
+    var regions: Regions = .empty;
+    defer regions.deinit(gpa);
+    var sel: SelGlyphs = .empty;
+    defer sel.deinit(gpa);
+
+    const posts = [_]PostView{
+        .{ .name = "A", .handle = "@a.zat", .age = "1m", .body = "hello there field", .tint = 0xFFAAAAAA, .reply = 0, .boost = 0, .like = 0, .initial = 'A', .liked = false, .boosted = false, .is_focus = true },
+    };
+    // A WIDE layout so the focus post is on-screen and the body is drawn.
+    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_thread, null, 0, accent_house, null, .{}, null, null, &sel);
+    // "hello there field" = 15 visible glyphs (spaces are emitted too): the body
+    // captured into the selection map, in reading order.
+    try std.testing.expect(sel.items.len > 0);
+    try std.testing.expectEqual(@as(u32, 'h'), sel.items[0].cp);
+
+    // A non-thread screen captures nothing (only the rooted post is selectable).
+    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_home, null, 0, accent_house, null, .{}, null, null, &sel);
+    try std.testing.expectEqual(@as(usize, 0), sel.items.len);
 }
 
 test "layoutCompose emits send + cancel regions; multi-line draft + empty draft both render" {
@@ -1835,7 +1923,7 @@ test "long timeline does not overflow draw coordinates (off-screen posts skipped
     const posts = try arena.alloc(PostView, n);
     for (posts) |*pv| pv.* = .{ .name = "x", .handle = "@x.zat", .age = "1m", .body = "a body line that wraps a little across the feed column width here", .tint = 0xFF888888, .reply = 1, .boost = 2, .like = 3, .initial = 'x', .liked = false, .boosted = false };
 
-    const h = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null); // must not panic
+    const h = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null); // must not panic
     try std.testing.expect(h > 940 * 10); // height accounts for the whole list
     try std.testing.expect(regions.items.len < 4 * 24); // only on-screen posts are tappable
 
@@ -1849,11 +1937,11 @@ test "long timeline does not overflow draw coordinates (off-screen posts skipped
     @memset(heights, -1);
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h_fill = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null);
+    const h_fill = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null);
     const fill_regions = regions.items.len;
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h_cached = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null);
+    const h_cached = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null);
     try std.testing.expectEqual(h, h_fill);
     try std.testing.expectEqual(h, h_cached);
     try std.testing.expectEqual(fill_regions, regions.items.len);
@@ -1876,7 +1964,7 @@ test "profile screen renders the author's posts under a header; other screens st
     // Profile screen: 8 post tap regions (body + avatar + reply/repost/like +
     // bookmark/share/more) + 4 profile-nav tab regions in the sticky header
     // (the header here isn't editable, so no edit-profile region).
-    const hp = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_profile, header, 0, accent_house, null, .{}, null, null);
+    const hp = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_profile, header, 0, accent_house, null, .{}, null, null, null);
     try std.testing.expect(hp > 112);
     try std.testing.expectEqual(@as(usize, 12), regions.items.len);
 
@@ -1884,7 +1972,7 @@ test "profile screen renders the author's posts under a header; other screens st
     // so no tap regions, and the height clamps to the viewport (no post stack).
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const he = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, 1, null, 0, accent_house, null, .{}, null, null); // Explore
+    const he = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, 1, null, 0, accent_house, null, .{}, null, null, null); // Explore
     try std.testing.expectEqual(@as(i32, 940), he);
     try std.testing.expectEqual(@as(usize, 0), regions.items.len);
 }

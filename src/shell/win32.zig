@@ -131,6 +131,7 @@ extern "kernel32" fn GetModuleHandleW(lpModuleName: ?[*:0]const u16) callconv(.w
 extern "kernel32" fn GetLastError() callconv(.winapi) u32;
 extern "user32" fn RegisterClassExW(class: *const WNDCLASSEXW) callconv(.winapi) u16;
 extern "user32" fn LoadCursorW(hInstance: HINSTANCE, lpCursorName: usize) callconv(.winapi) HCURSOR;
+extern "user32" fn SetCursor(hCursor: HCURSOR) callconv(.winapi) HCURSOR;
 extern "user32" fn AdjustWindowRect(lpRect: *RECT, dwStyle: u32, bMenu: i32) callconv(.winapi) i32;
 extern "user32" fn CreateWindowExW(
     dwExStyle: u32,
@@ -183,10 +184,15 @@ const qs_allinput: u32 = 0x04FF;
 const dib_rgb_colors: u32 = 0;
 const srccopy: u32 = 0x00CC_0020;
 const idc_arrow: usize = 32512;
+const idc_ibeam: usize = 32513; // I-beam, over selectable/editable text
+const idc_sizeall: usize = 32646; // four-way move, while dragging (grab)
+const idc_hand: usize = 32649; // the link/clickable hand
+const htclient: usize = 1; // WM_SETCURSOR hit-test code: the client area
 const error_class_already_exists: u32 = 1410;
 
 const wm_destroy: u32 = 0x0002;
 const wm_size: u32 = 0x0005;
+const wm_setcursor: u32 = 0x0020;
 const wm_paint: u32 = 0x000F;
 const wm_close: u32 = 0x0010;
 const wm_erasebkgnd: u32 = 0x0014;
@@ -245,6 +251,9 @@ pub const Window = struct {
     /// counted here, surfaced by the pump, never silent (E3 honored as
     /// far as a Win32 callback allows).
     dropped: u32,
+    /// The pointer shape the shell asked for; WM_SETCURSOR re-applies it on
+    /// every move (Windows resets to the class cursor otherwise). See setCursor.
+    want_cursor: layout.Cursor,
 };
 
 pub const PumpResult = struct {
@@ -329,6 +338,7 @@ pub fn open(
         .exposed = false,
         .pending_high = 0,
         .dropped = 0,
+        .want_cursor = .default,
     };
     // A burst of typing or dragging should never need the allocator
     // mid-callback.
@@ -384,6 +394,18 @@ fn wndProc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) callconv(.winap
             return 0;
         },
         wm_erasebkgnd => return 1, // we paint every pixel; no flicker pass
+        wm_setcursor => {
+            // Windows resets to the class (arrow) cursor on every move unless
+            // we claim it: over the client area, set the shape the shell asked
+            // for and return TRUE to stop further processing. The non-client
+            // area (borders, resize edges) falls through to the default so the
+            // WM keeps its own resize cursors.
+            if (@as(usize, @bitCast(lparam)) & 0xFFFF == htclient) {
+                _ = SetCursor(LoadCursorW(null, cursorIdc(window.want_cursor)));
+                return 1;
+            }
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
         wm_char => {
             if (keys.utf16Step(&window.pending_high, @truncate(wparam))) |cp| {
                 var buf: [8]u8 = undefined;
@@ -510,6 +532,24 @@ pub fn pump(
     window.resized = false;
     window.dropped = 0;
     return result;
+}
+
+/// Map a shape to its Win32 system cursor id.
+fn cursorIdc(shape: layout.Cursor) usize {
+    return switch (shape) {
+        .default => idc_arrow,
+        .pointer => idc_hand,
+        .text => idc_ibeam,
+        .grab => idc_sizeall,
+    };
+}
+
+/// Swap the pointer shape (parity with the X11 backend). Record it so the
+/// WM_SETCURSOR handler re-applies it on every move, and set it now for
+/// immediate feedback. Compile-proven; this backend is not yet runtime-tested.
+pub fn setCursor(window: *Window, shape: layout.Cursor) void {
+    window.want_cursor = shape;
+    _ = SetCursor(LoadCursorW(null, cursorIdc(shape)));
 }
 
 pub fn present(window: *Window, surface: *const tui.Surface) error{ OutOfMemory, ProtocolError }!void {

@@ -46,5 +46,6 @@ pub const open = impl.open;
 pub const close = impl.close;
 pub const pump = impl.pump;
 pub const setClipboard = impl.setClipboard;
+pub const setCursor = impl.setCursor;
 pub const present = impl.present;
 pub const presentDrawList = impl.presentDrawList;

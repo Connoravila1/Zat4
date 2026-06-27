@@ -465,6 +465,24 @@ pub fn pump(
     return result;
 }
 
+/// Swap the pointer shape (parity with the X11 backend). `+[NSCursor <shape>]`
+/// returns the shared cursor; `-set` makes it current. Compile-proven; this
+/// backend is not yet runtime-tested. (If AppKit's per-move cursor-rect reset
+/// fights this, a resetCursorRects/cursorUpdate override is the robust wiring —
+/// noted for when the backend is brought up on real hardware.)
+pub fn setCursor(window: *Window, shape: layout.Cursor) void {
+    const o = &window.objc;
+    const cls = o.getClass("NSCursor") orelse return;
+    const name: [*:0]const u8 = switch (shape) {
+        .default => "arrowCursor",
+        .pointer => "pointingHandCursor",
+        .text => "IBeamCursor",
+        .grab => "closedHandCursor",
+    };
+    const cursor = send0(o, cls, o.selReg(name)) orelse return;
+    _ = send0(o, cursor, o.selReg("set"));
+}
+
 /// Rasterize and blit: pixels are COPIED into a CFData (the layer may
 /// hold the image past this call), wrapped as a CGImage, and assigned to
 /// the layer's contents. bitmapInfo 0x2006 = ByteOrder32Little |

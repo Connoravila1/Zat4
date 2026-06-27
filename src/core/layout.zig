@@ -132,6 +132,16 @@ pub const InputEvent = struct {
     }
 };
 
+/// The pointer SHAPE a window backend should show. A plain-data affordance
+/// decision — WHICH cursor — made in the shell from the frame's hit-tests and
+/// mapped to a native OS cursor by each backend (the B-split: the decision is
+/// data here; turning it into an X11 glyph / IDC_* / NSCursor is the backend's
+/// I/O). One vocabulary on every OS, like InputEvent's modifier bits.
+///   default = the arrow · pointer = the hand (over clickable links/buttons)
+///   text    = the I-beam (over selectable/editable text)
+///   grab    = the move/grab hand (while dragging, e.g. a lens card)
+pub const Cursor = enum(u8) { default, pointer, text, grab };
+
 // ---------------------------------------------------------------------------
 // Surface → draw list (the Cut 5.0 layout)
 // ---------------------------------------------------------------------------

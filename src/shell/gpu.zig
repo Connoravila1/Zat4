@@ -200,6 +200,7 @@ fn load() Error!void {
     glActiveTexture = try sym(lib_gl, P_ActiveTexture, "glActiveTexture");
     glPixelStorei = try sym(lib_gl, P_PixelStorei, "glPixelStorei");
     glGetUniformLocation = try sym(lib_gl, P_GetUniformLocation, "glGetUniformLocation");
+    glUniform4f = try sym(lib_gl, P_Uniform4f, "glUniform4f");
     glUniform2f = try sym(lib_gl, P_Uniform2f, "glUniform2f");
     glUniform1f = try sym(lib_gl, P_Uniform1f, "glUniform1f");
     glUniform1i = try sym(lib_gl, P_Uniform1i, "glUniform1i");
@@ -338,6 +339,7 @@ const P_TexParameteri = *const fn (GLenum, GLenum, GLint) callconv(.c) void;
 const P_ActiveTexture = *const fn (GLenum) callconv(.c) void;
 const P_PixelStorei = *const fn (GLenum, GLint) callconv(.c) void;
 const P_GetUniformLocation = *const fn (GLuint, [*:0]const GLchar) callconv(.c) GLint;
+const P_Uniform4f = *const fn (GLint, GLfloat, GLfloat, GLfloat, GLfloat) callconv(.c) void;
 const P_Uniform2f = *const fn (GLint, GLfloat, GLfloat) callconv(.c) void;
 const P_Uniform1f = *const fn (GLint, GLfloat) callconv(.c) void;
 const P_Uniform1i = *const fn (GLint, GLint) callconv(.c) void;
@@ -370,6 +372,7 @@ var glTexParameteri: P_TexParameteri = undefined;
 var glActiveTexture: P_ActiveTexture = undefined;
 var glPixelStorei: P_PixelStorei = undefined;
 var glGetUniformLocation: P_GetUniformLocation = undefined;
+var glUniform4f: P_Uniform4f = undefined;
 var glUniform2f: P_Uniform2f = undefined;
 var glUniform1f: P_Uniform1f = undefined;
 var glUniform1i: P_Uniform1i = undefined;
@@ -408,6 +411,7 @@ const GL_UNPACK_ALIGNMENT: GLenum = 0x0CF5;
 const GL_NEAREST: GLint = 0x2600;
 const GL_TEXTURE1: GLenum = 0x84C1;
 const GL_TEXTURE2: GLenum = 0x84C2;
+const GL_TEXTURE3: GLenum = 0x84C3;
 
 /// One vertex of a quad. Position in screen pixels, colour 0..1, atlas UV
 /// (glyph mode), and the rounded-rect SDF inputs (local offset from the
@@ -705,7 +709,21 @@ pub fn buildVertices(
                 .{ bx - nx, by - ny },
                 .{ ax - nx, ay - ny },
             };
-            try pushQuad(&verts, gpa, p, zero_uv, zero_local, .{ 0, 0 }, 0, mode_solid, argb(it.color));
+            // A thick line with round caps IS a rounded-rect (a capsule) in the
+            // line's own rotated frame: along-axis × across-axis. Feed it through
+            // the SAME anti-aliased rounded-rect SDF the cards/heart use, instead
+            // of a hard-edged solid quad — so every stroke (the engagement icons,
+            // the nav-rail icons, any line-art) renders crisp, not jagged. Local
+            // coords are the corners in that frame; half = (len/2+cap, hth), corner
+            // radius = hth makes the ends full semicircles (the capsule).
+            const along = len / 2.0 + hth;
+            const local = [4][2]f32{
+                .{ -along, hth },
+                .{ along, hth },
+                .{ along, -hth },
+                .{ -along, -hth },
+            };
+            try pushQuad(&verts, gpa, p, zero_uv, local, .{ along, hth }, hth, mode_rrect, argb(it.color));
         },
         .text => {
             const it = bare.text;
@@ -1181,7 +1199,7 @@ const heart_frag_src: [:0]const GLchar =
     \\  float fillMask = smoothstep(yline - 0.06, yline + 0.06, lp.y);
     \\  float filledInside = inside * fillMask;
     \\  vec3 rose = vec3(245.0, 80.0, 110.0) / 255.0;
-    \\  vec3 grey = vec3(0.46, 0.48, 0.56);
+    \\  vec3 grey = vec3(0.706, 0.694, 0.659);  // matches feed_view.icon_grey (soft neutral white)
     \\  vec3 rimCol = mix(grey, rose, clamp(uFill + uGlow * 0.4, 0.0, 1.0));
     \\  vec3 fillCol = rose * (0.9 + uGlow * 0.5);
     \\  vec3 col = mix(rimCol, fillCol, filledInside);
@@ -1252,6 +1270,203 @@ pub fn initHeartRenderer() Error!HeartRenderer {
         .u_glow = glGetUniformLocation(prog, "uGlow"),
         .u_burst = glGetUniformLocation(prog, "uBurst"),
     };
+}
+
+// ---------------------------------------------------------------------------
+// SDF icons — the heart's technique generalised. Each icon is a signed distance
+// field composed from primitives (segments-as-capsules, boxes, rings), drawn as
+// ONE crisp anti-aliased shape — the shippable replacement for the line-art
+// icons. A tight quad per icon (the fragment shader only runs over the icon's
+// box, unlike the heart's full-screen pass). One draw call per icon.
+// ---------------------------------------------------------------------------
+
+/// Icon ids — must match the `uIcon` chain in `icon_frag_src`.
+pub const icon_repost: i32 = 0;
+pub const icon_gear: i32 = 1;
+pub const icon_reply: i32 = 2; // speech bubble (also Messages)
+pub const icon_bookmark: i32 = 3;
+pub const icon_share: i32 = 4;
+pub const icon_more: i32 = 5;
+pub const icon_home: i32 = 6;
+pub const icon_search: i32 = 7;
+pub const icon_heart: i32 = 8; // hollow heart (Activity)
+pub const icon_sliders: i32 = 9; // faders (Algorithms)
+
+const icon_vert_src: [:0]const GLchar =
+    \\attribute vec2 aPos;          // unit quad corners [-1,1]
+    \\uniform vec2 uViewport;
+    \\uniform vec2 uCenter;         // icon centre px (top-down)
+    \\uniform float uSize;          // icon half-extent px
+    \\void main() {
+    \\  vec2 px = uCenter + aPos * (uSize * 1.18);  // box + AA margin, top-down px
+    \\  vec2 ndc = vec2(px.x / uViewport.x * 2.0 - 1.0, 1.0 - px.y / uViewport.y * 2.0);
+    \\  gl_Position = vec4(ndc, 0.0, 1.0);
+    \\}
+;
+
+const icon_frag_src: [:0]const GLchar =
+    \\precision highp float;
+    \\uniform vec2 uViewport;
+    \\uniform vec2 uCenter;
+    \\uniform float uSize;
+    \\uniform vec4 uColor;          // rgb + token opacity
+    \\uniform int uIcon;
+    \\float sdSeg(vec2 p, vec2 a, vec2 b){
+    \\  vec2 pa = p - a, ba = b - a;
+    \\  float h = clamp(dot(pa,ba)/dot(ba,ba), 0.0, 1.0);
+    \\  return length(pa - ba*h);
+    \\}
+    \\float sdBox(vec2 p, vec2 b){ vec2 d = abs(p) - b; return length(max(d,0.0)) + min(max(d.x,d.y), 0.0); }
+    \\float sdRBox(vec2 p, vec2 b, float r){ return sdBox(p, b - vec2(r)) - r; }
+    \\float dot2(vec2 v){ return dot(v,v); }
+    \\float sdHeart(vec2 p){
+    \\  p.x = abs(p.x);
+    \\  if (p.y + p.x > 1.0) return sqrt(dot2(p - vec2(0.25,0.75))) - sqrt(2.0)/4.0;
+    \\  return sqrt(min(dot2(p - vec2(0.0,1.0)), dot2(p - 0.5*max(p.x + p.y, 0.0)))) * sign(p.x - p.y);
+    \\}
+    \\float iconDist(int id, vec2 p){
+    \\  float th = 0.12;            // stroke half-thickness (icon-box units)
+    \\  float d = 1e9;
+    \\  if (id == 0) {             // repost: two opposing arrows (⇄)
+    \\    d = min(d, sdSeg(p, vec2(-0.62,-0.30), vec2(0.50,-0.30)));
+    \\    d = min(d, sdSeg(p, vec2(0.50,-0.30), vec2(0.26,-0.52)));
+    \\    d = min(d, sdSeg(p, vec2(0.50,-0.30), vec2(0.26,-0.08)));
+    \\    d = min(d, sdSeg(p, vec2(0.62,0.30), vec2(-0.50,0.30)));
+    \\    d = min(d, sdSeg(p, vec2(-0.50,0.30), vec2(-0.26,0.08)));
+    \\    d = min(d, sdSeg(p, vec2(-0.50,0.30), vec2(-0.26,0.52)));
+    \\    return d - th;
+    \\  } else if (id == 1) {      // gear: a toothed annulus + centre hole
+    \\    float r = length(p);
+    \\    float a = atan(p.y, p.x);
+    \\    float teeth = smoothstep(0.0, 0.6, cos(a * 8.0));
+    \\    float outer = 0.56 + 0.20 * teeth;
+    \\    return max(r - outer, 0.30 - r);
+    \\  } else if (id == 2) {      // reply / messages: a speech bubble + tail
+    \\    float bub = abs(sdRBox(p - vec2(0.0,-0.12), vec2(0.66,0.40), 0.18)) - th;
+    \\    float tail = sdSeg(p, vec2(-0.34,0.24), vec2(-0.48,0.62)) - th;
+    \\    return min(bub, tail);
+    \\  } else if (id == 3) {      // bookmark: a tag with a V-notch
+    \\    d = min(d, sdSeg(p, vec2(-0.42,-0.66), vec2(0.42,-0.66)));
+    \\    d = min(d, sdSeg(p, vec2(-0.42,-0.66), vec2(-0.42,0.62)));
+    \\    d = min(d, sdSeg(p, vec2(0.42,-0.66), vec2(0.42,0.62)));
+    \\    d = min(d, sdSeg(p, vec2(-0.42,0.62), vec2(0.0,0.24)));
+    \\    d = min(d, sdSeg(p, vec2(0.42,0.62), vec2(0.0,0.24)));
+    \\    return d - th;
+    \\  } else if (id == 4) {      // share: an up-arrow rising from an open tray
+    \\    d = min(d, sdSeg(p, vec2(0.0,-0.62), vec2(0.0,0.28)));
+    \\    d = min(d, sdSeg(p, vec2(0.0,-0.62), vec2(-0.26,-0.32)));
+    \\    d = min(d, sdSeg(p, vec2(0.0,-0.62), vec2(0.26,-0.32)));
+    \\    d = min(d, sdSeg(p, vec2(-0.46,0.02), vec2(-0.46,0.64)));
+    \\    d = min(d, sdSeg(p, vec2(0.46,0.02), vec2(0.46,0.64)));
+    \\    d = min(d, sdSeg(p, vec2(-0.46,0.64), vec2(0.46,0.64)));
+    \\    return d - th;
+    \\  } else if (id == 5) {      // more: three filled dots
+    \\    float r = 0.16;
+    \\    d = length(p - vec2(-0.56,0.0)) - r;
+    \\    d = min(d, length(p) - r);
+    \\    d = min(d, length(p - vec2(0.56,0.0)) - r);
+    \\    return d;
+    \\  } else if (id == 6) {      // home: a roof + walls
+    \\    d = min(d, sdSeg(p, vec2(0.0,-0.66), vec2(-0.64,-0.04)));
+    \\    d = min(d, sdSeg(p, vec2(0.0,-0.66), vec2(0.64,-0.04)));
+    \\    d = min(d, sdSeg(p, vec2(-0.46,-0.10), vec2(-0.46,0.62)));
+    \\    d = min(d, sdSeg(p, vec2(0.46,-0.10), vec2(0.46,0.62)));
+    \\    d = min(d, sdSeg(p, vec2(-0.46,0.62), vec2(0.46,0.62)));
+    \\    return d - th;
+    \\  } else if (id == 7) {      // search: a magnifier ring + handle
+    \\    float ring = abs(length(p - vec2(-0.14,-0.14)) - 0.40) - th;
+    \\    float handle = sdSeg(p, vec2(0.16,0.16), vec2(0.58,0.58)) - th;
+    \\    return min(ring, handle);
+    \\  } else if (id == 8) {      // heart (hollow) — the Activity nav icon
+    \\    vec2 hp = vec2(p.x, -p.y) * 1.15 + vec2(0.0, 0.5);
+    \\    return abs(sdHeart(hp)) - th;
+    \\  } else {                   // sliders: three faders with knobs (Algorithms)
+    \\    d = min(d, sdSeg(p, vec2(-0.66,-0.42), vec2(0.66,-0.42)));
+    \\    d = min(d, sdSeg(p, vec2(-0.66,0.0), vec2(0.66,0.0)));
+    \\    d = min(d, sdSeg(p, vec2(-0.66,0.42), vec2(0.66,0.42)));
+    \\    float rails = d - th * 0.85;
+    \\    float kr = 0.15;
+    \\    float knobs = length(p - vec2(0.24,-0.42)) - kr;
+    \\    knobs = min(knobs, length(p - vec2(-0.30,0.0)) - kr);
+    \\    knobs = min(knobs, length(p - vec2(0.36,0.42)) - kr);
+    \\    return min(rails, knobs);
+    \\  }
+    \\}
+    \\void main(){
+    \\  vec2 frag = vec2(gl_FragCoord.x, uViewport.y - gl_FragCoord.y); // top-down px
+    \\  vec2 p = (frag - uCenter) / uSize;   // local; icon box half-extent ~1
+    \\  float d = iconDist(uIcon, p);
+    \\  float aa = 1.5 / uSize;               // ~1.5px AA band
+    \\  float a = smoothstep(aa, -aa, d) * uColor.a;
+    \\  gl_FragColor = vec4(uColor.rgb, a);
+    \\}
+;
+
+/// A7.2: cold struct, one per window; process-lifetime like the other renderers.
+pub const IconRenderer = struct {
+    program: GLuint,
+    vbo: GLuint,
+    a_pos: GLint,
+    u_viewport: GLint,
+    u_center: GLint,
+    u_size: GLint,
+    u_color: GLint,
+    u_icon: GLint,
+};
+
+pub fn initIconRenderer() Error!IconRenderer {
+    const vs = try compileShader(GL_VERTEX_SHADER, icon_vert_src);
+    const fs = try compileShader(GL_FRAGMENT_SHADER, icon_frag_src);
+    const prog = glCreateProgram();
+    glAttachShader(prog, vs);
+    glAttachShader(prog, fs);
+    glLinkProgram(prog);
+    var ok: GLint = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    if (ok == 0) {
+        var log: [1024]GLchar = undefined;
+        var n: GLsizei = 0;
+        glGetProgramInfoLog(prog, log.len, &n, &log);
+        elog("icon program link FAILED: {s}", .{log[0..@intCast(n)]});
+        return Error.GpuInit;
+    }
+    // A unit quad ([-1,1]²) as two triangles — the vertex shader scales/places it.
+    const quad = [_]f32{ -1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1 };
+    var vbo: GLuint = 0;
+    glGenBuffers(1, @ptrCast(&vbo));
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, @intCast(quad.len * @sizeOf(f32)), &quad, GL_STATIC_DRAW);
+    elog("icon renderer ready (SDF icons)", .{});
+    return .{
+        .program = prog,
+        .vbo = vbo,
+        .a_pos = glGetAttribLocation(prog, "aPos"),
+        .u_viewport = glGetUniformLocation(prog, "uViewport"),
+        .u_center = glGetUniformLocation(prog, "uCenter"),
+        .u_size = glGetUniformLocation(prog, "uSize"),
+        .u_color = glGetUniformLocation(prog, "uColor"),
+        .u_icon = glGetUniformLocation(prog, "uIcon"),
+    };
+}
+
+/// Draw one SDF icon centred at (cx,cy) px (top-down), `size` px half-extent, in
+/// `color` (0xAARRGGBB; alpha folded into the coverage). Blends over the feed.
+pub fn drawIcon(ir: *IconRenderer, icon: i32, cx: f32, cy: f32, size: f32, color: u32, vw: i32, vh: i32) void {
+    glUseProgram(ir.program);
+    glBindBuffer(GL_ARRAY_BUFFER, ir.vbo);
+    bindAttrib(ir.a_pos, 2, 2 * @sizeOf(f32), 0);
+    glUniform2f(ir.u_viewport, @floatFromInt(vw), @floatFromInt(vh));
+    glUniform2f(ir.u_center, cx, cy);
+    glUniform1f(ir.u_size, size);
+    const a: f32 = @floatFromInt((color >> 24) & 0xFF);
+    const r: f32 = @floatFromInt((color >> 16) & 0xFF);
+    const g: f32 = @floatFromInt((color >> 8) & 0xFF);
+    const b: f32 = @floatFromInt(color & 0xFF);
+    glUniform4f(ir.u_color, r / 255.0, g / 255.0, b / 255.0, a / 255.0);
+    glUniform1i(ir.u_icon, icon);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
 }
 
 /// Draw one animated heart centred at (cx,cy) px (top-down), `size` px half-

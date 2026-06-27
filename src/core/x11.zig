@@ -50,14 +50,40 @@ pub const event_mask_exposure: u32 = 0x0000_8000;
 pub const event_mask_structure: u32 = 0x0002_0000;
 
 const opcode_create_window: u8 = 1;
+const opcode_change_window_attrs: u8 = 2;
 const opcode_map_window: u8 = 8;
 const opcode_intern_atom: u8 = 16;
 const opcode_change_property: u8 = 18;
+const opcode_get_property: u8 = 20;
 const opcode_set_selection_owner: u8 = 22;
 const opcode_send_event: u8 = 25;
+const opcode_open_font: u8 = 45;
+const opcode_create_pixmap: u8 = 53;
+const opcode_free_pixmap: u8 = 54;
 const opcode_create_gc: u8 = 55;
+const opcode_free_gc: u8 = 60;
 const opcode_put_image: u8 = 72;
+const opcode_create_glyph_cursor: u8 = 94;
+const opcode_query_extension: u8 = 98;
 const opcode_get_keyboard_mapping: u8 = 101;
+
+// X Render extension minor opcodes (the major opcode is learned at runtime via
+// QueryExtension — extensions aren't assigned a fixed major).
+const render_query_version: u8 = 0;
+const render_query_pict_formats: u8 = 1;
+const render_create_picture: u8 = 4;
+const render_free_picture: u8 = 7;
+const render_create_cursor: u8 = 27;
+
+/// The "cursor" glyph font pairs each pointer shape with its mask at glyph N
+/// and N+1 (the convention XCreateFontCursor encodes — source shape, mask one
+/// glyph above). The three shapes we build from it:
+///   60 = XC_hand2  — the link/clickable hand (finger pointing up-right)
+///  152 = XC_xterm  — the I-beam, over selectable/editable text
+///   52 = XC_fleur  — the four-way move/grab hand, shown while dragging
+pub const cursor_hand: u16 = 60;
+pub const cursor_xterm: u16 = 152;
+pub const cursor_fleur: u16 = 52;
 
 /// Event codes we send/parse beyond input (clipboard = the selection dance).
 pub const event_selection_request: u8 = 30;
@@ -255,6 +281,241 @@ pub fn createGC(buf: []u8, gc: u32, drawable: u32) []const u8 {
     put16(buf, 2, 4);
     put32(buf, 4, gc);
     put32(buf, 8, drawable);
+    return buf[0..16];
+}
+
+// ---------------------------------------------------------------------------
+// Pointer cursors — bind the server "cursor" glyph font once, build the hand
+// pointer from it, then swap it onto the window over clickable targets.
+// ---------------------------------------------------------------------------
+
+/// OpenFont (opcode 45): bind `fid` to a server font by name. The only use is
+/// the standard "cursor" glyph font, the source of the built-in pointer shapes.
+pub fn openFont(buf: []u8, fid: u32, name: []const u8) []const u8 {
+    const total = 12 + padded4(name.len);
+    assert(buf.len >= total);
+    @memset(buf[0..total], 0);
+    buf[0] = opcode_open_font;
+    put16(buf, 2, @intCast(total / 4));
+    put32(buf, 4, fid);
+    put16(buf, 8, @intCast(name.len));
+    @memcpy(buf[12..][0..name.len], name);
+    return buf[0..total];
+}
+
+/// CreateGlyphCursor (opcode 94): build cursor `cid` from a font's shape glyph
+/// and its mask glyph (the cursor font pairs them — see `cursor_hand`). Colours
+/// are 16-bit per channel; the conventional pointer is black-on-white, so the
+/// foreground stays zero (black) and the background is set to white.
+pub fn createGlyphCursor(
+    buf: []u8,
+    cid: u32,
+    source_font: u32,
+    mask_font: u32,
+    source_char: u16,
+    mask_char: u16,
+) []const u8 {
+    const total = 32; // 8 fixed units, no value list
+    assert(buf.len >= total);
+    @memset(buf[0..total], 0);
+    buf[0] = opcode_create_glyph_cursor;
+    put16(buf, 2, total / 4);
+    put32(buf, 4, cid);
+    put32(buf, 8, source_font);
+    put32(buf, 12, mask_font);
+    put16(buf, 16, source_char);
+    put16(buf, 18, mask_char);
+    // fore-{red,green,blue} at 20/22/24 stay 0 (black) from the memset.
+    put16(buf, 26, 0xFFFF); // back-red
+    put16(buf, 28, 0xFFFF); // back-green
+    put16(buf, 30, 0xFFFF); // back-blue
+    return buf[0..total];
+}
+
+/// ChangeWindowAttributes (opcode 2) setting ONLY CWCursor: swap the window's
+/// pointer shape. `cursor` = 0 (None) restores the inherited (arrow) cursor.
+pub fn changeWindowCursor(buf: []u8, wid: u32, cursor: u32) []const u8 {
+    const total = 16; // 3 fixed units + 1 value
+    assert(buf.len >= total);
+    @memset(buf[0..total], 0);
+    buf[0] = opcode_change_window_attrs;
+    put16(buf, 2, total / 4);
+    put32(buf, 4, wid);
+    put32(buf, 8, 0x0000_4000); // value-mask: CWCursor
+    put32(buf, 12, cursor);
+    return buf[0..total];
+}
+
+// ---------------------------------------------------------------------------
+// Themed cursors via the X Render extension — upload a theme's ARGB cursor
+// image as a real, DPI-sized cursor (the core font cursors can't be scaled).
+// The whole path is best-effort: any failure leaves the font cursors in place.
+// ---------------------------------------------------------------------------
+
+/// QueryExtension (opcode 98): does the server have extension `name`, and at
+/// which major opcode? Reply parsed by `queryExtensionReply`.
+pub fn queryExtension(buf: []u8, name: []const u8) []const u8 {
+    const total = 8 + padded4(name.len);
+    assert(buf.len >= total);
+    @memset(buf[0..total], 0);
+    buf[0] = opcode_query_extension;
+    put16(buf, 2, @intCast(total / 4));
+    put16(buf, 4, @intCast(name.len));
+    @memcpy(buf[8..][0..name.len], name);
+    return buf[0..total];
+}
+
+/// GetProperty (opcode 20): read a window property (we use it to read the root
+/// window's RESOURCE_MANAGER — the xrdb database that carries `Xcursor.size`).
+/// `long_length` bounds the value read, in 4-byte units. The reply's value
+/// length (bytes, for an 8-bit string property) is at `getPropertyValueLen`;
+/// the value bytes follow as the reply's extra data.
+pub fn getProperty(buf: []u8, window: u32, property: u32, long_length: u32) []const u8 {
+    assert(buf.len >= 24);
+    @memset(buf[0..24], 0);
+    buf[0] = opcode_get_property;
+    buf[1] = 0; // delete: false
+    put16(buf, 2, 6);
+    put32(buf, 4, window);
+    put32(buf, 8, property);
+    put32(buf, 12, 0); // type: AnyPropertyType
+    put32(buf, 16, 0); // long offset
+    put32(buf, 20, long_length);
+    return buf[0..24];
+}
+
+pub fn getPropertyValueLen(reply: *const [32]u8) u32 {
+    return get32(reply, 16);
+}
+
+pub const ExtensionInfo = struct { present: bool, major_opcode: u8 };
+
+pub fn queryExtensionReply(header: *const [32]u8) ExtensionInfo {
+    return .{ .present = header[8] != 0, .major_opcode = header[9] };
+}
+
+/// RenderQueryVersion: announce the client Render version (0.11) before use.
+/// A reply comes back (consume it); its content we don't need.
+pub fn renderQueryVersion(buf: []u8, render_major: u8) []const u8 {
+    assert(buf.len >= 12);
+    @memset(buf[0..12], 0);
+    buf[0] = render_major;
+    buf[1] = render_query_version;
+    put16(buf, 2, 3);
+    put32(buf, 4, 0); // client major
+    put32(buf, 8, 11); // client minor
+    return buf[0..12];
+}
+
+/// RenderQueryPictFormats: list the server's picture formats. The reply is a
+/// 32-byte header (num-formats at offset 8) + an array of 28-byte PICTFORMINFO;
+/// `argb32Format` scans it for the standard premultiplied ARGB32 format.
+pub fn renderQueryPictFormats(buf: []u8, render_major: u8) []const u8 {
+    assert(buf.len >= 4);
+    buf[0] = render_major;
+    buf[1] = render_query_pict_formats;
+    put16(buf, 2, 1);
+    return buf[0..4];
+}
+
+/// Scan a QueryPictFormats reply for the standard ARGB32 direct format (depth
+/// 32, 8-bit channels at the conventional shifts) and return its PICTFORMAT id,
+/// or null. `header` is the 32-byte reply head; `extra` is the reply body.
+pub fn argb32Format(header: *const [32]u8, extra: []const u8) ?u32 {
+    const num_formats = get32(header, 8);
+    var i: u32 = 0;
+    var off: usize = 0;
+    while (i < num_formats) : (i += 1) {
+        if (off + 28 > extra.len) return null;
+        const id = get32(extra, off);
+        const ftype = extra[off + 4];
+        const depth = extra[off + 5];
+        // DIRECTFORMAT at off+8: red/green/blue/alpha each {shift u16, mask u16}.
+        const red_shift = get16(extra, off + 8);
+        const green_shift = get16(extra, off + 12);
+        const blue_shift = get16(extra, off + 16);
+        const alpha_shift = get16(extra, off + 20);
+        const alpha_mask = get16(extra, off + 22);
+        off += 28;
+        if (ftype == 1 and depth == 32 and alpha_mask == 0xFF and
+            alpha_shift == 24 and red_shift == 16 and green_shift == 8 and blue_shift == 0)
+        {
+            return id;
+        }
+    }
+    return null;
+}
+
+/// CreatePixmap (opcode 53): an off-screen drawable to hold the cursor image.
+pub fn createPixmap(buf: []u8, depth: u8, pid: u32, drawable: u32, width: u16, height: u16) []const u8 {
+    assert(buf.len >= 16);
+    @memset(buf[0..16], 0);
+    buf[0] = opcode_create_pixmap;
+    buf[1] = depth;
+    put16(buf, 2, 4);
+    put32(buf, 4, pid);
+    put32(buf, 8, drawable);
+    put16(buf, 12, width);
+    put16(buf, 14, height);
+    return buf[0..16];
+}
+
+pub fn freePixmap(buf: []u8, pid: u32) []const u8 {
+    assert(buf.len >= 8);
+    buf[0] = opcode_free_pixmap;
+    buf[1] = 0;
+    put16(buf, 2, 2);
+    put32(buf, 4, pid);
+    return buf[0..8];
+}
+
+pub fn freeGC(buf: []u8, gc: u32) []const u8 {
+    assert(buf.len >= 8);
+    buf[0] = opcode_free_gc;
+    buf[1] = 0;
+    put16(buf, 2, 2);
+    put32(buf, 4, gc);
+    return buf[0..8];
+}
+
+/// RenderCreatePicture (minor 4): wrap the pixmap as a Picture in `format`,
+/// with no extra attributes (value-mask 0).
+pub fn renderCreatePicture(buf: []u8, render_major: u8, pid: u32, drawable: u32, format: u32) []const u8 {
+    assert(buf.len >= 20);
+    @memset(buf[0..20], 0);
+    buf[0] = render_major;
+    buf[1] = render_create_picture;
+    put16(buf, 2, 5);
+    put32(buf, 4, pid);
+    put32(buf, 8, drawable);
+    put32(buf, 12, format);
+    put32(buf, 16, 0); // value-mask: none
+    return buf[0..20];
+}
+
+pub fn renderFreePicture(buf: []u8, render_major: u8, picture: u32) []const u8 {
+    assert(buf.len >= 8);
+    @memset(buf[0..8], 0);
+    buf[0] = render_major;
+    buf[1] = render_free_picture;
+    put16(buf, 2, 2);
+    put32(buf, 4, picture);
+    return buf[0..8];
+}
+
+/// RenderCreateCursor (minor 27): make cursor `cid` from a Picture (the server
+/// snapshots it, so the Picture/pixmap can be freed afterward). `xhot`/`yhot`
+/// are the hotspot in image pixels.
+pub fn renderCreateCursor(buf: []u8, render_major: u8, cid: u32, picture: u32, xhot: u16, yhot: u16) []const u8 {
+    assert(buf.len >= 16);
+    @memset(buf[0..16], 0);
+    buf[0] = render_major;
+    buf[1] = render_create_cursor;
+    put16(buf, 2, 4);
+    put32(buf, 4, cid);
+    put32(buf, 8, picture);
+    put16(buf, 12, xhot);
+    put16(buf, 14, yhot);
     return buf[0..16];
 }
 
@@ -907,5 +1168,93 @@ test "x11: clipboard encoders pinned by golden bytes" {
         try testing.expectEqual(@as(u32, 0xCCCC), sr.selection);
         try testing.expectEqual(@as(u32, 0xDDDD), sr.target);
         try testing.expectEqual(@as(u32, 0xEEEE), sr.property);
+    }
+}
+
+test "x11: render extension encoders + ARGB32 format scan" {
+    var buf: [64]u8 = undefined;
+
+    // CreatePixmap(depth=32): 16 bytes, opcode 53.
+    {
+        const r = createPixmap(&buf, 32, 0x30, 0x40, 24, 24);
+        try testing.expectEqual(@as(u8, 53), r[0]);
+        try testing.expectEqual(@as(u8, 32), r[1]); // depth
+        try testing.expectEqual(@as(u32, 0x30), get32(r, 4)); // pid
+        try testing.expectEqual(@as(u16, 24), get16(r, 12)); // width
+    }
+    // RenderCreateCursor(minor 27): 16 bytes, dynamic major, hotspot at 12/14.
+    {
+        const r = renderCreateCursor(&buf, 0x8A, 0x50, 0x60, 1, 2);
+        try testing.expectEqual(@as(u8, 0x8A), r[0]); // render major
+        try testing.expectEqual(@as(u8, 27), r[1]); // CreateCursor
+        try testing.expectEqual(@as(u32, 0x50), get32(r, 4)); // cursor id
+        try testing.expectEqual(@as(u32, 0x60), get32(r, 8)); // source picture
+        try testing.expectEqual(@as(u16, 1), get16(r, 12)); // xhot
+        try testing.expectEqual(@as(u16, 2), get16(r, 14)); // yhot
+    }
+    // argb32Format: find the depth-32 direct format at the conventional shifts.
+    {
+        var header = [_]u8{0} ** 32;
+        put32(&header, 8, 2); // two formats
+        var extra = [_]u8{0} ** 56; // 2 × PICTFORMINFO
+        // format 0: a depth-24 RGB (no alpha) — must be skipped.
+        put32(&extra, 0, 0x11);
+        extra[4] = 1; // direct
+        extra[5] = 24;
+        // format 1: ARGB32.
+        put32(&extra, 28 + 0, 0x22);
+        extra[28 + 4] = 1; // direct
+        extra[28 + 5] = 32; // depth
+        put16(&extra, 28 + 8, 16); // red shift
+        put16(&extra, 28 + 12, 8); // green shift
+        put16(&extra, 28 + 16, 0); // blue shift
+        put16(&extra, 28 + 20, 24); // alpha shift
+        put16(&extra, 28 + 22, 0xFF); // alpha mask
+        try testing.expectEqual(@as(?u32, 0x22), argb32Format(&header, &extra));
+    }
+}
+
+test "x11: cursor encoders pinned by golden bytes" {
+    var buf: [64]u8 = undefined;
+
+    // OpenFont(fid=0x12, "cursor"): header 12 + padded("cursor"=6)=8 → 20.
+    {
+        const r = openFont(&buf, 0x12, "cursor");
+        try testing.expectEqual(@as(usize, 20), r.len);
+        try testing.expectEqual(@as(u8, 45), r[0]); // OpenFont
+        try testing.expectEqual(@as(u16, 5), get16(r, 2)); // 20/4 units
+        try testing.expectEqual(@as(u32, 0x12), get32(r, 4)); // fid
+        try testing.expectEqual(@as(u16, 6), get16(r, 8)); // name length
+        try testing.expectEqualSlices(u8, "cursor", r[12..18]);
+    }
+
+    // CreateGlyphCursor(cid=0x14, font=0x12, shape 60 + mask 61): 32 bytes.
+    {
+        const r = createGlyphCursor(&buf, 0x14, 0x12, 0x12, cursor_hand, cursor_hand + 1);
+        try testing.expectEqual(@as(usize, 32), r.len);
+        try testing.expectEqual(@as(u8, 94), r[0]); // CreateGlyphCursor
+        try testing.expectEqual(@as(u16, 8), get16(r, 2)); // 32/4 units
+        try testing.expectEqual(@as(u32, 0x14), get32(r, 4)); // cursor id
+        try testing.expectEqual(@as(u32, 0x12), get32(r, 8)); // source font
+        try testing.expectEqual(@as(u32, 0x12), get32(r, 12)); // mask font
+        try testing.expectEqual(@as(u16, 60), get16(r, 16)); // source char (XC_hand2)
+        try testing.expectEqual(@as(u16, 61), get16(r, 18)); // mask char
+        try testing.expectEqual(@as(u16, 0), get16(r, 20)); // fore-red: black
+        try testing.expectEqual(@as(u16, 0xFFFF), get16(r, 26)); // back-red: white
+        try testing.expectEqual(@as(u16, 0xFFFF), get16(r, 30)); // back-blue: white
+    }
+
+    // ChangeWindowAttributes setting CWCursor only: 16 bytes, opcode 2.
+    {
+        const r = changeWindowCursor(&buf, 0x99, 0x14);
+        try testing.expectEqual(@as(usize, 16), r.len);
+        try testing.expectEqual(@as(u8, 2), r[0]); // ChangeWindowAttributes
+        try testing.expectEqual(@as(u16, 4), get16(r, 2)); // 16/4 units
+        try testing.expectEqual(@as(u32, 0x99), get32(r, 4)); // window
+        try testing.expectEqual(@as(u32, 0x4000), get32(r, 8)); // value-mask: CWCursor
+        try testing.expectEqual(@as(u32, 0x14), get32(r, 12)); // cursor id
+        // None (0) restores the inherited arrow.
+        const r0 = changeWindowCursor(&buf, 0x99, 0);
+        try testing.expectEqual(@as(u32, 0), get32(r0, 12));
     }
 }
