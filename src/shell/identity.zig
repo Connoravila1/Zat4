@@ -164,7 +164,18 @@ fn verifiedDocForDid(
     expected_handle: ?[]const u8,
 ) !core.ParsedDoc {
     const url = try core.buildDidDocUrl(scratch, endpoints.plc, did);
-    const resp = try http.request(scratch, io, environ, url, .{});
+    // did:web resolves to a host taken FROM the DID (`https://<host>/.well-known/
+    // did.json`) — a network-derived, attacker-influenced value — so guard it
+    // (SSRF, Phase 1), as with the handle well-known above. did:plc resolves
+    // through the OPERATOR-CONFIGURED plc directory (`endpoints.plc`), a trusted
+    // endpoint that may legitimately be loopback in dev (the tunnel) — so it is
+    // NOT guarded, matching this module's trusted-endpoint doctrine. The guard
+    // enforces https-only + IP-literal block + no redirects for did:web; DNS-
+    // rebind resolve-and-pin stays a noted residual (std's client hides the seam).
+    const did_web = std.mem.startsWith(u8, did, "did:web:");
+    const resp = try http.request(scratch, io, environ, url, .{
+        .guard = if (did_web) .untrusted else .trusted,
+    });
     if (resp.status != 200) return error.DidDocumentFetchFailed;
     return core.parseDidDocument(scratch, resp.body, did, expected_handle);
 }
@@ -243,6 +254,27 @@ test "loopback round trip: DID -> document fetch -> verification -> identity fie
     );
     try std.testing.expectEqualStrings("https://pds.alice.test", doc.pds_url);
     try std.testing.expectEqualStrings("zQ3shLoopbackFixtureKey", doc.signing_key_multibase);
+}
+
+test "did:web doc fetch is SSRF-guarded: a loopback host is refused before connecting" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var scratch_state = std.heap.ArenaAllocator.init(gpa);
+    defer scratch_state.deinit();
+
+    // did:web builds https://<host>/.well-known/did.json from the DID's own host.
+    // A loopback IP-literal must be refused by the .untrusted guard with NO
+    // connection attempt (SSRF). did:plc through the operator plc stays trusted
+    // (the loopback round-trip above proves that path still works).
+    const result = verifiedDocForDid(
+        scratch_state.allocator(),
+        io,
+        null,
+        .{ .plc = "https://plc.directory" },
+        "did:web:127.0.0.1",
+        null,
+    );
+    try std.testing.expectError(error.BlockedAddress, result);
 }
 
 test "dupeIdentity ownership: every string freed by freeIdentity, no leaks" {
