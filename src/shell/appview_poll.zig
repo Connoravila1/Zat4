@@ -268,6 +268,8 @@ pub fn pollRepo(
         for (f.records) |r| {
             if (r.cid.len == 0 or r.value.subject.len == 0) continue;
             if (record_check.isBad(vr, r.cid)) continue; // CID failed verification → reject
+            // Lexicon conformance: the follow subject must be a real DID.
+            if (!record_check.isValidDid(r.value.subject)) continue;
             if (try markSeen(gpa, seen, r.cid)) continue;
             appview.indexFollow(gpa, idx, did, r.value.subject) catch {};
             store.appendFollow(log, arena, did, r.value.subject, r.cid);
@@ -289,6 +291,7 @@ pub fn pollRepo(
         for (f.records) |r| {
             if (r.cid.len == 0 or r.value.subject.cid.len == 0) continue;
             if (record_check.isBad(vr, r.cid)) continue; // CID failed verification → reject
+            if (!record_check.isValidCid(r.value.subject.cid)) continue; // subject must be a real CID
             // setLikeEdge is idempotent and maintains the count; run it every
             // poll so prior-session likes are known (viewer.like) and un-likeable.
             appview.setLikeEdge(gpa, idx, did, r.value.subject.cid, r.uri) catch {};
@@ -308,6 +311,7 @@ pub fn pollRepo(
         for (f.records) |r| {
             if (r.cid.len == 0 or r.value.subject.cid.len == 0) continue;
             if (record_check.isBad(vr, r.cid)) continue; // CID failed verification → reject
+            if (!record_check.isValidCid(r.value.subject.cid)) continue; // subject must be a real CID
             if (try markSeen(gpa, seen, r.cid)) continue;
             appview.indexEngagement(gpa, idx, .repost, r.value.subject.cid) catch {};
             store.appendEngagement(log, arena, .repost, did, r.value.subject.cid, r.cid, r.uri);

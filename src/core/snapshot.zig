@@ -172,6 +172,18 @@ pub fn decode(gpa: Allocator, bytes: []const u8) DecodeError!feed.Store {
 
     try store.string_bytes.appendSlice(gpa, try c.take(@intCast(header.string_len)));
 
+    // Reject a corrupt/oversized count BEFORE it drives a multi-GB resize: with
+    // the string pool already consumed, no collection can hold more elements
+    // than the bytes left to describe them (each element costs at least its
+    // length prefix downstream). A local-cache hardening — without it a bogus
+    // count just OOMs into a cold start; with it, a clean InvalidSnapshot. This
+    // is Phase 2's "a count never sizes memory unchecked" applied to the on-disk
+    // boundary too (the cache is untrusted input like the wire).
+    const remaining = c.bytes.len - c.at;
+    if (header.authors_len > remaining or header.posts_len > remaining or header.feed_len > remaining) {
+        return error.InvalidSnapshot;
+    }
+
     try store.authors.resize(gpa, header.authors_len);
     const authors = store.authors.slice();
     try takeField(&c, authors.items(.did));

@@ -32,6 +32,28 @@
 const std = @import("std");
 const dagjson = @import("dagjson.zig");
 const jsonguard = @import("jsonguard.zig");
+const identity = @import("identity.zig");
+const cid_lib = @import("cid.zig");
+
+// Lexicon-schema conformance at the boundary (Phase 2): the typed parse already
+// enforces field TYPES and the ingest checks required fields are present; these
+// confirm the key fields hold a well-FORMED value of the right kind before a
+// record becomes a core record — a follow's subject is a real DID, a
+// like/repost's subject is a real CID. A malformed one is non-conforming junk
+// (or probing) and is rejected, so the pure core only ever keys on valid ids.
+
+/// Is `s` a syntactically valid atproto DID (did:plc / did:web)?
+pub fn isValidDid(s: []const u8) bool {
+    identity.validateDid(s) catch return false;
+    return true;
+}
+
+/// Is `s` a syntactically valid CIDv1 multibase string?
+pub fn isValidCid(s: []const u8) bool {
+    var bin: [cid_lib.binary_len]u8 = undefined;
+    cid_lib.parse(s, &bin) catch return false;
+    return true;
+}
 
 // Hard caps on attacker-controlled text fields, enforced at the ingest boundary
 // BEFORE the value crosses into the pure core (Phase 2). Generous — well above
@@ -200,6 +222,16 @@ test "a row with no cid is skipped, not counted" {
     defer freeReport(gpa, report);
     try testing.expectEqual(@as(usize, 0), report.checked);
     try testing.expectEqual(@as(usize, 0), badCount(report));
+}
+
+test "isValidDid / isValidCid: accept real ids, reject junk" {
+    try testing.expect(isValidDid("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"));
+    try testing.expect(isValidDid("did:web:example.com"));
+    try testing.expect(!isValidDid("not-a-did"));
+    try testing.expect(!isValidDid(""));
+    try testing.expect(isValidCid("bafyreidykglsfhoixmivffc5uwhcgshx4j465xwqntbmu43nb2dzqwfvae"));
+    try testing.expect(!isValidCid("not-a-cid"));
+    try testing.expect(!isValidCid(""));
 }
 
 test "textWithinLimits: caps length and rejects bad UTF-8" {

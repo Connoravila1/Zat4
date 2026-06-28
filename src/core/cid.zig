@@ -97,6 +97,11 @@ pub fn verifyValue(
 /// the full binary, so a wrong codec/hash simply won't match a recomputed CID.
 pub fn parse(s: []const u8, out: *[binary_len]u8) ParseError!void {
     if (s.len == 0 or s[0] != 'b') return error.NotBase32Multibase;
+    // Bound the attacker-controlled input BEFORE decoding (Phase 2). A CIDv1
+    // string is at most `max_string_len`; a longer one is rejected here rather
+    // than overrunning `buf` in the decoder. (The decoder also bounds its own
+    // writes — defense in depth — but capping here rejects abuse early.)
+    if (s.len > max_string_len) return error.BadLength;
     var buf: [binary_len + 4]u8 = undefined;
     const n = base32DecodeLower(s[1..], &buf) catch return error.BadBase32;
     if (n != binary_len) return error.BadLength;
@@ -151,6 +156,10 @@ fn base32DecodeLower(s: []const u8, out: []u8) error{BadBase32}!usize {
         bits += 5;
         if (bits >= 8) {
             bits -= 8;
+            // Never write past the caller's buffer — a network-supplied string
+            // longer than expected must be a clean error, not an OOB write
+            // (Phase 2: network-derived length never indexes unchecked).
+            if (n >= out.len) return error.BadBase32;
             out[n] = @intCast((acc >> bits) & 0xff);
             n += 1;
             acc &= (@as(u32, 1) << bits) - 1;
@@ -236,6 +245,12 @@ test "parse: errors are explicit and total" {
     try testing.expectError(error.NotBase32Multibase, parse("zfoo", &out));
     try testing.expectError(error.BadBase32, parse("b001", &out)); // '0','1' aren't base32
     try testing.expectError(error.BadLength, parse("bmzxw6", &out)); // valid base32, too short
+    // Over-long, all-valid base32: would decode past the 40-byte buffer — must be
+    // a clean BadLength, never an OOB write (the stack-overflow regression).
+    var long: [201]u8 = undefined;
+    long[0] = 'b';
+    @memset(long[1..], 'a');
+    try testing.expectError(error.BadLength, parse(&long, &out));
     try parse(hello_world_cid, &out); // the real one parses cleanly
 }
 

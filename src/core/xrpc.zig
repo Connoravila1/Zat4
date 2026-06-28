@@ -31,6 +31,7 @@
 //! lifetimes documented per function.
 
 const std = @import("std");
+const jsonguard = @import("jsonguard.zig");
 const Allocator = std.mem.Allocator;
 
 // ---------------------------------------------------------------------------
@@ -109,6 +110,11 @@ pub const DecodeError = error{ MalformedResponseBody, OutOfMemory };
 /// old client (E4). `arena` must be an arena (leaky parse); the returned
 /// record's slices point into it and live exactly as long as it does.
 pub fn decode(comptime T: type, arena: Allocator, body: []const u8) DecodeError!T {
+    // Bound nesting BEFORE std.json (which recurses per level and can blow the
+    // stack on `[[[[…]]]]`). Every other JSON-fed boundary guards depth first;
+    // this is the primary timeline/profile/getRecord read path, so it must too
+    // (Phase 2 — a depth bomb is a clean rejection, not a stack-overflow DoS).
+    if (!jsonguard.depthWithinLimit(body, jsonguard.max_json_depth)) return error.MalformedResponseBody;
     return std.json.parseFromSliceLeaky(T, arena, body, .{
         .ignore_unknown_fields = true,
     }) catch |err| switch (err) {
