@@ -34,6 +34,7 @@ const Allocator = std.mem.Allocator;
 const tui = @import("tui.zig");
 const feed = @import("feed.zig");
 const moderation = @import("moderation.zig");
+const timefmt = @import("timefmt.zig");
 
 // ---------------------------------------------------------------------------
 // State and intent
@@ -561,13 +562,11 @@ pub const WrapIterator = struct {
 // Relative ages — pure arithmetic; "now" always arrives as an argument
 // ---------------------------------------------------------------------------
 
+/// Relative age into `buf`. Delegates to `timefmt` — the single source shared
+/// with the premium feed view (D6); kept as a thin alias so existing callers
+/// (layout.zig, field_ui.zig) are unchanged.
 pub fn formatAge(buf: []u8, now: i64, created: i64) []const u8 {
-    const delta = now - created;
-    if (delta < 60) return std.fmt.bufPrint(buf, "now", .{}) catch "";
-    if (delta < 3_600) return std.fmt.bufPrint(buf, "{d}m", .{@divFloor(delta, 60)}) catch "";
-    if (delta < 86_400) return std.fmt.bufPrint(buf, "{d}h", .{@divFloor(delta, 3_600)}) catch "";
-    if (delta < 604_800) return std.fmt.bufPrint(buf, "{d}d", .{@divFloor(delta, 86_400)}) catch "";
-    return std.fmt.bufPrint(buf, "{d}w", .{@divFloor(delta, 604_800)}) catch "";
+    return timefmt.format(buf, now, created);
 }
 
 // ---------------------------------------------------------------------------

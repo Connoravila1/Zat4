@@ -601,6 +601,7 @@ test {
     _ = @import("core/moderation.zig");
     _ = @import("core/tui.zig");
     _ = @import("core/timeline_ui.zig");
+    _ = @import("core/timefmt.zig");
     _ = @import("core/field.zig");
     _ = @import("core/effect.zig");
     _ = @import("core/field_ui.zig");

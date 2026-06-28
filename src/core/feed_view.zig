@@ -37,6 +37,7 @@ const text = @import("text.zig");
 const raster = @import("raster.zig");
 const lens_socket = @import("lens_socket.zig");
 const text_select = @import("text_select.zig");
+const timefmt = @import("timefmt.zig");
 
 // Palette, copied from field.zig so the view never reaches across a module
 // for a constant (D4: only the value crosses, by copy). ARGB.
@@ -1742,15 +1743,13 @@ pub fn fromTimeline(arena: Allocator, items: []const feed.TimelineItem, now: i64
     return out;
 }
 
-/// Mirrors timeline_ui.formatAge's unit logic (seconds), kept local so the
-/// view does not drag the whole timeline module into its graph (F1 spirit).
+/// Arena-owned relative age. Formats via the shared `timefmt` (the single
+/// source, also used by the TUI — D6) into a stack buffer, then dupes into the
+/// arena. The dedicated one-function module is why this no longer needs a local
+/// copy yet still avoids pulling a whole UI module into the view's graph.
 fn ageStr(arena: Allocator, now: i64, created: i64) error{OutOfMemory}![]const u8 {
-    const d = if (now > created) now - created else 0;
-    if (d < 60) return arena.dupe(u8, "now");
-    if (d < 3_600) return std.fmt.allocPrint(arena, "{d}m", .{@divFloor(d, 60)});
-    if (d < 86_400) return std.fmt.allocPrint(arena, "{d}h", .{@divFloor(d, 3_600)});
-    if (d < 604_800) return std.fmt.allocPrint(arena, "{d}d", .{@divFloor(d, 86_400)});
-    return std.fmt.allocPrint(arena, "{d}w", .{@divFloor(d, 604_800)});
+    var buf: [16]u8 = undefined;
+    return arena.dupe(u8, timefmt.format(&buf, now, created));
 }
 
 const avatar_tints = [_]u32{ 0xFFCAA3A8, 0xFF9FC7A0, 0xFFE0C074, 0xFFA9B6D6, 0xFFD6A87F, 0xFFB5A9CC };

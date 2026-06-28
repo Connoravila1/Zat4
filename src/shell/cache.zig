@@ -442,12 +442,14 @@ pub fn loadSessionAt(gpa: Allocator, path: []const u8) ?auth.Session {
     };
 }
 
+/// Free a session loaded from disk. Delegates to the auth module, which owns
+/// the Session free contract (D5): ONE freer for the shared type, so a loaded
+/// session and a logged-in one release identically. This also covers the oauth
+/// fields (scope/issuer/token_endpoint/nonce) and scrubs the token secrets —
+/// the hand-rolled version here did neither, so an oauth session freed through
+/// this path leaked and left secrets in freed pages (C4/C5).
 pub fn freeSession(gpa: Allocator, session: *const auth.Session) void {
-    gpa.free(session.did);
-    gpa.free(session.handle);
-    gpa.free(session.pds_url);
-    gpa.free(session.access_jwt);
-    gpa.free(session.refresh_jwt);
+    auth.freeSession(gpa, session.*);
 }
 
 pub fn sessionPath(buf: []u8, environ: ?*const std.process.Environ.Map) ?[]const u8 {
