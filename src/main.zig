@@ -593,6 +593,7 @@ test {
     _ = @import("shell/oauth.zig");
     _ = @import("shell/xrpc.zig");
     _ = @import("shell/auth.zig");
+    _ = @import("shell/keystore.zig");
     _ = @import("core/feed.zig");
     _ = @import("core/feed_view.zig");
     _ = @import("core/lens_socket.zig");

@@ -97,6 +97,22 @@ fn winOpen(path: []const u8, write: bool) ?*anyopaque {
 const snapshot = @import("../core/snapshot.zig");
 const feed = @import("../core/feed.zig");
 const auth = @import("auth.zig");
+const keystore = @import("keystore.zig");
+
+// Keystore keys (Phase 4): both session blobs live in the OS keystore when one
+// is available, off the 0600 plaintext file (see saveSessionAt / the SECURITY
+// NOTE on the oauth section). Keystore use is gated to Linux for now — libsecret
+// is the only backend; macOS Keychain / Windows Credential Manager are the
+// follow-ups behind keystore.zig's same interface, so those platforms keep the
+// 0600 file until then.
+const session_keystore_key = "app-password-session";
+const oauth_keystore_key = "oauth-session";
+// Linux only (libsecret is the sole backend) AND never in test builds — the
+// cache tests must exercise the file path deterministically and must NEVER touch
+// the developer's real keyring (a fixed production key would clobber a live
+// saved session). `keystore.zig` has its own test for the FFI (dedicated key,
+// self-cleaning); the cache↔keystore wiring is validated live (--oauth-resume).
+const keystore_supported = builtin.os.tag == .linux and !builtin.is_test;
 
 const store_file = "store.zat";
 const session_file = "session.zat";
@@ -390,13 +406,36 @@ pub fn saveSessionAt(gpa: Allocator, path: []const u8, session: *const auth.Sess
         out.appendSlice(arena, std.mem.asBytes(&len)) catch return false;
         out.appendSlice(arena, field) catch return false;
     }
+    // Phase 4: prefer the OS keystore (secrets off plaintext). On a VERIFIED
+    // store (keystore.put reads back to confirm), drop any 0600 fallback so no
+    // plaintext sibling lingers — the "encrypt one file, leave the other" theater
+    // the SECURITY NOTE warns about. If the keystore is absent/locked, fall back
+    // to the 0600 file unchanged.
+    if (keystore_supported and keystore.put(gpa, session_keystore_key, out.items)) {
+        unlink(path);
+        return true;
+    }
     return writeFileAtomic(path, out.items, 0o600);
 }
 
-/// Loaded strings are gpa-owned; release with `freeSession`.
+/// Loaded strings are gpa-owned; release with `freeSession`. Reads the keystore
+/// first (Phase 4), then the 0600 file (legacy / fallback / pre-migration — a
+/// file hit migrates to the keystore on the next save).
 pub fn loadSessionAt(gpa: Allocator, path: []const u8) ?auth.Session {
+    if (keystore_supported) {
+        if (keystore.get(gpa, session_keystore_key)) |blob| {
+            defer gpa.free(blob);
+            if (parseSession(gpa, blob)) |s| return s;
+        }
+    }
     const bytes = readFileAlloc(gpa, path) orelse return null;
     defer gpa.free(bytes);
+    return parseSession(gpa, bytes);
+}
+
+/// Parse a session blob (keystore secret or file bytes) into an owned Session.
+/// Borrows `bytes` (dupes every field into `gpa`); the caller frees `bytes`.
+fn parseSession(gpa: Allocator, bytes: []const u8) ?auth.Session {
     if (bytes.len < 6 or !std.mem.eql(u8, bytes[0..4], &session_magic)) return null;
     if (std.mem.bytesToValue(u16, bytes[4..6]) != session_version) return null;
 
@@ -465,13 +504,13 @@ pub fn sessionPath(buf: []u8, environ: ?*const std.process.Environ.Map) ?[]const
 // length-prefixed strings. Persisting the key is what lets a DPoP login survive
 // a relaunch (the binding is only useful if the key is stable).
 //
-// SECURITY NOTE (the keystore is the next hardening, slice 5b): the DPoP key
-// and refresh token sit here at 0600 plaintext — the SAME exposure the app-
-// password `session.zat` already carries for its refresh token. The real
-// upgrade is moving BOTH into the OS keystore (libsecret/Keychain/Credential
-// Manager); encrypting only this file while the sibling sits plaintext would be
-// security theater. So this matches the existing posture and the keystore pass
-// hardens the whole cache at once.
+// SECURITY (slice 5b — DONE on Linux): the DPoP key + refresh token go into the
+// OS keystore (libsecret) when available; the 0600 file is the fallback only
+// where no keystore exists, and a keystore store deletes any plaintext sibling
+// (saveOAuthSessionAt below). BOTH session blobs are covered (app-password + this
+// one), so there is no "encrypt one, leave the other" theater. macOS Keychain /
+// Windows Credential Manager are the follow-ups behind keystore.zig's interface;
+// those platforms keep the 0600 posture until then.
 const oauth_session_magic = [4]u8{ 'Z', 'A', 'T', 'O' };
 const oauth_session_version: u16 = 1;
 
@@ -497,13 +536,32 @@ pub fn saveOAuthSessionAt(gpa: Allocator, path: []const u8, sess: *const auth.Se
     const nlen: u32 = @intCast(nonce.len);
     out.appendSlice(arena, std.mem.asBytes(&nlen)) catch return false;
     out.appendSlice(arena, nonce) catch return false;
+    // Phase 4: keystore-first (DPoP key + refresh token off plaintext), file
+    // fallback. A verified store removes the plaintext sibling. See saveSessionAt.
+    if (keystore_supported and keystore.put(gpa, oauth_keystore_key, out.items)) {
+        unlink(path);
+        return true;
+    }
     return writeFileAtomic(path, out.items, 0o600);
 }
 
-/// Loaded strings are gpa-owned; release with `auth.freeSession`.
+/// Loaded strings are gpa-owned; release with `auth.freeSession`. Keystore first
+/// (Phase 4), then the 0600 file (legacy / fallback / pre-migration).
 pub fn loadOAuthSessionAt(gpa: Allocator, path: []const u8) ?auth.Session {
+    if (keystore_supported) {
+        if (keystore.get(gpa, oauth_keystore_key)) |blob| {
+            defer gpa.free(blob);
+            if (parseOAuthSession(gpa, blob)) |s| return s;
+        }
+    }
     const bytes = readFileAlloc(gpa, path) orelse return null;
     defer gpa.free(bytes);
+    return parseOAuthSession(gpa, bytes);
+}
+
+/// Parse an oauth session blob (keystore secret or file bytes); borrows `bytes`
+/// (dupes fields into `gpa`), the caller frees `bytes`.
+fn parseOAuthSession(gpa: Allocator, bytes: []const u8) ?auth.Session {
     // 4 magic + 2 version + 32 key = 38 byte header minimum.
     if (bytes.len < 38 or !std.mem.eql(u8, bytes[0..4], &oauth_session_magic)) return null;
     if (std.mem.bytesToValue(u16, bytes[4..6]) != oauth_session_version) return null;
