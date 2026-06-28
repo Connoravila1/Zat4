@@ -96,13 +96,14 @@ fn fetch(
 }
 
 /// Re-derive and check every record CID in a raw listRecords body against the
-/// PDS's claim (verify-don't-trust). LOG-ONLY for now: a mismatch is reported
-/// to the journal but the record is still indexed, so we confirm our DAG-CBOR
-/// reproduces every legitimate record's CID on real data BEFORE promoting this
-/// to a hard reject. `total_bad` accumulates across a poll cycle for the
-/// per-repo summary. Pure check; only the logging is a side effect (B3 — this
-/// is the shell). Commit-signature verification (proving repo authorship) needs
-/// the signed firehose commit and stays gated on the Tap cutover.
+/// PDS's claim (verify-don't-trust). ENFORCING: the returned report names the
+/// failing CIDs, and each ingest loop SKIPS records whose cid is in it
+/// (`record_check.isBad`) — a record whose bytes don't hash to its claimed CID
+/// (tampered/corrupt) or won't canonically encode (can't be vouched for) is NOT
+/// indexed. A failing row never blocks its honest neighbours. The CALLER frees
+/// the report (`record_check.freeReport`). `total_*` accumulate for the per-repo
+/// log. Commit-signature verification (proving repo authorship) needs the signed
+/// firehose commit and stays gated on the Tap cutover.
 fn verifyCids(
     gpa: Allocator,
     raw: []const u8,
@@ -110,16 +111,18 @@ fn verifyCids(
     collection: []const u8,
     total_checked: *usize,
     total_bad: *usize,
-) void {
+) record_check.Report {
     const report = record_check.checkListRecords(gpa, raw);
     total_checked.* += report.checked;
     total_bad.* += record_check.badCount(report);
     if (record_check.badCount(report) > 0) {
+        const example: []const u8 = if (report.bad_cids.len > 0) report.bad_cids[0] else "";
         std.debug.print(
-            "[verify] CID MISMATCH {s} {s}: {d} checked, {d} mismatch, {d} unverifiable (first bad: {s})\n",
-            .{ did, collection, report.checked, report.mismatched, report.unverifiable, record_check.firstBad(&report) },
+            "[verify] REJECTING {d} record(s) from {s} {s}: {d} mismatch, {d} unverifiable (e.g. {s}) — CID did not match the PDS claim\n",
+            .{ record_check.badCount(report), did, collection, report.mismatched, report.unverifiable, example },
         );
     }
+    return report;
 }
 
 /// True if `cid` was ALREADY applied (caller skips); otherwise records it. Keyed
@@ -193,10 +196,14 @@ pub fn pollRepo(
         }
         var fetched_name: []const u8 = "";
         if (try fetch(arena, io, environ, pds_url, did, lexicon.collection.profile, ProfileValue)) |f| {
-            verifyCids(gpa, f.raw, did, "profile", &v_checked, &v_bad);
-            // Phase 2: only accept a display name within the cap and valid UTF-8;
-            // a bad one is dropped (the DID still shows), never indexed.
-            if (f.records.len > 0 and record_check.textWithinLimits(f.records[0].value.displayName, record_check.max_display_name)) {
+            const vr = verifyCids(gpa, f.raw, did, "profile", &v_checked, &v_bad);
+            defer record_check.freeReport(gpa, vr);
+            // Accept the display name only if the profile record's CID verifies
+            // AND the name is within the cap and valid UTF-8; otherwise the DID
+            // still shows, nothing bad is indexed.
+            if (f.records.len > 0 and !record_check.isBad(vr, f.records[0].cid) and
+                record_check.textWithinLimits(f.records[0].value.displayName, record_check.max_display_name))
+            {
                 fetched_name = f.records[0].value.displayName;
             }
         }
@@ -216,11 +223,15 @@ pub fn pollRepo(
     // so it survives a restart without a re-poll. (The append rides inside the
     // index lock; at Cut-1 author/post rates the write is trivial — G3.)
     if (try fetch(arena, io, environ, pds_url, did, lexicon.collection.post, lexicon.PostRecord)) |f| {
-        verifyCids(gpa, f.raw, did, "post", &v_checked, &v_bad);
+        const vr = verifyCids(gpa, f.raw, did, "post", &v_checked, &v_bad);
+        defer record_check.freeReport(gpa, vr);
         lock.lock();
         defer lock.unlock();
         for (f.records) |r| {
             if (r.cid.len == 0) continue;
+            // Trust boundary: a record whose bytes don't hash to its claimed CID
+            // is rejected, not indexed (verify-don't-trust).
+            if (record_check.isBad(vr, r.cid)) continue;
             // Phase 2: cap + UTF-8-validate the free-text BEFORE it crosses into
             // the core. An over-limit / malformed post is rejected at the
             // boundary (generous cap — real posts are tiny), not indexed.
@@ -250,11 +261,13 @@ pub fn pollRepo(
     // Follows — indexFollow appends, so gate on the follow record's cid; a
     // newly-applied edge is persisted, and replay refills `seen` from it.
     if (try fetch(arena, io, environ, pds_url, did, lexicon.collection.follow, FollowValue)) |f| {
-        verifyCids(gpa, f.raw, did, "follow", &v_checked, &v_bad);
+        const vr = verifyCids(gpa, f.raw, did, "follow", &v_checked, &v_bad);
+        defer record_check.freeReport(gpa, vr);
         lock.lock();
         defer lock.unlock();
         for (f.records) |r| {
             if (r.cid.len == 0 or r.value.subject.len == 0) continue;
+            if (record_check.isBad(vr, r.cid)) continue; // CID failed verification → reject
             if (try markSeen(gpa, seen, r.cid)) continue;
             appview.indexFollow(gpa, idx, did, r.value.subject) catch {};
             store.appendFollow(log, arena, did, r.value.subject, r.cid);
@@ -264,7 +277,8 @@ pub fn pollRepo(
     // Likes — fully edge-managed: setLikeEdge maintains both the count and the
     // viewer.like uri (the single source of truth).
     if (try fetch(arena, io, environ, pds_url, did, lexicon.collection.like, RefValue)) |f| {
-        verifyCids(gpa, f.raw, did, "like", &v_checked, &v_bad);
+        const vr = verifyCids(gpa, f.raw, did, "like", &v_checked, &v_bad);
+        defer record_check.freeReport(gpa, vr);
         lock.lock();
         defer lock.unlock();
         // Reconcile this actor's like edges with their CURRENT records: drop the
@@ -274,6 +288,7 @@ pub fn pollRepo(
         appview.clearLikeEdgesForActor(gpa, idx, did);
         for (f.records) |r| {
             if (r.cid.len == 0 or r.value.subject.cid.len == 0) continue;
+            if (record_check.isBad(vr, r.cid)) continue; // CID failed verification → reject
             // setLikeEdge is idempotent and maintains the count; run it every
             // poll so prior-session likes are known (viewer.like) and un-likeable.
             appview.setLikeEdge(gpa, idx, did, r.value.subject.cid, r.uri) catch {};
@@ -286,22 +301,24 @@ pub fn pollRepo(
 
     // Reposts — same idempotency gate as likes.
     if (try fetch(arena, io, environ, pds_url, did, lexicon.collection.repost, RefValue)) |f| {
-        verifyCids(gpa, f.raw, did, "repost", &v_checked, &v_bad);
+        const vr = verifyCids(gpa, f.raw, did, "repost", &v_checked, &v_bad);
+        defer record_check.freeReport(gpa, vr);
         lock.lock();
         defer lock.unlock();
         for (f.records) |r| {
             if (r.cid.len == 0 or r.value.subject.cid.len == 0) continue;
+            if (record_check.isBad(vr, r.cid)) continue; // CID failed verification → reject
             if (try markSeen(gpa, seen, r.cid)) continue;
             appview.indexEngagement(gpa, idx, .repost, r.value.subject.cid) catch {};
             store.appendEngagement(log, arena, .repost, did, r.value.subject.cid, r.cid, r.uri);
         }
     }
 
-    // Per-repo trust-boundary summary (TEMP, log-only phase): positive proof the
-    // check is running on real data. Anomalies already logged inline above. This
-    // line goes away when CID verification is promoted to a hard reject.
-    if (v_checked > 0) {
-        std.debug.print("[verify] {s}: {d} record CIDs checked, {d} bad (log-only)\n", .{ did, v_checked, v_bad });
+    // Trust-boundary enforcement is now silent on the happy path; only rejections
+    // are logged (inline, per collection above). A per-repo line fires only when
+    // something was actually rejected this cycle.
+    if (v_bad > 0) {
+        std.debug.print("[verify] {s}: {d} record CIDs checked, {d} REJECTED (CID mismatch)\n", .{ did, v_checked, v_bad });
     }
 
     return added;

@@ -23,9 +23,11 @@
 //! from its `value` bytes (via the dagjson → DAG-CBOR → CID path the rest of the
 //! crypto stack uses) and confirms it matches — so a PDS that tampers a record
 //! in flight, or serves a corrupted one, is caught instead of trusted (the
-//! "verify don't trust" principle made live). Pure: a response body in, a tally
-//! out, no I/O. It NEVER throws — a malformed body or row is COUNTED, not
-//! raised, so one bad PDS response cannot break the poll loop (E2/E4).
+//! "verify don't trust" principle made live). Pure: a response body in, a report
+//! out, no I/O. It NEVER throws — a malformed body or row is COUNTED, not raised,
+//! so one bad PDS response cannot break the poll loop (E2/E4). The report names
+//! the failing CIDs so the ingest rejects EXACTLY those records (a tampered row
+//! never blocks its honest neighbours).
 
 const std = @import("std");
 const dagjson = @import("dagjson.zig");
@@ -56,40 +58,43 @@ pub const Report = struct {
     /// Checked rows whose recomputed CID did NOT match the claim (tampering).
     mismatched: usize = 0,
     /// Checked rows whose value would not parse / convert / encode — cannot be
-    /// vouched for, so treated as suspect (counted, never silently passed).
+    /// vouched for, so treated as suspect (counted + rejected, never passed).
     unverifiable: usize = 0,
-    /// The first claimed CID that failed (mismatch or unverifiable), copied in
-    /// for a log line — `firstBad()` reads it. Empty when everything checked out.
-    first_bad_buf: [96]u8 = undefined,
-    first_bad_len: usize = 0,
+    /// The claimed CIDs that FAILED (mismatch or unverifiable) — owned by the
+    /// gpa passed to `checkListRecords`. The ingest rejects records whose cid is
+    /// in here (`isBad`). Free with `freeReport`. Empty when everything checked.
+    bad_cids: [][]const u8 = &.{},
 };
 
-/// Bad rows (mismatch + unverifiable) — the count that matters for a verdict.
+/// How many records failed verification (the count that gates a verdict).
 pub fn badCount(report: Report) usize {
-    return report.mismatched + report.unverifiable;
+    return report.bad_cids.len;
 }
 
-/// The first failing CID (borrows `report`); "" if all clean.
-pub fn firstBad(report: *const Report) []const u8 {
-    return report.first_bad_buf[0..report.first_bad_len];
+/// Did this record's CID fail verification? (→ the ingest must reject it.)
+pub fn isBad(report: Report, cid: []const u8) bool {
+    for (report.bad_cids) |b| {
+        if (std.mem.eql(u8, b, cid)) return true;
+    }
+    return false;
 }
 
-fn noteBad(report: *Report, claimed: []const u8) void {
-    if (report.first_bad_len != 0) return;
-    const n = @min(claimed.len, report.first_bad_buf.len);
-    @memcpy(report.first_bad_buf[0..n], claimed[0..n]);
-    report.first_bad_len = n;
+/// Release a report's owned bad-cid list. Safe on the empty default.
+pub fn freeReport(gpa: std.mem.Allocator, report: Report) void {
+    for (report.bad_cids) |c| gpa.free(c);
+    gpa.free(report.bad_cids);
 }
 
 /// Check every record CID in a listRecords response `body`. `gpa` funds the
-/// per-record conversion arenas. A row with an empty/missing cid is skipped
-/// (not counted). A malformed body returns a report with one unverifiable.
+/// per-record conversion arenas AND the returned bad-cid list. A row with an
+/// empty/missing cid is skipped (not counted). A malformed body returns one
+/// unverifiable and no bad cids (the typed parse the caller already did would
+/// have rejected such a body first, so this is the unreachable-but-safe case).
 pub fn checkListRecords(gpa: std.mem.Allocator, body: []const u8) Report {
     var report: Report = .{};
     // Bound adversarial nesting before std.json walks the whole document (Phase 2).
     if (!jsonguard.depthWithinLimit(body, jsonguard.max_json_depth)) {
         report.unverifiable = 1;
-        noteBad(&report, "<malformed-body>");
         return report;
     }
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -98,7 +103,6 @@ pub fn checkListRecords(gpa: std.mem.Allocator, body: []const u8) Report {
 
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch {
         report.unverifiable = 1;
-        noteBad(&report, "<malformed-body>");
         return report;
     };
     const root = switch (parsed) {
@@ -110,6 +114,8 @@ pub fn checkListRecords(gpa: std.mem.Allocator, body: []const u8) Report {
         .array => |a| a,
         else => return report,
     };
+
+    var bad: std.ArrayListUnmanaged([]const u8) = .empty;
     for (rows.items) |row| {
         const obj = switch (row) {
             .object => |o| o,
@@ -124,47 +130,30 @@ pub fn checkListRecords(gpa: std.mem.Allocator, body: []const u8) Report {
         report.checked += 1;
         const ok = dagjson.verifyParsedRecord(gpa, value, claimed) catch {
             report.unverifiable += 1;
-            noteBad(&report, claimed);
+            noteBad(gpa, &bad, claimed);
             continue;
         };
         if (!ok) {
             report.mismatched += 1;
-            noteBad(&report, claimed);
+            noteBad(gpa, &bad, claimed);
         }
     }
+    report.bad_cids = bad.toOwnedSlice(gpa) catch &.{};
     return report;
 }
 
+/// Append an owned copy of a failing cid; on OOM, drop it (degraded, not a
+/// crash — the worst case is that one record isn't rejected this cycle).
+fn noteBad(gpa: std.mem.Allocator, bad: *std.ArrayListUnmanaged([]const u8), claimed: []const u8) void {
+    const c = gpa.dupe(u8, claimed) catch return;
+    bad.append(gpa, c) catch gpa.free(c);
+}
+
 // ---------------------------------------------------------------------------
-// Tests — a tiny real record + its real CID, plus a tampered one.
+// Tests
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
-
-test "clean listing verifies; a tampered value is caught" {
-    const gpa = testing.allocator;
-    // A record value and the CID of its canonical DAG-CBOR. Reuse dagjson's own
-    // verified path to derive the truth, so this test pins the listing wrapper,
-    // not the (separately golden-tested) CID math.
-    const value =
-        \\{"$type":"app.zat4.feed.post","text":"hello","createdAt":"2026-01-01T00:00:00Z"}
-    ;
-    // Find the true CID via a self-check: any string that verifyRecordCid
-    // accepts. We instead assert behavior at the listing level with a KNOWN
-    // mismatch (a syntactically valid but wrong CID) and a malformed row.
-    const wrong_cid = "bafyre4aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const body = try std.fmt.allocPrint(gpa,
-        \\{{"records":[{{"uri":"at://x/app.zat4.feed.post/1","cid":"{s}","value":{s}}}],"cursor":null}}
-    , .{ wrong_cid, value });
-    defer gpa.free(body);
-
-    const report = checkListRecords(gpa, body);
-    try testing.expectEqual(@as(usize, 1), report.checked);
-    // The claimed CID is wrong, so it is either a mismatch (parsed fine, hash
-    // differs) — never a silent pass.
-    try testing.expect(badCount(report) >= 1);
-    try testing.expectEqualStrings(wrong_cid, firstBad(&report));
-}
 
 test "a clean listing passes with zero bad (real record + its true CID)" {
     const gpa = testing.allocator;
@@ -174,24 +163,32 @@ test "a clean listing passes with zero bad (real record + its true CID)" {
         \\{"records":[{"uri":"at://x/c/1","cid":"bafyreidykglsfhoixmivffc5uwhcgshx4j465xwqntbmu43nb2dzqwfvae","value":{"hello":"world"}}]}
     ;
     const report = checkListRecords(gpa, body);
+    defer freeReport(gpa, report);
     try testing.expectEqual(@as(usize, 1), report.checked);
     try testing.expectEqual(@as(usize, 0), badCount(report));
-    try testing.expectEqualStrings("", firstBad(&report));
+}
+
+test "a tampered value is caught and named in bad_cids" {
+    const gpa = testing.allocator;
+    const wrong_cid = "bafyre4aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const body = try std.fmt.allocPrint(gpa,
+        \\{{"records":[{{"uri":"at://x/app.zat4.feed.post/1","cid":"{s}","value":{{"$type":"app.zat4.feed.post","text":"hello"}}}}]}}
+    , .{wrong_cid});
+    defer gpa.free(body);
+
+    const report = checkListRecords(gpa, body);
+    defer freeReport(gpa, report);
+    try testing.expectEqual(@as(usize, 1), report.checked);
+    try testing.expect(badCount(report) >= 1);
+    try testing.expect(isBad(report, wrong_cid)); // the failing cid is named
+    try testing.expect(!isBad(report, "some-other-cid")); // an honest neighbour is not
 }
 
 test "malformed body is unverifiable, never a throw" {
     const gpa = testing.allocator;
     const report = checkListRecords(gpa, "{not json");
+    defer freeReport(gpa, report);
     try testing.expectEqual(@as(usize, 1), report.unverifiable);
-    try testing.expect(badCount(report) >= 1);
-}
-
-test "textWithinLimits: caps length and rejects bad UTF-8" {
-    try testing.expect(textWithinLimits("hello", 64));
-    try testing.expect(textWithinLimits("", 64));
-    try testing.expect(!textWithinLimits("toolong", 4)); // over the cap
-    try testing.expect(!textWithinLimits("\xff\xfe", 64)); // invalid UTF-8
-    try testing.expect(textWithinLimits("café ☕", 64)); // valid multibyte UTF-8
 }
 
 test "a row with no cid is skipped, not counted" {
@@ -200,6 +197,15 @@ test "a row with no cid is skipped, not counted" {
         \\{"records":[{"uri":"at://x/c/1","value":{"$type":"x","text":"y"}}]}
     ;
     const report = checkListRecords(gpa, body);
+    defer freeReport(gpa, report);
     try testing.expectEqual(@as(usize, 0), report.checked);
     try testing.expectEqual(@as(usize, 0), badCount(report));
+}
+
+test "textWithinLimits: caps length and rejects bad UTF-8" {
+    try testing.expect(textWithinLimits("hello", 64));
+    try testing.expect(textWithinLimits("", 64));
+    try testing.expect(!textWithinLimits("toolong", 4)); // over the cap
+    try testing.expect(!textWithinLimits("\xff\xfe", 64)); // invalid UTF-8
+    try testing.expect(textWithinLimits("café ☕", 64)); // valid multibyte UTF-8
 }
