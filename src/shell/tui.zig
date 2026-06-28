@@ -511,6 +511,16 @@ pub fn run(
     var thread_focus_uri: []const u8 = "";
     var thread_dirty = false;
     var thread_return_screen: u8 = 0;
+    // ZONE page (a tag-scoped feed): tapping a `#tag` in a post's tray opens it.
+    // On entry the shell fetches the zone (`feed_shell.loadZoneFeed`) as CONTENT;
+    // the ordering is a query (`feed_core.buildTagView`) keyed by the tag. The
+    // tag (display form) is sent to the AppView's getPostsForTag, which normalizes
+    // it. `zone_return_screen` is where Back goes.
+    var on_zone_prev = false;
+    var zone_tag_buf: [256]u8 = undefined;
+    var zone_tag: []const u8 = "";
+    var zone_dirty = false;
+    var zone_return_screen: u8 = 0;
     // RE-ROOT mode: false when a thread is opened from the timeline (show the WHOLE
     // thread, scroll to the focus); true when a reply is tapped INSIDE the thread
     // (re-root on it: condensed ancestors above + the focus + its subtree).
@@ -758,15 +768,37 @@ pub fn run(
         }
         on_thread_prev = on_thread;
 
+        // Zone page: on ENTERING (a tag-pill tap flips gscreen) or a tag change,
+        // fetch the zone's posts as CONTENT into the SHARED store. The view
+        // ordering is then a query (buildTagView). Same E2 containment.
+        const on_zone = mode == .timeline and gscreen == feed_view.screen_zones;
+        if (on_zone and (!on_zone_prev or zone_dirty)) {
+            const zo = feed_shell.loadZoneFeed(gpa, arena, io, environ, session, appview_url, store, zone_tag, 50) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => blk: {
+                    status = "zone: network error"; // contained
+                    break :blk null;
+                },
+            };
+            if (zo) |result| switch (result) {
+                .ok => {},
+                .failed => status = "zone: unavailable",
+            };
+            zone_dirty = false;
+        }
+        on_zone_prev = on_zone;
+
         // The ACTIVE view: Home (one ordering over the store), the profile screen
-        // (the TARGET author's posts), or a post's THREAD — each a query over the
-        // SAME store. One list of view-models the render + input + engagement
-        // paths all key off; the post records (and so engagement + identity) are
-        // shared (ZONES invariant 4).
+        // (the TARGET author's posts), a post's THREAD, or a ZONE (a tag query) —
+        // each a query over the SAME store. One list of view-models the render +
+        // input + engagement paths all key off; the post records (and so
+        // engagement + identity) are shared (ZONES invariant 4).
         const view_items: []const feed_core.TimelineItem = if (on_thread)
             try feed_core.buildThreadView(arena, store, thread_focus_cid, thread_rerooted, gcollapsed.items)
         else if (on_profile)
             try feed_core.buildAuthorView(arena, store, profile_target_did)
+        else if (on_zone)
+            try feed_core.buildTagView(arena, store, zone_tag)
         else
             try feed_core.buildTimeline(arena, store);
         const profile_header = try profileHeaderFor(arena, session, gscreen, profile_target_did, view_items);
@@ -824,8 +856,9 @@ pub fn run(
         // sockets are always open, so there's no tray-close there).
         const left_loadout_page = prev_screen == feed_view.screen_loadout and gscreen != feed_view.screen_loadout;
         const left_thread = prev_screen == feed_view.screen_thread and gscreen != feed_view.screen_thread;
+        const left_zone = prev_screen == feed_view.screen_zones and gscreen != feed_view.screen_zones;
         const tray_closed = socket_was_open and !gsocket_ui.open;
-        if ((tray_closed or left_loadout_page or left_thread) and loadout_dirty) {
+        if ((tray_closed or left_loadout_page or left_thread or left_zone) and loadout_dirty) {
             if (writer) |w| {
                 // Write the WHOLE record (all three surfaces) so one surface's
                 // edit doesn't clobber the others. ids slice into each surface's
@@ -849,11 +882,20 @@ pub fn run(
         // (drawn inline after the root + author self-thread). Elsewhere (home
         // header, loadout page) it's the FEED socket. Accent stays feed-derived
         // — reply seating never retints (owner rule).
+        // The socket-of-the-screen: REPLY socket on a thread, the ZONE socket on a
+        // zone page, the FEED socket on Home. Each is a switcher over its own
+        // surface's loadout (the three the Algorithms page edits).
         const on_thread_screen = gscreen == feed_view.screen_thread;
-        const cur_socket_tray: lens_socket.TrayView = if (on_thread_screen) .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated } else home_tray;
-        const cur_socket_ui = if (on_thread_screen) reply_ui else gsocket_ui;
-        const cur_socket_hits = if (on_thread_screen) &reply_hits else &gsocket_hits;
-        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = lens_socket.seatedAccent(home_tray), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .loadout_geoms = &page_geoms } else null;
+        const on_zone_screen = gscreen == feed_view.screen_zones;
+        const cur_socket_tray: lens_socket.TrayView = if (on_thread_screen)
+            .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }
+        else if (on_zone_screen)
+            .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }
+        else
+            home_tray;
+        const cur_socket_ui = if (on_thread_screen) reply_ui else if (on_zone_screen) zone_ui else gsocket_ui;
+        const cur_socket_hits = if (on_thread_screen) &reply_hits else if (on_zone_screen) &zone_hits else &gsocket_hits;
+        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = lens_socket.seatedAccent(home_tray), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "" } else null;
         switch (mode) {
             .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status),
             .compose => {
@@ -1259,6 +1301,32 @@ pub fn run(
                                             else => applyLoadoutAction(sact, reply_cards, reply_blob, &reply_seated, &reply_ui, &loadout_dirty),
                                         }
                                     }
+                                } else if (gscreen == feed_view.screen_zones) {
+                                    // The zone page's socket: a switcher over the ZONE
+                                    // loadout (shared with the Algorithms page). Order-only;
+                                    // no real ranking power yet (the discover engine is
+                                    // unbuilt). Reorder lives on the Algorithms page.
+                                    if (lens_socket.hitTest(g.socket_hits.items, rx, ry)) |sact| {
+                                        socket_handled = true;
+                                        switch (sact) {
+                                            .toggle_tray => zone_ui.open = !zone_ui.open,
+                                            .seat => |cid| {
+                                                if (trayIndexOfCid(zone_cards, zone_blob, cid)) |idx| {
+                                                    zone_seated = idx;
+                                                    loadout_dirty = true;
+                                                }
+                                                zone_ui.open = false;
+                                                zone_ui.expanded = null;
+                                                zone_ui.picking = null;
+                                            },
+                                            .get_more => {
+                                                zone_ui.open = false;
+                                                gscreen = feed_view.screen_loadout;
+                                                gscroll_px = 0;
+                                            },
+                                            else => applyLoadoutAction(sact, zone_cards, zone_blob, &zone_seated, &zone_ui, &loadout_dirty),
+                                        }
+                                    }
                                 } else if (lens_socket.hitTest(g.socket_hits.items, rx, ry)) |sact| {
                                     socket_handled = true;
                                     // Any socket action other than opening/using the picker
@@ -1444,7 +1512,7 @@ pub fn run(
                                         .like, .repost => if (hit.post < view_items.len) {
                                             state.selected = hit.post;
                                             const ek: Engagement = if (hit.kind == .like) .like else .repost;
-                                            const r = try engageSelected(ek, gpa, arena, session, store, view_items[hit.post], hit.post, gscreen, profile_target_did, thread_focus_cid, thread_rerooted, gcollapsed.items, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
+                                            const r = try engageSelected(ek, gpa, arena, session, store, view_items[hit.post], hit.post, gscreen, profile_target_did, thread_focus_cid, zone_tag, thread_rerooted, gcollapsed.items, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
                                             if (r.status.len > 0) status = r.status;
                                         },
                                         // Reply → open the premium composer in reply
@@ -1510,7 +1578,9 @@ pub fn run(
                                         },
                                         // Back (thread top bar) → the prior screen.
                                         .back => {
-                                            gscreen = thread_return_screen;
+                                            // The zone page and the thread share the Back
+                                            // button; each returns to where it was entered from.
+                                            gscreen = if (gscreen == feed_view.screen_zones) zone_return_screen else thread_return_screen;
                                             g.scroll.* = 0;
                                         },
                                         // "N new posts" pill → reveal the staged
@@ -1554,6 +1624,27 @@ pub fn run(
                                             } else |_| {}
                                         },
                                         .bookmark, .share, .more, .profile_tab => {},
+                                        // Tag pill → ENTER its zone. The region carries the
+                                        // post index in `post` and the tag's index in `_pad`;
+                                        // resolve the display tag, open the zone page, and let
+                                        // the fetch-on-enter pull the zone feed (buildTagView).
+                                        .zone_jump => if (hit.post < view_items.len) {
+                                            const tags = view_items[hit.post].tags;
+                                            if (hit._pad < tags.len) {
+                                                const t = tags[hit._pad];
+                                                if (t.len > 0 and t.len <= zone_tag_buf.len) {
+                                                    @memcpy(zone_tag_buf[0..t.len], t);
+                                                    // Back returns to where we came FROM (don't
+                                                    // overwrite it on a zone→zone hop).
+                                                    if (gscreen != feed_view.screen_zones) zone_return_screen = gscreen;
+                                                    zone_tag = zone_tag_buf[0..t.len];
+                                                    gscreen = feed_view.screen_zones;
+                                                    zone_dirty = true;
+                                                    gscroll_px = 0;
+                                                    gsocket_ui.open = false; // tuck the home socket
+                                                }
+                                            }
+                                        },
                                         // Settings → Sign out: flag it and leave the
                                         // run loop. The caller (main) clears the cached
                                         // session instead of re-saving it, so the next
@@ -1822,12 +1913,12 @@ pub fn run(
                     }
                 },
                 .like => if (view_items.len > 0) {
-                    const r = try engageSelected(.like, gpa, arena, session, store, view_items[state.selected], state.selected, gscreen, profile_target_did, thread_focus_cid, thread_rerooted, gcollapsed.items, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
+                    const r = try engageSelected(.like, gpa, arena, session, store, view_items[state.selected], state.selected, gscreen, profile_target_did, thread_focus_cid, zone_tag, thread_rerooted, gcollapsed.items, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
                     if (r.status.len > 0) status = r.status;
                     if (r.skip_rest) continue;
                 },
                 .repost => if (view_items.len > 0) {
-                    const r = try engageSelected(.repost, gpa, arena, session, store, view_items[state.selected], state.selected, gscreen, profile_target_did, thread_focus_cid, thread_rerooted, gcollapsed.items, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
+                    const r = try engageSelected(.repost, gpa, arena, session, store, view_items[state.selected], state.selected, gscreen, profile_target_did, thread_focus_cid, zone_tag, thread_rerooted, gcollapsed.items, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
                     if (r.status.len > 0) status = r.status;
                     if (r.skip_rest) continue;
                 },
@@ -2163,9 +2254,10 @@ const ComposeKind = enum { post, profile };
 /// profile screen's author query, or a post's thread. The single place "which
 /// view is showing" is decided, for both the main loop and engageSelected's
 /// optimistic repaint.
-fn buildActiveView(arena: Allocator, store: *feed_core.Store, screen: u8, profile_did: []const u8, thread_cid: []const u8, rerooted: bool, collapsed: []const []const u8) error{OutOfMemory}![]feed_core.TimelineItem {
+fn buildActiveView(arena: Allocator, store: *feed_core.Store, screen: u8, profile_did: []const u8, thread_cid: []const u8, zone_tag: []const u8, rerooted: bool, collapsed: []const []const u8) error{OutOfMemory}![]feed_core.TimelineItem {
     if (screen == feed_view.screen_thread) return feed_core.buildThreadView(arena, store, thread_cid, rerooted, collapsed);
     if (screen == feed_view.screen_profile) return feed_core.buildAuthorView(arena, store, profile_did);
+    if (screen == feed_view.screen_zones) return feed_core.buildTagView(arena, store, zone_tag);
     return feed_core.buildTimeline(arena, store);
 }
 
@@ -2221,6 +2313,8 @@ fn engageSelected(
     screen: u8,
     profile_did: []const u8,
     thread_cid: []const u8,
+    /// The open zone's tag, so a like on the zone page repaints the zone view.
+    zone_tag: []const u8,
     thread_rerooted: bool,
     collapsed_cids: []const []const u8,
     state: *timeline_ui.UiState,
@@ -2265,7 +2359,7 @@ fn engageSelected(
                     if (!acted) return .{ .status = "" };
                     const set = if (kind == .like) def_unlike else def_unrepost;
                     set.put(gpa, std.hash.Wyhash.hash(0, item.cid), {}) catch {};
-                    const fresh = try buildActiveView(arena, store, screen, profile_did, thread_cid, thread_rerooted, collapsed_cids);
+                    const fresh = try buildActiveView(arena, store, screen, profile_did, thread_cid, zone_tag, thread_rerooted, collapsed_cids);
                     const fresh_header = try profileHeaderFor(arena, session, screen, profile_did, fresh);
                     try paintFrame(gpa, out, arena, prev, next, backend, pix, fresh, fresh_header, state, revealed_cids, now, session.handle, if (kind == .like) "unliking..." else "unboosting...");
                     if (pix) |g| fireEngageEffect(gpa, g, kind, target, false);
@@ -2282,7 +2376,7 @@ fn engageSelected(
             const record_uri = uri_buf[0..borrowed.len];
             @memcpy(record_uri, borrowed);
 
-            const fresh = try buildActiveView(arena, store, screen, profile_did, thread_cid, thread_rerooted, collapsed_cids);
+            const fresh = try buildActiveView(arena, store, screen, profile_did, thread_cid, zone_tag, thread_rerooted, collapsed_cids);
             const fresh_header = try profileHeaderFor(arena, session, screen, profile_did, fresh);
             try paintFrame(gpa, out, arena, prev, next, backend, pix, fresh, fresh_header, state, revealed_cids, now, session.handle, if (kind == .like) "unliking..." else "unboosting...");
             // Fire the drain effect at the post's heart cell (state is now
@@ -2311,7 +2405,7 @@ fn engageSelected(
 
     // Optimistic first: the bumped count paints now; the worker call
     // follows on its own thread; a refusal reverts (drained in the loop).
-    const fresh = try buildActiveView(arena, store, screen, profile_did, thread_cid, thread_rerooted, collapsed_cids);
+    const fresh = try buildActiveView(arena, store, screen, profile_did, thread_cid, zone_tag, thread_rerooted, collapsed_cids);
     const fresh_header = try profileHeaderFor(arena, session, screen, profile_did, fresh);
     try paintFrame(gpa, out, arena, prev, next, backend, pix, fresh, fresh_header, state, revealed_cids, now, session.handle, if (kind == .like) "liking..." else "boosting...");
     // Fire the like/boost burst at the post's heart cell (state is now
@@ -2596,6 +2690,9 @@ const Grid = struct {
     /// in), or <0 when off-window — drives the hover highlight. Set per frame.
     hover_x: i32 = -1,
     hover_y: i32 = -1,
+    /// The open zone's display tag (e.g. "water") when on the zone page — the
+    /// "#name" title in its header. "" on every other screen.
+    zone_title: []const u8 = "",
 };
 
 // ===========================================================================
@@ -3075,7 +3172,7 @@ fn paintFrame(
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
                 g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits) catch g.content_h.*;
             } else {
-                g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, null, null) catch g.content_h.*;
+                g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, null, null, g.zone_title) catch g.content_h.*;
             }
             const t_layout = if (debug_frame_timing) clock_shell.monotonicNanos() else 0;
             window_shell.presentDrawList(win, gpa, g.engine, g.draw.slice(), field_core.background) catch {}; // E2: a lost blit is the next frame's problem
@@ -3370,7 +3467,7 @@ fn paintFrameGpu(
             // skip_heart=true on every screen: the SDF heart pass (drawEngagementHearts,
             // below) draws the heart in place for each visible like button of the
             // ACTIVE view, so layout never draws its own — one heart, one pipeline.
-            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, &chain_info, &gs.sel_glyphs) catch g.content_h.*;
+            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, &chain_info, &gs.sel_glyphs, g.zone_title) catch g.content_h.*;
         }
         gpu.feedBuild(&gs.feed, gpa, g.engine, g.draw.slice(), scale) catch {};
 

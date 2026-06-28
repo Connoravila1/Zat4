@@ -67,6 +67,7 @@ pub fn ingestEvent(gpa: Allocator, arena: Allocator, idx: *appview.Index, event_
             .created_at = p.created_at,
             .reply_parent_cid = p.reply_parent_cid,
             .reply_root_cid = p.reply_root_cid,
+            .tags = p.tags, // zone routing (the reducer pulled these from facets)
         });
         return .post;
     }
@@ -231,6 +232,26 @@ test "ingest: an app.zat4 post create is indexed" {
     const what = try ingestEvent(gpa, arena_state.allocator(), &idx, ev);
     try testing.expectEqual(Reduced.post, what);
     try testing.expectEqual(@as(usize, 1), idx.posts.len);
+}
+
+test "ingest: a post's #tag facets route it into a zone" {
+    const gpa = testing.allocator;
+    var idx: appview.Index = .{};
+    defer appview.deinit(gpa, &idx);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ev =
+        \\{"did":"did:plc:alice","time_us":1,"kind":"commit","commit":{"operation":"create","collection":"app.zat4.feed.post","rkey":"a","cid":"bafyc1","record":{"$type":"app.zat4.feed.post","text":"love #water","createdAt":"2026-06-14T00:00:00Z","facets":[{"index":{"byteStart":5,"byteEnd":11},"features":[{"$type":"app.zat4.richtext.facet#tag","tag":"water"}]}]}}}
+    ;
+    try testing.expectEqual(Reduced.post, try ingestEvent(gpa, arena, &idx, ev));
+
+    const water = try appview.buildTagFeed(arena, &idx, "water", "", 50);
+    try testing.expectEqual(@as(usize, 1), water.len);
+    try testing.expectEqualStrings("love #water", water[0].text);
+    try testing.expectEqual(@as(usize, 1), water[0].tags.len);
+    try testing.expectEqualStrings("water", water[0].tags[0]);
 }
 
 test "ingest: a follow create lands in the graph" {

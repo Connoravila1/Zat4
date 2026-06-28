@@ -223,6 +223,7 @@ fn applyEvent(
                 .created_at = feed.parseTimestamp(p.created_at) catch 0,
                 .reply_parent_cid = p.reply_parent_cid,
                 .reply_root_cid = p.reply_root_cid,
+                .tags = lexicon.collectTags(arena, p.facets) catch &.{}, // zone routing
             }) catch false;
             lock.unlock();
             if (is_new) {
@@ -232,7 +233,7 @@ fn applyEvent(
                     .{ .root = .{ .cid = p.reply_root_cid }, .parent = .{ .cid = p.reply_parent_cid } }
                 else
                     null;
-                store.appendPost(log, arena, p.did, p.rkey, p.cid, p.text, p.created_at, reply);
+                store.appendPost(log, arena, p.did, p.rkey, p.cid, p.text, p.created_at, reply, p.facets);
             }
             return is_new;
         },

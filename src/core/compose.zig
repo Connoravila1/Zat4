@@ -32,7 +32,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const identity = @import("identity.zig");
 
-pub const SpanKind = enum { mention, link };
+pub const SpanKind = enum { mention, link, tag };
 
 /// One detected span: UTF-8 byte offsets into the composed text, the
 /// currency the wire's `byteSlice` wants verbatim.
@@ -44,10 +44,11 @@ pub const FacetSpan = struct {
     byte_end: u32,
 };
 
-/// Scan text for mention and link spans, in order, non-overlapping.
+/// Scan text for mention, link and tag spans, in order, non-overlapping.
 /// Mentions include the leading '@' in their range (the wire convention);
 /// the handle inside must validate. Links are http(s) runs with trailing
-/// punctuation trimmed.
+/// punctuation trimmed. Tags include the leading '#'; the run of tag bytes
+/// after it must be non-empty (a bare '#' stays prose).
 pub fn detectFacetSpans(arena: Allocator, text: []const u8) error{OutOfMemory}![]FacetSpan {
     var spans: std.ArrayList(FacetSpan) = .empty;
     var i: usize = 0;
@@ -84,6 +85,21 @@ pub fn detectFacetSpans(arena: Allocator, text: []const u8) error{OutOfMemory}![
                 i = end;
                 continue;
             }
+        } else if (text[i] == '#' and atWordStart(text, i)) {
+            const start = i;
+            var end = i + 1;
+            while (end < text.len and isTagByte(text[end])) end += 1;
+            // Tag bytes never include sentence punctuation, so the run stops
+            // itself — no trailing trim needed. A bare '#' is just prose.
+            if (end > start + 1) {
+                try spans.append(arena, .{
+                    .kind = .tag,
+                    .byte_start = @intCast(start),
+                    .byte_end = @intCast(end),
+                });
+                i = end;
+                continue;
+            }
         }
         i += 1;
     }
@@ -102,6 +118,13 @@ fn isHandleByte(b: u8) bool {
 
 fn startsLink(rest: []const u8) bool {
     return std.mem.startsWith(u8, rest, "https://") or std.mem.startsWith(u8, rest, "http://");
+}
+
+/// Valid inside a `#tag` run: ASCII alphanumerics and underscore. Conservative
+/// on purpose — punctuation ends the tag, so trimming is unnecessary. (Unicode
+/// tag bytes can broaden this later; the wire is ready for it.)
+fn isTagByte(b: u8) bool {
+    return std.ascii.isAlphanumeric(b) or b == '_';
 }
 
 // ---------------------------------------------------------------------------
@@ -158,4 +181,60 @@ test "facets: parenthesized mention, trailing punctuation trimmed from handle" {
     const spans = try detectFacetSpans(arena_state.allocator(), text);
     try testing.expectEqual(@as(usize, 1), spans.len);
     try testing.expectEqualStrings("@alice.test", text[spans[0].byte_start..spans[0].byte_end]);
+}
+
+test "facets: tag spans include the '#', stop at punctuation, exact byte offsets" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const text = "love #water and #nba4real!";
+    const spans = try detectFacetSpans(arena, text);
+    try testing.expectEqual(@as(usize, 2), spans.len);
+
+    try testing.expectEqual(SpanKind.tag, spans[0].kind);
+    try testing.expectEqualStrings("#water", text[spans[0].byte_start..spans[0].byte_end]);
+
+    try testing.expectEqual(SpanKind.tag, spans[1].kind);
+    // The trailing '!' is prose, not part of the tag.
+    try testing.expectEqualStrings("#nba4real", text[spans[1].byte_start..spans[1].byte_end]);
+}
+
+test "facets: tag offsets are UTF-8 bytes, counted past multibyte text" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    const text = "héllo #zat4"; // é is two bytes: '#' sits at byte 7
+    const spans = try detectFacetSpans(arena_state.allocator(), text);
+    try testing.expectEqual(@as(usize, 1), spans.len);
+    try testing.expectEqual(SpanKind.tag, spans[0].kind);
+    try testing.expectEqual(@as(u32, 7), spans[0].byte_start);
+    try testing.expectEqualStrings("#zat4", text[spans[0].byte_start..spans[0].byte_end]);
+}
+
+test "facets: non-tags stay prose — mid-word #, bare '#', '#' before punctuation" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Mid-word '#' (e.g. a language name) is not a word-start tag.
+    try testing.expectEqual(@as(usize, 0), (try detectFacetSpans(arena, "wrote some C# today")).len);
+    // A bare '#' with no tag bytes is prose.
+    try testing.expectEqual(@as(usize, 0), (try detectFacetSpans(arena, "the # symbol")).len);
+    try testing.expectEqual(@as(usize, 0), (try detectFacetSpans(arena, "ends here #")).len);
+    try testing.expectEqual(@as(usize, 0), (try detectFacetSpans(arena, "#! shebang-ish")).len);
+}
+
+test "facets: a tag, a mention and a link coexist in one post" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const text = "@alice.test re #zig see https://ziglang.org";
+    const spans = try detectFacetSpans(arena, text);
+    try testing.expectEqual(@as(usize, 3), spans.len);
+    try testing.expectEqual(SpanKind.mention, spans[0].kind);
+    try testing.expectEqual(SpanKind.tag, spans[1].kind);
+    try testing.expectEqualStrings("#zig", text[spans[1].byte_start..spans[1].byte_end]);
+    try testing.expectEqual(SpanKind.link, spans[2].kind);
 }

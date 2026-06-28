@@ -246,6 +246,10 @@ pub fn resolveFacets(
                 .@"$type" = lexicon.richtext.facet_link,
                 .uri = raw,
             },
+            .tag => .{
+                .@"$type" = lexicon.richtext.facet_tag,
+                .tag = raw[1..], // strip the leading '#'; resolution is local
+            },
             .mention => blk: {
                 const outcome = try xrpc.query(
                     arena,

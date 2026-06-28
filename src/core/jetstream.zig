@@ -62,14 +62,20 @@ pub const LivePost = struct {
     text: []const u8,
     reply_parent_cid: []const u8, // "" when not a reply
     reply_root_cid: []const u8, // "" when not a reply
+    /// The post's zone tags ('#' stripped), extracted from the record's `#tag`
+    /// facets. Empty when none. The doorway data that routes a post into its
+    /// zones at ingest. Borrows the reduction arena, like the slices above.
+    tags: []const []const u8,
     created_at: i64,
     time_us: i64, // the stream cursor: resume-from on reconnect
 
     comptime {
-        // Budget: 6 slices + 2 i64 = 112 on 64-bit, zero padding. Reduced
-        // per event at human posting rates, but it is a record in a loop —
-        // ambiguous counts as hot (A7.2's own rule), so it is guarded. (A7)
-        if (@sizeOf(usize) == 8) assert(@sizeOf(LivePost) == 112);
+        // Budget: 7 slices + 2 i64 = 128 on 64-bit, zero padding. A7.1: raised
+        // from 112 to carry `tags` — Zat Zones routes a post into its zones from
+        // these. One added slice; LivePost is transient (one reduced per event,
+        // consumed and copied into the pooled `Post` immediately, never bulk-
+        // resident), so the cost is a single live instance, not a resident array.
+        if (@sizeOf(usize) == 8) assert(@sizeOf(LivePost) == 128);
     }
 };
 
@@ -107,6 +113,7 @@ pub fn reduce(arena: Allocator, event_json: []const u8) error{OutOfMemory}!?Live
         .text = record.text,
         .reply_parent_cid = parent_cid,
         .reply_root_cid = root_cid,
+        .tags = try lexicon.collectTags(arena, record.facets),
         .created_at = feed.parseTimestamp(record.createdAt) catch 0,
         .time_us = event.time_us,
     };
@@ -200,6 +207,21 @@ test "reduce: replies carry their thread cids" {
     const live = (try reduce(arena_state.allocator(), reply_event)).?;
     try testing.expectEqualStrings("bafyreiparent", live.reply_parent_cid);
     try testing.expectEqualStrings("bafyreiroot", live.reply_root_cid);
+}
+
+test "reduce: a post's #tag facets surface as tags ('#' stripped)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const tagged =
+        \\{"did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","time_us":7,"kind":"commit",
+        \\ "commit":{"operation":"create","collection":"app.zat4.feed.post","rkey":"r","cid":"c7",
+        \\ "record":{"$type":"app.zat4.feed.post","text":"love #water","createdAt":"2026-01-02T03:04:05Z",
+        \\ "facets":[{"index":{"byteStart":5,"byteEnd":11},
+        \\            "features":[{"$type":"app.zat4.richtext.facet#tag","tag":"water"}]}]}}}
+    ;
+    const live = (try reduce(arena_state.allocator(), tagged)).?;
+    try testing.expectEqual(@as(usize, 1), live.tags.len);
+    try testing.expectEqualStrings("water", live.tags[0]);
 }
 
 test "reduce: everything else is null — likes, deletes, identity, garbage" {

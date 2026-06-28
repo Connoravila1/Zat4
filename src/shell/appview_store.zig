@@ -185,11 +185,12 @@ pub fn appendPost(
     text: []const u8,
     created_at: []const u8,
     reply: ?lexicon.ReplyRefOut,
+    facets: ?[]const lexicon.Facet,
 ) void {
     if (store.fd < 0 or rkey.len == 0 or cid.len == 0) return;
     const env: PostEnvelope = .{
         .did = author_did,
-        .commit = .{ .rkey = rkey, .cid = cid, .record = .{ .text = text, .createdAt = created_at, .reply = reply } },
+        .commit = .{ .rkey = rkey, .cid = cid, .record = .{ .text = text, .createdAt = created_at, .reply = reply, .facets = facets } },
     };
     writeEnvelope(store, arena, env);
 }
@@ -390,7 +391,7 @@ test "store: append then replay rebuilds the index (posts, follows, likes)" {
         defer close(&store);
         try testing.expect(store.fd >= 0);
         appendFollow(&store, arena, "did:plc:me", "did:plc:author", "bafy-follow-1");
-        appendPost(&store, arena, "did:plc:author", "rk1", "bafy-post-1", "hello zat4", "2026-06-14T00:00:00Z", null);
+        appendPost(&store, arena, "did:plc:author", "rk1", "bafy-post-1", "hello zat4", "2026-06-14T00:00:00Z", null, null);
         appendEngagement(&store, arena, .like, "did:plc:me", "bafy-post-1", "bafy-like-1", "at://did:plc:me/app.zat4.feed.like/r1");
     }
 
@@ -416,6 +417,41 @@ test "store: append then replay rebuilds the index (posts, follows, likes)" {
     try testing.expect(seen.contains(seenKey("bafy-like-1")));
 }
 
+test "store: a post's #tag facets survive a restart (replay restores the zone)" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const path = tmpPath();
+    rm(path);
+    defer rm(path);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Append a tagged post to the durable log (as the poll/tap path does).
+    {
+        var store = open(path);
+        defer close(&store);
+        try testing.expect(store.fd >= 0);
+        const facets = [_]lexicon.Facet{.{
+            .index = .{ .byteStart = 5, .byteEnd = 11 },
+            .features = &.{.{ .@"$type" = lexicon.richtext.facet_tag, .tag = "water" }},
+        }};
+        appendPost(&store, arena, "did:plc:author", "rk1", "bafy-post-1", "love #water", "2026-06-14T00:00:00Z", null, &facets);
+    }
+
+    // A fresh process replays the log: the zone membership is rebuilt.
+    var idx: appview.Index = .{};
+    defer appview.deinit(gpa, &idx);
+    var seen: SeenSet = .empty;
+    defer seen.deinit(gpa);
+    _ = try replay(gpa, &idx, &seen, path);
+
+    const water = try appview.buildTagFeed(arena, &idx, "water", "", 10);
+    try testing.expectEqual(@as(usize, 1), water.len);
+    try testing.expectEqualStrings("love #water", water[0].text);
+}
+
 test "store: a post body with newlines/quotes round-trips as ONE log line" {
     // The log is newline-delimited and split on '\n' at replay; json escaping
     // must keep an embedded newline INSIDE the string so the record stays one
@@ -434,7 +470,7 @@ test "store: a post body with newlines/quotes round-trips as ONE log line" {
     {
         var s = open(path);
         defer close(&s);
-        appendPost(&s, arena, "did:plc:a", "rk1", "cidNL", tricky, "2026-06-14T00:00:00Z", null);
+        appendPost(&s, arena, "did:plc:a", "rk1", "cidNL", tricky, "2026-06-14T00:00:00Z", null, null);
     }
 
     var idx: appview.Index = .{};
@@ -464,7 +500,7 @@ test "store: replaying the same log twice does not double-apply (idempotent rest
         var store = open(path);
         defer close(&store);
         appendFollow(&store, arena, "did:plc:me", "did:plc:a", "bafy-f1");
-        appendPost(&store, arena, "did:plc:a", "rk1", "bafy-p1", "p", "2026-06-14T00:00:00Z", null);
+        appendPost(&store, arena, "did:plc:a", "rk1", "bafy-p1", "p", "2026-06-14T00:00:00Z", null, null);
         appendEngagement(&store, arena, .like, "did:plc:me", "bafy-p1", "bafy-l1", "at://did:plc:me/app.zat4.feed.like/r1");
     }
 
@@ -491,7 +527,7 @@ test "store: a disabled store (no path) is a silent no-op, replay of nothing is 
     var store = open(""); // disabled
     defer close(&store);
     try testing.expect(store.fd < 0);
-    appendPost(&store, arena_state.allocator(), "did:x", "rk", "cid", "t", "2026-06-14T00:00:00Z", null); // no crash
+    appendPost(&store, arena_state.allocator(), "did:x", "rk", "cid", "t", "2026-06-14T00:00:00Z", null, null); // no crash
 
     var idx: appview.Index = .{};
     defer appview.deinit(gpa, &idx);

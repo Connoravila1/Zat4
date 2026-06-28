@@ -92,6 +92,10 @@ pub const method = struct {
     pub const get_timeline = "app.zat4.feed.getTimeline";
     pub const get_author_feed = "app.zat4.feed.getAuthorFeed";
     pub const get_post_thread = "app.zat4.feed.getPostThread";
+    // Zat Zones: a zone feed is the posts bearing a tag; the catalog is the set
+    // of known tags. Both are plain feed queries (not their own namespace).
+    pub const get_posts_for_tag = "app.zat4.feed.getPostsForTag";
+    pub const list_tags = "app.zat4.feed.listTags";
 
     // Protocol methods — shared by every atproto app, NOT Bluesky content.
     // These stay exactly as they are (the wall self-check exempts them).
@@ -164,6 +168,9 @@ pub const richtext = struct {
     // Not a record: a string-constant namespace (no fields). A1/A7 do not apply.
     pub const facet_link = "app.zat4.richtext.facet#link";
     pub const facet_mention = "app.zat4.richtext.facet#mention";
+    // A `#tag` facet: its `tag` value is the word WITHOUT the leading '#'.
+    // It is the doorway into a Zat Zone — a tag-scoped slice of the feed.
+    pub const facet_tag = "app.zat4.richtext.facet#tag";
 };
 
 /// Subset of `app.zat4.actor.defs#profileViewDetailed` we consume.
@@ -251,6 +258,10 @@ pub const PostRecord = struct {
     /// The record schema's reply refs (strong refs to root + parent).
     /// Shared shape with the write side — it is the same wire object.
     reply: ?ReplyRefOut = null,
+    /// Rich-text facets, including `#tag` facets. The AppView reads these on
+    /// ingest to route a post into its zones (see `collectTags`); absent ⇒ no
+    /// facets. Same wire object as the write side's `PostRecordOut.facets`.
+    facets: ?[]const Facet = null,
 };
 
 /// The session account's relationship to a post (present only on
@@ -285,6 +296,10 @@ pub const PostView = struct {
     quoteCount: u32 = 0,
     indexedAt: []const u8 = "",
     viewer: ?Viewer = null,
+    /// The post's zone tags (display casing, '#' stripped), derived by the
+    /// AppView from the record's `#tag` facets — the post's tray. Each is a
+    /// tappable doorway into a zone. Absent/empty ⇒ no tags.
+    tags: []const []const u8 = &.{},
 };
 
 /// `app.zat4.feed.defs#replyRef` — root and parent, hydrated.
@@ -326,6 +341,22 @@ pub const ThreadView = struct {
     posts: []const FeedViewPost = &.{},
 };
 
+/// One zone in the catalog: its display tag (first-seen casing, '#' stripped)
+/// and how many posts bear it. The catalog is the set of these.
+/// A7.2: cold struct, size guard waived — transient parse/build target.
+pub const TagView = struct {
+    tag: []const u8 = "",
+    count: usize = 0,
+};
+
+/// Response of `app.zat4.feed.listTags`: the known zones (manifest-state and
+/// ranking are later phases; this is the flat set).
+/// A7.2: cold struct, size guard waived — transient parse/build target.
+pub const TagsPage = struct {
+    cursor: ?[]const u8 = null,
+    tags: []const TagView = &.{},
+};
+
 // ---------------------------------------------------------------------------
 // Write-path wire shapes (`com.atproto.repo.createRecord`). Creation-side
 // records carry their "$type" as a defaulted field; optionals left null are
@@ -348,13 +379,15 @@ pub const ByteSlice = struct {
     byteEnd: u32,
 };
 
-/// One facet feature: a mention (did set) or a link (uri set). The unset
-/// side is omitted from the wire.
+/// One facet feature: a mention (did set), a link (uri set), or a tag (tag
+/// set, the word without its leading '#'). The unset sides are omitted from
+/// the wire — the `$type` is the discriminant.
 /// A7.2: cold struct, size guard waived — transient build target.
 pub const FacetFeature = struct {
     @"$type": []const u8,
     did: ?[]const u8 = null,
     uri: ?[]const u8 = null,
+    tag: ?[]const u8 = null,
 };
 
 /// `app.zat4.richtext.facet`.
@@ -363,6 +396,24 @@ pub const Facet = struct {
     index: ByteSlice,
     features: []const FacetFeature,
 };
+
+/// Pull the tag values (the words behind `#tag` facets, '#' already stripped)
+/// out of a post's facets — the doorways into its zones. PURE (B2); the
+/// returned slice and its strings borrow `arena`. D3: this is the ONE place the
+/// facet wire shape is read into plain values, so the AppView core (ingest →
+/// index) takes a flat `[]const []const u8` and never sees the wire type.
+pub fn collectTags(arena: std.mem.Allocator, facets: ?[]const Facet) std.mem.Allocator.Error![]const []const u8 {
+    const fs = facets orelse return &.{};
+    var tags: std.ArrayList([]const u8) = .empty;
+    for (fs) |f| {
+        for (f.features) |feat| {
+            if (!std.mem.eql(u8, feat.@"$type", richtext.facet_tag)) continue;
+            const t = feat.tag orelse continue;
+            if (t.len > 0) try tags.append(arena, t);
+        }
+    }
+    return tags.toOwnedSlice(arena);
+}
 
 /// Reply refs on an outgoing post: strong refs to the thread root and the
 /// immediate parent.
@@ -580,10 +631,10 @@ test "wall: every content collection and owned method is app.zat4, never app.bsk
         try testing.expect(std.mem.startsWith(u8, nsid, "app.zat4."));
         try testing.expect(std.mem.indexOf(u8, nsid, "app.bsky") == null);
     }
-    inline for (.{ method.get_profile, method.get_timeline, method.get_author_feed }) |nsid| {
+    inline for (.{ method.get_profile, method.get_timeline, method.get_author_feed, method.get_posts_for_tag, method.list_tags }) |nsid| {
         try testing.expect(std.mem.startsWith(u8, nsid, "app.zat4."));
     }
-    inline for (.{ richtext.facet_link, richtext.facet_mention }) |nsid| {
+    inline for (.{ richtext.facet_link, richtext.facet_mention, richtext.facet_tag }) |nsid| {
         try testing.expect(std.mem.startsWith(u8, nsid, "app.zat4.richtext."));
     }
     // Protocol methods are NOT walled — they are shared atproto, and must
@@ -679,4 +730,48 @@ test "round-trip: a post with zat4 facets serializes the owned richtext type" {
     const json = try std.json.Stringify.valueAlloc(arena, post, .{ .emit_null_optional_fields = false });
     try testing.expect(std.mem.indexOf(u8, json, "app.zat4.richtext.facet#link") != null);
     try testing.expect(std.mem.indexOf(u8, json, "app.bsky") == null);
+}
+
+test "round-trip: a post with a tag facet serializes the owned tag type, tag without '#'" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // "love #water" — the tag span is bytes 5..11 ("#water"); the facet's
+    // `tag` value carries the word with the '#' stripped.
+    const facets = [_]Facet{.{
+        .index = .{ .byteStart = 5, .byteEnd = 11 },
+        .features = &.{.{ .@"$type" = richtext.facet_tag, .tag = "water" }},
+    }};
+    const post: PostRecordOut = .{
+        .text = "love #water",
+        .createdAt = "2026-06-28T00:00:00Z",
+        .facets = &facets,
+    };
+    const json = try std.json.Stringify.valueAlloc(arena, post, .{ .emit_null_optional_fields = false });
+    try testing.expect(std.mem.indexOf(u8, json, "app.zat4.richtext.facet#tag") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"tag\":\"water\"") != null);
+    // The unset mention/link sides stay off the wire; no Bluesky namespace leaks.
+    try testing.expect(std.mem.indexOf(u8, json, "\"did\"") == null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"uri\"") == null);
+    try testing.expect(std.mem.indexOf(u8, json, "app.bsky") == null);
+}
+
+test "collectTags: pulls only #tag facet values, skips mentions and links" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const facets = [_]Facet{
+        .{ .index = .{ .byteStart = 0, .byteEnd = 6 }, .features = &.{.{ .@"$type" = richtext.facet_tag, .tag = "water" }} },
+        .{ .index = .{ .byteStart = 7, .byteEnd = 18 }, .features = &.{.{ .@"$type" = richtext.facet_mention, .did = "did:plc:x" }} },
+        .{ .index = .{ .byteStart = 19, .byteEnd = 30 }, .features = &.{.{ .@"$type" = richtext.facet_tag, .tag = "rivers" }} },
+    };
+    const tags = try collectTags(arena, &facets);
+    try testing.expectEqual(@as(usize, 2), tags.len);
+    try testing.expectEqualStrings("water", tags[0]);
+    try testing.expectEqualStrings("rivers", tags[1]);
+
+    // No facets at all is an empty list, not an error (E4).
+    try testing.expectEqual(@as(usize, 0), (try collectTags(arena, null)).len);
 }

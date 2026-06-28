@@ -150,6 +150,28 @@ pub const Index = struct {
     /// `author.displayName` with the human name; absent ⇒ the client falls back
     /// to the handle. Resolved + persisted alongside the handle.
     display_names: std.AutoHashMapUnmanaged(StrId, StrId) = .empty,
+
+    // --- Zat Zones: the tag index (A6, all OUT OF BAND — the hot `Post` stays
+    // 32 bytes). A zone is not a stored container; it is these derived indexes
+    // over the post array. Normalized tag (case-folded + trimmed) is the key
+    // (invariant 1); the first-seen display casing is shown.
+
+    /// Normalized-tag id → the rows of every post bearing it: the zone's
+    /// candidate pool, in ingest order. A `getPostsForTag` is a scan of this
+    /// list (materialized reverse-chron). Each list is owned and freed in deinit.
+    tag_posts: std.AutoHashMapUnmanaged(StrId, std.ArrayListUnmanaged(u32)) = .empty,
+    /// Normalized-tag id → first-seen DISPLAY-form id (both interned). Its key
+    /// set IS the set of known zones; the value is what the catalog shows.
+    tag_display: std.AutoHashMapUnmanaged(StrId, StrId) = .empty,
+    /// Normalized-tag ids in first-seen order — a stable catalog ordering for
+    /// `listTags` (manifest-state / ranking are later phases).
+    tag_order: std.ArrayList(StrId) = .empty,
+    /// Per-post tag lists for the tray, parallel to `posts` (one Span per row)
+    /// indexing into `post_tag_ids`. The display-form tag ids a post bears,
+    /// deduped within the post. `{off,0}` ⇒ an untagged post.
+    post_tag_spans: std.ArrayList(Span) = .empty,
+    /// Flat pool of display-form tag ids, sliced by `post_tag_spans`.
+    post_tag_ids: std.ArrayList(StrId) = .empty,
 };
 
 pub fn deinit(gpa: Allocator, idx: *Index) void {
@@ -168,6 +190,14 @@ pub fn deinit(gpa: Allocator, idx: *Index) void {
     idx.like_edges.deinit(gpa);
     idx.handles.deinit(gpa);
     idx.display_names.deinit(gpa);
+    // Each zone's row list is an owned ArrayListUnmanaged — free them, then the map.
+    var tit = idx.tag_posts.valueIterator();
+    while (tit.next()) |list| list.deinit(gpa);
+    idx.tag_posts.deinit(gpa);
+    idx.tag_display.deinit(gpa);
+    idx.tag_order.deinit(gpa);
+    idx.post_tag_spans.deinit(gpa);
+    idx.post_tag_ids.deinit(gpa);
     idx.* = .{};
 }
 
@@ -211,7 +241,28 @@ pub const PostInput = struct {
     /// thread root. "" when the post is not a reply. Indexed out of band (A6).
     reply_parent_cid: []const u8 = "",
     reply_root_cid: []const u8 = "",
+    /// The post's zone tags ('#' stripped), as the shell extracted them from the
+    /// record's facets (`lexicon.collectTags`). Plain values only (D3 — the wire
+    /// facet type never reaches this core). Empty ⇒ untagged.
+    tags: []const []const u8 = &.{},
 };
+
+/// Longest tag we index. Real hashtags are short; an absurdly long one is
+/// almost certainly junk, so it is dropped (E4) rather than widening scratch.
+pub const max_tag_bytes = 128;
+/// Most distinct tags we index from one post (defends the per-post dedup scan
+/// and the tray against a stuffed record). Extra tags are dropped (E4).
+pub const max_tags_per_post = 32;
+
+/// Normalize a tag for the zone key (invariant 1): trim surrounding ASCII
+/// whitespace and fold ASCII case into `buf`. Returns the normalized bytes, or
+/// null when the tag is empty or too long to be a zone (E4 — an ordinary skip).
+fn normalizeTag(raw: []const u8, buf: []u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0 or trimmed.len > buf.len) return null;
+    for (trimmed, 0..) |c, i| buf[i] = std.ascii.toLower(c);
+    return buf[0..trimmed.len];
+}
 
 /// Index one post. A8: if the cid is already present, this is a no-op (same
 /// cid ⇒ same bytes ⇒ never re-process). Returns true if newly indexed.
@@ -248,6 +299,48 @@ pub fn indexPost(gpa: Allocator, idx: *Index, in: PostInput) Allocator.Error!boo
     // sole appender of `posts`).
     try idx.reply_parent.append(gpa, reply_parent_id);
     try idx.reply_root.append(gpa, reply_root_id);
+
+    // Zone tag index (A6, out of band). For each distinct tag this post bears:
+    // register the zone (normalized key, first-seen display casing — invariant
+    // 1), add this row to the zone's candidate pool, and record the display id
+    // in this row's tray list. Deduped within the post so "#water #Water" is one
+    // zone membership and one tray entry.
+    const tag_off: u32 = @intCast(idx.post_tag_ids.items.len);
+    var tag_len: u32 = 0;
+    var seen: [max_tags_per_post]StrId = undefined;
+    var seen_n: usize = 0;
+    var nbuf: [max_tag_bytes]u8 = undefined;
+    for (in.tags) |raw_tag| {
+        if (seen_n >= seen.len) break;
+        const norm = normalizeTag(raw_tag, &nbuf) orelse continue;
+        const norm_id = try internStr(gpa, idx, norm);
+        var dup = false;
+        for (seen[0..seen_n]) |sid| {
+            if (sid == norm_id) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+        seen[seen_n] = norm_id;
+        seen_n += 1;
+
+        const display_id = try internStr(gpa, idx, raw_tag);
+        const dgop = try idx.tag_display.getOrPut(gpa, norm_id);
+        if (!dgop.found_existing) {
+            dgop.value_ptr.* = display_id; // first-seen casing wins
+            try idx.tag_order.append(gpa, norm_id);
+        }
+        const pgop = try idx.tag_posts.getOrPut(gpa, norm_id);
+        if (!pgop.found_existing) pgop.value_ptr.* = .empty;
+        try pgop.value_ptr.append(gpa, row);
+
+        // The tray shows the zone's established display casing, not this post's.
+        try idx.post_tag_ids.append(gpa, idx.tag_display.get(norm_id).?);
+        tag_len += 1;
+    }
+    try idx.post_tag_spans.append(gpa, .{ .off = tag_off, .len = tag_len });
+
     try idx.post_by_cid.put(gpa, cid_id, row);
     return true;
 }
@@ -461,6 +554,9 @@ pub const TimelineRow = struct {
     /// from the index. null ⇒ not a reply.
     reply_parent: ?ReplyTargetRow = null,
     reply_root: ?ReplyTargetRow = null,
+    /// The post's zone tags (display casing) — its tray. Built into the request
+    /// arena by `fillRow`. Empty ⇒ untagged.
+    tags: []const []const u8 = &.{},
 };
 
 /// Build a reverse-chronological timeline for `viewer_did`: the most recent
@@ -528,6 +624,57 @@ pub fn buildAuthorFeed(
     return materializeRows(arena, idx, viewer_id, rows.items, limit);
 }
 
+/// Build a reverse-chronological feed of the posts bearing `tag` — a ZONE feed.
+/// PURE (B2): same (index, tag, viewer, limit) ⇒ same rows. The zone is not a
+/// stored container; this is the tag index materialized on demand (invariant 4 —
+/// a zone feed is a query). `tag` is normalized (case-fold + trim — invariant 1)
+/// before lookup, so `#Water`/`#water` resolve to the same zone. An unknown tag
+/// yields an empty feed (E4, not an error).
+///
+/// Cut-1 ordering is reverse-chron over the whole candidate pool; the choosable
+/// scored lenses (Discover/Calm/the user's config) arrive when the discover
+/// engine lands — a zone feed is that engine pointed at this pool (invariant 6).
+pub fn buildTagFeed(
+    arena: Allocator,
+    idx: *const Index,
+    tag: []const u8,
+    viewer_did: []const u8,
+    limit: usize,
+) Allocator.Error![]TimelineRow {
+    var nbuf: [max_tag_bytes]u8 = undefined;
+    const norm = normalizeTag(tag, &nbuf) orelse return &.{};
+    const norm_id = idx.intern.get(norm) orelse return &.{};
+    const pool = idx.tag_posts.get(norm_id) orelse return &.{};
+    const viewer_id: ?StrId = idx.intern.get(viewer_did);
+
+    var rows: std.ArrayList(u32) = .empty;
+    defer rows.deinit(arena);
+    try rows.appendSlice(arena, pool.items);
+
+    return materializeRows(arena, idx, viewer_id, rows.items, limit);
+}
+
+/// The zone catalog: every known tag with its display casing and post count, in
+/// first-seen order. PURE (B2), allocated into `arena`. Manifest-state and
+/// ranking are later phases (Z3/Z7); this is the flat set (the latent layer).
+pub fn listZones(arena: Allocator, idx: *const Index) Allocator.Error![]ZoneInfo {
+    const out = try arena.alloc(ZoneInfo, idx.tag_order.items.len);
+    for (out, idx.tag_order.items) |*z, norm_id| {
+        const display_id = idx.tag_display.get(norm_id) orelse norm_id;
+        const count: usize = if (idx.tag_posts.get(norm_id)) |pool| pool.items.len else 0;
+        z.* = .{ .tag = str(idx, display_id), .count = count };
+    }
+    return out;
+}
+
+/// One catalog entry — a zone's display tag and how many posts bear it. Boundary
+/// value (the shell serializes it). A7.2: cold struct, transient, size guard
+/// waived.
+pub const ZoneInfo = struct {
+    tag: []const u8,
+    count: usize,
+};
+
 /// Shared tail of both feed builders (D2/F4 — extracted once a SECOND caller
 /// appeared): sort the candidate post rows reverse-chron, take `limit`, and
 /// fill plain `TimelineRow`s, stamping each with `viewer_id`'s like record uri
@@ -554,7 +701,7 @@ fn materializeRows(
 
     var reply_counts = try buildReplyCounts(arena, idx);
     defer reply_counts.deinit(arena);
-    for (out, rows[0..n]) |*o, row| o.* = fillRow(idx, viewer_id, row, &reply_counts);
+    for (out, rows[0..n]) |*o, row| o.* = try fillRow(arena, idx, viewer_id, row, &reply_counts);
     return out;
 }
 
@@ -575,7 +722,7 @@ fn buildReplyCounts(arena: Allocator, idx: *const Index) Allocator.Error!std.Aut
 /// Fill one indexed post `row` into a plain `TimelineRow`, stamping the viewer's
 /// like uri + the reply count + hydrated reply targets. PURE read — the single
 /// per-post boundary projection, shared by every feed/thread builder.
-fn fillRow(idx: *const Index, viewer_id: ?StrId, row: u32, reply_counts: *const std.AutoHashMapUnmanaged(StrId, u32)) TimelineRow {
+fn fillRow(arena: Allocator, idx: *const Index, viewer_id: ?StrId, row: u32, reply_counts: *const std.AutoHashMapUnmanaged(StrId, u32)) Allocator.Error!TimelineRow {
     const cid_id = idx.posts.items(.cid)[row];
     const author_id = idx.posts.items(.author)[row];
     const s = idx.posts.items(.text)[row];
@@ -583,6 +730,15 @@ fn fillRow(idx: *const Index, viewer_id: ?StrId, row: u32, reply_counts: *const 
         (if (idx.like_edges.get(edgeKey(vid, cid_id))) |uid| str(idx, uid) else "")
     else
         "";
+    // The tray: resolve this row's display-form tag ids into strings (C1 — into
+    // the request arena). Empty when the post bears no tags.
+    const span = idx.post_tag_spans.items[row];
+    var tags: []const []const u8 = &.{};
+    if (span.len > 0) {
+        const out = try arena.alloc([]const u8, span.len);
+        for (out, 0..) |*t, i| t.* = str(idx, idx.post_tag_ids.items[span.off + i]);
+        tags = out;
+    }
     return .{
         .cid = str(idx, cid_id),
         .author_did = str(idx, author_id),
@@ -596,6 +752,7 @@ fn fillRow(idx: *const Index, viewer_id: ?StrId, row: u32, reply_counts: *const 
         .reply_count = reply_counts.get(cid_id) orelse 0,
         .reply_parent = hydrateReplyTarget(idx, idx.reply_parent.items[row]),
         .reply_root = hydrateReplyTarget(idx, idx.reply_root.items[row]),
+        .tags = tags,
     };
 }
 
@@ -662,7 +819,7 @@ pub fn buildPostThread(
     var head: usize = 0;
     while (head < queue.items.len and out.items.len < limit) : (head += 1) {
         const row = queue.items[head];
-        try out.append(arena, fillRow(idx, viewer_id, row, &reply_counts));
+        try out.append(arena, try fillRow(arena, idx, viewer_id, row, &reply_counts));
         if (children.get(row)) |kids| {
             for (kids.items) |k| try queue.append(arena, k);
         }
@@ -712,6 +869,70 @@ test "index: a post dedups by cid (A8 immutable-by-hash)" {
     try testing.expect(try indexPost(gpa, &idx, p)); // newly indexed
     try testing.expect(!try indexPost(gpa, &idx, p)); // same cid ⇒ no-op
     try testing.expectEqual(@as(usize, 1), idx.posts.len);
+}
+
+test "zones: buildTagFeed returns a tag's posts, newest first, normalized key" {
+    const gpa = testing.allocator;
+    var idx: Index = .{};
+    defer deinit(gpa, &idx);
+
+    // Two posts in #water (different casing → one zone), one in #rivers only.
+    _ = try indexPost(gpa, &idx, .{ .cid = "c1", .author_did = "did:a", .text = "older", .created_at = 100, .tags = &.{"water"} });
+    _ = try indexPost(gpa, &idx, .{ .cid = "c2", .author_did = "did:b", .text = "newer", .created_at = 200, .tags = &.{ "Water", "rivers" } });
+    _ = try indexPost(gpa, &idx, .{ .cid = "c3", .author_did = "did:c", .text = "untagged", .created_at = 300 });
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The query normalizes: "#WATER" finds both #water/#Water posts, newest first.
+    const water = try buildTagFeed(arena, &idx, "WATER", "", 50);
+    try testing.expectEqual(@as(usize, 2), water.len);
+    try testing.expectEqualStrings("newer", water[0].text);
+    try testing.expectEqualStrings("older", water[1].text);
+    // The tray on a row carries the zone's first-seen display casing ("water").
+    try testing.expectEqual(@as(usize, 2), water[0].tags.len); // water + rivers
+    try testing.expectEqualStrings("water", water[1].tags[0]);
+
+    // #rivers has just the one; an unknown tag is an empty feed (E4).
+    try testing.expectEqual(@as(usize, 1), (try buildTagFeed(arena, &idx, "rivers", "", 50)).len);
+    try testing.expectEqual(@as(usize, 0), (try buildTagFeed(arena, &idx, "nope", "", 50)).len);
+}
+
+test "zones: a post with the same tag twice joins the zone once (dedup within post)" {
+    const gpa = testing.allocator;
+    var idx: Index = .{};
+    defer deinit(gpa, &idx);
+
+    _ = try indexPost(gpa, &idx, .{ .cid = "c1", .author_did = "did:a", .text = "p", .created_at = 1, .tags = &.{ "water", "Water", "WATER" } });
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const water = try buildTagFeed(arena, &idx, "water", "", 50);
+    try testing.expectEqual(@as(usize, 1), water.len); // the post appears once, not 3×
+    try testing.expectEqual(@as(usize, 1), water[0].tags.len); // one tray entry
+}
+
+test "zones: listZones lists every zone once with its post count, first-seen casing" {
+    const gpa = testing.allocator;
+    var idx: Index = .{};
+    defer deinit(gpa, &idx);
+
+    _ = try indexPost(gpa, &idx, .{ .cid = "c1", .author_did = "did:a", .text = "p1", .created_at = 1, .tags = &.{"Water"} });
+    _ = try indexPost(gpa, &idx, .{ .cid = "c2", .author_did = "did:b", .text = "p2", .created_at = 2, .tags = &.{ "water", "rivers" } });
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const zones = try listZones(arena, &idx);
+    try testing.expectEqual(@as(usize, 2), zones.len); // water + rivers, water not doubled
+    try testing.expectEqualStrings("Water", zones[0].tag); // first-seen casing
+    try testing.expectEqual(@as(usize, 2), zones[0].count); // two posts in water
+    try testing.expectEqualStrings("rivers", zones[1].tag);
+    try testing.expectEqual(@as(usize, 1), zones[1].count);
 }
 
 test "intern: same string returns the same id, stored once" {

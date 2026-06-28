@@ -180,6 +180,14 @@ fn route(arena: Allocator, idx: *const appview.Index, cfg: ServeConfig, target: 
     if (std.mem.endsWith(u8, path, "app.zat4.feed.getPostThread")) {
         return getPostThread(arena, idx, cfg, target);
     }
+    // Zat Zones: a zone feed (posts for one tag) and the catalog (the tag set).
+    // Checked before getPostThread? No — order is by exact suffix, disjoint.
+    if (std.mem.endsWith(u8, path, "app.zat4.feed.getPostsForTag")) {
+        return getPostsForTag(arena, idx, cfg, target);
+    }
+    if (std.mem.endsWith(u8, path, "app.zat4.feed.listTags")) {
+        return listTags(arena, idx);
+    }
     if (std.mem.endsWith(u8, path, "app.zat4.actor.getProfile")) {
         return getProfile(arena, idx, target);
     }
@@ -231,6 +239,29 @@ fn getPostThread(arena: Allocator, idx: *const appview.Index, cfg: ServeConfig, 
     return serializeThread(arena, thread);
 }
 
+fn getPostsForTag(arena: Allocator, idx: *const appview.Index, cfg: ServeConfig, target: []const u8) RouteError![]const u8 {
+    // A zone feed: the posts bearing `tag`, scored by the viewer's lens (Cut-1:
+    // reverse-chron). `tag` is percent-encoded (it can hold non-URL bytes).
+    const tag = (try queryValueDecoded(arena, target, "tag")) orelse "";
+    const viewer = (try queryValueDecoded(arena, target, "viewer")) orelse "";
+    var limit = cfg.default_limit;
+    if (queryValue(target, "limit")) |l| {
+        limit = @min(std.fmt.parseInt(usize, l, 10) catch cfg.default_limit, cfg.max_limit);
+    }
+
+    const rows = try appview.buildTagFeed(arena, idx, tag, viewer, limit);
+    return serializeFeed(arena, rows);
+}
+
+/// The zone catalog: every known tag with its post count (the latent layer).
+fn listTags(arena: Allocator, idx: *const appview.Index) RouteError![]const u8 {
+    const zones = try appview.listZones(arena, idx);
+    const tags = try arena.alloc(lexicon.TagView, zones.len);
+    for (tags, zones) |*t, z| t.* = .{ .tag = z.tag, .count = z.count };
+    const page: lexicon.TagsPage = .{ .cursor = null, .tags = tags };
+    return std.json.Stringify.valueAlloc(arena, page, .{ .emit_null_optional_fields = false });
+}
+
 /// Serialize feed rows into the lexicon's TimelinePage shape so the existing
 /// client parser consumes them unchanged (D3 — the AppView speaks the same
 /// wire the client already reads). Shared by getTimeline and getAuthorFeed.
@@ -276,6 +307,8 @@ fn feedViewPostFor(arena: Allocator, r: appview.TimelineRow) RouteError!lexicon.
             // the filled heart from it on reload AND deletes it to unlike.
             // Absent (null) when the viewer hasn't liked this post.
             .viewer = if (r.viewer_like_uri.len > 0) .{ .like = r.viewer_like_uri } else null,
+            // The post's zone tags (the tray) — derived from its #tag facets.
+            .tags = r.tags,
         },
         .reply = reply,
     };
@@ -452,6 +485,58 @@ test "auth: strict bearer gate — fail closed, exact match, reject the rest" {
     try testing.expect(!authorized(tok, "s3cret-zat4-token")); // missing scheme
     try testing.expect(!authorized(tok, "Basic s3cret-zat4-token")); // wrong scheme
     try testing.expect(!authorized(tok, null)); // no header
+}
+
+test "route: getPostsForTag serves a zone feed; getTimeline carries the tray" {
+    const gpa = testing.allocator;
+    var idx: appview.Index = .{};
+    defer appview.deinit(gpa, &idx);
+
+    try appview.indexFollow(gpa, &idx, "did:plc:me", "did:plc:author");
+    _ = try appview.indexPost(gpa, &idx, .{ .cid = "c1", .author_did = "did:plc:author", .text = "love #water", .created_at = 100, .tags = &.{"water"} });
+    _ = try appview.indexPost(gpa, &idx, .{ .cid = "c2", .author_did = "did:plc:author", .text = "no tags here", .created_at = 200 });
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The zone feed: only the #water post, and its tray surfaces on the wire.
+    const zjson = try route(arena, &idx, .{}, "/xrpc/app.zat4.feed.getPostsForTag?tag=water&viewer=did%3Aplc%3Ame&limit=10");
+    const zpage = try std.json.parseFromSliceLeaky(lexicon.TimelinePage, arena, zjson, .{ .ignore_unknown_fields = true });
+    try testing.expectEqual(@as(usize, 1), zpage.feed.len);
+    try testing.expectEqualStrings("love #water", zpage.feed[0].post.record.text);
+    try testing.expectEqual(@as(usize, 1), zpage.feed[0].post.tags.len);
+    try testing.expectEqualStrings("water", zpage.feed[0].post.tags[0]);
+
+    // The agnostic timeline carries each post's tray too (so the feed can stitch
+    // to zones): the tagged post has one tag, the untagged one has none.
+    const tjson = try route(arena, &idx, .{}, "/xrpc/app.zat4.feed.getTimeline?viewer=did%3Aplc%3Ame&limit=10");
+    const tpage = try std.json.parseFromSliceLeaky(lexicon.TimelinePage, arena, tjson, .{ .ignore_unknown_fields = true });
+    try testing.expectEqual(@as(usize, 2), tpage.feed.len);
+    try testing.expectEqualStrings("no tags here", tpage.feed[0].post.record.text); // newest
+    try testing.expectEqual(@as(usize, 0), tpage.feed[0].post.tags.len);
+    try testing.expectEqual(@as(usize, 1), tpage.feed[1].post.tags.len);
+}
+
+test "route: listTags returns the zone catalog with post counts" {
+    const gpa = testing.allocator;
+    var idx: appview.Index = .{};
+    defer appview.deinit(gpa, &idx);
+
+    _ = try appview.indexPost(gpa, &idx, .{ .cid = "c1", .author_did = "did:a", .text = "p1", .created_at = 1, .tags = &.{"Water"} });
+    _ = try appview.indexPost(gpa, &idx, .{ .cid = "c2", .author_did = "did:b", .text = "p2", .created_at = 2, .tags = &.{ "water", "rivers" } });
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const json = try route(arena, &idx, .{}, "/xrpc/app.zat4.feed.listTags");
+    const page = try std.json.parseFromSliceLeaky(lexicon.TagsPage, arena, json, .{ .ignore_unknown_fields = true });
+    try testing.expectEqual(@as(usize, 2), page.tags.len);
+    try testing.expectEqualStrings("Water", page.tags[0].tag); // first-seen casing
+    try testing.expectEqual(@as(usize, 2), page.tags[0].count);
+    try testing.expectEqualStrings("rivers", page.tags[1].tag);
+    try testing.expectEqual(@as(usize, 1), page.tags[1].count);
 }
 
 test "route: an unknown method is NotFound" {

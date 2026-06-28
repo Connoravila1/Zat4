@@ -170,6 +170,21 @@ pub const FeedItem = struct {
     }
 };
 
+/// A post's zone-tag slice, OUT OF BAND (A6): an `[off, len)` window into the
+/// store's flat `tag_pool`, parallel to `posts` (one per post row). Keeps the
+/// hot `Post` at 64 bytes while a post's variable-length tag set rides outside
+/// it. `len == 0` ⇒ an untagged post. HOT (one per post, scanned to build the
+/// tray) → A7.
+pub const TagRange = struct {
+    off: u32,
+    len: u32,
+
+    comptime {
+        // Budget 8: two u32, packed exactly. (A7)
+        assert(@sizeOf(TagRange) == 8);
+    }
+};
+
 // ---------------------------------------------------------------------------
 // The store — the feed subsystem's resident state
 // ---------------------------------------------------------------------------
@@ -224,6 +239,13 @@ pub const Store = struct {
     /// absence is ordinary data, not an error).
     like_uris: std.ArrayList(TextSpan) = .empty,
     repost_uris: std.ArrayList(TextSpan) = .empty,
+    /// Zat Zones — a post's tags, OUT OF BAND (A6): `tag_pool` is a flat list of
+    /// tag-string spans (into `string_bytes`); `post_tags` is parallel to `posts`,
+    /// one `TagRange` per post windowing into `tag_pool`. The tray (the row of
+    /// tappable zone-doorways below a post) is built from these. Content sealed by
+    /// the post's CID (A8), so set once at first ingest, never reconciled.
+    tag_pool: std.ArrayList(TextSpan) = .empty,
+    post_tags: std.ArrayList(TagRange) = .empty,
     /// Pagination cursor for the next page; zero-length = no further pages
     /// known. (Old cursors orphan a few bytes in the append-only buffer per
     /// page — accepted, same trade the compiler's string table makes.)
@@ -259,6 +281,8 @@ pub fn deinitStore(gpa: Allocator, store: *Store) void {
     store.repost_pending.deinit(gpa);
     store.like_uris.deinit(gpa);
     store.repost_uris.deinit(gpa);
+    store.tag_pool.deinit(gpa);
+    store.post_tags.deinit(gpa);
     store.* = undefined;
 }
 
@@ -559,6 +583,23 @@ fn internPost(
         // changed locally and the server hasn't reflected yet (the pending
         // guard), which we leave alone so a lagging refresh can't revert it.
         const posts = store.posts.slice();
+        // A8 caveat — the CID seals the record bytes, but a REFERENCE wire shape
+        // OMITS createdAt and tags (a reply-ref carries only enough to say
+        // "replying to @x"). So a post first seen as a reply-parent is created as
+        // a PLACEHOLDER (created_at 0, empty tray); when its full feed view later
+        // dedups onto it, fill those authoritative fields in — same CID ⇒ the
+        // full view's createdAt/tags ARE the sealed values, the ref just lacked
+        // them. (Without this, a reply-parent shows "2947w" and no tag tray.)
+        const ca = parseTimestamp(view.record.createdAt) catch 0;
+        if (ca != 0) posts.items(.created_at)[index] = ca;
+        if (view.tags.len > 0 and index < store.post_tags.items.len and store.post_tags.items[index].len == 0) {
+            const tag_off: u32 = @intCast(store.tag_pool.items.len);
+            for (view.tags) |t| {
+                if (t.len == 0) continue;
+                try store.tag_pool.append(gpa, try appendString(gpa, store, t));
+            }
+            store.post_tags.items[index] = .{ .off = tag_off, .len = @intCast(store.tag_pool.items.len - tag_off) };
+        }
         posts.items(.reply_count)[index] = view.replyCount;
         posts.items(.quote_count)[index] = view.quoteCount;
 
@@ -623,6 +664,17 @@ fn internPost(
     try store.repost_uris.resize(gpa, store.posts.len);
     store.like_uris.items[index] = .empty;
     store.repost_uris.items[index] = .empty;
+    // Zone tags (A6, out of band): copy this post's tag set into the flat pool
+    // and record its window, parallel to `posts`. Sealed by CID — set once here,
+    // never reconciled (a re-seen post hits the dedup branch above and keeps it).
+    {
+        const tag_off: u32 = @intCast(store.tag_pool.items.len);
+        for (view.tags) |t| {
+            if (t.len == 0) continue;
+            try store.tag_pool.append(gpa, try appendString(gpa, store, t));
+        }
+        try store.post_tags.append(gpa, .{ .off = tag_off, .len = @intCast(store.tag_pool.items.len - tag_off) });
+    }
     if (view.viewer) |viewer| {
         if (viewer.like) |u| {
             store.liked.set(index);
@@ -709,19 +761,24 @@ pub const TimelineItem = struct {
     /// state, never on the post. Ride the last of the tail padding.
     has_kids: bool = false,
     collapsed: bool = false,
+    /// The post's zone tags (display casing) — its tray, a row of tappable
+    /// doorways into zones. A slice like the rest of this struct's variable-length
+    /// fields; the strings borrow the store's bytes, the outer slice the arena.
+    /// Empty ⇒ untagged. (ZONES inv. 4: derived from the post's facets, never a
+    /// stored container.)
+    tags: []const []const u8 = &.{},
 
     comptime {
         // Produced in bulk every build — hot, so guarded (A7). Slices make
         // the size pointer-width-dependent; the budget is pinned where the
         // record is its packed self and degrades to nothing off 64-bit.
-        // (A7.1 record, third raise: 112 → 144. The write path needs uri +
-        // cid on the item — they are the stable ids A5 prescribes for
-        // crossing the boundary — and ItemFlags rides the tail padding
-        // (7×16 slices + 8 i64 + 16 counts + 2 + 1 = 139 payload, 5 pad).
-        // depth + is_focus take 2 of those 5 pad bytes — still 144. Second
-        // raise: +2 LabelFlags for moderation. First raise: the guard caught
-        // a budget that counted four slices when five were present.)
-        if (@sizeOf(usize) == 8) assert(@sizeOf(TimelineItem) == 144);
+        // (A7.1 record, FOURTH raise: 144 → 160. Zat Zones puts the post's tag
+        // tray on the view-model — one more slice, the same kind of variable-
+        // length view field as name/body/replying_to (the third raise's +16 for
+        // replying_to was justified identically). 8×16 slices + 8 i64 + 16 counts
+        // + 2 + 1 = 155 payload, 5 pad → 160. Second raise: +2 LabelFlags. First:
+        // the guard caught a budget that counted four slices when five existed.)
+        if (@sizeOf(usize) == 8) assert(@sizeOf(TimelineItem) == 160);
     }
 };
 
@@ -735,7 +792,7 @@ pub fn buildTimeline(
     const out = try arena.alloc(TimelineItem, store.feed.len);
     const feed = store.feed.slice();
     for (feed.items(.post), feed.items(.reposted_by), out) |post_index, reposted_by, *item| {
-        item.* = fillTimelineItem(store, @intFromEnum(post_index), reposted_by);
+        item.* = try fillTimelineItem(arena, store, @intFromEnum(post_index), reposted_by);
     }
     return out;
 }
@@ -745,7 +802,7 @@ pub fn buildTimeline(
 /// (one author's posts), a zone (a tag query), an algorithm (a scored order)
 /// are all just different ORDERINGS of post indices over the one store — the
 /// post is the post (ZONES invariant 4), seen through N lenses. Pure.
-fn fillTimelineItem(store: *const Store, p: usize, reposted_by: OptionalAuthorIndex) TimelineItem {
+fn fillTimelineItem(arena: Allocator, store: *const Store, p: usize, reposted_by: OptionalAuthorIndex) error{OutOfMemory}!TimelineItem {
     const posts = store.posts.slice();
     const authors = store.authors.slice();
     const post_authors = posts.items(.author);
@@ -781,7 +838,20 @@ fn fillTimelineItem(store: *const Store, p: usize, reposted_by: OptionalAuthorIn
             .viewer_liked = store.liked.isSet(p),
             .viewer_reposted = store.reposted.isSet(p),
         },
+        .tags = try collectRowTags(arena, store, p),
     };
+}
+
+/// Resolve a post row's out-of-band tags into a plain `[]const []const u8` in
+/// `arena` — the tray the renderer paints, in stored order. Empty when the post
+/// is untagged (E4). PURE.
+fn collectRowTags(arena: Allocator, store: *const Store, p: usize) error{OutOfMemory}![]const []const u8 {
+    if (p >= store.post_tags.items.len) return &.{};
+    const r = store.post_tags.items[p];
+    if (r.len == 0) return &.{};
+    const out = try arena.alloc([]const u8, r.len);
+    for (out, 0..) |*t, i| t.* = sliceSpan(store, store.tag_pool.items[r.off + i]);
+    return out;
 }
 
 /// Build a VIEW of one author's own posts over the SHARED store, reverse-chron
@@ -819,8 +889,61 @@ pub fn buildAuthorView(
     std.sort.block(u32, rows.items, Ctx{ .createds = createds }, Ctx.lessThan);
 
     const out = try arena.alloc(TimelineItem, rows.items.len);
-    for (rows.items, out) |p, *item| item.* = fillTimelineItem(store, p, .none);
+    for (rows.items, out) |p, *item| item.* = try fillTimelineItem(arena, store, p, .none);
     return out;
+}
+
+/// Build a VIEW of one ZONE's posts over the SHARED store (ZONES inv. 4 — a
+/// query, not a container): the posts bearing `tag`, reverse-chron. The tag is
+/// normalized (case-fold + trim) before matching, so `#Water`/`#water` resolve
+/// to the same zone (invariant 1). The posts are the same records Home/profile
+/// reference; engagement/identity stay unified. Allocates in `arena` (C3). The
+/// shell first fetches the zone's posts into the store (getPostsForTag); this is
+/// then a pure query over what's resident — and naturally includes any other
+/// resident post bearing the tag. Cut-1 ordering is reverse-chron; the choosable
+/// scored lenses arrive with the discover engine (invariant 6).
+pub fn buildTagView(arena: Allocator, store: *const Store, tag: []const u8) error{OutOfMemory}![]TimelineItem {
+    var nbuf: [128]u8 = undefined;
+    const want = normalizeTagClient(tag, &nbuf) orelse return &.{};
+
+    const posts = store.posts.slice();
+    const createds = posts.items(.created_at);
+    var rows: std.ArrayList(u32) = .empty;
+    defer rows.deinit(arena);
+    var mbuf: [128]u8 = undefined;
+    for (0..store.posts.len) |p| {
+        if (p >= store.post_tags.items.len) continue;
+        const r = store.post_tags.items[p];
+        var hit = false;
+        var i: u32 = 0;
+        while (i < r.len) : (i += 1) {
+            const norm = normalizeTagClient(sliceSpan(store, store.tag_pool.items[r.off + i]), &mbuf) orelse continue;
+            if (std.mem.eql(u8, norm, want)) {
+                hit = true;
+                break;
+            }
+        }
+        if (hit) try rows.append(arena, @intCast(p));
+    }
+    const Ctx = struct {
+        createds: []const i64,
+        pub fn lessThan(ctx: @This(), x: u32, y: u32) bool {
+            return ctx.createds[x] > ctx.createds[y]; // newest first
+        }
+    };
+    std.sort.block(u32, rows.items, Ctx{ .createds = createds }, Ctx.lessThan);
+    const out = try arena.alloc(TimelineItem, rows.items.len);
+    for (rows.items, out) |p, *item| item.* = try fillTimelineItem(arena, store, p, .none);
+    return out;
+}
+
+/// Normalize a tag for zone matching (invariant 1): trim + ASCII case-fold into
+/// `buf`. Null when empty/too long (E4). Mirrors the AppView's `normalizeTag`.
+fn normalizeTagClient(raw: []const u8, buf: []u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0 or trimmed.len > buf.len) return null;
+    for (trimmed, 0..) |c, i| buf[i] = std.ascii.toLower(c);
+    return buf[0..trimmed.len];
 }
 
 /// Build a post's THREAD as a Reddit-style NESTED view over the shared store
@@ -921,7 +1044,7 @@ pub fn buildThreadView(
         }
         std.mem.reverse(u32, chain.items); // root → parent-of-focus
         for (chain.items) |arow| {
-            var aitem = fillTimelineItem(store, arow, .none);
+            var aitem = try fillTimelineItem(arena, store, arow, .none);
             aitem.depth = thread_ancestor_depth;
             try out.append(arena, aitem);
         }
@@ -929,7 +1052,7 @@ pub fn buildThreadView(
 
     try stack.append(arena, .{ .row = root, .depth = 0, .stitched = false });
     while (stack.pop()) |fr| {
-        var item = fillTimelineItem(store, fr.row, .none);
+        var item = try fillTimelineItem(arena, store, fr.row, .none);
         item.depth = fr.depth;
         item.is_focus = fr.row == focus;
         item.stitched = fr.stitched;
@@ -1045,6 +1168,11 @@ pub fn ingestLivePost(
     try store.repost_uris.resize(gpa, store.posts.len);
     store.like_uris.items[index] = .empty;
     store.repost_uris.items[index] = .empty;
+    // Same parallel-array discipline for the zone tags (A6): post_tags MUST grow
+    // with posts or a post index overruns it (the snapshot round-trip and the
+    // internPost dedup both rely on post_tags.len == posts.len). The client
+    // firehose path carries no tags yet, so an empty tray.
+    try store.post_tags.append(gpa, .{ .off = @intCast(store.tag_pool.items.len), .len = 0 });
 
     const gop = try store.post_by_cid.getOrPutContextAdapted(
         gpa,
@@ -1564,6 +1692,90 @@ test "ingest: flattens a page into SoA records — authors and posts deduplicate
 
     // Pagination cursor captured.
     try testing.expectEqualStrings("CURSOR-1", nextCursor(&store));
+}
+
+test "zones: a post's tags are stored out of band and surface on the timeline item" {
+    const gpa = testing.allocator; // C6
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+
+    const page: lexicon.TimelinePage = .{ .feed = &.{
+        .{ .post = .{
+            .uri = "at://did:plc:a/app.zat4.feed.post/r1",
+            .cid = "bafytag1",
+            .author = .{ .did = "did:plc:a", .handle = "a.zat4.com" },
+            .record = .{ .text = "love #water", .createdAt = "2026-06-28T00:00:00Z" },
+            .tags = &.{ "water", "rivers" },
+        } },
+        .{ .post = .{
+            .uri = "at://did:plc:b/app.zat4.feed.post/r2",
+            .cid = "bafynotag",
+            .author = .{ .did = "did:plc:b", .handle = "b.zat4.com" },
+            .record = .{ .text = "no tags here", .createdAt = "2026-06-28T00:00:01Z" },
+        } },
+    } };
+    _ = try ingestPage(gpa, &store, page);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const items = try buildTimeline(arena_state.allocator(), &store);
+    try testing.expectEqual(@as(usize, 2), items.len);
+    // Out-of-band storage stays parallel to posts; the tray resolves in order.
+    try testing.expectEqual(@as(usize, 2), items[0].tags.len);
+    try testing.expectEqualStrings("water", items[0].tags[0]);
+    try testing.expectEqualStrings("rivers", items[0].tags[1]);
+    // An untagged post yields an empty tray (E4) — and the parallel arrays stay
+    // aligned (the untagged row doesn't borrow the tagged row's window).
+    try testing.expectEqual(@as(usize, 0), items[1].tags.len);
+}
+
+test "zones/dates: a reply-parent placeholder gets created_at + tags filled by its full view" {
+    const gpa = testing.allocator; // C6
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+
+    // A feed page where a REPLY is listed before its PARENT (#test) — the
+    // newest-first reality. Ingesting the reply hydrates #test as a REFERENCE
+    // (no createdAt, no tags) → a placeholder. Then #test arrives as its own
+    // full feed view, carrying the real createdAt + tags. The dedup must fill
+    // those in, not leave the placeholder (the "2947w + no tray" bug).
+    const parent_ref: lexicon.PostView = .{
+        .cid = "bafytest",
+        .author = .{ .did = "did:plc:a", .handle = "a.zat4.com" },
+        .record = .{ .text = "This is a #test", .createdAt = "" },
+    };
+    const page: lexicon.TimelinePage = .{ .feed = &.{
+        .{
+            .post = .{
+                .uri = "at://did:plc:a/app.zat4.feed.post/reply1",
+                .cid = "bafyreply",
+                .author = .{ .did = "did:plc:a", .handle = "a.zat4.com" },
+                .record = .{ .text = "wait a second", .createdAt = "2026-06-28T21:17:10Z" },
+            },
+            .reply = .{ .parent = parent_ref, .root = parent_ref },
+        },
+        .{ .post = .{
+            .uri = "at://did:plc:a/app.zat4.feed.post/test1",
+            .cid = "bafytest",
+            .author = .{ .did = "did:plc:a", .handle = "a.zat4.com" },
+            .record = .{ .text = "This is a #test", .createdAt = "2026-06-28T21:16:58Z" },
+            .tags = &.{ "test", "deep" },
+        } },
+    } };
+    _ = try ingestPage(gpa, &store, page);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const items = try buildTimeline(arena_state.allocator(), &store);
+    var found = false;
+    for (items) |it| {
+        if (!std.mem.eql(u8, it.cid, "bafytest")) continue;
+        found = true;
+        try testing.expect(it.created_at != 0); // date filled, not the epoch-0 placeholder
+        try testing.expectEqual(@as(usize, 2), it.tags.len); // tray filled from the full view
+        try testing.expectEqualStrings("test", it.tags[0]);
+    }
+    try testing.expect(found);
 }
 
 test "disengage: unlike hands out the record uri once, revert restores it" {

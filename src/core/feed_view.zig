@@ -71,7 +71,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// `compose` (the New-post button) route navigation rather than engagement.
 /// `compose_send` / `compose_cancel` are the premium composer's footer buttons
 /// (the shell turns a tap into the same control byte the keyboard sends).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump };
 
 /// The six top-level rail destinations, in order. The `Screen` index a nav
 /// region carries is an index into this. Shared by the rail (draw + hit) and
@@ -95,6 +95,10 @@ pub const screen_thread: u8 = 6;
 /// Profile is no longer a rail slot; reached via the bottom-left "you" card
 /// and avatar taps (which set this screen explicitly). Off the rail range.
 pub const screen_profile: u8 = 7;
+/// A ZONE page (a tag-scoped feed) — transient, reached by tapping a `#tag` in a
+/// post's tray. Off the rail; renders like Home (title + header socket + feed)
+/// with the zone's name as the title and a back button. (Zat Zones slice 4.)
+pub const screen_zones: u8 = 8;
 
 /// The profile screen's header band — the viewed account's identity over its
 /// post list. Plain data handed in by the shell (B5); the post count is the
@@ -202,14 +206,18 @@ pub const PostView = struct {
     /// Thread lens: this post has replies, and the reader has collapsed it.
     has_kids: bool = false,
     collapsed: bool = false,
+    /// The post's zone tags (display casing) — the tray of tappable zone-doorways
+    /// the renderer paints below the post. A slice like the other variable-length
+    /// view fields; empty ⇒ untagged.
+    tags: []const []const u8 = &.{},
 
     comptime {
-        // Budget: 5 slices (5×16=80) + 4 u32 (16) + 8 bytes (initial/liked/boosted/
-        // depth/is_focus/stitched/has_kids/collapsed) = 104, no padding.
-        // (A7.1 raise 88 → 104: the `replying_to` handle is a real view field —
-        // the feed's reply-context line needs the parent handle on the
-        // view-model. Built for a handful of visible rows, so the +16 is fine.)
-        assert(@sizeOf(PostView) == 104);
+        // Budget: 6 slices (6×16=96) + 4 u32 (16) + 8 bytes (initial/liked/boosted/
+        // depth/is_focus/stitched/has_kids/collapsed) = 120, no padding.
+        // (A7.1 raise 104 → 120: the `tags` tray is a real view field — same kind
+        // of variable-length view data as `replying_to` (the prior 88→104 raise),
+        // built for a handful of visible rows, so the +16 is fine.)
+        assert(@sizeOf(PostView) == 120);
     }
 };
 
@@ -239,7 +247,8 @@ const profile_tabs = [_][]const u8{ "Posts", "Replies", "Media", "Likes" };
 /// are the wide values; the plain top bar is 111.
 pub fn headerBottom(active_screen: u8) i32 {
     if (active_screen == screen_profile) return profile_header_h_wide;
-    if (active_screen == screen_home) return home_header_h_wide;
+    // The zone page seats a socket in its header like Home, so it is the same height.
+    if (active_screen == screen_home or active_screen == screen_zones) return home_header_h_wide;
     return 111;
 }
 
@@ -361,6 +370,64 @@ fn wrapBody(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32
         have_space = true;
     }
     return baseline;
+}
+
+/// The tag tray: a wrapping row of tappable "#tag" pills below a post — each a
+/// doorway into its zone (the feed↔zone stitch). Measures (`draw_it = false`) or
+/// paints + emits regions (`draw_it = true`) and returns the tray's pixel height,
+/// 0 when the post has no tags. The pill set + column width determine the height,
+/// so it is SCROLL-INVARIANT. Each pill emits a `.zone_jump` region carrying the
+/// post index and, in `_pad`, the tag's index — the shell resolves (post, tag) →
+/// zone. `y` is the tray's top; the first pill row sits there.
+fn trayLayout(
+    gpa: Allocator,
+    dl: *raster.DrawList,
+    e: *const text.Engine,
+    x: i32,
+    y: i32,
+    w: i32,
+    tags: []const []const u8,
+    accent: u32,
+    draw_it: bool,
+    regions: ?*Regions,
+    pi: usize,
+) error{OutOfMemory}!i32 {
+    if (tags.len == 0) return 0;
+    const pad_x: i32 = 11;
+    const pill_h: i32 = 26;
+    const row_gap: i32 = 8;
+    const pill_gap: i32 = 8;
+    const size: u16 = 13;
+    const pill_bg: u32 = 0x16EDEAE0; // a faint ink wash — reads as a chip, not a button
+    var cx = x;
+    var cy = y;
+    var buf: [160]u8 = undefined;
+    for (tags, 0..) |tag, ti| {
+        const label = std.fmt.bufPrint(&buf, "#{s}", .{tag}) catch continue;
+        const tw: i32 = @intCast(text.measure(e, .regular, label, size));
+        const pw = tw + 2 * pad_x;
+        // Wrap to the next row when this pill would overflow the column (but keep
+        // at least one pill per row, however narrow the column).
+        if (cx + pw > x + w and cx > x) {
+            cx = x;
+            cy += pill_h + row_gap;
+        }
+        if (draw_it) {
+            try rect(gpa, dl, cx, cy, pw, pill_h, pill_bg, @intCast(pill_h >> 1));
+            _ = try str(gpa, dl, e, .regular, cx + pad_x, cy + 18, accent, size, label);
+            if (regions) |rg| try rg.append(gpa, .{
+                .x = @intCast(std.math.clamp(cx, -32768, 32767)),
+                .y = @intCast(std.math.clamp(cy, -32768, 32767)),
+                .w = @intCast(@max(0, @min(32767, pw))),
+                .h = @intCast(pill_h),
+                .post = @intCast(pi),
+                .kind = .zone_jump,
+                ._pad = @intCast(@min(ti, 255)), // the tag index, for the shell to resolve
+            });
+        }
+        cx += pw + pill_gap;
+    }
+    return (cy + pill_h) - y;
 }
 
 /// Record the body glyphs just appended to `dl` (the range [from, dl.len)) into
@@ -749,6 +816,9 @@ pub fn layout(
     /// Filled when the focused post is laid out; cleared otherwise. Null = the
     /// caller doesn't support selection (software path / preview / tests).
     sel_out: ?*SelGlyphs,
+    /// The zone's display name (e.g. "water") when `active_screen == screen_zones`
+    /// — shown as the "#name" title in the zone page's header. "" otherwise.
+    zone_title: []const u8,
 ) error{OutOfMemory}!i32 {
     const m = metricsFor(width);
     if (regions) |rg| rg.clearRetainingCapacity();
@@ -795,8 +865,9 @@ pub fn layout(
     } else {
         feed_y0 = 112;
     }
-    // Home seats the socket in its header, so the post stack starts below it.
-    if (active_screen == screen_home and socket_tray != null) {
+    // Home (and a zone page) seat the socket in the header, so the post stack
+    // starts below it.
+    if ((active_screen == screen_home or active_screen == screen_zones) and socket_tray != null) {
         feed_y0 = if (m.wide) home_header_h_wide + 14 else home_header_h_narrow + 12;
     }
 
@@ -815,6 +886,11 @@ pub fn layout(
         // A post's thread: the `posts` handed in ARE the thread (ancestors, the
         // focused post, then replies, in that order) — fall through to the post
         // loop. The top bar shows "Thread" + a back button (drawTopBar).
+    } else if (active_screen == screen_zones) {
+        // A zone page: the `posts` handed in ARE the zone's feed (a tag query over
+        // the store). Falls through to the post loop; the top bar shows the zone's
+        // "#tag" name, a back button, and the (present-but-no-power) zone socket.
+        feed_y0 = if (m.wide) home_header_h_wide + 14 else home_header_h_narrow + 12;
     } else if (active_screen == screen_settings) {
         // Settings is otherwise a placeholder, but it hosts the one wired control
         // we need today: Sign out — clears the cached session, so the app returns
@@ -834,13 +910,13 @@ pub fn layout(
         const lw: i32 = @intCast(text.measure(e, .semibold, label, 15));
         _ = try str(gpa, dl, e, .semibold, bx + @divTrunc(bw - lw, 2), by + 29, ink, 15, label);
         try emitRegion(gpa, regions, bx, by, bw, bh, 0, .sign_out);
-        try drawTopBar(gpa, dl, e, m, active_screen, regions, profile, accent, socket_tray, socket_ui, socket_hits);
+        try drawTopBar(gpa, dl, e, m, active_screen, regions, profile, accent, socket_tray, socket_ui, socket_hits, zone_title);
         return height;
     } else if (active_screen != 0) {
         const msg = "Coming soon";
         const tw: i32 = @intCast(text.measure(e, .regular, msg, 16));
         _ = try str(gpa, dl, e, .regular, m.col_x + @divTrunc(m.col_w - tw, 2), @divTrunc(height, 2), muted, 16, msg);
-        try drawTopBar(gpa, dl, e, m, active_screen, regions, profile, accent, socket_tray, socket_ui, socket_hits); // no posts scroll here, but keep the title consistent
+        try drawTopBar(gpa, dl, e, m, active_screen, regions, profile, accent, socket_tray, socket_ui, socket_hits, zone_title); // no posts scroll here, but keep the title consistent
         return height;
     }
 
@@ -977,24 +1053,29 @@ pub fn layout(
         // cheap over a long feed (otherwise every post re-shapes every scroll
         // frame). Geometry: next_y = body_end + 48 (erow +16, row +20, gap +12),
         // so body_end = next_y - 48 reconstructs it from a cached advance.
+        // The cache holds the BODY advance only (post_top → body_end) — that is
+        // the costly, scroll-invariant text-shaping result. The tray height is
+        // cheap and recomputed every frame (and a future per-reader fold then
+        // stays cache-free), so it is added on top, not stored.
         const cached: ?i32 = if (heights) |hh| (if (pi < hh.len and hh[pi] >= 0) hh[pi] else null) else null;
         var body_end: i32 = undefined;
-        var next_y: i32 = undefined;
         if (cached) |adv| {
-            next_y = post_top + adv;
-            body_end = next_y - 60;
+            body_end = post_top + adv;
         } else {
             body_end = try wrapBody(gpa, dl, e, cx, post_top + body_top_off, content_w, body_c, 16, p.body, body_line, false);
-            next_y = body_end + 60;
             if (heights) |hh| if (pi < hh.len) {
-                hh[pi] = next_y - post_top;
+                hh[pi] = body_end - post_top;
             };
         }
-        // Roomier vertical rhythm (was 48): more air between body→actions and
-        // post→post, so the feed doesn't read cramped. body_end + 60 = erow(+22)
-        // + row(+22) + gap(+16). Keep the cache reconstruction above in sync.
+        // Roomier vertical rhythm: body_end + 60 = erow(+22) + row(+22) + gap(+16).
         const erow = body_end + 22;
-        const bottom = erow + 22;
+        // The tag tray sits below the engagement row; measure it now so the
+        // divider + next post drop by its height (0 when the post is untagged, so
+        // an untagged post lays out byte-for-byte as before).
+        const tray_h = try trayLayout(gpa, dl, e, cx, 0, content_w, p.tags, accent, false, null, pi);
+        const tray_extra: i32 = if (tray_h > 0) tray_h + 12 else 0;
+        const bottom = erow + 22 + tray_extra;
+        const next_y = body_end + 60 + tray_extra;
         const visible = next_y > 0 and post_top < height;
 
         if (visible) {
@@ -1146,6 +1227,12 @@ pub fn layout(
                 try emitRegion(gpa, regions, rxp - 7, tap_y, is + 14, tap_h, @intCast(pi), .bookmark);
             }
 
+            // Tag tray — the row of tappable zone-doorways below the actions.
+            // Drawn for any post that carries tags (the feed↔zone stitch).
+            if (p.tags.len > 0) {
+                _ = try trayLayout(gpa, dl, e, cx, erow + 26, content_w, p.tags, accent, true, regions, pi);
+            }
+
             // divider — full-width on the flat feed; the thread uses a short
             // divider under the indented content. CHAIN posts get NO horizontal
             // divider — the vertical stem + elbow are their separation instead.
@@ -1166,7 +1253,7 @@ pub fn layout(
     };
     // The sticky top bar, drawn LAST so the posts above scroll BEHIND its
     // frosted box with the title/tabs crisp on top.
-    try drawTopBar(gpa, dl, e, m, active_screen, regions, profile, accent, socket_tray, socket_ui, socket_hits);
+    try drawTopBar(gpa, dl, e, m, active_screen, regions, profile, accent, socket_tray, socket_ui, socket_hits, zone_title);
 
     // The "N new posts" pill (Home only): staged arrivals waiting to be revealed.
     // Pinned just below the header, centered; tapping it reveals + scrolls to top
@@ -1590,18 +1677,26 @@ pub fn layoutLoadout(
 /// divider. Emitted AFTER the posts so they pass behind it (occluded + dimmed),
 /// the chrome reading crisply on top. The box spans the feed column width; the
 /// rail/sidebar live in their own columns and are untouched.
-fn drawTopBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, active_screen: u8, regions: ?*Regions, profile: ?ProfileHeader, accent: u32, socket_tray: ?lens_socket.TrayView, socket_ui: lens_socket.SocketUi, socket_hits: ?*lens_socket.HitList) error{OutOfMemory}!void {
+fn drawTopBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, active_screen: u8, regions: ?*Regions, profile: ?ProfileHeader, accent: u32, socket_tray: ?lens_socket.TrayView, socket_ui: lens_socket.SocketUi, socket_hits: ?*lens_socket.HitList, zone_title: []const u8) error{OutOfMemory}!void {
     if (active_screen == screen_profile) return drawProfileHeader(gpa, dl, e, m, regions, profile orelse .{ .display_name = "", .handle = "", .post_count = 0 }, accent);
     const is_thread = active_screen == screen_thread;
-    // screen_thread is past nav_labels, so guard the index → a "Thread" title.
-    const title: []const u8 = if (active_screen < nav_labels.len) nav_labels[active_screen] else "Thread";
     const is_home = active_screen == screen_home;
+    const is_zone = active_screen == screen_zones;
+    // The zone page titles by its tag ("#water"); thread is "Thread"; rail
+    // screens use their nav label.
+    var zbuf: [140]u8 = undefined;
+    const title: []const u8 = if (is_zone)
+        (std.fmt.bufPrint(&zbuf, "#{s}", .{zone_title}) catch "#zone")
+    else if (active_screen < nav_labels.len) nav_labels[active_screen] else "Thread";
+    // Home AND a zone page seat the lens socket → the taller header; both the
+    // thread and a zone page get a Back button on the left.
+    const seats_socket = is_home or is_zone;
+    const wants_back = is_thread or is_zone;
     if (m.wide) {
-        const box_h: i32 = if (is_home) home_header_h_wide else 111;
+        const box_h: i32 = if (seats_socket) home_header_h_wide else 111;
         try rect(gpa, dl, m.col_x, 0, m.col_w, box_h, header_veil, 0);
-        // The thread screen gets a back button on the left; the title sits after.
         var tx = m.lx;
-        if (is_thread) {
+        if (wants_back) {
             const bl = "<  Back";
             const blw: i32 = @intCast(text.measure(e, .semibold, bl, 15) + 26);
             try rect(gpa, dl, m.lx, 30, blw, 36, panel, 16);
@@ -1610,23 +1705,28 @@ fn drawTopBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Me
             tx = m.lx + blw + 22;
         }
         _ = try str(gpa, dl, e, .semibold, tx, 50, ink, 27, title);
-        // THE LENS SOCKET seats here, replacing the Following/Discover tabs.
-        if (is_home) if (socket_tray) |tray| {
+        // THE LENS SOCKET seats here (Home + zone page), replacing tab labels.
+        if (seats_socket) if (socket_tray) |tray| {
             const geom: lens_socket.Geometry = .{ .x = m.lx, .y = socket_y_wide, .w = m.cw, .scale = 1.0 };
             _ = try lens_socket.build(gpa, e, tray, socket_ui, geom, dl, socket_hits);
         };
         try rect(gpa, dl, m.col_x, box_h - 1, m.col_w, 1, divider, 0);
     } else {
-        const box_h: i32 = if (is_home) home_header_h_narrow else 97;
+        const box_h: i32 = if (seats_socket) home_header_h_narrow else 97;
         try rect(gpa, dl, m.col_x, 0, m.col_w, box_h, header_veil, 0);
-        if (is_thread) {
+        if (wants_back) {
             const bl = "<  Back";
             const blw: i32 = @intCast(text.measure(e, .semibold, bl, 14) + 22);
             try rect(gpa, dl, m.lx, 16, blw, 32, panel, 15);
             _ = try str(gpa, dl, e, .semibold, m.lx + 11, 37, ink, 14, bl);
             try emitRegion(gpa, regions, m.lx, 16, blw, 32, 0, .back);
-            _ = try str(gpa, dl, e, .semibold, m.lx + blw + 18, 38, ink, 18, "Thread");
-            try rect(gpa, dl, m.col_x, 96, m.col_w, 1, divider, 0);
+            _ = try str(gpa, dl, e, .semibold, m.lx + blw + 18, 38, ink, 18, title);
+            // A zone page seats its socket below the back row; the thread does not.
+            if (is_zone) if (socket_tray) |tray| {
+                const geom: lens_socket.Geometry = .{ .x = m.lx, .y = socket_y_narrow, .w = m.cw, .scale = 1.0 };
+                _ = try lens_socket.build(gpa, e, tray, socket_ui, geom, dl, socket_hits);
+            };
+            try rect(gpa, dl, m.col_x, box_h - 1, m.col_w, 1, divider, 0);
             return;
         }
         const wm = try str(gpa, dl, e, .semibold, m.lx, 42, accent, 22, "zat4");
@@ -1759,6 +1859,7 @@ pub fn fromTimeline(arena: Allocator, items: []const feed.TimelineItem, now: i64
             .stitched = it.stitched,
             .has_kids = it.has_kids,
             .collapsed = it.collapsed,
+            .tags = it.tags,
         };
     }
     return out;
@@ -1829,7 +1930,7 @@ test "layout emits 4 tap regions per post (avatar + 3 engagement); hitTest resol
     const posts = [_]PostView{
         .{ .name = "A", .handle = "@a.zat", .age = "1m", .body = "hello there field", .tint = 0xFFAAAAAA, .reply = 1, .boost = 2, .like = 3, .initial = 'A', .liked = true, .boosted = false },
     };
-    const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null);
+    const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "");
     try std.testing.expect(h > 112); // content extends below the top bar
     // 8 regions per post: body tap + avatar + reply/repost/like + bookmark/share/more.
     try std.testing.expectEqual(@as(usize, 8), regions.items.len);
@@ -1874,14 +1975,14 @@ test "layout captures the rooted post's body glyphs for selection (thread screen
         .{ .name = "A", .handle = "@a.zat", .age = "1m", .body = "hello there field", .tint = 0xFFAAAAAA, .reply = 0, .boost = 0, .like = 0, .initial = 'A', .liked = false, .boosted = false, .is_focus = true },
     };
     // A WIDE layout so the focus post is on-screen and the body is drawn.
-    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_thread, null, 0, accent_house, null, .{}, null, null, &sel);
+    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_thread, null, 0, accent_house, null, .{}, null, null, &sel, "");
     // "hello there field" = 15 visible glyphs (spaces are emitted too): the body
     // captured into the selection map, in reading order.
     try std.testing.expect(sel.items.len > 0);
     try std.testing.expectEqual(@as(u32, 'h'), sel.items[0].cp);
 
     // A non-thread screen captures nothing (only the rooted post is selectable).
-    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_home, null, 0, accent_house, null, .{}, null, null, &sel);
+    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_home, null, 0, accent_house, null, .{}, null, null, &sel, "");
     try std.testing.expectEqual(@as(usize, 0), sel.items.len);
 }
 
@@ -1943,7 +2044,7 @@ test "long timeline does not overflow draw coordinates (off-screen posts skipped
     const posts = try arena.alloc(PostView, n);
     for (posts) |*pv| pv.* = .{ .name = "x", .handle = "@x.zat", .age = "1m", .body = "a body line that wraps a little across the feed column width here", .tint = 0xFF888888, .reply = 1, .boost = 2, .like = 3, .initial = 'x', .liked = false, .boosted = false };
 
-    const h = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null); // must not panic
+    const h = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, ""); // must not panic
     try std.testing.expect(h > 940 * 10); // height accounts for the whole list
     try std.testing.expect(regions.items.len < 4 * 24); // only on-screen posts are tappable
 
@@ -1957,11 +2058,11 @@ test "long timeline does not overflow draw coordinates (off-screen posts skipped
     @memset(heights, -1);
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h_fill = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null);
+    const h_fill = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "");
     const fill_regions = regions.items.len;
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h_cached = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null);
+    const h_cached = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "");
     try std.testing.expectEqual(h, h_fill);
     try std.testing.expectEqual(h, h_cached);
     try std.testing.expectEqual(fill_regions, regions.items.len);
@@ -1984,7 +2085,7 @@ test "profile screen renders the author's posts under a header; other screens st
     // Profile screen: 8 post tap regions (body + avatar + reply/repost/like +
     // bookmark/share/more) + 4 profile-nav tab regions in the sticky header
     // (the header here isn't editable, so no edit-profile region).
-    const hp = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_profile, header, 0, accent_house, null, .{}, null, null, null);
+    const hp = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_profile, header, 0, accent_house, null, .{}, null, null, null, "");
     try std.testing.expect(hp > 112);
     try std.testing.expectEqual(@as(usize, 12), regions.items.len);
 
@@ -1992,7 +2093,7 @@ test "profile screen renders the author's posts under a header; other screens st
     // so no tap regions, and the height clamps to the viewport (no post stack).
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const he = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, 1, null, 0, accent_house, null, .{}, null, null, null); // Explore
+    const he = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, 1, null, 0, accent_house, null, .{}, null, null, null, ""); // Explore
     try std.testing.expectEqual(@as(i32, 940), he);
     try std.testing.expectEqual(@as(usize, 0), regions.items.len);
 
@@ -2000,7 +2101,7 @@ test "profile screen renders the author's posts under a header; other screens st
     // control: a single Sign out tap region.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_settings, null, 0, accent_house, null, .{}, null, null, null);
+    _ = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_settings, null, 0, accent_house, null, .{}, null, null, null, "");
     try std.testing.expectEqual(@as(usize, 1), regions.items.len);
     try std.testing.expectEqual(Action.sign_out, regions.items[0].kind);
 }

@@ -62,6 +62,10 @@ pub const Reduced = union(enum) {
         created_at: []const u8,
         reply_parent_cid: []const u8 = "", // "" when not a reply
         reply_root_cid: []const u8 = "",
+        /// The post's rich-text facets (carries its `#tag` facets). The consumer
+        /// derives zone tags via `lexicon.collectTags` and persists these so a
+        /// replay restores the tags too. null ⇒ no facets.
+        facets: ?[]const lexicon.Facet = null,
     },
     follow: struct {
         did: []const u8, // follower
@@ -95,6 +99,8 @@ const InnerRecord = struct {
     subject: std.json.Value = .null,
     /// A post's reply refs (root + parent strong refs); null on a non-reply.
     reply: ?lexicon.ReplyRefOut = null,
+    /// A post's rich-text facets (including `#tag` facets); null when none.
+    facets: ?[]const lexicon.Facet = null,
 };
 
 /// A7.2: cold struct, size guard waived — transient parse target.
@@ -157,6 +163,7 @@ pub fn reduce(arena: Allocator, message_json: []const u8) error{OutOfMemory}!?Ev
             .created_at = rec.createdAt,
             .reply_parent_cid = if (rec.reply) |rep| rep.parent.cid else "",
             .reply_root_cid = if (rec.reply) |rep| rep.root.cid else "",
+            .facets = rec.facets,
         } } };
     }
     if (std.mem.eql(u8, env.collection, lexicon.collection.follow)) {

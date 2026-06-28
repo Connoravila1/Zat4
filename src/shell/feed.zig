@@ -225,6 +225,47 @@ pub fn loadThread(
     }
 }
 
+/// Fetch a ZONE's feed (`getPostsForTag?tag=&viewer=`) and ingest its posts as
+/// CONTENT into the shared store; the zone VIEW is then a pure query
+/// (`feed_core.buildTagView`), so engagement + identity stay unified with every
+/// other view (ZONES inv. 4). The server normalizes the tag, so the display-form
+/// `tag` the user tapped resolves to the same zone (invariant 1).
+pub fn loadZoneFeed(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    session: *auth.Session,
+    appview_url: []const u8,
+    store: *feed_core.Store,
+    tag: []const u8,
+    limit: u32,
+) !PageOutcome {
+    var limit_buf: [12]u8 = undefined;
+    const limit_str = std.fmt.bufPrint(&limit_buf, "{d}", .{limit}) catch unreachable;
+    const params = [_]xrpc.Param{
+        .{ .name = "tag", .value = tag },
+        .{ .name = "viewer", .value = session.did },
+        .{ .name = "limit", .value = limit_str },
+    };
+
+    const outcome = try auth.queryHost(
+        gpa,
+        arena,
+        io,
+        environ,
+        session,
+        appview_url,
+        lexicon.method.get_posts_for_tag,
+        &params,
+        lexicon.TimelinePage,
+    );
+    switch (outcome) {
+        .failed => |failure| return .{ .failed = failure },
+        .ok => |page| return .{ .ok = try feed_core.ingestPosts(gpa, store, page) },
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Loopback round trip — a scripted fixture PDS serves two timeline pages;
 // the second request must carry the first page's cursor on the wire, and a

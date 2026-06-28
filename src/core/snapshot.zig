@@ -38,7 +38,12 @@ const Allocator = std.mem.Allocator;
 const feed = @import("feed.zig");
 
 pub const magic = [4]u8{ 'Z', 'A', 'T', 'C' };
-pub const version: u16 = 1;
+// v2: added the zone tag arrays (tag_pool + post_tags). The bump makes a v1
+// cache (no tags) cleanly REJECTED on load → a fresh fetch repopulates with
+// tags, rather than a desynced post_tags shorter than posts. (This is the
+// cache-version mechanism: a data-shape change bumps the version, old caches
+// drop themselves — the production-safe answer to "I changed server data".)
+pub const version: u16 = 2;
 
 /// A7.2: cold struct, size guard waived — one per encode/decode.
 const Header = struct {
@@ -47,6 +52,7 @@ const Header = struct {
     posts_len: u32,
     feed_len: u32,
     cursor: feed.TextSpan,
+    tag_pool_len: u32,
 };
 
 pub const DecodeError = error{ OutOfMemory, InvalidSnapshot };
@@ -67,6 +73,7 @@ pub fn encode(arena: Allocator, store: *const feed.Store) error{OutOfMemory}![]u
     try appendInt(arena, &out, u32, @intCast(store.feed.len));
     try appendInt(arena, &out, u32, store.next_cursor.offset);
     try appendInt(arena, &out, u32, store.next_cursor.len);
+    try appendInt(arena, &out, u32, @intCast(store.tag_pool.items.len));
 
     try out.appendSlice(arena, store.string_bytes.items);
 
@@ -96,6 +103,11 @@ pub fn encode(arena: Allocator, store: *const feed.Store) error{OutOfMemory}![]u
 
     try appendBitset(arena, &out, store.liked, store.posts.len);
     try appendBitset(arena, &out, store.reposted, store.posts.len);
+
+    // Zone tags: the flat pool, then the per-post windows (parallel to posts).
+    // Post content (derived from facets, stable), so persisted like text/counts.
+    try appendField(arena, &out, store.tag_pool.items);
+    try appendField(arena, &out, store.post_tags.items);
 
     return out.items;
 }
@@ -163,6 +175,7 @@ pub fn decode(gpa: Allocator, bytes: []const u8) DecodeError!feed.Store {
         .posts_len = try c.takeInt(u32),
         .feed_len = try c.takeInt(u32),
         .cursor = .{ .offset = try c.takeInt(u32), .len = try c.takeInt(u32) },
+        .tag_pool_len = try c.takeInt(u32),
     };
     // A sanity ceiling: a local cache is megabytes, not gigabytes.
     if (header.string_len > 256 * 1024 * 1024) return error.InvalidSnapshot;
@@ -180,7 +193,7 @@ pub fn decode(gpa: Allocator, bytes: []const u8) DecodeError!feed.Store {
     // is Phase 2's "a count never sizes memory unchecked" applied to the on-disk
     // boundary too (the cache is untrusted input like the wire).
     const remaining = c.bytes.len - c.at;
-    if (header.authors_len > remaining or header.posts_len > remaining or header.feed_len > remaining) {
+    if (header.authors_len > remaining or header.posts_len > remaining or header.feed_len > remaining or header.tag_pool_len > remaining) {
         return error.InvalidSnapshot;
     }
 
@@ -213,6 +226,13 @@ pub fn decode(gpa: Allocator, bytes: []const u8) DecodeError!feed.Store {
 
     try takeBitset(gpa, &c, &store.liked, header.posts_len);
     try takeBitset(gpa, &c, &store.reposted, header.posts_len);
+
+    // Zone tags (v2), in encode order: the flat pool, then the per-post windows
+    // (parallel to posts — keeps the post_tags[index] access in internPost safe).
+    try store.tag_pool.resize(gpa, header.tag_pool_len);
+    try takeField(&c, store.tag_pool.items);
+    try store.post_tags.resize(gpa, header.posts_len);
+    try takeField(&c, store.post_tags.items);
     // The optimistic-write guards are transient (they mark a tap the server
     // has not yet confirmed): a fresh process has no in-flight writes, so they
     // are deliberately NOT in the snapshot. Size them all-false so indexing is
@@ -254,6 +274,12 @@ pub fn decode(gpa: Allocator, bytes: []const u8) DecodeError!feed.Store {
         if (opt.unwrap()) |author| {
             if (@intFromEnum(author) >= header.authors_len) return error.InvalidSnapshot;
         }
+    }
+    // Tag spans point into the string buffer; each per-post window lies within
+    // the pool (untrusted file — verify both, like every other span/index).
+    for (store.tag_pool.items) |span| try validateSpan(&store, span);
+    for (store.post_tags.items) |r| {
+        if (@as(usize, r.off) + @as(usize, r.len) > store.tag_pool.items.len) return error.InvalidSnapshot;
     }
 
     // Rebuild the identity maps from the verified spans (A8: the CID is
