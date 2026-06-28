@@ -491,6 +491,23 @@ pub fn freeSession(gpa: Allocator, session: *const auth.Session) void {
     auth.freeSession(gpa, session.*);
 }
 
+/// Sign-out: remove every trace of the cached session — BOTH cache files AND the
+/// keystore entries (app-password + oauth), so a relaunch finds nothing and shows
+/// the Join/login flow. Best-effort and idempotent (E4): a missing file or an
+/// absent keystore entry is success, not an error. Mirrors the two places a
+/// session is persisted — `saveSessionAt` (keystore key `app-password-session` +
+/// `session.zat`) and `saveOAuthSessionAt` (`oauth-session` + `oauth_session.zat`).
+pub fn clearSession(environ: ?*const std.process.Environ.Map) void {
+    if (keystore_supported) {
+        keystore.del(session_keystore_key);
+        keystore.del(oauth_keystore_key);
+    }
+    var buf: [512]u8 = undefined;
+    if (sessionPath(&buf, environ)) |p| unlink(p);
+    var buf2: [512]u8 = undefined;
+    if (oauthSessionPath(&buf2, environ)) |p| unlink(p);
+}
+
 pub fn sessionPath(buf: []u8, environ: ?*const std.process.Environ.Map) ?[]const u8 {
     var dir_buf: [512]u8 = undefined;
     const dir = cacheDir(&dir_buf, environ) orelse return null;

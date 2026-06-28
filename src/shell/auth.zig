@@ -197,6 +197,54 @@ fn freeSecret(gpa: Allocator, secret: []const u8) void {
     gpa.free(secret);
 }
 
+/// Re-home a `Session`'s owned strings from `src` to `dst`, then free (scrubbing
+/// the secrets of) the source — an ownership transfer across allocators.
+///
+/// Why this exists: the GUI runs the blocking OAuth login on a worker thread,
+/// which (per the enroll-worker convention) allocates from a thread-safe
+/// allocator rather than the single-threaded render allocator. The finished
+/// session must then be handed to a caller that frees with the render allocator,
+/// so its strings are duped into `dst` and the worker-owned originals released.
+/// Called on the main thread AFTER the worker is joined — no concurrency here.
+///
+/// On success the returned `Session` is wholly owned by `dst` and `s` has been
+/// freed (do not touch it again). On an allocation failure nothing leaks: the
+/// partial `dst` copies unwind via `errdefer`, and `s` is left intact for the
+/// caller to free with `src`.
+pub fn reownSession(dst: Allocator, src: Allocator, s: Session) !Session {
+    const did = try dst.dupe(u8, s.did);
+    errdefer dst.free(did);
+    const handle = try dst.dupe(u8, s.handle);
+    errdefer dst.free(handle);
+    const pds_url = try dst.dupe(u8, s.pds_url);
+    errdefer dst.free(pds_url);
+    const access = try dst.dupe(u8, s.access_jwt);
+    errdefer freeSecret(dst, access);
+    const refresh = try dst.dupe(u8, s.refresh_jwt);
+    errdefer freeSecret(dst, refresh);
+
+    var out: Session = .{
+        .did = did,
+        .handle = handle,
+        .pds_url = pds_url,
+        .access_jwt = access,
+        .refresh_jwt = refresh,
+        .mode = s.mode,
+        .dpop_secret = s.dpop_secret,
+    };
+    if (s.mode == .oauth) {
+        out.scope = try dst.dupe(u8, s.scope);
+        errdefer dst.free(out.scope);
+        out.issuer = try dst.dupe(u8, s.issuer);
+        errdefer dst.free(out.issuer);
+        out.token_endpoint = try dst.dupe(u8, s.token_endpoint);
+        errdefer dst.free(out.token_endpoint);
+        out.nonce = if (s.nonce) |n| try dst.dupe(u8, n) else null;
+    }
+    freeSession(src, s); // scrubs + releases the source copy (no concurrency: post-join)
+    return out;
+}
+
 /// Free a `Session` produced by `login` (A1: behavior as a free function). The
 /// JWTs are session secrets, so they are scrubbed before release.
 pub fn freeSession(gpa: Allocator, session: Session) void {
@@ -659,6 +707,38 @@ test "loopback round trip: login POSTs credentials, session strings owned by gpa
     try std.testing.expectEqualStrings("access-1", session.access_jwt);
     try std.testing.expectEqualStrings("refresh-1", session.refresh_jwt);
     try std.testing.expectEqualStrings(pds, session.pds_url);
+}
+
+test "reownSession: oauth fields transfer to dst and the source is released (C6)" {
+    const gpa = std.testing.allocator; // C6: a leak in either the dst copy or the
+    // src free fails this test (src and dst are the same allocator, so the dupe
+    // count and the free count must balance exactly).
+
+    // A worker-owned oauth session (every owned string + the oauth-only fields).
+    const src: Session = .{
+        .mode = .oauth,
+        .did = try gpa.dupe(u8, "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"),
+        .handle = try gpa.dupe(u8, "bob.test"),
+        .pds_url = try gpa.dupe(u8, "https://pds.example"),
+        .access_jwt = try gpa.dupe(u8, "access-secret"),
+        .refresh_jwt = try gpa.dupe(u8, "refresh-secret"),
+        .scope = try gpa.dupe(u8, "atproto transition:generic"),
+        .issuer = try gpa.dupe(u8, "https://issuer.example"),
+        .token_endpoint = try gpa.dupe(u8, "https://issuer.example/token"),
+        .nonce = try gpa.dupe(u8, "nonce-xyz"),
+        .dpop_secret = [_]u8{7} ** 32,
+    };
+
+    const out = try reownSession(gpa, gpa, src); // src is freed inside on success
+    defer freeSession(gpa, out);
+
+    try std.testing.expectEqual(AuthMode.oauth, out.mode);
+    try std.testing.expectEqualStrings("did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", out.did);
+    try std.testing.expectEqualStrings("bob.test", out.handle);
+    try std.testing.expectEqualStrings("access-secret", out.access_jwt);
+    try std.testing.expectEqualStrings("https://issuer.example/token", out.token_endpoint);
+    try std.testing.expectEqualStrings("nonce-xyz", out.nonce.?);
+    try std.testing.expectEqualSlices(u8, &([_]u8{7} ** 32), &out.dpop_secret);
 }
 
 test "loopback round trip: a login refusal is a value the caller can show" {

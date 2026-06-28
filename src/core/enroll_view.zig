@@ -55,8 +55,12 @@ const privacy_placeholder =
 /// Which step of the funnel the surface is showing. `recovery` only appears for
 /// a NEW, no-email identity (it reveals the account recovery key) — it sits
 /// after `confirm` so the progress dots stay clean and both "save this secret"
-/// moments (password, recovery key) sit together.
-pub const Step = enum(u8) { provenance, identity, membership, password, confirm, recovery, done, verifying };
+/// moments (password, recovery key) sit together. `connecting` is the EXISTING
+/// branch's terminal wait: after the handle is entered we hand off to the browser
+/// OAuth flow and spin here until it lands. It is appended LAST on purpose — the
+/// new-account ritual's step indices (which the progress dots count) must not
+/// shift.
+pub const Step = enum(u8) { provenance, identity, membership, password, confirm, recovery, done, verifying, connecting };
 
 /// How the person is coming in (the top-level branch). `undecided` only before
 /// step 0 is answered; the identity step renders differently per branch.
@@ -149,6 +153,10 @@ pub const EnrollView = struct {
     card_h: i32 = 0,
     body_dy: i32 = 0,
     info: Info = .none, // which info bubble is open
+    /// `.connecting` only: the browser OAuth flow failed (or was abandoned), so
+    /// the spinner becomes a "couldn't sign in" card with a retry. False while the
+    /// wait is still live.
+    connect_failed: bool = false,
 };
 
 /// One tap target. HOT (iterated in `hitTest`); guarded (A7). No payload — the
@@ -253,6 +261,7 @@ pub fn layout(
         .recovery => try stepRecovery(gpa, dl, e, ix, iw, by, view, hits),
         .done => try stepDone(gpa, dl, e, ix, iw, by, view, hits),
         .verifying => try stepVerifying(gpa, dl, e, ix, iw, by, view),
+        .connecting => try stepConnecting(gpa, dl, e, ix, iw, by, view, hits),
     }
 
     // Hover lift: one overlay over whatever control the cursor is on, eased so
@@ -709,6 +718,72 @@ fn drawRing(gpa: Allocator, dl: *raster.DrawList, cx: i32, cy: i32, r: i32, pow_
             col = mixToWhite(accent, std.math.clamp(0.7 + 0.3 * fl, 0.0, 1.0));
             th = 5;
             ext = 7.0; // the comet head, longest
+        }
+        const r_out = base_out + ext;
+        try line(gpa, dl, @intFromFloat(cxf + r_in * c), @intFromFloat(cyf + r_in * s), @intFromFloat(cxf + r_out * c), @intFromFloat(cyf + r_out * s), col, th);
+    }
+}
+
+/// The EXISTING-branch "finish in your browser" wait. While the worker runs the
+/// OAuth flow (unknown duration) this shows an indeterminate orbiting spinner;
+/// if the flow fails or is abandoned (`connect_failed`) it becomes a calm
+/// retry card. Branded in the same accent + radial-tick language as the proof
+/// ring so the wait feels native to the flow.
+fn stepConnecting(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, ix: i32, iw: i32, y0: i32, view: EnrollView, hits: ?*HitList) !void {
+    var y = y0 + 4;
+    if (view.connect_failed) {
+        try centerStr(gpa, dl, e, ix, iw, y + 16, ink, 21, "Couldn't sign in");
+        y += 36;
+        y = try wrapCenter(gpa, dl, e, ix, y, iw, muted, 14, "The browser sign-in didn't complete. Try again, or go back to choose a different way in.");
+        y += 26;
+        try primaryButton(gpa, dl, e, ix, iw, y, "Try again", true, hits);
+        y += 46 + 12;
+        try ghostButton(gpa, dl, e, ix, iw, y, "Back", hits);
+        return;
+    }
+
+    try centerStr(gpa, dl, e, ix, iw, y + 16, ink, 21, "Finish in your browser");
+    y += 36;
+    y = try wrapCenter(gpa, dl, e, ix, y, iw, muted, 14, "We opened your browser to sign in securely at your own server. Complete it there and you'll land right back here.");
+    y += 20;
+
+    const cx = ix + @divTrunc(iw, 2);
+    const r: i32 = 60;
+    const cy = y + r + 8;
+    try drawConnectingSpinner(gpa, dl, cx, cy, r, view.bar_phase);
+    try centerStr(gpa, dl, e, ix, iw, cy + r + 30, faint, 13, "Waiting for your browser\u{2026}");
+}
+
+/// An INDETERMINATE spinner for the OAuth browser wait — the duration is unknown
+/// (it's gated on the human + their server), so instead of filling to a percent
+/// like `drawRing`, a bright comet of radial ticks ORBITS the ring continuously:
+/// brightest at the head, fading down a ~third-circle tail, dim ahead. Same tick
+/// vocabulary as the proof ring; pure (driven only by the field clock `phase`).
+fn drawConnectingSpinner(gpa: Allocator, dl: *raster.DrawList, cx: i32, cy: i32, r: i32, phase: f32) !void {
+    const N: i32 = 48;
+    const base_out: f32 = @floatFromInt(r);
+    const r_in: f32 = base_out - 11.0;
+    const cxf: f32 = @floatFromInt(cx);
+    const cyf: f32 = @floatFromInt(cy);
+    const step: f32 = 1.0 / @as(f32, @floatFromInt(N));
+    const head: f32 = @mod(@abs(phase) * 0.5, 1.0); // ~half a revolution per second
+    const window: f32 = 0.34; // comet length as a fraction of the circle
+    var i: i32 = 0;
+    while (i < N) : (i += 1) {
+        const fi: f32 = @floatFromInt(i);
+        const frac = fi * step;
+        const ang = -1.5707963 + frac * 6.2831853; // top, clockwise
+        const c = @cos(ang);
+        const s = @sin(ang);
+        const d = @mod(head - frac + 1.0, 1.0); // distance BEHIND the head (0 at head)
+        var col: u32 = soft(accentRGB(), 0x2C); // dim, ahead of the comet
+        var th: u8 = 3;
+        var ext: f32 = 0;
+        if (d < window) {
+            const k = 1.0 - d / window; // 1 at the head → 0 at the tail
+            col = mixToWhite(accent, std.math.clamp(k * 0.85, 0.0, 1.0));
+            th = if (k > 0.7) 5 else 4;
+            ext = k * 6.0;
         }
         const r_out = base_out + ext;
         try line(gpa, dl, @intFromFloat(cxf + r_in * c), @intFromFloat(cyf + r_in * s), @intFromFloat(cxf + r_out * c), @intFromFloat(cyf + r_out * s), col, th);
@@ -1278,6 +1353,7 @@ pub fn cardHeight(step: Step, branch: Branch) i32 {
         .recovery => 484,
         .done => 380,
         .verifying => 402,
+        .connecting => 402,
     };
 }
 

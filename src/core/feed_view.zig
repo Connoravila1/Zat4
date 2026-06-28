@@ -71,7 +71,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// `compose` (the New-post button) route navigation rather than engagement.
 /// `compose_send` / `compose_cancel` are the premium composer's footer buttons
 /// (the shell turns a tap into the same control byte the keyboard sends).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out };
 
 /// The six top-level rail destinations, in order. The `Screen` index a nav
 /// region carries is an index into this. Shared by the rail (draw + hit) and
@@ -815,6 +815,27 @@ pub fn layout(
         // A post's thread: the `posts` handed in ARE the thread (ancestors, the
         // focused post, then replies, in that order) — fall through to the post
         // loop. The top bar shows "Thread" + a back button (drawTopBar).
+    } else if (active_screen == screen_settings) {
+        // Settings is otherwise a placeholder, but it hosts the one wired control
+        // we need today: Sign out — clears the cached session, so the app returns
+        // to the Join/login flow on the next launch.
+        const top = headerBottom(active_screen) + 28;
+        const bw: i32 = @min(280, m.col_w - 44);
+        const bx = m.col_x + @divTrunc(m.col_w - bw, 2);
+        _ = try str(gpa, dl, e, .semibold, bx, top + 4, ink, 17, "Account");
+        _ = try str(gpa, dl, e, .regular, bx, top + 28, muted, 13, "Sign out of Zat4 on this device.");
+        const by = top + 50;
+        const bh: u16 = 46;
+        // A bordered (not filled-accent) button — sign-out is a calm, deliberate
+        // action, not a primary call-to-action.
+        try rect(gpa, dl, bx, by, bw, bh, 0x14EDEAE0, 12); // subtle fill
+        try rect(gpa, dl, bx, by, bw, 1, 0x33EDEAE0, 12); // lit top edge
+        const label = "Sign out";
+        const lw: i32 = @intCast(text.measure(e, .semibold, label, 15));
+        _ = try str(gpa, dl, e, .semibold, bx + @divTrunc(bw - lw, 2), by + 29, ink, 15, label);
+        try emitRegion(gpa, regions, bx, by, bw, bh, 0, .sign_out);
+        try drawTopBar(gpa, dl, e, m, active_screen, regions, profile, accent, socket_tray, socket_ui, socket_hits);
+        return height;
     } else if (active_screen != 0) {
         const msg = "Coming soon";
         const tw: i32 = @intCast(text.measure(e, .regular, msg, 16));
@@ -1974,4 +1995,12 @@ test "profile screen renders the author's posts under a header; other screens st
     const he = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, 1, null, 0, accent_house, null, .{}, null, null, null); // Explore
     try std.testing.expectEqual(@as(i32, 940), he);
     try std.testing.expectEqual(@as(usize, 0), regions.items.len);
+
+    // The Settings screen is a placeholder too, but it carries the one wired
+    // control: a single Sign out tap region.
+    dl.len = 0;
+    regions.clearRetainingCapacity();
+    _ = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_settings, null, 0, accent_house, null, .{}, null, null, null);
+    try std.testing.expectEqual(@as(usize, 1), regions.items.len);
+    try std.testing.expectEqual(Action.sign_out, regions.items[0].kind);
 }

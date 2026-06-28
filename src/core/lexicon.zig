@@ -138,6 +138,21 @@ pub const collection = struct {
     /// §10). A singleton (rkey "self") in the user's own repo, so it travels
     /// with the account — invariant 12 made literal.
     pub const loadout = "app.zat4.socket.loadout";
+    /// The user's Zat4 MEMBERSHIP (IDENTITY_ENROLLMENT_DESIGN §13.2). A singleton
+    /// (rkey "self") in the user's own repo: its mere EXISTENCE marks the DID as a
+    /// Zat4 member, which drives the returning-vs-first-time sign-in fork. Carries
+    /// the join timestamp, how they joined (new account vs imported DID), and the
+    /// load-bearing consent record.
+    pub const membership = "app.zat4.actor.membership";
+};
+
+/// How a DID became a Zat4 member — a new Zat4 account on our PDS (with a Zat4
+/// password) vs an imported existing identity (OAuth, no Zat4 password). Stored as
+/// the `via` string on the membership record (§13.3).
+pub const membership_via = struct {
+    // Not a record: a string-constant namespace (no fields). A1/A7 do not apply.
+    pub const created = "created";
+    pub const imported = "imported";
 };
 
 /// Richtext facet `$type` discriminators. Zat4 defines its own richtext
@@ -416,6 +431,45 @@ pub const ProfileRecordOut = struct {
     displayName: ?[]const u8 = null,
     description: ?[]const u8 = null,
     createdAt: []const u8,
+};
+
+// ── Membership record (`app.zat4.actor.membership`, rkey "self") ──
+// The read shapes are fully defaulted so `GetRecordResponse(MembershipRecord)`
+// can parse a present record OR fall back cleanly when none exists (E4); the
+// `*Out` shapes are the write forms. See IDENTITY_ENROLLMENT_DESIGN §13.
+
+/// The consent captured at enrollment (read form). A7.2: cold struct, size guard
+/// waived — one per membership read, never in a hot loop.
+pub const MembershipConsent = struct {
+    tosVersion: []const u8 = "",
+    agreedAt: []const u8 = "",
+    ageConfirmed: bool = false,
+};
+
+/// The membership record (read form). A7.2: cold struct, size guard waived — one
+/// per sign-in membership check.
+pub const MembershipRecord = struct {
+    @"$type": []const u8 = collection.membership,
+    createdAt: []const u8 = "",
+    via: []const u8 = "",
+    consent: MembershipConsent = .{},
+};
+
+/// The consent captured at enrollment (write form). A7.2: cold struct, size guard
+/// waived — one per enrollment write.
+pub const MembershipConsentOut = struct {
+    tosVersion: []const u8,
+    agreedAt: []const u8,
+    ageConfirmed: bool,
+};
+
+/// The membership record (write form). A7.2: cold struct, size guard waived — one
+/// per enrollment write.
+pub const MembershipRecordOut = struct {
+    @"$type": []const u8 = collection.membership,
+    createdAt: []const u8,
+    via: []const u8,
+    consent: MembershipConsentOut,
 };
 
 /// The createRecord envelope, generic over the record shape at comptime

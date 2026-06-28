@@ -35,6 +35,9 @@ const credential_core = @import("../core/credential.zig");
 const credential_shell = @import("credential.zig");
 const membership_shell = @import("membership.zig");
 const auth = @import("auth.zig"); // createAccount + Session (the network hand-off)
+const oauth = @import("oauth.zig"); // existing-account browser sign-in (OAuth/DPoP)
+const identity = @import("identity.zig"); // handle → PDS resolution for the OAuth flow
+const membership_record = @import("membership_record.zig"); // the on-network Zat4 membership record
 const config = @import("config.zig"); // the PDS host new accounts are minted on
 const lexicon = @import("../core/lexicon.zig");
 const pow = @import("../core/pow.zig");
@@ -140,6 +143,7 @@ const State = struct {
     trans_t: f32 = 1.0, // 0 right after a step change → 1 settled
     card_h: f32 = 0.0, // eased card height (0 = not yet initialised)
     info: enroll_view.Info = .none, // which info bubble is open
+    connect_failed: bool = false, // .connecting: the browser OAuth flow failed → retry card
 };
 
 // How long the password "crafting" decode plays (≈1.9 s — long enough to enjoy).
@@ -217,6 +221,21 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     // finishes during the ~1.9s password decode; the verify behind "Checking…".
     var memjob: MemJob = .{};
     defer joinMem(&memjob); // join any in-flight hash before exit (runs before mstore deinit)
+
+    // The EXISTING-account browser OAuth sign-in runs on its own worker (the flow
+    // BLOCKS on the loopback callback while the user is in the browser, so it must
+    // not sit on the UI thread). The spinner stays live; the loop polls `done`.
+    // `defer` cancels + joins any in-flight flow on exit (Esc / window close) —
+    // the cancel unblocks the loopback wait so we never hang on shutdown.
+    var oauthjob: OAuthJob = .{};
+    defer stopOAuth(&oauthjob);
+
+    // A first-time imported DID's OAuth session is held here while they finish the
+    // membership-minting step (PoW), then handed to the caller. Freed on exit if
+    // the window closes mid-mint (set to null before any return that consumes it,
+    // so this never double-frees).
+    var pending_oauth_session: ?auth.Session = null;
+    defer if (pending_oauth_session) |ps| auth.freeSession(gpa, ps);
 
     var t: f32 = 0;
     var last_step_ns: u64 = 0;
@@ -384,10 +403,11 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
                     splashes.append(gpa, .{ .x = bx, .y = by, .radius = 4, .amp = 1.6 }) catch {};
                 }
             }
-            // Proof sealed → mint the account (slice 3b). A NEW account is created
-            // on the PDS once; on success the session is handed back to the caller
-            // (the feed), on failure we drop to the done screen for a retry. The
-            // existing-identity verify path is a later slice (it loops for now).
+            // Proof sealed → mint membership, once. NEW branch: create the account
+            // on the PDS (which also writes its membership record) → feed, or the
+            // done screen on failure. EXISTING branch: a first-time imported DID
+            // (carrying its OAuth session) — write the membership record
+            // (via=imported, no password) → feed.
             if (state.branch == .new) {
                 if (state.seal_t >= 1.0 and !signup_attempted) {
                     signup_attempted = true;
@@ -397,15 +417,60 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
                     }
                     state.step = .done; // failed (printed); let them retry
                 }
-            } else if (state.seal_t >= 1.0 and (frame_ns -| state.seal_start_ns) > 2_300_000_000) {
-                stopPow(&powjob);
-                reset(&state);
+            } else if (state.seal_t >= 1.0 and !signup_attempted) {
+                signup_attempted = true;
+                if (pending_oauth_session) |ps| {
+                    var session = ps;
+                    var aa = std.heap.ArenaAllocator.init(gpa);
+                    defer aa.deinit();
+                    _ = membership_record.put(gpa, aa.allocator(), io, env, &session, lexicon.membership_via.imported, tos_version_placeholder, state.age_ok, clock_shell.unixSeconds()) catch |err| {
+                        std.debug.print("[enroll] membership write error: {s}\n", .{@errorName(err)});
+                    };
+                    pending_oauth_session = null; // ownership transfers to the return
+                    stopPow(&powjob);
+                    return session; // membership minted → drop into the feed
+                }
+                reset(&state); // no carried session (shouldn't happen) — fail safe
             }
         } else {
             if (powjob.active) stopPow(&powjob);
             state.pow_t = 0.0;
             state.seal_t = 0.0;
             signup_attempted = false; // left verifying → allow a fresh attempt
+        }
+
+        // EXISTING-account browser sign-in: while on the connecting step, run the
+        // blocking OAuth flow on the worker and poll for it. On success we re-home
+        // the worker-owned session into `gpa` (no concurrency: the worker is
+        // joined first) and drop into the feed; on failure the spinner becomes a
+        // retry card. The worker isn't (re)started while a failure is showing —
+        // "Try again" clears `connect_failed`, which re-arms the start below.
+        if (state.step == .connecting) {
+            if (!oauthjob.active and !state.connect_failed) startOAuth(&oauthjob, &state, io, env);
+            if (oauthjob.active and oauthjob.done.load(.acquire)) {
+                joinOAuth(&oauthjob); // join the finished worker; we consume its result below
+                if (oauthjob.ok) {
+                    if (auth.reownSession(gpa, std.heap.page_allocator, oauthjob.session)) |sess| {
+                        if (oauthjob.is_member) {
+                            return sess; // returning member → straight to the feed (§13.1)
+                        }
+                        // First-time imported DID → mint Zat4 membership: through
+                        // the PoW gate, then write the record (via=imported), no
+                        // password. Carry the OAuth session through the PoW step.
+                        pending_oauth_session = sess;
+                        signup_attempted = false;
+                        state.step = .verifying;
+                        state.pow_start_ns = frame_ns;
+                    } else |_| {
+                        // OOM re-homing the session — release the worker copy and
+                        // let the user retry (a transient, not a dead end).
+                        auth.freeSession(std.heap.page_allocator, oauthjob.session);
+                        state.connect_failed = true;
+                    }
+                } else {
+                    state.connect_failed = true;
+                }
+            }
         }
 
         // "Copied" toast: hold ~1.1 s after a copy, then fade over ~0.35 s.
@@ -548,6 +613,7 @@ fn snapshot(s: *const State, blink_on: bool) enroll_view.EnrollView {
         .card_h = @intFromFloat(s.card_h),
         .body_dy = @intFromFloat((1.0 - s.trans_t) * 30.0),
         .info = s.info,
+        .connect_failed = s.connect_failed,
     };
 }
 
@@ -704,7 +770,15 @@ fn apply(s: *State, target: enroll_view.HitTarget, io: std.Io, now_ns: u64, msto
         .primary => switch (s.step) {
             .provenance => {},
             .identity => {
-                s.step = .membership;
+                // EXISTING identity → hand off to the browser OAuth sign-in (the
+                // run loop starts the worker on this step). NEW identity continues
+                // the create-account ritual through membership.
+                if (s.branch == .existing) {
+                    s.connect_failed = false;
+                    s.step = .connecting;
+                } else {
+                    s.step = .membership;
+                }
                 s.focus = .none;
             },
             .membership => {
@@ -734,6 +808,9 @@ fn apply(s: *State, target: enroll_view.HitTarget, io: std.Io, now_ns: u64, msto
                 s.pow_start_ns = now_ns;
             },
             .verifying => {},
+            // The connecting card's "Try again" after a failed sign-in: clear the
+            // failure so the run loop re-launches the OAuth worker.
+            .connecting => s.connect_failed = false,
         },
         .tier_secure => selectTier(s, .secure, now_ns),
         .tier_super => selectTier(s, .super_secure, now_ns),
@@ -1074,6 +1151,124 @@ fn startVerify(job: *MemJob, s: *State, io: std.Io, mstore: *membership_shell.St
     spawnMem(job, .verify, mstore, io);
 }
 
+// ── EXISTING-account browser OAuth sign-in (background worker) ──────────────
+//
+// "I already have an account" hands off to the atproto OAuth/DPoP flow: resolve
+// the typed handle to its PDS, open the system browser, and exchange the
+// callback for a DPoP-bound session. That flow BLOCKS on the loopback callback
+// for as long as the human takes, so it runs here, off the UI thread, exactly
+// like the PoW + membership workers. The render loop spins the connecting
+// spinner and polls `done`.
+//
+// Allocator discipline (the one subtlety): the worker builds the session with
+// the thread-safe `page_allocator` — never the single-threaded render `gpa`,
+// which the UI thread is using every frame. After the loop JOINS the worker, it
+// re-homes the session into `gpa` via `auth.reownSession` (no concurrency at
+// that point) so the caller frees it like any other session.
+
+/// The background OAuth job (one live instance — A7.2 cold, guard waived).
+const OAuthJob = struct {
+    // A7.2: cold struct (one live instance, holds a thread + lifecycle), size guard waived.
+    thread: ?std.Thread = null,
+    /// Set by the main thread to abort the loopback wait (window closed mid-flow);
+    /// `oauth.login` polls it so a shutdown never hangs on `accept`.
+    cancel: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+    active: bool = false, // a flow is running (or finished and not yet consumed)
+    ok: bool = false, // a session was produced (read after done-acquire / join)
+    /// Whether the signed-in DID already has a Zat4 membership record (§13.1): the
+    /// fork — true → returning member (→ feed), false → first-timer (→ enrollment).
+    /// Determined on the worker right after login so the result lands with the
+    /// session, no UI-thread network call.
+    is_member: bool = false,
+    session: auth.Session = undefined, // page_allocator-owned on success
+    handle: [256]u8 = undefined, // copied would-be handle (worker reads this, not State)
+    handle_len: u16 = 0,
+    io: std.Io = undefined,
+    env: ?*const std.process.Environ.Map = null,
+};
+
+/// Worker body: resolve the handle → PDS, then run the browser OAuth flow. Both
+/// legs are networked shell ops; everything is allocated from the thread-safe
+/// `page_allocator` (the session) and a private arena over it (transients), so
+/// the worker never touches the render allocator. Publishes via `done` (release).
+fn oauthWorker(job: *OAuthJob) void {
+    const a = std.heap.page_allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const scratch = arena_state.allocator();
+    const handle = job.handle[0..job.handle_len];
+    if (runOAuth(a, scratch, job, handle)) |sess| {
+        job.session = sess;
+        job.ok = true;
+        // The fork (§13.1): does this DID already hold a Zat4 membership? A read
+        // failure is treated as "not a member" (the safe default — a first-timer
+        // path can always re-mint; idempotent at rkey "self"). Strings live in the
+        // arena (discarded); we only need existence.
+        const m = membership_record.fetch(a, scratch, job.io, job.env, &job.session, job.session.did) catch null;
+        job.is_member = (m != null);
+    } else |err| {
+        std.debug.print("[enroll] oauth sign-in failed: {s}\n", .{@errorName(err)});
+        job.ok = false;
+    }
+    job.done.store(true, .release);
+}
+
+/// Resolve the handle and run the login. The resolved `Identity` lives in
+/// `scratch` (freed with the arena); the returned session is `gpa`-owned
+/// (page_allocator here), re-homed by the caller after join.
+fn runOAuth(gpa: std.mem.Allocator, scratch: std.mem.Allocator, job: *OAuthJob, handle: []const u8) !auth.Session {
+    const id = try identity.resolve(scratch, job.io, job.env, .{}, handle);
+    return oauth.login(gpa, job.io, job.env, scratch, id.pds_url, id.handle, &job.cancel);
+}
+
+/// Spawn the OAuth flow for the handle currently typed into the existing-branch
+/// field. The handle is COPIED into the job so the worker never reads `State`
+/// (which the UI thread mutates). A spawn failure completes the job as a clean
+/// failure rather than hanging.
+fn startOAuth(job: *OAuthJob, s: *State, io: std.Io, env: ?*const std.process.Environ.Map) void {
+    const h = tfView(&s.handle);
+    const n = @min(h.len, job.handle.len);
+    @memcpy(job.handle[0..n], h[0..n]);
+    job.handle_len = @intCast(n);
+    job.io = io;
+    job.env = env;
+    job.cancel.store(false, .monotonic);
+    job.done.store(false, .monotonic);
+    job.ok = false;
+    job.active = true;
+    job.thread = std.Thread.spawn(.{}, oauthWorker, .{job}) catch null;
+    if (job.thread == null) job.done.store(true, .release); // spawn failed → "done" (ok=false)
+}
+
+/// Join a finished worker WITHOUT freeing its result — the render loop calls this
+/// once it sees `done`, because it's about to CONSUME `session` (re-home it into
+/// `gpa`). Leaves `thread == null`, which tells the shutdown `stopOAuth` the
+/// result was already taken.
+fn joinOAuth(job: *OAuthJob) void {
+    if (job.thread) |th| {
+        th.join();
+        job.thread = null;
+    }
+    job.active = false;
+}
+
+/// Shutdown cleanup (the `defer`): cancel + join any in-flight sign-in (the
+/// cancel unblocks the loopback wait so this returns promptly even mid-browser),
+/// AND release a SUCCESSFUL result that was never consumed — the case where the
+/// flow lands in the very frame the window closes, so the loop breaks before
+/// taking it. If the loop already consumed the result it called `joinOAuth`
+/// first (`thread == null`), so this is then a no-op and never double-frees.
+fn stopOAuth(job: *OAuthJob) void {
+    if (job.thread) |th| {
+        job.cancel.store(true, .release);
+        th.join();
+        job.thread = null;
+        if (job.ok) auth.freeSession(std.heap.page_allocator, job.session);
+    }
+    job.active = false;
+}
+
 /// Compose the final handle for the done screen from the branch + inputs.
 fn finalize(s: *State) void {
     var n: usize = 0;
@@ -1105,6 +1300,11 @@ fn reset(s: *State) void {
 /// bootstrapping). Returns the gpa-owned session on success, or null on a refusal
 /// / transport error (printed). Email path for now; the no-email / recovery-DID
 /// binding is a later sub-slice. A transient arena holds the request strings.
+/// The Terms-of-Service version recorded in the consent at enrollment. PLACEHOLDER
+/// until real Terms exist (ENROLLMENT_BUILD §9 A) — it just needs to be a stable
+/// string so the membership record can pin which version was agreed to.
+const tos_version_placeholder = "draft-2026-06";
+
 fn createZatAccount(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, s: *State) ?auth.Session {
     if (!s.has_pw) return null;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -1129,7 +1329,17 @@ fn createZatAccount(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process
         return null;
     };
     switch (outcome) {
-        .ok => |sess| return sess,
+        .ok => |sess| {
+            var session = sess;
+            // Record Zat4 membership in the brand-new repo (§13.2): its existence
+            // makes the next sign-in a returning-member fast path. Best-effort —
+            // the account already exists, so a failed write is logged, not fatal;
+            // re-enrollment re-attempts it (putRecord at rkey "self" is idempotent).
+            _ = membership_record.put(gpa, arena, io, env, &session, lexicon.membership_via.created, tos_version_placeholder, s.age_ok, clock_shell.unixSeconds()) catch |err| {
+                std.debug.print("[enroll] membership write error: {s}\n", .{@errorName(err)});
+            };
+            return session;
+        },
         .refused => |f| {
             std.debug.print("[enroll] createAccount refused: {d} {s}: {s}\n", .{ f.status, f.code, f.message });
             return null;

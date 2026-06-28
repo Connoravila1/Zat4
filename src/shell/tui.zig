@@ -156,7 +156,10 @@ pub fn run(
     appview_url: []const u8,
     store: *feed_core.Store,
     backend: Backend,
-) !void {
+) !bool {
+    // Returns whether the user SIGNED OUT (vs a normal window close / quit): the
+    // caller then clears the cached session instead of re-saving it on exit.
+    var user_signed_out = false;
     const stdin_file: std.Io.File = .stdin();
     const stdout_file: std.Io.File = .stdout();
     if (backend == .terminal) {
@@ -1551,6 +1554,14 @@ pub fn run(
                                             } else |_| {}
                                         },
                                         .bookmark, .share, .more, .profile_tab => {},
+                                        // Settings → Sign out: flag it and leave the
+                                        // run loop. The caller (main) clears the cached
+                                        // session instead of re-saving it, so the next
+                                        // launch shows the Join/login flow.
+                                        .sign_out => {
+                                            user_signed_out = true;
+                                            break :main_loop;
+                                        },
                                             }
                                         }
                                     }
@@ -1934,6 +1945,7 @@ pub fn run(
             }
         }
     }
+    return user_signed_out;
 }
 
 /// The caret blink phase: solid for the ~530 ms after the last edit/move

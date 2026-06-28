@@ -182,18 +182,48 @@ pub fn main(init: std.process.Init) !void {
     // On a completed sign-up, the flow hands back a session: cache it (so the
     // next launch goes straight to the feed) and drop into the feed now.
     if (window_mode and env.get("ZAT_APP_PASSWORD") == null and !hasCachedSession(gpa, env)) {
+        // Returning OAuth user (6.3): a persisted DPoP session means we skip the
+        // Join flow and drop straight into the feed, exactly as a cached app-
+        // password session does in the normal path below. Rotated tokens are
+        // saved back on exit (E4). The app-password cache was already ruled out
+        // by `hasCachedSession` above, so these two never collide.
+        var oa_buf: [512]u8 = undefined;
+        if (cache_shell.oauthSessionPath(&oa_buf, env)) |oa_sp| {
+            if (cache_shell.loadOAuthSessionAt(gpa, oa_sp)) |loaded| {
+                var session = loaded;
+                var signed_out = false;
+                defer auth.freeSession(gpa, session);
+                // On a normal exit, persist rotated tokens (E4); on sign-out, wipe
+                // the cached session so the next launch shows the Join/login flow.
+                defer if (signed_out) cache_shell.clearSession(env) else {
+                    _ = cache_shell.saveOAuthSessionAt(gpa, oa_sp, &session);
+                };
+                var store = cache_shell.loadStore(gpa, env) orelse feed_core.Store{};
+                defer feed_core.deinitStore(gpa, &store);
+                defer _ = cache_shell.saveStore(gpa, env, &store);
+                const eps = config.fromEnv(env);
+                const win = window_shell.open(gpa, env, "zat", 110, 32) catch return;
+                defer window_shell.close(win);
+                signed_out = shell_tui.run(gpa, io, env, &session, eps.appview_url, &store, .{ .window = win }) catch false;
+                return;
+            }
+        }
+
         if (try enroll_run.run(gpa, io, env)) |new_session| {
             var session = new_session;
+            var signed_out = false;
             defer auth.freeSession(gpa, session);
             var sp_buf: [512]u8 = undefined;
             if (cache_shell.sessionPath(&sp_buf, env)) |sp| _ = cache_shell.saveSessionAt(gpa, sp, &session);
+            // Sign-out from a freshly-enrolled session wipes the cache just saved.
+            defer if (signed_out) cache_shell.clearSession(env);
             var store = cache_shell.loadStore(gpa, env) orelse feed_core.Store{};
             defer feed_core.deinitStore(gpa, &store);
             defer _ = cache_shell.saveStore(gpa, env, &store);
             const eps = config.fromEnv(env);
             const win = window_shell.open(gpa, env, "zat", 110, 32) catch return;
             defer window_shell.close(win);
-            shell_tui.run(gpa, io, env, &session, eps.appview_url, &store, .{ .window = win }) catch {};
+            signed_out = shell_tui.run(gpa, io, env, &session, eps.appview_url, &store, .{ .window = win }) catch false;
         }
         return;
     }
@@ -250,7 +280,7 @@ pub fn main(init: std.process.Init) !void {
         };
         try out.print("[oauth] {s} -> {s}\n[oauth] opening browser to sign in...\n", .{ oid.handle, oid.pds_url });
         try out.flush();
-        var sess = oauth_shell.login(gpa, io, env, arena, oid.pds_url, oid.handle) catch |err| {
+        var sess = oauth_shell.login(gpa, io, env, arena, oid.pds_url, oid.handle, null) catch |err| {
             try out.print("--oauth-login failed: {s}\n", .{@errorName(err)});
             try out.flush();
             return err;
@@ -436,14 +466,18 @@ pub fn main(init: std.process.Init) !void {
         if (session_path) |sp| {
             if (cache_shell.loadSessionAt(gpa, sp)) |cached| {
                 var session = cached;
+                var signed_out = false;
                 defer cache_shell.freeSession(gpa, &session);
-                defer _ = cache_shell.saveSessionAt(gpa, sp, &session); // E4: failure = no cache
+                // Normal exit re-saves (rotated tokens, E4); sign-out wipes the cache.
+                defer if (signed_out) cache_shell.clearSession(env) else {
+                    _ = cache_shell.saveSessionAt(gpa, sp, &session);
+                };
                 var store = cache_shell.loadStore(gpa, env) orelse feed_core.Store{};
                 defer feed_core.deinitStore(gpa, &store);
                 defer _ = cache_shell.saveStore(gpa, env, &store); // E4
                 const opened = try openBackend(gpa, env, out, window_mode);
                 defer if (opened.win) |w| window_shell.close(w);
-                shell_tui.run(gpa, io, env, &session, endpoints.appview_url, &store, opened.backend) catch |err| switch (err) {
+                signed_out = shell_tui.run(gpa, io, env, &session, endpoints.appview_url, &store, opened.backend) catch |err| switch (err) {
                     error.NotATerminal => {
                         try out.print("--tui needs an interactive terminal (a real stdin/stdout tty)\n", .{});
                         try out.flush();
@@ -476,15 +510,16 @@ pub fn main(init: std.process.Init) !void {
                 // is the print demo for non-interactive runs.
                 if (session_path) |sp| _ = cache_shell.saveSessionAt(gpa, sp, &session); // E4
                 if (tui_mode) {
+                    var signed_out = false;
                     var store = cache_shell.loadStore(gpa, env) orelse feed_core.Store{};
                     defer feed_core.deinitStore(gpa, &store);
                     defer _ = cache_shell.saveStore(gpa, env, &store); // E4
                     defer if (session_path) |sp| {
-                        _ = cache_shell.saveSessionAt(gpa, sp, &session); // rotated tokens
+                        if (signed_out) cache_shell.clearSession(env) else _ = cache_shell.saveSessionAt(gpa, sp, &session); // rotated tokens
                     };
                     const opened = try openBackend(gpa, env, out, window_mode);
                     defer if (opened.win) |w| window_shell.close(w);
-                    shell_tui.run(gpa, io, env, &session, endpoints.appview_url, &store, opened.backend) catch |err| switch (err) {
+                    signed_out = shell_tui.run(gpa, io, env, &session, endpoints.appview_url, &store, opened.backend) catch |err| switch (err) {
                         error.NotATerminal => {
                             try out.print("--tui needs an interactive terminal (a real stdin/stdout tty)\n", .{});
                             try out.flush();
@@ -638,6 +673,7 @@ test {
     _ = @import("shell/credential.zig");
     _ = @import("core/membership.zig");
     _ = @import("shell/membership.zig");
+    _ = @import("shell/membership_record.zig");
     _ = @import("core/enroll_view.zig");
     _ = @import("shell/enroll_run.zig");
     _ = @import("shell/feed.zig");

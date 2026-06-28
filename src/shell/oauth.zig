@@ -125,6 +125,11 @@ fn wellKnownUrl(scratch: Allocator, base: []const u8, path: []const u8) Allocato
 /// Opens the system browser and blocks on the loopback callback until the user
 /// completes (or denies). Returns a ready-to-use `auth.Session` (oauth mode),
 /// its strings owned by `gpa`; every transient lives in `scratch`.
+///
+/// `cancel` (optional) lets a caller abort the wait from another thread: the GUI
+/// runs this on a worker and sets the flag if the user closes the window while
+/// the browser is still open, so the loopback wait stops instead of blocking
+/// forever (returns `error.CallbackFailed`). Headless callers pass null.
 pub fn login(
     gpa: Allocator,
     io: std.Io,
@@ -132,6 +137,7 @@ pub fn login(
     scratch: Allocator,
     pds_url: []const u8,
     handle: ?[]const u8,
+    cancel: ?*std.atomic.Value(bool),
 ) !auth.Session {
     // 1. Discover the issuer's endpoints (scratch-owned for the flow).
     const server = try discover(scratch, io, environ, scratch, pds_url);
@@ -180,7 +186,7 @@ pub fn login(
     };
 
     // 6. Block on the callback; validate state + iss.
-    const query = try awaitCallback(scratch, io, &lb.server);
+    const query = try awaitCallback(scratch, io, &lb.server, cancel);
     const cb = try oauth_flow.parseCallback(scratch, query);
     try oauth_flow.validateCallback(cb, state, server.issuer);
 
@@ -251,9 +257,23 @@ fn openLoopback(io: std.Io) !Loopback {
 /// close the listener before the genuine `GET /callback?...` arrives — exactly
 /// the "Unable to connect" failure. So we ignore empty/non-callback connections
 /// and keep listening until the callback (carrying a query) shows up.
-fn awaitCallback(scratch: Allocator, io: std.Io, server: *std.Io.net.Server) ![]u8 {
+fn awaitCallback(scratch: Allocator, io: std.Io, server: *std.Io.net.Server, cancel: ?*std.atomic.Value(bool)) ![]u8 {
     var seen: u32 = 0;
     while (seen < 64) : (seen += 1) {
+        // Wait for an incoming connection by POLLING the listener with a short
+        // timeout rather than blocking in `accept`, so we can observe `cancel`
+        // (the GUI closed the window mid-flow) and bail promptly instead of
+        // hanging a worker thread on `accept` forever. With no cancel flag this
+        // is the same patient wait as a bare accept, just woken every 250 ms.
+        // Windows has no browser flow yet, so it keeps the plain blocking accept.
+        if (comptime builtin.os.tag != .windows) {
+            while (true) {
+                if (cancel) |c| if (c.load(.acquire)) return error.CallbackFailed;
+                var lfds = [_]std.posix.pollfd{.{ .fd = server.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+                const lready = std.posix.poll(&lfds, 250) catch return error.CallbackFailed;
+                if (lready > 0) break;
+            }
+        }
         const stream = server.accept(io) catch return error.CallbackFailed;
         // One close for every exit of this iteration — continue, return, OR the
         // `try` below failing on OOM (the old per-branch closes leaked the fd on
