@@ -122,6 +122,10 @@ pub fn main(init: std.process.Init) !void {
     // full browser authorization-code flow against the account's PDS and prints
     // the DPoP-bound result, then exits. Opens the system browser; needs one sign-in.
     var oauth_login_handle: ?[]const u8 = null;
+    // OAuth persistence test (slice 5): `--oauth-resume` loads the saved DPoP
+    // session and makes an authenticated call WITHOUT re-login, proving the key
+    // and tokens survive across launches.
+    var oauth_resume = false;
     var ai: usize = 1;
     while (ai < args.len) : (ai += 1) {
         const arg = args[ai];
@@ -145,6 +149,8 @@ pub fn main(init: std.process.Init) !void {
                 ai += 1;
                 oauth_login_handle = args[ai];
             }
+        } else if (std.mem.eql(u8, arg, "--oauth-resume")) {
+            oauth_resume = true;
         } else if (std.mem.eql(u8, arg, "--tui")) {
             tui_mode = true;
         } else if (std.mem.eql(u8, arg, "--window")) {
@@ -268,6 +274,41 @@ pub fn main(init: std.process.Init) !void {
             return err;
         };
         try out.print("[oauth] DPoP-authenticated getSession OK:\n  {s}\n", .{body});
+        // Slice 5: persist the session (key + tokens) so it survives a relaunch.
+        var sp_buf: [512]u8 = undefined;
+        if (cache_shell.oauthSessionPath(&sp_buf, env)) |sp| {
+            if (cache_shell.saveOAuthSessionAt(gpa, sp, &sess))
+                try out.print("[oauth] session saved — relaunch with --oauth-resume to reuse it (no re-login)\n", .{});
+        }
+        try out.flush();
+        return;
+    }
+
+    // Slice 5 proof: resume the persisted DPoP session and make an authenticated
+    // call without any re-login — the key and tokens came off disk.
+    if (oauth_resume) {
+        var sp_buf: [512]u8 = undefined;
+        const sp = cache_shell.oauthSessionPath(&sp_buf, env) orelse {
+            try out.print("--oauth-resume: no cache directory available\n", .{});
+            try out.flush();
+            return;
+        };
+        var sess = cache_shell.loadOAuthSessionAt(gpa, sp) orelse {
+            try out.print("--oauth-resume: no saved OAuth session (run --oauth-login first)\n", .{});
+            try out.flush();
+            return;
+        };
+        defer oauth_shell.freeOAuthSession(gpa, sess);
+        try out.print("[oauth] resumed saved session for {s} — no re-login\n", .{sess.handle});
+        try out.flush();
+        const body = oauth_shell.dpopQuery(gpa, arena, io, env, &sess, "com.atproto.server.getSession", &.{}) catch |err| {
+            try out.print("[oauth] resumed getSession FAILED: {s}\n", .{@errorName(err)});
+            try out.flush();
+            return err;
+        };
+        try out.print("[oauth] DPoP getSession with the PERSISTED key OK:\n  {s}\n", .{body});
+        // Re-save: the nonce (and possibly tokens) rotated during the call.
+        _ = cache_shell.saveOAuthSessionAt(gpa, sp, &sess);
         try out.flush();
         return;
     }

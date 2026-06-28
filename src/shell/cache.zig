@@ -97,9 +97,11 @@ fn winOpen(path: []const u8, write: bool) ?*anyopaque {
 const snapshot = @import("../core/snapshot.zig");
 const feed = @import("../core/feed.zig");
 const auth = @import("auth.zig");
+const oauth = @import("oauth.zig");
 
 const store_file = "store.zat";
 const session_file = "session.zat";
+const oauth_session_file = "oauth_session.zat";
 const max_file_bytes = 64 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
@@ -448,6 +450,108 @@ pub fn sessionPath(buf: []u8, environ: ?*const std.process.Environ.Map) ?[]const
     return joinFile(buf, dir, session_file);
 }
 
+// --- OAuth (DPoP) session persistence (OAuth slice 5) -----------------------
+//
+// Same on-disk posture as the app-password session above: a 0600 file in the
+// cache dir. The format is magic + version + the raw 32-byte DPoP key + the
+// length-prefixed strings. Persisting the key is what lets a DPoP login survive
+// a relaunch (the binding is only useful if the key is stable).
+//
+// SECURITY NOTE (the keystore is the next hardening, slice 5b): the DPoP key
+// and refresh token sit here at 0600 plaintext — the SAME exposure the app-
+// password `session.zat` already carries for its refresh token. The real
+// upgrade is moving BOTH into the OS keystore (libsecret/Keychain/Credential
+// Manager); encrypting only this file while the sibling sits plaintext would be
+// security theater. So this matches the existing posture and the keystore pass
+// hardens the whole cache at once.
+const oauth_session_magic = [4]u8{ 'Z', 'A', 'T', 'O' };
+const oauth_session_version: u16 = 1;
+
+pub fn saveOAuthSessionAt(gpa: Allocator, path: []const u8, sess: *const oauth.OAuthSession) bool {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var out: std.ArrayList(u8) = .empty;
+    out.appendSlice(arena, &oauth_session_magic) catch return false;
+    out.appendSlice(arena, std.mem.asBytes(&oauth_session_version)) catch return false;
+    out.appendSlice(arena, &sess.dpop_secret) catch return false;
+    inline for (.{
+        sess.did,         sess.handle,        sess.pds_url,
+        sess.access_token, sess.refresh_token, sess.scope,
+        sess.issuer,      sess.token_endpoint,
+    }) |field| {
+        const len: u32 = @intCast(field.len);
+        out.appendSlice(arena, std.mem.asBytes(&len)) catch return false;
+        out.appendSlice(arena, field) catch return false;
+    }
+    // The nonce is optional; an empty string on disk means "none".
+    const nonce = sess.nonce orelse "";
+    const nlen: u32 = @intCast(nonce.len);
+    out.appendSlice(arena, std.mem.asBytes(&nlen)) catch return false;
+    out.appendSlice(arena, nonce) catch return false;
+    return writeFileAtomic(path, out.items, 0o600);
+}
+
+/// Loaded strings are gpa-owned; release with `oauth.freeOAuthSession`.
+pub fn loadOAuthSessionAt(gpa: Allocator, path: []const u8) ?oauth.OAuthSession {
+    const bytes = readFileAlloc(gpa, path) orelse return null;
+    defer gpa.free(bytes);
+    // 4 magic + 2 version + 32 key = 38 byte header minimum.
+    if (bytes.len < 38 or !std.mem.eql(u8, bytes[0..4], &oauth_session_magic)) return null;
+    if (std.mem.bytesToValue(u16, bytes[4..6]) != oauth_session_version) return null;
+    const secret: [32]u8 = bytes[6..38].*;
+
+    var fields: [9][]const u8 = undefined; // 8 strings + nonce
+    var at: usize = 38;
+    var loaded: usize = 0;
+    for (&fields) |*field| {
+        if (bytes.len - at < 4) {
+            for (fields[0..loaded]) |f| gpa.free(f);
+            return null;
+        }
+        const len = std.mem.bytesToValue(u32, bytes[at..][0..4]);
+        at += 4;
+        if (bytes.len - at < len) {
+            for (fields[0..loaded]) |f| gpa.free(f);
+            return null;
+        }
+        field.* = gpa.dupe(u8, bytes[at .. at + len]) catch {
+            for (fields[0..loaded]) |f| gpa.free(f);
+            return null;
+        };
+        loaded += 1;
+        at += len;
+    }
+    if (at != bytes.len) {
+        for (fields) |f| gpa.free(f);
+        return null;
+    }
+    // Empty nonce string -> none.
+    var nonce: ?[]const u8 = fields[8];
+    if (fields[8].len == 0) {
+        gpa.free(fields[8]);
+        nonce = null;
+    }
+    return .{
+        .did = fields[0],
+        .handle = fields[1],
+        .pds_url = fields[2],
+        .access_token = fields[3],
+        .refresh_token = fields[4],
+        .scope = fields[5],
+        .issuer = fields[6],
+        .token_endpoint = fields[7],
+        .dpop_secret = secret,
+        .nonce = nonce,
+    };
+}
+
+pub fn oauthSessionPath(buf: []u8, environ: ?*const std.process.Environ.Map) ?[]const u8 {
+    var dir_buf: [512]u8 = undefined;
+    const dir = cacheDir(&dir_buf, environ) orelse return null;
+    return joinFile(buf, dir, oauth_session_file);
+}
+
 // ---------------------------------------------------------------------------
 // Tests (C6) — real files under /tmp, cleaned up
 // ---------------------------------------------------------------------------
@@ -515,4 +619,47 @@ test "cache: session round-trips behind 0600 and frees clean" {
     const stat_rc = linux.statx(linux.AT.FDCWD, zPath(&z, path).?, 0, .{ .MODE = true }, &stx);
     try testing.expect(stat_rc == 0);
     try testing.expectEqual(@as(u16, 0o600), stx.mode & 0o777);
+}
+
+test "cache: OAuth session round-trips key, tokens, and nonce" {
+    const gpa = testing.allocator; // C6
+    var path_buf: [128]u8 = undefined;
+    const path = tmpPath(&path_buf, "oauth");
+    defer unlink(path);
+
+    var secret: [32]u8 = undefined;
+    for (&secret, 0..) |*b, i| b.* = @intCast(i);
+
+    const sess = oauth.OAuthSession{
+        .did = "did:plc:dddddddddddddddddddddddd",
+        .handle = "dan.test",
+        .pds_url = "https://pds.example",
+        .access_token = "access-tok",
+        .refresh_token = "refresh-tok",
+        .scope = "atproto transition:generic",
+        .issuer = "https://pds.example",
+        .token_endpoint = "https://pds.example/oauth/token",
+        .dpop_secret = secret,
+        .nonce = "server-nonce-1",
+    };
+    try testing.expect(saveOAuthSessionAt(gpa, path, &sess));
+
+    const loaded = loadOAuthSessionAt(gpa, path) orelse return error.TestUnexpectedResult;
+    defer oauth.freeOAuthSession(gpa, loaded);
+    try testing.expectEqualStrings(sess.did, loaded.did);
+    try testing.expectEqualStrings(sess.access_token, loaded.access_token);
+    try testing.expectEqualStrings(sess.token_endpoint, loaded.token_endpoint);
+    try testing.expectEqualSlices(u8, &secret, &loaded.dpop_secret);
+    try testing.expectEqualStrings("server-nonce-1", loaded.nonce.?);
+
+    // A null nonce round-trips as null (empty string on disk).
+    var sess2 = sess;
+    sess2.nonce = null;
+    var path2_buf: [128]u8 = undefined;
+    const path2 = tmpPath(&path2_buf, "oauth2");
+    defer unlink(path2);
+    try testing.expect(saveOAuthSessionAt(gpa, path2, &sess2));
+    const loaded2 = loadOAuthSessionAt(gpa, path2) orelse return error.TestUnexpectedResult;
+    defer oauth.freeOAuthSession(gpa, loaded2);
+    try testing.expectEqual(@as(?[]const u8, null), loaded2.nonce);
 }
