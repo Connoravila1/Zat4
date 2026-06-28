@@ -31,6 +31,23 @@ const std = @import("std");
 const dagjson = @import("dagjson.zig");
 const jsonguard = @import("jsonguard.zig");
 
+// Hard caps on attacker-controlled text fields, enforced at the ingest boundary
+// BEFORE the value crosses into the pure core (Phase 2). Generous — well above
+// any legitimate value — so they reject abuse, not real content. The response
+// is already bounded to a few MiB by the transport (Phase 1); these tighten
+// per-FIELD so one record can't carry a multi-MiB text blob, and add the UTF-8
+// check the size cap alone can't give.
+pub const max_post_text: usize = 64 * 1024;
+pub const max_display_name: usize = 4 * 1024;
+pub const max_handle: usize = 256; // atproto handles cap at 253
+
+/// A network-derived text field is acceptable only if it is within `max` bytes
+/// AND valid UTF-8 — rejecting malformed encoding and the homoglyph/bidi
+/// spoofing vector early, so the core only ever sees well-formed text (B5).
+pub fn textWithinLimits(s: []const u8, max: usize) bool {
+    return s.len <= max and std.unicode.utf8ValidateSlice(s);
+}
+
 /// The outcome of checking one `com.atproto.repo.listRecords` response.
 /// A7.2: cold struct, size guard waived — one per collection per poll cycle.
 pub const Report = struct {
@@ -167,6 +184,14 @@ test "malformed body is unverifiable, never a throw" {
     const report = checkListRecords(gpa, "{not json");
     try testing.expectEqual(@as(usize, 1), report.unverifiable);
     try testing.expect(badCount(report) >= 1);
+}
+
+test "textWithinLimits: caps length and rejects bad UTF-8" {
+    try testing.expect(textWithinLimits("hello", 64));
+    try testing.expect(textWithinLimits("", 64));
+    try testing.expect(!textWithinLimits("toolong", 4)); // over the cap
+    try testing.expect(!textWithinLimits("\xff\xfe", 64)); // invalid UTF-8
+    try testing.expect(textWithinLimits("café ☕", 64)); // valid multibyte UTF-8
 }
 
 test "a row with no cid is skipped, not counted" {

@@ -178,7 +178,9 @@ pub fn pollRepo(
             const params = [_]xrpc.Param{.{ .name = "repo", .value = did }};
             const outcome = xrpc.query(arena, io, environ, pds_url, lexicon.method.describe_repo, &params, lexicon.RepoDescription, .{}) catch null;
             if (outcome) |o| switch (o) {
-                .ok => |desc| if (desc.handle.len > 0 and desc.handleIsCorrect) {
+                .ok => |desc| if (desc.handle.len > 0 and desc.handleIsCorrect and
+                    record_check.textWithinLimits(desc.handle, record_check.max_handle))
+                {
                     handle = desc.handle;
                 },
                 .failed => {},
@@ -187,7 +189,11 @@ pub fn pollRepo(
         var fetched_name: []const u8 = "";
         if (try fetch(arena, io, environ, pds_url, did, lexicon.collection.profile, ProfileValue)) |f| {
             verifyCids(gpa, f.raw, did, "profile", &v_checked, &v_bad);
-            if (f.records.len > 0) fetched_name = f.records[0].value.displayName;
+            // Phase 2: only accept a display name within the cap and valid UTF-8;
+            // a bad one is dropped (the DID still shows), never indexed.
+            if (f.records.len > 0 and record_check.textWithinLimits(f.records[0].value.displayName, record_check.max_display_name)) {
+                fetched_name = f.records[0].value.displayName;
+            }
         }
         if (handle.len > 0 or fetched_name.len > 0) {
             lock.lock();
@@ -210,6 +216,13 @@ pub fn pollRepo(
         defer lock.unlock();
         for (f.records) |r| {
             if (r.cid.len == 0) continue;
+            // Phase 2: cap + UTF-8-validate the free-text BEFORE it crosses into
+            // the core. An over-limit / malformed post is rejected at the
+            // boundary (generous cap — real posts are tiny), not indexed.
+            if (!record_check.textWithinLimits(r.value.text, record_check.max_post_text)) {
+                std.debug.print("[ingest] {s}: rejected post {s} (text over limit or invalid UTF-8)\n", .{ did, r.cid });
+                continue;
+            }
             const reply_parent_cid: []const u8 = if (r.value.reply) |rep| rep.parent.cid else "";
             const reply_root_cid: []const u8 = if (r.value.reply) |rep| rep.root.cid else "";
             const is_new = appview.indexPost(gpa, idx, .{
