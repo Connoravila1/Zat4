@@ -48,6 +48,12 @@ pub const Failure = core.Failure;
 pub const CallOptions = struct {
     /// Full authorization header value (e.g. "Bearer <jwt>").
     authorization: ?[]const u8 = null,
+    /// SSRF posture (Phase 1). Defaults to `.trusted` — operator-configured
+    /// hosts (the AppView, the user's own PDS). A caller fetching a
+    /// NETWORK-DERIVED host (e.g. the AppView polling a follow-graph PDS whose
+    /// URL came from a resolved DID-document serviceEndpoint) passes
+    /// `.untrusted` to enable the guard before any connection.
+    guard: http.Guard = .trusted,
 };
 
 /// Every call resolves to exactly one of these. A tagged union of plain
@@ -88,6 +94,7 @@ pub fn query(
     return fetchWithRetry(Response, arena, io, environ, url, .{
         .accept = "application/json",
         .authorization = call_options.authorization,
+        .guard = call_options.guard,
     });
 }
 
@@ -116,6 +123,7 @@ pub fn procedure(
         .content_type = if (body != null) "application/json" else null,
         .accept = "application/json",
         .authorization = call_options.authorization,
+        .guard = call_options.guard,
     });
 }
 
@@ -182,6 +190,7 @@ pub fn queryCapturingBody(
     return fetchWithRetryBody(Response, arena, io, environ, url, .{
         .accept = "application/json",
         .authorization = call_options.authorization,
+        .guard = call_options.guard,
     });
 }
 
@@ -263,6 +272,18 @@ test "loopback round trip: server refusal becomes a Failure value, not a Zig err
     try std.testing.expectEqual(@as(u16, 400), outcome.failed.status);
     try std.testing.expectEqualStrings("InvalidRequest", outcome.failed.code);
     try std.testing.expectEqualStrings("Profile not found", outcome.failed.message);
+}
+
+test "query honors the SSRF guard: an untrusted call to a blocked host is refused" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const Resp = struct { ok: bool = false };
+    // The guard option must reach http's gate: a loopback host on an .untrusted
+    // call is rejected BEFORE any connection (proves the plumbing, not just http).
+    const result = query(arena_state.allocator(), io, null, "https://127.0.0.1", "com.example.noop", &.{}, Resp, .{ .guard = .untrusted });
+    try std.testing.expectError(error.BlockedAddress, result);
 }
 
 /// Procedure fixture: echoes what it observed (method, content-type, raw

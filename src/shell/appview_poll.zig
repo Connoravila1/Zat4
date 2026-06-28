@@ -84,7 +84,11 @@ fn fetch(
     // Capture the raw 2xx body alongside the typed records: the same bytes are
     // re-hashed to verify each record's CID against the PDS's claim (the trust
     // boundary — see verifyCids / record_check). One fetch, both uses.
-    const captured = try xrpc.queryCapturingBody(arena, io, environ, pds_url, lexicon.method.list_records, &params, Listing(Value), .{});
+    // `pds_url` is the follow-graph author's PDS, resolved from their DID
+    // document's serviceEndpoint — a NETWORK-DERIVED host — so the read carries
+    // the SSRF guard (Phase 1): https-only, no IP-literal internal host, no
+    // redirect. Our own PDSes are public https and pass cleanly.
+    const captured = try xrpc.queryCapturingBody(arena, io, environ, pds_url, lexicon.method.list_records, &params, Listing(Value), .{ .guard = .untrusted });
     return switch (captured.outcome) {
         .ok => |r| .{ .records = r.records, .raw = captured.body },
         .failed => null,
@@ -176,7 +180,8 @@ pub fn pollRepo(
         var handle: []const u8 = "";
         if (need_handle) {
             const params = [_]xrpc.Param{.{ .name = "repo", .value = did }};
-            const outcome = xrpc.query(arena, io, environ, pds_url, lexicon.method.describe_repo, &params, lexicon.RepoDescription, .{}) catch null;
+            // serviceEndpoint-derived host (see fetch) → SSRF-guarded.
+            const outcome = xrpc.query(arena, io, environ, pds_url, lexicon.method.describe_repo, &params, lexicon.RepoDescription, .{ .guard = .untrusted }) catch null;
             if (outcome) |o| switch (o) {
                 .ok => |desc| if (desc.handle.len > 0 and desc.handleIsCorrect and
                     record_check.textWithinLimits(desc.handle, record_check.max_handle))
