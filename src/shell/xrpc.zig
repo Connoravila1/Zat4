@@ -60,6 +60,13 @@ pub fn Outcome(comptime Response: type) type {
     };
 }
 
+/// A typed outcome plus the raw 2xx response body (arena-owned) — what
+/// `queryCapturingBody` returns. Named (not an anonymous literal) so the
+/// internal engine and the public wrapper share ONE type.
+pub fn Captured(comptime Response: type) type {
+    return struct { outcome: Outcome(Response), body: []const u8 };
+}
+
 /// Call an XRPC query (GET). `Response` is the lexicon record type to decode
 /// into (comptime — F2: reflection, not generated codecs).
 ///
@@ -125,6 +132,19 @@ fn fetchWithRetry(
     url: []const u8,
     request_options: http.RequestOptions,
 ) !Outcome(Response) {
+    return (try fetchWithRetryBody(Response, arena, io, environ, url, request_options)).outcome;
+}
+
+/// The retry/classify engine, also surfacing the raw response body so the
+/// capturing variant can hand it back. `query`/`procedure` discard the body.
+fn fetchWithRetryBody(
+    comptime Response: type,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    url: []const u8,
+    request_options: http.RequestOptions,
+) !Captured(Response) {
     var attempt: usize = 0;
     while (true) {
         const resp = try http.request(arena, io, environ, url, request_options);
@@ -136,10 +156,33 @@ fn fetchWithRetry(
             }
         }
         if (resp.status < 200 or resp.status > 299) {
-            return .{ .failed = try core.parseFailure(arena, resp.status, resp.body) };
+            return .{ .outcome = .{ .failed = try core.parseFailure(arena, resp.status, resp.body) }, .body = resp.body };
         }
-        return .{ .ok = try core.decode(Response, arena, resp.body) };
+        return .{ .outcome = .{ .ok = try core.decode(Response, arena, resp.body) }, .body = resp.body };
     }
+}
+
+/// Like `query`, but ALSO returns the raw 2xx response body (arena-owned). For
+/// the one caller that must re-examine the wire bytes after the typed decode:
+/// the AppView ingest re-hashes each record to verify its CID against the PDS's
+/// claim (verify-don't-trust, the trust boundary). `body` carries the error
+/// body on a refusal. Only OPAQUE bytes cross — no wire-format TYPE leaks, so
+/// the D3 seal holds; the caller re-parses with the sanctioned dagjson path.
+pub fn queryCapturingBody(
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    host: []const u8,
+    nsid: []const u8,
+    params: []const Param,
+    comptime Response: type,
+    call_options: CallOptions,
+) !Captured(Response) {
+    const url = try core.buildQueryUrl(arena, host, nsid, params);
+    return fetchWithRetryBody(Response, arena, io, environ, url, .{
+        .accept = "application/json",
+        .authorization = call_options.authorization,
+    });
 }
 
 // ---------------------------------------------------------------------------

@@ -583,6 +583,7 @@ test {
     _ = @import("core/dagcbor.zig");
     _ = @import("core/cid.zig");
     _ = @import("core/dagjson.zig");
+    _ = @import("core/record_check.zig");
     _ = @import("core/netguard.zig");
     _ = @import("core/jsonguard.zig");
     _ = @import("core/lexicon.zig");

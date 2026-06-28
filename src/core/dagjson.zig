@@ -73,8 +73,27 @@ pub fn verifyRecordCid(
     if (!jsonguard.depthWithinLimit(record_json, jsonguard.max_json_depth)) return error.MalformedJson;
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, record_json, .{}) catch
         return error.MalformedJson;
-    const value = try convert(arena, parsed, 0);
-    return cid.verifyValue(gpa, value, claimed_cid);
+    return verifyParsedRecord(gpa, parsed, claimed_cid);
+}
+
+/// As `verifyRecordCid`, but over an ALREADY-PARSED record value — the JSON
+/// `value` node of a batch entry (a `com.atproto.repo.listRecords` row, a
+/// firehose record). A caller that parsed a whole response once verifies each
+/// record without re-serializing it. `value` may borrow any allocator; the
+/// IPLD conversion is made and freed in a private arena here. Depth is bounded
+/// by `convert` (TooDeep), so the caller's outer parse needs no separate guard
+/// for THIS node — but should still bound the whole document it parsed.
+pub fn verifyParsedRecord(
+    gpa: std.mem.Allocator,
+    value: std.json.Value,
+    claimed_cid: []const u8,
+) VerifyError!bool {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const converted = try convert(arena, value, 0);
+    return cid.verifyValue(gpa, converted, claimed_cid);
 }
 
 /// Convert a parsed JSON value into the IPLD `dagcbor.Value` model. Allocates
