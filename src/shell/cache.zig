@@ -97,7 +97,6 @@ fn winOpen(path: []const u8, write: bool) ?*anyopaque {
 const snapshot = @import("../core/snapshot.zig");
 const feed = @import("../core/feed.zig");
 const auth = @import("auth.zig");
-const oauth = @import("oauth.zig");
 
 const store_file = "store.zat";
 const session_file = "session.zat";
@@ -428,11 +427,18 @@ pub fn loadSessionAt(gpa: Allocator, path: []const u8) ?auth.Session {
         return null;
     }
     return .{
+        .mode = .app_password,
         .did = fields[0],
         .handle = fields[1],
         .pds_url = fields[2],
         .access_jwt = fields[3],
         .refresh_jwt = fields[4],
+        // Inert in app-password mode (never read or freed).
+        .dpop_secret = [_]u8{0} ** 32,
+        .scope = "",
+        .issuer = "",
+        .token_endpoint = "",
+        .nonce = null,
     };
 }
 
@@ -467,7 +473,7 @@ pub fn sessionPath(buf: []u8, environ: ?*const std.process.Environ.Map) ?[]const
 const oauth_session_magic = [4]u8{ 'Z', 'A', 'T', 'O' };
 const oauth_session_version: u16 = 1;
 
-pub fn saveOAuthSessionAt(gpa: Allocator, path: []const u8, sess: *const oauth.OAuthSession) bool {
+pub fn saveOAuthSessionAt(gpa: Allocator, path: []const u8, sess: *const auth.Session) bool {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -476,8 +482,8 @@ pub fn saveOAuthSessionAt(gpa: Allocator, path: []const u8, sess: *const oauth.O
     out.appendSlice(arena, std.mem.asBytes(&oauth_session_version)) catch return false;
     out.appendSlice(arena, &sess.dpop_secret) catch return false;
     inline for (.{
-        sess.did,         sess.handle,        sess.pds_url,
-        sess.access_token, sess.refresh_token, sess.scope,
+        sess.did,         sess.handle,      sess.pds_url,
+        sess.access_jwt,  sess.refresh_jwt, sess.scope,
         sess.issuer,      sess.token_endpoint,
     }) |field| {
         const len: u32 = @intCast(field.len);
@@ -492,8 +498,8 @@ pub fn saveOAuthSessionAt(gpa: Allocator, path: []const u8, sess: *const oauth.O
     return writeFileAtomic(path, out.items, 0o600);
 }
 
-/// Loaded strings are gpa-owned; release with `oauth.freeOAuthSession`.
-pub fn loadOAuthSessionAt(gpa: Allocator, path: []const u8) ?oauth.OAuthSession {
+/// Loaded strings are gpa-owned; release with `auth.freeSession`.
+pub fn loadOAuthSessionAt(gpa: Allocator, path: []const u8) ?auth.Session {
     const bytes = readFileAlloc(gpa, path) orelse return null;
     defer gpa.free(bytes);
     // 4 magic + 2 version + 32 key = 38 byte header minimum.
@@ -533,11 +539,12 @@ pub fn loadOAuthSessionAt(gpa: Allocator, path: []const u8) ?oauth.OAuthSession 
         nonce = null;
     }
     return .{
+        .mode = .oauth,
         .did = fields[0],
         .handle = fields[1],
         .pds_url = fields[2],
-        .access_token = fields[3],
-        .refresh_token = fields[4],
+        .access_jwt = fields[3],
+        .refresh_jwt = fields[4],
         .scope = fields[5],
         .issuer = fields[6],
         .token_endpoint = fields[7],
@@ -630,12 +637,13 @@ test "cache: OAuth session round-trips key, tokens, and nonce" {
     var secret: [32]u8 = undefined;
     for (&secret, 0..) |*b, i| b.* = @intCast(i);
 
-    const sess = oauth.OAuthSession{
+    const sess = auth.Session{
+        .mode = .oauth,
         .did = "did:plc:dddddddddddddddddddddddd",
         .handle = "dan.test",
         .pds_url = "https://pds.example",
-        .access_token = "access-tok",
-        .refresh_token = "refresh-tok",
+        .access_jwt = "access-tok",
+        .refresh_jwt = "refresh-tok",
         .scope = "atproto transition:generic",
         .issuer = "https://pds.example",
         .token_endpoint = "https://pds.example/oauth/token",
@@ -645,9 +653,9 @@ test "cache: OAuth session round-trips key, tokens, and nonce" {
     try testing.expect(saveOAuthSessionAt(gpa, path, &sess));
 
     const loaded = loadOAuthSessionAt(gpa, path) orelse return error.TestUnexpectedResult;
-    defer oauth.freeOAuthSession(gpa, loaded);
+    defer auth.freeSession(gpa, loaded);
     try testing.expectEqualStrings(sess.did, loaded.did);
-    try testing.expectEqualStrings(sess.access_token, loaded.access_token);
+    try testing.expectEqualStrings(sess.access_jwt, loaded.access_jwt);
     try testing.expectEqualStrings(sess.token_endpoint, loaded.token_endpoint);
     try testing.expectEqualSlices(u8, &secret, &loaded.dpop_secret);
     try testing.expectEqualStrings("server-nonce-1", loaded.nonce.?);
@@ -660,6 +668,6 @@ test "cache: OAuth session round-trips key, tokens, and nonce" {
     defer unlink(path2);
     try testing.expect(saveOAuthSessionAt(gpa, path2, &sess2));
     const loaded2 = loadOAuthSessionAt(gpa, path2) orelse return error.TestUnexpectedResult;
-    defer oauth.freeOAuthSession(gpa, loaded2);
+    defer auth.freeSession(gpa, loaded2);
     try testing.expectEqual(@as(?[]const u8, null), loaded2.nonce);
 }

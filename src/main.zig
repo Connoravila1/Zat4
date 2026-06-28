@@ -255,8 +255,8 @@ pub fn main(init: std.process.Init) !void {
             try out.flush();
             return err;
         };
-        defer oauth_shell.freeOAuthSession(gpa, sess);
-        const at = sess.access_token;
+        defer auth.freeSession(gpa, sess);
+        const at = sess.access_jwt;
         try out.print(
             \\OAuth login complete — tokens are DPoP-bound.
             \\  did:        {s}
@@ -265,15 +265,18 @@ pub fn main(init: std.process.Init) !void {
             \\  access:     {s}... ({d} bytes)
             \\  refresh:    present ({d} bytes)
             \\
-        , .{ sess.did, sess.scope, sess.issuer, at[0..@min(12, at.len)], at.len, sess.refresh_token.len });
+        , .{ sess.did, sess.scope, sess.issuer, at[0..@min(12, at.len)], at.len, sess.refresh_jwt.len });
         try out.flush();
-        // Slice 4 proof: actually USE the DPoP session — an authenticated call.
-        const body = oauth_shell.dpopQuery(gpa, arena, io, env, &sess, "com.atproto.server.getSession", &.{}) catch |err| {
-            try out.print("[oauth] DPoP-authenticated getSession FAILED: {s}\n", .{@errorName(err)});
+        // Slice 6: the SAME auth.query the app uses — DPoP dispatched internally.
+        const outcome = auth.query(gpa, arena, io, env, &sess, lexicon.method.get_session, &.{}, lexicon.GetSessionResponse) catch |err| {
+            try out.print("[oauth] auth.query getSession FAILED: {s}\n", .{@errorName(err)});
             try out.flush();
             return err;
         };
-        try out.print("[oauth] DPoP-authenticated getSession OK:\n  {s}\n", .{body});
+        switch (outcome) {
+            .ok => |r| try out.print("[oauth] auth.query getSession OK: did={s} handle={s}\n", .{ r.did, r.handle }),
+            .failed => |f| try out.print("[oauth] getSession refused: {d} {s}\n", .{ f.status, f.code }),
+        }
         // Slice 5: persist the session (key + tokens) so it survives a relaunch.
         var sp_buf: [512]u8 = undefined;
         if (cache_shell.oauthSessionPath(&sp_buf, env)) |sp| {
@@ -298,15 +301,18 @@ pub fn main(init: std.process.Init) !void {
             try out.flush();
             return;
         };
-        defer oauth_shell.freeOAuthSession(gpa, sess);
+        defer auth.freeSession(gpa, sess);
         try out.print("[oauth] resumed saved session for {s} — no re-login\n", .{sess.handle});
         try out.flush();
-        const body = oauth_shell.dpopQuery(gpa, arena, io, env, &sess, "com.atproto.server.getSession", &.{}) catch |err| {
+        const outcome = auth.query(gpa, arena, io, env, &sess, lexicon.method.get_session, &.{}, lexicon.GetSessionResponse) catch |err| {
             try out.print("[oauth] resumed getSession FAILED: {s}\n", .{@errorName(err)});
             try out.flush();
             return err;
         };
-        try out.print("[oauth] DPoP getSession with the PERSISTED key OK:\n  {s}\n", .{body});
+        switch (outcome) {
+            .ok => |r| try out.print("[oauth] auth.query getSession with the PERSISTED key OK: did={s} handle={s}\n", .{ r.did, r.handle }),
+            .failed => |f| try out.print("[oauth] resumed getSession refused: {d} {s}\n", .{ f.status, f.code }),
+        }
         // Re-save: the nonce (and possibly tokens) rotated during the call.
         _ = cache_shell.saveOAuthSessionAt(gpa, sp, &sess);
         try out.flush();

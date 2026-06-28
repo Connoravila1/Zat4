@@ -42,7 +42,20 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const xrpc = @import("xrpc.zig");
+const http = @import("http.zig");
+const clock = @import("clock.zig");
+const config = @import("config.zig");
 const lexicon = @import("../core/lexicon.zig");
+const xrpc_core = @import("../core/xrpc.zig");
+const dpop = @import("../core/dpop.zig");
+const oauth_flow = @import("../core/oauth_flow.zig");
+
+/// How a session authenticates. `app_password` is the legacy/dev path (a Bearer
+/// JWT, refreshed via `refreshSession`); `oauth` is the atproto OAuth + DPoP
+/// path (a token bound to a device key, every request carrying a fresh proof,
+/// refreshed via the OAuth token endpoint). The rest of the app calls
+/// `query`/`procedure` and never branches on this — the dispatch is interior.
+pub const AuthMode = enum(u8) { app_password, oauth };
 
 /// An authenticated session — plain values (A1), every string owned by the
 /// `gpa` given to `login`. Free with `freeSession`. Callers read `did`,
@@ -50,12 +63,30 @@ const lexicon = @import("../core/lexicon.zig");
 /// records get no encapsulation — the SUBSYSTEM is the sealed thing), but
 /// only this module has a reason to touch them.
 /// A7.2: cold struct, size guard waived — one per logged-in account.
+///
+/// Dual-mode: `did`/`handle`/`pds_url` and the two token fields are common to
+/// both. The DPoP fields below are meaningful only when `mode == .oauth`; for
+/// `app_password` they are inert (zeroed key, empty strings, null nonce) and
+/// never freed. `access_jwt`/`refresh_jwt` hold the OAuth access/refresh tokens
+/// in oauth mode (same slots, different credential).
 pub const Session = struct {
     did: []const u8,
     handle: []const u8,
     pds_url: []const u8,
     access_jwt: []const u8,
     refresh_jwt: []const u8,
+    /// Defaults make the common app-password session a 5-field literal; the
+    /// oauth fields below default inert and are filled only by the oauth path.
+    mode: AuthMode = .app_password,
+    // --- oauth/DPoP only (inert in app-password mode: never read or freed) ---
+    /// The 32-byte P-256 DPoP private scalar the tokens are bound to.
+    dpop_secret: [32]u8 = [_]u8{0} ** 32,
+    scope: []const u8 = "",
+    /// The OAuth issuer and its token endpoint (for the refresh grant).
+    issuer: []const u8 = "",
+    token_endpoint: []const u8 = "",
+    /// The most recent server DPoP nonce; rotates per response.
+    nonce: ?[]const u8 = null,
 };
 
 /// Login resolves to a session or the server's stated refusal (wrong
@@ -142,6 +173,12 @@ pub fn freeSession(gpa: Allocator, session: Session) void {
     gpa.free(session.pds_url);
     freeSecret(gpa, session.access_jwt);
     freeSecret(gpa, session.refresh_jwt);
+    if (session.mode == .oauth) {
+        gpa.free(session.scope);
+        gpa.free(session.issuer);
+        gpa.free(session.token_endpoint);
+        if (session.nonce) |n| gpa.free(n);
+    }
 }
 
 /// Authenticated XRPC query against the session's own PDS. On
@@ -199,6 +236,12 @@ pub fn queryHost(
         }
     }
 
+    // OAuth sessions authenticate to their own PDS with DPoP, not a Bearer JWT.
+    if (session.mode == .oauth) {
+        const url = try xrpc_core.buildQueryUrl(arena, host, nsid, params);
+        return dpopOutcome(Response, gpa, arena, io, environ, session, .GET, url, null, null);
+    }
+
     const first = try xrpc.query(arena, io, environ, host, nsid, params, Response, .{
         .authorization = try bearer(arena, session.access_jwt),
     });
@@ -228,6 +271,12 @@ pub fn procedure(
     input: anytype,
     comptime Response: type,
 ) !xrpc.Outcome(Response) {
+    // OAuth sessions write to their PDS with DPoP.
+    if (session.mode == .oauth) {
+        const url = try xrpc_core.buildMethodUrl(arena, session.pds_url, nsid);
+        const body: ?[]const u8 = if (@TypeOf(input) == @TypeOf(null)) null else try xrpc_core.encodeBody(arena, input);
+        return dpopOutcome(Response, gpa, arena, io, environ, session, .POST, url, body, if (body != null) "application/json" else null);
+    }
     const first = try xrpc.procedure(arena, io, environ, session.pds_url, nsid, input, Response, .{
         .authorization = try bearer(arena, session.access_jwt),
     });
@@ -307,7 +356,191 @@ fn dupeSession(gpa: Allocator, pds_url: []const u8, resp: lexicon.SessionRespons
     const access = try gpa.dupe(u8, resp.accessJwt);
     errdefer gpa.free(access);
     const refresh = try gpa.dupe(u8, resp.refreshJwt);
-    return .{ .did = did, .handle = handle, .pds_url = pds, .access_jwt = access, .refresh_jwt = refresh };
+    return .{
+        .mode = .app_password,
+        .did = did,
+        .handle = handle,
+        .pds_url = pds,
+        .access_jwt = access,
+        .refresh_jwt = refresh,
+        // Inert in app-password mode — never read, never freed.
+        .dpop_secret = [_]u8{0} ** 32,
+        .scope = "",
+        .issuer = "",
+        .token_endpoint = "",
+        .nonce = null,
+    };
+}
+
+// --- OAuth / DPoP request mechanics (the oauth-mode half of query/procedure) -
+//
+// `oauth.zig` obtains the session (the browser flow); this module USES it. A
+// DPoP request carries a fresh proof bound to the access token (ath) and the
+// request (htm/htu), plus `Authorization: DPoP <token>`. The server's nonce
+// rotates per response (retried once); an expired token (401) triggers one
+// refresh-and-retry. `dpopPost` is also the primitive the login flow's PAR and
+// token exchange ride on (so it lives here, where both can reach it without an
+// import cycle).
+
+/// Send a DPoP-authenticated request, decode a 2xx into the typed record, and
+/// classify anything else into a `Failure` value — the same `Outcome` contract
+/// the Bearer path returns.
+fn dpopOutcome(
+    comptime Response: type,
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    session: *Session,
+    method: std.http.Method,
+    url: []const u8,
+    body: ?[]const u8,
+    content_type: ?[]const u8,
+) !xrpc.Outcome(Response) {
+    const resp = try dpopSend(gpa, arena, io, environ, session, method, url, body, content_type);
+    if (resp.status >= 200 and resp.status <= 299) {
+        return .{ .ok = try xrpc_core.decode(Response, arena, resp.body) };
+    }
+    return .{ .failed = try xrpc_core.parseFailure(arena, resp.status, resp.body) };
+}
+
+/// The request engine: sign, send, handle the DPoP-nonce handshake and the
+/// 401-refresh, retry. Returns the final status + body (`arena`-owned). `htu`
+/// is the URL minus its query (RFC 9449). Mutates the session's nonce (and, on
+/// refresh, the tokens) in place.
+fn dpopSend(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    session: *Session,
+    method: std.http.Method,
+    url: []const u8,
+    body: ?[]const u8,
+    content_type: ?[]const u8,
+) !struct { status: u16, body: []u8 } {
+    const htu = url[0 .. std.mem.indexOfScalar(u8, url, '?') orelse url.len];
+    var refreshed = false;
+    var attempt: u8 = 0;
+    while (attempt < 4) : (attempt += 1) {
+        const jti = try randomJti(io, arena);
+        const proof = try dpop.buildProof(arena, .{
+            .secret_key = session.dpop_secret,
+            .htm = if (method == .POST) "POST" else "GET",
+            .htu = htu,
+            .iat = clock.unixSeconds(),
+            .jti = jti,
+            .nonce = session.nonce,
+            .access_token = session.access_jwt, // ath: binds the proof to the token
+        });
+        const auth_header = try std.fmt.allocPrint(arena, "DPoP {s}", .{session.access_jwt});
+        const resp = try http.requestCapturing(arena, io, environ, url, .{
+            .method = method,
+            .body = body,
+            .content_type = content_type,
+            .accept = "application/json",
+            .authorization = auth_header,
+            .extra_headers = &.{.{ .name = "DPoP", .value = proof }},
+        }, "DPoP-Nonce");
+
+        if (resp.captured) |n| try setNonce(gpa, session, n);
+        if (resp.status >= 200 and resp.status <= 299) return .{ .status = resp.status, .body = resp.body };
+        // Nonce handshake / rotation: retry once the nonce is in hand.
+        if (resp.captured != null and oauth_flow.isUseDpopNonce(arena, resp.body)) continue;
+        // Expired access token: refresh once, then retry. A failed refresh means
+        // the session is dead — surface the 401 for the caller to re-auth on.
+        if (resp.status == 401 and !refreshed) {
+            refreshOAuth(gpa, arena, io, environ, session) catch {
+                return .{ .status = resp.status, .body = resp.body };
+            };
+            refreshed = true;
+            continue;
+        }
+        return .{ .status = resp.status, .body = resp.body };
+    }
+    return error.OAuthRetryExhausted;
+}
+
+/// Refresh-token grant (DPoP-bound) at the issuer's token endpoint; rotates the
+/// access + refresh tokens (and scope, and nonce) in place.
+fn refreshOAuth(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    session: *Session,
+) !void {
+    const body = try oauth_flow.buildRefreshBody(arena, config.oauth_client_id, session.refresh_jwt);
+    const post = try dpopPost(io, environ, arena, session.token_endpoint, body, session.dpop_secret, session.nonce);
+    const fresh = try oauth_flow.parseTokenResponse(gpa, post.body);
+    freeSecret(gpa, session.access_jwt);
+    freeSecret(gpa, session.refresh_jwt);
+    gpa.free(session.scope);
+    gpa.free(fresh.sub); // unchanged; keep session.did
+    session.access_jwt = fresh.access_token;
+    session.refresh_jwt = fresh.refresh_token;
+    session.scope = fresh.scope;
+    if (post.nonce) |n| try setNonce(gpa, session, n);
+}
+
+/// A DPoP-signed form POST with the expected nonce handshake (retry once with
+/// the server nonce). The login flow's PAR + token exchange and the refresh
+/// grant all ride on this. `scratch`-owned body + nonce. Public so `oauth.zig`
+/// can use it without an import cycle.
+pub fn dpopPost(
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    scratch: Allocator,
+    endpoint: []const u8,
+    form_body: []const u8,
+    secret: [32]u8,
+    nonce_in: ?[]const u8,
+) !struct { body: []u8, nonce: ?[]u8 } {
+    var nonce = nonce_in;
+    var attempt: u8 = 0;
+    while (attempt < 2) : (attempt += 1) {
+        const jti = try randomJti(io, scratch);
+        const proof = try dpop.buildProof(scratch, .{
+            .secret_key = secret,
+            .htm = "POST",
+            .htu = endpoint,
+            .iat = clock.unixSeconds(),
+            .jti = jti,
+            .nonce = nonce,
+        });
+        const resp = try http.requestCapturing(scratch, io, environ, endpoint, .{
+            .method = .POST,
+            .body = form_body,
+            .content_type = "application/x-www-form-urlencoded",
+            .accept = "application/json",
+            .guard = .untrusted,
+            .extra_headers = &.{.{ .name = "DPoP", .value = proof }},
+        }, "DPoP-Nonce");
+        if (resp.status >= 200 and resp.status <= 299) return .{ .body = resp.body, .nonce = resp.captured };
+        if (attempt == 0 and resp.captured != null and oauth_flow.isUseDpopNonce(scratch, resp.body)) {
+            nonce = resp.captured;
+            continue;
+        }
+        return error.OAuthRequestFailed;
+    }
+    unreachable;
+}
+
+/// Replace the session's nonce with a fresh `gpa`-owned copy, freeing the old.
+fn setNonce(gpa: Allocator, session: *Session, new: []const u8) Allocator.Error!void {
+    const owned = try gpa.dupe(u8, new);
+    if (session.nonce) |old| gpa.free(old);
+    session.nonce = owned;
+}
+
+/// 16 CSPRNG bytes as base64url — a unique DPoP proof id. `scratch`-owned.
+fn randomJti(io: std.Io, scratch: Allocator) ![]u8 {
+    var raw: [16]u8 = undefined;
+    try io.randomSecure(&raw);
+    const enc_len = std.base64.url_safe_no_pad.Encoder.calcSize(16);
+    const out = try scratch.alloc(u8, enc_len);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(out, &raw);
+    return out;
 }
 
 // ---------------------------------------------------------------------------

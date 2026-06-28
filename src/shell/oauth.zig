@@ -16,27 +16,27 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! B1 classification: SHELL (thin). OAuth authorization-server discovery: the
-//! two networked `.well-known` fetches that turn a resolved PDS into the
-//! issuer's endpoint set. The PARSING is pure (`core/oauth.zig`); this module
-//! only does I/O — fetch, hand the bytes to the parser, and validate the issuer.
+//! B1 classification: SHELL. OBTAINING an OAuth session — discovery and the
+//! browser authorization-code flow. The counterpart, USING a session (the
+//! DPoP-authenticated query/procedure and refresh), lives in `auth.zig`, which
+//! `login` returns an `auth.Session` into; the split keeps the import acyclic
+//! (`oauth` → `auth`, never back).
 //!
-//! Both fetches are `.untrusted` (the host is network-derived), so they inherit
-//! `http`'s SSRF gate: https-only, blocked-range refusal, and no redirect
-//! following (Phase 1). The caller resolves handle/DID → PDS via the existing
-//! `identity` module and passes the PDS URL here; this is the OAuth-specific
-//! leg of that chain (D6: one vertical slice, reusing identity as-is).
+//! Discovery: two networked `.well-known` fetches turn a resolved PDS into the
+//! issuer's endpoint set. The parsing is pure (`core/oauth.zig`). Both fetches
+//! are `.untrusted` (the host is network-derived), inheriting `http`'s SSRF
+//! gate. Login: PKCE/DPoP prep → PAR → system browser → loopback callback →
+//! token exchange (the pure builders/parsers are `core/oauth_flow.zig`; the DPoP
+//! POST primitive is `auth.dpopPost`).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const http = @import("http.zig");
-const clock = @import("clock.zig");
 const config = @import("config.zig");
+const auth = @import("auth.zig");
 const oauth = @import("../core/oauth.zig");
 const oauth_flow = @import("../core/oauth_flow.zig");
 const pkce = @import("../core/pkce.zig");
-const dpop = @import("../core/dpop.zig");
-const xrpc_core = @import("../core/xrpc.zig");
 const Scheme = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 
 /// Metadata documents are small flat JSON; 256 KiB is luxurious headroom while
@@ -114,56 +114,16 @@ fn wellKnownUrl(scratch: Allocator, base: []const u8, path: []const u8) Allocato
 }
 
 // ---------------------------------------------------------------------------
-// The authorization-code login flow (the Slice-3 choreography). Discovery →
-// PKCE/DPoP prep → PAR → browser → loopback callback → token exchange, with the
-// DPoP-nonce retry. The pure halves live in `core/oauth_flow`; this is the I/O.
+// The authorization-code login flow. Discovery → PKCE/DPoP prep → PAR → browser
+// → loopback callback → token exchange. The result is an `auth.Session` (oauth
+// mode); from there the app uses `auth.query`/`auth.procedure` like any session.
 // ---------------------------------------------------------------------------
-
-/// A live DPoP-bound OAuth session: the tokens, the key they're bound to, the
-/// endpoints to refresh against, and the rotating server nonce. Mutable — the
-/// `nonce` rotates on every request and the tokens rotate on refresh, in place.
-/// The DPoP key is ephemeral this slice (in-memory); Slice 5 persists it.
-/// Strings owned by `gpa`; the tokens and nonce are secrets, scrubbed on free.
-/// A7.2: cold struct, size guard waived — one per logged-in account.
-pub const OAuthSession = struct {
-    did: []const u8,
-    handle: []const u8,
-    pds_url: []const u8,
-    access_token: []const u8,
-    refresh_token: []const u8,
-    scope: []const u8,
-    issuer: []const u8,
-    token_endpoint: []const u8,
-    /// The 32-byte P-256 DPoP private scalar these tokens are bound to.
-    dpop_secret: [32]u8,
-    /// The most recent server DPoP nonce; rotates per response.
-    nonce: ?[]const u8,
-};
-
-pub fn freeOAuthSession(gpa: Allocator, s: OAuthSession) void {
-    gpa.free(s.did);
-    gpa.free(s.handle);
-    gpa.free(s.pds_url);
-    secureFree(gpa, s.access_token);
-    secureFree(gpa, s.refresh_token);
-    gpa.free(s.scope);
-    gpa.free(s.issuer);
-    gpa.free(s.token_endpoint);
-    if (s.nonce) |n| gpa.free(n);
-}
-
-/// Scrub a secret's bytes before release (token-theft hardening, Phase 0 —
-/// mirrors `auth.freeSecret`).
-fn secureFree(gpa: Allocator, secret: []const u8) void {
-    std.crypto.secureZero(u8, @constCast(secret));
-    gpa.free(secret);
-}
 
 /// Run the full browser OAuth login for the account at `pds_url` (resolved by
 /// the caller from a handle/DID via `identity`). `handle` seeds the login form.
 /// Opens the system browser and blocks on the loopback callback until the user
-/// completes (or denies). The result's strings are owned by `gpa`; every
-/// transient lives in `scratch`.
+/// completes (or denies). Returns a ready-to-use `auth.Session` (oauth mode),
+/// its strings owned by `gpa`; every transient lives in `scratch`.
 pub fn login(
     gpa: Allocator,
     io: std.Io,
@@ -171,7 +131,7 @@ pub fn login(
     scratch: Allocator,
     pds_url: []const u8,
     handle: ?[]const u8,
-) !OAuthSession {
+) !auth.Session {
     // 1. Discover the issuer's endpoints (scratch-owned for the flow).
     const server = try discover(scratch, io, environ, scratch, pds_url);
 
@@ -199,7 +159,7 @@ pub fn login(
         .code_challenge = &challenge,
         .login_hint = handle,
     });
-    const par_post = try dpopPost(io, environ, scratch, server.par_endpoint, par_body, secret, null);
+    const par_post = try auth.dpopPost(io, environ, scratch, server.par_endpoint, par_body, secret, null);
     const par = try oauth_flow.parseParResponse(scratch, par_post.body);
 
     // 5. Open the browser to the authorize endpoint.
@@ -221,7 +181,7 @@ pub fn login(
         .code = cb.code,
         .code_verifier = &verifier,
     });
-    const tok_post = try dpopPost(io, environ, scratch, server.token_endpoint, token_body, secret, par_post.nonce);
+    const tok_post = try auth.dpopPost(io, environ, scratch, server.token_endpoint, token_body, secret, par_post.nonce);
     const tokens = try oauth_flow.parseTokenResponse(gpa, tok_post.body);
     errdefer oauth_flow.freeTokenSet(gpa, tokens);
 
@@ -237,189 +197,18 @@ pub fn login(
     const nonce_owned: ?[]const u8 = if (tok_post.nonce) |n| try gpa.dupe(u8, n) else null;
 
     return .{
+        .mode = .oauth,
         .did = tokens.sub,
         .handle = handle_owned,
         .pds_url = pds_owned,
-        .access_token = tokens.access_token,
-        .refresh_token = tokens.refresh_token,
+        .access_jwt = tokens.access_token,
+        .refresh_jwt = tokens.refresh_token,
         .scope = tokens.scope,
         .issuer = issuer,
         .token_endpoint = token_endpoint,
         .dpop_secret = secret,
         .nonce = nonce_owned,
     };
-}
-
-// ---------------------------------------------------------------------------
-// Using the session (Slice 4): DPoP-authenticated XRPC + token refresh. Every
-// authenticated request carries a fresh DPoP proof (bound to the access token
-// via `ath`, and to the request via htm/htu) plus `Authorization: DPoP <token>`.
-// The server's DPoP nonce rotates per response and is retried once; an expired
-// access token (401) triggers one refresh-and-retry. A refresh that fails
-// propagates as an error — the caller re-authenticates (no silent loop).
-// ---------------------------------------------------------------------------
-
-/// DPoP-authenticated XRPC query (GET) against the session's PDS. Returns the
-/// 2xx response body (`arena`-owned). Mutates `sess.nonce` (and, on refresh,
-/// the tokens) in place.
-pub fn dpopQuery(
-    gpa: Allocator,
-    arena: Allocator,
-    io: std.Io,
-    environ: ?*const std.process.Environ.Map,
-    sess: *OAuthSession,
-    nsid: []const u8,
-    params: []const xrpc_core.Param,
-) ![]u8 {
-    const url = try xrpc_core.buildQueryUrl(arena, sess.pds_url, nsid, params);
-    return dpopSend(gpa, arena, io, environ, sess, .GET, url, null, null);
-}
-
-/// DPoP-authenticated XRPC procedure (POST) with a JSON body against the
-/// session's PDS. Returns the 2xx response body (`arena`-owned).
-pub fn dpopProcedure(
-    gpa: Allocator,
-    arena: Allocator,
-    io: std.Io,
-    environ: ?*const std.process.Environ.Map,
-    sess: *OAuthSession,
-    nsid: []const u8,
-    input: anytype,
-) ![]u8 {
-    const url = try xrpc_core.buildMethodUrl(arena, sess.pds_url, nsid);
-    const body = try xrpc_core.encodeBody(arena, input);
-    return dpopSend(gpa, arena, io, environ, sess, .POST, url, body, "application/json");
-}
-
-/// The shared request engine: sign, send, handle the DPoP-nonce handshake and
-/// the 401-refresh, retry. `htu` is the request URL minus its query (RFC 9449).
-fn dpopSend(
-    gpa: Allocator,
-    arena: Allocator,
-    io: std.Io,
-    environ: ?*const std.process.Environ.Map,
-    sess: *OAuthSession,
-    method: std.http.Method,
-    url: []const u8,
-    body: ?[]const u8,
-    content_type: ?[]const u8,
-) ![]u8 {
-    const htu = url[0 .. std.mem.indexOfScalar(u8, url, '?') orelse url.len];
-    var refreshed = false;
-    var attempt: u8 = 0;
-    while (attempt < 4) : (attempt += 1) {
-        const jti = try randomToken(io, arena, 16);
-        const proof = try dpop.buildProof(arena, .{
-            .secret_key = sess.dpop_secret,
-            .htm = if (method == .POST) "POST" else "GET",
-            .htu = htu,
-            .iat = clock.unixSeconds(),
-            .jti = jti,
-            .nonce = sess.nonce,
-            .access_token = sess.access_token, // binds the proof to the token (ath)
-        });
-        const auth_header = try std.fmt.allocPrint(arena, "DPoP {s}", .{sess.access_token});
-        const resp = try http.requestCapturing(arena, io, environ, url, .{
-            .method = method,
-            .body = body,
-            .content_type = content_type,
-            .accept = "application/json",
-            .authorization = auth_header,
-            .extra_headers = &.{.{ .name = "DPoP", .value = proof }},
-        }, "DPoP-Nonce");
-
-        if (resp.captured) |n| try setNonce(gpa, sess, n);
-
-        if (resp.status >= 200 and resp.status < 300) return resp.body;
-        // First contact / rotation: retry once the nonce is in hand.
-        if (resp.captured != null and oauth_flow.isUseDpopNonce(arena, resp.body)) continue;
-        // Expired access token: refresh once, then retry.
-        if (resp.status == 401 and !refreshed) {
-            try refresh(gpa, arena, io, environ, sess);
-            refreshed = true;
-            continue;
-        }
-        return error.DpopRequestFailed;
-    }
-    return error.DpopRequestFailed;
-}
-
-/// Refresh-token grant (DPoP-bound) at the issuer's token endpoint; rotates the
-/// access + refresh tokens (and scope, and nonce) in place. A failure
-/// propagates — the session is dead and the caller must re-authenticate.
-fn refresh(
-    gpa: Allocator,
-    arena: Allocator,
-    io: std.Io,
-    environ: ?*const std.process.Environ.Map,
-    sess: *OAuthSession,
-) !void {
-    const body = try oauth_flow.buildRefreshBody(arena, config.oauth_client_id, sess.refresh_token);
-    const post = try dpopPost(io, environ, arena, sess.token_endpoint, body, sess.dpop_secret, sess.nonce);
-    const fresh = try oauth_flow.parseTokenResponse(gpa, post.body);
-    // Rotate the spent secrets out, scrubbing them.
-    secureFree(gpa, sess.access_token);
-    secureFree(gpa, sess.refresh_token);
-    gpa.free(sess.scope);
-    gpa.free(fresh.sub); // sub is unchanged; keep sess.did
-    sess.access_token = fresh.access_token;
-    sess.refresh_token = fresh.refresh_token;
-    sess.scope = fresh.scope;
-    if (post.nonce) |n| try setNonce(gpa, sess, n);
-}
-
-/// Replace the session's nonce with a fresh one (gpa-owned), freeing the old.
-fn setNonce(gpa: Allocator, sess: *OAuthSession, new: []const u8) Allocator.Error!void {
-    const owned = try gpa.dupe(u8, new);
-    if (sess.nonce) |old| gpa.free(old);
-    sess.nonce = owned;
-}
-
-/// One DPoP-signed POST with the expected nonce handshake: the first attempt
-/// has no nonce; if the server answers `use_dpop_nonce` with a fresh
-/// `DPoP-Nonce`, rebuild the proof with it and retry exactly once. Returns the
-/// 2xx body and the latest nonce (both `scratch`-owned).
-fn dpopPost(
-    io: std.Io,
-    environ: ?*const std.process.Environ.Map,
-    scratch: Allocator,
-    endpoint: []const u8,
-    form_body: []const u8,
-    secret: [32]u8,
-    nonce_in: ?[]const u8,
-) !struct { body: []u8, nonce: ?[]u8 } {
-    var nonce = nonce_in;
-    var attempt: u8 = 0;
-    while (attempt < 2) : (attempt += 1) {
-        const jti = try randomToken(io, scratch, 16);
-        const proof = try dpop.buildProof(scratch, .{
-            .secret_key = secret,
-            .htm = "POST",
-            .htu = endpoint,
-            .iat = clock.unixSeconds(),
-            .jti = jti,
-            .nonce = nonce,
-        });
-        const resp = try http.requestCapturing(scratch, io, environ, endpoint, .{
-            .method = .POST,
-            .body = form_body,
-            .content_type = "application/x-www-form-urlencoded",
-            .accept = "application/json",
-            .guard = .untrusted,
-            .extra_headers = &.{.{ .name = "DPoP", .value = proof }},
-        }, "DPoP-Nonce");
-
-        if (resp.status >= 200 and resp.status < 300) {
-            return .{ .body = resp.body, .nonce = resp.captured };
-        }
-        // The nonce handshake is expected on first contact — retry once.
-        if (attempt == 0 and resp.captured != null and oauth_flow.isUseDpopNonce(scratch, resp.body)) {
-            nonce = resp.captured;
-            continue;
-        }
-        return error.OAuthRequestFailed;
-    }
-    unreachable;
 }
 
 /// A7.2: cold struct, size guard waived — one per login, held only during the flow.
@@ -444,8 +233,7 @@ fn openLoopback(io: std.Io) !Loopback {
 }
 
 /// Wait for the real callback request and answer the browser with a small
-/// "you're signed in" page (which tries to close itself — the max-smooth touch).
-/// Returns the callback query string (`scratch`-owned).
+/// "you're signed in" page. Returns the callback query string (`scratch`-owned).
 ///
 /// Loops over connections rather than accepting just one: browsers (Firefox/
 /// LibreWolf especially) open *speculative* preconnections that send no data,
@@ -509,7 +297,7 @@ fn openBrowser(io: std.Io, url: []const u8) !void {
     _ = child.wait(io) catch {};
 }
 
-/// `n` CSPRNG bytes as base64url (unreserved, URL-safe) — for `state` and `jti`.
+/// `n` CSPRNG bytes as base64url (unreserved, URL-safe) — for `state`.
 /// Uses `io.randomSecure` (the same syscall CSPRNG the credential gen uses).
 fn randomToken(io: std.Io, scratch: Allocator, comptime n: usize) ![]u8 {
     var raw: [n]u8 = undefined;
@@ -522,8 +310,8 @@ fn randomToken(io: std.Io, scratch: Allocator, comptime n: usize) ![]u8 {
 
 // ---------------------------------------------------------------------------
 // Tests (C6). The networked `discover`/`login` are exercised end-to-end when the
-// flow runs (Slice 3 live test) and the parsers are golden-tested in
-// core/oauth*.zig against real pds.zat4.com documents; here we pin pure helpers.
+// flow runs (live test) and the parsers are golden-tested in core/oauth*.zig
+// against real pds.zat4.com documents; here we pin the pure helper.
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
