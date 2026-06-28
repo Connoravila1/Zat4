@@ -142,6 +142,7 @@ fn startLiveStream(
 /// SAME loop, screens, and input decoder serve a tty or an X11 window.
 /// The window pretends to be a terminal (cells out, key bytes in); the
 /// loop never learns the difference.
+/// A7.2: cold union, size guard waived — exactly one per app run.
 pub const Backend = union(enum) {
     terminal,
     window: *window_shell.Window,
@@ -867,8 +868,9 @@ pub fn run(
                         } else {
                             // Software fallback: the glyph-field cell composer.
                             const cell = cellSize(win.fb.width, gzoom);
-                            const cols: u16 = @intCast(@max(16, win.fb.width / cell.w));
-                            const rows: u16 = @intCast(@max(6, win.fb.height / cell.h));
+                            const fgrid = softFieldGrid(win.fb.width, win.fb.height, cell.w, cell.h);
+                            const cols = fgrid.cols;
+                            const rows = fgrid.rows;
                             if (gfield.cols != cols or gfield.rows != rows) {
                                 field_core.deinit(gpa, &gfield);
                                 try field_core.init(gpa, &gfield, cols, rows);
@@ -898,8 +900,9 @@ pub fn run(
                 if (pix) |g| switch (backend) {
                     .window => |win| {
                         const cell = cellSize(win.fb.width, gzoom);
-                        const cols: u16 = @intCast(@max(16, win.fb.width / cell.w));
-                        const rows: u16 = @intCast(@max(6, win.fb.height / cell.h));
+                        const fgrid = softFieldGrid(win.fb.width, win.fb.height, cell.w, cell.h);
+                        const cols = fgrid.cols;
+                        const rows = fgrid.rows;
                         if (gfield.cols != cols or gfield.rows != rows) {
                             field_core.deinit(gpa, &gfield);
                             try field_core.init(gpa, &gfield, cols, rows);
@@ -2743,8 +2746,9 @@ fn initGpuState(gpa: Allocator, engine: *text_core.Engine, win: *window_shell.Wi
     const heart = try gpu.initHeartRenderer();
     const icon_r = try gpu.initIconRenderer();
 
-    const cols: u32 = @max(8, w / field_cell_w);
-    const rows: u32 = @max(8, h / field_cell_h);
+    const fgrid = gpuFieldGrid(w, h);
+    const cols = fgrid.cols;
+    const rows = fgrid.rows;
     var field: glyph_field.Field = undefined;
     try glyph_field.init(gpa, &field, cols, rows);
     errdefer glyph_field.deinit(gpa, &field);
@@ -2825,8 +2829,9 @@ fn deinitGpuState(gpa: Allocator, gs: *GpuState) void {
 /// existing state (and its deinit) valid (C5). The dye/height reset on resize
 /// is accepted for v1 (the field re-seeds calm); reproject later if wanted.
 fn resizeGpuField(gpa: Allocator, gs: *GpuState, w: u32, h: u32) !void {
-    const cols: u32 = @max(8, w / field_cell_w);
-    const rows: u32 = @max(8, h / field_cell_h);
+    const fgrid = gpuFieldGrid(w, h);
+    const cols = fgrid.cols;
+    const rows = fgrid.rows;
     var newfield: glyph_field.Field = undefined;
     try glyph_field.init(gpa, &newfield, cols, rows);
     errdefer glyph_field.deinit(gpa, &newfield);
@@ -2902,6 +2907,35 @@ const glyph_h_max: f32 = 40;
 const zoom_min: f32 = 0.6;
 const zoom_max: f32 = 2.2;
 
+/// The field grid never shrinks below this many cells, so even a tiny window
+/// shows a coherent glyph field rather than a sparse smear. ONE floor for every
+/// surface and both render paths (D6): the home/compose/profile software sites
+/// had drifted to 24/8 vs 16/6 and the GPU path to 8/8 — same window, so that
+/// was change-amplification drift, not intent. The floor binds only at
+/// degenerate sizes; the field is a transient background (wiped on resize, §7).
+const field_grid_min_cols: u32 = 24;
+const field_grid_min_rows: u32 = 8;
+
+/// SOFTWARE-path field grid: how many `cellSize` cells tile the framebuffer
+/// (u16, as `field_core.init` wants). The single source for the home, compose,
+/// and profile software paths — derive the grid here, never inline (D6).
+fn softFieldGrid(fb_w: u32, fb_h: u32, cell_w: u16, cell_h: u16) struct { cols: u16, rows: u16 } {
+    return .{
+        .cols = @intCast(@max(field_grid_min_cols, fb_w / cell_w)),
+        .rows = @intCast(@max(field_grid_min_rows, fb_h / cell_h)),
+    };
+}
+
+/// GPU-path field grid: the fixed `field_cell_*` cells tile the window (u32, as
+/// `glyph_field.init` wants). The single source for GPU init AND resize so the
+/// two can never derive the grid differently (the CLAUDE.md §6 unify item).
+fn gpuFieldGrid(w: u32, h: u32) struct { cols: u32, rows: u32 } {
+    return .{
+        .cols = @max(field_grid_min_cols, w / field_cell_w),
+        .rows = @max(field_grid_min_rows, h / field_cell_h),
+    };
+}
+
 /// Derive the integer cell size from the WINDOW width and the user zoom.
 /// Pure; the single place the (window,zoom)→pixels mapping lives, so the
 /// render path, the pointer hit-test, and the grid-dimension math can
@@ -2968,8 +3002,9 @@ fn paintFrame(
             // fill the window at whatever size results. The font engine
             // rasterizes at the derived pixel height (cached per-size).
             const cell = cellSize(win.fb.width, g.zoom.*);
-            const cols: u16 = @intCast(@max(24, win.fb.width / cell.w));
-            const rows: u16 = @intCast(@max(8, win.fb.height / cell.h));
+            const fgrid = softFieldGrid(win.fb.width, win.fb.height, cell.w, cell.h);
+            const cols = fgrid.cols;
+            const rows = fgrid.rows;
             // (Re)size the field to the window. Cheap; the perturb grid
             // is wiped on resize (transient by design, §7).
             if (g.field.cols != cols or g.field.rows != rows) {
@@ -3188,9 +3223,8 @@ fn paintComposeGpu(
     const w: u32 = win.fb.width;
     const h: u32 = win.fb.height;
     gpu.setViewport(@intCast(w), @intCast(h));
-    const want_cols: u32 = @max(8, w / field_cell_w);
-    const want_rows: u32 = @max(8, h / field_cell_h);
-    if (want_cols != gs.cols or want_rows != gs.rows) {
+    const want = gpuFieldGrid(w, h);
+    if (want.cols != gs.cols or want.rows != gs.rows) {
         resizeGpuField(gpa, gs, w, h) catch {};
     }
     const scale = uiScale(w);
@@ -3232,9 +3266,8 @@ fn paintFrameGpu(
     gpu.setViewport(@intCast(w), @intCast(h));
     // Refit the field grid to the window when the cell count changes (cheap;
     // a few KB R32F). On a failed realloc keep the prior grid (E2).
-    const want_cols: u32 = @max(8, w / field_cell_w);
-    const want_rows: u32 = @max(8, h / field_cell_h);
-    if (want_cols != gs.cols or want_rows != gs.rows) {
+    const want = gpuFieldGrid(w, h);
+    if (want.cols != gs.cols or want.rows != gs.rows) {
         resizeGpuField(gpa, gs, w, h) catch {};
     }
 

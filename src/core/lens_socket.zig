@@ -239,6 +239,8 @@ pub const HitList = std.ArrayListUnmanaged(HitRect);
 /// value — NEVER an index (A5). The shell routes this through the SAME
 /// action path the keyboard uses (PHASE5 §3). "No hit" is `null`, an
 /// ordinary result (E3/E4).
+/// A7.2: cold union, size guard waived — one UI intent per hit-test, routed
+/// immediately through the action path, never collected.
 pub const SocketAction = union(enum) {
     toggle_tray,
     seat: []const u8, // seat this lens — CID crosses out (A5/A8)

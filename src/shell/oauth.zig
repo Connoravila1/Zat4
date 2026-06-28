@@ -30,6 +30,7 @@
 //! POST primitive is `auth.dpopPost`).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const http = @import("http.zig");
 const config = @import("config.zig");
@@ -167,7 +168,16 @@ pub fn login(
     // Dev affordance: echo the URL so a failed auto-open (headless/SSH) is
     // recoverable by pasting it. Not a secret. Removed when the GUI drives this.
     std.debug.print("[oauth] authorize URL (opens automatically): {s}\n", .{authorize_url});
-    openBrowser(io, authorize_url) catch {};
+    openBrowser(io, authorize_url) catch |err| {
+        // Auto-open failed (headless / SSH / no xdg-open). NOT fatal: the URL was
+        // printed above for manual paste, so the flow proceeds to await the
+        // callback. Surfacing the reason instead of swallowing it (E3) keeps a
+        // failed launch from looking like a silent hang. NOTE for slice 6.2: in
+        // the GUI this message + the URL print become a proper surfaced state,
+        // and the flow's overall lifetime (cancel if the browser never opens)
+        // is owned by the worker-thread design that wires this in.
+        std.debug.print("[oauth] could not launch a browser ({s}); open the URL above manually.\n", .{@errorName(err)});
+    };
 
     // 6. Block on the callback; validate state + iss.
     const query = try awaitCallback(scratch, io, &lb.server);
@@ -245,30 +255,44 @@ fn awaitCallback(scratch: Allocator, io: std.Io, server: *std.Io.net.Server) ![]
     var seen: u32 = 0;
     while (seen < 64) : (seen += 1) {
         const stream = server.accept(io) catch return error.CallbackFailed;
+        // One close for every exit of this iteration — continue, return, OR the
+        // `try` below failing on OOM (the old per-branch closes leaked the fd on
+        // that error path). `accept` blocks patiently between connections, so
+        // the overall wait for the user is unbounded; only each individual
+        // connection is bounded by the poll below (C5).
+        defer stream.close(io);
+
+        // A speculative preconnection (the comment above) can open the socket
+        // and send NOTHING, which would block receiveHead forever and hang the
+        // whole login. Bound each connection: if no request bytes arrive within
+        // a few seconds, treat it as silent and move on — the browser opens a
+        // fresh connection for the real GET /callback. Mirrors the raw-fd poll
+        // in stream.zig; Windows v1 skips it (no browser flow there yet).
+        if (comptime builtin.os.tag != .windows) {
+            var pfds = [_]std.posix.pollfd{.{ .fd = stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+            const ready = std.posix.poll(&pfds, 5_000) catch 0;
+            if (ready == 0) continue;
+        }
+
         var read_buf: [16 * 1024]u8 = undefined;
         var write_buf: [4 * 1024]u8 = undefined;
         var stream_reader = stream.reader(io, &read_buf);
         var stream_writer = stream.writer(io, &write_buf);
         var hs: std.http.Server = .init(&stream_reader.interface, &stream_writer.interface);
-        var req = hs.receiveHead() catch {
-            // A speculative/empty connection (no complete request) — discard it
-            // and wait for the next, keeping the listener open.
-            stream.close(io);
-            continue;
-        };
+        // A speculative/empty connection (no complete request) — discard it and
+        // wait for the next, keeping the listener open.
+        var req = hs.receiveHead() catch continue;
         const target = req.head.target; // e.g. "/callback?code=...&state=...&iss=..."
         const qpos = std.mem.indexOfScalar(u8, target, '?');
         if (!std.mem.startsWith(u8, target, "/callback") or qpos == null) {
             // Not the callback (a preconnect GET /, /favicon.ico, etc.).
             req.respond("", .{ .status = .not_found }) catch {};
-            stream.close(io);
             continue;
         }
         const query = try scratch.dupe(u8, target[qpos.? + 1 ..]);
         req.respond(success_page, .{
             .extra_headers = &.{.{ .name = "content-type", .value = "text/html; charset=utf-8" }},
         }) catch {};
-        stream.close(io);
         return query;
     }
     return error.CallbackFailed;

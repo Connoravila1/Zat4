@@ -54,6 +54,9 @@ const lexicon = @import("../core/lexicon.zig");
 // The mailbox — plain-data messages, the only thing that crosses out
 // ---------------------------------------------------------------------------
 
+// A7.2: cold union, size guard waived — a slice-carrying hand-off message
+// drained in short batches at event rates, not a tightly-packed hot record
+// (same reasoning as write_worker's Request/Result and the Mailbox below).
 pub const Mail = union(enum) {
     /// A live post; every string is gpa-owned by the message. The
     /// consumer ingests, then calls `freePost`.

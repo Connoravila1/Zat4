@@ -47,6 +47,8 @@ pub const EngagementKind = enum { like, repost };
 
 /// What a reduced Tap message asks the consumer to do. Plain values; strings
 /// borrow the reduction arena (E1 — the consumer copies what it keeps).
+/// A7.2: cold union, size guard waived — a transient per-message reduction,
+/// consumed (and copied if kept) before the next, never accumulated.
 pub const Reduced = union(enum) {
     /// Not a create we index (an identity-only signal carries no record, an
     /// update/delete, or a non-zat4 collection that slipped the server filter).

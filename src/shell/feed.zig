@@ -36,6 +36,7 @@ const lexicon = @import("../core/lexicon.zig");
 
 /// One page load resolves to ingest stats or the server's refusal — the
 /// same value-not-error stance as everywhere else (E4).
+/// A7.2: cold union, size guard waived — one page-load result, returned and matched.
 pub const PageOutcome = union(enum) {
     ok: feed_core.IngestStats,
     failed: xrpc.Failure,

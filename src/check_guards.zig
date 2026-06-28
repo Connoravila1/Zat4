@@ -124,16 +124,22 @@ fn readFile(arena: Allocator, path: [:0]const u8) ?[]const u8 {
     return out.items;
 }
 
-/// Module-level struct declaration: column 0, `const`/`pub const`, the
-/// struct keyword on the same line. Indented (function- or test-local)
-/// declarations are out of scope on purpose — A7 governs records, and
-/// records live at module level here.
+/// Module-level record declaration: column 0, `const`/`pub const`, the
+/// struct/union keyword on the same line. Tagged (and bare) UNIONS count too —
+/// a `union(enum)` held in a collection (e.g. `DrawItem` in a MultiArrayList)
+/// is as hot as any struct, so A7 governs it. Missing them was a real blind
+/// spot. Indented (function- or test-local) declarations are out of scope on
+/// purpose — A7 governs records, and records live at module level here.
 fn isStructDecl(line: []const u8) bool {
     if (!std.mem.startsWith(u8, line, "pub const ") and !std.mem.startsWith(u8, line, "const "))
         return false;
     return std.mem.indexOf(u8, line, "= struct {") != null or
         std.mem.indexOf(u8, line, "= extern struct {") != null or
-        std.mem.indexOf(u8, line, "= packed struct") != null;
+        std.mem.indexOf(u8, line, "= packed struct") != null or
+        std.mem.indexOf(u8, line, "= union(") != null or
+        std.mem.indexOf(u8, line, "= union {") != null or
+        std.mem.indexOf(u8, line, "= extern union {") != null or
+        std.mem.indexOf(u8, line, "= packed union") != null;
 }
 
 /// A struct passes if the contiguous comment block above it, or its body

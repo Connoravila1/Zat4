@@ -151,6 +151,8 @@ test "keyFor round-trips through actionFor: clicks and keys cannot drift" {
 
 /// What a key means inside the composer. ctrl-d sends (end of input);
 /// ESC or ctrl-c backs out with the draft intact for this session.
+/// A7.2: cold union, size guard waived — a per-keystroke action result,
+/// produced and consumed one at a time, never collected.
 pub const ComposeAction = union(enum) {
     insert: u21,
     backspace,

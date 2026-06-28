@@ -1198,6 +1198,8 @@ pub fn setRepostUri(gpa: Allocator, store: *Store, cid: []const u8, uri: []const
 /// to delete. It BORROWS the store's bytes and is valid only until the
 /// next store-mutating call — callers copy it out before reverting (the
 /// revert path appends, which may realloc the buffer underneath it).
+/// A7.2: cold union, size guard waived — a one-shot unlike verdict, returned
+/// and consumed immediately, never held in quantity.
 pub const Disengaged = union(enum) {
     applied: []const u8,
     not_engaged,

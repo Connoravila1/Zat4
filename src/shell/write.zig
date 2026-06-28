@@ -42,6 +42,7 @@ const pow_shell = @import("pow.zig");
 
 /// What a write resolves to: the created record's (uri, cid) — slices
 /// owned by the caller's arena — or the server's refusal.
+/// A7.2: cold union, size guard waived — one per write, returned and matched.
 pub const WriteOutcome = union(enum) {
     ok: lexicon.RecordRef,
     failed: xrpc.Failure,

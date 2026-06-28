@@ -57,6 +57,33 @@ const oauth_flow = @import("../core/oauth_flow.zig");
 /// `query`/`procedure` and never branches on this — the dispatch is interior.
 pub const AuthMode = enum(u8) { app_password, oauth };
 
+/// Serializes the credential-mutating choreography (token refresh + DPoP nonce
+/// rotation) when a `Session` is shared across threads: the write worker
+/// (write_worker.zig) holds a `*Session` and rotates its tokens/nonce while the
+/// UI thread may issue its own PDS calls on the same session. Without this, an
+/// oauth `setNonce` (free+replace of `session.nonce`) on one thread races a
+/// proof build reading `session.nonce` on the other — a use-after-free / double
+/// free on essentially every overlapping write.
+///
+/// Unlike the Mailbox/IndexLock spinlocks (brief critical sections), this lock
+/// is held across a network round-trip, so the waiter SLEEPS rather than
+/// spinning a core. Built on `std.atomic` for the same reason the rest of the
+/// codebase avoids `std.Thread.Mutex` (unstable across our 0.16 fork snapshots;
+/// stream.zig records it). Uncontended acquire is a single atomic swap;
+/// contention — rare, at human action rates — costs ~1ms sleeps. Holding it
+/// also defines away the refresh-token-rotation race: the second caller wakes,
+/// reads the freshly-rotated token, and never spends the spent (single-use)
+/// refresh token. A7.2: cold lock type (one per session), size guard waived.
+pub const SessionLock = struct {
+    held: std.atomic.Value(bool) = .init(false),
+    fn lock(self: *SessionLock) void {
+        while (self.held.swap(true, .acquire)) clock.sleepMillis(1);
+    }
+    fn unlock(self: *SessionLock) void {
+        self.held.store(false, .release);
+    }
+};
+
 /// An authenticated session — plain values (A1), every string owned by the
 /// `gpa` given to `login`. Free with `freeSession`. Callers read `did`,
 /// `handle`, `pds_url`; the jwt fields are data like any other (D5:
@@ -87,6 +114,10 @@ pub const Session = struct {
     token_endpoint: []const u8 = "",
     /// The most recent server DPoP nonce; rotates per response.
     nonce: ?[]const u8 = null,
+    /// Serializes credential mutation when this session is shared across threads
+    /// (see SessionLock). Inert and uncontended for a single-threaded session.
+    /// Not persisted (cache.zig serializes named fields, never the whole struct).
+    cred_lock: SessionLock = .{},
 };
 
 /// Login resolves to a session or the server's stated refusal (wrong
@@ -94,6 +125,7 @@ pub const Session = struct {
 /// data the caller can show or branch on (E4). Zig errors remain reserved
 /// for transport/codec failure (E3). `refused` strings live in the arena
 /// passed to `login`.
+/// A7.2: cold union, size guard waived — one per login, returned and matched.
 pub const LoginOutcome = union(enum) {
     ok: Session,
     refused: xrpc.Failure,
@@ -236,6 +268,14 @@ pub fn queryHost(
         }
     }
 
+    // Past this point we read and may rotate the session's credential fields
+    // (access token / DPoP nonce). Serialize against the write-worker thread
+    // that shares this *Session; the appview-bearer path above touches no
+    // mutable field and stays lock-free (the hot timeline read). D4: the
+    // cross-thread coupling stays sealed inside this module.
+    session.cred_lock.lock();
+    defer session.cred_lock.unlock();
+
     // OAuth sessions authenticate to their own PDS with DPoP, not a Bearer JWT.
     if (session.mode == .oauth) {
         const url = try xrpc_core.buildQueryUrl(arena, host, nsid, params);
@@ -271,6 +311,12 @@ pub fn procedure(
     input: anytype,
     comptime Response: type,
 ) !xrpc.Outcome(Response) {
+    // A write always targets the PDS session token, so the whole body reads/
+    // rotates credential fields — serialize against the write-worker thread
+    // that shares this *Session (see queryHost / SessionLock).
+    session.cred_lock.lock();
+    defer session.cred_lock.unlock();
+
     // OAuth sessions write to their PDS with DPoP.
     if (session.mode == .oauth) {
         const url = try xrpc_core.buildMethodUrl(arena, session.pds_url, nsid);
@@ -480,7 +526,14 @@ fn refreshOAuth(
     session.access_jwt = fresh.access_token;
     session.refresh_jwt = fresh.refresh_token;
     session.scope = fresh.scope;
-    if (post.nonce) |n| try setNonce(gpa, session, n);
+    // Do NOT stamp the token-endpoint's DPoP nonce onto session.nonce. Nonces
+    // are per-server (RFC 9449); session.nonce belongs to the PDS resource
+    // server, while post.nonce came from the issuer's token endpoint. Writing
+    // it here would force a guaranteed `use_dpop_nonce` retry on the very next
+    // PDS request (and can burn the dpopSend attempt budget → spurious
+    // OAuthRetryExhausted). The PDS nonce already held stays; if stale, the
+    // normal handshake refreshes it. (post.nonce is arena-owned; ignoring it
+    // leaks nothing.)
 }
 
 /// A DPoP-signed form POST with the expected nonce handshake (retry once with
@@ -738,4 +791,42 @@ test "loopback round trip: a dead refresh token surfaces as a value; session is 
     // The session was not corrupted by the failed rotation (E2).
     try std.testing.expectEqualStrings("access-old", session.access_jwt);
     try std.testing.expectEqualStrings("refresh-old", session.refresh_jwt);
+}
+
+test "cred_lock serializes concurrent nonce rotation (the shared-Session race)" {
+    // The bug: the write-worker thread and the UI thread share one *Session;
+    // in oauth mode every request frees+replaces session.nonce (setNonce). Two
+    // threads doing that unsynchronized double-free the old nonce / read a
+    // dangling one. This test hammers the exact read-then-rotate sequence
+    // dpopSend runs, from many threads, under the leak/double-free detector
+    // (C6) — the allocator IS the oracle: without the lock it corrupts/aborts.
+    const gpa = std.testing.allocator;
+    var session = try testSession(gpa, 0);
+    session.mode = .oauth; // scope/issuer/token_endpoint stay "" (free is a no-op on len 0)
+    session.nonce = try gpa.dupe(u8, "nonce-seed");
+    defer freeSession(gpa, session);
+
+    const Hammer = struct {
+        fn run(s: *Session, g: Allocator) void {
+            var i: usize = 0;
+            while (i < 3000) : (i += 1) {
+                s.cred_lock.lock();
+                defer s.cred_lock.unlock();
+                // Read the nonce (as buildProof would) then rotate it (setNonce)
+                // — the read-modify-write the lock must make atomic.
+                if (s.nonce) |n| {
+                    if (n.len == 0xDEAD) unreachable; // force the load, not elided
+                }
+                setNonce(g, s, "nonce-rotated") catch {};
+            }
+        }
+    };
+
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Hammer.run, .{ &session, gpa });
+    for (threads) |t| t.join();
+
+    // Survived 12k concurrent rotations with no double-free/UAF; the nonce is
+    // still exactly one owned allocation (freeSession will prove no leak).
+    try std.testing.expect(session.nonce != null);
 }

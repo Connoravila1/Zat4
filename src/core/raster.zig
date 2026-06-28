@@ -132,6 +132,16 @@ pub const DrawItem = union(enum) {
     text: TextItem,
     rect: RectItem,
     line: LineItem,
+
+    comptime {
+        // HOT (thousands per frame, stored in DrawList). Each variant is a
+        // guarded 16 bytes; the union adds the active-variant tag, padded up
+        // to the payload's 4-byte alignment → 20. An exact guard so a fifth
+        // variant or a widened payload fails the build (A7). NOTE the bulk
+        // cost is lower than this: DrawList is a MultiArrayList, which stores
+        // the 1-byte tag and the 16-byte payload in SEPARATE arrays.
+        assert(@sizeOf(DrawItem) == 20);
+    }
 };
 
 /// The frame's draw list: struct-of-arrays (tags / payloads) of
