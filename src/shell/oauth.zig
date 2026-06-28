@@ -36,6 +36,7 @@ const oauth = @import("../core/oauth.zig");
 const oauth_flow = @import("../core/oauth_flow.zig");
 const pkce = @import("../core/pkce.zig");
 const dpop = @import("../core/dpop.zig");
+const xrpc_core = @import("../core/xrpc.zig");
 const Scheme = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 
 /// Metadata documents are small flat JSON; 256 KiB is luxurious headroom while
@@ -118,26 +119,44 @@ fn wellKnownUrl(scratch: Allocator, base: []const u8, path: []const u8) Allocato
 // DPoP-nonce retry. The pure halves live in `core/oauth_flow`; this is the I/O.
 // ---------------------------------------------------------------------------
 
-/// The product of a successful login: the DPoP-bound token set plus the
-/// material needed to keep using and refreshing it (Slice 4). The DPoP key is
-/// ephemeral this slice (in-memory, regenerated per login); Slice 5 persists it.
-/// Strings owned by `gpa`. A7.2: cold struct, size guard waived — one per login.
-pub const LoginResult = struct {
-    tokens: oauth_flow.TokenSet,
-    /// The 32-byte P-256 DPoP private scalar bound to these tokens.
-    dpop_secret: [32]u8,
+/// A live DPoP-bound OAuth session: the tokens, the key they're bound to, the
+/// endpoints to refresh against, and the rotating server nonce. Mutable — the
+/// `nonce` rotates on every request and the tokens rotate on refresh, in place.
+/// The DPoP key is ephemeral this slice (in-memory); Slice 5 persists it.
+/// Strings owned by `gpa`; the tokens and nonce are secrets, scrubbed on free.
+/// A7.2: cold struct, size guard waived — one per logged-in account.
+pub const OAuthSession = struct {
+    did: []const u8,
+    handle: []const u8,
+    pds_url: []const u8,
+    access_token: []const u8,
+    refresh_token: []const u8,
+    scope: []const u8,
     issuer: []const u8,
-    /// The token endpoint, kept for the refresh grant (Slice 4).
     token_endpoint: []const u8,
-    /// The most recent server DPoP nonce, to seed the next request (Slice 4).
-    dpop_nonce: ?[]const u8,
+    /// The 32-byte P-256 DPoP private scalar these tokens are bound to.
+    dpop_secret: [32]u8,
+    /// The most recent server DPoP nonce; rotates per response.
+    nonce: ?[]const u8,
 };
 
-pub fn freeLoginResult(gpa: Allocator, r: LoginResult) void {
-    oauth_flow.freeTokenSet(gpa, r.tokens);
-    gpa.free(r.issuer);
-    gpa.free(r.token_endpoint);
-    if (r.dpop_nonce) |n| gpa.free(n);
+pub fn freeOAuthSession(gpa: Allocator, s: OAuthSession) void {
+    gpa.free(s.did);
+    gpa.free(s.handle);
+    gpa.free(s.pds_url);
+    secureFree(gpa, s.access_token);
+    secureFree(gpa, s.refresh_token);
+    gpa.free(s.scope);
+    gpa.free(s.issuer);
+    gpa.free(s.token_endpoint);
+    if (s.nonce) |n| gpa.free(n);
+}
+
+/// Scrub a secret's bytes before release (token-theft hardening, Phase 0 —
+/// mirrors `auth.freeSecret`).
+fn secureFree(gpa: Allocator, secret: []const u8) void {
+    std.crypto.secureZero(u8, @constCast(secret));
+    gpa.free(secret);
 }
 
 /// Run the full browser OAuth login for the account at `pds_url` (resolved by
@@ -152,7 +171,7 @@ pub fn login(
     scratch: Allocator,
     pds_url: []const u8,
     handle: ?[]const u8,
-) !LoginResult {
+) !OAuthSession {
     // 1. Discover the issuer's endpoints (scratch-owned for the flow).
     const server = try discover(scratch, io, environ, scratch, pds_url);
 
@@ -206,7 +225,11 @@ pub fn login(
     const tokens = try oauth_flow.parseTokenResponse(gpa, tok_post.body);
     errdefer oauth_flow.freeTokenSet(gpa, tokens);
 
-    // 8. Assemble the gpa-owned result.
+    // 8. Assemble the gpa-owned session — the token strings transfer into it.
+    const handle_owned = try gpa.dupe(u8, handle orelse "");
+    errdefer gpa.free(handle_owned);
+    const pds_owned = try gpa.dupe(u8, pds_url);
+    errdefer gpa.free(pds_owned);
     const issuer = try gpa.dupe(u8, server.issuer);
     errdefer gpa.free(issuer);
     const token_endpoint = try gpa.dupe(u8, server.token_endpoint);
@@ -214,12 +237,142 @@ pub fn login(
     const nonce_owned: ?[]const u8 = if (tok_post.nonce) |n| try gpa.dupe(u8, n) else null;
 
     return .{
-        .tokens = tokens,
-        .dpop_secret = secret,
+        .did = tokens.sub,
+        .handle = handle_owned,
+        .pds_url = pds_owned,
+        .access_token = tokens.access_token,
+        .refresh_token = tokens.refresh_token,
+        .scope = tokens.scope,
         .issuer = issuer,
         .token_endpoint = token_endpoint,
-        .dpop_nonce = nonce_owned,
+        .dpop_secret = secret,
+        .nonce = nonce_owned,
     };
+}
+
+// ---------------------------------------------------------------------------
+// Using the session (Slice 4): DPoP-authenticated XRPC + token refresh. Every
+// authenticated request carries a fresh DPoP proof (bound to the access token
+// via `ath`, and to the request via htm/htu) plus `Authorization: DPoP <token>`.
+// The server's DPoP nonce rotates per response and is retried once; an expired
+// access token (401) triggers one refresh-and-retry. A refresh that fails
+// propagates as an error — the caller re-authenticates (no silent loop).
+// ---------------------------------------------------------------------------
+
+/// DPoP-authenticated XRPC query (GET) against the session's PDS. Returns the
+/// 2xx response body (`arena`-owned). Mutates `sess.nonce` (and, on refresh,
+/// the tokens) in place.
+pub fn dpopQuery(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    sess: *OAuthSession,
+    nsid: []const u8,
+    params: []const xrpc_core.Param,
+) ![]u8 {
+    const url = try xrpc_core.buildQueryUrl(arena, sess.pds_url, nsid, params);
+    return dpopSend(gpa, arena, io, environ, sess, .GET, url, null, null);
+}
+
+/// DPoP-authenticated XRPC procedure (POST) with a JSON body against the
+/// session's PDS. Returns the 2xx response body (`arena`-owned).
+pub fn dpopProcedure(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    sess: *OAuthSession,
+    nsid: []const u8,
+    input: anytype,
+) ![]u8 {
+    const url = try xrpc_core.buildMethodUrl(arena, sess.pds_url, nsid);
+    const body = try xrpc_core.encodeBody(arena, input);
+    return dpopSend(gpa, arena, io, environ, sess, .POST, url, body, "application/json");
+}
+
+/// The shared request engine: sign, send, handle the DPoP-nonce handshake and
+/// the 401-refresh, retry. `htu` is the request URL minus its query (RFC 9449).
+fn dpopSend(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    sess: *OAuthSession,
+    method: std.http.Method,
+    url: []const u8,
+    body: ?[]const u8,
+    content_type: ?[]const u8,
+) ![]u8 {
+    const htu = url[0 .. std.mem.indexOfScalar(u8, url, '?') orelse url.len];
+    var refreshed = false;
+    var attempt: u8 = 0;
+    while (attempt < 4) : (attempt += 1) {
+        const jti = try randomToken(io, arena, 16);
+        const proof = try dpop.buildProof(arena, .{
+            .secret_key = sess.dpop_secret,
+            .htm = if (method == .POST) "POST" else "GET",
+            .htu = htu,
+            .iat = clock.unixSeconds(),
+            .jti = jti,
+            .nonce = sess.nonce,
+            .access_token = sess.access_token, // binds the proof to the token (ath)
+        });
+        const auth_header = try std.fmt.allocPrint(arena, "DPoP {s}", .{sess.access_token});
+        const resp = try http.requestCapturing(arena, io, environ, url, .{
+            .method = method,
+            .body = body,
+            .content_type = content_type,
+            .accept = "application/json",
+            .authorization = auth_header,
+            .extra_headers = &.{.{ .name = "DPoP", .value = proof }},
+        }, "DPoP-Nonce");
+
+        if (resp.captured) |n| try setNonce(gpa, sess, n);
+
+        if (resp.status >= 200 and resp.status < 300) return resp.body;
+        // First contact / rotation: retry once the nonce is in hand.
+        if (resp.captured != null and oauth_flow.isUseDpopNonce(arena, resp.body)) continue;
+        // Expired access token: refresh once, then retry.
+        if (resp.status == 401 and !refreshed) {
+            try refresh(gpa, arena, io, environ, sess);
+            refreshed = true;
+            continue;
+        }
+        return error.DpopRequestFailed;
+    }
+    return error.DpopRequestFailed;
+}
+
+/// Refresh-token grant (DPoP-bound) at the issuer's token endpoint; rotates the
+/// access + refresh tokens (and scope, and nonce) in place. A failure
+/// propagates — the session is dead and the caller must re-authenticate.
+fn refresh(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    sess: *OAuthSession,
+) !void {
+    const body = try oauth_flow.buildRefreshBody(arena, config.oauth_client_id, sess.refresh_token);
+    const post = try dpopPost(io, environ, arena, sess.token_endpoint, body, sess.dpop_secret, sess.nonce);
+    const fresh = try oauth_flow.parseTokenResponse(gpa, post.body);
+    // Rotate the spent secrets out, scrubbing them.
+    secureFree(gpa, sess.access_token);
+    secureFree(gpa, sess.refresh_token);
+    gpa.free(sess.scope);
+    gpa.free(fresh.sub); // sub is unchanged; keep sess.did
+    sess.access_token = fresh.access_token;
+    sess.refresh_token = fresh.refresh_token;
+    sess.scope = fresh.scope;
+    if (post.nonce) |n| try setNonce(gpa, sess, n);
+}
+
+/// Replace the session's nonce with a fresh one (gpa-owned), freeing the old.
+fn setNonce(gpa: Allocator, sess: *OAuthSession, new: []const u8) Allocator.Error!void {
+    const owned = try gpa.dupe(u8, new);
+    if (sess.nonce) |old| gpa.free(old);
+    sess.nonce = owned;
 }
 
 /// One DPoP-signed POST with the expected nonce handshake: the first attempt

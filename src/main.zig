@@ -244,23 +244,30 @@ pub fn main(init: std.process.Init) !void {
         };
         try out.print("[oauth] {s} -> {s}\n[oauth] opening browser to sign in...\n", .{ oid.handle, oid.pds_url });
         try out.flush();
-        const result = oauth_shell.login(gpa, io, env, arena, oid.pds_url, oid.handle) catch |err| {
+        var sess = oauth_shell.login(gpa, io, env, arena, oid.pds_url, oid.handle) catch |err| {
             try out.print("--oauth-login failed: {s}\n", .{@errorName(err)});
             try out.flush();
             return err;
         };
-        defer oauth_shell.freeLoginResult(gpa, result);
-        const at = result.tokens.access_token;
+        defer oauth_shell.freeOAuthSession(gpa, sess);
+        const at = sess.access_token;
         try out.print(
             \\OAuth login complete — tokens are DPoP-bound.
             \\  did:        {s}
             \\  scope:      {s}
-            \\  expires_in: {d}s
             \\  issuer:     {s}
             \\  access:     {s}... ({d} bytes)
             \\  refresh:    present ({d} bytes)
             \\
-        , .{ result.tokens.sub, result.tokens.scope, result.tokens.expires_in, result.issuer, at[0..@min(12, at.len)], at.len, result.tokens.refresh_token.len });
+        , .{ sess.did, sess.scope, sess.issuer, at[0..@min(12, at.len)], at.len, sess.refresh_token.len });
+        try out.flush();
+        // Slice 4 proof: actually USE the DPoP session — an authenticated call.
+        const body = oauth_shell.dpopQuery(gpa, arena, io, env, &sess, "com.atproto.server.getSession", &.{}) catch |err| {
+            try out.print("[oauth] DPoP-authenticated getSession FAILED: {s}\n", .{@errorName(err)});
+            try out.flush();
+            return err;
+        };
+        try out.print("[oauth] DPoP-authenticated getSession OK:\n  {s}\n", .{body});
         try out.flush();
         return;
     }

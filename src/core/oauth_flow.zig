@@ -218,6 +218,17 @@ pub fn buildTokenBody(gpa: Allocator, p: TokenParams) Allocator.Error![]u8 {
     return b.toOwnedSlice(gpa);
 }
 
+/// Form-encode the refresh-token grant body. The same token endpoint and DPoP
+/// machinery as the initial exchange; only the grant differs.
+pub fn buildRefreshBody(gpa: Allocator, client_id: []const u8, refresh_token: []const u8) Allocator.Error![]u8 {
+    var b: std.ArrayListUnmanaged(u8) = .empty;
+    defer b.deinit(gpa);
+    try appendForm(&b, gpa, "grant_type", "refresh_token", true);
+    try appendForm(&b, gpa, "refresh_token", refresh_token, false);
+    try appendForm(&b, gpa, "client_id", client_id, false);
+    return b.toOwnedSlice(gpa);
+}
+
 /// The DPoP-bound token set from a successful exchange. Strings owned by `gpa`.
 /// A7.2: cold struct — one per login. Waived.
 pub const TokenSet = struct {
@@ -419,6 +430,14 @@ test "oauth_flow: token response requires DPoP binding" {
 
     const bearer = "{\"token_type\":\"Bearer\",\"access_token\":\"at\",\"refresh_token\":\"rt\",\"sub\":\"x\",\"scope\":\"y\"}";
     try testing.expectError(error.NotDpopBound, parseTokenResponse(testing.allocator, bearer));
+}
+
+test "oauth_flow: refresh body carries the grant, token, and client_id" {
+    const body = try buildRefreshBody(testing.allocator, "https://pds.zat4.com/client-metadata.json", "rt-value-123");
+    defer testing.allocator.free(body);
+    try testing.expect(std.mem.startsWith(u8, body, "grant_type=refresh_token&"));
+    try testing.expect(std.mem.indexOf(u8, body, "refresh_token=rt-value-123") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "client_id=https%3A%2F%2Fpds.zat4.com%2Fclient-metadata.json") != null);
 }
 
 test "oauth_flow: use_dpop_nonce error is recognized" {
