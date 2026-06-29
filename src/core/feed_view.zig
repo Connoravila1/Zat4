@@ -38,6 +38,7 @@ const raster = @import("raster.zig");
 const lens_socket = @import("lens_socket.zig");
 const text_select = @import("text_select.zig");
 const timefmt = @import("timefmt.zig");
+const compose = @import("compose.zig");
 
 // Palette, copied from field.zig so the view never reaches across a module
 // for a constant (D4: only the value crosses, by copy). ARGB.
@@ -55,6 +56,9 @@ pub const accent_house: u32 = 0xFFE8B84B;
 const sel_fill: u32 = 0x553A6EA5;
 const like_c: u32 = 0xFFF0617A;
 const boost_c: u32 = 0xFF8FD18F;
+/// Inline `#hashtag` colour in prose — a clear, calm blue that reads as a link
+/// without going neon. Same hue as the Discover lens accent.
+const tag_blue: u32 = 0xFF4DA3FF;
 /// Resting engagement-icon colour — a soft neutral grey-white (no blue cast),
 /// so the reply, repost, and hollow-heart icons read as one calm set without
 /// pulling cool/blue or going bright white.
@@ -71,7 +75,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// `compose` (the New-post button) route navigation rather than engagement.
 /// `compose_send` / `compose_cancel` are the premium composer's footer buttons
 /// (the shell turns a tap into the same control byte the keyboard sends).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline };
 
 /// The six top-level rail destinations, in order. The `Screen` index a nav
 /// region carries is an index into this. Shared by the rail (draw + hit) and
@@ -327,10 +331,41 @@ fn metricsFor(width: i32) Metrics {
     return .{ .rail_x = 0, .col_x = col_x, .col_w = col_w, .lx = col_x + 18, .cw = col_w - 36, .side_x = 0, .wide = false };
 }
 
-/// The content column's x-range (logical px) at a given window width — the panel
-/// the GPU field softens beneath (the glass backdrop blur). Mirrors metricsFor.
-pub fn contentColumn(width: i32) struct { x: i32, w: i32 } {
+/// Home (and the focused thread) keep the NARROW reading column; every other
+/// top-level page reads as a WIDE horizontal page. The right "column" stops being
+/// a separate floating sidebar and becomes an EXTENSION attached to the content.
+fn isWidePage(active_screen: u8) bool {
+    return active_screen != screen_home and active_screen != screen_thread;
+}
+
+/// Page-aware metrics. On a wide page the glass spans the feed AND the old
+/// sidebar span as ONE horizontal rectangle (`col_w` grows by `side_w`), with
+/// `side_x` repurposed as the EXTENSION (widgets) start INSIDE the panel. `lx`/
+/// `cw` stay the readable MAIN region, so post text never stretches — the extra
+/// width is the extension. Home/thread (and any narrow window) are unchanged.
+fn metricsPage(width: i32, active_screen: u8) Metrics {
     const m = metricsFor(width);
+    if (!m.wide or !isWidePage(active_screen)) return m;
+    const wide_w = m.col_w + side_w; // the glass spans the feed + the old sidebar span
+    // PROFILE is the one wide page with a widget EXTENSION on the right: the main
+    // region stays on the left (lx/cw unchanged), `side_x` = the extension start.
+    if (active_screen == screen_profile) {
+        return .{ .rail_x = m.rail_x, .col_x = m.col_x, .col_w = wide_w, .lx = m.lx, .cw = m.cw, .side_x = m.side_x, .wide = true };
+    }
+    // Every OTHER wide page (zone, browse, settings, Algorithms) centres a
+    // comfortable content column in the wide glass — no side panel; the freed
+    // sidebar space becomes breathing room (and a 2-up catalog on browse), not
+    // an empty column. `side_x` parks at the right edge (no extension drawn).
+    const cwid: i32 = 760;
+    const left = @divTrunc(wide_w - cwid, 2);
+    return .{ .rail_x = m.rail_x, .col_x = m.col_x, .col_w = wide_w, .lx = m.col_x + left + 22, .cw = cwid - 44, .side_x = m.col_x + wide_w, .wide = true };
+}
+
+/// The content column's x-range (logical px) for a given window width AND screen
+/// — the panel the GPU field softens beneath (the glass backdrop blur). Mirrors
+/// `metricsPage`, so the blur widens with the wide pages.
+pub fn contentColumn(width: i32, active_screen: u8) struct { x: i32, w: i32 } {
+    const m = metricsPage(width, active_screen);
     return .{ .x = m.col_x, .w = m.col_w };
 }
 
@@ -375,12 +410,12 @@ fn str(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, weight: text
 /// shows (`wrapDraft` already honours '\n'). A body with NO '\n' is a single
 /// segment, so it wraps byte-for-byte as before — the height cache and the
 /// long-feed coordinate accounting (the 800-post regression) depend on that.
-fn wrapBody(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32, first_baseline: i32, maxw: i32, color: u32, px: u16, body: []const u8, line_h: i32, draw_it: bool) !i32 {
+fn wrapBody(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32, first_baseline: i32, maxw: i32, color: u32, px: u16, body: []const u8, line_h: i32, draw_it: bool, style: ?*const BodyTags) !i32 {
     var baseline = first_baseline;
     var seg_start: usize = 0;
     while (true) {
         const nl = std.mem.indexOfScalarPos(u8, body, seg_start, '\n') orelse body.len;
-        baseline = try wrapLine(gpa, dl, e, x0, baseline, maxw, color, px, body[seg_start..nl], line_h, draw_it);
+        baseline = try wrapLine(gpa, dl, e, x0, baseline, maxw, color, px, body[seg_start..nl], line_h, draw_it, style);
         if (nl == body.len) break;
         seg_start = nl + 1; // step past the '\n' — the next paragraph starts a fresh line
     }
@@ -389,7 +424,7 @@ fn wrapBody(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32
 
 /// Word-wrap one paragraph segment (no '\n') to `maxw`; greedy break at the last
 /// space before overflow. The per-line worker behind `wrapBody`.
-fn wrapLine(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32, first_baseline: i32, maxw: i32, color: u32, px: u16, body: []const u8, line_h: i32, draw_it: bool) !i32 {
+fn wrapLine(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32, first_baseline: i32, maxw: i32, color: u32, px: u16, body: []const u8, line_h: i32, draw_it: bool, style: ?*const BodyTags) !i32 {
     var baseline = first_baseline;
     var line_start: usize = 0;
     var last_space: usize = 0;
@@ -400,7 +435,7 @@ fn wrapLine(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32
         if (!at_end and body[i] != ' ') continue;
         const candidate = body[line_start..i];
         if (text.measure(e, .regular, candidate, px) > @as(u32, @intCast(@max(0, maxw))) and have_space) {
-            if (draw_it) _ = try str(gpa, dl, e, .regular, x0, baseline, color, px, body[line_start..last_space]);
+            if (draw_it) try drawBodyRun(gpa, dl, e, x0, baseline, color, px, body, line_start, last_space, style);
             baseline += line_h;
             line_start = last_space + 1;
             have_space = false;
@@ -408,7 +443,7 @@ fn wrapLine(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32
             continue;
         }
         if (at_end) {
-            if (draw_it) _ = try str(gpa, dl, e, .regular, x0, baseline, color, px, body[line_start..i]);
+            if (draw_it) try drawBodyRun(gpa, dl, e, x0, baseline, color, px, body, line_start, i, style);
             baseline += line_h;
             break;
         }
@@ -416,6 +451,66 @@ fn wrapLine(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32
         have_space = true;
     }
     return baseline;
+}
+
+/// Inline-hashtag styling for a post body: the colour to light `#tags`, plus the
+/// region sink + post identity needed to make each tag tappable. Each lit tag
+/// emits a `.tag_inline` region carrying (post index, the tag's index within
+/// `tags`) — the same (post, tag) pair the tray pills carry, so the shell opens
+/// the zone the same way. Null when the body is drawn plain (measure passes and
+/// the condensed thread ancestors). A7.2: cold — one transient per drawn post.
+const BodyTags = struct {
+    color: u32,
+    regions: ?*Regions,
+    pi: usize,
+    tags: []const []const u8,
+};
+
+/// Index of `name` (a bare tag, no '#') in `tags`, case-insensitive — the served
+/// display casing may differ from how the author typed it. Null if absent.
+fn tagIndexOf(tags: []const []const u8, name: []const u8) ?usize {
+    for (tags, 0..) |t, i| if (std.ascii.eqlIgnoreCase(t, name)) return i;
+    return null;
+}
+
+/// Draw one wrapped line `body[a..b)` at (x0, baseline) in `color`. With a
+/// `style`, any `#tag` run (same word-start rule the composer wrote facets with —
+/// `compose.tagSpanAt`) is lit in `style.color` and gets a `.tag_inline` tap
+/// region; without one it's a single plain `str`, byte-for-byte the old draw.
+/// The wrap geometry is unaffected: only the DRAW is split into runs, and glyph
+/// advance is per-glyph (no kerning), so split runs land exactly where one `str`
+/// would have — wrap points and width are identical whether or not tags are lit.
+fn drawBodyRun(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32, baseline: i32, color: u32, px: u16, body: []const u8, a: usize, b: usize, style: ?*const BodyTags) error{OutOfMemory}!void {
+    const st = style orelse {
+        _ = try str(gpa, dl, e, .regular, x0, baseline, color, px, body[a..b]);
+        return;
+    };
+    var x = x0;
+    var i = a;
+    while (i < b) {
+        if (compose.tagSpanAt(body, i)) |raw_end| {
+            const end = @min(raw_end, b); // a tag never spans a wrapped line; clamp defensively
+            const startx = x;
+            x = try str(gpa, dl, e, .regular, startx, baseline, st.color, px, body[i..end]);
+            if (st.regions) |rg| if (tagIndexOf(st.tags, body[i + 1 .. end])) |ti| {
+                try rg.append(gpa, .{
+                    .x = @intCast(std.math.clamp(startx, -32768, 32767)),
+                    .y = @intCast(std.math.clamp(baseline - @as(i32, @intCast(px)) + 4, -32768, 32767)),
+                    .w = @intCast(@max(0, @min(32767, x - startx))),
+                    .h = @intCast(@max(0, @min(32767, @as(i32, @intCast(px))))),
+                    .post = @intCast(st.pi),
+                    .kind = .tag_inline,
+                    ._pad = @intCast(@min(ti, 255)),
+                });
+            };
+            i = end;
+            continue;
+        }
+        var j = i + 1;
+        while (j < b and compose.tagSpanAt(body, j) == null) j += 1;
+        x = try str(gpa, dl, e, .regular, x, baseline, color, px, body[i..j]);
+        i = j;
+    }
 }
 
 /// The tag tray: a wrapping row of tappable "#tag" pills below a post — each a
@@ -807,9 +902,52 @@ fn drawSidebar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, sx: 
     // a visible pointer to the canonical repository, pinned to the sidebar bottom.
     // Putting the licence in the repo alone does not satisfy §13; the offer has to
     // reach network users of the running instance. Keep this visible.
-    const fy = @max(py + 8, height - 40);
+    try drawAgpl(gpa, dl, e, x0, @max(py + 8, height - 40));
+}
+
+/// The AGPL §13 source offer — pinned wherever it lands (home sidebar, the profile
+/// extension, or the bottom of a centred wide page). Network-served software MUST
+/// keep this visible; do not drop it.
+fn drawAgpl(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32, fy: i32) error{OutOfMemory}!void {
     _ = try str(gpa, dl, e, .regular, x0, fy, faint, 12, "Zat4 — free software, GNU AGPL-3.0");
     _ = try str(gpa, dl, e, .regular, x0, fy + 18, muted, 12, "source: codeberg.org/connoravila/zat4");
+}
+
+/// The PROFILE widget EXTENSION: the right portion of the wide PROFILE panel (from
+/// `m.side_x` to the panel's right edge), drawn as part of the SAME glass — a
+/// fold, not a floating sidebar. Widgets are PROFILE-ONLY (the other wide pages
+/// recentre their content instead). A column of customisable WIDGET slots
+/// (placeholders for now — the user furnishes them; eventually the public,
+/// owner-arranged profile, see LINK_PAGE_ROADMAP §11) over the AGPL source offer.
+fn drawExtension(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, height: i32, regions: ?*Regions) !void {
+    _ = regions;
+    const ex0 = m.side_x;
+    const ew = (m.col_x + m.col_w) - m.side_x; // = side_w
+    const x0 = ex0 + 20;
+    const w = ew - 40;
+    // Start BELOW the profile identity header (it spans the full wide panel and is
+    // drawn on top, so content above its bottom would be occluded).
+    const top: i32 = headerBottom(screen_profile) + 16;
+
+    // The seam where the main region meets the extension — a fold in one panel.
+    try rect(gpa, dl, ex0, top - 16, 1, height - (top - 16), 0x14EDEAE0, 0);
+
+    // Customisable widget slots — placeholders for now. Faint "add a widget" cards
+    // so the extension reads as a surface you furnish, not a fixed sidebar.
+    _ = try str(gpa, dl, e, .semibold, x0, top + 8, faint, 11, "WIDGETS");
+    var wy: i32 = top + 20;
+    const slot_h: i32 = 138;
+    var i: usize = 0;
+    while (i < 2) : (i += 1) {
+        try rect(gpa, dl, x0, wy, w, slot_h, 0x0CEDEAE0, 15);
+        try rect(gpa, dl, x0, wy, w, 1, 0x1AEDEAE0, 15); // lit top edge
+        const label = "+  Add a widget";
+        const lw: i32 = @intCast(text.measure(e, .regular, label, 14));
+        _ = try str(gpa, dl, e, .regular, x0 + @divTrunc(w - lw, 2), wy + @divTrunc(slot_h, 2) + 5, faint, 14, label);
+        wy += slot_h + 16;
+    }
+
+    try drawAgpl(gpa, dl, e, x0, @max(wy + 8, height - 40));
 }
 
 /// Emit the whole premium feed for `posts` into `dl`, OVER whatever the
@@ -880,7 +1018,7 @@ pub fn layout(
     /// to its zone feed (a `.zone_open` region carrying the catalog index).
     zones: []const ZoneCard,
 ) error{OutOfMemory}!i32 {
-    const m = metricsFor(width);
+    const m = metricsPage(width, active_screen);
     if (regions) |rg| rg.clearRetainingCapacity();
     if (socket_hits) |sh| sh.clearRetainingCapacity();
     // No focused post laid out this frame ⇒ no selectable body. Cleared up front;
@@ -916,11 +1054,21 @@ pub fn layout(
     // under them) and fix where the post stack begins.
     var feed_y0: i32 = 112;
     if (m.wide) {
-        // 2a. Desktop three-pane: nav rail + sidebar flank the feed. Each
-        // SECTION draws its own box (the nav group, the account card, the
-        // sidebar cards) so the field stays visible between them.
+        // 2a. Desktop chrome: the nav rail always flanks the content. Home (and the
+        // focused thread) keep the floating 3-pane SIDEBAR — separate cards with
+        // the field showing between. Every other page is WIDE: the glass already
+        // spans the old sidebar area as one rectangle, so the right side is an
+        // EXTENSION drawn INSIDE that panel (widgets), not a separate column.
         try drawRail(gpa, dl, e, m.rail_x, height, active_screen, regions, accent, skip_heart);
-        try drawSidebar(gpa, dl, e, m.side_x, height);
+        if (!isWidePage(active_screen)) {
+            try drawSidebar(gpa, dl, e, m.side_x, height); // home/thread: floating 3-pane sidebar
+        } else if (active_screen == screen_profile) {
+            try drawExtension(gpa, dl, e, m, height, regions); // profile: customisable widgets
+        } else {
+            // Other wide pages centre their content in the wide glass — no side
+            // panel; only the AGPL offer is pinned to the content column's bottom.
+            try drawAgpl(gpa, dl, e, m.lx, height - 40);
+        }
         feed_y0 = 126;
     } else {
         feed_y0 = 112;
@@ -1049,7 +1197,7 @@ pub fn layout(
             if (acached) |adv| {
                 anext_y = post_top + adv;
             } else {
-                const abe = try wrapBody(gpa, dl, e, acx, abody_top, acw, muted, 13, p.body, aline, false);
+                const abe = try wrapBody(gpa, dl, e, acx, abody_top, acw, muted, 13, p.body, aline, false, null);
                 anext_y = abe + 16;
                 if (heights) |hh| if (pi < hh.len) {
                     hh[pi] = anext_y - post_top;
@@ -1063,7 +1211,7 @@ pub fn layout(
                 try emitRegion(gpa, regions, aax, post_top, aav, @intCast(aav), @intCast(pi), .author);
                 const abx = try str(gpa, dl, e, .semibold, acx, post_top + 13, muted, 14, p.name);
                 _ = try str(gpa, dl, e, .regular, abx + 7, post_top + 13, faint, 11, p.handle);
-                _ = try wrapBody(gpa, dl, e, acx, abody_top, acw, muted, 13, p.body, aline, true);
+                _ = try wrapBody(gpa, dl, e, acx, abody_top, acw, muted, 13, p.body, aline, true, null);
                 // Connector down the avatar column linking the chain to the focus.
                 try rect(gpa, dl, aax + @divTrunc(aav, 2) - 1, post_top + aav, 2, anext_y - (post_top + aav), 0x44B7B3A8, 0);
             }
@@ -1128,7 +1276,7 @@ pub fn layout(
         if (cached) |adv| {
             body_end = post_top + adv;
         } else {
-            body_end = try wrapBody(gpa, dl, e, cx, post_top + body_top_off, content_w, body_c, 16, p.body, body_line, false);
+            body_end = try wrapBody(gpa, dl, e, cx, post_top + body_top_off, content_w, body_c, 16, p.body, body_line, false, null);
             if (heights) |hh| if (pi < hh.len) {
                 hh[pi] = body_end - post_top;
             };
@@ -1228,9 +1376,13 @@ pub fn layout(
                 try emitRegion(gpa, regions, tgx - 12, post_top + av + 2, 24, 24, @intCast(pi), .collapse);
             }
 
-            // body (draw)
+            // body (draw) — inline `#tags` are lit blue + made tappable (a
+            // `.tag_inline` region per tag → its zone), resolved against this
+            // post's served tags. Works on every post in the loop, so the feed AND
+            // the thread's rooted post both get clickable hashtags.
             const body_from = dl.len;
-            _ = try wrapBody(gpa, dl, e, cx, post_top + body_top_off, content_w, body_c, 16, p.body, body_line, true);
+            const body_style: BodyTags = .{ .color = tag_blue, .regions = regions, .pi = pi, .tags = p.tags };
+            _ = try wrapBody(gpa, dl, e, cx, post_top + body_top_off, content_w, body_c, 16, p.body, body_line, true, &body_style);
             // The rooted post (thread screen) is the one selectable post: capture
             // its body glyphs for the read-only selection layer (ZONES inv. 4 —
             // selection is a query over this transient map, never a stored copy).
@@ -1671,8 +1823,15 @@ pub fn layoutLoadout(
     zone_tray: lens_socket.TrayView,
     zone_ui: lens_socket.SocketUi,
     zone_hits: *lens_socket.HitList,
+    /// GPU path: skip the rail's software line-art nav icons — the SDF-icon pass
+    /// strikes them crisp (the same as `layout`'s `skip_heart`). Software: false,
+    /// so the rail draws its own line-art. (Was hardcoded false, which forced the
+    /// worse line-art on the Algorithms page even on the GPU.)
+    skip_nav: bool,
 ) error{OutOfMemory}!i32 {
-    const m = metricsFor(width);
+    // Algorithms is a WIDE page like the others: the glass spans the full
+    // rectangle and the content centres in it — NO floating main-feed sidebar.
+    const m = metricsPage(width, screen_loadout);
     if (regions) |rg| rg.clearRetainingCapacity();
     // Sockets are only built (and so only hit-testable) on the Loadout tab.
     feed_hits.clearRetainingCapacity();
@@ -1680,13 +1839,13 @@ pub fn layoutLoadout(
     zone_hits.clearRetainingCapacity();
     if (out_geoms) |g| g.* = .{ .{ .x = 0, .y = 0, .w = 0 }, .{ .x = 0, .y = 0, .w = 0 }, .{ .x = 0, .y = 0, .w = 0 } };
 
-    // Glass column over the field + the flanking chrome (desktop three-pane).
+    // Glass column over the field + the rail. Content centres in the wide glass.
     try rect(gpa, dl, m.col_x, 0, m.col_w, height, veil, 0);
     if (m.wide) {
         try rect(gpa, dl, m.col_x, 0, 1, height, 0x24EDEAE0, 0);
         try rect(gpa, dl, m.col_x + m.col_w - 1, 0, 1, height, 0x24EDEAE0, 0);
-        try drawRail(gpa, dl, e, m.rail_x, height, screen_loadout, regions, accent, false);
-        try drawSidebar(gpa, dl, e, m.side_x, height);
+        try drawRail(gpa, dl, e, m.rail_x, height, screen_loadout, regions, accent, skip_nav);
+        try drawAgpl(gpa, dl, e, m.lx, height - 40);
     }
 
     const header_h: i32 = 130;
@@ -1946,6 +2105,23 @@ fn drawTopBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Me
     }
 }
 
+/// Relative luminance of an RGB colour (0–255), fixed-point ~0.2126/0.7152/0.0722.
+fn lumaOf(c: u32) u32 {
+    const r = (c >> 16) & 0xFF;
+    const g = (c >> 8) & 0xFF;
+    const b = c & 0xFF;
+    return (54 * r + 182 * g + 19 * b) >> 8;
+}
+/// Primary text colour readable over `bgcol` — near-black on a light block, the
+/// house ink on a dark one — so the zone block reads at ANY hue.
+fn readableOn(bgcol: u32) u32 {
+    return if (lumaOf(bgcol) > 140) 0xFF1A1710 else 0xFFEDEAE0;
+}
+/// Secondary (dimmer) text over `bgcol` — the same hue at reduced alpha.
+fn readableDim(bgcol: u32) u32 {
+    return if (lumaOf(bgcol) > 140) 0xB01A1710 else 0xBFEDEAE0;
+}
+
 /// A three-dot "more" affordance — three small filled dots centred on (cx, cy).
 fn menuDots(gpa: Allocator, dl: *raster.DrawList, cx: i32, cy: i32, c: u32) error{OutOfMemory}!void {
     const r: i32 = 2;
@@ -1968,19 +2144,31 @@ fn drawZoneHeader(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m
 
     if (m.wide) {
         const box_h = zone_header_h_wide;
-        try rect(gpa, dl, m.col_x, 0, m.col_w, box_h, header_veil, 0);
+        // The whole top BLOCK takes the zone ALGO (socket) colour; text auto-
+        // contrasts (luminance) so it reads at any hue. This is separate from the
+        // app accent — the home feed is untouched; the block follows the ZONE
+        // socket's seated lens. Switch the zone lens → the block recolours.
+        const zc: u32 = if (socket_tray) |t| lens_socket.seatedAccent(t) else accent;
+        const on = readableOn(zc);
+        const dim = readableDim(zc);
+        // Colour only the IDENTITY portion (icon/name/chip/Pin/desc/stats); the
+        // lens socket + caption sit on a NEUTRAL strip below, so the socket card
+        // reads on dark like everywhere else instead of clashing on the colour.
+        const id_h: i32 = 160;
+        try rect(gpa, dl, m.col_x, 0, m.col_w, id_h, zc, 0);
+        try rect(gpa, dl, m.col_x, id_h, m.col_w, box_h - id_h, header_veil, 0);
+        const redge = m.lx + m.cw; // right edge of the CENTRED content column
 
-        // Top row: Back (left) + a "more" menu (right).
+        // Top row: Back (left) + a "more" menu (far right).
         const bl = "<  Back";
         const blw: i32 = @intCast(text.measure(e, .semibold, bl, 15) + 26);
-        try rect(gpa, dl, m.lx, 22, blw, 34, panel, 16);
-        _ = try str(gpa, dl, e, .semibold, m.lx + 13, 44, ink, 15, bl);
+        try rect(gpa, dl, m.lx, 22, blw, 34, (0x22 << 24) | (on & 0x00FFFFFF), 16);
+        _ = try str(gpa, dl, e, .semibold, m.lx + 13, 44, on, 15, bl);
         try emitRegion(gpa, regions, m.lx, 22, blw, 34, 0, .back);
-        const mdx = m.lx + m.cw - 20;
-        try menuDots(gpa, dl, mdx, 39, muted);
-        try emitRegion(gpa, regions, mdx - 16, 28, 36, 26, 0, .more);
+        try menuDots(gpa, dl, redge - 2, 39, dim);
+        try emitRegion(gpa, regions, redge - 18, 28, 36, 26, 0, .more);
 
-        // Identity band: icon tile + #name + "communal face" chip + Pin.
+        // Identity band: icon tile + #name + "communal face" chip (left); Pin (right).
         const tile: i32 = 50;
         const ty: i32 = 68;
         try rect(gpa, dl, m.lx, ty, tile, tile, tilePalette(zone_title), 13);
@@ -1991,33 +2179,34 @@ fn drawZoneHeader(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m
             _ = try glyph1(gpa, dl, e, .semibold, m.lx + @divTrunc(tile - gadv, 2), ty + 34, bg, 24, g0);
         }
         const nx = m.lx + tile + 16;
-        const hx = try str(gpa, dl, e, .semibold, nx, ty + 24, ink, 28, "#");
-        const nend = try str(gpa, dl, e, .semibold, hx, ty + 24, ink, 28, zone_title);
+        const hx = try str(gpa, dl, e, .semibold, nx, ty + 24, on, 28, "#");
+        const nend = try str(gpa, dl, e, .semibold, hx, ty + 24, on, 28, zone_title);
         const chip = "communal face";
         const cw: i32 = @intCast(text.measure(e, .regular, chip, 12));
-        try rect(gpa, dl, nend + 14, ty + 8, cw + 24, 24, 0x16EDEAE0, 12);
-        _ = try str(gpa, dl, e, .regular, nend + 26, ty + 24, muted, 12, chip);
+        try rect(gpa, dl, nend + 14, ty + 8, cw + 24, 24, (0x26 << 24) | (on & 0x00FFFFFF), 12);
+        _ = try str(gpa, dl, e, .regular, nend + 26, ty + 24, on, 12, chip);
 
-        // Pin button (accent), far right of the identity row. Inert scaffold —
-        // pinning is a later feature; the tap is a no-op (.bookmark) for now.
+        // Pin — a REVERSE pill (solid contrast fill, label in the block colour) so
+        // it pops on the coloured block. Inert scaffold (.bookmark) for now.
         const pin = "Pin";
         const pw: i32 = @intCast(text.measure(e, .semibold, pin, 14) + 50);
-        const px = m.lx + m.cw - pw;
-        try rect(gpa, dl, px, ty + 4, pw, 40, accent, 12);
-        try iconBookmark(gpa, dl, px + 16, ty + 15, 17, bg);
-        _ = try str(gpa, dl, e, .semibold, px + 40, ty + 29, bg, 14, pin);
+        const px = redge - pw;
+        try rect(gpa, dl, px, ty + 4, pw, 40, on, 12);
+        try iconBookmark(gpa, dl, px + 16, ty + 15, 17, zc);
+        _ = try str(gpa, dl, e, .semibold, px + 40, ty + 29, zc, 14, pin);
         try emitRegion(gpa, regions, px, ty + 4, pw, 40, 0, .bookmark);
 
         // Description (scaffold) + stats line (real post count + scaffold standing).
-        _ = try str(gpa, dl, e, .regular, m.lx, ty + 64, muted, 14, "a place that precipitated out of the tag — ordered by your own lens");
+        _ = try str(gpa, dl, e, .regular, m.lx, ty + 64, dim, 14, "a place that precipitated out of the tag — ordered by your own lens");
         const stats = std.fmt.bufPrint(&zbuf, "{d} {s} · regulars forming", .{ zone_count, if (zone_count == 1) "post" else "posts" }) catch "regulars forming";
-        _ = try str(gpa, dl, e, .regular, m.lx, ty + 86, faint, 13, stats);
+        _ = try str(gpa, dl, e, .regular, m.lx, ty + 86, dim, 13, stats);
 
-        // The lens socket (seated lower than Home's, under the band), then its caption.
+        // The lens socket (the zone algo, seated lower than Home's), then its caption.
         if (socket_tray) |tray| {
             const geom: lens_socket.Geometry = .{ .x = m.lx, .y = zone_socket_y_wide, .w = m.cw, .scale = 1.0 };
             _ = try lens_socket.build(gpa, e, tray, socket_ui, geom, dl, socket_hits);
         }
+        // Caption sits on the NEUTRAL strip now → neutral text + divider.
         _ = try str(gpa, dl, e, .regular, m.lx, box_h - 16, faint, 12, "the face is shared; the order is yours — swap in any algorithm");
         try rect(gpa, dl, m.col_x, box_h - 1, m.col_w, 1, divider, 0);
     } else {
@@ -2458,11 +2647,38 @@ test "wrapBody honours explicit newlines as hard line breaks" {
     const line_h: i32 = 24;
     const wide: i32 = 4000; // wide enough that nothing soft-wraps
     // The same words on one line vs split across three hard breaks.
-    const one = try wrapBody(gpa, &dl, &engine, 0, 0, wide, ink, 16, "alpha beta gamma", line_h, false);
-    const three = try wrapBody(gpa, &dl, &engine, 0, 0, wide, ink, 16, "alpha\nbeta\ngamma", line_h, false);
+    const one = try wrapBody(gpa, &dl, &engine, 0, 0, wide, ink, 16, "alpha beta gamma", line_h, false, null);
+    const three = try wrapBody(gpa, &dl, &engine, 0, 0, wide, ink, 16, "alpha\nbeta\ngamma", line_h, false, null);
     try std.testing.expectEqual(line_h, one);
     try std.testing.expectEqual(@as(i32, line_h * 3), three);
     // A blank line (consecutive newlines) is kept as its own line.
-    const blank = try wrapBody(gpa, &dl, &engine, 0, 0, wide, ink, 16, "a\n\nb", line_h, false);
+    const blank = try wrapBody(gpa, &dl, &engine, 0, 0, wide, ink, 16, "a\n\nb", line_h, false, null);
     try std.testing.expectEqual(@as(i32, line_h * 3), blank);
+}
+
+test "inline #tags emit tappable .tag_inline regions, resolved case-insensitively to the post's tags" {
+    const gpa = std.testing.allocator;
+    var engine = try text.initEngine();
+    defer text.deinitEngine(gpa, &engine);
+    var dl: raster.DrawList = .{};
+    defer dl.deinit(gpa);
+    var regions: Regions = .empty;
+    defer regions.deinit(gpa);
+
+    const tags = [_][]const u8{ "deep", "smallweb" };
+    const style: BodyTags = .{ .color = tag_blue, .regions = &regions, .pi = 7, .tags = &tags };
+    // Two inline tags; the second is cased differently than the served tag.
+    _ = try wrapBody(gpa, &dl, &engine, 0, 0, 4000, body_c, 16, "go #deep then #SmallWeb ok", 24, true, &style);
+
+    var pads: [4]u8 = .{ 255, 255, 255, 255 };
+    var n: usize = 0;
+    for (regions.items) |r| {
+        if (r.kind != .tag_inline) continue;
+        try std.testing.expectEqual(@as(u16, 7), r.post); // the post index rides through
+        if (n < pads.len) pads[n] = r._pad;
+        n += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(@as(u8, 0), pads[0]); // #deep → tags[0]
+    try std.testing.expectEqual(@as(u8, 1), pads[1]); // #SmallWeb → tags[1] (case-insensitive)
 }

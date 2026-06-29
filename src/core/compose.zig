@@ -127,6 +127,18 @@ fn isTagByte(b: u8) bool {
     return std.ascii.isAlphanumeric(b) or b == '_';
 }
 
+/// If a `#tag` begins exactly at byte `i` — a word-start '#' followed by at least
+/// one tag byte — return the exclusive end index (past the last tag byte); else
+/// null. The single pure rule shared by the composer's facet detection (what gets
+/// WRITTEN as a tag facet) and the renderer's inline highlighting (what gets lit
+/// blue + made tappable), so the two can never diverge.
+pub fn tagSpanAt(text: []const u8, i: usize) ?usize {
+    if (i >= text.len or text[i] != '#' or !atWordStart(text, i)) return null;
+    var end = i + 1;
+    while (end < text.len and isTagByte(text[end])) end += 1;
+    return if (end > i + 1) end else null;
+}
+
 // ---------------------------------------------------------------------------
 // Tests (B2, C6) — byte offsets asserted exactly, including past multibyte
 // text, because the wire takes these numbers verbatim

@@ -1659,11 +1659,12 @@ pub fn run(
                                             } else |_| {}
                                         },
                                         .bookmark, .share, .more, .profile_tab => {},
-                                        // Tag pill → ENTER its zone. The region carries the
-                                        // post index in `post` and the tag's index in `_pad`;
-                                        // resolve the display tag, open the zone page, and let
-                                        // the fetch-on-enter pull the zone feed (buildTagView).
-                                        .zone_jump => if (hit.post < view_items.len) {
+                                        // Tag pill (tray) OR an inline `#tag` in the prose →
+                                        // ENTER its zone. Both regions carry the post index in
+                                        // `post` and the tag's index in `_pad`; resolve the
+                                        // display tag, open the zone page, and let the
+                                        // fetch-on-enter pull the zone feed (buildTagView).
+                                        .zone_jump, .tag_inline => if (hit.post < view_items.len) {
                                             const tags = view_items[hit.post].tags;
                                             if (hit._pad < tags.len) {
                                                 const t = tags[hit._pad];
@@ -3224,7 +3225,7 @@ fn paintFrame(
             const feed_posts = feed_view.fromTimeline(arena, view_items, now) catch &[_]feed_view.PostView{};
             if (g.screen.* == feed_view.screen_loadout) {
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
-                g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits) catch g.content_h.*;
+                g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false) catch g.content_h.*; // software: draw line-art nav
             } else {
                 g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, null, null, g.zone_title, g.zones) catch g.content_h.*;
             }
@@ -3516,7 +3517,7 @@ fn paintFrameGpu(
         if (g.screen.* == feed_view.screen_loadout) {
             // The loadout page: three stacked sockets, its own render path.
             const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
-            g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits) catch g.content_h.*;
+            g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, true) catch g.content_h.*; // GPU: SDF pass strikes the nav icons crisp
         } else {
             // skip_heart=true on every screen: the SDF heart pass (drawEngagementHearts,
             // below) draws the heart in place for each visible like button of the
@@ -3552,7 +3553,7 @@ fn paintFrameGpu(
     gpu.clear(gpu_clear_r, gpu_clear_g, gpu_clear_b);
     // Soften the field UNDER the content column (glass backdrop). The feed lays
     // out at the logical design width; map the column's x-range to physical px.
-    const cc = feed_view.contentColumn(@intCast(design_w));
+    const cc = feed_view.contentColumn(@intCast(design_w), g.screen.*);
     const panel_l = @as(f32, @floatFromInt(cc.x)) * scale;
     const panel_r = @as(f32, @floatFromInt(cc.x + cc.w)) * scale;
     gpu.drawFieldGrid(&gs.grid, &gs.ramp, gs.mcx, gs.mcy, gs.t, @intCast(w), @intCast(h), panel_l, panel_r);
@@ -3663,6 +3664,7 @@ fn drawHoverOverlay(gpa: Allocator, g: Grid, gs: *GpuState, scale: f32, vw: i32,
             if (g.hover_x < r.x or g.hover_x >= @as(i32, r.x) + r.w or g.hover_y < r.y or g.hover_y >= @as(i32, r.y) + r.h) continue;
             switch (r.kind) {
                 .post_body => wash = r,
+                .tag_inline => {}, // an inline hashtag underlines in drawSocketHoverTop (on TOP of the feed); the post wash here still fires via .post_body
                 .compose_send, .compose_cancel => {},
                 else => button = r, // engagement, avatar, nav, tabs, edit, pill, back…
             }
@@ -3907,7 +3909,16 @@ fn drawSocketHoverTop(gpa: Allocator, g: Grid, gs: *GpuState, scale: f32, vw: i3
         scanSocketHits(g.reply_hits.items, g.hover_x, g.hover_y, &sock_wash, &sock_button);
         scanSocketHits(g.zone_hits.items, g.hover_x, g.hover_y, &sock_wash, &sock_button);
     }
-    if (sock_wash == null and sock_button == null) return;
+    // An inline `#tag` under the cursor gets an UNDERLINE — drawn HERE (after the
+    // feed) so it lands on TOP of the prose, not behind the translucent post like
+    // the wash. The "this is a link" affordance the user asked for.
+    var tag_ul: ?feed_view.Region = null;
+    for (g.regions.items) |r| {
+        if (r.kind != .tag_inline) continue;
+        if (g.hover_x < r.x or g.hover_x >= @as(i32, r.x) + r.w or g.hover_y < r.y or g.hover_y >= @as(i32, r.y) + r.h) continue;
+        tag_ul = r;
+    }
+    if (sock_wash == null and sock_button == null and tag_ul == null) return;
 
     const wash_a: u32 = @intFromFloat(@as(f32, 0x0E) * gs.hover_alpha);
     const btn_a: u32 = @intFromFloat(@as(f32, 0x1C) * gs.hover_alpha);
@@ -3917,6 +3928,11 @@ fn drawSocketHoverTop(gpa: Allocator, g: Grid, gs: *GpuState, scale: f32, vw: i3
     // feed's pill. Both translucent white on top — a lift, not a veil.
     if (sock_wash) |r| hd.append(gpa, .{ .rect = .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h, .color = (wash_a << 24) | 0x00FFFFFF, .radius = 10 } }) catch {};
     if (sock_button) |r| hd.append(gpa, .{ .rect = .{ .x = @intCast(@as(i32, r.x) - 4), .y = r.y, .w = r.w + 8, .h = r.h, .color = (btn_a << 24) | 0x00FFFFFF, .radius = 12 } }) catch {};
+    if (tag_ul) |r| {
+        const ul_a: u32 = @intFromFloat(@as(f32, 0xFF) * gs.hover_alpha);
+        const uy: i32 = @as(i32, r.y) + @as(i32, r.h) - 1;
+        hd.append(gpa, .{ .rect = .{ .x = r.x, .y = @intCast(uy), .w = r.w, .h = 2, .color = (ul_a << 24) | 0x004DA3FF, .radius = 0 } }) catch {}; // 0x4DA3FF = feed_view tag_blue
+    }
     if (hd.len == 0) return;
     gpu.feedBuild(&gs.hover, gpa, g.engine, hd.slice(), scale) catch return;
     gpu.feedDraw(&gs.hover, vw, vh);
@@ -3976,8 +3992,10 @@ fn drawSdfIcons(g: Grid, gs: *GpuState, items: []const feed_core.TimelineItem, v
                 gpu.drawIcon(&gs.icon, id, cx, cy, eng, grey, vw, vh);
             },
             // The nav rail (mirrors drawRail's icon at region.x+10, size 22 →
-            // centre +21 / +19). Skipped on the loadout page, which keeps line-art.
-            .nav => if (g.screen.* != feed_view.screen_loadout) {
+            // centre +21 / +19). Drawn on EVERY screen incl. the loadout page, so
+            // the Algorithms tab gets the same crisp SDF icons as the rest (it used
+            // to be excluded here + line-art in layoutLoadout — which looked worse).
+            .nav => {
                 const id: i32 = switch (r.post) {
                     0 => gpu.icon_home,
                     1 => gpu.icon_hash, // Zones
