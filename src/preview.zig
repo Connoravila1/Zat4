@@ -30,6 +30,34 @@ const field = @import("core/field.zig");
 const lens_socket = @import("core/lens_socket.zig");
 const lens_catalog = @import("core/lens_catalog.zig");
 const enroll_view = @import("core/enroll_view.zig");
+const tiling = @import("core/tiling.zig");
+
+/// Solve the three-pane as a PARTITION: nav (fixed 248) | feed (weight) |
+/// sidebar (fixed 352), then map the placed rects into feed_view's PaneGeom.
+/// This is the S.1 seam — the shell solves geometry, feed_view renders into it.
+fn partitionGeom(arena: std.mem.Allocator, w: i32, h: i32, feed_weight: f32) !feed_view.PaneGeom {
+    const wi: u16 = @intFromFloat(feed_weight * 128.0);
+    const tree: tiling.Node = .{ .split = .{ .dir = .h, .children = &.{
+        .{ .leaf = .{ .kind = .nav, .weight = 0, .min = 248 } },
+        .{ .leaf = .{ .kind = .feed, .weight = wi, .min = 0 } },
+        .{ .leaf = .{ .kind = .widgets, .weight = 0, .min = 352 } },
+    } } };
+    const carve = try tiling.tile(arena, &tree, @intCast(w), @intCast(h), .{ .seam = 0 });
+    var rail_x: i32 = 0;
+    var col_x: i32 = 0;
+    var col_w: i32 = 0;
+    var side_x: i32 = 0;
+    for (carve.viewports) |vp| switch (vp.kind) {
+        .nav => rail_x = vp.x,
+        .feed => {
+            col_x = vp.x;
+            col_w = vp.w;
+        },
+        .widgets => side_x = vp.x,
+        else => {},
+    };
+    return .{ .rail_x = rail_x, .col_x = col_x, .col_w = col_w, .lx = col_x + 22, .cw = col_w - 44, .side_x = side_x, .wide = true };
+}
 
 const W: u32 = 1280;
 const H: u32 = 880;
@@ -94,11 +122,57 @@ pub fn main(init: std.process.Init) !void {
     // so the proof matches what the live app loads with.
     const hc, const hb = try lens_catalog.defaultFeedLoadout(arena);
     const home_tray: lens_socket.TrayView = .{ .cards = hc, .text = hb, .seated = lens_catalog.default_feed_seated };
-    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, 0, null, 3, lens_socket.seatedAccent(home_tray), home_tray, .{}, null, null, null, "", &.{});
+    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, 0, null, 3, lens_socket.seatedAccent(home_tray), home_tray, .{}, null, null, null, "", &.{}, null);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
 
     const io = init.io;
     try writePpm(io, gpa, &fb, "/tmp/zat_preview.ppm");
+
+    // TILING FOUNDATION (S.1) PROOF: the SAME real feed, but its pane geometry
+    // SOLVED by the partition carve (core/tiling.zig) and handed to layout()
+    // via `geom`, instead of feed_view's own metricsPage. The rail/feed/sidebar
+    // here are placed by the partition; everything rendered is the real UI.
+    inline for (.{ .{ @as(f32, 3.0), "/tmp/zat_tiling_real.ppm" }, .{ @as(f32, 6.0), "/tmp/zat_tiling_real_wide.ppm" } }) |variant| {
+        @memset(fb.pixels, clear);
+        dl.len = 0;
+        try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
+        const geom = try partitionGeom(arena, @intCast(W), @intCast(H), variant[0]);
+        _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, 0, null, 3, lens_socket.seatedAccent(home_tray), home_tray, .{}, null, null, null, "", &.{}, geom);
+        try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+        try writePpm(io, gpa, &fb, variant[1]);
+        std.debug.print("wrote {s} (real feed via partition, feed weight {d})\n", .{ variant[1], variant[0] });
+    }
+    // Content-driven SEARCH tile push: the real sidebar with search OPEN — the
+    // results tile grows and pushes trending/follow down (cheap reposition).
+    {
+        @memset(fb.pixels, clear);
+        dl.len = 0;
+        try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
+        var geom = try partitionGeom(arena, @intCast(W), @intCast(H), 3.0);
+        geom.search_open = 1.0;
+        _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, 0, null, 3, lens_socket.seatedAccent(home_tray), home_tray, .{}, null, null, null, "", &.{}, geom);
+        try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+        try writePpm(io, gpa, &fb, "/tmp/zat_tiling_search.ppm");
+        std.debug.print("wrote /tmp/zat_tiling_search.ppm (real sidebar, search open)\n", .{});
+    }
+    // DECOMPOSED rail: layout draws content+sidebar (rail_external), then the
+    // rail is rendered SEPARATELY via renderRail — proving the decomposition
+    // produces the same full UI (the shell does these as two GPU buffers).
+    {
+        @memset(fb.pixels, clear);
+        dl.len = 0;
+        try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
+        var geom = try partitionGeom(arena, @intCast(W), @intCast(H), 3.0);
+        geom.rail_external = true;
+        _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, 0, null, 3, lens_socket.seatedAccent(home_tray), home_tray, .{}, null, null, null, "", &.{}, geom);
+        // The CONDENSED rail (expand 0 = icons-only) on the right + the FULL rail
+        // (expand 1) on the left — the two states the Zones slide moves between.
+        try feed_view.renderRail(gpa, &dl, &engine, geom.rail_x, @intCast(H), 1, null, feed_view.accent_house, false, 1.0);
+        try feed_view.renderRail(gpa, &dl, &engine, @as(i32, @intCast(W)) - 76, @intCast(H), 1, null, feed_view.accent_house, false, 0.0);
+        try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+        try writePpm(io, gpa, &fb, "/tmp/zat_tiling_decomposed.ppm");
+        std.debug.print("wrote /tmp/zat_tiling_decomposed.ppm (full rail left + condensed rail right)\n", .{});
+    }
     std.debug.print("wrote /tmp/zat_preview.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
 
     // The socket OPEN on the feed, with Discover (blue) seated — proof that
@@ -109,7 +183,7 @@ pub fn main(init: std.process.Init) !void {
     try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
     var blue_tray = home_tray;
     blue_tray.seated = 2; // Discover → blue
-    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, 0, null, 0, lens_socket.seatedAccent(blue_tray), blue_tray, .{ .open = true, .open_t = 1.0 }, null, null, null, "", &.{});
+    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, 0, null, 0, lens_socket.seatedAccent(blue_tray), blue_tray, .{ .open = true, .open_t = 1.0 }, null, null, null, "", &.{}, null);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_feed_open.ppm");
     std.debug.print("wrote /tmp/zat_feed_open.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
@@ -150,7 +224,7 @@ pub fn main(init: std.process.Init) !void {
     // All-same-author thread → the reply socket lands at the end (the screenshot case).
     // Use a BLUE accent here to prove the seated-lens color flows to the focus
     // wash (and everywhere else), not the static house amber.
-    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), &thread, 0, &dl, null, null, false, feed_view.screen_thread, null, 0, 0xFF4DA3FF, reply_t2, .{}, &thr_hits, null, null, "", &.{});
+    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), &thread, 0, &dl, null, null, false, feed_view.screen_thread, null, 0, 0xFF4DA3FF, reply_t2, .{}, &thr_hits, null, null, "", &.{}, null);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_thread.ppm");
     std.debug.print("wrote /tmp/zat_thread.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
@@ -160,7 +234,7 @@ pub fn main(init: std.process.Init) !void {
     dl.len = 0;
     try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
     const header: feed_view.ProfileHeader = .{ .display_name = "connor.zat4.com", .handle = "@connor.zat4.com", .post_count = 11, .editable = true };
-    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, feed_view.screen_profile, header, 0, feed_view.accent_house, null, .{}, null, null, null, "", &.{});
+    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, feed_view.screen_profile, header, 0, feed_view.accent_house, null, .{}, null, null, null, "", &.{}, null);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_profile.ppm");
     std.debug.print("wrote /tmp/zat_profile.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
@@ -171,7 +245,7 @@ pub fn main(init: std.process.Init) !void {
     @memset(fb.pixels, clear);
     dl.len = 0;
     try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
-    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, feed_view.screen_zones, null, 0, lens_socket.seatedAccent(home_tray), home_tray, .{}, null, null, null, "smallweb", &.{});
+    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, feed_view.screen_zones, null, 0, lens_socket.seatedAccent(home_tray), home_tray, .{}, null, null, null, "smallweb", &.{}, null);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_zone.ppm");
     std.debug.print("wrote /tmp/zat_zone.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
@@ -190,7 +264,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .tag = "design", .count = 1130 },
         .{ .tag = "music", .count = 642 },
     };
-    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, feed_view.screen_zones_browse, null, 0, lens_socket.seatedAccent(home_tray), home_tray, .{}, null, null, null, "", &sample_zones);
+    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, feed_view.screen_zones_browse, null, 0, lens_socket.seatedAccent(home_tray), home_tray, .{}, null, null, null, "", &sample_zones, null);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_zones_browse.ppm");
     std.debug.print("wrote /tmp/zat_zones_browse.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
@@ -283,7 +357,7 @@ pub fn main(init: std.process.Init) !void {
     @memset(fb.pixels, clear);
     dl.len = 0;
     try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
-    _ = try feed_view.layoutLoadout(gpa, &engine, @intCast(W), @intCast(H), &dl, null, lens_socket.seatedAccent(feed_t), 0, 0, null, feed_t, .{}, &fh, reply_t, .{}, &rh, zone_t, .{}, &zh, false);
+    _ = try feed_view.layoutLoadout(gpa, &engine, @intCast(W), @intCast(H), &dl, null, lens_socket.seatedAccent(feed_t), 0, 0, null, feed_t, .{}, &fh, reply_t, .{}, &rh, zone_t, .{}, &zh, false, false, null);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_loadout.ppm");
     std.debug.print("wrote /tmp/zat_loadout.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });

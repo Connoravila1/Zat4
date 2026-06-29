@@ -86,7 +86,7 @@ pub const max_lenses: usize = 6;
 /// app-wide re-tint is the L.2 sub-slice; here the socket tints its own
 /// cartridge so the seated color is already visible).
 pub const palette = [9]u32{
-    0xFFE8B23A, // 0 amber  — Standard Discover (house accent)
+    0xFFF2762A, // 0 orange — Standard Discover (house accent / site default)
     0xFF4A9EFF, // 1 blue   — Private Discover
     0xFF949AAA, // 2 grey   — Following (neutral = "no shaping", reads chronological)
     0xFF9B7BFF, // 3 violet — reserve

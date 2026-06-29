@@ -51,7 +51,7 @@ const faint: u32 = 0xFF6A655A;
 /// On Home the live accent is the SEATED LENS's palette color (§11.5),
 /// threaded into `layout` as `accent` and passed down to the chrome; this
 /// const is the fallback for surfaces with no seated lens.
-pub const accent_house: u32 = 0xFFE8B84B;
+pub const accent_house: u32 = 0xFFF2762A; // site default accent (orange)
 /// Text-selection highlight (translucent steel, drawn behind selected glyphs).
 const sel_fill: u32 = 0x553A6EA5;
 const like_c: u32 = 0xFFF0617A;
@@ -320,6 +320,43 @@ const Metrics = struct {
         assert(@sizeOf(Metrics) == 28); // 6×i32 + bool + 3 pad
     }
 };
+
+/// Externally-supplied pane geometry (the tiling foundation, S.1). When the
+/// shell solves the layout as a space partition, it hands `layout()` the placed
+/// pane rects through this; `layout()` then renders the real UI into them
+/// instead of computing its own `metricsPage` geometry. Absent (null) ⇒ the
+/// original self-computed three-pane (every existing caller, unchanged).
+/// A7.2: cold — one per frame, passed by value across the boundary (B5).
+pub const PaneGeom = struct {
+    rail_x: i32,
+    col_x: i32,
+    col_w: i32,
+    lx: i32,
+    cw: i32,
+    side_x: i32,
+    wide: bool,
+    /// Content-driven tile demo: how open the sidebar SEARCH tile is (0..1). At
+    /// >0 the search-results tile grows and PUSHES the trending + follow tiles
+    /// down — a pure reposition (no relayout), the cheap within-screen movement.
+    /// The shell animates this; null geom ⇒ 0 (closed).
+    search_open: f32 = 0,
+    /// When true, `layout()` does NOT draw the nav rail — the shell renders it
+    /// as its own movable TILE (`renderRail`) so it can slide/compress
+    /// independently of the content (the decomposition that makes per-tile
+    /// movement real). The rail's hit regions are still emitted by `renderRail`.
+    rail_external: bool = false,
+};
+
+/// The geometry `layout()` would compute for a given window width + screen,
+/// exposed so the shell can hold it as ANIMATED state (spring one frame's geom
+/// toward the next screen's target and pass it back via `geom`) — the tiling
+/// foundation's morph. A convex blend of two of these is itself a valid layout
+/// (every boundary interpolates monotonically), so animating between screens
+/// never overlaps. Returns the live per-screen geometry unchanged.
+pub fn paneGeomFor(width: i32, active_screen: u8) PaneGeom {
+    const m = metricsPage(width, active_screen);
+    return .{ .rail_x = m.rail_x, .col_x = m.col_x, .col_w = m.col_w, .lx = m.lx, .cw = m.cw, .side_x = m.side_x, .wide = m.wide };
+}
 
 fn metricsFor(width: i32) Metrics {
     if (width >= wide_min) {
@@ -806,58 +843,109 @@ fn navIcon(idx: usize, gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, s: 
     }
 }
 
-fn drawRail(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, rx: i32, height: i32, active: usize, regions: ?*Regions, accent: u32, skip_nav: bool) !void {
+/// Render the nav rail as a STANDALONE tile (the decomposition): the shell
+/// calls this into its own draw list so the rail can slide/compress on its own.
+/// Emits the rail's hit regions too (so clicks + the GPU SDF nav icons follow).
+pub fn renderRail(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, rail_x: i32, height: i32, active: usize, regions: ?*Regions, accent: u32, skip_nav: bool, expand: f32) !void {
+    return drawRail(gpa, dl, e, rail_x, height, active, regions, accent, skip_nav, expand);
+}
+
+fn drawRail(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, rx: i32, height: i32, active: usize, regions: ?*Regions, accent: u32, skip_nav: bool, expand: f32) !void {
     const x0 = rx + 14;
-    const wm = try str(gpa, dl, e, .semibold, x0 + 8, 58, accent, 26, "zat4");
-    _ = try str(gpa, dl, e, .semibold, wm, 58, ink, 26, ".");
+    // `expand` (0 = a tight ICONS-ONLY column, 1 = the full labelled rail) is the
+    // condense/hover-expand control. The panel stays visible but narrows; the
+    // labels + wordmark + New-post + "you" card FADE by `expand`. Nav icons stay
+    // (drawn full, by the SDF pass / line-art) so the column always reads.
+    const ex = std.math.clamp(expand, 0, 1);
+    const ea: u32 = @as(u32, @intFromFloat(ex * 255.0)) << 24; // text/extras alpha
+    const box_w: i32 = @intFromFloat(52.0 + @as(f32, @floatFromInt(rail_w - 24 - 52)) * ex);
+    const pill_w: i32 = @intFromFloat(44.0 + @as(f32, @floatFromInt(rail_w - 32 - 44)) * ex);
 
-    // The nav GROUP (Home…Settings) sits on its OWN box — the logo above and
-    // the New-post button below stay on the field, each its own section.
-    try rect(gpa, dl, x0 - 2, 94, rail_w - 24, 304, panel, 18);
+    const wm = try str(gpa, dl, e, .semibold, x0 + 8, 58, (accent & 0x00FFFFFF) | ea, 26, "zat4");
+    _ = try str(gpa, dl, e, .semibold, wm, 58, (ink & 0x00FFFFFF) | ea, 26, ".");
 
+    // The nav GROUP box (visible always; just narrower when condensed).
+    try rect(gpa, dl, x0 - 2, 94, box_w, 304, panel, 18);
+
+    // Visual ORDER of the nav rows (each row's `idx` is still its Screen — the
+    // region/icon/active mapping is unchanged; only the on-screen order differs).
+    // Algorithms (4) sits under Zones (1).
+    const nav_order = [_]usize{ 0, 1, 4, 2, 3, 5 };
     var ny: i32 = 108;
-    for (nav_labels, 0..) |label, idx| {
+    for (nav_order) |idx| {
+        const label = nav_labels[idx];
         const on = idx == active;
         const col = if (on) ink else muted;
-        // A faint accent pill marks the active destination.
-        if (on) try rect(gpa, dl, x0 + 2, ny - 8, rail_w - 32, 42, (0x1F << 24) | (accent & 0x00FFFFFF), 12);
-        // GPU path: all nav icons are drawn by the SDF-icon pass; only software
-        // strokes the line-art. (The active-pill + label + region still emit.)
+        if (on) try rect(gpa, dl, x0 + 2, ny - 8, pill_w, 42, (0x1F << 24) | (accent & 0x00FFFFFF), 12);
         if (!skip_nav) try navIcon(idx, gpa, dl, x0 + 10, ny, 22, if (on) accent else muted);
-        _ = try str(gpa, dl, e, if (on) .semibold else .regular, x0 + 48, ny + 17, col, 16, label);
-        // Full-row tap target → the Screen at this index (post carries it).
-        try emitRegion(gpa, regions, rx + 14, ny - 8, rail_w - 28, 42, @intCast(idx), .nav);
+        _ = try str(gpa, dl, e, if (on) .semibold else .regular, x0 + 48, ny + 17, (col & 0x00FFFFFF) | ea, 16, label);
+        // Tap target spans the (condensed) column width so the icon is clickable.
+        try emitRegion(gpa, regions, rx + 14, ny - 8, box_w, 42, @intCast(idx), .nav);
         ny += 50;
     }
 
     ny += 16;
-    try rect(gpa, dl, x0 + 6, ny, rail_w - 44, 50, accent, 14);
-    const npw: i32 = @intCast(text.measure(e, .semibold, "New post", 16));
-    _ = try str(gpa, dl, e, .semibold, x0 + 6 + @divTrunc(rail_w - 44 - npw, 2), ny + 32, bg, 16, "New post");
-    try emitRegion(gpa, regions, x0 + 6, ny, rail_w - 44, 50, 0, .compose);
+    // New-post + "you" card FADE out when condensed (they don't fit a tight
+    // column); their regions are emitted only while visible so a hidden control
+    // can't be clicked.
+    if (ex > 0.05) {
+        try rect(gpa, dl, x0 + 6, ny, rail_w - 44, 50, (accent & 0x00FFFFFF) | ea, 14);
+        const npw: i32 = @intCast(text.measure(e, .semibold, "New post", 16));
+        _ = try str(gpa, dl, e, .semibold, x0 + 6 + @divTrunc(rail_w - 44 - npw, 2), ny + 32, (bg & 0x00FFFFFF) | ea, 16, "New post");
+        try emitRegion(gpa, regions, x0 + 6, ny, rail_w - 44, 50, 0, .compose);
 
-    const by = height - 60;
-    // The account card gets its own small box.
-    try rect(gpa, dl, x0 - 2, by - 10, rail_w - 24, 58, panel, 16);
-    try rect(gpa, dl, x0 + 6, by, 38, 38, 0xFF3F3B2D, 19);
-    _ = try str(gpa, dl, e, .semibold, x0 + 54, by + 16, ink, 14, "you");
-    _ = try str(gpa, dl, e, .regular, x0 + 54, by + 33, faint, 12, "@you.zat");
-    // The "you" card opens the Profile screen (Profile is no longer a rail
-    // slot — this card is its entry point, alongside avatar taps).
-    try emitRegion(gpa, regions, x0 + 6, by - 4, rail_w - 40, 46, screen_profile, .nav);
+        const by = height - 60;
+        try rect(gpa, dl, x0 - 2, by - 10, rail_w - 24, 58, (panel & 0x00FFFFFF) | ea, 16);
+        try rect(gpa, dl, x0 + 6, by, 38, 38, (0x00FF3F3B2D & 0x00FFFFFF) | ea, 19);
+        _ = try str(gpa, dl, e, .semibold, x0 + 54, by + 16, (ink & 0x00FFFFFF) | ea, 14, "you");
+        _ = try str(gpa, dl, e, .regular, x0 + 54, by + 33, (faint & 0x00FFFFFF) | ea, 12, "@you.zat");
+        try emitRegion(gpa, regions, x0 + 6, by - 4, rail_w - 40, 46, screen_profile, .nav);
+    }
 }
 
-fn drawSidebar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, sx: i32, height: i32) !void {
+fn drawSidebar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, sx: i32, height: i32, search_open: f32) !void {
     const x0 = sx + 16;
     const w = side_w - 32;
+    const so = std.math.clamp(search_open, 0, 1);
+    const searching = so > 0.02;
 
-    // search field
+    // search field (lights up while open)
     try rect(gpa, dl, x0, 28, w, 46, panel, 13);
-    try iconSearch(gpa, dl, x0 + 14, 41, 20, faint);
-    _ = try str(gpa, dl, e, .regular, x0 + 46, 57, faint, 14, "Search zat4");
+    if (searching) {
+        try rect(gpa, dl, x0, 28, w, 2, accent_house, 0);
+        try rect(gpa, dl, x0, 72, w, 2, accent_house, 0);
+        try rect(gpa, dl, x0, 28, 2, 46, accent_house, 0);
+        try rect(gpa, dl, x0 + w - 2, 28, 2, 46, accent_house, 0);
+    }
+    try iconSearch(gpa, dl, x0 + 14, 41, 20, if (searching) accent_house else faint);
+    _ = try str(gpa, dl, e, .regular, x0 + 46, 57, if (searching) ink else faint, 14, if (searching) "small" else "Search zat4");
 
-    // trending
-    const ty: i32 = 92;
+    // SEARCH RESULTS — content-driven height that PUSHES everything below it.
+    // Rows clip to the live height so they reveal as the tile grows. Pure
+    // reposition: nothing is re-laid-out (the cheap within-screen movement).
+    const results_full: i32 = 196;
+    const push: i32 = @intFromFloat(@as(f32, @floatFromInt(results_full)) * so);
+    if (searching) {
+        const ry: i32 = 82;
+        try rect(gpa, dl, x0, ry, w, push, 0xFF26241B, 14);
+        const results = [_][2][]const u8{
+            .{ "#smallweb", "zone · 412 posts" },
+            .{ "#small-net", "zone · 2,481 posts" },
+            .{ "@mara.zat", "Mara Vesper" },
+            .{ "smallweb manifesto", "post · 2d" },
+        };
+        var sy: i32 = ry + 18;
+        for (results) |res| {
+            if (sy + 30 > ry + push) break; // clip to the live height
+            try rect(gpa, dl, x0 + 12, sy, 26, 26, accent_house, 13);
+            _ = try str(gpa, dl, e, .semibold, x0 + 48, sy + 13, ink, 14, res[0]);
+            _ = try str(gpa, dl, e, .regular, x0 + 48, sy + 30, faint, 12, res[1]);
+            sy += 44;
+        }
+    }
+
+    // trending — pushed down by the open search tile
+    const ty: i32 = 92 + push;
     const th: i32 = 234;
     try rect(gpa, dl, x0, ty, w, th, panel, 15);
     _ = try str(gpa, dl, e, .semibold, x0 + 18, ty + 28, faint, 12, "TRENDING");
@@ -1017,8 +1105,15 @@ pub fn layout(
     /// zones with their post counts. Empty on every other screen. Each card taps
     /// to its zone feed (a `.zone_open` region carrying the catalog index).
     zones: []const ZoneCard,
+    /// The tiling foundation (S.1): when present, the pane geometry is SOLVED by
+    /// the shell's partition and handed in, so the real UI renders into those
+    /// rects (and morphs as they animate). Null ⇒ self-computed `metricsPage`.
+    geom: ?PaneGeom,
 ) error{OutOfMemory}!i32 {
-    const m = metricsPage(width, active_screen);
+    const m: Metrics = if (geom) |g|
+        .{ .rail_x = g.rail_x, .col_x = g.col_x, .col_w = g.col_w, .lx = g.lx, .cw = g.cw, .side_x = g.side_x, .wide = g.wide }
+    else
+        metricsPage(width, active_screen);
     if (regions) |rg| rg.clearRetainingCapacity();
     if (socket_hits) |sh| sh.clearRetainingCapacity();
     // No focused post laid out this frame ⇒ no selectable body. Cleared up front;
@@ -1059,9 +1154,12 @@ pub fn layout(
         // the field showing between. Every other page is WIDE: the glass already
         // spans the old sidebar area as one rectangle, so the right side is an
         // EXTENSION drawn INSIDE that panel (widgets), not a separate column.
-        try drawRail(gpa, dl, e, m.rail_x, height, active_screen, regions, accent, skip_heart);
+        // The rail is drawn here UNLESS the shell renders it as its own tile
+        // (rail_external) so it can slide/compress independently of the content.
+        if (!(geom != null and geom.?.rail_external))
+            try drawRail(gpa, dl, e, m.rail_x, height, active_screen, regions, accent, skip_heart, 1.0);
         if (!isWidePage(active_screen)) {
-            try drawSidebar(gpa, dl, e, m.side_x, height); // home/thread: floating 3-pane sidebar
+            try drawSidebar(gpa, dl, e, m.side_x, height, if (geom) |gg| gg.search_open else 0); // home/thread: floating 3-pane sidebar
         } else if (active_screen == screen_profile) {
             try drawExtension(gpa, dl, e, m, height, regions); // profile: customisable widgets
         } else {
@@ -1828,10 +1926,19 @@ pub fn layoutLoadout(
     /// so the rail draws its own line-art. (Was hardcoded false, which forced the
     /// worse line-art on the Algorithms page even on the GPU.)
     skip_nav: bool,
+    /// When true, the shell renders the nav rail as its own tile (decomposition),
+    /// so layoutLoadout does NOT draw it here. Software path: false.
+    rail_external: bool,
+    /// Optional partition geometry (the shell expands the loadout content into
+    /// the freed space when the left rail condenses). Null ⇒ self-computed.
+    pane_geom: ?PaneGeom,
 ) error{OutOfMemory}!i32 {
     // Algorithms is a WIDE page like the others: the glass spans the full
     // rectangle and the content centres in it — NO floating main-feed sidebar.
-    const m = metricsPage(width, screen_loadout);
+    const m: Metrics = if (pane_geom) |g|
+        .{ .rail_x = g.rail_x, .col_x = g.col_x, .col_w = g.col_w, .lx = g.lx, .cw = g.cw, .side_x = g.side_x, .wide = g.wide }
+    else
+        metricsPage(width, screen_loadout);
     if (regions) |rg| rg.clearRetainingCapacity();
     // Sockets are only built (and so only hit-testable) on the Loadout tab.
     feed_hits.clearRetainingCapacity();
@@ -1844,7 +1951,7 @@ pub fn layoutLoadout(
     if (m.wide) {
         try rect(gpa, dl, m.col_x, 0, 1, height, 0x24EDEAE0, 0);
         try rect(gpa, dl, m.col_x + m.col_w - 1, 0, 1, height, 0x24EDEAE0, 0);
-        try drawRail(gpa, dl, e, m.rail_x, height, screen_loadout, regions, accent, skip_nav);
+        if (!rail_external) try drawRail(gpa, dl, e, m.rail_x, height, screen_loadout, regions, accent, skip_nav, 1.0);
         try drawAgpl(gpa, dl, e, m.lx, height - 40);
     }
 
@@ -2432,7 +2539,7 @@ test "layout emits 4 tap regions per post (avatar + 3 engagement); hitTest resol
     const posts = [_]PostView{
         .{ .name = "A", .handle = "@a.zat", .age = "1m", .body = "hello there field", .tint = 0xFFAAAAAA, .reply = 1, .boost = 2, .like = 3, .initial = 'A', .liked = true, .boosted = false },
     };
-    const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{});
+    const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null);
     try std.testing.expect(h > 112); // content extends below the top bar
     // 8 regions per post: body tap + avatar + reply/repost/like + bookmark/share/more.
     try std.testing.expectEqual(@as(usize, 8), regions.items.len);
@@ -2477,14 +2584,14 @@ test "layout captures the rooted post's body glyphs for selection (thread screen
         .{ .name = "A", .handle = "@a.zat", .age = "1m", .body = "hello there field", .tint = 0xFFAAAAAA, .reply = 0, .boost = 0, .like = 0, .initial = 'A', .liked = false, .boosted = false, .is_focus = true },
     };
     // A WIDE layout so the focus post is on-screen and the body is drawn.
-    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_thread, null, 0, accent_house, null, .{}, null, null, &sel, "", &.{});
+    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_thread, null, 0, accent_house, null, .{}, null, null, &sel, "", &.{}, null);
     // "hello there field" = 15 visible glyphs (spaces are emitted too): the body
     // captured into the selection map, in reading order.
     try std.testing.expect(sel.items.len > 0);
     try std.testing.expectEqual(@as(u32, 'h'), sel.items[0].cp);
 
     // A non-thread screen captures nothing (only the rooted post is selectable).
-    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_home, null, 0, accent_house, null, .{}, null, null, &sel, "", &.{});
+    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_home, null, 0, accent_house, null, .{}, null, null, &sel, "", &.{}, null);
     try std.testing.expectEqual(@as(usize, 0), sel.items.len);
 }
 
@@ -2546,7 +2653,7 @@ test "long timeline does not overflow draw coordinates (off-screen posts skipped
     const posts = try arena.alloc(PostView, n);
     for (posts) |*pv| pv.* = .{ .name = "x", .handle = "@x.zat", .age = "1m", .body = "a body line that wraps a little across the feed column width here", .tint = 0xFF888888, .reply = 1, .boost = 2, .like = 3, .initial = 'x', .liked = false, .boosted = false };
 
-    const h = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}); // must not panic
+    const h = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null); // must not panic
     try std.testing.expect(h > 940 * 10); // height accounts for the whole list
     try std.testing.expect(regions.items.len < 4 * 24); // only on-screen posts are tappable
 
@@ -2560,11 +2667,11 @@ test "long timeline does not overflow draw coordinates (off-screen posts skipped
     @memset(heights, -1);
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h_fill = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{});
+    const h_fill = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null);
     const fill_regions = regions.items.len;
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h_cached = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{});
+    const h_cached = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null);
     try std.testing.expectEqual(h, h_fill);
     try std.testing.expectEqual(h, h_cached);
     try std.testing.expectEqual(fill_regions, regions.items.len);
@@ -2587,7 +2694,7 @@ test "profile screen renders the author's posts under a header; other screens st
     // Profile screen: 8 post tap regions (body + avatar + reply/repost/like +
     // bookmark/share/more) + 4 profile-nav tab regions in the sticky header
     // (the header here isn't editable, so no edit-profile region).
-    const hp = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_profile, header, 0, accent_house, null, .{}, null, null, null, "", &.{});
+    const hp = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_profile, header, 0, accent_house, null, .{}, null, null, null, "", &.{}, null);
     try std.testing.expect(hp > 112);
     try std.testing.expectEqual(@as(usize, 12), regions.items.len);
 
@@ -2595,7 +2702,7 @@ test "profile screen renders the author's posts under a header; other screens st
     // so no tap regions, and the height clamps to the viewport (no post stack).
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const he = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, 2, null, 0, accent_house, null, .{}, null, null, null, "", &.{}); // Activity (a still-bare placeholder)
+    const he = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, 2, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null); // Activity (a still-bare placeholder)
     try std.testing.expectEqual(@as(i32, 940), he);
     try std.testing.expectEqual(@as(usize, 0), regions.items.len);
 
@@ -2603,7 +2710,7 @@ test "profile screen renders the author's posts under a header; other screens st
     // control: a single Sign out tap region.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_settings, null, 0, accent_house, null, .{}, null, null, null, "", &.{});
+    _ = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_settings, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null);
     try std.testing.expectEqual(@as(usize, 1), regions.items.len);
     try std.testing.expectEqual(Action.sign_out, regions.items[0].kind);
 }
@@ -2623,7 +2730,7 @@ test "zones browse: each catalog entry emits one .zone_open card region carrying
         .{ .tag = "zig", .count = 913 },
         .{ .tag = "small-net", .count = 1 },
     };
-    const h = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_zones_browse, null, 0, accent_house, null, .{}, null, null, null, "", &zones);
+    const h = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_zones_browse, null, 0, accent_house, null, .{}, null, null, null, "", &zones, null);
     try std.testing.expect(h > 0);
     // The inert chrome (tabs/search/categories) emits no regions; the rail does
     // (it flanks every wide screen), so filter to the card taps: one `.zone_open`

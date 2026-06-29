@@ -1845,6 +1845,13 @@ pub fn run(
                         continue;
                     }
                 }
+                // Tiling foundation: '/' toggles the content-driven SEARCH tile —
+                // it grows + pushes the trending/follow tiles down (a cheap
+                // reposition, no relayout). The shell springs `search_open`.
+                if (ch == '/') {
+                    gs.search_want = !gs.search_want;
+                    continue;
+                }
             };
 
             if (mode == .compose) {
@@ -2794,6 +2801,16 @@ const GpuState = struct {
     grid: gpu.FieldGrid,
     ramp: gpu.FieldRenderer,
     feed: gpu.Feed,
+    /// The PREVIOUS screen's feed verts, kept for the screen-switch CROSSFADE:
+    /// on a screen change `feed`↔`feed_prev` swap, then `feed` rebuilds with the
+    /// new content while `feed_prev` holds the old; we draw old at (1-fade) + new
+    /// at fade. The nav rail is in BOTH so it stays solid; only content dissolves.
+    feed_prev: gpu.Feed,
+    fade_t: f32 = 1, // 1 = settled (no fade); 0 just after a screen switch
+    fade_screen: u8 = 0, // the screen `feed` currently holds (edge-detects switches)
+    /// The nav rail as its OWN tile (decomposition) — a separate vert buffer so
+    /// it can slide/compress independently of the content. Built each rebuild.
+    rail: gpu.Feed,
     /// A small overlay vert buffer for the HOVER highlight (post wash + button
     /// highlight), rebuilt each frame and drawn between the field and the feed so
     /// the highlights sit BEHIND the post content. Separate from `feed` so a
@@ -2885,7 +2902,112 @@ const GpuState = struct {
     chain_handle_len: u8 = 0,
     chain_catchup_t: f32 = 0, // 0 = above/hidden, 1 = settled at the pin
     chain_was_pinned: bool = false, // edge-detect the scroll-down pin to fire the catch-up
+    /// Tiling foundation (S.2): the pane geometry as ANIMATED state. The live
+    /// sub-pixel pane boundaries (`geom_*`) spring toward the current screen's
+    /// target (feed_view.paneGeomFor), so switching screens GLIDES the panes
+    /// instead of snapping. `gv_*` are the velocities; seeded on the first frame.
+    /// Geometry is a SOLVED partition each frame — a blend of two valid layouts
+    /// is itself valid, so the morph never overlaps.
+    geom_init: bool = false,
+    geom_rail_x: f32 = 0,
+    geom_col_x: f32 = 0,
+    geom_col_w: f32 = 0,
+    geom_lx: f32 = 0,
+    geom_cw: f32 = 0,
+    geom_side_x: f32 = 0,
+    gv_rail_x: f32 = 0,
+    gv_col_x: f32 = 0,
+    gv_col_w: f32 = 0,
+    gv_lx: f32 = 0,
+    gv_cw: f32 = 0,
+    gv_side_x: f32 = 0,
+    /// Content-driven SEARCH tile (sidebar): `search_open` springs 0..1 toward
+    /// `search_want`; while it moves it pushes the trending/follow tiles down
+    /// (a cheap reposition — no relayout). Toggled by '/'.
+    search_open: f32 = 0,
+    search_v: f32 = 0,
+    search_want: bool = false,
+    /// ZONES test: the nav rail relocates to the right on the Zones tab. Springs
+    /// 0 (rail at home/left) → 1 (rail slid to the right). A revertable demo.
+    zones_t: f32 = 0,
+    zones_v: f32 = 0,
+    /// Hover-expand of the condensed right rail: 0 = icons-only strip, 1 = full
+    /// labelled rail. Springs toward 1 while the cursor is over the right strip.
+    rail_hover_t: f32 = 0,
+    rail_hover_v: f32 = 0,
+    /// The LIVE content column (logical px) — set each rebuild from the animated
+    /// geometry. The field's panel-softening ("distortion") reads THIS so it
+    /// tracks the content as it widens/shifts, instead of the static metricsPage.
+    content_x: i32 = 0,
+    content_w: i32 = 0,
+    /// ALGORITHMS test: the LEFT rail condenses in place (stays left) and the
+    /// content expands. `algo_t` springs on the loadout screen; `left_hover_t`
+    /// springs while the cursor is over the (left) rail, re-expanding it.
+    algo_t: f32 = 0,
+    algo_v: f32 = 0,
+    left_hover_t: f32 = 0,
+    left_hover_v: f32 = 0,
 };
+
+/// Spring one geometry boundary toward its target (S.2). Stiff + just over
+/// critical damping → fast settle, no overshoot (overshoot would let a pane
+/// boundary cross past its target mid-morph).
+fn springGeom(cur: *f32, vel: *f32, target: f32, dt: f32) void {
+    const k: f32 = 150.0;
+    const c: f32 = 25.0;
+    vel.* += (-k * (cur.* - target) - c * vel.*) * dt;
+    cur.* += vel.* * dt;
+}
+
+/// Step the WHOLE geometry toward the screen's target — content column AND
+/// glass move together (no "finished content waiting for the glass"). A convex
+/// blend of two valid layouts is itself valid, so it never overlaps. The text
+/// width (cw) is folded into the height-cache key by the caller, so a morph that
+/// changes cw re-measures — but those are the wide NON-post pages (nothing heavy
+/// to measure), while the post pages share one reading width (cache stays warm).
+fn stepGeomAnim(gs: *GpuState, target: feed_view.PaneGeom, dt: f32) bool {
+    const tr: f32 = @floatFromInt(target.rail_x);
+    const tcx: f32 = @floatFromInt(target.col_x);
+    const tcw: f32 = @floatFromInt(target.col_w);
+    const tlx: f32 = @floatFromInt(target.lx);
+    const tcwd: f32 = @floatFromInt(target.cw);
+    const tsx: f32 = @floatFromInt(target.side_x);
+    if (!gs.geom_init) {
+        gs.geom_init = true;
+        gs.geom_rail_x = tr;
+        gs.geom_col_x = tcx;
+        gs.geom_col_w = tcw;
+        gs.geom_lx = tlx;
+        gs.geom_cw = tcwd;
+        gs.geom_side_x = tsx;
+        return false;
+    }
+    springGeom(&gs.geom_rail_x, &gs.gv_rail_x, tr, dt);
+    springGeom(&gs.geom_col_x, &gs.gv_col_x, tcx, dt);
+    springGeom(&gs.geom_col_w, &gs.gv_col_w, tcw, dt);
+    springGeom(&gs.geom_lx, &gs.gv_lx, tlx, dt);
+    springGeom(&gs.geom_cw, &gs.gv_cw, tcwd, dt);
+    springGeom(&gs.geom_side_x, &gs.gv_side_x, tsx, dt);
+    const far = @abs(gs.geom_rail_x - tr) + @abs(gs.geom_col_x - tcx) + @abs(gs.geom_col_w - tcw) +
+        @abs(gs.geom_lx - tlx) + @abs(gs.geom_cw - tcwd) + @abs(gs.geom_side_x - tsx);
+    return far > 0.75;
+}
+
+/// The live (animated) geometry as a PaneGeom to hand `layout()`. The glass
+/// width is clamped to never be narrower than the text column, so the text
+/// never overflows the panel mid-widen. `wide` snaps to the target's value.
+fn liveGeom(gs: *const GpuState, target: feed_view.PaneGeom) feed_view.PaneGeom {
+    const col_w: i32 = @intFromFloat(@round(@max(gs.geom_col_w, gs.geom_cw)));
+    return .{
+        .rail_x = @intFromFloat(@round(gs.geom_rail_x)),
+        .col_x = @intFromFloat(@round(gs.geom_col_x)),
+        .col_w = col_w,
+        .lx = @intFromFloat(@round(gs.geom_lx)),
+        .cw = @intFromFloat(@round(gs.geom_cw)),
+        .side_x = @intFromFloat(@round(gs.geom_side_x)),
+        .wide = target.wide,
+    };
+}
 
 /// Bring up the GPU path on the live window. Any failure (no GL, shader/pack
 /// error, OOM) propagates so the caller falls back to software (E2). Each
@@ -2899,6 +3021,10 @@ fn initGpuState(gpa: Allocator, engine: *text_core.Engine, win: *window_shell.Wi
 
     var feed = try gpu.initFeed(gpa);
     errdefer gpu.feedDeinit(&feed, gpa);
+    var feed_prev = try gpu.initFeed(gpa);
+    errdefer gpu.feedDeinit(&feed_prev, gpa);
+    var rail = try gpu.initFeed(gpa);
+    errdefer gpu.feedDeinit(&rail, gpa);
     var hover = try gpu.initFeed(gpa);
     errdefer gpu.feedDeinit(&hover, gpa);
     var sel = try gpu.initFeed(gpa);
@@ -2925,6 +3051,8 @@ fn initGpuState(gpa: Allocator, engine: *text_core.Engine, win: *window_shell.Wi
         .grid = grid,
         .ramp = ramp,
         .feed = feed,
+        .feed_prev = feed_prev,
+        .rail = rail,
         .hover = hover,
         .sel = sel,
         .menu = menu,
@@ -2981,6 +3109,8 @@ fn deinitGpuState(gpa: Allocator, gs: *GpuState) void {
     gpa.free(gs.bias);
     glyph_field.deinit(gpa, &gs.field);
     gpu.feedDeinit(&gs.feed, gpa);
+    gpu.feedDeinit(&gs.feed_prev, gpa);
+    gpu.feedDeinit(&gs.rail, gpa);
     gpu.feedDeinit(&gs.hover, gpa);
     gpu.feedDeinit(&gs.sel, gpa);
     gpu.feedDeinit(&gs.menu, gpa);
@@ -3225,9 +3355,13 @@ fn paintFrame(
             const feed_posts = feed_view.fromTimeline(arena, view_items, now) catch &[_]feed_view.PostView{};
             if (g.screen.* == feed_view.screen_loadout) {
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
-                g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false) catch g.content_h.*; // software: draw line-art nav
+                g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null) catch g.content_h.*; // software: draw line-art nav
             } else {
-                g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, null, null, g.zone_title, g.zones) catch g.content_h.*;
+                // Tiling foundation (S.1): geometry comes through the partition
+                // seam. Slice 1 hands back the screen's own geometry (identical
+                // render); the animated morph springs this between screens.
+                const sw_geom = feed_view.paneGeomFor(@intCast(win.fb.width), g.screen.*);
+                g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, null, null, g.zone_title, g.zones, sw_geom) catch g.content_h.*;
             }
             const t_layout = if (debug_frame_timing) clock_shell.monotonicNanos() else 0;
             window_shell.presentDrawList(win, gpa, g.engine, g.draw.slice(), field_core.background) catch {}; // E2: a lost blit is the next frame's problem
@@ -3488,11 +3622,61 @@ fn paintFrameGpu(
         socket_sig ^= @as(u64, @bitCast(@as(i64, g.socket_ui.drag_x))) *% 0x9E37_79B1;
         socket_sig ^= @as(u64, @bitCast(@as(i64, g.socket_ui.drag_y))) *% 0x85EB_CA77;
     }
+    // Screen-switch CROSSFADE: on a screen change, swap the feed buffers so the
+    // OLD screen's verts survive in `feed_prev` (it fades OUT) while `feed`
+    // rebuilds with the new content (it fades IN). The nav rail is identical in
+    // both, so it stays solid; only the differing content dissolves. Cheap — no
+    // relayout during the fade, just two cached draws at a uniform alpha.
+    if (gs.fade_screen != g.screen.*) {
+        const tmp = gs.feed;
+        gs.feed = gs.feed_prev;
+        gs.feed_prev = tmp;
+        gs.fade_t = 0;
+        gs.fade_screen = g.screen.*;
+        gs.feed_sig = 0; // the swapped-in buffer is stale → force a rebuild below
+    }
+    gs.fade_t += (1.0 - gs.fade_t) * 0.16; // ease in (~0.25 s)
+
+    // Content-driven SEARCH tile: spring it toward open/closed. While it moves
+    // the sidebar repositions, so the feed rebuilds — but the feed's width is
+    // unchanged, so its height cache stays warm (cheap, like a scroll).
+    springGeom(&gs.search_open, &gs.search_v, if (gs.search_want) 1.0 else 0.0, 1.0 / 60.0);
+    const search_animating = @abs(gs.search_open - (if (gs.search_want) @as(f32, 1.0) else 0.0)) > 0.004 or @abs(gs.search_v) > 0.004;
+
+    // ZONES TEST: on the Zones tab the nav rail relocates to the RIGHT — a
+    // custom per-page tile-move. `zones_t` springs 0→1 when on a zones screen;
+    // while it animates the rail (and its regions/icons) follow, so we rebuild.
+    const on_zones = g.screen.* == feed_view.screen_zones_browse or g.screen.* == feed_view.screen_zones;
+    springGeom(&gs.zones_t, &gs.zones_v, if (on_zones) 1.0 else 0.0, 1.0 / 60.0);
+    const zones_animating = @abs(gs.zones_t - (if (on_zones) @as(f32, 1.0) else 0.0)) > 0.003 or @abs(gs.zones_v) > 0.003;
+
+    // Hover the RIGHT rail → it expands. The hit-band must track the rail's
+    // CURRENT (animated) left edge — when expanded it reaches ~188px further
+    // left, so a fixed collapsed-strip band would drop the hover as you move
+    // onto the open panel and snap it shut. Use last frame's rail_hover_t.
+    const dwf: f32 = @floatFromInt(design_w);
+    const rail_left_now: f32 = (dwf - 76.0) - gs.rail_hover_t * 188.0;
+    const over_right_rail = gs.zones_t > 0.5 and @as(f32, @floatFromInt(g.hover_x)) >= rail_left_now - 8.0 and g.hover_x < @as(i32, @intCast(design_w)) and g.hover_y >= 0;
+    springGeom(&gs.rail_hover_t, &gs.rail_hover_v, if (over_right_rail) 1.0 else 0.0, 1.0 / 60.0);
+    const rail_hover_animating = @abs(gs.rail_hover_t - (if (over_right_rail) @as(f32, 1.0) else 0.0)) > 0.004 or @abs(gs.rail_hover_v) > 0.004;
+
+    // ALGORITHMS: the LEFT rail condenses in place (stays left). algo_t springs
+    // on the loadout screen; hovering the left rail (its current right edge
+    // tracks the expand) re-opens it.
+    const on_algo = g.screen.* == feed_view.screen_loadout;
+    springGeom(&gs.algo_t, &gs.algo_v, if (on_algo) 1.0 else 0.0, 1.0 / 60.0);
+    const home_rail_left: f32 = @floatFromInt(feed_view.paneGeomFor(@intCast(design_w), feed_view.screen_loadout).rail_x);
+    // The condensed rail hugs the left edge (shifted left by 60); the hover band
+    // tracks that shifted position + the current expand width.
+    const left_rail_right: f32 = (home_rail_left - 60.0) + 64.0 + gs.left_hover_t * 188.0;
+    const over_left_rail = gs.algo_t > 0.5 and g.hover_x >= 0 and @as(f32, @floatFromInt(g.hover_x)) < left_rail_right + 8.0 and g.hover_y >= 0;
+    springGeom(&gs.left_hover_t, &gs.left_hover_v, if (over_left_rail) 1.0 else 0.0, 1.0 / 60.0);
+    const algo_animating = @abs(gs.algo_t - (if (on_algo) @as(f32, 1.0) else 0.0)) > 0.003 or @abs(gs.algo_v) > 0.003 or @abs(gs.left_hover_t - (if (over_left_rail) @as(f32, 1.0) else 0.0)) > 0.004 or @abs(gs.left_hover_v) > 0.004;
     const sig = feedSignature(items, g.scroll.*, w, h) ^ (@as(u64, g.screen.*) *% 0x9E37_79B9_7F4A_7C15) ^ (socket_sig *% 0xD1B5_4A32_D192_ED03);
     // A drag/settle animates the socket every frame (lift, reflow, ghost), so
     // bypass the feed cache while it runs — a brief interaction, and the field
     // already rebuilds every frame anyway.
-    if (sig != gs.feed_sig or gs.feed.verts.items.len == 0 or g.socket_ui.drag_active != null or g.screen.* == feed_view.screen_loadout) {
+    if (sig != gs.feed_sig or gs.feed.verts.items.len == 0 or g.socket_ui.drag_active != null or search_animating or zones_animating or rail_hover_animating or algo_animating or g.screen.* == feed_view.screen_loadout) {
         gs.feed_sig = sig;
         // An empty timeline renders the chrome with no posts (no placeholders).
         const feed_posts = feed_view.fromTimeline(arena, items, now) catch &[_]feed_view.PostView{};
@@ -3517,14 +3701,94 @@ fn paintFrameGpu(
         if (g.screen.* == feed_view.screen_loadout) {
             // The loadout page: three stacked sockets, its own render path.
             const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
-            g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, true) catch g.content_h.*; // GPU: SDF pass strikes the nav icons crisp
+            // ALGORITHMS: expand the loadout content into the space the condensed
+            // left rail frees — shift the glass a bit LEFT toward the rail + widen
+            // RIGHT, by algo_t. (The rail itself condenses in the rail-tile pass.)
+            var lg = feed_view.paneGeomFor(@intCast(design_w), feed_view.screen_loadout);
+            if (gs.algo_t > 0.01) {
+                const at = gs.algo_t * gs.algo_t * (3.0 - 2.0 * gs.algo_t);
+                const tcx: f32 = home_rail_left + 92.0;
+                const tcw: f32 = @as(f32, @floatFromInt(design_w)) - tcx - 40.0;
+                const lp2 = struct {
+                    fn f(a: i32, b: f32, t: f32) i32 {
+                        return @intFromFloat(@as(f32, @floatFromInt(a)) + (b - @as(f32, @floatFromInt(a))) * t);
+                    }
+                }.f;
+                lg.col_x = lp2(lg.col_x, tcx, at);
+                lg.col_w = lp2(lg.col_w, tcw, at);
+                lg.lx = lp2(lg.lx, tcx + 22.0, at);
+            }
+            gs.content_x = lg.col_x;
+            gs.content_w = lg.col_w;
+            g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, true, true, lg) catch g.content_h.*; // GPU: SDF pass strikes the nav icons crisp
         } else {
             // skip_heart=true on every screen: the SDF heart pass (drawEngagementHearts,
             // below) draws the heart in place for each visible like button of the
             // ACTIVE view, so layout never draws its own — one heart, one pipeline.
-            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, &chain_info, &gs.sel_glyphs, g.zone_title, g.zones) catch g.content_h.*;
+            // Tiling foundation (S.1): geometry through the partition seam. The
+            // GPU path lays out at the logical design width, so the geom is
+            // solved at design_w. Slice 1 = the screen's own geometry (identical).
+            // Tiling foundation (S.1): geometry through the partition seam. The
+            // GPU path lays out at the logical design width, so the geom is
+            // solved at design_w. Geometry SNAPS to the screen's layout (smooth,
+            // no per-frame relayout); a cross-screen MORPH is a separate, cheaper
+            // mechanism (see the dormant geom_* spring state) — not a relayout.
+            var gp_geom = feed_view.paneGeomFor(@intCast(design_w), g.screen.*);
+            gp_geom.search_open = gs.search_open; // the content-driven sidebar push
+            gp_geom.rail_external = true; // the rail is its own tile (decomposition)
+            // ZONES: the rail moved to the right, so the content fills the freed
+            // LEFT space — shift the glass left + widen as zones_t grows. (Zones
+            // has no posts, so the per-frame relayout during the slide is cheap.)
+            if (gs.zones_t > 0.01) {
+                const zt2 = gs.zones_t * gs.zones_t * (3.0 - 2.0 * gs.zones_t);
+                const tcx: f32 = 90.0;
+                const tcw: f32 = @as(f32, @floatFromInt(design_w)) - 90.0 - 104.0; // stop before the right rail
+                const lp = struct {
+                    fn f(a: i32, b: f32, t: f32) i32 {
+                        return @intFromFloat(@as(f32, @floatFromInt(a)) + (b - @as(f32, @floatFromInt(a))) * t);
+                    }
+                }.f;
+                gp_geom.col_x = lp(gp_geom.col_x, tcx, zt2);
+                gp_geom.col_w = lp(gp_geom.col_w, tcw, zt2);
+                gp_geom.lx = lp(gp_geom.lx, tcx + 22.0, zt2);
+            }
+            gs.content_x = gp_geom.col_x; // for the field panel-softening (tracks the live content)
+            gs.content_w = gp_geom.col_w;
+            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, &chain_info, &gs.sel_glyphs, g.zone_title, g.zones, gp_geom) catch g.content_h.*;
         }
         gpu.feedBuild(&gs.feed, gpa, g.engine, g.draw.slice(), scale) catch {};
+
+        // The nav rail as its OWN tile (the decomposition): render it into a
+        // separate vertex buffer so it can slide/compress independently of the
+        // content. It emits the nav hit regions (clicks + the SDF nav icons
+        // follow). Because the rail is no longer in `gs.feed`, the screen-switch
+        // crossfade no longer dissolves it — it stays solid, which is correct.
+        // Built for EVERY screen (incl. the loadout/Algorithms page, which now
+        // skips its own rail via rail_external) with the active nav = the screen.
+        {
+            const dw: f32 = @floatFromInt(design_w);
+            const home_rail_x: f32 = @floatFromInt(feed_view.paneGeomFor(@intCast(design_w), g.screen.*).rail_x);
+            const zt = gs.zones_t * gs.zones_t * (3.0 - 2.0 * gs.zones_t); // smoothstep
+            g.draw.len = 0;
+            // LEFT rail: slides off the left as zt→1 (Zones). On the Algorithms
+            // page it CONDENSES and hugs the LEFT EDGE (shift left by algo_t);
+            // hover re-expands it in place.
+            const algo_shift: f32 = gs.algo_t * 60.0;
+            const left_home: f32 = home_rail_x - algo_shift;
+            const exit_x: i32 = @intFromFloat(left_home + (-260.0 - left_home) * zt);
+            const left_expand: f32 = 1.0 - gs.algo_t * (1.0 - gs.left_hover_t);
+            feed_view.renderRail(gpa, g.draw, g.engine, exit_x, @intCast(lh), g.screen.*, g.regions, g.accent, true, left_expand) catch {};
+            // RIGHT rail (CONDENSED): slides IN from beyond the right edge as
+            // zt→1, simultaneously. Hover expands it (rail_hover_t) and shifts it
+            // LEFT so the full width fits on-screen (a flyout over the content).
+            if (gs.zones_t > 0.01) {
+                const compressed_x = dw - 76.0;
+                const settled_x = compressed_x - gs.rail_hover_t * 188.0; // shift left when expanded
+                const enter_x: i32 = @intFromFloat((dw + 20.0) + (settled_x - (dw + 20.0)) * zt);
+                feed_view.renderRail(gpa, g.draw, g.engine, enter_x, @intCast(lh), g.screen.*, g.regions, g.accent, true, gs.rail_hover_t) catch {};
+            }
+            gpu.feedBuild(&gs.rail, gpa, g.engine, g.draw.slice(), scale) catch {};
+        }
 
         // Capture the chain extent + identity (OWNED copies) for the sticky chain
         // header overlay — valid across the non-rebuild frames until the next
@@ -3553,16 +3817,26 @@ fn paintFrameGpu(
     gpu.clear(gpu_clear_r, gpu_clear_g, gpu_clear_b);
     // Soften the field UNDER the content column (glass backdrop). The feed lays
     // out at the logical design width; map the column's x-range to physical px.
-    const cc = feed_view.contentColumn(@intCast(design_w), g.screen.*);
-    const panel_l = @as(f32, @floatFromInt(cc.x)) * scale;
-    const panel_r = @as(f32, @floatFromInt(cc.x + cc.w)) * scale;
+    // Panel softening tracks the LIVE (animated) content column, not the static
+    // metricsPage one — so the "distortion" panel follows the widened Zones glass.
+    const panel_l = @as(f32, @floatFromInt(gs.content_x)) * scale;
+    const panel_r = @as(f32, @floatFromInt(gs.content_x + gs.content_w)) * scale;
     gpu.drawFieldGrid(&gs.grid, &gs.ramp, gs.mcx, gs.mcy, gs.t, @intCast(w), @intCast(h), panel_l, panel_r);
     // Hover highlight (post wash + button highlight), BEHIND the feed so the
     // content draws on top — the app feels alive under the cursor.
     drawHoverOverlay(gpa, g, gs, scale, @intCast(w), @intCast(h));
     // The feed verts persist across frames (rebuilt above only when the feed
-    // changed); just draw them.
-    gpu.feedDraw(&gs.feed, @intCast(w), @intCast(h));
+    // changed); just draw them. During a screen-switch CROSSFADE, draw the old
+    // screen (fading out) under the new (fading in) — the rail, in both, stays.
+    if (gs.fade_t < 0.995) {
+        gpu.feedDrawAlpha(&gs.feed_prev, @intCast(w), @intCast(h), 1.0 - gs.fade_t);
+        gpu.feedDrawAlpha(&gs.feed, @intCast(w), @intCast(h), gs.fade_t);
+    } else {
+        gpu.feedDraw(&gs.feed, @intCast(w), @intCast(h));
+    }
+    // The nav rail tile draws ON TOP of the content and SOLID (no crossfade) —
+    // it's constant across screens, so it stays put while content dissolves.
+    gpu.feedDraw(&gs.rail, @intCast(w), @intCast(h));
     // The rooted post's read-only text selection — a translucent band drawn ON TOP
     // of the feed text (a highlighter, not an occluder). It must sit above the
     // post's glass fill, so it draws AFTER the feed, not behind it (behind, the

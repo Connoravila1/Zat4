@@ -198,6 +198,69 @@ pub fn build(b: *std.Build) void {
     const enroll_step = b.step("enroll", "Drive the interactive enrollment flow on the real window (no session/network)");
     enroll_step.dependOn(&run_enroll.step);
 
+    // TILING SPIKE (`zig build tiling-spike [-- <out_dir>]`): a SANDBOX that
+    // renders the page-as-split-tree carve (core/tiling.zig) to PPMs —  static
+    // wide/narrow proofs + a Home→Profile flow flipbook — to judge the modular
+    // tiling approach BEFORE it supersedes feed_view's per-screen metric
+    // ladder. Headless (raster path, no window/GPU); links libc via the font
+    // engine for the proportional labels. Touches no live render code.
+    const tiling_mod = b.createModule(.{
+        .root_source_file = b.path("src/tiling_spike.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addFontEngine(b, tiling_mod);
+    const tiling_exe = b.addExecutable(.{ .name = "zat-tiling-spike", .root_module = tiling_mod });
+    const run_tiling = b.addRunArtifact(tiling_exe);
+    if (b.args) |args| run_tiling.addArgs(args);
+    const tiling_step = b.step("tiling-spike", "Render the tiling-layout carve + flow flipbook to PPMs (headless sandbox)");
+    tiling_step.dependOn(&run_tiling.step);
+
+    // TILING LIVE (`zig build tiling-live`): the INTERACTIVE sandbox — opens a
+    // real X11 window (software present path, no GPU) and lets you navigate the
+    // page-as-tree layouts live to feel the re-target/settle. Same dependency
+    // posture as the other harnesses (libc via the font engine; X11 spoken raw
+    // over the socket). Needs a display. Touches no live render code.
+    const tiling_live_mod = b.createModule(.{
+        .root_source_file = b.path("src/tiling_live.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addFontEngine(b, tiling_live_mod);
+    const tiling_live_exe = b.addExecutable(.{ .name = "zat-tiling-live", .root_module = tiling_live_mod });
+    const run_tiling_live = b.addRunArtifact(tiling_live_exe);
+    if (b.args) |args| run_tiling_live.addArgs(args);
+    const tiling_live_step = b.step("tiling-live", "Interactive windowed tiling-layout demo (navigate pages, feel the settle)");
+    tiling_live_step.dependOn(&run_tiling_live.step);
+
+    // TILING-REAL (`zig build tiling-real`): the REAL feed (feed_view) rendered
+    // through the partition geometry on the GPU + living field — interactive
+    // (space morphs the feed wider, resize re-solves live). Isolated harness.
+    const tiling_real_mod = b.createModule(.{
+        .root_source_file = b.path("src/tiling_real.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addFontEngine(b, tiling_real_mod);
+    const tiling_real_exe = b.addExecutable(.{ .name = "zat-tiling-real", .root_module = tiling_real_mod });
+    const run_tiling_real = b.addRunArtifact(tiling_real_exe);
+    if (b.args) |args| run_tiling_real.addArgs(args);
+    const tiling_real_step = b.step("tiling-real", "Run the REAL feed on the partition foundation (GPU, interactive)");
+    tiling_real_step.dependOn(&run_tiling_real.step);
+
+    // Isolated tests for the pure carve (the spike module is exe-only, so its
+    // tests would otherwise be dormant). Kept off the default `test` step so
+    // the sandbox never gates the real suite; run with `zig build tiling-test`.
+    const tiling_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/tiling.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const tiling_tests = b.addTest(.{ .root_module = tiling_test_mod });
+    const run_tiling_tests = b.addRunArtifact(tiling_tests);
+    const tiling_test_step = b.step("tiling-test", "Run the tiling-spike carve's golden tests (leak-checked)");
+    tiling_test_step.dependOn(&run_tiling_tests.step);
+
     // Convenience: wipe the local build cache. The cache GROWING is
     // correct, not a bug — Zig keeps content-hashed artifacts so
     // incremental rebuilds are fast, and it cannot auto-delete old

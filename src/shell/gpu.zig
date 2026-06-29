@@ -477,6 +477,7 @@ const vert_src: [:0]const GLchar =
 const frag_src: [:0]const GLchar =
     \\precision mediump float;
     \\uniform sampler2D uAtlas;
+    \\uniform float uAlpha;
     \\varying vec4 vColor;
     \\varying vec2 vUV;
     \\varying vec2 vLocal;
@@ -492,7 +493,7 @@ const frag_src: [:0]const GLchar =
     \\  } else if (vMode < 1.5) {
     \\    cov = texture2D(uAtlas, vUV).r;
     \\  }
-    \\  gl_FragColor = vec4(vColor.rgb, vColor.a * cov);
+    \\  gl_FragColor = vec4(vColor.rgb, vColor.a * cov * uAlpha);
     \\}
 ;
 
@@ -507,6 +508,7 @@ pub const Renderer = struct {
     atlas_dim: u32,
     u_viewport: GLint,
     u_atlas: GLint,
+    u_alpha: GLint,
     a_pos: GLint,
     a_color: GLint,
     a_uv: GLint,
@@ -565,6 +567,7 @@ pub fn initRenderer() Error!Renderer {
         .atlas_dim = 0,
         .u_viewport = glGetUniformLocation(prog, "uViewport"),
         .u_atlas = glGetUniformLocation(prog, "uAtlas"),
+        .u_alpha = glGetUniformLocation(prog, "uAlpha"),
         .a_pos = glGetAttribLocation(prog, "aPos"),
         .a_color = glGetAttribLocation(prog, "aColor"),
         .a_uv = glGetAttribLocation(prog, "aUV"),
@@ -750,8 +753,8 @@ pub fn buildVertices(
 
 /// Upload the vertex buffer and issue the single draw call. `atlas` must
 /// already be uploaded (uploadAtlas) and bound on texture unit 0.
-pub fn draw(r: *Renderer, verts: []const Vertex, vw: i32, vh: i32) void {
-    if (verts.len == 0) return;
+pub fn draw(r: *Renderer, verts: []const Vertex, vw: i32, vh: i32, alpha: f32) void {
+    if (verts.len == 0 or alpha <= 0.001) return;
     glUseProgram(r.program);
     glBindBuffer(GL_ARRAY_BUFFER, r.vbo);
     glBufferData(GL_ARRAY_BUFFER, @intCast(verts.len * @sizeOf(Vertex)), verts.ptr, GL_DYNAMIC_DRAW);
@@ -772,6 +775,7 @@ pub fn draw(r: *Renderer, verts: []const Vertex, vw: i32, vh: i32) void {
     glBindTexture(GL_TEXTURE_2D, r.atlas_tex);
     glUniform2f(r.u_viewport, @floatFromInt(vw), @floatFromInt(vh));
     glUniform1i(r.u_atlas, 0);
+    glUniform1f(r.u_alpha, alpha);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDrawArrays(GL_TRIANGLES, 0, @intCast(verts.len));
@@ -821,7 +825,14 @@ pub fn feedBuild(
 
 /// Issue the feed's single draw call (atlas already uploaded by feedBuild).
 pub fn feedDraw(self: *Feed, vw: i32, vh: i32) void {
-    draw(&self.renderer, self.verts.items, vw, vh);
+    draw(&self.renderer, self.verts.items, vw, vh, 1.0);
+}
+
+/// Draw the feed at a global opacity (the screen-switch crossfade): the old
+/// screen's verts fade out while the new fade in. Constant elements (the nav
+/// rail) are in BOTH, so they stay solid; only the differing content dissolves.
+pub fn feedDrawAlpha(self: *Feed, vw: i32, vh: i32, alpha: f32) void {
+    draw(&self.renderer, self.verts.items, vw, vh, alpha);
 }
 
 /// Free the CPU-side vertex list + atlas. The GL program/buffer/texture are
