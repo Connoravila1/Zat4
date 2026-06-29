@@ -1291,6 +1291,7 @@ pub const icon_home: i32 = 6;
 pub const icon_search: i32 = 7;
 pub const icon_heart: i32 = 8; // hollow heart (Activity)
 pub const icon_sliders: i32 = 9; // faders (Algorithms)
+pub const icon_hash: i32 = 10; // hash # (Zones)
 
 const icon_vert_src: [:0]const GLchar =
     \\attribute vec2 aPos;          // unit quad corners [-1,1]
@@ -1380,6 +1381,12 @@ const icon_frag_src: [:0]const GLchar =
     \\  } else if (id == 8) {      // heart (hollow) — the Activity nav icon
     \\    vec2 hp = vec2(p.x, -p.y) * 1.15 + vec2(0.0, 0.5);
     \\    return abs(sdHeart(hp)) - th;
+    \\  } else if (id == 10) {     // hash (#) — Zones
+    \\    d = min(d, sdSeg(p, vec2(-0.22,-0.68), vec2(-0.36,0.68)));
+    \\    d = min(d, sdSeg(p, vec2(0.36,-0.68), vec2(0.22,0.68)));
+    \\    d = min(d, sdSeg(p, vec2(-0.68,-0.24), vec2(0.68,-0.24)));
+    \\    d = min(d, sdSeg(p, vec2(-0.72,0.26), vec2(0.64,0.26)));
+    \\    return d - th;
     \\  } else {                   // sliders: three faders with knobs (Algorithms)
     \\    d = min(d, sdSeg(p, vec2(-0.66,-0.42), vec2(0.66,-0.42)));
     \\    d = min(d, sdSeg(p, vec2(-0.66,0.0), vec2(0.66,0.0)));

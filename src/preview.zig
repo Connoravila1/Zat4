@@ -94,7 +94,7 @@ pub fn main(init: std.process.Init) !void {
     // so the proof matches what the live app loads with.
     const hc, const hb = try lens_catalog.defaultFeedLoadout(arena);
     const home_tray: lens_socket.TrayView = .{ .cards = hc, .text = hb, .seated = lens_catalog.default_feed_seated };
-    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, 0, null, 3, lens_socket.seatedAccent(home_tray), home_tray, .{}, null, null, null, "");
+    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, 0, null, 3, lens_socket.seatedAccent(home_tray), home_tray, .{}, null, null, null, "", &.{});
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
 
     const io = init.io;
@@ -109,7 +109,7 @@ pub fn main(init: std.process.Init) !void {
     try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
     var blue_tray = home_tray;
     blue_tray.seated = 2; // Discover → blue
-    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, 0, null, 0, lens_socket.seatedAccent(blue_tray), blue_tray, .{ .open = true, .open_t = 1.0 }, null, null, null, "");
+    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, 0, null, 0, lens_socket.seatedAccent(blue_tray), blue_tray, .{ .open = true, .open_t = 1.0 }, null, null, null, "", &.{});
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_feed_open.ppm");
     std.debug.print("wrote /tmp/zat_feed_open.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
@@ -150,7 +150,7 @@ pub fn main(init: std.process.Init) !void {
     // All-same-author thread → the reply socket lands at the end (the screenshot case).
     // Use a BLUE accent here to prove the seated-lens color flows to the focus
     // wash (and everywhere else), not the static house amber.
-    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), &thread, 0, &dl, null, null, false, feed_view.screen_thread, null, 0, 0xFF4DA3FF, reply_t2, .{}, &thr_hits, null, null, "");
+    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), &thread, 0, &dl, null, null, false, feed_view.screen_thread, null, 0, 0xFF4DA3FF, reply_t2, .{}, &thr_hits, null, null, "", &.{});
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_thread.ppm");
     std.debug.print("wrote /tmp/zat_thread.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
@@ -160,7 +160,7 @@ pub fn main(init: std.process.Init) !void {
     dl.len = 0;
     try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
     const header: feed_view.ProfileHeader = .{ .display_name = "connor.zat4.com", .handle = "@connor.zat4.com", .post_count = 11, .editable = true };
-    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, feed_view.screen_profile, header, 0, feed_view.accent_house, null, .{}, null, null, null, "");
+    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, feed_view.screen_profile, header, 0, feed_view.accent_house, null, .{}, null, null, null, "", &.{});
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_profile.ppm");
     std.debug.print("wrote /tmp/zat_profile.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
@@ -171,10 +171,29 @@ pub fn main(init: std.process.Init) !void {
     @memset(fb.pixels, clear);
     dl.len = 0;
     try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
-    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, feed_view.screen_zones, null, 0, lens_socket.seatedAccent(home_tray), home_tray, .{}, null, null, null, "smallweb");
+    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, feed_view.screen_zones, null, 0, lens_socket.seatedAccent(home_tray), home_tray, .{}, null, null, null, "smallweb", &.{});
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_zone.ppm");
     std.debug.print("wrote /tmp/zat_zone.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
+
+    // The Zones BROWSE catalog (slice 5): title + sub-tabs + search + categories
+    // + the manifest grid, over the field. A handful of sample zones stand in for
+    // a `listTags` result so the grid + cards render in the proof.
+    @memset(fb.pixels, clear);
+    dl.len = 0;
+    try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
+    const sample_zones = [_]feed_view.ZoneCard{
+        .{ .tag = "deep", .count = 2481 },
+        .{ .tag = "zig", .count = 913 },
+        .{ .tag = "small-net", .count = 2481 },
+        .{ .tag = "zathelp", .count = 204 },
+        .{ .tag = "design", .count = 1130 },
+        .{ .tag = "music", .count = 642 },
+    };
+    _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, feed_view.screen_zones_browse, null, 0, lens_socket.seatedAccent(home_tray), home_tray, .{}, null, null, null, "", &sample_zones);
+    try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+    try writePpm(io, gpa, &fb, "/tmp/zat_zones_browse.ppm");
+    std.debug.print("wrote /tmp/zat_zones_browse.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
 
     // THE LENS SOCKET (L.0 resting + L.1 open) over the living field, the
     // real pure path: lens_socket.build → raster.paint. A few placeholder

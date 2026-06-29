@@ -266,6 +266,44 @@ pub fn loadZoneFeed(
     }
 }
 
+/// The result of a zone-catalog fetch: the known zones (display tag + post
+/// count) on success, a contained failure otherwise. The `tags` slice is
+/// allocated in the caller's `arena` (the caller copies what it keeps).
+/// A7.2: cold union, size guard waived — one catalog-load result, matched once.
+pub const ZonesOutcome = union(enum) {
+    ok: []const lexicon.TagView,
+    failed: xrpc.Failure,
+};
+
+/// Fetch the zone CATALOG (`listTags`) — the flat set of known zones with their
+/// post counts. This is metadata, NOT posts, so it does not touch the store; the
+/// caller copies the entries it keeps into its own catalog (the browse screen).
+/// Ranking / manifest-state are later phases (Z3/Z7); this is the latent set.
+pub fn loadZones(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    session: *auth.Session,
+    appview_url: []const u8,
+) !ZonesOutcome {
+    const outcome = try auth.queryHost(
+        gpa,
+        arena,
+        io,
+        environ,
+        session,
+        appview_url,
+        lexicon.method.list_tags,
+        &.{},
+        lexicon.TagsPage,
+    );
+    switch (outcome) {
+        .failed => |failure| return .{ .failed = failure },
+        .ok => |page| return .{ .ok = page.tags },
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Loopback round trip — a scripted fixture PDS serves two timeline pages;
 // the second request must carry the first page's cursor on the wire, and a

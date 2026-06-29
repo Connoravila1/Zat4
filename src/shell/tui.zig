@@ -521,6 +521,15 @@ pub fn run(
     var zone_tag: []const u8 = "";
     var zone_dirty = false;
     var zone_return_screen: u8 = 0;
+    // Zones BROWSE catalog (`screen_zones_browse`): gpa-owned zone cards (the
+    // display tag duped + post count), (re)fetched from `listTags` on entering
+    // the browse screen. Each card taps to its zone feed; freed on exit.
+    var zone_catalog: std.ArrayList(feed_view.ZoneCard) = .empty;
+    var on_browse_prev = false;
+    defer {
+        for (zone_catalog.items) |zc| gpa.free(zc.tag);
+        zone_catalog.deinit(gpa);
+    }
     // RE-ROOT mode: false when a thread is opened from the timeline (show the WHOLE
     // thread, scroll to the focus); true when a reply is tapped INSIDE the thread
     // (re-root on it: condensed ancestors above + the focus + its subtree).
@@ -788,6 +797,32 @@ pub fn run(
         }
         on_zone_prev = on_zone;
 
+        // Zones BROWSE: on ENTERING the catalog screen, fetch the zone set
+        // (`listTags`) into the owned catalog. Metadata, not posts — it doesn't
+        // touch the store. Contained failure (E2): the grid just stays as it was.
+        const on_browse = mode == .timeline and gscreen == feed_view.screen_zones_browse;
+        if (on_browse and !on_browse_prev) {
+            const zo = feed_shell.loadZones(gpa, arena, io, environ, session, appview_url) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => blk: {
+                    status = "zones: network error"; // contained
+                    break :blk null;
+                },
+            };
+            if (zo) |result| switch (result) {
+                .ok => |tags| {
+                    for (zone_catalog.items) |zc| gpa.free(zc.tag);
+                    zone_catalog.clearRetainingCapacity();
+                    for (tags) |t| {
+                        const dup = try gpa.dupe(u8, t.tag);
+                        try zone_catalog.append(gpa, .{ .tag = dup, .count = t.count });
+                    }
+                },
+                .failed => status = "zones: unavailable",
+            };
+        }
+        on_browse_prev = on_browse;
+
         // The ACTIVE view: Home (one ordering over the store), the profile screen
         // (the TARGET author's posts), a post's THREAD, or a ZONE (a tag query) —
         // each a query over the SAME store. One list of view-models the render +
@@ -895,7 +930,7 @@ pub fn run(
             home_tray;
         const cur_socket_ui = if (on_thread_screen) reply_ui else if (on_zone_screen) zone_ui else gsocket_ui;
         const cur_socket_hits = if (on_thread_screen) &reply_hits else if (on_zone_screen) &zone_hits else &gsocket_hits;
-        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = lens_socket.seatedAccent(home_tray), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "" } else null;
+        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = lens_socket.seatedAccent(home_tray), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{} } else null;
         switch (mode) {
             .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status),
             .compose => {
@@ -1643,6 +1678,22 @@ pub fn run(
                                                     gscroll_px = 0;
                                                     gsocket_ui.open = false; // tuck the home socket
                                                 }
+                                            }
+                                        },
+                                        // Zone card (browse grid) → ENTER its zone. The
+                                        // region carries the catalog index in `post`; resolve
+                                        // its display tag and open the zone page (the
+                                        // fetch-on-enter pulls the feed, like a tag pill).
+                                        .zone_open => if (hit.post < zone_catalog.items.len) {
+                                            const t = zone_catalog.items[hit.post].tag;
+                                            if (t.len > 0 and t.len <= zone_tag_buf.len) {
+                                                @memcpy(zone_tag_buf[0..t.len], t);
+                                                if (gscreen != feed_view.screen_zones) zone_return_screen = gscreen;
+                                                zone_tag = zone_tag_buf[0..t.len];
+                                                gscreen = feed_view.screen_zones;
+                                                zone_dirty = true;
+                                                gscroll_px = 0;
+                                                gsocket_ui.open = false;
                                             }
                                         },
                                         // Settings → Sign out: flag it and leave the
@@ -2693,6 +2744,9 @@ const Grid = struct {
     /// The open zone's display tag (e.g. "water") when on the zone page — the
     /// "#name" title in its header. "" on every other screen.
     zone_title: []const u8 = "",
+    /// The zone CATALOG for the browse screen (`screen_zones_browse`): the known
+    /// zones with post counts. Empty on every other screen.
+    zones: []const feed_view.ZoneCard = &.{},
 };
 
 // ===========================================================================
@@ -3172,7 +3226,7 @@ fn paintFrame(
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
                 g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits) catch g.content_h.*;
             } else {
-                g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, null, null, g.zone_title) catch g.content_h.*;
+                g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, null, null, g.zone_title, g.zones) catch g.content_h.*;
             }
             const t_layout = if (debug_frame_timing) clock_shell.monotonicNanos() else 0;
             window_shell.presentDrawList(win, gpa, g.engine, g.draw.slice(), field_core.background) catch {}; // E2: a lost blit is the next frame's problem
@@ -3467,7 +3521,7 @@ fn paintFrameGpu(
             // skip_heart=true on every screen: the SDF heart pass (drawEngagementHearts,
             // below) draws the heart in place for each visible like button of the
             // ACTIVE view, so layout never draws its own — one heart, one pipeline.
-            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, &chain_info, &gs.sel_glyphs, g.zone_title) catch g.content_h.*;
+            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, &chain_info, &gs.sel_glyphs, g.zone_title, g.zones) catch g.content_h.*;
         }
         gpu.feedBuild(&gs.feed, gpa, g.engine, g.draw.slice(), scale) catch {};
 
@@ -3926,7 +3980,7 @@ fn drawSdfIcons(g: Grid, gs: *GpuState, items: []const feed_core.TimelineItem, v
             .nav => if (g.screen.* != feed_view.screen_loadout) {
                 const id: i32 = switch (r.post) {
                     0 => gpu.icon_home,
-                    1 => gpu.icon_search,
+                    1 => gpu.icon_hash, // Zones
                     2 => gpu.icon_heart, // Activity
                     3 => gpu.icon_reply, // Messages
                     4 => gpu.icon_sliders, // Algorithms
