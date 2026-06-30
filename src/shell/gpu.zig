@@ -202,9 +202,12 @@ fn load() Error!void {
     glGetUniformLocation = try sym(lib_gl, P_GetUniformLocation, "glGetUniformLocation");
     glUniform4f = try sym(lib_gl, P_Uniform4f, "glUniform4f");
     glUniform2f = try sym(lib_gl, P_Uniform2f, "glUniform2f");
+    glUniform3f = try sym(lib_gl, P_Uniform3f, "glUniform3f");
     glUniform1f = try sym(lib_gl, P_Uniform1f, "glUniform1f");
     glUniform1i = try sym(lib_gl, P_Uniform1i, "glUniform1i");
     glEnable = try sym(lib_gl, P_Enable, "glEnable");
+    glDisable = try sym(lib_gl, P_Enable, "glDisable");
+    glScissor = try sym(lib_gl, P_Scissor, "glScissor");
     glBlendFunc = try sym(lib_gl, P_BlendFunc, "glBlendFunc");
     glDrawArrays = try sym(lib_gl, P_DrawArrays, "glDrawArrays");
     glGetErrorGL = try sym(lib_gl, P_GetErrorGL, "glGetError");
@@ -341,9 +344,11 @@ const P_PixelStorei = *const fn (GLenum, GLint) callconv(.c) void;
 const P_GetUniformLocation = *const fn (GLuint, [*:0]const GLchar) callconv(.c) GLint;
 const P_Uniform4f = *const fn (GLint, GLfloat, GLfloat, GLfloat, GLfloat) callconv(.c) void;
 const P_Uniform2f = *const fn (GLint, GLfloat, GLfloat) callconv(.c) void;
+const P_Uniform3f = *const fn (GLint, GLfloat, GLfloat, GLfloat) callconv(.c) void;
 const P_Uniform1f = *const fn (GLint, GLfloat) callconv(.c) void;
 const P_Uniform1i = *const fn (GLint, GLint) callconv(.c) void;
 const P_Enable = *const fn (GLenum) callconv(.c) void;
+const P_Scissor = *const fn (GLint, GLint, GLsizei, GLsizei) callconv(.c) void;
 const P_BlendFunc = *const fn (GLenum, GLenum) callconv(.c) void;
 const P_DrawArrays = *const fn (GLenum, GLint, GLsizei) callconv(.c) void;
 const P_GetErrorGL = *const fn () callconv(.c) GLenum;
@@ -374,9 +379,12 @@ var glPixelStorei: P_PixelStorei = undefined;
 var glGetUniformLocation: P_GetUniformLocation = undefined;
 var glUniform4f: P_Uniform4f = undefined;
 var glUniform2f: P_Uniform2f = undefined;
+var glUniform3f: P_Uniform3f = undefined;
 var glUniform1f: P_Uniform1f = undefined;
 var glUniform1i: P_Uniform1i = undefined;
 var glEnable: P_Enable = undefined;
+var glDisable: P_Enable = undefined;
+var glScissor: P_Scissor = undefined;
 var glBlendFunc: P_BlendFunc = undefined;
 var glDrawArrays: P_DrawArrays = undefined;
 var glGetErrorGL: P_GetErrorGL = undefined;
@@ -405,6 +413,18 @@ const GL_TEXTURE_WRAP_S: GLenum = 0x2802;
 const GL_TEXTURE_WRAP_T: GLenum = 0x2803;
 const GL_CLAMP_TO_EDGE: GLint = 0x812F;
 const GL_BLEND: GLenum = 0x0BE2;
+const GL_SCISSOR_TEST: GLenum = 0x0C11;
+
+/// Clip subsequent draws to a window-pixel rectangle (GL bottom-left origin) — so
+/// a full-screen-triangle shader (the heart SDF) only shades that small box
+/// instead of the whole framebuffer. `popScissor` MUST follow to restore drawing.
+pub fn pushScissor(x: i32, y: i32, w: i32, h: i32) void {
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(@max(0, x), @max(0, y), @max(0, w), @max(0, h));
+}
+pub fn popScissor() void {
+    glDisable(GL_SCISSOR_TEST);
+}
 const GL_SRC_ALPHA: GLenum = 0x0302;
 const GL_ONE_MINUS_SRC_ALPHA: GLenum = 0x0303;
 const GL_UNPACK_ALIGNMENT: GLenum = 0x0CF5;
@@ -962,6 +982,14 @@ const field_grid_frag_src: [:0]const GLchar =
     \\uniform vec2 uMouse;       // cursor in cells (x<0 ⇒ no cursor)
     \\uniform sampler2D uDye;    // R32F persistent colour charge, cols×rows
     \\uniform vec2 uPanel;       // content-column x-range in px (l,r); l>=r ⇒ none
+    \\uniform vec3 uInk;         // base glyph colour (bright endpoint); pink in Julia mode
+    \\uniform float uHeart;      // Julia mode: >0.5 ⇒ the cursor light pool is HEART-shaped
+    \\// Classic implicit heart curve: <0 inside, 0 on the outline, >0 outside.
+    \\// p is in heart space (origin at the heart's centre, y pointing UP).
+    \\float juliaHeart(vec2 p) {
+    \\  float a = p.x * p.x + p.y * p.y - 1.0;
+    \\  return a * a * a - p.x * p.x * p.y * p.y * p.y;
+    \\}
     \\void main() {
     \\  vec2 px = vec2(gl_FragCoord.x, uViewport.y - gl_FragCoord.y); // top-down
     \\  vec2 cell = floor(px / uCell);
@@ -977,7 +1005,20 @@ const field_grid_frag_src: [:0]const GLchar =
     \\  float pool = max(0.0, 1.0 - distance(cell + 0.5, vec2(lx, ly)) / (cols * 0.85));
     \\  // CURSOR LIGHT: a soft, brighter halo follows the pointer and reveals
     \\  // the field around it — the field's own light mechanic, localized to you.
-    \\  float cg = (uMouse.x >= 0.0) ? 0.55 * max(0.0, 1.0 - distance(cell + 0.5, uMouse) / 9.0) : 0.0;
+    \\  float cg = 0.0;
+    \\  if (uMouse.x >= 0.0) {
+    \\    if (uHeart > 0.5) {
+    \\      // The cursor pool reshaped into a heart: normalise into heart space,
+    \\      // flip screen-y (down) to maths-y (up), scale + recentre so it fills the
+    \\      // halo, then light the inside with a soft edge.
+    \\      vec2 hp = (cell + 0.5 - uMouse) / 7.0;
+    \\      hp = vec2(hp.x, -hp.y) * 1.3;
+    \\      hp.y += 0.35;
+    \\      cg = 0.62 * smoothstep(0.25, -0.45, juliaHeart(hp));
+    \\    } else {
+    \\      cg = 0.55 * max(0.0, 1.0 - distance(cell + 0.5, uMouse) / 9.0);
+    \\    }
+    \\  }
     \\  float b = 0.38 + 0.55 * pool + cg;
     \\  // persistent colour charge from effects (a like stains it red)
     \\  float dye = clamp(texture2D(uDye, (cell + 0.5) / uFieldSize).r, 0.0, 1.0);
@@ -999,8 +1040,18 @@ const field_grid_frag_src: [:0]const GLchar =
     \\  float idx = floor(dn * (uRampN - 1.0) + 0.5);
     \\  vec2 local = fract(px / uCell);
     \\  vec2 ruv = vec2((idx + local.x) / uRampN, local.y);
-    \\  float cov = texture2D(uRamp, ruv).r;
-    \\  cov = max(cov, glow * 0.5);             // bloom: soft halo beyond the glyphs
+    \\  float cov;
+    \\  if (uHeart > 0.5) {
+    \\    // JULIA MODE: each lit cell's glyph IS a little heart — a solid SDF shape
+    \\    // (the actual symbol), not a glow blob. Replaces the ASCII ramp glyph.
+    \\    vec2 lc = (local - vec2(0.5)) * 2.3;          // -1..1 across the cell
+    \\    lc = vec2(lc.x, -lc.y) * 1.15; lc.y += 0.35;  // into heart space, y up
+    \\    cov = smoothstep(0.10, -0.35, juliaHeart(lc));
+    \\    cov = max(cov, glow * 0.22);                  // faint halo; the heart dominates
+    \\  } else {
+    \\    cov = texture2D(uRamp, ruv).r;
+    \\    cov = max(cov, glow * 0.5);                   // bloom: soft halo beyond the glyphs
+    \\  }
     \\  // cool grey-white, dimmer; tinting to the rose 'like' colour where dyed.
     \\  float lum = clamp(0.35 + b * 0.45 + intensity * 0.30, 0.0, 1.05);
     \\  // VIGNETTE: dim the ambient field toward the screen edges for depth +
@@ -1011,8 +1062,9 @@ const field_grid_frag_src: [:0]const GLchar =
     \\  // DEPTH: a slow large-scale undulation so the field reads as a VOLUME with
     \\  // near/far regions, not one flat plane. [REVERT: delete this line]
     \\  lum *= 0.86 + 0.14 * sin(cell.x * 0.06 + uTime * 0.025) * sin(cell.y * 0.08 - uTime * 0.02);
-    \\  // cool grey-white glyphs (the original palette, warmth reverted).
-    \\  vec3 base = mix(vec3(84.0, 89.0, 102.0) / 255.0, vec3(166.0, 172.0, 186.0) / 255.0, clamp(0.28 + b * 0.5, 0.0, 1.0));
+    \\  // glyph colour: dark→bright endpoints derived from uInk (cool grey-white
+    \\  // normally; pink in Julia mode). The glow rides this, so it recolours too.
+    \\  vec3 base = mix(uInk * 0.52, uInk, clamp(0.28 + b * 0.5, 0.0, 1.0));
     \\  vec3 col = mix(base, vec3(245.0, 80.0, 110.0) / 255.0, dyev);
     \\  lum = max(lum, dyev);                   // red reads even in quiet areas
     \\  lum += glow * 0.45;                     // bloom brightens around lit clusters
@@ -1054,6 +1106,8 @@ pub const FieldGrid = struct {
     u_mouse: GLint,
     u_dye: GLint,
     u_panel: GLint,
+    u_ink: GLint,
+    u_heart: GLint,
 };
 
 pub fn initFieldGrid() Error!FieldGrid {
@@ -1117,6 +1171,8 @@ pub fn initFieldGrid() Error!FieldGrid {
         .u_mouse = glGetUniformLocation(prog, "uMouse"),
         .u_dye = glGetUniformLocation(prog, "uDye"),
         .u_panel = glGetUniformLocation(prog, "uPanel"),
+        .u_ink = glGetUniformLocation(prog, "uInk"),
+        .u_heart = glGetUniformLocation(prog, "uHeart"),
     };
 }
 
@@ -1137,7 +1193,7 @@ pub fn uploadField(fg: *FieldGrid, height: []const f32, dye: []const f32, cols: 
 /// Draw the field grid-intensity. `fr` supplies the ramp texture + cell metrics
 /// (built by initFieldRenderer); `uploadField` must have run this frame.
 /// `mx`,`my` are the cursor in cells (top-down); pass mx<0 for no cursor.
-pub fn drawFieldGrid(fg: *FieldGrid, fr: *FieldRenderer, mx: f32, my: f32, time: f32, vw: i32, vh: i32, panel_l: f32, panel_r: f32) void {
+pub fn drawFieldGrid(fg: *FieldGrid, fr: *FieldRenderer, mx: f32, my: f32, time: f32, vw: i32, vh: i32, panel_l: f32, panel_r: f32, ink: u32, heart: bool) void {
     glUseProgram(fg.program);
     glBindBuffer(GL_ARRAY_BUFFER, fg.vbo);
     bindAttrib(fg.a_pos, 2, 2 * @sizeOf(f32), 0);
@@ -1158,6 +1214,10 @@ pub fn drawFieldGrid(fg: *FieldGrid, fr: *FieldRenderer, mx: f32, my: f32, time:
     glUniform1f(fg.u_gain, fg.gain);
     glUniform2f(fg.u_mouse, mx, my);
     glUniform2f(fg.u_panel, panel_l, panel_r);
+    // Base glyph colour (bright endpoint). Normally a cool grey-white; Julia mode
+    // passes pink so the whole field — glyphs and the glow that rides them — pinks.
+    glUniform3f(fg.u_ink, @as(f32, @floatFromInt((ink >> 16) & 0xFF)) / 255.0, @as(f32, @floatFromInt((ink >> 8) & 0xFF)) / 255.0, @as(f32, @floatFromInt(ink & 0xFF)) / 255.0);
+    glUniform1f(fg.u_heart, if (heart) 1.0 else 0.0);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDrawArrays(GL_TRIANGLES, 0, 3);

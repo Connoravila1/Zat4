@@ -631,6 +631,7 @@ test {
     _ = @import("shell/keystore.zig");
     _ = @import("core/feed.zig");
     _ = @import("core/feed_view.zig");
+    _ = @import("core/settings_view.zig");
     _ = @import("core/lens_socket.zig");
     _ = @import("core/lens_catalog.zig");
     _ = @import("shell/loadout.zig");

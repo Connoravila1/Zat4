@@ -59,6 +59,7 @@ const body: u32 = 0xFFD8D3C8; // detail-panel paragraph text
 const muted: u32 = 0xFF9A968A;
 const faint: u32 = 0xFF6A655A;
 const glass: u32 = 0xFF1C1B16; // the socket panel — OPAQUE (owner: no transparency)
+const julia_glass: u32 = 0xFFA6407A; // Julia mode: the socket panel goes bright rose
 const hairline: u32 = 0x18FFFFFF; // ~9% white edge
 const pill_bg: u32 = 0x14FFFFFF; // ~8% white card fill (reads on the dark panel)
 const pill_edge: u32 = 0x1FFFFFFF; // ~12% white card edge
@@ -195,7 +196,20 @@ pub const SocketUi = struct {
     /// 0 = actively dragging (ghost follows the pointer); 1..N = settling (ghost
     /// eases from the release point into its slot). The shell advances it.
     settle_phase: u8 = 0,
+    /// Toy Box "Julia mode": when set, every socket colour (card swatches, seated
+    /// accents, picker chips) renders `julia_pink` regardless of the lens's stored
+    /// colour — so no colour but pink can be seen or chosen. The shell mirrors the
+    /// settings toggle into this each frame.
+    julia: bool = false,
 };
+
+/// Julia mode's accent pink — a bright bubblegum hot-pink (girlier than the
+/// palette's muted rose). The whole-UI accent + every socket swatch take this.
+pub const julia_pink: u32 = 0xFFFF69B4;
+/// Julia mode's FIELD glyph ink — a saturated magenta, DARK enough to read as
+/// pink symbols on the now-WHITE field backdrop (light theme). Kept distinct from
+/// the accent so the field is its own layer.
+pub const julia_field_ink: u32 = 0xFFC81E84;
 
 /// Frames the drop-settle animation runs over (the ghost easing home).
 pub const settle_total_frames: u8 = 9;
@@ -488,10 +502,10 @@ pub fn build(
         .color = 2,
         .flags = .{},
     };
-    const acc = palette[@min(seat.color, palette.len - 1)];
+    const acc = if (ui.julia) julia_pink else palette[@min(seat.color, palette.len - 1)];
 
     // ---- 1. the socket panel (glass over the field) ----
-    try rect(gpa, dl, x0, y0, w, sock_h, glass, radius);
+    try rect(gpa, dl, x0, y0, w, sock_h, if (ui.julia) julia_glass else glass, radius);
     try rect(gpa, dl, x0, y0, w, fxi(1 * sc) + 1, hairline, radius); // top inner-light edge
     // contact rails, top & bottom (dashed, faint)
     const dash = fxi(6 * sc);
@@ -615,7 +629,7 @@ pub fn build(
     const expanded = exp != null;
     for (tray.cards, 0..) |card, i| {
         const seated = have and i == tray.seated;
-        const card_acc = palette[@min(card.color, palette.len - 1)];
+        const card_acc = if (ui.julia) julia_pink else palette[@min(card.color, palette.len - 1)];
 
         // The held/settling card rides the ghost (drawn last); skip its slot —
         // the gap it leaves is filled by the reflowing neighbours.
@@ -748,7 +762,7 @@ pub fn build(
             const chx = pop_x + fxi(8 * sc) + ccol * (chip + cgp);
             const chy = pop_y + fxi(8 * sc) + crow * (chip + cgp);
             if (card.color == ci) try rect(gpa, dl, chx - fxi(2 * sc), chy - fxi(2 * sc), chip + fxi(4 * sc), chip + fxi(4 * sc), ink, chip_rad); // selected ring
-            try rect(gpa, dl, chx, chy, chip, chip, palette[ci], chip_rad);
+            try rect(gpa, dl, chx, chy, chip, chip, if (ui.julia) julia_pink else palette[ci], chip_rad);
             try pushHit(gpa, hits, chx, chy, chip, chip, .swatch, span(tray, card.cid), @intCast(ci));
         }
     };
@@ -786,7 +800,7 @@ pub fn build(
     // (a quick ease), and carries a LIFT (scale + shadow) that fades as it lands.
     if (dragging) |d| {
         const card = tray.cards[d];
-        const card_acc = palette[@min(card.color, palette.len - 1)];
+        const card_acc = if (ui.julia) julia_pink else palette[@min(card.color, palette.len - 1)];
         const from_x = ui.drag_x - @divTrunc(card_w, 2);
         const from_y = ui.drag_y - @divTrunc(card_h, 2);
         var gx = from_x;
@@ -819,7 +833,7 @@ pub fn build(
     if (exp) |ex| {
         if (grid_top + row_e * (card_h + col_gap) + card_h + col_gap + detail_h <= reveal_bottom + fxi(2 * sc)) {
         const card = tray.cards[ex];
-        const card_acc = palette[@min(card.color, palette.len - 1)];
+        const card_acc = if (ui.julia) julia_pink else palette[@min(card.color, palette.len - 1)];
         const py = grid_top + row_e * (card_h + col_gap) + card_h + col_gap;
         try rect(gpa, dl, grid_x, py, grid_w, detail_h, soft(card_acc, 0x14), cart_radius);
         try rect(gpa, dl, grid_x, py, grid_w, fxi(1 * sc) + 1, soft(card_acc, 0x66), cart_radius);

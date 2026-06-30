@@ -566,7 +566,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         const margin: f32 = 52;
         const panel_l: f32 = (card_left - margin) * scale;
         const panel_r: f32 = (card_left + 460.0 + margin) * scale;
-        gpu.drawFieldGrid(&field_grid, &field_renderer, mcx, mcy, t, @intCast(W), @intCast(H), panel_l, panel_r);
+        gpu.drawFieldGrid(&field_grid, &field_renderer, mcx, mcy, t, @intCast(W), @intCast(H), panel_l, panel_r, 0xFFA6ACBA, false); // enroll is pre-auth: default grey-white ink, no hearts
         gpu.feedDraw(&feed_path, @intCast(W), @intCast(H));
         gpu.swap(&g);
     }

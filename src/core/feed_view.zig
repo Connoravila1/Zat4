@@ -39,6 +39,7 @@ const lens_socket = @import("lens_socket.zig");
 const text_select = @import("text_select.zig");
 const timefmt = @import("timefmt.zig");
 const compose = @import("compose.zig");
+const settings_view = @import("settings_view.zig");
 
 // Palette, copied from field.zig so the view never reaches across a module
 // for a constant (D4: only the value crosses, by copy). ARGB.
@@ -65,6 +66,61 @@ const tag_blue: u32 = 0xFF4DA3FF;
 const icon_grey: u32 = 0xFFB4B1A8;
 const veil: u32 = 0xD4181812; // ~83% over the field — texture glows faintly through
 const header_veil: u32 = 0xF2181812; // ~95%: the sticky top bar, drawn OVER the posts so
+// Julia mode: the menu surfaces go DIFFERENT shades of pink instead of near-black
+// (the glass column, the sticky bars, and the cards each a distinct plum-pink).
+// Chosen via `juliaSkin(accent)` so no new param threads through layout.
+const veil_julia: u32 = 0xEAA83870; // glass column — saturated rose, high opacity
+const header_veil_julia: u32 = 0xF49A305F; // sticky bars — deeper rose, near-opaque
+const panel_julia: u32 = 0xF0C24E86; // cards / rail — bright bubblegum
+
+// Julia mode is detected from the accent token (already threaded everywhere), so
+// the menu skinning needs no extra parameter on layout()/the draw functions.
+inline fn skinVeil(accent: u32) u32 {
+    return if (accent == lens_socket.julia_pink) veil_julia else veil;
+}
+inline fn skinHeaderVeil(accent: u32) u32 {
+    return if (accent == lens_socket.julia_pink) header_veil_julia else header_veil;
+}
+inline fn skinPanel(accent: u32) u32 {
+    return if (accent == lens_socket.julia_pink) panel_julia else panel;
+}
+
+// Julia mode is a LIGHT theme (white field, bright pink panels), so the text must
+// go DARK to read. Rather than thread a flag through ~120 text-draw sites, the
+// shell calls `juliaRemapText` over the finished draw list: the three text inks
+// are known constants, so they're remapped by value in one pass. (lens_socket
+// shares the same ink/muted/faint values, so the socket text is remapped too.)
+// Light theme on deep-pink panels → WHITE text reads best. Primary pure white;
+// secondary/tertiary a soft pink-white so the hierarchy survives.
+const ink_julia: u32 = 0xFFFFFFFF; // names, body, titles
+const muted_julia: u32 = 0xFFF4E2EC; // handles, secondary
+const faint_julia: u32 = 0xFFE6C6D8; // tertiary (TRENDING sub-lines, etc.)
+
+/// Remap the three UI text inks to their dark Julia-mode variants, in place, over
+/// the finished draw list (TextItems only — rects/lit-edges that reuse the ink
+/// value as a tint are untouched). Idempotent-ish: only the three exact colours
+/// move. The shell calls this when Julia mode is on, before the GPU upload.
+pub fn juliaRemapText(dl: *raster.DrawList) void {
+    var i: usize = 0;
+    while (i < dl.len) : (i += 1) {
+        var item = dl.get(i);
+        switch (item) {
+            .text => |*t| {
+                const nc: ?u32 = switch (t.color) {
+                    ink => ink_julia,
+                    muted => muted_julia,
+                    faint => faint_julia,
+                    else => null,
+                };
+                if (nc) |c| {
+                    t.color = c;
+                    dl.set(i, item);
+                }
+            },
+            else => {},
+        }
+    }
+}
 // they scroll BEHIND it (firmly dimmed), the title/tabs crisp on top — a frosted header
 // ambient-texture slice will lower this so the living field glows through.
 const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
@@ -75,7 +131,11 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// `compose` (the New-post button) route navigation rather than engagement.
 /// `compose_send` / `compose_cancel` are the premium composer's footer buttons
 /// (the shell turns a tap into the same control byte the keyboard sends).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline };
+/// `settings_section` selects the left-hand settings section (carries the
+/// section index in `post`); `settings_row` is a detail-pane row tap (carries
+/// the global row index — inert scaffold today, except `act_sign_out` rows which
+/// the renderer emits as `.sign_out` so that one wired control keeps working).
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row };
 
 /// The six top-level rail destinations, in order. The `Screen` index a nav
 /// region carries is an index into this. Shared by the rail (draw + hit) and
@@ -388,6 +448,14 @@ fn metricsPage(width: i32, active_screen: u8) Metrics {
     // region stays on the left (lx/cw unchanged), `side_x` = the extension start.
     if (active_screen == screen_profile) {
         return .{ .rail_x = m.rail_x, .col_x = m.col_x, .col_w = wide_w, .lx = m.lx, .cw = m.cw, .side_x = m.side_x, .wide = true };
+    }
+    // SETTINGS is a master–detail surface (a section list + a detail pane), so it
+    // wants the FULL wide column with a modest gutter — not the narrow centred
+    // reading column the other wide pages use. This sits the title + panes left,
+    // toward the rail, so the two panes balance instead of leaving a big left gap.
+    if (active_screen == screen_settings) {
+        const gut: i32 = 34;
+        return .{ .rail_x = m.rail_x, .col_x = m.col_x, .col_w = wide_w, .lx = m.col_x + gut, .cw = wide_w - 2 * gut, .side_x = m.col_x + wide_w, .wide = true };
     }
     // Every OTHER wide page (zone, browse, settings, Algorithms) centres a
     // comfortable content column in the wide glass — no side panel; the freed
@@ -832,6 +900,75 @@ fn iconZones(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, s: i32, c: u3
     try line(gpa, dl, x + fxi(f * 0.08), y + fxi(f * 0.64), x + fxi(f * 0.82), y + fxi(f * 0.64), c, 2);
 }
 
+/// A right-pointing disclosure chevron (the iOS ">"). Two strokes meeting at a
+/// point, drawn within an `s`×`s` box.
+fn iconChevron(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, s: i32, c: u32) !void {
+    const f: f32 = @floatFromInt(s);
+    const tipx = x + fxi(f * 0.62);
+    try line(gpa, dl, x + fxi(f * 0.40), y + fxi(f * 0.24), tipx, y + fxi(f * 0.5), c, 2);
+    try line(gpa, dl, tipx, y + fxi(f * 0.5), x + fxi(f * 0.40), y + fxi(f * 0.76), c, 2);
+}
+
+/// A notification bell — a dome on a base with a clapper dot.
+fn iconBell(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, s: i32, c: u32) !void {
+    const f: f32 = @floatFromInt(s);
+    try line(gpa, dl, x + fxi(f * 0.5), y + fxi(f * 0.08), x + fxi(f * 0.5), y + fxi(f * 0.16), c, 2); // top stem
+    try line(gpa, dl, x + fxi(f * 0.24), y + fxi(f * 0.70), x + fxi(f * 0.30), y + fxi(f * 0.30), c, 2); // left wall
+    try line(gpa, dl, x + fxi(f * 0.76), y + fxi(f * 0.70), x + fxi(f * 0.70), y + fxi(f * 0.30), c, 2); // right wall
+    try line(gpa, dl, x + fxi(f * 0.30), y + fxi(f * 0.30), x + fxi(f * 0.70), y + fxi(f * 0.30), c, 2); // shoulder
+    try line(gpa, dl, x + fxi(f * 0.18), y + fxi(f * 0.70), x + fxi(f * 0.82), y + fxi(f * 0.70), c, 2); // rim
+    try rect(gpa, dl, x + fxi(f * 0.44), y + fxi(f * 0.78), fxi(f * 0.12), fxi(f * 0.12), c, @intCast(fxi(f * 0.06))); // clapper
+}
+
+/// A safety shield — a crest outline narrowing to a point.
+fn iconShield(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, s: i32, c: u32) !void {
+    const f: f32 = @floatFromInt(s);
+    const tipx = x + fxi(f * 0.5);
+    try line(gpa, dl, x + fxi(f * 0.18), y + fxi(f * 0.16), tipx, y + fxi(f * 0.08), c, 2); // top-left
+    try line(gpa, dl, x + fxi(f * 0.82), y + fxi(f * 0.16), tipx, y + fxi(f * 0.08), c, 2); // top-right
+    try line(gpa, dl, x + fxi(f * 0.18), y + fxi(f * 0.16), x + fxi(f * 0.20), y + fxi(f * 0.56), c, 2); // left wall
+    try line(gpa, dl, x + fxi(f * 0.82), y + fxi(f * 0.16), x + fxi(f * 0.80), y + fxi(f * 0.56), c, 2); // right wall
+    try line(gpa, dl, x + fxi(f * 0.20), y + fxi(f * 0.56), tipx, y + fxi(f * 0.92), c, 2); // left to point
+    try line(gpa, dl, x + fxi(f * 0.80), y + fxi(f * 0.56), tipx, y + fxi(f * 0.92), c, 2); // right to point
+}
+
+/// A lab flask — the Toy Box mark (experimental). Neck, flared body, a hint of
+/// fill.
+fn iconFlask(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, s: i32, c: u32) !void {
+    const f: f32 = @floatFromInt(s);
+    try line(gpa, dl, x + fxi(f * 0.40), y + fxi(f * 0.10), x + fxi(f * 0.40), y + fxi(f * 0.40), c, 2); // neck left
+    try line(gpa, dl, x + fxi(f * 0.60), y + fxi(f * 0.10), x + fxi(f * 0.60), y + fxi(f * 0.40), c, 2); // neck right
+    try line(gpa, dl, x + fxi(f * 0.34), y + fxi(f * 0.10), x + fxi(f * 0.66), y + fxi(f * 0.10), c, 2); // mouth
+    try line(gpa, dl, x + fxi(f * 0.40), y + fxi(f * 0.40), x + fxi(f * 0.18), y + fxi(f * 0.86), c, 2); // body left
+    try line(gpa, dl, x + fxi(f * 0.60), y + fxi(f * 0.40), x + fxi(f * 0.82), y + fxi(f * 0.86), c, 2); // body right
+    try line(gpa, dl, x + fxi(f * 0.18), y + fxi(f * 0.86), x + fxi(f * 0.82), y + fxi(f * 0.86), c, 2); // base
+    try rect(gpa, dl, x + fxi(f * 0.30), y + fxi(f * 0.66), fxi(f * 0.40), fxi(f * 0.18), c, 2); // liquid
+}
+
+/// An info mark — a circle with an "i" (a dot over a stem).
+fn iconInfo(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, s: i32, c: u32) !void {
+    const f: f32 = @floatFromInt(s);
+    const cx = x + fxi(f * 0.5);
+    const cy = y + fxi(f * 0.5);
+    try ring(gpa, dl, cx, cy, f * 0.42, c, 2, 12);
+    try rect(gpa, dl, cx - fxi(f * 0.05), y + fxi(f * 0.24), fxi(f * 0.10), fxi(f * 0.10), c, @intCast(fxi(f * 0.05))); // dot
+    try rect(gpa, dl, cx - fxi(f * 0.05), y + fxi(f * 0.44), fxi(f * 0.10), fxi(f * 0.30), c, 1); // stem
+}
+
+/// Map a settings SECTION icon tag to its line-art drawer (keeping the schema
+/// free of draw concerns). Reuses the existing nav vocabulary where it fits.
+fn settingsIcon(icon: settings_view.Icon, gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, s: i32, c: u32) !void {
+    switch (icon) {
+        .account => try iconPerson(gpa, dl, x, y, s, c),
+        .appearance => try iconAlgorithms(gpa, dl, x, y, s, c),
+        .feed => try iconHome(gpa, dl, x, y, s, c),
+        .notifications => try iconBell(gpa, dl, x, y, s, c),
+        .privacy => try iconShield(gpa, dl, x, y, s, c),
+        .toybox => try iconFlask(gpa, dl, x, y, s, c),
+        .about => try iconInfo(gpa, dl, x, y, s, c),
+    }
+}
+
 fn navIcon(idx: usize, gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, s: i32, c: u32) !void {
     switch (idx) {
         0 => try iconHome(gpa, dl, x, y, s, c),
@@ -865,7 +1002,7 @@ fn drawRail(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, rx: i32
     _ = try str(gpa, dl, e, .semibold, wm, 58, (ink & 0x00FFFFFF) | ea, 26, ".");
 
     // The nav GROUP box (visible always; just narrower when condensed).
-    try rect(gpa, dl, x0 - 2, 94, box_w, 304, panel, 18);
+    try rect(gpa, dl, x0 - 2, 94, box_w, 304, skinPanel(accent), 18);
 
     // Visual ORDER of the nav rows (each row's `idx` is still its Screen — the
     // region/icon/active mapping is unchanged; only the on-screen order differs).
@@ -895,7 +1032,7 @@ fn drawRail(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, rx: i32
         try emitRegion(gpa, regions, x0 + 6, ny, rail_w - 44, 50, 0, .compose);
 
         const by = height - 60;
-        try rect(gpa, dl, x0 - 2, by - 10, rail_w - 24, 58, (panel & 0x00FFFFFF) | ea, 16);
+        try rect(gpa, dl, x0 - 2, by - 10, rail_w - 24, 58, (skinPanel(accent) & 0x00FFFFFF) | ea, 16);
         try rect(gpa, dl, x0 + 6, by, 38, 38, (0x00FF3F3B2D & 0x00FFFFFF) | ea, 19);
         _ = try str(gpa, dl, e, .semibold, x0 + 54, by + 16, (ink & 0x00FFFFFF) | ea, 14, "you");
         _ = try str(gpa, dl, e, .regular, x0 + 54, by + 33, (faint & 0x00FFFFFF) | ea, 12, "@you.zat");
@@ -903,14 +1040,14 @@ fn drawRail(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, rx: i32
     }
 }
 
-fn drawSidebar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, sx: i32, height: i32, search_open: f32) !void {
+fn drawSidebar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, sx: i32, height: i32, search_open: f32, accent: u32) !void {
     const x0 = sx + 16;
     const w = side_w - 32;
     const so = std.math.clamp(search_open, 0, 1);
     const searching = so > 0.02;
 
     // search field (lights up while open)
-    try rect(gpa, dl, x0, 28, w, 46, panel, 13);
+    try rect(gpa, dl, x0, 28, w, 46, skinPanel(accent), 13);
     if (searching) {
         try rect(gpa, dl, x0, 28, w, 2, accent_house, 0);
         try rect(gpa, dl, x0, 72, w, 2, accent_house, 0);
@@ -947,7 +1084,7 @@ fn drawSidebar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, sx: 
     // trending — pushed down by the open search tile
     const ty: i32 = 92 + push;
     const th: i32 = 234;
-    try rect(gpa, dl, x0, ty, w, th, panel, 15);
+    try rect(gpa, dl, x0, ty, w, th, skinPanel(accent), 15);
     _ = try str(gpa, dl, e, .semibold, x0 + 18, ty + 28, faint, 12, "TRENDING");
     const trends = [_][3][]const u8{
         .{ "protocol", "at://small-net", "2,481 posts" },
@@ -966,7 +1103,7 @@ fn drawSidebar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, sx: 
     // who to follow
     const wy: i32 = ty + th + 18;
     const wh: i32 = 196;
-    try rect(gpa, dl, x0, wy, w, wh, panel, 15);
+    try rect(gpa, dl, x0, wy, w, wh, skinPanel(accent), 15);
     _ = try str(gpa, dl, e, .semibold, x0 + 18, wy + 28, faint, 12, "WHO TO FOLLOW");
     const who = [_][2][]const u8{ .{ "Desh", "@desh.zat" }, .{ "atlas", "@atlas.zat" }, .{ "rune", "@rune.zat" } };
     const tints = [_]u32{ 0xFF9FB0C7, 0xFFC9A87A, 0xFFB59EC9 };
@@ -1109,6 +1246,15 @@ pub fn layout(
     /// the shell's partition and handed in, so the real UI renders into those
     /// rects (and morphs as they animate). Null ⇒ self-computed `metricsPage`.
     geom: ?PaneGeom,
+    /// The selected left-hand SECTION on the Settings screen (`screen_settings`)
+    /// — index into `settings_view.sections`. The shell owns this selection (it
+    /// is master–detail state, like the zone/thread return-screen vars); ignored
+    /// on every other screen. 0 = the first section (Account).
+    settings_section: u8,
+    /// Runtime on/off state of the Settings toggles — a bitset indexed by GLOBAL
+    /// row index (the shell owns it; seeded from each toggle's `flag_on` default).
+    /// A toggle row renders on iff its bit is set. Ignored off `screen_settings`.
+    settings_toggles: u64,
 ) error{OutOfMemory}!i32 {
     const m: Metrics = if (geom) |g|
         .{ .rail_x = g.rail_x, .col_x = g.col_x, .col_w = g.col_w, .lx = g.lx, .cw = g.cw, .side_x = g.side_x, .wide = g.wide }
@@ -1137,7 +1283,7 @@ pub fn layout(
             try rect(gpa, dl, m.col_x + m.col_w + k * step, 0, step, height, shade, 0); // right gutter
         }
     }
-    try rect(gpa, dl, m.col_x, 0, m.col_w, height, veil, 0); // glass fill
+    try rect(gpa, dl, m.col_x, 0, m.col_w, height, skinVeil(accent), 0); // glass fill
     if (m.wide) {
         try rect(gpa, dl, m.col_x, 0, 1, height, 0x24EDEAE0, 0); // left lit edge
         try rect(gpa, dl, m.col_x + m.col_w - 1, 0, 1, height, 0x24EDEAE0, 0); // right lit edge
@@ -1159,7 +1305,7 @@ pub fn layout(
         if (!(geom != null and geom.?.rail_external))
             try drawRail(gpa, dl, e, m.rail_x, height, active_screen, regions, accent, skip_heart, 1.0);
         if (!isWidePage(active_screen)) {
-            try drawSidebar(gpa, dl, e, m.side_x, height, if (geom) |gg| gg.search_open else 0); // home/thread: floating 3-pane sidebar
+            try drawSidebar(gpa, dl, e, m.side_x, height, if (geom) |gg| gg.search_open else 0, accent); // home/thread: floating 3-pane sidebar
         } else if (active_screen == screen_profile) {
             try drawExtension(gpa, dl, e, m, height, regions); // profile: customisable widgets
         } else {
@@ -1204,26 +1350,10 @@ pub fn layout(
         // returns its content height directly — no post loop, no top bar.
         return try drawZonesBrowse(gpa, dl, e, m, height, scroll, regions, accent, zones);
     } else if (active_screen == screen_settings) {
-        // Settings is otherwise a placeholder, but it hosts the one wired control
-        // we need today: Sign out — clears the cached session, so the app returns
-        // to the Join/login flow on the next launch.
-        const top = headerBottom(active_screen) + 28;
-        const bw: i32 = @min(280, m.col_w - 44);
-        const bx = m.col_x + @divTrunc(m.col_w - bw, 2);
-        _ = try str(gpa, dl, e, .semibold, bx, top + 4, ink, 17, "Account");
-        _ = try str(gpa, dl, e, .regular, bx, top + 28, muted, 13, "Sign out of Zat4 on this device.");
-        const by = top + 50;
-        const bh: u16 = 46;
-        // A bordered (not filled-accent) button — sign-out is a calm, deliberate
-        // action, not a primary call-to-action.
-        try rect(gpa, dl, bx, by, bw, bh, 0x14EDEAE0, 12); // subtle fill
-        try rect(gpa, dl, bx, by, bw, 1, 0x33EDEAE0, 12); // lit top edge
-        const label = "Sign out";
-        const lw: i32 = @intCast(text.measure(e, .semibold, label, 15));
-        _ = try str(gpa, dl, e, .semibold, bx + @divTrunc(bw - lw, 2), by + 29, ink, 15, label);
-        try emitRegion(gpa, regions, bx, by, bw, bh, 0, .sign_out);
-        try drawTopBar(gpa, dl, e, m, active_screen, regions, profile, accent, socket_tray, socket_ui, socket_hits, zone_title, 0);
-        return height;
+        // Settings draws its own master–detail body (a left section list + the
+        // selected section's grouped rows) and owns its scroll, returning content
+        // height directly — no post loop, no top bar (it draws its own title).
+        return try drawSettings(gpa, dl, e, m, height, scroll, regions, accent, settings_section, settings_toggles);
     } else if (active_screen != 0) {
         const msg = "Coming soon";
         const tw: i32 = @intCast(text.measure(e, .regular, msg, 16));
@@ -1610,7 +1740,6 @@ fn aScale(c: u32, al: f32) u32 {
 /// text center vertically in the visible band. The shell positions `draw_y` (the
 /// pure-sticky + catch-up math) and animates `alpha`.
 pub fn buildChainHeaderBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, width: i32, draw_y: i32, header_h: i32, pin_y: i32, tint: u32, initial: u21, name: []const u8, handle: []const u8, accent: u32, alpha: f32) error{OutOfMemory}!void {
-    _ = accent;
     _ = pin_y;
     const m = metricsFor(width);
     // The frosted band fills from the thread top bar's BOTTOM (drawTopBar box_h:
@@ -1619,7 +1748,7 @@ pub fn buildChainHeaderBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.
     const band_top: i32 = if (m.wide) 111 else 96;
     const band_bottom = draw_y + header_h;
     if (band_bottom > band_top) {
-        try rect(gpa, dl, m.col_x, band_top, m.col_w, band_bottom - band_top, aScale(header_veil, alpha), 0);
+        try rect(gpa, dl, m.col_x, band_top, m.col_w, band_bottom - band_top, aScale(skinHeaderVeil(accent), alpha), 0);
         try rect(gpa, dl, m.col_x, band_bottom - 1, m.col_w, 1, aScale((0x66 << 24) | (divider & 0x00FFFFFF), alpha), 0);
     }
     // Avatar + name + @handle drawn at the EXACT geometry of the inline thread
@@ -1822,7 +1951,7 @@ pub fn layoutCompose(
     const cw = m.col_w - 32;
     const card_y: i32 = 92;
     const card_h: i32 = @min(height - card_y - 40, 380);
-    try rect(gpa, dl, cx0, card_y, cw, card_h, panel, 18);
+    try rect(gpa, dl, cx0, card_y, cw, card_h, skinPanel(accent), 18);
 
     const pad: i32 = 24;
     const lx = cx0 + pad;
@@ -1947,7 +2076,7 @@ pub fn layoutLoadout(
     if (out_geoms) |g| g.* = .{ .{ .x = 0, .y = 0, .w = 0 }, .{ .x = 0, .y = 0, .w = 0 }, .{ .x = 0, .y = 0, .w = 0 } };
 
     // Glass column over the field + the rail. Content centres in the wide glass.
-    try rect(gpa, dl, m.col_x, 0, m.col_w, height, veil, 0);
+    try rect(gpa, dl, m.col_x, 0, m.col_w, height, skinVeil(accent), 0);
     if (m.wide) {
         try rect(gpa, dl, m.col_x, 0, 1, height, 0x24EDEAE0, 0);
         try rect(gpa, dl, m.col_x + m.col_w - 1, 0, 1, height, 0x24EDEAE0, 0);
@@ -1989,7 +2118,7 @@ pub fn layoutLoadout(
     }
 
     // Sticky header: frosted box, title, the tab row, divider — drawn LAST.
-    try rect(gpa, dl, m.col_x, 0, m.col_w, header_h, header_veil, 0);
+    try rect(gpa, dl, m.col_x, 0, m.col_w, header_h, skinHeaderVeil(accent), 0);
     _ = try str(gpa, dl, e, .semibold, m.lx, 50, ink, 27, "Algorithms");
     var tx = m.lx;
     const tab_baseline: i32 = 96;
@@ -2030,6 +2159,157 @@ fn tilePalette(tag: []const u8) u32 {
 /// index (the shell resolves it to the tag and opens the zone feed). Only the
 /// name + count are real today; the tile colour is derived, the bookmark is
 /// present-but-inert scaffold. PURE.
+/// The warning red — destructive labels (Sign out). Local to the settings
+/// surface for now; promote to the shared palette when a second site needs it.
+const warn: u32 = 0xFFE5544B;
+
+/// The SETTINGS screen (`screen_settings`) — a master–detail layout: a left
+/// SECTION list and, on the right, the selected section's rows grouped into
+/// rounded cards (the iOS grouped-list look). The whole tree is plain data in
+/// `settings_view` (sections + rows); this walks it and paints. Reordering or
+/// adding settings is editing that table, never this function. Returns total
+/// content height for the scroll clamp. PURE.
+///
+/// v1 limits (skeleton): both panes scroll together (sections fit a screen, so
+/// this rarely shows); every control except Sign out is inert display — taps on
+/// other rows emit a `.settings_row` no-op. On a NARROW window the two panes get
+/// cramped (settings is normally a wide page); a stacked narrow mode is later.
+fn drawSettings(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, height: i32, scroll: i32, regions: ?*Regions, accent: u32, sel_section: u8, toggles: u64) error{OutOfMemory}!i32 {
+    const x0 = m.lx;
+    const w = m.cw;
+    // Defensive clamp — the shell owns the selection, but never trust an index
+    // at a boundary (it indexes a fixed array).
+    const ss: usize = if (sel_section < settings_view.sections.len) sel_section else 0;
+
+    const top: i32 = if (m.wide) 40 else 30;
+    const title_y = top + scroll;
+    _ = try str(gpa, dl, e, .semibold, x0, title_y + 30, ink, 30, "Settings");
+    const body_y = title_y + 70; // both panes begin below the page title
+
+    // Pane split.
+    const list_w: i32 = std.math.clamp(@divTrunc(w * 36, 100), 180, 260);
+    const split_gap: i32 = 28;
+    const detail_x = x0 + list_w + split_gap;
+    const detail_w = w - list_w - split_gap;
+
+    // ── Left: the section list (icon + label + chevron + active pill). ──
+    const sec_row_h: i32 = 50;
+    var ly = body_y;
+    for (settings_view.sections, 0..) |sec, si| {
+        const on = si == ss;
+        if (on) try rect(gpa, dl, x0, ly, list_w, sec_row_h - 6, (0x1F << 24) | (accent & 0x00FFFFFF), 12);
+        try settingsIcon(sec.icon, gpa, dl, x0 + 14, ly + 11, 22, if (on) accent else muted);
+        _ = try str(gpa, dl, e, if (on) .semibold else .regular, x0 + 48, ly + 29, if (on) ink else muted, 16, sec.label);
+        try iconChevron(gpa, dl, x0 + list_w - 26, ly + 13, 18, if (on) accent else faint);
+        try emitRegion(gpa, regions, x0, ly, list_w, sec_row_h - 6, @intCast(si), .settings_section);
+        ly += sec_row_h;
+    }
+
+    // ── Right: the selected section's detail (title + grouped cards). ──
+    const sec = settings_view.sections[ss];
+    _ = try str(gpa, dl, e, .semibold, detail_x, body_y + 24, ink, 22, sec.label);
+    var dy = body_y + 50;
+
+    // Precompute the contiguous groups of this section, in order, with counts —
+    // so each card's background can be drawn at its full height behind its rows.
+    var group_ids: [32]u8 = undefined;
+    var group_cnt: [32]i32 = undefined;
+    var ng: usize = 0;
+    for (settings_view.rows) |r| {
+        if (r.section != ss) continue;
+        if (ng == 0 or group_ids[ng - 1] != r.group) {
+            if (ng == group_ids.len) break; // table guard (more than 32 groups: unreached)
+            group_ids[ng] = r.group;
+            group_cnt[ng] = 0;
+            ng += 1;
+        }
+        group_cnt[ng - 1] += 1;
+    }
+
+    const row_h: i32 = 52;
+    const group_gap: i32 = 22;
+    for (0..ng) |g| {
+        const gid = group_ids[g];
+        const card_h = group_cnt[g] * row_h;
+        if (dy + card_h > 0 and dy < height) {
+            try rect(gpa, dl, detail_x, dy, detail_w, card_h, skinPanel(accent), 14);
+            try rect(gpa, dl, detail_x, dy, detail_w, 1, 0x14EDEAE0, 14); // lit top edge
+            var k: i32 = 0;
+            for (settings_view.rows, 0..) |r, ridx| {
+                if (r.section != ss or r.group != gid) continue;
+                const ry = dy + k * row_h;
+                if (k > 0) try rect(gpa, dl, detail_x + 18, ry, detail_w - 36, 1, divider, 0);
+                try drawSettingsRow(gpa, dl, e, regions, r, @intCast(ridx), detail_x, ry, detail_w, row_h, accent, toggles);
+                k += 1;
+            }
+        }
+        dy += card_h + group_gap;
+    }
+
+    return @max(ly, dy) - scroll + 40;
+}
+
+/// One detail-pane row, dispatched on its archetype. Info rows aren't tappable;
+/// every other row emits a region — `act_sign_out` routes to the live `.sign_out`
+/// handler, the rest to the inert `.settings_row` (skeleton).
+fn drawSettingsRow(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, regions: ?*Regions, r: settings_view.Row, ridx: u16, x: i32, y: i32, w: i32, h: i32, accent: u32, toggles: u64) error{OutOfMemory}!void {
+    const pad: i32 = 18;
+    const label_y = y + @divTrunc(h, 2) + 5;
+    const destructive = (r.flags & settings_view.flag_destructive) != 0;
+    const label_col = if (destructive) warn else ink;
+    const right = x + w - pad;
+    const chev_y = y + @divTrunc(h - 18, 2);
+
+    if (r.kind == .action) {
+        // A standalone command — centred (iOS-style), in accent or destructive red.
+        const col = if (destructive) warn else accent;
+        const lw: i32 = @intCast(text.measure(e, .semibold, r.label, 15));
+        _ = try str(gpa, dl, e, .semibold, x + @divTrunc(w - lw, 2), label_y, col, 15, r.label);
+    } else {
+        _ = try str(gpa, dl, e, .regular, x + pad, label_y, label_col, 15, r.label);
+    }
+
+    switch (r.kind) {
+        .disclosure => try iconChevron(gpa, dl, right - 16, chev_y, 18, faint),
+        .choice => {
+            const vw: i32 = @intCast(text.measure(e, .regular, r.value, 14));
+            _ = try str(gpa, dl, e, .regular, right - 22 - vw, label_y, muted, 14, r.value);
+            try iconChevron(gpa, dl, right - 16, chev_y, 18, faint);
+        },
+        .info => {
+            const vw: i32 = @intCast(text.measure(e, .regular, r.value, 14));
+            _ = try str(gpa, dl, e, .regular, right - vw, label_y, muted, 14, r.value);
+        },
+        .toggle => {
+            const pw: i32 = 42;
+            const ph: i32 = 24;
+            const px = right - pw;
+            const py = y + @divTrunc(h - ph, 2);
+            // The toggle's LIVE state is the shell's runtime bit, not the table's
+            // default flag (which only seeds the initial bitset).
+            const on = (toggles >> @as(u6, @intCast(ridx))) & 1 != 0;
+            const track: u32 = if (on) (accent & 0x00FFFFFF) | 0xFF000000 else 0x33EDEAE0;
+            try rect(gpa, dl, px, py, pw, ph, track, @intCast(@divTrunc(ph, 2)));
+            const knob: i32 = ph - 6;
+            const kx = if (on) px + pw - knob - 3 else px + 3;
+            try rect(gpa, dl, kx, py + 3, knob, knob, 0xFFF5F2EA, @intCast(@divTrunc(knob, 2)));
+        },
+        .slider => {
+            const tw: i32 = 96;
+            const tx = right - tw;
+            const ty = y + @divTrunc(h, 2);
+            try rect(gpa, dl, tx, ty - 1, tw, 2, 0x33EDEAE0, 1);
+            try rect(gpa, dl, tx + @divTrunc(tw, 2) - 6, ty - 7, 12, 14, accent, 6);
+        },
+        .action => {}, // label already drawn centred above
+    }
+
+    if (r.kind != .info) {
+        const kind: Action = if (r.action == settings_view.act_sign_out) .sign_out else .settings_row;
+        try emitRegion(gpa, regions, x, y, w, @intCast(@max(0, @min(32767, h))), ridx, kind);
+    }
+}
+
 fn drawZoneCard(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, regions: ?*Regions, x: i32, y: i32, w: i32, h: i32, z: ZoneCard, idx: u16) error{OutOfMemory}!void {
     try rect(gpa, dl, x, y, w, h, panel, 14);
     try rect(gpa, dl, x, y, w, 1, 0x14EDEAE0, 14); // faint lit top edge
@@ -2097,7 +2377,7 @@ fn drawZonesBrowse(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, 
 
     // Search / jump field (visual scaffold).
     const sh: i32 = 48;
-    try rect(gpa, dl, x0, y, w, sh, panel, 12);
+    try rect(gpa, dl, x0, y, w, sh, skinPanel(accent), 12);
     try iconSearch(gpa, dl, x0 + 16, y + 14, 20, faint);
     _ = try str(gpa, dl, e, .regular, x0 + 50, y + 30, faint, 15, "Search zones, or jump straight to a tag…");
     y += sh + 26;
@@ -2167,12 +2447,12 @@ fn drawTopBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Me
     const wants_back = is_thread or is_zone;
     if (m.wide) {
         const box_h: i32 = if (seats_socket) home_header_h_wide else 111;
-        try rect(gpa, dl, m.col_x, 0, m.col_w, box_h, header_veil, 0);
+        try rect(gpa, dl, m.col_x, 0, m.col_w, box_h, skinHeaderVeil(accent), 0);
         var tx = m.lx;
         if (wants_back) {
             const bl = "<  Back";
             const blw: i32 = @intCast(text.measure(e, .semibold, bl, 15) + 26);
-            try rect(gpa, dl, m.lx, 30, blw, 36, panel, 16);
+            try rect(gpa, dl, m.lx, 30, blw, 36, skinPanel(accent), 16);
             _ = try str(gpa, dl, e, .semibold, m.lx + 13, 53, ink, 15, bl);
             try emitRegion(gpa, regions, m.lx, 30, blw, 36, 0, .back);
             tx = m.lx + blw + 22;
@@ -2186,11 +2466,11 @@ fn drawTopBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Me
         try rect(gpa, dl, m.col_x, box_h - 1, m.col_w, 1, divider, 0);
     } else {
         const box_h: i32 = if (seats_socket) home_header_h_narrow else 97;
-        try rect(gpa, dl, m.col_x, 0, m.col_w, box_h, header_veil, 0);
+        try rect(gpa, dl, m.col_x, 0, m.col_w, box_h, skinHeaderVeil(accent), 0);
         if (wants_back) {
             const bl = "<  Back";
             const blw: i32 = @intCast(text.measure(e, .semibold, bl, 14) + 22);
-            try rect(gpa, dl, m.lx, 16, blw, 32, panel, 15);
+            try rect(gpa, dl, m.lx, 16, blw, 32, skinPanel(accent), 15);
             _ = try str(gpa, dl, e, .semibold, m.lx + 11, 37, ink, 14, bl);
             try emitRegion(gpa, regions, m.lx, 16, blw, 32, 0, .back);
             _ = try str(gpa, dl, e, .semibold, m.lx + blw + 18, 38, ink, 18, title);
@@ -2263,7 +2543,7 @@ fn drawZoneHeader(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m
         // reads on dark like everywhere else instead of clashing on the colour.
         const id_h: i32 = 160;
         try rect(gpa, dl, m.col_x, 0, m.col_w, id_h, zc, 0);
-        try rect(gpa, dl, m.col_x, id_h, m.col_w, box_h - id_h, header_veil, 0);
+        try rect(gpa, dl, m.col_x, id_h, m.col_w, box_h - id_h, skinHeaderVeil(accent), 0);
         const redge = m.lx + m.cw; // right edge of the CENTRED content column
 
         // Top row: Back (left) + a "more" menu (far right).
@@ -2318,10 +2598,10 @@ fn drawZoneHeader(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m
         try rect(gpa, dl, m.col_x, box_h - 1, m.col_w, 1, divider, 0);
     } else {
         const box_h = zone_header_h_narrow;
-        try rect(gpa, dl, m.col_x, 0, m.col_w, box_h, header_veil, 0);
+        try rect(gpa, dl, m.col_x, 0, m.col_w, box_h, skinHeaderVeil(accent), 0);
         const bl = "<  Back";
         const blw: i32 = @intCast(text.measure(e, .semibold, bl, 14) + 22);
-        try rect(gpa, dl, m.lx, 14, blw, 30, panel, 15);
+        try rect(gpa, dl, m.lx, 14, blw, 30, skinPanel(accent), 15);
         _ = try str(gpa, dl, e, .semibold, m.lx + 11, 34, ink, 14, bl);
         try emitRegion(gpa, regions, m.lx, 14, blw, 30, 0, .back);
 
@@ -2361,7 +2641,7 @@ fn drawProfileHeader(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine
 
     if (m.wide) {
         const band_h = profile_header_h_wide;
-        try rect(gpa, dl, m.col_x, 0, m.col_w, band_h, header_veil, 0);
+        try rect(gpa, dl, m.col_x, 0, m.col_w, band_h, skinHeaderVeil(accent), 0);
         const av: i32 = 56;
         const ay: i32 = 26;
         try rect(gpa, dl, m.lx, ay, av, av, tintFor(ph.handle), @intCast(av >> 1));
@@ -2376,7 +2656,7 @@ fn drawProfileHeader(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine
             const label = "Edit profile";
             const bw: i32 = @intCast(text.measure(e, .semibold, label, 14) + 28);
             const bx2 = m.lx + m.cw - bw;
-            try rect(gpa, dl, bx2, 41, bw, 34, panel, 16);
+            try rect(gpa, dl, bx2, 41, bw, 34, skinPanel(accent), 16);
             _ = try str(gpa, dl, e, .semibold, bx2 + 14, 63, ink, 14, label);
             try emitRegion(gpa, regions, bx2, 41, bw, 34, 0, .edit_profile);
         }
@@ -2388,7 +2668,7 @@ fn drawProfileHeader(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine
 
     // Narrow (mobile) profile band — same idea, tighter.
     const band_h = profile_header_h_narrow;
-    try rect(gpa, dl, m.col_x, 0, m.col_w, band_h, header_veil, 0);
+    try rect(gpa, dl, m.col_x, 0, m.col_w, band_h, skinHeaderVeil(accent), 0);
     const av: i32 = 44;
     const ay: i32 = 14;
     try rect(gpa, dl, m.lx, ay, av, av, tintFor(ph.handle), @intCast(av >> 1));
@@ -2403,7 +2683,7 @@ fn drawProfileHeader(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine
         const label = "Edit";
         const bw: i32 = @intCast(text.measure(e, .semibold, label, 13) + 22);
         const bx2 = m.lx + m.cw - bw;
-        try rect(gpa, dl, bx2, 30, bw, 30, panel, 14);
+        try rect(gpa, dl, bx2, 30, bw, 30, skinPanel(accent), 14);
         _ = try str(gpa, dl, e, .semibold, bx2 + 11, 50, ink, 13, label);
         try emitRegion(gpa, regions, bx2, 30, bw, 30, 0, .edit_profile);
     }
@@ -2539,7 +2819,7 @@ test "layout emits 4 tap regions per post (avatar + 3 engagement); hitTest resol
     const posts = [_]PostView{
         .{ .name = "A", .handle = "@a.zat", .age = "1m", .body = "hello there field", .tint = 0xFFAAAAAA, .reply = 1, .boost = 2, .like = 3, .initial = 'A', .liked = true, .boosted = false },
     };
-    const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null);
+    const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0);
     try std.testing.expect(h > 112); // content extends below the top bar
     // 8 regions per post: body tap + avatar + reply/repost/like + bookmark/share/more.
     try std.testing.expectEqual(@as(usize, 8), regions.items.len);
@@ -2584,14 +2864,14 @@ test "layout captures the rooted post's body glyphs for selection (thread screen
         .{ .name = "A", .handle = "@a.zat", .age = "1m", .body = "hello there field", .tint = 0xFFAAAAAA, .reply = 0, .boost = 0, .like = 0, .initial = 'A', .liked = false, .boosted = false, .is_focus = true },
     };
     // A WIDE layout so the focus post is on-screen and the body is drawn.
-    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_thread, null, 0, accent_house, null, .{}, null, null, &sel, "", &.{}, null);
+    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_thread, null, 0, accent_house, null, .{}, null, null, &sel, "", &.{}, null, 0, 0);
     // "hello there field" = 15 visible glyphs (spaces are emitted too): the body
     // captured into the selection map, in reading order.
     try std.testing.expect(sel.items.len > 0);
     try std.testing.expectEqual(@as(u32, 'h'), sel.items[0].cp);
 
     // A non-thread screen captures nothing (only the rooted post is selectable).
-    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_home, null, 0, accent_house, null, .{}, null, null, &sel, "", &.{}, null);
+    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_home, null, 0, accent_house, null, .{}, null, null, &sel, "", &.{}, null, 0, 0);
     try std.testing.expectEqual(@as(usize, 0), sel.items.len);
 }
 
@@ -2653,7 +2933,7 @@ test "long timeline does not overflow draw coordinates (off-screen posts skipped
     const posts = try arena.alloc(PostView, n);
     for (posts) |*pv| pv.* = .{ .name = "x", .handle = "@x.zat", .age = "1m", .body = "a body line that wraps a little across the feed column width here", .tint = 0xFF888888, .reply = 1, .boost = 2, .like = 3, .initial = 'x', .liked = false, .boosted = false };
 
-    const h = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null); // must not panic
+    const h = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0); // must not panic
     try std.testing.expect(h > 940 * 10); // height accounts for the whole list
     try std.testing.expect(regions.items.len < 4 * 24); // only on-screen posts are tappable
 
@@ -2667,11 +2947,11 @@ test "long timeline does not overflow draw coordinates (off-screen posts skipped
     @memset(heights, -1);
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h_fill = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null);
+    const h_fill = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0);
     const fill_regions = regions.items.len;
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h_cached = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null);
+    const h_cached = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0);
     try std.testing.expectEqual(h, h_fill);
     try std.testing.expectEqual(h, h_cached);
     try std.testing.expectEqual(fill_regions, regions.items.len);
@@ -2694,7 +2974,7 @@ test "profile screen renders the author's posts under a header; other screens st
     // Profile screen: 8 post tap regions (body + avatar + reply/repost/like +
     // bookmark/share/more) + 4 profile-nav tab regions in the sticky header
     // (the header here isn't editable, so no edit-profile region).
-    const hp = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_profile, header, 0, accent_house, null, .{}, null, null, null, "", &.{}, null);
+    const hp = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_profile, header, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0);
     try std.testing.expect(hp > 112);
     try std.testing.expectEqual(@as(usize, 12), regions.items.len);
 
@@ -2702,17 +2982,36 @@ test "profile screen renders the author's posts under a header; other screens st
     // so no tap regions, and the height clamps to the viewport (no post stack).
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const he = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, 2, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null); // Activity (a still-bare placeholder)
+    const he = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, 2, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0); // Activity (a still-bare placeholder)
     try std.testing.expectEqual(@as(i32, 940), he);
     try std.testing.expectEqual(@as(usize, 0), regions.items.len);
 
-    // The Settings screen is a placeholder too, but it carries the one wired
-    // control: a single Sign out tap region.
+    // The Settings screen is now a master–detail surface (driven by the
+    // settings_view table): one tap region per SECTION (left list) plus one per
+    // INTERACTIVE row of the selected section (info rows aren't tappable).
+    // Section 0 (Account) is selected here. Counts are derived from the table so
+    // this stays green when the table is rearranged — only the SHAPE is asserted.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_settings, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null);
-    try std.testing.expectEqual(@as(usize, 1), regions.items.len);
-    try std.testing.expectEqual(Action.sign_out, regions.items[0].kind);
+    // Narrow width (460): `m.wide` is false so the rail emits no regions — the
+    // only regions are the settings surface's own, keeping the count exact.
+    _ = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_settings, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, settings_view.sec_account, 0);
+    var account_interactive: usize = 0;
+    for (settings_view.rows) |r| {
+        if (r.section == settings_view.sec_account and r.kind != .info) account_interactive += 1;
+    }
+    var n_sections: usize = 0;
+    var n_sign_out: usize = 0;
+    for (regions.items) |r| {
+        if (r.kind == .settings_section) n_sections += 1;
+        if (r.kind == .sign_out) n_sign_out += 1;
+    }
+    // Every section is listed, and Account's interactive rows are tappable.
+    try std.testing.expectEqual(settings_view.sections.len, n_sections);
+    try std.testing.expectEqual(settings_view.sections.len + account_interactive, regions.items.len);
+    // The one wired control survives the rework: Account's Sign out still routes
+    // through the live `.sign_out` handler.
+    try std.testing.expectEqual(@as(usize, 1), n_sign_out);
 }
 
 test "zones browse: each catalog entry emits one .zone_open card region carrying its index" {
@@ -2730,7 +3029,7 @@ test "zones browse: each catalog entry emits one .zone_open card region carrying
         .{ .tag = "zig", .count = 913 },
         .{ .tag = "small-net", .count = 1 },
     };
-    const h = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_zones_browse, null, 0, accent_house, null, .{}, null, null, null, "", &zones, null);
+    const h = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_zones_browse, null, 0, accent_house, null, .{}, null, null, null, "", &zones, null, 0, 0);
     try std.testing.expect(h > 0);
     // The inert chrome (tabs/search/categories) emits no regions; the rail does
     // (it flanks every wide screen), so filter to the card taps: one `.zone_open`

@@ -55,6 +55,7 @@ const text_core = @import("../core/text.zig");
 const field_core = @import("../core/field.zig");
 const field_ui = @import("../core/field_ui.zig");
 const feed_view = @import("../core/feed_view.zig");
+const settings_view = @import("../core/settings_view.zig");
 const text_select = @import("../core/text_select.zig");
 const textedit = @import("../core/textedit.zig");
 const lens_socket = @import("../core/lens_socket.zig");
@@ -521,6 +522,24 @@ pub fn run(
     var zone_tag: []const u8 = "";
     var zone_dirty = false;
     var zone_return_screen: u8 = 0;
+    // Settings (`screen_settings`): the selected left-hand section (master–detail
+    // state, like the return-screen vars above). A section tap sets it.
+    var gsettings_section: u8 = 0;
+    // Runtime on/off of every Settings toggle — a bitset indexed by GLOBAL row
+    // index, seeded from each toggle's `flag_on` default. A toggle tap flips its
+    // bit (so all Toy Box switches are live, even before their effects are wired).
+    var toggle_bits: u64 = blk: {
+        var b: u64 = 0;
+        for (settings_view.rows, 0..) |r, i| {
+            if (r.kind == .toggle and (r.flags & settings_view.flag_on) != 0) b |= @as(u64, 1) << @intCast(i);
+        }
+        break :blk b;
+    };
+    // The "Julia mode" Toy Box toggle's row index, found once (null if removed).
+    const julia_row: ?u6 = blk: {
+        for (settings_view.rows, 0..) |r, i| if (r.action == settings_view.act_julia) break :blk @intCast(i);
+        break :blk null;
+    };
     // Zones BROWSE catalog (`screen_zones_browse`): gpa-owned zone cards (the
     // display tag duped + post count), (re)fetched from `listTags` on entering
     // the browse screen. Each card taps to its zone feed; freed on exit.
@@ -928,9 +947,17 @@ pub fn run(
             .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }
         else
             home_tray;
-        const cur_socket_ui = if (on_thread_screen) reply_ui else if (on_zone_screen) zone_ui else gsocket_ui;
+        // Toy Box "Julia mode": forces the whole UI pink. Read its toggle bit; the
+        // accent, the socket swatches, and the field-glyph ink all substitute pink.
+        const julia_on = if (julia_row) |jr| (toggle_bits >> jr) & 1 != 0 else false;
+        switch (backend) { // heart cursor follows the Julia toggle
+            .window => |w| window_shell.setJulia(w, julia_on),
+            else => {},
+        }
+        var cur_socket_ui = if (on_thread_screen) reply_ui else if (on_zone_screen) zone_ui else gsocket_ui;
+        cur_socket_ui.julia = julia_on;
         const cur_socket_hits = if (on_thread_screen) &reply_hits else if (on_zone_screen) &zone_hits else &gsocket_hits;
-        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = lens_socket.seatedAccent(home_tray), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{} } else null;
+        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else lens_socket.seatedAccent(home_tray), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .julia = julia_on } else null;
         switch (mode) {
             .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status),
             .compose => {
@@ -1704,6 +1731,36 @@ pub fn run(
                                         .sign_out => {
                                             user_signed_out = true;
                                             break :main_loop;
+                                        },
+                                        // Settings master–detail: pick the section.
+                                        .settings_section => {
+                                            gsettings_section = @intCast(hit.post);
+                                            gscroll_px = 0;
+                                        },
+                                        // A detail-pane row. Toggles flip their
+                                        // runtime bit (live — Julia mode reads its
+                                        // bit; other toggles flip but do nothing
+                                        // until wired). Non-toggle rows: inert.
+                                        .settings_row => {
+                                            if (hit.post < settings_view.rows.len and settings_view.rows[hit.post].kind == .toggle) {
+                                                toggle_bits ^= @as(u64, 1) << @intCast(hit.post);
+                                                // Julia mode flipped ON → sparks fly from the
+                                                // SWITCH: a heart-shaped bloom of ripples out of
+                                                // the toggle's spot in the field. Convert the
+                                                // toggle pill (logical px, right end of the row)
+                                                // to a field cell (window px / cell, via scale).
+                                                if (julia_row) |jr| if (hit.post == jr and (toggle_bits >> jr) & 1 != 0) {
+                                                    if (gpu_state) |*gs| {
+                                                        const tx = (@as(f32, @floatFromInt(hit.x)) + @as(f32, @floatFromInt(hit.w)) - 36.0) * gs.scale;
+                                                        const ty = (@as(f32, @floatFromInt(hit.y)) + @as(f32, @floatFromInt(hit.h)) * 0.5) * gs.scale;
+                                                        pushJuliaBurst(gpa, gs, @intFromFloat(tx / @as(f32, @floatFromInt(field_cell_w))), @intFromFloat(ty / @as(f32, @floatFromInt(field_cell_h))));
+                                                        // The visible spark: hearts fly from the switch, on top of everything.
+                                                        gs.julia_burst_x = tx;
+                                                        gs.julia_burst_y = ty;
+                                                        gs.julia_burst_t = 1.0;
+                                                    }
+                                                };
+                                            }
                                         },
                                             }
                                         }
@@ -2755,6 +2812,13 @@ const Grid = struct {
     /// The zone CATALOG for the browse screen (`screen_zones_browse`): the known
     /// zones with post counts. Empty on every other screen.
     zones: []const feed_view.ZoneCard = &.{},
+    /// The selected SECTION on the Settings screen (master–detail state). Index
+    /// into `settings_view.sections`; ignored off `screen_settings`.
+    settings_section: u8 = 0,
+    /// Runtime on/off of every Settings toggle (bitset by global row index).
+    settings_toggles: u64 = 0,
+    /// Toy Box "Julia mode" active — the field renderer pinks its glyph ink.
+    julia: bool = false,
 };
 
 // ===========================================================================
@@ -2782,6 +2846,11 @@ const amb_drift: f32 = 0.10;
 const gpu_clear_r: f32 = @as(f32, 0x18) / 255.0;
 const gpu_clear_g: f32 = @as(f32, 0x18) / 255.0;
 const gpu_clear_b: f32 = @as(f32, 0x12) / 255.0;
+// Julia mode is a LIGHT theme: the field backdrop is a soft pink-white (not the
+// dark room), so the field reads as pink symbols on white paper.
+const julia_clear_r: f32 = @as(f32, 0xF7) / 255.0;
+const julia_clear_g: f32 = @as(f32, 0xE9) / 255.0;
+const julia_clear_b: f32 = @as(f32, 0xF1) / 255.0;
 
 fn uiScale(physical_w: u32) f32 {
     return @as(f32, @floatFromInt(physical_w)) / @as(f32, @floatFromInt(design_w));
@@ -2857,6 +2926,13 @@ const GpuState = struct {
     t: f32,
     mcx: f32,
     mcy: f32,
+    /// Toy Box "Julia mode" toggle-ON spark: a one-shot burst of SDF hearts that
+    /// fly out from the switch, drawn ON TOP (so it isn't hidden behind a panel
+    /// like the field ripple is). `t` runs 1→0 over the burst; x,y = origin in
+    /// framebuffer px.
+    julia_burst_t: f32 = 0,
+    julia_burst_x: f32 = 0,
+    julia_burst_y: f32 = 0,
     /// Last frame's DPI scale (physical_w / design_w) — the feed lays out in
     /// LOGICAL pixels, so the input handlers read this to map a click/region
     /// back to physical pixels and thence to a field cell. Refreshed each
@@ -3175,6 +3251,39 @@ fn pushLikeSplash(gpa: Allocator, gs: *GpuState, gx: u32, gy: u32, with_dye: boo
     }
 }
 
+/// Toy Box "Julia mode" — the over-the-top toggle-ON celebration: sparks fly out
+/// of the SWITCH as a bloom of wave splashes, traced along a HEART curve so the
+/// living field pulses a heart of ripples outward then relaxes. WAVE only
+/// (dye = 0), so nothing accumulates across toggles. One call per ON-flip; ~17
+/// one-shot splashes (the like burst is the same mechanism), negligible — the
+/// splash buffer is cleared every field step. `(cx, cy)` is a field cell.
+fn pushJuliaBurst(gpa: Allocator, gs: *GpuState, cx: i32, cy: i32) void {
+    if (gs.cols == 0 or gs.rows == 0) return;
+    const cols_i: i32 = @intCast(gs.cols);
+    const rows_i: i32 = @intCast(gs.rows);
+    const cl = struct {
+        fn f(v: i32, hi: i32) u16 {
+            return @intCast(std.math.clamp(v, 0, hi - 1));
+        }
+    }.f;
+    // A bright central pulse at the switch.
+    gs.splashes.append(gpa, .{ .x = cl(cx, cols_i), .y = cl(cy, rows_i), .radius = 7, .amp = 4.5, .dye = 0 }) catch {};
+    // Splashes traced along the classic heart parametric curve (scaled to cells,
+    // screen-y flipped so the point sits at the bottom): the ripples bloom a heart.
+    const n: u32 = 16;
+    const sscale: f32 = 0.9;
+    var k: u32 = 0;
+    while (k < n) : (k += 1) {
+        const t = @as(f32, @floatFromInt(k)) * (6.2831853 / @as(f32, @floatFromInt(n)));
+        const s = @sin(t);
+        const hx = 16.0 * s * s * s;
+        const hy = 13.0 * @cos(t) - 5.0 * @cos(2.0 * t) - 2.0 * @cos(3.0 * t) - @cos(4.0 * t);
+        const ox: i32 = @intFromFloat(hx * sscale);
+        const oy: i32 = @intFromFloat(-hy * sscale); // screen y is down
+        gs.splashes.append(gpa, .{ .x = cl(cx + ox, cols_i), .y = cl(cy + oy, rows_i), .radius = 3, .amp = 1.8, .dye = 0 }) catch {};
+    }
+}
+
 /// THE single source of truth for the glyph cell size for the CELL-PATH
 /// fallback. Two facts drive it: (1) the cell HEIGHT is the pixel size the
 /// font rasterizes at, and (2) the cell WIDTH is sized to a font advance at
@@ -3361,7 +3470,7 @@ fn paintFrame(
                 // seam. Slice 1 hands back the screen's own geometry (identical
                 // render); the animated morph springs this between screens.
                 const sw_geom = feed_view.paneGeomFor(@intCast(win.fb.width), g.screen.*);
-                g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, null, null, g.zone_title, g.zones, sw_geom) catch g.content_h.*;
+                g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, null, null, g.zone_title, g.zones, sw_geom, g.settings_section, g.settings_toggles) catch g.content_h.*;
             }
             const t_layout = if (debug_frame_timing) clock_shell.monotonicNanos() else 0;
             window_shell.presentDrawList(win, gpa, g.engine, g.draw.slice(), field_core.background) catch {}; // E2: a lost blit is the next frame's problem
@@ -3533,14 +3642,18 @@ fn paintComposeGpu(
     const lh = logicalH(w, h);
     g.draw.len = 0;
     feed_view.layoutCompose(gpa, g.engine, @intCast(design_w), @intCast(lh), g.accent, ctx, reply_handle, draft, caret, sel_start, sel_end, blink_on, status, g.draw, g.regions) catch {};
+    if (g.julia) feed_view.juliaRemapText(g.draw); // light theme: dark text
     gpu.feedBuild(&gs.feed, gpa, g.engine, g.draw.slice(), scale) catch {};
     gs.feed_sig = 0; // force a timeline rebuild when the composer closes
 
     advanceField(gpa, gs, g.active);
 
     gpu.uploadField(&gs.grid, gs.field.height, gs.field.dye, gs.field.cols, gs.field.rows);
-    gpu.clear(gpu_clear_r, gpu_clear_g, gpu_clear_b);
-    gpu.drawFieldGrid(&gs.grid, &gs.ramp, gs.mcx, gs.mcy, gs.t, @intCast(w), @intCast(h), 0, 0); // composer: no panel softening
+    if (g.julia) gpu.clear(julia_clear_r, julia_clear_g, julia_clear_b) else gpu.clear(gpu_clear_r, gpu_clear_g, gpu_clear_b);
+    // Field glyph ink: cool grey-white normally; pink under Julia mode (the glow
+    // rides the ink, so it pinks too). 0xA6ACBA = the shader's original bright endpoint.
+    const field_ink: u32 = if (g.julia) lens_socket.julia_field_ink else 0xFFA6ACBA;
+    gpu.drawFieldGrid(&gs.grid, &gs.ramp, gs.mcx, gs.mcy, gs.t, @intCast(w), @intCast(h), 0, 0, field_ink, g.julia); // composer: no panel softening
     gpu.feedDraw(&gs.feed, @intCast(w), @intCast(h));
     gpu.swap(&gs.g);
 }
@@ -3672,7 +3785,7 @@ fn paintFrameGpu(
     const over_left_rail = gs.algo_t > 0.5 and g.hover_x >= 0 and @as(f32, @floatFromInt(g.hover_x)) < left_rail_right + 8.0 and g.hover_y >= 0;
     springGeom(&gs.left_hover_t, &gs.left_hover_v, if (over_left_rail) 1.0 else 0.0, 1.0 / 60.0);
     const algo_animating = @abs(gs.algo_t - (if (on_algo) @as(f32, 1.0) else 0.0)) > 0.003 or @abs(gs.algo_v) > 0.003 or @abs(gs.left_hover_t - (if (over_left_rail) @as(f32, 1.0) else 0.0)) > 0.004 or @abs(gs.left_hover_v) > 0.004;
-    const sig = feedSignature(items, g.scroll.*, w, h) ^ (@as(u64, g.screen.*) *% 0x9E37_79B9_7F4A_7C15) ^ (socket_sig *% 0xD1B5_4A32_D192_ED03);
+    const sig = feedSignature(items, g.scroll.*, w, h) ^ (@as(u64, g.screen.*) *% 0x9E37_79B9_7F4A_7C15) ^ (socket_sig *% 0xD1B5_4A32_D192_ED03) ^ (@as(u64, g.settings_section) *% 0xC2B2_AE3D_27D4_EB4F) ^ (g.settings_toggles *% 0x9E6C_63D0_676A_9A99);
     // A drag/settle animates the socket every frame (lift, reflow, ghost), so
     // bypass the feed cache while it runs — a brief interaction, and the field
     // already rebuilds every frame anyway.
@@ -3754,8 +3867,9 @@ fn paintFrameGpu(
             }
             gs.content_x = gp_geom.col_x; // for the field panel-softening (tracks the live content)
             gs.content_w = gp_geom.col_w;
-            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, &chain_info, &gs.sel_glyphs, g.zone_title, g.zones, gp_geom) catch g.content_h.*;
+            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, &chain_info, &gs.sel_glyphs, g.zone_title, g.zones, gp_geom, g.settings_section, g.settings_toggles) catch g.content_h.*;
         }
+        if (g.julia) feed_view.juliaRemapText(g.draw); // light theme: dark text
         gpu.feedBuild(&gs.feed, gpa, g.engine, g.draw.slice(), scale) catch {};
 
         // The nav rail as its OWN tile (the decomposition): render it into a
@@ -3787,6 +3901,7 @@ fn paintFrameGpu(
                 const enter_x: i32 = @intFromFloat((dw + 20.0) + (settled_x - (dw + 20.0)) * zt);
                 feed_view.renderRail(gpa, g.draw, g.engine, enter_x, @intCast(lh), g.screen.*, g.regions, g.accent, true, gs.rail_hover_t) catch {};
             }
+            if (g.julia) feed_view.juliaRemapText(g.draw); // light theme: dark text
             gpu.feedBuild(&gs.rail, gpa, g.engine, g.draw.slice(), scale) catch {};
         }
 
@@ -3814,14 +3929,15 @@ fn paintFrameGpu(
 
     // Render: the living field behind, the feed on top, then swap.
     gpu.uploadField(&gs.grid, gs.field.height, gs.field.dye, gs.field.cols, gs.field.rows);
-    gpu.clear(gpu_clear_r, gpu_clear_g, gpu_clear_b);
+    if (g.julia) gpu.clear(julia_clear_r, julia_clear_g, julia_clear_b) else gpu.clear(gpu_clear_r, gpu_clear_g, gpu_clear_b);
     // Soften the field UNDER the content column (glass backdrop). The feed lays
     // out at the logical design width; map the column's x-range to physical px.
     // Panel softening tracks the LIVE (animated) content column, not the static
     // metricsPage one — so the "distortion" panel follows the widened Zones glass.
     const panel_l = @as(f32, @floatFromInt(gs.content_x)) * scale;
     const panel_r = @as(f32, @floatFromInt(gs.content_x + gs.content_w)) * scale;
-    gpu.drawFieldGrid(&gs.grid, &gs.ramp, gs.mcx, gs.mcy, gs.t, @intCast(w), @intCast(h), panel_l, panel_r);
+    const field_ink: u32 = if (g.julia) lens_socket.julia_field_ink else 0xFFA6ACBA;
+    gpu.drawFieldGrid(&gs.grid, &gs.ramp, gs.mcx, gs.mcy, gs.t, @intCast(w), @intCast(h), panel_l, panel_r, field_ink, g.julia);
     // Hover highlight (post wash + button highlight), BEHIND the feed so the
     // content draws on top — the app feels alive under the cursor.
     drawHoverOverlay(gpa, g, gs, scale, @intCast(w), @intCast(h));
@@ -3848,6 +3964,7 @@ fn paintFrameGpu(
     // The engagement hearts: one SDF heart per visible like button, drawn IN
     // PLACE (feed_view skips its own), so a like fills + pops the ACTUAL heart.
     drawEngagementHearts(g, gs, items, @intCast(w), @intCast(h));
+    drawJuliaBurst(gs, @intCast(w), @intCast(h));
     // The SDF icons (repost, gear) — crisp, drawn in place of the line-art.
     drawSdfIcons(g, gs, items, @intCast(w), @intCast(h));
     // The sticky CHAIN header: pins while scrolling the chain, catches up on
@@ -4287,6 +4404,35 @@ fn drawSdfIcons(g: Grid, gs: *GpuState, items: []const feed_core.TimelineItem, v
             else => {},
         }
     }
+}
+
+/// The Julia toggle-ON spark: a ring of SDF hearts flying out of the switch,
+/// drawn over everything so it can't hide behind a panel. Procedural (no
+/// per-heart storage) — positions derive from the burst clock + index; each
+/// heart flies outward, arcs up a touch, and shrinks as it fades. ~14 hearts for
+/// ~0.5s, one draw call each — negligible. Decrements the clock each frame.
+fn drawJuliaBurst(gs: *GpuState, vw: i32, vh: i32) void {
+    if (gs.julia_burst_t <= 0) return;
+    const t = gs.julia_burst_t; // 1 → 0
+    const prog = 1.0 - t; // 0 → 1
+    const n: u32 = 10;
+    const maxdist: f32 = 150.0 * gs.scale;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const ang = @as(f32, @floatFromInt(i)) * (6.2831853 / @as(f32, @floatFromInt(n))) + 0.3;
+        const dist = prog * maxdist;
+        const px = gs.julia_burst_x + @cos(ang) * dist;
+        const py = gs.julia_burst_y + @sin(ang) * dist - prog * prog * 50.0 * gs.scale; // arc up
+        const size = (9.0 + 7.0 * t) * gs.scale; // shrink as they fade
+        // Each heart's SDF runs over a full-screen triangle — without a scissor,
+        // N hearts = N full-screen fragment passes (the lag spike). Clip each to
+        // its own small box so it only shades ~(box²) px. GL origin is bottom-left.
+        const box = size * 3.0;
+        gpu.pushScissor(@intFromFloat(px - box), @intFromFloat(@as(f32, @floatFromInt(vh)) - py - box), @intFromFloat(box * 2.0), @intFromFloat(box * 2.0));
+        gpu.drawHeart(&gs.heart, px, py, size, 1.0, 1.0 + 0.4 * t, t, 0.0, vw, vh);
+    }
+    gpu.popScissor();
+    gs.julia_burst_t = @max(0.0, t - 0.03); // ~33 frames ≈ 0.55s
 }
 
 fn drawEngagementHearts(g: Grid, gs: *GpuState, items: []const feed_core.TimelineItem, vw: i32, vh: i32) void {

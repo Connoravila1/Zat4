@@ -140,7 +140,7 @@ pub const InputEvent = struct {
 ///   default = the arrow · pointer = the hand (over clickable links/buttons)
 ///   text    = the I-beam (over selectable/editable text)
 ///   grab    = the move/grab hand (while dragging, e.g. a lens card)
-pub const Cursor = enum(u8) { default, pointer, text, grab };
+pub const Cursor = enum(u8) { default, pointer, text, grab, heart };
 
 // ---------------------------------------------------------------------------
 // Surface → draw list (the Cut 5.0 layout)

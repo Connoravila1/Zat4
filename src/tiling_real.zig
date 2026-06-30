@@ -214,7 +214,7 @@ pub fn main(init: std.process.Init) !void {
         const lh = logicalH(W, H);
         const geom = partitionGeom(arena, @intCast(design_w), @intCast(lh), side_w) catch continue;
         dl.len = 0;
-        _ = feed_view.layout(gpa, &engine, @intCast(design_w), @intCast(lh), posts, 0, &dl, null, null, false, 0, null, 3, lens_socket.seatedAccent(home_tray), home_tray, .{}, null, null, null, "", &.{}, geom) catch {};
+        _ = feed_view.layout(gpa, &engine, @intCast(design_w), @intCast(lh), posts, 0, &dl, null, null, false, 0, null, 3, lens_socket.seatedAccent(home_tray), home_tray, .{}, null, null, null, "", &.{}, geom, 0, 0) catch {};
         gpu.feedBuild(&feed_path, gpa, &engine, dl.slice(), uiScale(W)) catch {};
 
         gpu.uploadField(&field_grid, field.height, field.dye, field.cols, field.rows);

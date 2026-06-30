@@ -122,6 +122,10 @@ pub const Window = struct {
     hand_cursor: u32,
     text_cursor: u32,
     grab_cursor: u32,
+    /// Toy Box "Julia mode": a custom ARGB heart cursor (0 = None/unavailable).
+    /// When `julia` is set, `setCursor` swaps any non-grab shape for the heart.
+    heart_cursor: u32,
+    julia: bool,
     cursor_shape: layout.Cursor,
 };
 
@@ -455,6 +459,8 @@ pub fn openAt(
         .hand_cursor = themed.hand orelse hand_cursor,
         .text_cursor = themed.text orelse text_cursor,
         .grab_cursor = themed.grab orelse grab_cursor,
+        .heart_cursor = themed.heart orelse 0, // 0 ⇒ no heart (RENDER absent): keep normal cursors
+        .julia = false,
         .cursor_shape = .default,
     };
     raster.resize(gpa, &window.fb, width, height, layout.palette_bg) catch return error.OutOfMemory;
@@ -470,7 +476,7 @@ pub fn openAt(
 // ---------------------------------------------------------------------------
 
 // A7.2: cold struct, size guard waived — one transient per window open.
-const ThemedCursors = struct { hand: ?u32 = null, text: ?u32 = null, grab: ?u32 = null };
+const ThemedCursors = struct { hand: ?u32 = null, text: ?u32 = null, grab: ?u32 = null, heart: ?u32 = null };
 
 const hand_names = [_][]const u8{ "pointer", "hand2", "hand1", "hand" };
 const text_names = [_][]const u8{ "xterm", "text", "ibeam" };
@@ -517,6 +523,79 @@ fn loadThemedCursors(
     out.hand = uploadThemeCursor(gpa, fd, env, rmaj, fmt, setup, base | 7, size, &hand_names);
     out.text = uploadThemeCursor(gpa, fd, env, rmaj, fmt, setup, base | 8, size, &text_names);
     out.grab = uploadThemeCursor(gpa, fd, env, rmaj, fmt, setup, base | 9, size, &grab_names);
+    // The Toy Box heart cursor: generated in code (no theme file), uploaded the
+    // same RENDER way. base | 13 is its own persistent id (| 10..12 are the temp
+    // upload ids, freed after each cursor).
+    out.heart = uploadHeartCursor(gpa, fd, rmaj, fmt, setup, base | 13, size);
+}
+
+/// Render a pink ARGB heart into a `size`×`size` buffer and upload it as cursor
+/// `cid` via RENDER (the same pixmap→picture→cursor path as a theme cursor, but
+/// with pixels we draw ourselves). Premultiplied B,G,R,A (LSBFirst, matching the
+/// theme path). Null on any miss → caller leaves the heart cursor unavailable.
+fn uploadHeartCursor(gpa: Allocator, fd: i32, rmaj: u8, fmt: u32, setup: x11.Setup, cid: u32, size_in: u32) ?u32 {
+    const size: u32 = std.math.clamp(size_in, 16, 64);
+    if (size * size + 6 > setup.max_request_units) return null;
+    const pixels = gpa.alloc(u8, @as(usize, size) * size * 4) catch return null;
+    defer gpa.free(pixels);
+    fillHeartPixels(pixels, size);
+
+    const base = setup.resource_id_base;
+    const pixmap = base | 10;
+    const cgc = base | 11;
+    const picture = base | 12;
+    const w: u16 = @intCast(size);
+    const h: u16 = @intCast(size);
+    var b: [32]u8 = undefined;
+    writeAll(fd, x11.createPixmap(&b, 32, pixmap, setup.root_window, w, h)) catch return null;
+    writeAll(fd, x11.createGC(&b, cgc, pixmap)) catch return null;
+    writeAll(fd, x11.putImageHeader(&b, pixmap, cgc, w, h, 0, 32)) catch return null;
+    writeAll(fd, pixels) catch return null;
+    writeAll(fd, x11.renderCreatePicture(&b, rmaj, picture, pixmap, fmt)) catch return null;
+    // Hotspot at the heart's top dimple (where the two lobes meet) — feels like
+    // the "point" of the pointer.
+    writeAll(fd, x11.renderCreateCursor(&b, rmaj, cid, picture, @intCast(size / 2), @intCast(size * 32 / 100))) catch return null;
+    writeAll(fd, x11.renderFreePicture(&b, rmaj, picture)) catch return null;
+    writeAll(fd, x11.freeGC(&b, cgc)) catch return null;
+    writeAll(fd, x11.freePixmap(&b, pixmap)) catch return null;
+    return cid;
+}
+
+/// Draw a filled pink heart with a white inner rim + soft edge into `pixels`
+/// (premultiplied B,G,R,A). The implicit heart curve (juliaHeart): <0 inside.
+fn fillHeartPixels(pixels: []u8, size: u32) void {
+    const s: f32 = @floatFromInt(size);
+    var y: u32 = 0;
+    while (y < size) : (y += 1) {
+        var x: u32 = 0;
+        while (x < size) : (x += 1) {
+            const nx = (@as(f32, @floatFromInt(x)) + 0.5) / s * 2.0 - 1.0; // -1..1
+            const ny = (@as(f32, @floatFromInt(y)) + 0.5) / s * 2.0 - 1.0;
+            const hx = nx * 1.25;
+            const hy = -ny * 1.25 + 0.32; // flip screen-y, recentre
+            const aa = hx * hx + hy * hy - 1.0;
+            const f = aa * aa * aa - hx * hx * hy * hy * hy; // <0 inside
+            var alpha: f32 = 0;
+            var r: f32 = 1.0;
+            var g: f32 = 0.41;
+            var bl: f32 = 0.71; // FF69B4
+            if (f < 0.0) {
+                alpha = 1.0;
+                if (f > -0.17) { // white inner rim near the outline
+                    r = 1.0;
+                    g = 1.0;
+                    bl = 1.0;
+                }
+            } else if (f < 0.16) { // soft anti-aliased edge just outside
+                alpha = 1.0 - f / 0.16;
+            }
+            const i = (@as(usize, y) * size + x) * 4;
+            pixels[i + 0] = @intFromFloat(@max(0.0, @min(255.0, bl * alpha * 255.0)));
+            pixels[i + 1] = @intFromFloat(@max(0.0, @min(255.0, g * alpha * 255.0)));
+            pixels[i + 2] = @intFromFloat(@max(0.0, @min(255.0, r * alpha * 255.0)));
+            pixels[i + 3] = @intFromFloat(@max(0.0, @min(255.0, alpha * 255.0)));
+        }
+    }
 }
 
 /// Find one of `names` in the system theme, parse the nearest-size image, and
@@ -694,7 +773,11 @@ pub fn close(window: *Window) void {
 /// agree on what is tappable / selectable. The `cursor_shape` latch makes a
 /// no-change call free, so a motion flood costs one request per shape CHANGE.
 /// Best-effort I/O (E4 — a failed write just leaves the shape unchanged).
-pub fn setCursor(window: *Window, shape: layout.Cursor) void {
+pub fn setCursor(window: *Window, shape_in: layout.Cursor) void {
+    // Julia mode swaps every cursor (except the drag grab) for the heart, when
+    // the heart cursor actually loaded — so the override is invisible elsewhere.
+    var shape = shape_in;
+    if (window.julia and window.heart_cursor != 0 and shape != .grab) shape = .heart;
     if (shape == window.cursor_shape) return;
     window.cursor_shape = shape;
     var buf: [16]u8 = undefined;
@@ -703,8 +786,20 @@ pub fn setCursor(window: *Window, shape: layout.Cursor) void {
         .pointer => window.hand_cursor,
         .text => window.text_cursor,
         .grab => window.grab_cursor,
+        .heart => window.heart_cursor,
     };
     writeAll(window.fd, x11.changeWindowCursor(&buf, window.wid, cursor)) catch {};
+}
+
+/// Toy Box "Julia mode" toggle for the heart cursor (the shell sets it each
+/// frame from the settings toggle). Re-applies immediately if the pointer shape
+/// is already latched, so the heart appears/leaves without waiting for a motion.
+pub fn setJulia(window: *Window, on: bool) void {
+    if (window.julia == on) return;
+    window.julia = on;
+    const want = window.cursor_shape;
+    window.cursor_shape = .grab; // force setCursor past its latch
+    setCursor(window, want);
 }
 
 pub fn setClipboard(window: *Window, data: []const u8) void {
