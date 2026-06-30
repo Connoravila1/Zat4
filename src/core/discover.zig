@@ -1,0 +1,689 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//
+// Zat4 — a social-media client built on the AT Protocol.
+// Copyright (C) 2026  Connor Avila
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published
+// by the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+//! B1 classification: CORE (pure). **The discover engine's model + scorer** —
+//! Phase D1 (the candidate record) and D3 (the pure scoring core + the default
+//! config), the foundation every feed in Zat4 rides on.
+//!
+//! The load-bearing idea of the whole feature, in one line:
+//!
+//!   A feed is a SCORING FUNCTION over candidate posts. The "algorithm" is the
+//!   set of numbers (a `FeedConfig`) that scoring function uses. The first-party
+//!   default feed and a user-built feed are the SAME engine called with a
+//!   different config — there is no privileged path (DISCOVER invariant 2).
+//!
+//! This file is that engine's heart and nothing else: the plain-data candidate
+//! the scorer consumes, the plain-data config that IS an algorithm, and the
+//! pure transform from (candidates, config, now) → a ranked order. No I/O, no
+//! clock, no randomness (B2/B4): `now` is handed in as a value. Sourcing (D2,
+//! shell) fills the candidate pool; diversity + moderation (D4) filter the
+//! ranked order afterwards; serialization into a shareable atproto record (D5)
+//! turns a config into a marketplace artifact. Those are separate slices over
+//! this one engine — never a second scoring path (D6, invariant 1).
+//!
+//! By the law:
+//!   * A1/A3 — `Candidate` is plain data in a struct-of-arrays; scoring is a
+//!     free function over the collection, never a method.
+//!   * A4/A5 — a candidate references its post by an OPAQUE `Ref` handle the
+//!     caller assigns meaning to; this module never dereferences it, so the
+//!     post index never gains meaning here and never leaves its owning module.
+//!   * A6 — the in/out-of-network flag rides out of band in a parallel bitset.
+//!   * A7 — `Candidate` is hot (scored in bulk every refresh); it carries an
+//!     exact-size guard. `FeedConfig` is cold (one per feed selection, never in
+//!     a hot loop) and is A7.2-waived.
+//!   * B4 — `now` is a parameter. Same candidates + same config + same `now` ⇒
+//!     same ranking, which is exactly what makes a shared algorithm verifiable
+//!     (invariant 5) and this file trivially testable.
+
+const std = @import("std");
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+
+// ---------------------------------------------------------------------------
+// The candidate — the hot record the scorer consumes (Phase D1)
+// ---------------------------------------------------------------------------
+
+/// An OPAQUE handle a candidate carries back to whoever sourced it. The caller
+/// (the feed module, a zone query, a reply pool) packs its own post index in
+/// and reads it back in ranked order; this module NEVER interprets it — it
+/// sorts handles, it does not index an array it doesn't own. So A4/A5 hold:
+/// the meaningful index stays inside its owning module, and what crosses this
+/// boundary is a handle, not a bare index.
+pub const Ref = enum(u32) {
+    _,
+
+    pub fn from(value: u32) Ref {
+        return @enumFromInt(value);
+    }
+    pub fn raw(r: Ref) u32 {
+        return @intFromEnum(r);
+    }
+};
+
+/// One candidate post: its opaque ref plus every signal the scorer weighs.
+/// The graph-dependent signals (`author_rep`, `relevance`) and the on-device
+/// `behavioral` signal are COMPUTED IN THE SHELL and handed in as plain values
+/// — the core never touches the follow graph, a clock, or the attention stream
+/// directly (B2/B4, invariant 3). Signals Zat4 does not yet capture (the click
+/// and bookmark and reply-chain counts) are modeled now so the config and the
+/// scorer share one vocabulary (F5: get the model right early); until a source
+/// populates them they are simply 0 (E4: absence is ordinary data).
+pub const Candidate = struct {
+    /// Caller's opaque handle (see `Ref`).
+    ref: Ref,
+    /// Unix seconds, same unit as the `now` passed to the scorer.
+    created_at: i64,
+    like_count: u32,
+    repost_count: u32,
+    reply_count: u32,
+    /// The author replied back into the thread — the strongest positive.
+    reply_chain_count: u32,
+    bookmark_count: u32,
+    profile_click_count: u32,
+    link_click_count: u32,
+    /// Block / mute / report / not-interested — the asymmetric punisher. A
+    /// positive count; the config's weight for it is negative.
+    negative_count: u32,
+    /// Shell-supplied author credibility in [0,1] (B3 computes it off-graph).
+    author_rep: f32,
+    /// Shell-supplied topic-match-to-this-user in [0,1].
+    relevance: f32,
+    /// TIER-2 RESERVED (Phase D9): the on-device per-user attention/affinity
+    /// signal (dwell, watch-through) folded to [0,1]. NEVER leaves the device
+    /// (invariant 3); handed in exactly like `relevance`. The scorer already
+    /// multiplies it through (default `behavioral_weight` 0 ⇒ inert), so the
+    /// learner is reachable with no layout rework — and this slot costs ZERO
+    /// bytes: without it the struct is 52 bytes, which i64 alignment pads to 56
+    /// anyway, so the f32 rides in on padding that would otherwise be dead.
+    behavioral: f32,
+
+    comptime {
+        // Budget 56: ref(4) + created_at(8) + 8×u32 counts(32) + author_rep,
+        // relevance, behavioral (3×f32 = 12) = 56, an exact multiple of the
+        // i64 alignment, no padding. In the SoA store every field is its own
+        // column, so even this never materializes as one packed row in memory
+        // — the guard pins the honest @sizeOf and forces a decision the instant
+        // a signal is added. (A7; raising this requires A7.1 justification. The
+        // behavioral slot did NOT raise it — see the field comment.)
+        assert(@sizeOf(Candidate) == 56);
+    }
+};
+
+/// The candidate pool for one refresh: the hot `Candidate` rows in SoA, plus
+/// the in/out-of-network bit per row OUT OF BAND (A6) — sourcing (D2) sets it
+/// and the source-mix uses it; the per-candidate SCORE does not depend on it,
+/// so the scorer never reads this bitset.
+/// A7.2: cold struct, size guard waived — one per refresh, transient; its
+/// CONTENTS are the hot, guarded `Candidate` rows.
+pub const Candidates = struct {
+    list: std.MultiArrayList(Candidate) = .empty,
+    in_network: std.DynamicBitSetUnmanaged = .{},
+
+    /// Append one candidate, growing the parallel in/out-of-network bit (A6).
+    pub fn append(self: *Candidates, gpa: Allocator, c: Candidate, in_network: bool) error{OutOfMemory}!void {
+        try self.list.append(gpa, c);
+        try self.in_network.resize(gpa, self.list.len, false);
+        self.in_network.setValue(self.list.len - 1, in_network);
+    }
+
+    pub fn deinit(self: *Candidates, gpa: Allocator) void {
+        self.list.deinit(gpa);
+        self.in_network.deinit(gpa);
+        self.* = undefined;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// The config — the algorithm as plain, cold data (Phase D3)
+// ---------------------------------------------------------------------------
+
+/// The author-controlled CANDIDATE QUERY: what the engine is asked to fetch,
+/// not how the result is ranked. Modeling this as a structured sub-record now
+/// — rather than baking a single source-mix scalar into the engine — keeps
+/// RETRIEVAL a first-class creative surface: a future author shapes the POOL
+/// (topic include-sets, similarity seeds, graph-walk hops, time windows), the
+/// engine still owns the I/O and cost, and nothing invasive is expressible
+/// (the author never touches the network — D2 runs the query in the shell).
+/// v1 honors `source_mix` + `max_candidates`; the richer, variable-length
+/// retrieval params attach here when D2's index becomes parameterizable. (F5:
+/// get the model's SHAPE right early so widening retrieval later is not a
+/// change-amplification defect; F4: build only the scalar knobs for now.)
+/// A7.2: cold config sub-record, size guard waived.
+pub const Query = struct {
+    /// In-network vs out-of-network ratio in [0,1] (0.5 default). 1.0 = follows
+    /// only; 0.0 = discovery only. A parameter, never a constant.
+    source_mix: f32 = 0.5,
+    /// The pool-size cap the sourcer honors for one refresh.
+    max_candidates: u32 = 500,
+    /// Hard recency window in hours; 0 = no window (E4).
+    recency_window_hrs: u32 = 0,
+};
+
+/// The algorithm. Plain data (A1), loaded once per feed selection and never in
+/// a hot loop, so it carries NO size guard. The default feed is just one VALUE
+/// of this type; a marketplace algorithm is another. Every default below is a
+/// CALIBRATION PRIOR (G1/G2), not a measured truth — `like = 1.0` is the
+/// baseline everything else is relative to; the numbers get tuned against real
+/// Zat4 data and are trivial to retune. Serializes into a shareable atproto
+/// record in D5.
+///
+/// The defaults ARE the launch "Zat4 Discover" config, and they are CALIBRATED
+/// against Twitter's open-sourced Heavy-Ranker output weights (2023), our
+/// `like = 1.0` baseline = Twitter's raw weights ÷ its like of 0.5 (so the
+/// ratios are Twitter's exactly). The load-bearing lesson, corroborated
+/// independently by Bluesky's Discover ("40 replies beat 200 likes"): a REPLY is
+/// the dominant public quality signal (~27× a like), an author replying back is
+/// the strongest of all (~150×), and a repost is only ~2× a like — NOT the 20×
+/// an earlier draft of this config guessed. Negative feedback is the asymmetric
+/// punisher (~−148). The click/dwell weights are BEHAVIORAL — reserved priors
+/// here (the counts are 0 until on-device capture exists, D9), and pinned to 0
+/// in the Private config (the doorway never hands it the signal).
+/// A7.2: cold config, size guard waived.
+pub const FeedConfig = struct {
+    // Engagement weights (multiplied by the per-candidate counts, summed).
+    // Calibrated to Twitter Heavy-Ranker ratios (×2 so like = 1.0 baseline).
+    w_like: f32 = 1.0, // baseline passive approval (Twitter 0.5)
+    w_repost: f32 = 2.0, // amplification (Twitter retweet 1.0 = 2× a like)
+    w_reply: f32 = 27.0, // conversation — the dominant public signal (Twitter 13.5)
+    w_reply_chain: f32 = 150.0, // author replied back — strongest positive (Twitter 75)
+    w_bookmark: f32 = 10.0, // high-intent private save (no Twitter equiv; reserved)
+    w_profile_click: f32 = 24.0, // BEHAVIORAL — interest in the author (Twitter 12)
+    w_link_click: f32 = 22.0, // BEHAVIORAL — followed the content out (Twitter 11)
+    w_negative: f32 = -148.0, // block / mute / report — asymmetric punisher (Twitter −74)
+
+    // Freshness + boosts (MULTIPLY the engagement sum — see `scoreRow`).
+    recency_half_life_hrs: f32 = 6.0,
+    velocity_boost: bool = true, // early-engagement (~first 30 min) multiplier
+    author_rep_weight: f32 = 0.5, // "moderate" prior (Twitter leans on TweepCred)
+    relevance_weight: f32 = 1.0, // "high" prior
+    /// TIER-2 RESERVED (Phase D9): how much the on-device per-user preference
+    /// vector multiplies into the score. Default 0 ⇒ the behavioral signal is
+    /// inert, so the learner is opt-in per config and reachable with no rework.
+    behavioral_weight: f32 = 0.0,
+
+    // Diversity caps — DATA the engine carries; applied as a separate pass in
+    // D4, never tangled into scoring here.
+    max_per_author: u32 = 3,
+    max_per_subtopic: u32 = 8,
+
+    /// The candidate query (retrieval) this algorithm asks for.
+    query: Query = .{},
+
+    /// DECLARED per-algorithm on-device state budget, in bytes (Phase D9/D11
+    /// foresight). The doorway enforces it and the marketplace shows it as a
+    /// truthful, system-derived label ("stores up to X locally" — invariant 6);
+    /// a stateless algorithm declares 0. Capped at `state_budget_hard_cap`.
+    /// Modeled now so the label vocabulary and the box's scratch budget carry
+    /// it without a retrofit; the learner that uses it is D9.
+    state_budget_bytes: u32 = 1 << 20, // 1 MiB soft default (digest-class)
+};
+
+/// The hard ceiling on a single algorithm's declared on-device state (10 MiB).
+/// The cap is BOTH disk hygiene and a side-channel wall: it bounds how much an
+/// algorithm could ever accumulate about a user locally (Phase D9/D11). Most
+/// algorithms need far less than the soft default; this is the room an
+/// ambitious author may declare into, shown to the user, never granted by
+/// default.
+pub const state_budget_hard_cap: u32 = 10 << 20;
+
+/// The Twitter-like default — Discover. One value of `FeedConfig`, with no
+/// special-casing anywhere: `score(candidates, DEFAULT_CONFIG, now)` IS the
+/// default feed (invariant 2).
+pub const DEFAULT_CONFIG: FeedConfig = .{};
+
+/// The window (hours) over which the early-engagement velocity boost applies.
+const velocity_window_hrs: f64 = 0.5;
+
+// ---------------------------------------------------------------------------
+// The scorer — the pure transform (Phase D3)
+// ---------------------------------------------------------------------------
+
+/// Exponential freshness decay: `0.5 ^ (age / half_life)`. A future timestamp
+/// (clock skew) clamps to age 0 ⇒ decay 1, never a negative age. A non-positive
+/// half-life disables decay (E4), so a "no recency" config is expressible.
+/// Pure.
+pub fn recencyDecay(now: i64, created_at: i64, half_life_hrs: f32) f64 {
+    if (half_life_hrs <= 0) return 1.0;
+    const d = now - created_at;
+    const age_hrs: f64 = if (d <= 0) 0.0 else @as(f64, @floatFromInt(d)) / 3600.0;
+    return std.math.pow(f64, 0.5, age_hrs / @as(f64, half_life_hrs));
+}
+
+/// Early-engagement velocity: a young post gets a boost that decays linearly
+/// from 2× at age 0 to 1× at the window edge, then 1× thereafter. A calibration
+/// prior (G2): the precise curve is a measure-and-tune question, not a truth.
+/// Pure.
+pub fn velocityFactor(config: FeedConfig, age_hrs: f64) f64 {
+    if (!config.velocity_boost) return 1.0;
+    if (age_hrs >= velocity_window_hrs) return 1.0;
+    return 1.0 + (1.0 - age_hrs / velocity_window_hrs);
+}
+
+/// Score one candidate — the heart, the recorded MULTIPLICATIVE formula:
+///
+///   score = (Σ count[k] × w[k])          // weighted engagement sum
+///         × recency_decay
+///         × velocity_factor
+///         × (1 + author_rep × author_rep_weight)
+///         × (1 + relevance  × relevance_weight)
+///         × (1 + behavioral × behavioral_weight)   // Tier 2; weight 0 ⇒ inert
+///
+/// Multiplicative (not an additive sum of all terms) is the recorded decision:
+/// it produces the authentic Twitter-like behavior where a fresh, fast-climbing
+/// post can outrank an older viral one — at the cost of being more volatile and
+/// more gameable on a single term, which is a CALIBRATION question to settle
+/// with measurement (G2), not a structural one. Note a consequence to calibrate:
+/// a zero-engagement post scores 0 regardless of recency, so a brand-new post
+/// with no signal does not surface on engagement alone — a base-recency floor is
+/// the calibration knob if cold posts need a chance. Pure; takes a row by value
+/// (56 bytes, trivial — G3) so a test can score a hand-built candidate directly.
+pub fn scoreRow(c: Candidate, config: FeedConfig, now: i64) f64 {
+    const eng =
+        @as(f64, @floatFromInt(c.like_count)) * @as(f64, config.w_like) +
+        @as(f64, @floatFromInt(c.repost_count)) * @as(f64, config.w_repost) +
+        @as(f64, @floatFromInt(c.reply_count)) * @as(f64, config.w_reply) +
+        @as(f64, @floatFromInt(c.reply_chain_count)) * @as(f64, config.w_reply_chain) +
+        @as(f64, @floatFromInt(c.bookmark_count)) * @as(f64, config.w_bookmark) +
+        @as(f64, @floatFromInt(c.profile_click_count)) * @as(f64, config.w_profile_click) +
+        @as(f64, @floatFromInt(c.link_click_count)) * @as(f64, config.w_link_click) +
+        @as(f64, @floatFromInt(c.negative_count)) * @as(f64, config.w_negative);
+
+    const d = now - c.created_at;
+    const age_hrs: f64 = if (d <= 0) 0.0 else @as(f64, @floatFromInt(d)) / 3600.0;
+
+    const rec = recencyDecay(now, c.created_at, config.recency_half_life_hrs);
+    const vel = velocityFactor(config, age_hrs);
+    const author = 1.0 + @as(f64, c.author_rep) * @as(f64, config.author_rep_weight);
+    const rel = 1.0 + @as(f64, c.relevance) * @as(f64, config.relevance_weight);
+    const behav = 1.0 + @as(f64, c.behavioral) * @as(f64, config.behavioral_weight);
+
+    return eng * rec * vel * author * rel * behav;
+}
+
+/// Rank a candidate pool: pure transform from (candidates, config, now) → the
+/// candidates' refs in DESCENDING score order, allocated in `arena` (C1/C3).
+/// Diversity caps and moderation are SEPARATE later passes (D4) — this returns
+/// the pure scored order and nothing else. Ties break by recency then ref so
+/// the order is total and deterministic (verifiability, invariant 5). The empty
+/// pool is an empty order, not an error (E4).
+pub fn score(arena: Allocator, cands: *const Candidates, config: FeedConfig, now: i64) error{OutOfMemory}![]Ref {
+    const n = cands.list.len;
+    const out = try arena.alloc(Ref, n);
+    if (n == 0) return out;
+
+    const scores = try arena.alloc(f64, n);
+    const order = try arena.alloc(u32, n);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        scores[i] = scoreRow(cands.list.get(i), config, now);
+        order[i] = @intCast(i);
+    }
+
+    const refs = cands.list.items(.ref);
+    const createds = cands.list.items(.created_at);
+    const Ctx = struct {
+        scores: []const f64,
+        createds: []const i64,
+        refs: []const Ref,
+        pub fn lessThan(ctx: @This(), x: u32, y: u32) bool {
+            if (ctx.scores[x] != ctx.scores[y]) return ctx.scores[x] > ctx.scores[y]; // higher first
+            if (ctx.createds[x] != ctx.createds[y]) return ctx.createds[x] > ctx.createds[y]; // fresher first
+            return ctx.refs[x].raw() < ctx.refs[y].raw(); // stable tiebreak
+        }
+    };
+    std.sort.block(u32, order, Ctx{ .scores = scores, .createds = createds, .refs = refs }, Ctx.lessThan);
+
+    for (out, order) |*o, idx| o.* = refs[idx];
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// The post-scoring filters — diversity + non-bypassable moderation (Phase D4)
+// ---------------------------------------------------------------------------
+
+/// Apply the two post-scoring passes to a ranked order: **moderation removal**
+/// (non-bypassable, invariant 8) and the **per-author diversity cap**. A pure
+/// transform over the order — `author_key[i]` and `keep[i]` are PARALLEL to
+/// `order` (one per ranked position), supplied by the caller from its own store;
+/// the engine groups authors by key EQUALITY and never interprets the key as an
+/// index (A5 — it's a grouping token, like a hash).
+///
+/// `keep[i] == false` is a moderation removal: applied regardless of `config`,
+/// so no algorithm — first-party default or contributed — can rank around what
+/// moderation hid (invariant 8, "freedom over ranking, never over the pool").
+/// The diversity cap then keeps at most `config.max_per_author` survivors per
+/// author so no one account dominates a refresh; `max_per_author == 0` means no
+/// cap. (`max_per_subtopic` is modeled in the config but not enforced yet — it
+/// needs the topic/entity index from D2; recorded, not silently dropped.)
+///
+/// Order: moderation-hidden posts are dropped FIRST so they never consume an
+/// author's diversity slot (a lower-ranked visible post by that author can take
+/// it instead). Moderation stays non-bypassable either way; this just doesn't
+/// waste quota on removed posts. Returns survivors in rank order, in `arena`.
+pub fn applyCaps(
+    arena: Allocator,
+    order: []const Ref,
+    author_key: []const u32,
+    keep: []const bool,
+    config: FeedConfig,
+) error{OutOfMemory}![]Ref {
+    assert(order.len == author_key.len and order.len == keep.len);
+    var out: std.ArrayListUnmanaged(Ref) = .empty;
+    try out.ensureTotalCapacity(arena, order.len);
+
+    var per_author: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+    defer per_author.deinit(arena);
+
+    for (order, author_key, keep) |ref, akey, k| {
+        if (!k) continue; // moderation removal — non-bypassable
+        if (config.max_per_author != 0) {
+            const gop = try per_author.getOrPut(arena, akey);
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            if (gop.value_ptr.* >= config.max_per_author) continue; // author cap hit
+            gop.value_ptr.* += 1;
+        }
+        out.appendAssumeCapacity(ref);
+    }
+    return out.toOwnedSlice(arena);
+}
+
+// ---------------------------------------------------------------------------
+// Validation — a shared/hostile config is just bad DATA, never a crash (D5)
+// ---------------------------------------------------------------------------
+
+/// Clamp one float into a finite range; a NaN/Inf (which would poison the
+/// multiplicative score) falls back to `dflt`. Pure.
+fn clampF(x: f32, lo: f32, hi: f32, dflt: f32) f32 {
+    if (!std.math.isFinite(x)) return dflt;
+    return std.math.clamp(x, lo, hi);
+}
+
+/// Sanitize a config loaded from anywhere (a shared record, a hand-edit, an
+/// import) into one the engine can run safely (E2/E4): every weight is clamped
+/// to a finite range so no value can produce a NaN/Inf or absurdly dominate,
+/// the source-mix is pinned to [0,1], and the declared state budget is capped at
+/// `state_budget_hard_cap` (DISCOVER D9/D11 — an imported algorithm cannot
+/// declare itself more on-device room than the ceiling allows). Pure: the
+/// engine never trusts a number it did not clamp. Generous bounds — these stop
+/// abuse and accidents, not legitimate tuning (the priors sit well inside them).
+pub fn validated(c: FeedConfig) FeedConfig {
+    const d = DEFAULT_CONFIG;
+    var v = c;
+    const w_lo: f32 = -100_000;
+    const w_hi: f32 = 100_000;
+    v.w_like = clampF(c.w_like, w_lo, w_hi, d.w_like);
+    v.w_repost = clampF(c.w_repost, w_lo, w_hi, d.w_repost);
+    v.w_reply = clampF(c.w_reply, w_lo, w_hi, d.w_reply);
+    v.w_reply_chain = clampF(c.w_reply_chain, w_lo, w_hi, d.w_reply_chain);
+    v.w_bookmark = clampF(c.w_bookmark, w_lo, w_hi, d.w_bookmark);
+    v.w_profile_click = clampF(c.w_profile_click, w_lo, w_hi, d.w_profile_click);
+    v.w_link_click = clampF(c.w_link_click, w_lo, w_hi, d.w_link_click);
+    v.w_negative = clampF(c.w_negative, w_lo, w_hi, d.w_negative);
+    v.recency_half_life_hrs = clampF(c.recency_half_life_hrs, 0, 1_000_000, d.recency_half_life_hrs);
+    v.author_rep_weight = clampF(c.author_rep_weight, -1000, 1000, d.author_rep_weight);
+    v.relevance_weight = clampF(c.relevance_weight, -1000, 1000, d.relevance_weight);
+    v.behavioral_weight = clampF(c.behavioral_weight, -1000, 1000, d.behavioral_weight);
+    v.query.source_mix = clampF(c.query.source_mix, 0, 1, d.query.source_mix);
+    if (v.query.max_candidates == 0) v.query.max_candidates = d.query.max_candidates;
+    if (v.state_budget_bytes > state_budget_hard_cap) v.state_budget_bytes = state_budget_hard_cap;
+    return v;
+}
+
+// ---------------------------------------------------------------------------
+// Tests — leak-checked (C6), pure (no clock: `now` is a fixed literal)
+// ---------------------------------------------------------------------------
+
+const test_now: i64 = 1_700_000_000; // a fixed "now" — the clock never enters (B4)
+
+/// Build a candidate with the given ref/age/likes, everything else zero — the
+/// minimal hand-built input the pure scorer needs.
+fn mk(ref: u32, age_secs: i64, likes: u32) Candidate {
+    return .{
+        .ref = Ref.from(ref),
+        .created_at = test_now - age_secs,
+        .like_count = likes,
+        .repost_count = 0,
+        .reply_count = 0,
+        .reply_chain_count = 0,
+        .bookmark_count = 0,
+        .profile_click_count = 0,
+        .link_click_count = 0,
+        .negative_count = 0,
+        .author_rep = 0,
+        .relevance = 0,
+        .behavioral = 0,
+    };
+}
+
+test "score: more engagement ranks first at equal age" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var c: Candidates = .{};
+    defer c.deinit(t.allocator);
+    try c.append(t.allocator, mk(10, 3600, 5), true);
+    try c.append(t.allocator, mk(20, 3600, 50), true); // more likes, same age
+    try c.append(t.allocator, mk(30, 3600, 1), true);
+
+    const order = try score(arena, &c, DEFAULT_CONFIG, test_now);
+    try t.expectEqual(@as(usize, 3), order.len);
+    try t.expectEqual(@as(u32, 20), order[0].raw());
+    try t.expectEqual(@as(u32, 10), order[1].raw());
+    try t.expectEqual(@as(u32, 30), order[2].raw());
+}
+
+test "score: fresher wins when engagement is equal" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var c: Candidates = .{};
+    defer c.deinit(t.allocator);
+    try c.append(t.allocator, mk(1, 12 * 3600, 100), true); // 12h old
+    try c.append(t.allocator, mk(2, 1 * 3600, 100), true); //  1h old
+
+    const order = try score(arena, &c, DEFAULT_CONFIG, test_now);
+    try t.expectEqual(@as(u32, 2), order[0].raw()); // recency decay favors the fresh one
+    try t.expectEqual(@as(u32, 1), order[1].raw());
+}
+
+test "score: calibrated ratios hold — a reply dominates, a repost is only ~2x a like" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ten_likes = mk(1, 3600, 10); // 10 × 1 = 10
+    var one_reply = mk(2, 3600, 0);
+    one_reply.reply_count = 1; // 1 × 27 = 27 — the dominant public signal
+    var one_repost = mk(3, 3600, 0);
+    one_repost.repost_count = 1; // 1 × 2 = 2 — a repost is only ~2× a like
+    const three_likes = mk(4, 3600, 3); // 3 × 1 = 3
+
+    var c: Candidates = .{};
+    defer c.deinit(t.allocator);
+    try c.append(t.allocator, ten_likes, true);
+    try c.append(t.allocator, one_reply, true);
+    try c.append(t.allocator, one_repost, true);
+    try c.append(t.allocator, three_likes, true);
+
+    const order = try score(arena, &c, DEFAULT_CONFIG, test_now);
+    // reply (27) > ten likes (10) > three likes (3) > one repost (2)
+    try t.expectEqual(@as(u32, 2), order[0].raw());
+    try t.expectEqual(@as(u32, 1), order[1].raw());
+    try t.expectEqual(@as(u32, 4), order[2].raw());
+    try t.expectEqual(@as(u32, 3), order[3].raw());
+}
+
+test "score: negative actions are an asymmetric punisher" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var reported = mk(1, 3600, 100); // 100 likes...
+    reported.negative_count = 2; // ...but two reports: 100×1 + 2×(-74) = -48
+
+    var c: Candidates = .{};
+    defer c.deinit(t.allocator);
+    try c.append(t.allocator, reported, true);
+    try c.append(t.allocator, mk(2, 3600, 1), true); // a quiet positive post
+
+    const order = try score(arena, &c, DEFAULT_CONFIG, test_now);
+    try t.expectEqual(@as(u32, 2), order[0].raw()); // the punished post sinks below it
+    try t.expect(scoreRow(reported, DEFAULT_CONFIG, test_now) < 0);
+}
+
+test "score: behavioral signal is inert under the default config (Tier-2 reserved)" {
+    const t = std.testing;
+    // Two identical posts; one carries a strong behavioral signal. With the
+    // default behavioral_weight of 0 it must NOT change the score — the slot is
+    // reserved, the learner (D9) is not built.
+    const plain = mk(1, 3600, 10);
+    var attended = mk(2, 3600, 10);
+    attended.behavioral = 1.0;
+    try t.expectEqual(scoreRow(plain, DEFAULT_CONFIG, test_now), scoreRow(attended, DEFAULT_CONFIG, test_now));
+
+    // Turn the weight on and the same signal now lifts the score (the path works).
+    var learns = DEFAULT_CONFIG;
+    learns.behavioral_weight = 0.5;
+    try t.expect(scoreRow(attended, learns, test_now) > scoreRow(plain, learns, test_now));
+}
+
+test "score: future timestamp (clock skew) clamps, does not explode" {
+    const t = std.testing;
+    const future = mk(1, -3600, 10); // created_at one hour in the FUTURE
+    const s = scoreRow(future, DEFAULT_CONFIG, test_now);
+    try t.expect(std.math.isFinite(s));
+    // age clamps to 0 ⇒ decay 1, velocity at its max 2× ⇒ score = 10 × 1 × 2.
+    try t.expectApproxEqAbs(@as(f64, 20.0), s, 1e-9);
+}
+
+test "score: deterministic — same inputs, same order (verifiability)" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var c: Candidates = .{};
+    defer c.deinit(t.allocator);
+    try c.append(t.allocator, mk(1, 3600, 7), true);
+    try c.append(t.allocator, mk(2, 7200, 7), false);
+    try c.append(t.allocator, mk(3, 1800, 7), true);
+
+    const a = try score(arena, &c, DEFAULT_CONFIG, test_now);
+    const b = try score(arena, &c, DEFAULT_CONFIG, test_now);
+    try t.expectEqualSlices(Ref, a, b);
+}
+
+test "score: empty pool is an empty order, not an error" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var c: Candidates = .{};
+    defer c.deinit(t.allocator);
+    const order = try score(arena, &c, DEFAULT_CONFIG, test_now);
+    try t.expectEqual(@as(usize, 0), order.len);
+}
+
+test "applyCaps: per-author diversity cap keeps at most N per author, in rank order" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Ranked order: five posts; author 7 owns three of them (refs 1,2,4).
+    const order = [_]Ref{ Ref.from(1), Ref.from(2), Ref.from(3), Ref.from(4), Ref.from(5) };
+    const author = [_]u32{ 7, 7, 9, 7, 9 };
+    const keep = [_]bool{ true, true, true, true, true };
+
+    var cfg = DEFAULT_CONFIG;
+    cfg.max_per_author = 2;
+    const out = try applyCaps(arena, &order, &author, &keep, cfg);
+    // author 7 capped at its first two (1,2 — ref 4 dropped); author 9 keeps both.
+    try t.expectEqual(@as(usize, 4), out.len);
+    try t.expectEqual(@as(u32, 1), out[0].raw());
+    try t.expectEqual(@as(u32, 2), out[1].raw());
+    try t.expectEqual(@as(u32, 3), out[2].raw());
+    try t.expectEqual(@as(u32, 5), out[3].raw()); // ref 4 (author 7's third) removed
+}
+
+test "applyCaps: moderation removal is non-bypassable and frees the author slot" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // All by author 7; cap 1. The top-ranked post is moderation-hidden, so the
+    // cap must NOT be spent on it — the next visible post by 7 takes the slot.
+    const order = [_]Ref{ Ref.from(1), Ref.from(2), Ref.from(3) };
+    const author = [_]u32{ 7, 7, 7 };
+    const keep = [_]bool{ false, true, true }; // ref 1 hidden by moderation
+
+    var cfg = DEFAULT_CONFIG;
+    cfg.max_per_author = 1;
+    const out = try applyCaps(arena, &order, &author, &keep, cfg);
+    try t.expectEqual(@as(usize, 1), out.len);
+    try t.expectEqual(@as(u32, 2), out[0].raw()); // ref 1 removed, ref 2 takes the slot
+}
+
+test "validated: NaN/Inf and out-of-range fields are sanitized to safe data" {
+    const t = std.testing;
+    var hostile = DEFAULT_CONFIG;
+    hostile.w_repost = std.math.nan(f32); // would poison every score
+    hostile.w_like = 1e30; // absurd dominance
+    hostile.query.source_mix = 5.0; // out of [0,1]
+    hostile.state_budget_bytes = 1 << 30; // 1 GiB — above the hard cap
+    hostile.query.max_candidates = 0;
+
+    const v = validated(hostile);
+    try t.expect(std.math.isFinite(v.w_repost));
+    try t.expectEqual(DEFAULT_CONFIG.w_repost, v.w_repost); // NaN → default
+    try t.expectEqual(@as(f32, 100_000), v.w_like); // clamped to the ceiling
+    try t.expectEqual(@as(f32, 1.0), v.query.source_mix); // pinned to [0,1]
+    try t.expectEqual(state_budget_hard_cap, v.state_budget_bytes); // capped
+    try t.expectEqual(DEFAULT_CONFIG.query.max_candidates, v.query.max_candidates); // 0 → default
+
+    // A valid config is unchanged.
+    const ok = validated(DEFAULT_CONFIG);
+    try t.expectEqual(DEFAULT_CONFIG.w_repost, ok.w_repost);
+    try t.expectEqual(DEFAULT_CONFIG.recency_half_life_hrs, ok.recency_half_life_hrs);
+}
+
+test "applyCaps: max_per_author 0 means no cap; moderation still applies" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const order = [_]Ref{ Ref.from(1), Ref.from(2), Ref.from(3) };
+    const author = [_]u32{ 7, 7, 7 };
+    const keep = [_]bool{ true, false, true }; // ref 2 hidden
+
+    var cfg = DEFAULT_CONFIG;
+    cfg.max_per_author = 0; // unlimited
+    const out = try applyCaps(arena, &order, &author, &keep, cfg);
+    try t.expectEqual(@as(usize, 2), out.len); // all of author 7's VISIBLE posts kept
+    try t.expectEqual(@as(u32, 1), out[0].raw());
+    try t.expectEqual(@as(u32, 3), out[1].raw());
+}

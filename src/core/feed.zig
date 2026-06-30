@@ -54,6 +54,8 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const lexicon = @import("lexicon.zig");
 const moderation = @import("moderation.zig");
+const discover = @import("discover.zig");
+const learner = @import("learner.zig");
 
 // ---------------------------------------------------------------------------
 // The resident records — hot, guarded, integer-only
@@ -946,6 +948,116 @@ fn normalizeTagClient(raw: []const u8, buf: []u8) ?[]const u8 {
     return buf[0..trimmed.len];
 }
 
+/// Build the SCORED Home view over the shared store: the same fillTimelineItem
+/// seam as buildTimeline, but ORDERED by the discover engine (DISCOVER D3)
+/// instead of feed order. This is the "an algorithm (a scored order)" lens the
+/// fillTimelineItem comment names — Home through a `FeedConfig`. The candidate
+/// pool is the resident TOP-LEVEL posts (replies excluded — invariant 11: a
+/// reply is a candidate only in its parent's reply pool, never Home); for this
+/// cut that resident set IS the in-network pool (the followed-graph posts the
+/// timeline fetched). Out-of-network/topic sourcing (D2) widens the pool later;
+/// the SCORING is unchanged when it does — one engine, a bigger pool.
+///
+/// A4/A5 hold across the discover boundary: a candidate carries this module's
+/// post index packed into discover's OPAQUE `Ref`, which discover never
+/// dereferences (it only sorts handles); we read it back here, where the index
+/// is meaningful, to resolve each ranked post. `now` is passed in (the shell
+/// reads the clock — invariant 9). Diversity caps + moderation are the D4 pass,
+/// not applied here. Cut-1 limit: a scored row carries no repost attribution
+/// (reposted_by = .none) since scoring reorders away from feed rows — noted for
+/// D4. Allocates in `arena` (C3).
+///
+/// `prefs` is the on-device learner state (D9), or null. The behavioral signal
+/// is computed for a candidate ONLY when the config's `behavioral_weight > 0`
+/// AND `prefs` is non-null — the doorway in the core (invariant 6): a "no
+/// behavioral data" algorithm (Discover Private, weight 0) never even reads the
+/// vector, so it provably cannot consult attention data, and the shell never
+/// hands a vector to such a config in the first place (double-walled). When used,
+/// a candidate's `behavioral` is `learner.affinity` over the post's features
+/// (its zone tags + author), which the scorer multiplies through
+/// `behavioral_weight`. Until the shell captures real dwell the vector is empty
+/// and affinity is 0 — inert, exactly like the pre-D2 sourcing was.
+pub fn buildDiscoverView(
+    arena: Allocator,
+    store: *const Store,
+    config: discover.FeedConfig,
+    now: i64,
+    prefs: ?*const learner.PrefVector,
+) error{OutOfMemory}![]TimelineItem {
+    const posts = store.posts.slice();
+    const parents = posts.items(.reply_parent);
+    const createds = posts.items(.created_at);
+    const likes = posts.items(.like_count);
+    const reposts = posts.items(.repost_count);
+    const replies = posts.items(.reply_count);
+    const post_authors = posts.items(.author);
+    const author_dids = store.authors.slice().items(.did);
+
+    // The behavioral doorway, in the core: only a config that opts in (weight > 0)
+    // and was actually handed a vector reads attention data at all (invariant 6).
+    const use_behavioral = config.behavioral_weight > 0 and prefs != null;
+
+    // Build the candidate pool in bulk: capacity once, no per-append bitset
+    // churn. Every resident top-level post is in-network for this cut.
+    var cands: discover.Candidates = .{};
+    try cands.list.ensureTotalCapacity(arena, store.posts.len);
+    for (0..store.posts.len) |p| {
+        if (parents[p].unwrap() != null) continue; // exclude replies (invariant 11)
+        // D9: the learned per-user affinity for this post's features (tags +
+        // author), or 0 when the config doesn't use behavioral data. Computed
+        // only behind the doorway above.
+        const behavioral: f32 = if (use_behavioral) blk: {
+            const tags = try collectRowTags(arena, store, p);
+            const feats = try arena.alloc([]const u8, tags.len + 1);
+            @memcpy(feats[0..tags.len], tags);
+            feats[tags.len] = sliceSpan(store, author_dids[@intFromEnum(post_authors[p])]);
+            break :blk learner.affinity(prefs.?, feats);
+        } else 0;
+        cands.list.appendAssumeCapacity(.{
+            .ref = discover.Ref.from(@intCast(p)),
+            .created_at = createds[p],
+            .like_count = likes[p],
+            .repost_count = reposts[p],
+            .reply_count = replies[p],
+            // Signals Zat4 doesn't capture yet (D1) — 0 until a source fills them.
+            .reply_chain_count = 0,
+            .bookmark_count = 0,
+            .profile_click_count = 0,
+            .link_click_count = 0,
+            .negative_count = 0,
+            // Off-graph signal is the shell's to supply (D2); on-device behavioral
+            // is the learner's (D9), computed above behind the doorway.
+            .author_rep = 0,
+            .relevance = 0,
+            .behavioral = behavioral,
+        });
+    }
+    try cands.in_network.resize(arena, cands.list.len, true);
+
+    const order = try discover.score(arena, &cands, config, now);
+
+    // D4: the post-scoring filters. Per ranked position, hand the engine the
+    // post's author (the diversity grouping key) and a moderation keep-bit — the
+    // non-bypassable, runs-last pass (invariant 8). The moderation VERDICT is the
+    // sealed module's (feed knows only the LabelFlags bits); a hidden post is
+    // removed from the algorithmic pool here, identically for every config. (The
+    // chronological Following path keeps the renderer's show-behind-a-notice
+    // behavior — that is a user's explicit follows, not algorithmic surfacing.)
+    const label_flags = posts.items(.label_flags);
+    const author_key = try arena.alloc(u32, order.len);
+    const keep = try arena.alloc(bool, order.len);
+    for (order, author_key, keep) |ref, *ak, *k| {
+        const p = ref.raw();
+        ak.* = @intFromEnum(post_authors[p]);
+        k.* = moderation.verdictFor(label_flags[p]) == .show;
+    }
+    const final = try discover.applyCaps(arena, order, author_key, keep, config);
+
+    const out = try arena.alloc(TimelineItem, final.len);
+    for (final, out) |ref, *item| item.* = try fillTimelineItem(arena, store, ref.raw(), .none);
+    return out;
+}
+
 /// Build a post's THREAD as a Reddit-style NESTED view over the shared store
 /// (ZONES inv. 4 — a query, not a container): walk up to the absolute root, then
 /// DFS the whole descendant tree in preorder (siblings chronological), stamping
@@ -975,6 +1087,18 @@ pub fn buildThreadView(
     /// CIDs the reader has collapsed (per-view state, never on the post): a
     /// collapsed post is emitted but its descendants are skipped.
     collapsed: []const []const u8,
+    /// `now` for the scorer (invariant 9); only read when `reply_config` orders
+    /// by a recency-bearing algorithm. The shell reads the clock and hands it in.
+    now: i64,
+    /// The reply pool's chosen algorithm (DISCOVER D3.5), or null for the
+    /// THREADED DEFAULT — siblings chronological (invariant 14). This composes
+    /// ORDER onto the threading STRUCTURE (invariant 13): the tree shape is
+    /// unchanged; only the order of SIBLINGS within each branch changes. So
+    /// "Threaded + Most Liked" is a legible conversation with the best replies
+    /// first at every level — never the flat-vs-threaded false choice. The same
+    /// `FeedConfig` the feed uses; the tray is the user's, carried here too
+    /// (invariant 12).
+    reply_config: ?discover.FeedConfig,
 ) error{OutOfMemory}![]TimelineItem {
     const focus_usize = lookupCid(store, focus_cid) orelse return &.{};
     const focus: u32 = @intCast(focus_usize);
@@ -982,6 +1106,35 @@ pub fn buildThreadView(
     const parents = posts.items(.reply_parent);
     const createds = posts.items(.created_at);
     const post_authors = posts.items(.author);
+
+    // Compose ORDER onto structure: when a reply algorithm is chosen, score every
+    // post once so siblings can be ranked within their branch. Null ⇒ no scores,
+    // siblings stay chronological (the threaded default). Replies are scored with
+    // the SAME core (scoreRow) the feed uses — one engine, a different pool.
+    const reply_scores: ?[]f64 = if (reply_config) |cfg| blk: {
+        const likes = posts.items(.like_count);
+        const reposts = posts.items(.repost_count);
+        const replies_c = posts.items(.reply_count);
+        const s = try arena.alloc(f64, store.posts.len);
+        for (0..store.posts.len) |p| {
+            s[p] = discover.scoreRow(.{
+                .ref = discover.Ref.from(@intCast(p)),
+                .created_at = createds[p],
+                .like_count = likes[p],
+                .repost_count = reposts[p],
+                .reply_count = replies_c[p],
+                .reply_chain_count = 0,
+                .bookmark_count = 0,
+                .profile_click_count = 0,
+                .link_click_count = 0,
+                .negative_count = 0,
+                .author_rep = 0,
+                .relevance = 0,
+                .behavioral = 0,
+            }, cfg, now);
+        }
+        break :blk s;
+    } else null;
 
     // Walk up to the ABSOLUTE thread root (cycle-guarded) so the whole thread
     // shows — ancestors ABOVE the focus, which the reader can scroll up to (the
@@ -1015,10 +1168,19 @@ pub fn buildThreadView(
         }
     }
 
-    const Asc = struct {
+    // Sibling order: by the chosen algorithm's score (best first), else
+    // chronological (oldest first — the threaded default). Same struct shape so
+    // the DFS push logic is untouched; the comparator picks the axis. A score
+    // tie falls back to oldest-first so the order is total and stable.
+    const Order = struct {
         createds: []const i64,
+        scores: ?[]const f64,
         pub fn lessThan(ctx: @This(), x: u32, y: u32) bool {
-            return ctx.createds[x] < ctx.createds[y]; // oldest first
+            if (ctx.scores) |sc| {
+                if (sc[x] != sc[y]) return sc[x] > sc[y]; // higher score renders first
+                return ctx.createds[x] < ctx.createds[y]; // tie → oldest first
+            }
+            return ctx.createds[x] < ctx.createds[y]; // chronological
         }
     };
 
@@ -1069,7 +1231,7 @@ pub fn buildThreadView(
         if (item.collapsed) continue; // hide the subtree
         if (children.get(fr.row)) |kids| {
             const ks = try arena.dupe(u32, kids.items);
-            std.sort.block(u32, ks, Asc{ .createds = createds }, Asc.lessThan);
+            std.sort.block(u32, ks, Order{ .createds = createds, .scores = reply_scores }, Order.lessThan);
             var i = ks.len;
             while (i > 0) {
                 i -= 1;
@@ -2267,7 +2429,7 @@ test "optimistic post: reconcile re-keys temp→real; drop detaches on failure" 
     // The thread of the (real) parent no longer contains the dropped reply.
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    const thread = try buildThreadView(arena_state.allocator(), &store, "bafyreal", false, &.{});
+    const thread = try buildThreadView(arena_state.allocator(), &store, "bafyreal", false, &.{}, 1_700_000_000, null);
     try testing.expectEqual(@as(usize, 1), thread.len); // just the parent
 }
 
@@ -2302,7 +2464,7 @@ test "buildThreadView: whole thread, focus marked; OP self-chain stitches, other
     try mk(gpa, &store, "did:plc:a", "a.zat4.com", "cBR", "a into b", "cB", 40);
 
     // Focus the root: the whole tree, preorder, siblings chronological.
-    const t = try buildThreadView(arena, &store, "cRoot", false, &.{});
+    const t = try buildThreadView(arena, &store, "cRoot", false, &.{}, 1_700_000_000, null);
     try testing.expectEqual(@as(usize, 5), t.len);
     // root(0,—), self1(0,stitch), self2(0,stitch), b reply(1,nest), a-into-b(2,nest).
     try testing.expectEqualStrings("root", t[0].text);
@@ -2322,7 +2484,7 @@ test "buildThreadView: whole thread, focus marked; OP self-chain stitches, other
     try testing.expect(!t[4].stitched);
 
     // Collapsing cB hides its subtree (cBR) but keeps cB, flagged collapsed.
-    const tc = try buildThreadView(arena, &store, "cRoot", false, &.{"cB"});
+    const tc = try buildThreadView(arena, &store, "cRoot", false, &.{"cB"}, 1_700_000_000, null);
     try testing.expectEqual(@as(usize, 4), tc.len); // cBR is hidden
     var saw_cb = false;
     for (tc) |it| {
@@ -2336,7 +2498,7 @@ test "buildThreadView: whole thread, focus marked; OP self-chain stitches, other
 
     // Focusing the b reply still shows the WHOLE thread (ancestors above), with
     // cB marked as the focus — the shell scrolls to it; the tree is unchanged.
-    const t2 = try buildThreadView(arena, &store, "cB", false, &.{});
+    const t2 = try buildThreadView(arena, &store, "cB", false, &.{}, 1_700_000_000, null);
     try testing.expectEqual(@as(usize, 5), t2.len);
     try testing.expectEqualStrings("root", t2[0].text); // ancestors are above the focus
     var f_idx: ?usize = null;
@@ -2348,7 +2510,7 @@ test "buildThreadView: whole thread, focus marked; OP self-chain stitches, other
 
     // RE-ROOTED on cB: its ancestor (cRoot) is emitted CONDENSED (sentinel depth)
     // above, then cB (focus, depth 0) + its subtree (cBR, depth 1).
-    const tr = try buildThreadView(arena, &store, "cB", true, &.{});
+    const tr = try buildThreadView(arena, &store, "cB", true, &.{}, 1_700_000_000, null);
     try testing.expectEqual(@as(usize, 3), tr.len);
     try testing.expectEqualStrings("root", tr[0].text);
     try testing.expectEqual(thread_ancestor_depth, tr[0].depth); // condensed ancestor
@@ -2404,6 +2566,189 @@ test "view model: a profile view is a query over the shared store; engagement is
     for (av2) |it| {
         if (std.mem.eql(u8, it.cid, "bafyreialice1")) try testing.expect(it.item_flags.viewer_liked);
     }
+}
+
+test "buildDiscoverView: the scorer reorders Home away from feed order" {
+    const gpa = testing.allocator; // C6
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+
+    // Two posts at the SAME time so recency is equal and the difference is pure
+    // engagement; the quiet one is FIRST in feed order, the popular one second.
+    const page: lexicon.TimelinePage = .{ .feed = &.{
+        .{ .post = .{
+            .uri = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.zat4.feed.post/low",
+            .cid = "bafyrelow",
+            .author = .{ .did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", .handle = "a.test" },
+            .record = .{ .text = "quiet post", .createdAt = "2026-01-01T00:00:00Z" },
+        } },
+        .{ .post = .{
+            .uri = "at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/app.zat4.feed.post/high",
+            .cid = "bafyrehigh",
+            .author = .{ .did = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", .handle = "b.test" },
+            .record = .{ .text = "popular post", .createdAt = "2026-01-01T00:00:00Z" },
+            .likeCount = 100,
+            .repostCount = 5,
+        } },
+    } };
+    _ = try ingestPage(gpa, &store, page);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Chronological/feed order keeps page order: quiet first.
+    const chrono = try buildTimeline(arena, &store);
+    try testing.expectEqualStrings("quiet post", chrono[0].text);
+
+    // Scored: the popular post ranks first though it is SECOND in feed order —
+    // proof the algorithm (not feed order) decides the scored view.
+    // `now` ~1.3h after the posts: recency decay is equal and non-zero for both
+    // (a far-future `now` would underflow both to 0 and the tiebreak — not the
+    // weights — would decide). 2026-01-01T00:00:00Z ≈ 1_767_225_600.
+    const scored = try buildDiscoverView(arena, &store, discover.DEFAULT_CONFIG, 1_767_230_400, null);
+    try testing.expectEqual(@as(usize, 2), scored.len);
+    try testing.expectEqualStrings("popular post", scored[0].text);
+    try testing.expectEqualStrings("quiet post", scored[1].text);
+}
+
+test "buildDiscoverView D4: moderation removes hidden posts; per-author cap trims the rest" {
+    const gpa = testing.allocator; // C6
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+
+    // Five posts by ONE author at the same time, decreasing likes (so the score
+    // order is just the like order). The 80-like post is spam-labeled (hidden).
+    const A = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+    const page: lexicon.TimelinePage = .{ .feed = &.{
+        .{ .post = .{ .uri = "at://" ++ A ++ "/app.zat4.feed.post/a100", .cid = "bafa100", .author = .{ .did = A, .handle = "a.test" }, .record = .{ .text = "a100", .createdAt = "2026-01-01T00:00:00Z" }, .likeCount = 100 } },
+        .{ .post = .{ .uri = "at://" ++ A ++ "/app.zat4.feed.post/a80", .cid = "bafa80", .author = .{ .did = A, .handle = "a.test" }, .record = .{ .text = "a80", .createdAt = "2026-01-01T00:00:00Z" }, .likeCount = 80, .labels = &.{.{ .val = "spam" }} } },
+        .{ .post = .{ .uri = "at://" ++ A ++ "/app.zat4.feed.post/a60", .cid = "bafa60", .author = .{ .did = A, .handle = "a.test" }, .record = .{ .text = "a60", .createdAt = "2026-01-01T00:00:00Z" }, .likeCount = 60 } },
+        .{ .post = .{ .uri = "at://" ++ A ++ "/app.zat4.feed.post/a40", .cid = "bafa40", .author = .{ .did = A, .handle = "a.test" }, .record = .{ .text = "a40", .createdAt = "2026-01-01T00:00:00Z" }, .likeCount = 40 } },
+        .{ .post = .{ .uri = "at://" ++ A ++ "/app.zat4.feed.post/a20", .cid = "bafa20", .author = .{ .did = A, .handle = "a.test" }, .record = .{ .text = "a20", .createdAt = "2026-01-01T00:00:00Z" }, .likeCount = 20 } },
+    } };
+    _ = try ingestPage(gpa, &store, page);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const scored = try buildDiscoverView(arena_state.allocator(), &store, discover.DEFAULT_CONFIG, 1_767_230_400, null);
+
+    // Spam (a80) removed by the non-bypassable filter; of the four survivors the
+    // per-author cap (default 3) keeps the top three, dropping a20.
+    try testing.expectEqual(@as(usize, 3), scored.len);
+    try testing.expectEqualStrings("a100", scored[0].text);
+    try testing.expectEqualStrings("a60", scored[1].text);
+    try testing.expectEqualStrings("a40", scored[2].text);
+    for (scored) |it| {
+        try testing.expect(!std.mem.eql(u8, it.text, "a80")); // moderation-hidden, gone
+        try testing.expect(!std.mem.eql(u8, it.text, "a20")); // diversity-capped, gone
+    }
+}
+
+test "buildThreadView D3.5: a reply algorithm orders siblings; threading structure is preserved" {
+    const gpa = testing.allocator; // C6
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const mk = struct {
+        fn p(g: Allocator, s: *Store, did: []const u8, cid: []const u8, text: []const u8, parent: []const u8, created: i64) !void {
+            _ = try ingestLivePost(g, s, .{
+                .did = did,
+                .handle = "x",
+                .uri = cid,
+                .cid = cid,
+                .text = text,
+                .reply_parent_cid = parent,
+                .reply_root_cid = if (parent.len > 0) "cRoot" else "",
+                .created_at = created,
+            });
+        }
+    }.p;
+    // Root "a"; three direct replies by distinct authors (so none stitch), one
+    // nested under B. Times ascending A<B<C; likes B(50) > A(5) > C(1).
+    try mk(gpa, &store, "did:plc:a", "cRoot", "root", "", 10);
+    try mk(gpa, &store, "did:plc:b", "cA", "A", "cRoot", 20);
+    try mk(gpa, &store, "did:plc:c", "cB", "B", "cRoot", 25);
+    try mk(gpa, &store, "did:plc:d", "cC", "C", "cRoot", 30);
+    try mk(gpa, &store, "did:plc:e", "cB1", "B1", "cB", 40);
+    const likes = store.posts.slice().items(.like_count);
+    likes[lookupCid(&store, "cA").?] = 5;
+    likes[lookupCid(&store, "cB").?] = 50;
+    likes[lookupCid(&store, "cC").?] = 1;
+
+    // Threaded default (null config): siblings chronological → A, B, (B1), C.
+    const chrono = try buildThreadView(arena, &store, "cRoot", false, &.{}, 1_700_000_000, null);
+    const chrono_texts = [_][]const u8{ "root", "A", "B", "B1", "C" };
+    try testing.expectEqual(chrono_texts.len, chrono.len);
+    for (chrono, chrono_texts) |it, want| try testing.expectEqualStrings(want, it.text);
+
+    // Most-Liked reply algorithm (likes only, no recency): siblings of root by
+    // likes desc → B, A, C; B's child B1 STAYS under B (structure preserved).
+    const most_liked = discover.FeedConfig{
+        .w_repost = 0,
+        .w_reply = 0,
+        .w_reply_chain = 0,
+        .w_bookmark = 0,
+        .w_profile_click = 0,
+        .w_link_click = 0,
+        .recency_half_life_hrs = 0,
+        .velocity_boost = false,
+        .author_rep_weight = 0,
+        .relevance_weight = 0,
+    };
+    const scored = try buildThreadView(arena, &store, "cRoot", false, &.{}, 1_700_000_000, most_liked);
+    const scored_texts = [_][]const u8{ "root", "B", "B1", "A", "C" };
+    try testing.expectEqual(scored_texts.len, scored.len);
+    for (scored, scored_texts) |it, want| try testing.expectEqualStrings(want, it.text);
+    // Order composed onto structure: B1 still nests one level under B (depth 2),
+    // immediately after it — the tree shape is unchanged, only sibling order is.
+    try testing.expectEqualStrings("B1", scored[2].text);
+    try testing.expectEqual(@as(u8, 2), scored[2].depth);
+    try testing.expectEqual(@as(u8, 1), scored[1].depth); // B at depth 1
+}
+
+test "buildDiscoverView D9: a learned affinity lifts a matching post, but only behind the doorway" {
+    const gpa = testing.allocator; // C6
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+
+    // Two posts, same author, same time. The weather post is MORE engaged (12
+    // vs 10 likes), so on engagement alone it wins — only a behavioral lift can
+    // reorder them. The dolphins post is tagged #dolphins; the user's learner
+    // has learned to love dolphins.
+    const A = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+    const page: lexicon.TimelinePage = .{ .feed = &.{
+        .{ .post = .{ .uri = "at://" ++ A ++ "/app.zat4.feed.post/d", .cid = "bafd", .author = .{ .did = A, .handle = "a.test" }, .record = .{ .text = "dolphins post", .createdAt = "2026-01-01T00:00:00Z" }, .likeCount = 10, .tags = &.{"dolphins"} } },
+        .{ .post = .{ .uri = "at://" ++ A ++ "/app.zat4.feed.post/w", .cid = "bafw", .author = .{ .did = A, .handle = "a.test" }, .record = .{ .text = "weather post", .createdAt = "2026-01-01T00:00:00Z" }, .likeCount = 12, .tags = &.{"weather"} } },
+    } };
+    _ = try ingestPage(gpa, &store, page);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var v: learner.PrefVector = .{};
+    for (0..10) |_| learner.update(&v, &.{"dolphins"}, 1.0); // attention on dolphins
+
+    // A config that USES behavioral data + the trained vector → the dolphins post
+    // overcomes its engagement deficit and ranks first.
+    var learns = discover.DEFAULT_CONFIG;
+    learns.behavioral_weight = 1.0;
+    const adapted = try buildDiscoverView(arena, &store, learns, 1_767_230_400, &v);
+    try testing.expectEqualStrings("dolphins post", adapted[0].text);
+
+    // The doorway: a config with behavioral_weight 0 (e.g. Discover Private)
+    // never reads the vector even when one is passed → engagement decides, the
+    // weather post wins.
+    const private_view = try buildDiscoverView(arena, &store, discover.DEFAULT_CONFIG, 1_767_230_400, &v);
+    try testing.expectEqualStrings("weather post", private_view[0].text);
+
+    // And with no vector at all, same result — engagement order.
+    const no_prefs = try buildDiscoverView(arena, &store, learns, 1_767_230_400, null);
+    try testing.expectEqualStrings("weather post", no_prefs[0].text);
 }
 
 test "refresh ingest: new rows prepend in order, cursor untouched, rows dedup by pair" {

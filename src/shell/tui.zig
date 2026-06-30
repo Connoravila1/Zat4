@@ -60,6 +60,7 @@ const text_select = @import("../core/text_select.zig");
 const textedit = @import("../core/textedit.zig");
 const lens_socket = @import("../core/lens_socket.zig");
 const lens_catalog = @import("../core/lens_catalog.zig");
+const discover = @import("../core/discover.zig");
 const loadout_store = @import("loadout.zig");
 const effect_core = @import("../core/effect.zig");
 const clock_shell = @import("clock.zig");
@@ -855,12 +856,21 @@ pub fn run(
         // each a query over the SAME store. One list of view-models the render +
         // input + engagement paths all key off; the post records (and so
         // engagement + identity) are shared (ZONES invariant 4).
+        // The seated lens per surface decides ordering: the FEED lens whether
+        // Home is scored (and by which algorithm), the REPLY lens how a thread's
+        // siblings order (null on either = the no-scoring path: feed order /
+        // chronological threading). Resolved once per frame and reused by the
+        // engagement repaints so they rebuild through the same algorithm.
+        const feed_config = seatedLensConfig(socket_cards, socket_blob, gseated);
+        const reply_config = seatedLensConfig(reply_cards, reply_blob, reply_seated);
         const view_items: []const feed_core.TimelineItem = if (on_thread)
-            try feed_core.buildThreadView(arena, store, thread_focus_cid, thread_rerooted, gcollapsed.items)
+            try feed_core.buildThreadView(arena, store, thread_focus_cid, thread_rerooted, gcollapsed.items, now, reply_config)
         else if (on_profile)
             try feed_core.buildAuthorView(arena, store, profile_target_did)
         else if (on_zone)
             try feed_core.buildTagView(arena, store, zone_tag)
+        else if (feed_config) |cfg|
+            try feed_core.buildDiscoverView(arena, store, cfg, now, null)
         else
             try feed_core.buildTimeline(arena, store);
         const profile_header = try profileHeaderFor(arena, session, gscreen, profile_target_did, view_items);
@@ -1595,7 +1605,7 @@ pub fn run(
                                         .like, .repost => if (hit.post < view_items.len) {
                                             state.selected = hit.post;
                                             const ek: Engagement = if (hit.kind == .like) .like else .repost;
-                                            const r = try engageSelected(ek, gpa, arena, session, store, view_items[hit.post], hit.post, gscreen, profile_target_did, thread_focus_cid, zone_tag, thread_rerooted, gcollapsed.items, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
+                                            const r = try engageSelected(ek, gpa, arena, session, store, view_items[hit.post], hit.post, gscreen, profile_target_did, thread_focus_cid, zone_tag, thread_rerooted, gcollapsed.items, feed_config, reply_config, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
                                             if (r.status.len > 0) status = r.status;
                                         },
                                         // Reply → open the premium composer in reply
@@ -2065,12 +2075,12 @@ pub fn run(
                     }
                 },
                 .like => if (view_items.len > 0) {
-                    const r = try engageSelected(.like, gpa, arena, session, store, view_items[state.selected], state.selected, gscreen, profile_target_did, thread_focus_cid, zone_tag, thread_rerooted, gcollapsed.items, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
+                    const r = try engageSelected(.like, gpa, arena, session, store, view_items[state.selected], state.selected, gscreen, profile_target_did, thread_focus_cid, zone_tag, thread_rerooted, gcollapsed.items, feed_config, reply_config, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
                     if (r.status.len > 0) status = r.status;
                     if (r.skip_rest) continue;
                 },
                 .repost => if (view_items.len > 0) {
-                    const r = try engageSelected(.repost, gpa, arena, session, store, view_items[state.selected], state.selected, gscreen, profile_target_did, thread_focus_cid, zone_tag, thread_rerooted, gcollapsed.items, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
+                    const r = try engageSelected(.repost, gpa, arena, session, store, view_items[state.selected], state.selected, gscreen, profile_target_did, thread_focus_cid, zone_tag, thread_rerooted, gcollapsed.items, feed_config, reply_config, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
                     if (r.status.len > 0) status = r.status;
                     if (r.skip_rest) continue;
                 },
@@ -2402,14 +2412,31 @@ const Engagement = enum { like, repost };
 /// profile record (the in-app profile editor reuses the composer's input).
 const ComposeKind = enum { post, profile };
 
-/// Build the ACTIVE view's posts over the SHARED store — Home's timeline, the
-/// profile screen's author query, or a post's thread. The single place "which
-/// view is showing" is decided, for both the main loop and engageSelected's
-/// optimistic repaint.
-fn buildActiveView(arena: Allocator, store: *feed_core.Store, screen: u8, profile_did: []const u8, thread_cid: []const u8, zone_tag: []const u8, rerooted: bool, collapsed: []const []const u8) error{OutOfMemory}![]feed_core.TimelineItem {
-    if (screen == feed_view.screen_thread) return feed_core.buildThreadView(arena, store, thread_cid, rerooted, collapsed);
+/// The discover-engine config a surface's seated lens resolves to, or null when
+/// that lens is the no-scoring path (Following / Most Recent) — then the surface
+/// stays its plain builder (feed order, or chronological threading). Surface-
+/// agnostic: the SAME resolver serves the feed tray and the reply tray, because
+/// the tray is the user's and identical on every surface (DISCOVER invariant 12).
+/// Empty tray ⇒ null (E4).
+fn seatedLensConfig(cards: []const lens_socket.LensCard, blob: []const u8, seated: u32) ?discover.FeedConfig {
+    if (cards.len == 0) return null;
+    const idx = @min(seated, @as(u32, @intCast(cards.len - 1)));
+    const span = cards[idx].cid;
+    const cid = blob[span.off..][0..span.len];
+    return lens_catalog.scoringConfigForId(cid);
+}
+
+/// Build the ACTIVE view's posts over the SHARED store — Home (scored by the
+/// seated feed lens, or chronological), a post's thread (sibling order composed
+/// onto threading by the seated reply lens), the profile author query, or a
+/// zone. The single place "which view is showing" is decided, for both the main
+/// loop and engageSelected's optimistic repaint. `now` is the shell's clock
+/// reading, handed to the pure scorer (invariant 9).
+fn buildActiveView(arena: Allocator, store: *feed_core.Store, screen: u8, profile_did: []const u8, thread_cid: []const u8, zone_tag: []const u8, rerooted: bool, collapsed: []const []const u8, feed_config: ?discover.FeedConfig, reply_config: ?discover.FeedConfig, now: i64) error{OutOfMemory}![]feed_core.TimelineItem {
+    if (screen == feed_view.screen_thread) return feed_core.buildThreadView(arena, store, thread_cid, rerooted, collapsed, now, reply_config);
     if (screen == feed_view.screen_profile) return feed_core.buildAuthorView(arena, store, profile_did);
     if (screen == feed_view.screen_zones) return feed_core.buildTagView(arena, store, zone_tag);
+    if (feed_config) |cfg| return feed_core.buildDiscoverView(arena, store, cfg, now, null);
     return feed_core.buildTimeline(arena, store);
 }
 
@@ -2469,6 +2496,11 @@ fn engageSelected(
     zone_tag: []const u8,
     thread_rerooted: bool,
     collapsed_cids: []const []const u8,
+    /// The seated FEED and REPLY lens configs (null = the no-scoring path), so
+    /// the optimistic repaint rebuilds the active surface through the SAME
+    /// algorithm it's showing (Home scored / a thread's siblings ordered).
+    feed_config: ?discover.FeedConfig,
+    reply_config: ?discover.FeedConfig,
     state: *timeline_ui.UiState,
     revealed_cids: []const []const u8,
     now: i64,
@@ -2511,7 +2543,7 @@ fn engageSelected(
                     if (!acted) return .{ .status = "" };
                     const set = if (kind == .like) def_unlike else def_unrepost;
                     set.put(gpa, std.hash.Wyhash.hash(0, item.cid), {}) catch {};
-                    const fresh = try buildActiveView(arena, store, screen, profile_did, thread_cid, zone_tag, thread_rerooted, collapsed_cids);
+                    const fresh = try buildActiveView(arena, store, screen, profile_did, thread_cid, zone_tag, thread_rerooted, collapsed_cids, feed_config, reply_config, now);
                     const fresh_header = try profileHeaderFor(arena, session, screen, profile_did, fresh);
                     try paintFrame(gpa, out, arena, prev, next, backend, pix, fresh, fresh_header, state, revealed_cids, now, session.handle, if (kind == .like) "unliking..." else "unboosting...");
                     if (pix) |g| fireEngageEffect(gpa, g, kind, target, false);
@@ -2528,7 +2560,7 @@ fn engageSelected(
             const record_uri = uri_buf[0..borrowed.len];
             @memcpy(record_uri, borrowed);
 
-            const fresh = try buildActiveView(arena, store, screen, profile_did, thread_cid, zone_tag, thread_rerooted, collapsed_cids);
+            const fresh = try buildActiveView(arena, store, screen, profile_did, thread_cid, zone_tag, thread_rerooted, collapsed_cids, feed_config, reply_config, now);
             const fresh_header = try profileHeaderFor(arena, session, screen, profile_did, fresh);
             try paintFrame(gpa, out, arena, prev, next, backend, pix, fresh, fresh_header, state, revealed_cids, now, session.handle, if (kind == .like) "unliking..." else "unboosting...");
             // Fire the drain effect at the post's heart cell (state is now
@@ -2557,7 +2589,7 @@ fn engageSelected(
 
     // Optimistic first: the bumped count paints now; the worker call
     // follows on its own thread; a refusal reverts (drained in the loop).
-    const fresh = try buildActiveView(arena, store, screen, profile_did, thread_cid, zone_tag, thread_rerooted, collapsed_cids);
+    const fresh = try buildActiveView(arena, store, screen, profile_did, thread_cid, zone_tag, thread_rerooted, collapsed_cids, feed_config, reply_config, now);
     const fresh_header = try profileHeaderFor(arena, session, screen, profile_did, fresh);
     try paintFrame(gpa, out, arena, prev, next, backend, pix, fresh, fresh_header, state, revealed_cids, now, session.handle, if (kind == .like) "liking..." else "boosting...");
     // Fire the like/boost burst at the post's heart cell (state is now

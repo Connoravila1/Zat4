@@ -142,6 +142,12 @@ pub const collection = struct {
     /// §10). A singleton (rkey "self") in the user's own repo, so it travels
     /// with the account — invariant 12 made literal.
     pub const loadout = "app.zat4.socket.loadout";
+    /// A published feed ALGORITHM (DISCOVER D5): a `discover.FeedConfig` serialized
+    /// into a record in the author's own repo. Its CID is the algorithm's identity
+    /// — what a user inspects is byte-identical to what runs (invariant 5). The
+    /// pure serialize/parse is `core/algorithm.zig`; this is just the collection
+    /// the publish/import shell leg writes to and fetches from.
+    pub const algorithm = "app.zat4.feed.algorithm";
     /// The user's Zat4 MEMBERSHIP (IDENTITY_ENROLLMENT_DESIGN §13.2). A singleton
     /// (rkey "self") in the user's own repo: its mere EXISTENCE marks the DID as a
     /// Zat4 member, which drives the returning-vs-first-time sign-in fork. Carries

@@ -630,6 +630,10 @@ test {
     _ = @import("shell/auth.zig");
     _ = @import("shell/keystore.zig");
     _ = @import("core/feed.zig");
+    _ = @import("core/discover.zig");
+    _ = @import("core/algorithm.zig");
+    _ = @import("core/learner.zig");
+    _ = @import("shell/algorithm.zig");
     _ = @import("core/feed_view.zig");
     _ = @import("core/settings_view.zig");
     _ = @import("core/lens_socket.zig");

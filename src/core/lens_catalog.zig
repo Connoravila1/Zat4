@@ -40,6 +40,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const lens_socket = @import("lens_socket.zig");
+const discover = @import("discover.zig");
 
 /// One first-party algorithm. A cold, comptime configuration table — low
 /// cardinality, never iterated in a hot loop.
@@ -51,6 +52,12 @@ const Builtin = struct {
     desc: []const u8, // the expand-panel paragraph
     color: u8, // author-assigned DEFAULT palette index (user may override)
     flags: lens_socket.LensFlags,
+    /// The discover-engine algorithm this lens IS (DISCOVER D3): a built-in is
+    /// just a named `FeedConfig`. `null` = the no-scoring chronological path
+    /// (Following / Most Recent) — invariant 7's "nothing shaping you", which
+    /// the multiplicative engine cannot express as a config (0 engagement ⇒ 0
+    /// score), so it stays the plain feed-order/recency builder, not a config.
+    config: ?discover.FeedConfig = null,
 };
 
 // The first-party algorithms, named once so the per-surface default loadouts
@@ -63,6 +70,7 @@ const b_discover = Builtin{
     .desc = "The well-rounded default: a strong, Twitter-style feed that learns what you engage with — on your device, never sent anywhere.",
     .color = 0, // amber (house accent)
     .flags = .{ .learns = true, .is_default = true },
+    .config = discover.DEFAULT_CONFIG, // the house algorithm = one config value (invariant 2)
 };
 const b_following = Builtin{
     .id = "zat4:following",
@@ -79,6 +87,29 @@ const b_private = Builtin{
     .desc = "Surfaces strong posts beyond your follows, well-rounded — with ZERO behavioral data. Candidate-side only.",
     .color = 1, // blue (the calm/private tier)
     .flags = .{},
+    // Bluesky-like, CANDIDATE-SIDE ONLY — the best feed achievable with ZERO
+    // behavioral data. Every attention-derived weight is pinned to 0 (the
+    // doorway also never hands it the signal — invariant 6), so it leans on the
+    // public engagement graph the way Bluesky's Discover does: conversation
+    // depth above all (replies weighted even harder than Discover — Bluesky's
+    // "40 replies beat 200 likes"), amplification, a fresher recency window, and
+    // network-proximity relevance computed from the PUBLIC follow graph. What it
+    // gives up is the per-person "knows what you linger on" magic; what it keeps
+    // is "what your network finds worth discussing." behavioral_weight 0 forever.
+    .config = .{
+        .w_like = 1.0,
+        .w_repost = 2.0,
+        .w_reply = 40.0, // conversation is the private feed's strength — lean in
+        .w_reply_chain = 150.0,
+        .w_bookmark = 0.0, // private data, never captured
+        .w_profile_click = 0.0, // BEHAVIORAL — the wall
+        .w_link_click = 0.0, // BEHAVIORAL — the wall
+        .w_negative = -148.0, // block/mute/report are DELIBERATE public actions — allowed
+        .recency_half_life_hrs = 4.0, // fresher / more "now"
+        .author_rep_weight = 0.5, // from the public graph
+        .relevance_weight = 1.0, // network proximity, from the PUBLIC follow graph
+        .behavioral_weight = 0.0, // never — and never even handed the signal
+    },
 };
 const b_most_recent = Builtin{
     .id = "zat4:most-recent",
@@ -95,6 +126,19 @@ const b_most_liked = Builtin{
     .desc = "The most-liked replies first. A simple popularity sort; no behavioral data.",
     .color = 5, // rose
     .flags = .{},
+    // Pure popularity: likes only, decay + velocity + boosts off.
+    .config = .{
+        .w_repost = 0,
+        .w_reply = 0,
+        .w_reply_chain = 0,
+        .w_bookmark = 0,
+        .w_profile_click = 0,
+        .w_link_click = 0,
+        .recency_half_life_hrs = 0, // no decay
+        .velocity_boost = false,
+        .author_rep_weight = 0,
+        .relevance_weight = 0,
+    },
 };
 const b_calm = Builtin{
     .id = "zat4:calm",
@@ -103,6 +147,14 @@ const b_calm = Builtin{
     .desc = "Down-ranks pile-ons and high-velocity threads. Candidate-side only; no behavioral data.",
     .color = 7, // teal
     .flags = .{},
+    // Calmer than Discover: no early-velocity spike, slower freshness decay,
+    // conversation weighted lower so pile-ons don't dominate.
+    .config = .{
+        .velocity_boost = false,
+        .recency_half_life_hrs = 24.0,
+        .w_reply = 5.0,
+        .w_reply_chain = 20.0,
+    },
 };
 
 /// Every distinct built-in — what `findById` resolves a persisted ref against.
@@ -166,6 +218,29 @@ pub fn findById(id: []const u8) ?Builtin {
         if (std.mem.eql(u8, b.id, id)) return b;
     }
     return null;
+}
+
+/// The discover-engine `FeedConfig` a lens id resolves to, or null when the
+/// lens is the NO-SCORING chronological path (Following / Most Recent) or the
+/// id is unknown (E4). The caller scores with the config when present, and
+/// falls back to the plain feed-order/recency builder when null — so "Following"
+/// genuinely means nothing is shaping the order. A marketplace algo (a future
+/// CID-addressed config record, D5) resolves here too once those records exist;
+/// today only the built-ins do.
+pub fn scoringConfigForId(id: []const u8) ?discover.FeedConfig {
+    const b = findById(id) orelse return null;
+    return b.config;
+}
+
+test "scoringConfigForId: Discover scores, Following is the no-scoring path" {
+    const t = std.testing;
+    try t.expect(scoringConfigForId("zat4:discover") != null);
+    try t.expect(scoringConfigForId("zat4:following") == null); // chronological, no config
+    try t.expect(scoringConfigForId("zat4:unknown-marketplace-algo") == null);
+    // Most Liked is a real config: likes weighted, recency decay disabled.
+    const ml = scoringConfigForId("zat4:most-liked").?;
+    try t.expectEqual(@as(f32, 0), ml.recency_half_life_hrs);
+    try t.expectEqual(@as(f32, 1.0), ml.w_like);
 }
 
 /// A persisted loadout entry, resolved from the user's record (§10): which
