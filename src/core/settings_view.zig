@@ -77,6 +77,9 @@ pub const act_field: u8 = 6; // Appearance: the living glyph field on/off
 pub const act_show_handle: u8 = 7;
 pub const act_show_did: u8 = 8;
 pub const act_show_pds: u8 = 9;
+// CHOICE rows wired to a live knob (open a picker; selection drives the effect).
+pub const act_accent: u8 = 10; // Appearance: the UI accent colour
+pub const act_field_intensity: u8 = 11; // Appearance: the field's brightness (uGain)
 
 /// The GLOBAL row index of the (first) row carrying `action`, or null. Lets the
 /// shell map a functional `act_*` to its runtime toggle bit without hardcoding
@@ -86,10 +89,50 @@ pub fn rowOf(action: u8) ?u6 {
     return null;
 }
 
+/// A CHOICE row's options + default selection, looked up by the row's action.
+/// The shell owns the live selected index; the picker renders these. A7.2: cold
+/// config — a handful, comptime-constant, never in a hot loop.
+pub const Choice = struct {
+    action: u8,
+    default: u8, // default selected option index
+    options: []const []const u8,
+};
+
+/// The choices wired to a live effect (option index → a knob in the shell). Each
+/// `choice` ROW must carry the matching `action`. ≤ 8 options each (packed 3 bits
+/// per choice in the shell's selection word).
+pub const choices = [_]Choice{
+    .{ .action = act_accent, .default = 0, .options = &.{ "Auto", "Amber", "Blue", "Green", "Violet", "Rose", "Teal" } },
+    .{ .action = act_field_intensity, .default = 1, .options = &.{ "Subtle", "Normal", "Vivid" } },
+};
+
+/// The Choice for `action`, or null if it isn't a wired choice.
+pub fn choiceOf(action: u8) ?*const Choice {
+    for (&choices) |*c| if (c.action == action) return c;
+    return null;
+}
+
+/// The position of `action` within `choices` (its slot in the packed selection
+/// word), or null.
+pub fn choiceIndex(action: u8) ?u8 {
+    for (choices, 0..) |c, i| if (c.action == action) return @intCast(i);
+    return null;
+}
+
+comptime {
+    // The shell packs each choice's selected index into 3 bits (act_* word), so a
+    // choice may have at most 8 options, and the table at most 21 choices (63 bits).
+    assert(choices.len <= 21);
+    for (choices) |c| assert(c.options.len <= 8);
+}
+
 /// Row flag bits (A6: sparse booleans packed into one byte, not bloating the
 /// struct with `bool` fields).
 pub const flag_destructive: u8 = 1 << 0; // render the label in the warning red
 pub const flag_on: u8 = 1 << 1; // a toggle's displayed state (skeleton: static)
+pub const flag_wip: u8 = 1 << 2; // not yet implemented — rendered dimmed + a "Soon"
+//                                  tag, and non-interactive (no tap region). Clear
+//                                  the flag when the row's behaviour is wired.
 
 /// One section: a leading icon + a label. Cold-ish (seven of them) but drawn in
 /// the per-frame section-list loop, so treat as hot and guard (A7).
@@ -147,40 +190,40 @@ pub const rows = [_]Row{
     // ── Account ──────────────────────────────────────────────────────────
     .{ .section = sec_account, .group = 0, .kind = .info, .action = act_show_handle, .flags = 0, .label = "Handle", .value = "@you.zat4.com" },
     .{ .section = sec_account, .group = 0, .kind = .info, .action = act_show_did, .flags = 0, .label = "DID", .value = "did:plc:…" },
-    .{ .section = sec_account, .group = 0, .kind = .disclosure, .action = act_none, .flags = 0, .label = "Edit profile", .value = "" },
-    .{ .section = sec_account, .group = 1, .kind = .choice, .action = act_show_pds, .flags = 0, .label = "Home server (PDS)", .value = "pds.zat4.com" },
-    .{ .section = sec_account, .group = 1, .kind = .disclosure, .action = act_none, .flags = 0, .label = "App passwords", .value = "" },
+    .{ .section = sec_account, .group = 0, .kind = .disclosure, .action = act_none, .flags = flag_wip, .label = "Edit profile", .value = "" },
+    .{ .section = sec_account, .group = 1, .kind = .info, .action = act_show_pds, .flags = 0, .label = "Home server (PDS)", .value = "pds.zat4.com" },
+    .{ .section = sec_account, .group = 1, .kind = .disclosure, .action = act_none, .flags = flag_wip, .label = "App passwords", .value = "" },
     .{ .section = sec_account, .group = 2, .kind = .action, .action = act_sign_out, .flags = flag_destructive, .label = "Sign out", .value = "" },
 
     // ── Appearance ───────────────────────────────────────────────────────
-    .{ .section = sec_appearance, .group = 0, .kind = .choice, .action = act_none, .flags = 0, .label = "Theme", .value = "Dark" },
-    .{ .section = sec_appearance, .group = 0, .kind = .choice, .action = act_none, .flags = 0, .label = "Accent", .value = "Amber" },
-    .{ .section = sec_appearance, .group = 0, .kind = .choice, .action = act_none, .flags = 0, .label = "Text size", .value = "Medium" },
+    .{ .section = sec_appearance, .group = 0, .kind = .choice, .action = act_none, .flags = flag_wip, .label = "Theme", .value = "Dark" },
+    .{ .section = sec_appearance, .group = 0, .kind = .choice, .action = act_accent, .flags = 0, .label = "Accent", .value = "Auto" },
+    .{ .section = sec_appearance, .group = 0, .kind = .choice, .action = act_none, .flags = flag_wip, .label = "Text size", .value = "Medium" },
     .{ .section = sec_appearance, .group = 1, .kind = .toggle, .action = act_field, .flags = flag_on, .label = "Living glyph field", .value = "" },
-    .{ .section = sec_appearance, .group = 1, .kind = .choice, .action = act_none, .flags = 0, .label = "Field intensity", .value = "Subtle" },
-    .{ .section = sec_appearance, .group = 1, .kind = .choice, .action = act_none, .flags = 0, .label = "Density", .value = "Cozy" },
+    .{ .section = sec_appearance, .group = 1, .kind = .choice, .action = act_field_intensity, .flags = 0, .label = "Field intensity", .value = "Normal" },
+    .{ .section = sec_appearance, .group = 1, .kind = .choice, .action = act_none, .flags = flag_wip, .label = "Density", .value = "Cozy" },
 
     // ── Feed & Content ───────────────────────────────────────────────────
-    .{ .section = sec_feed, .group = 0, .kind = .choice, .action = act_none, .flags = 0, .label = "Default feed", .value = "Following" },
-    .{ .section = sec_feed, .group = 0, .kind = .toggle, .action = act_none, .flags = flag_on, .label = "Show reposts", .value = "" },
-    .{ .section = sec_feed, .group = 0, .kind = .toggle, .action = act_none, .flags = 0, .label = "Autoplay media", .value = "" },
-    .{ .section = sec_feed, .group = 1, .kind = .disclosure, .action = act_none, .flags = 0, .label = "Muted words", .value = "" },
-    .{ .section = sec_feed, .group = 1, .kind = .disclosure, .action = act_none, .flags = 0, .label = "Muted zones", .value = "" },
-    .{ .section = sec_feed, .group = 1, .kind = .choice, .action = act_none, .flags = 0, .label = "Sensitive content", .value = "Warn" },
+    .{ .section = sec_feed, .group = 0, .kind = .choice, .action = act_none, .flags = flag_wip, .label = "Default feed", .value = "Following" },
+    .{ .section = sec_feed, .group = 0, .kind = .toggle, .action = act_none, .flags = flag_wip, .label = "Show reposts", .value = "" },
+    .{ .section = sec_feed, .group = 0, .kind = .toggle, .action = act_none, .flags = flag_wip, .label = "Autoplay media", .value = "" },
+    .{ .section = sec_feed, .group = 1, .kind = .disclosure, .action = act_none, .flags = flag_wip, .label = "Muted words", .value = "" },
+    .{ .section = sec_feed, .group = 1, .kind = .disclosure, .action = act_none, .flags = flag_wip, .label = "Muted zones", .value = "" },
+    .{ .section = sec_feed, .group = 1, .kind = .choice, .action = act_none, .flags = flag_wip, .label = "Sensitive content", .value = "Warn" },
 
     // ── Notifications ────────────────────────────────────────────────────
-    .{ .section = sec_notifications, .group = 0, .kind = .toggle, .action = act_none, .flags = flag_on, .label = "Likes", .value = "" },
-    .{ .section = sec_notifications, .group = 0, .kind = .toggle, .action = act_none, .flags = flag_on, .label = "Replies", .value = "" },
-    .{ .section = sec_notifications, .group = 0, .kind = .toggle, .action = act_none, .flags = flag_on, .label = "Reposts", .value = "" },
-    .{ .section = sec_notifications, .group = 0, .kind = .toggle, .action = act_none, .flags = flag_on, .label = "New followers", .value = "" },
-    .{ .section = sec_notifications, .group = 1, .kind = .toggle, .action = act_none, .flags = 0, .label = "Zone activity", .value = "" },
+    .{ .section = sec_notifications, .group = 0, .kind = .toggle, .action = act_none, .flags = flag_wip, .label = "Likes", .value = "" },
+    .{ .section = sec_notifications, .group = 0, .kind = .toggle, .action = act_none, .flags = flag_wip, .label = "Replies", .value = "" },
+    .{ .section = sec_notifications, .group = 0, .kind = .toggle, .action = act_none, .flags = flag_wip, .label = "Reposts", .value = "" },
+    .{ .section = sec_notifications, .group = 0, .kind = .toggle, .action = act_none, .flags = flag_wip, .label = "New followers", .value = "" },
+    .{ .section = sec_notifications, .group = 1, .kind = .toggle, .action = act_none, .flags = flag_wip, .label = "Zone activity", .value = "" },
 
     // ── Privacy & Safety ─────────────────────────────────────────────────
-    .{ .section = sec_privacy, .group = 0, .kind = .choice, .action = act_none, .flags = 0, .label = "Who can reply", .value = "Everyone" },
-    .{ .section = sec_privacy, .group = 0, .kind = .toggle, .action = act_none, .flags = flag_on, .label = "Discoverable", .value = "" },
-    .{ .section = sec_privacy, .group = 1, .kind = .disclosure, .action = act_none, .flags = 0, .label = "Blocked accounts", .value = "" },
-    .{ .section = sec_privacy, .group = 1, .kind = .disclosure, .action = act_none, .flags = 0, .label = "Muted accounts", .value = "" },
-    .{ .section = sec_privacy, .group = 2, .kind = .toggle, .action = act_none, .flags = flag_on, .label = "Privacy labels on lenses", .value = "" },
+    .{ .section = sec_privacy, .group = 0, .kind = .choice, .action = act_none, .flags = flag_wip, .label = "Who can reply", .value = "Everyone" },
+    .{ .section = sec_privacy, .group = 0, .kind = .toggle, .action = act_none, .flags = flag_wip, .label = "Discoverable", .value = "" },
+    .{ .section = sec_privacy, .group = 1, .kind = .disclosure, .action = act_none, .flags = flag_wip, .label = "Blocked accounts", .value = "" },
+    .{ .section = sec_privacy, .group = 1, .kind = .disclosure, .action = act_none, .flags = flag_wip, .label = "Muted accounts", .value = "" },
+    .{ .section = sec_privacy, .group = 2, .kind = .toggle, .action = act_none, .flags = flag_wip, .label = "Privacy labels on lenses", .value = "" },
 
     // ── Toy Box ──────────────────────────────────────────────────────────
     // Your playground. Append experimental toggles here freely — clearly fenced
@@ -194,8 +237,8 @@ pub const rows = [_]Row{
     // ── About ────────────────────────────────────────────────────────────
     .{ .section = sec_about, .group = 0, .kind = .info, .action = act_none, .flags = 0, .label = "Version", .value = "0.1.0-dev" },
     .{ .section = sec_about, .group = 0, .kind = .info, .action = act_none, .flags = 0, .label = "Build", .value = "main" },
-    .{ .section = sec_about, .group = 1, .kind = .disclosure, .action = act_none, .flags = 0, .label = "Open-source licenses", .value = "" },
-    .{ .section = sec_about, .group = 1, .kind = .disclosure, .action = act_none, .flags = 0, .label = "Acknowledgements", .value = "" },
+    .{ .section = sec_about, .group = 1, .kind = .disclosure, .action = act_none, .flags = flag_wip, .label = "Open-source licenses", .value = "" },
+    .{ .section = sec_about, .group = 1, .kind = .disclosure, .action = act_none, .flags = flag_wip, .label = "Acknowledgements", .value = "" },
 };
 
 comptime {

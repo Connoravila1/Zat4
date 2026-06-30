@@ -145,7 +145,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt };
 
 /// The six top-level rail destinations, in order. The `Screen` index a nav
 /// region carries is an index into this. Shared by the rail (draw + hit) and
@@ -1278,6 +1278,11 @@ pub fn layout(
     /// table holds placeholders; the shell hands the live values). Empty fields
     /// fall back to the placeholder. Ignored off `screen_settings`.
     settings_account: SettingsAccount,
+    /// Packed selected-option index per CHOICE (3 bits each, by `choiceIndex`).
+    /// Drives what each wired choice row displays + the picker's checkmark.
+    settings_choices: u64,
+    /// The action of the choice whose picker popover is OPEN, or 255 = none.
+    settings_picking: u8,
 ) error{OutOfMemory}!i32 {
     const m: Metrics = if (geom) |g|
         .{ .rail_x = g.rail_x, .col_x = g.col_x, .col_w = g.col_w, .lx = g.lx, .cw = g.cw, .side_x = g.side_x, .wide = g.wide }
@@ -1376,7 +1381,7 @@ pub fn layout(
         // Settings draws its own master–detail body (a left section list + the
         // selected section's grouped rows) and owns its scroll, returning content
         // height directly — no post loop, no top bar (it draws its own title).
-        return try drawSettings(gpa, dl, e, m, height, scroll, regions, accent, settings_section, settings_toggles, settings_account);
+        return try drawSettings(gpa, dl, e, m, height, scroll, regions, accent, settings_section, settings_toggles, settings_account, settings_choices, settings_picking);
     } else if (active_screen != 0) {
         const msg = "Coming soon";
         const tw: i32 = @intCast(text.measure(e, .regular, msg, 16));
@@ -2197,7 +2202,7 @@ const warn: u32 = 0xFFE5544B;
 /// this rarely shows); every control except Sign out is inert display — taps on
 /// other rows emit a `.settings_row` no-op. On a NARROW window the two panes get
 /// cramped (settings is normally a wide page); a stacked narrow mode is later.
-fn drawSettings(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, height: i32, scroll: i32, regions: ?*Regions, accent: u32, sel_section: u8, toggles: u64, account: SettingsAccount) error{OutOfMemory}!i32 {
+fn drawSettings(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, height: i32, scroll: i32, regions: ?*Regions, accent: u32, sel_section: u8, toggles: u64, account: SettingsAccount, choices: u64, picking: u8) error{OutOfMemory}!i32 {
     const x0 = m.lx;
     const w = m.cw;
     // Defensive clamp — the shell owns the selection, but never trust an index
@@ -2251,6 +2256,12 @@ fn drawSettings(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: 
 
     const row_h: i32 = 52;
     const group_gap: i32 = 22;
+    // The open picker's anchor (recorded when its choice row is drawn; the popover
+    // is drawn AFTER the loop so it overlays the rows below it).
+    var pick_act: u8 = 255;
+    var pick_x: i32 = 0;
+    var pick_y: i32 = 0;
+    var pick_w: i32 = 0;
     for (0..ng) |g| {
         const gid = group_ids[g];
         const card_h = group_cnt[g] * row_h;
@@ -2262,33 +2273,92 @@ fn drawSettings(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: 
                 if (r.section != ss or r.group != gid) continue;
                 const ry = dy + k * row_h;
                 if (k > 0) try rect(gpa, dl, detail_x + 18, ry, detail_w - 36, 1, divider, 0);
-                try drawSettingsRow(gpa, dl, e, regions, r, @intCast(ridx), detail_x, ry, detail_w, row_h, accent, toggles, account);
+                try drawSettingsRow(gpa, dl, e, regions, r, @intCast(ridx), detail_x, ry, detail_w, row_h, accent, toggles, account, choices);
+                if (r.kind == .choice and r.action == picking) {
+                    pick_x = detail_x;
+                    pick_y = ry + row_h;
+                    pick_w = detail_w;
+                    pick_act = r.action;
+                }
                 k += 1;
             }
         }
         dy += card_h + group_gap;
     }
 
+    // The open choice's picker popover, drawn last so it overlays the rows below.
+    if (pick_act != 255) if (settings_view.choiceOf(pick_act)) |ch| {
+        try drawChoicePopover(gpa, dl, e, regions, ch, pick_x, pick_y, pick_w, choices);
+    };
+
     return @max(ly, dy) - scroll + 40;
+}
+
+/// The dropdown popover for an open CHOICE: a panel below the row listing the
+/// options, the selected one checked. Each option emits a `.settings_choice_opt`
+/// region carrying `choiceIndex*8 + optionIndex` so the shell can apply it.
+fn drawChoicePopover(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, regions: ?*Regions, ch: *const settings_view.Choice, x: i32, y: i32, w: i32, choices: u64) error{OutOfMemory}!void {
+    const ci = settings_view.choiceIndex(ch.action) orelse return;
+    const sel: u8 = @intCast((choices >> @intCast(@as(u32, ci) * 3)) & 7);
+    const opt_h: i32 = 38;
+    const pad: i32 = 8;
+    const pw: i32 = @min(w, 260);
+    const px = x + w - pw; // right-aligned under the value
+    const total_h = @as(i32, @intCast(ch.options.len)) * opt_h + pad * 2;
+    // Shadow + panel.
+    try rect(gpa, dl, px, y + 4, pw, total_h, 0x55000000, 14);
+    try rect(gpa, dl, px, y + 2, pw, total_h, 0xF61E1C16, 14);
+    try rect(gpa, dl, px, y + 2, pw, 1, 0x24EDEAE0, 14);
+    for (ch.options, 0..) |opt, oi| {
+        const oy = y + 2 + pad + @as(i32, @intCast(oi)) * opt_h;
+        const on = oi == sel;
+        if (on) try rect(gpa, dl, px + 6, oy, pw - 12, opt_h, 0x18EDEAE0, 9);
+        _ = try str(gpa, dl, e, if (on) .semibold else .regular, px + 18, oy + 24, if (on) ink else muted, 14, opt);
+        if (on) { // a check mark on the selected option (two strokes)
+            const cx = px + pw - 26;
+            const cy = oy + @divTrunc(opt_h, 2);
+            try line(gpa, dl, cx, cy + 2, cx + 4, cy + 6, ink, 2);
+            try line(gpa, dl, cx + 4, cy + 6, cx + 11, cy - 4, ink, 2);
+        }
+        try emitRegion(gpa, regions, px, oy, pw, opt_h, @intCast(@as(u32, ci) * 8 + @as(u32, @intCast(oi))), .settings_choice_opt);
+    }
 }
 
 /// One detail-pane row, dispatched on its archetype. Info rows aren't tappable;
 /// every other row emits a region — `act_sign_out` routes to the live `.sign_out`
 /// handler, the rest to the inert `.settings_row` (skeleton).
-fn drawSettingsRow(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, regions: ?*Regions, r: settings_view.Row, ridx: u16, x: i32, y: i32, w: i32, h: i32, accent: u32, toggles: u64, account: SettingsAccount) error{OutOfMemory}!void {
+fn drawSettingsRow(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, regions: ?*Regions, r: settings_view.Row, ridx: u16, x: i32, y: i32, w: i32, h: i32, accent: u32, toggles: u64, account: SettingsAccount, choices: u64) error{OutOfMemory}!void {
     const pad: i32 = 18;
     const label_y = y + @divTrunc(h, 2) + 5;
     const destructive = (r.flags & settings_view.flag_destructive) != 0;
     const label_col = if (destructive) warn else ink;
     const right = x + w - pad;
     const chev_y = y + @divTrunc(h - 18, 2);
-    // Account info rows show the viewer's REAL identity (handle/DID/PDS) — the
-    // shell hands it in; the table value is the fallback placeholder.
-    const val: []const u8 = switch (r.action) {
-        settings_view.act_show_handle => if (account.handle.len > 0) account.handle else r.value,
-        settings_view.act_show_did => if (account.did.len > 0) account.did else r.value,
-        settings_view.act_show_pds => if (account.pds.len > 0) account.pds else r.value,
-        else => r.value,
+
+    // Not-yet-implemented rows: dim the label, tag it "Soon", draw no control and
+    // emit NO region (so they don't look clickable). Honest scaffolding.
+    if ((r.flags & settings_view.flag_wip) != 0) {
+        _ = try str(gpa, dl, e, .regular, x + pad, label_y, aScale(ink, 0.30), 15, r.label);
+        const tag = "Soon";
+        const tw: i32 = @intCast(text.measure(e, .regular, tag, 12));
+        _ = try str(gpa, dl, e, .regular, right - tw, label_y, aScale(muted, 0.55), 12, tag);
+        return;
+    }
+
+    // The right-hand VALUE: a wired choice shows its live selected option; account
+    // info rows show the real identity; everything else the table placeholder.
+    const val: []const u8 = blk: {
+        if (settings_view.choiceOf(r.action)) |ch| {
+            const ci = settings_view.choiceIndex(r.action).?;
+            const sel: u8 = @intCast((choices >> @intCast(@as(u32, ci) * 3)) & 7);
+            break :blk ch.options[@min(sel, ch.options.len - 1)];
+        }
+        break :blk switch (r.action) {
+            settings_view.act_show_handle => if (account.handle.len > 0) account.handle else r.value,
+            settings_view.act_show_did => if (account.did.len > 0) account.did else r.value,
+            settings_view.act_show_pds => if (account.pds.len > 0) account.pds else r.value,
+            else => r.value,
+        };
     };
 
     if (r.kind == .action) {
@@ -2336,7 +2406,12 @@ fn drawSettingsRow(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, 
     }
 
     if (r.kind != .info) {
-        const kind: Action = if (r.action == settings_view.act_sign_out) .sign_out else .settings_row;
+        const kind: Action = if (r.action == settings_view.act_sign_out)
+            .sign_out
+        else if (settings_view.choiceOf(r.action) != null)
+            .settings_choice
+        else
+            .settings_row;
         try emitRegion(gpa, regions, x, y, w, @intCast(@max(0, @min(32767, h))), ridx, kind);
     }
 }
@@ -2850,7 +2925,7 @@ test "layout emits 4 tap regions per post (avatar + 3 engagement); hitTest resol
     const posts = [_]PostView{
         .{ .name = "A", .handle = "@a.zat", .age = "1m", .body = "hello there field", .tint = 0xFFAAAAAA, .reply = 1, .boost = 2, .like = 3, .initial = 'A', .liked = true, .boosted = false },
     };
-    const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{});
+    const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{}, 0, 255);
     try std.testing.expect(h > 112); // content extends below the top bar
     // 8 regions per post: body tap + avatar + reply/repost/like + bookmark/share/more.
     try std.testing.expectEqual(@as(usize, 8), regions.items.len);
@@ -2895,14 +2970,14 @@ test "layout captures the rooted post's body glyphs for selection (thread screen
         .{ .name = "A", .handle = "@a.zat", .age = "1m", .body = "hello there field", .tint = 0xFFAAAAAA, .reply = 0, .boost = 0, .like = 0, .initial = 'A', .liked = false, .boosted = false, .is_focus = true },
     };
     // A WIDE layout so the focus post is on-screen and the body is drawn.
-    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_thread, null, 0, accent_house, null, .{}, null, null, &sel, "", &.{}, null, 0, 0, .{});
+    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_thread, null, 0, accent_house, null, .{}, null, null, &sel, "", &.{}, null, 0, 0, .{}, 0, 255);
     // "hello there field" = 15 visible glyphs (spaces are emitted too): the body
     // captured into the selection map, in reading order.
     try std.testing.expect(sel.items.len > 0);
     try std.testing.expectEqual(@as(u32, 'h'), sel.items[0].cp);
 
     // A non-thread screen captures nothing (only the rooted post is selectable).
-    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_home, null, 0, accent_house, null, .{}, null, null, &sel, "", &.{}, null, 0, 0, .{});
+    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_home, null, 0, accent_house, null, .{}, null, null, &sel, "", &.{}, null, 0, 0, .{}, 0, 255);
     try std.testing.expectEqual(@as(usize, 0), sel.items.len);
 }
 
@@ -2964,7 +3039,7 @@ test "long timeline does not overflow draw coordinates (off-screen posts skipped
     const posts = try arena.alloc(PostView, n);
     for (posts) |*pv| pv.* = .{ .name = "x", .handle = "@x.zat", .age = "1m", .body = "a body line that wraps a little across the feed column width here", .tint = 0xFF888888, .reply = 1, .boost = 2, .like = 3, .initial = 'x', .liked = false, .boosted = false };
 
-    const h = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{}); // must not panic
+    const h = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{}, 0, 255); // must not panic
     try std.testing.expect(h > 940 * 10); // height accounts for the whole list
     try std.testing.expect(regions.items.len < 4 * 24); // only on-screen posts are tappable
 
@@ -2978,11 +3053,11 @@ test "long timeline does not overflow draw coordinates (off-screen posts skipped
     @memset(heights, -1);
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h_fill = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{});
+    const h_fill = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{}, 0, 255);
     const fill_regions = regions.items.len;
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h_cached = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{});
+    const h_cached = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{}, 0, 255);
     try std.testing.expectEqual(h, h_fill);
     try std.testing.expectEqual(h, h_cached);
     try std.testing.expectEqual(fill_regions, regions.items.len);
@@ -3005,7 +3080,7 @@ test "profile screen renders the author's posts under a header; other screens st
     // Profile screen: 8 post tap regions (body + avatar + reply/repost/like +
     // bookmark/share/more) + 4 profile-nav tab regions in the sticky header
     // (the header here isn't editable, so no edit-profile region).
-    const hp = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_profile, header, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{});
+    const hp = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_profile, header, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{}, 0, 255);
     try std.testing.expect(hp > 112);
     try std.testing.expectEqual(@as(usize, 12), regions.items.len);
 
@@ -3013,7 +3088,7 @@ test "profile screen renders the author's posts under a header; other screens st
     // so no tap regions, and the height clamps to the viewport (no post stack).
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const he = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, 2, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{}); // Activity (a still-bare placeholder)
+    const he = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, 2, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{}, 0, 255); // Activity (a still-bare placeholder)
     try std.testing.expectEqual(@as(i32, 940), he);
     try std.testing.expectEqual(@as(usize, 0), regions.items.len);
 
@@ -3026,10 +3101,11 @@ test "profile screen renders the author's posts under a header; other screens st
     regions.clearRetainingCapacity();
     // Narrow width (460): `m.wide` is false so the rail emits no regions — the
     // only regions are the settings surface's own, keeping the count exact.
-    _ = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_settings, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, settings_view.sec_account, 0, .{});
+    _ = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_settings, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, settings_view.sec_account, 0, .{}, 0, 255);
+    // Rows that emit a tap region: not info, and not WIP-greyed (those are inert).
     var account_interactive: usize = 0;
     for (settings_view.rows) |r| {
-        if (r.section == settings_view.sec_account and r.kind != .info) account_interactive += 1;
+        if (r.section == settings_view.sec_account and r.kind != .info and (r.flags & settings_view.flag_wip) == 0) account_interactive += 1;
     }
     var n_sections: usize = 0;
     var n_sign_out: usize = 0;
@@ -3060,7 +3136,7 @@ test "zones browse: each catalog entry emits one .zone_open card region carrying
         .{ .tag = "zig", .count = 913 },
         .{ .tag = "small-net", .count = 1 },
     };
-    const h = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_zones_browse, null, 0, accent_house, null, .{}, null, null, null, "", &zones, null, 0, 0, .{});
+    const h = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_zones_browse, null, 0, accent_house, null, .{}, null, null, null, "", &zones, null, 0, 0, .{}, 0, 255);
     try std.testing.expect(h > 0);
     // The inert chrome (tabs/search/categories) emits no regions; the rail does
     // (it flanks every wide screen), so filter to the card taps: one `.zone_open`

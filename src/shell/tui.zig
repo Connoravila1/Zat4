@@ -538,6 +538,16 @@ pub fn run(
     // Holds the "@handle" form for the Settings → Account info row (formatted
     // each frame from the session; the session handle has no leading @).
     var account_handle_buf: [128]u8 = undefined;
+    // CHOICE selections: the live selected-option index per choice, seeded from
+    // each choice's default. `gsettings_picking` = the open choice's action
+    // (255 = no picker open). A tap on a choice opens its picker; an option tap
+    // sets the index + closes.
+    var choice_sel: [settings_view.choices.len]u8 = blk: {
+        var s: [settings_view.choices.len]u8 = undefined;
+        for (settings_view.choices, 0..) |c, i| s[i] = c.default;
+        break :blk s;
+    };
+    var gsettings_picking: u8 = 255;
     // Zones BROWSE catalog (`screen_zones_browse`): gpa-owned zone cards (the
     // display tag duped + post count), (re)fetched from `listTags` on entering
     // the browse screen. Each card taps to its zone feed; freed on exit.
@@ -957,6 +967,10 @@ pub fn run(
             .did = session.did,
             .pds = session.pds_url,
         };
+        // Choice selections → the effects (each frame, declarative like the toggles).
+        const settings_choices_packed = packChoices(&choice_sel);
+        const accent_override: ?u32 = accentChoiceColor(choiceSel(&choice_sel, settings_view.act_accent));
+        const field_gain: f32 = fieldGainFor(choiceSel(&choice_sel, settings_view.act_field_intensity));
         switch (backend) { // heart cursor follows the Julia toggle
             .window => |w| window_shell.setJulia(w, julia_on),
             else => {},
@@ -964,7 +978,7 @@ pub fn run(
         var cur_socket_ui = if (on_thread_screen) reply_ui else if (on_zone_screen) zone_ui else gsocket_ui;
         cur_socket_ui.julia = julia_on;
         const cur_socket_hits = if (on_thread_screen) &reply_hits else if (on_zone_screen) &zone_hits else &gsocket_hits;
-        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else lens_socket.seatedAccent(home_tray), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
+        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
         switch (mode) {
             .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status),
             .compose => {
@@ -1743,6 +1757,7 @@ pub fn run(
                                         .settings_section => {
                                             gsettings_section = @intCast(hit.post);
                                             gscroll_px = 0;
+                                            gsettings_picking = 255; // close any open picker
                                         },
                                         // A detail-pane row. Toggles flip their
                                         // runtime bit (live — Julia mode reads its
@@ -1768,6 +1783,20 @@ pub fn run(
                                                     }
                                                 }
                                             }
+                                            gsettings_picking = 255; // a row tap closes the picker
+                                        },
+                                        // A wired CHOICE row: open (or re-close) its
+                                        // picker popover.
+                                        .settings_choice => {
+                                            const act = settings_view.rows[hit.post].action;
+                                            gsettings_picking = if (gsettings_picking == act) 255 else act;
+                                        },
+                                        // A picker option: post = choiceIndex*8 + optionIndex.
+                                        .settings_choice_opt => {
+                                            const ci = hit.post / 8;
+                                            const oi: u8 = @intCast(hit.post % 8);
+                                            if (ci < choice_sel.len) choice_sel[ci] = oi;
+                                            gsettings_picking = 255; // selection closes the picker
                                         },
                                             }
                                         }
@@ -2826,6 +2855,13 @@ const Grid = struct {
     settings_toggles: u64 = 0,
     /// The viewer's real identity for the Settings → Account info rows.
     settings_account: feed_view.SettingsAccount = .{},
+    /// Packed selected-option index per CHOICE (3 bits each); drives the choice
+    /// values + picker checkmark. `settings_picking` = the open choice's action
+    /// (255 = none). `field_gain` is the brightness the Field-intensity choice
+    /// resolves to (applied to the GPU field each frame).
+    settings_choices: u64 = 0,
+    settings_picking: u8 = 255,
+    field_gain: f32 = 0.9,
     /// Toy Box "Julia mode" active — the field renderer pinks its glyph ink.
     julia: bool = false,
     /// "Ripples on like" — the like fires the field ripple + red dye.
@@ -3252,6 +3288,42 @@ fn toggleOn(bits: u64, action: u8) bool {
     return if (settings_view.rowOf(action)) |i| (bits >> i) & 1 != 0 else false;
 }
 
+/// Pack the per-choice selected indices into the 3-bits-each word `layout` reads.
+fn packChoices(sel: []const u8) u64 {
+    var p: u64 = 0;
+    for (sel, 0..) |s, i| p |= @as(u64, s & 7) << @intCast(i * 3);
+    return p;
+}
+
+/// The live selected option index for a choice action (0 if it isn't a choice).
+fn choiceSel(sel: []const u8, action: u8) u8 {
+    return if (settings_view.choiceIndex(action)) |i| sel[i] else 0;
+}
+
+/// "Accent" choice → an accent override, or null for "Auto" (follow the lens).
+/// Option order matches settings_view.choices: Auto, Amber, Blue, Green, Violet,
+/// Rose, Teal (the lens-socket palette colours).
+fn accentChoiceColor(opt: u8) ?u32 {
+    return switch (opt) {
+        1 => feed_view.accent_house, // Amber (house)
+        2 => 0xFF4A9EFF, // Blue
+        3 => 0xFF3FC97E, // Green
+        4 => 0xFF9B7BFF, // Violet
+        5 => 0xFFFF5C8A, // Rose
+        6 => 0xFF33C2C2, // Teal
+        else => null, // 0 = Auto
+    };
+}
+
+/// "Field intensity" choice → the field's uGain. Subtle / Normal / Vivid.
+fn fieldGainFor(opt: u8) f32 {
+    return switch (opt) {
+        0 => 0.5, // Subtle
+        2 => 1.5, // Vivid
+        else => 0.9, // Normal (the default)
+    };
+}
+
 fn pushLikeSplash(gpa: Allocator, gs: *GpuState, gx: u32, gy: u32, with_dye: bool) void {
     if (gs.cols == 0 or gs.rows == 0) return;
     const sx = @min(gx, gs.cols - 1);
@@ -3503,7 +3575,7 @@ fn paintFrame(
                 // seam. Slice 1 hands back the screen's own geometry (identical
                 // render); the animated morph springs this between screens.
                 const sw_geom = feed_view.paneGeomFor(@intCast(win.fb.width), g.screen.*);
-                g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, null, null, g.zone_title, g.zones, sw_geom, g.settings_section, g.settings_toggles, g.settings_account) catch g.content_h.*;
+                g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, null, null, g.zone_title, g.zones, sw_geom, g.settings_section, g.settings_toggles, g.settings_account, g.settings_choices, g.settings_picking) catch g.content_h.*;
             }
             const t_layout = if (debug_frame_timing) clock_shell.monotonicNanos() else 0;
             window_shell.presentDrawList(win, gpa, g.engine, g.draw.slice(), field_core.background) catch {}; // E2: a lost blit is the next frame's problem
@@ -3828,7 +3900,7 @@ fn paintFrameGpu(
     const over_left_rail = gs.algo_t > 0.5 and g.hover_x >= 0 and @as(f32, @floatFromInt(g.hover_x)) < left_rail_right + 8.0 and g.hover_y >= 0;
     springGeom(&gs.left_hover_t, &gs.left_hover_v, if (over_left_rail) 1.0 else 0.0, 1.0 / 60.0);
     const algo_animating = @abs(gs.algo_t - (if (on_algo) @as(f32, 1.0) else 0.0)) > 0.003 or @abs(gs.algo_v) > 0.003 or @abs(gs.left_hover_t - (if (over_left_rail) @as(f32, 1.0) else 0.0)) > 0.004 or @abs(gs.left_hover_v) > 0.004;
-    const sig = feedSignature(items, g.scroll.*, w, h) ^ (@as(u64, g.screen.*) *% 0x9E37_79B9_7F4A_7C15) ^ (socket_sig *% 0xD1B5_4A32_D192_ED03) ^ (@as(u64, g.settings_section) *% 0xC2B2_AE3D_27D4_EB4F) ^ (g.settings_toggles *% 0x9E6C_63D0_676A_9A99);
+    const sig = feedSignature(items, g.scroll.*, w, h) ^ (@as(u64, g.screen.*) *% 0x9E37_79B9_7F4A_7C15) ^ (socket_sig *% 0xD1B5_4A32_D192_ED03) ^ (@as(u64, g.settings_section) *% 0xC2B2_AE3D_27D4_EB4F) ^ (g.settings_toggles *% 0x9E6C_63D0_676A_9A99) ^ (g.settings_choices *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, g.settings_picking) *% 0x8A91_7F2B_4D3E_61C7);
     // A drag/settle animates the socket every frame (lift, reflow, ghost), so
     // bypass the feed cache while it runs — a brief interaction, and the field
     // already rebuilds every frame anyway.
@@ -3910,7 +3982,7 @@ fn paintFrameGpu(
             }
             gs.content_x = gp_geom.col_x; // for the field panel-softening (tracks the live content)
             gs.content_w = gp_geom.col_w;
-            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, &chain_info, &gs.sel_glyphs, g.zone_title, g.zones, gp_geom, g.settings_section, g.settings_toggles, g.settings_account) catch g.content_h.*;
+            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, &chain_info, &gs.sel_glyphs, g.zone_title, g.zones, gp_geom, g.settings_section, g.settings_toggles, g.settings_account, g.settings_choices, g.settings_picking) catch g.content_h.*;
         }
         if (g.julia) feed_view.juliaRemapText(g.draw); // light theme: dark text
         // "Show frame timing": ride the fps/ms badge on the feed buffer. The gate
@@ -3989,6 +4061,7 @@ fn paintFrameGpu(
     const panel_l = @as(f32, @floatFromInt(gs.content_x)) * scale;
     const panel_r = @as(f32, @floatFromInt(gs.content_x + gs.content_w)) * scale;
     const field_ink: u32 = if (g.julia) lens_socket.julia_field_ink else 0xFFA6ACBA;
+    gs.grid.gain = g.field_gain; // Appearance → "Field intensity" choice
     if (g.field_on) gpu.drawFieldGrid(&gs.grid, &gs.ramp, gs.mcx, gs.mcy, gs.t, @intCast(w), @intCast(h), panel_l, panel_r, field_ink, g.julia); // "Living glyph field" off ⇒ flat background
     // Hover highlight (post wash + button highlight), BEHIND the feed so the
     // content draws on top — the app feels alive under the cursor.
