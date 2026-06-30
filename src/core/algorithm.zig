@@ -230,6 +230,41 @@ test "parse: a malformed VM program is rejected to a safe no-op on load" {
     try t.expectEqual(@as(usize, 0), cfg.vm_program.len); // rejected to no-op
 }
 
+test "fuzz: parse tolerates arbitrary input and always yields a validated config" {
+    const fuzzgen = @import("fuzzgen.zig");
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var g = fuzzgen.Gen.init(0xA1607A5E);
+    var buf: [512]u8 = undefined;
+    // Valid seeds (mutated by the generator to reach deep, post-parse paths) plus
+    // pure-random and charset-random input.
+    const seeds = [_][]const u8{
+        \\{ "version": 1, "config": { "w_like": 2.0, "rules": [ { "predicate": { "kind": "always" }, "action": { "kind": "boost", "factor": 2 } } ] } }
+        ,
+        \\{ "config": { "vm_program": [ { "op": "push_fact", "fact": "like_count" }, { "op": "push_const", "value": 2 }, { "op": "mul" } ] } }
+        ,
+    };
+    const charset = "{}[]\":,.- 0123456789truefalsenulopfactvaluekindrulesconfigvm_program";
+
+    var i: usize = 0;
+    while (i < 6000) : (i += 1) {
+        const input = g.next(&buf, &seeds, charset, i);
+        // No crash on ANY input; only OOM may propagate. Whatever parses is a sane,
+        // VALIDATED config — every untrusted bound holds (the load-path guarantee).
+        const cfg = parse(arena, input) catch continue;
+        try t.expect(std.math.isFinite(cfg.w_like));
+        try t.expect(std.math.isFinite(cfg.behavioral_weight));
+        try t.expect(cfg.rules.len <= discover.max_rules);
+        try t.expect(cfg.vm_program.len <= algo_vm.max_program_len);
+        try t.expect(cfg.query.max_candidates <= discover.max_candidates_hard_cap);
+        try t.expect(cfg.state_budget_bytes <= discover.state_budget_hard_cap);
+        if (i % 128 == 0) _ = arena_state.reset(.retain_capacity);
+    }
+}
+
 test "parse: forward-compatible — unknown fields are ignored (E4)" {
     const t = std.testing;
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);

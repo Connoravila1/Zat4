@@ -272,6 +272,13 @@ pub const state_budget_hard_cap: u32 = 10 << 20;
 /// more is malformed input, clipped to a safe length rather than rejected (E4).
 pub const max_rules: usize = 64;
 
+/// The hard ceiling on how many candidates one refresh may pull in to rank. The
+/// scorer runs `candidates × (rules + program ops)`, so an unbounded
+/// `max_candidates` in a shared (untrusted) config is the one remaining CPU/
+/// memory denial-of-service dial — `validated` clamps it. 5000 is 10× the
+/// digest-class default: generous for any real feed, far below "hang the client."
+pub const max_candidates_hard_cap: u32 = 5000;
+
 /// The Twitter-like default — Discover. One value of `FeedConfig`, with no
 /// special-casing anywhere: `score(candidates, DEFAULT_CONFIG, now)` IS the
 /// default feed (invariant 2).
@@ -512,6 +519,7 @@ pub fn validated(c: FeedConfig) FeedConfig {
     v.behavioral_weight = clampF(c.behavioral_weight, -1000, 1000, d.behavioral_weight);
     v.query.source_mix = clampF(c.query.source_mix, 0, 1, d.query.source_mix);
     if (v.query.max_candidates == 0) v.query.max_candidates = d.query.max_candidates;
+    if (v.query.max_candidates > max_candidates_hard_cap) v.query.max_candidates = max_candidates_hard_cap;
     if (v.state_budget_bytes > state_budget_hard_cap) v.state_budget_bytes = state_budget_hard_cap;
     // Clip a hostile/oversized rule-list to the cap (CPU-DoS wall). Truncating a
     // const slice borrows the same memory — no allocation, so `validated` stays
@@ -843,6 +851,10 @@ test "validated: NaN/Inf and out-of-range fields are sanitized to safe data" {
     hostile.query.source_mix = 5.0; // out of [0,1]
     hostile.state_budget_bytes = 1 << 30; // 1 GiB — above the hard cap
     hostile.query.max_candidates = 0;
+
+    var greedy = DEFAULT_CONFIG;
+    greedy.query.max_candidates = 4_000_000_000; // a DoS-sized retrieval request
+    try t.expectEqual(max_candidates_hard_cap, validated(greedy).query.max_candidates); // clamped
 
     const v = validated(hostile);
     try t.expect(std.math.isFinite(v.w_repost));

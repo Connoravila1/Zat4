@@ -85,6 +85,11 @@ pub fn publish(
     rkey: []const u8,
     now_epoch: i64,
 ) !Published {
+    // DEFERRED SECURITY (SECURITY_ROADMAP Phase 12): publish-time validation gate.
+    // `validated` below silently clamps/clips/drops a malformed config so we never
+    // publish unsafe data — but when the authoring UI lands, also REJECT a
+    // malformed program / over-cap rule-list here with a clear error to the author,
+    // rather than letting it degrade to a no-op on every reader's device.
     var ts_buf: [24]u8 = undefined;
     const record = AlgorithmRecordOut{
         .name = name,
@@ -132,6 +137,12 @@ pub fn fetch(
         .{ .name = "collection", .value = lexicon.collection.algorithm },
         .{ .name = "rkey", .value = rkey },
     };
+    // DEFERRED SECURITY (SECURITY_ROADMAP Phase 12): bound the response size
+    // BEFORE the JSON is parsed/allocated. A hostile algorithm record could carry
+    // a huge rules/vm_program array; `discover.validated` clips it, but only AFTER
+    // std.json has already allocated it. When the marketplace lands, add an
+    // explicit max-record-size guard at this fetch (the "bound before allocate"
+    // rule). Bounded today by PDS record-size limits — do not rely on that.
     const outcome = try auth.query(
         gpa,
         arena,

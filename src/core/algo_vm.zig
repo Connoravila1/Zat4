@@ -68,6 +68,19 @@ pub const Fact = enum(u8) {
     repost_count,
     reply_count,
     age_hrs, // hours since the post was created
+
+    comptime {
+        // INVARIANT — the fact vocabulary is exactly these six, and in particular
+        // carries NO per-author or per-identity fact (no author DID, handle, or
+        // "is this me"). That omission is load-bearing security: with no identity
+        // input, an authored formula CANNOT target a specific account, so it can
+        // never be weaponised to amplify the author or bury a rival — the targeting
+        // surface is not expressible. Adding ANY fact is a deliberate security
+        // decision: bump this count on purpose, and weigh whether the new fact
+        // opens a targeting or behavioral channel (see the behavioral-door wall in
+        // transparency.zig). Do not raise it to "make it compile."
+        assert(@typeInfo(Fact).@"enum".fields.len == 6);
+    }
 };
 
 /// The opcode vocabulary. A minimal, total, straight-line stack machine: loads,
@@ -156,11 +169,18 @@ const Stack = struct {
     }
 
     fn push(s: *Stack, v: f64) void {
+        // This indexes a buffer from UNTRUSTED bytecode. Safety checks are off
+        // under ReleaseFast (the bench build, or any future perf build), so force
+        // them on here: a bounds mistake becomes a controlled panic, never silent
+        // memory corruption — regardless of the build's optimization mode. The
+        // explicit guard below already makes it total; this is belt-and-suspenders.
+        @setRuntimeSafety(true);
         if (s.sp >= stack_cap) return; // overflow ⇒ drop (malformed program)
         s.buf[s.sp] = sanitize(v);
         s.sp += 1;
     }
     fn pop(s: *Stack) f64 {
+        @setRuntimeSafety(true); // see push — untrusted indexing, safe under any build mode
         if (s.sp == 0) return 0; // underflow ⇒ 0 (missing operand)
         s.sp -= 1;
         return s.buf[s.sp];
@@ -176,38 +196,54 @@ const Stack = struct {
 pub fn run(program: []const Instr, f: rules.Facts, base_score: f64) f64 {
     var st: Stack = .{};
     for (program) |ins| {
+        // EXHAUSTIVE — no `else`. Adding an opcode fails to compile here until it
+        // is handled, so the evaluator can never silently mis-execute a new op
+        // (which, with safety off, would be undefined behaviour). The op semantics
+        // live in exactly three exhaustive switches — here, `arity`, and the
+        // decompiler — and a fuzz test cross-checks them.
         switch (ins.op) {
             .push_const => st.push(ins.value),
             .push_fact => st.push(factValue(ins.fact, f, base_score)),
-            .neg => {
-                const a = st.pop();
-                st.push(-a);
+            .add => {
+                const b = st.pop();
+                st.push(st.pop() + b);
             },
-            .abs => {
-                const a = st.pop();
-                st.push(@abs(a));
+            .sub => {
+                const b = st.pop();
+                st.push(st.pop() - b);
             },
+            .mul => {
+                const b = st.pop();
+                st.push(st.pop() * b);
+            },
+            .div => {
+                const b = st.pop();
+                const a = st.pop();
+                st.push(if (b == 0) 0 else a / b);
+            },
+            .min => {
+                const b = st.pop();
+                st.push(@min(st.pop(), b));
+            },
+            .max => {
+                const b = st.pop();
+                st.push(@max(st.pop(), b));
+            },
+            .gt => {
+                const b = st.pop();
+                st.push(if (st.pop() > b) @as(f64, 1.0) else 0.0);
+            },
+            .lt => {
+                const b = st.pop();
+                st.push(if (st.pop() < b) @as(f64, 1.0) else 0.0);
+            },
+            .neg => st.push(-st.pop()),
+            .abs => st.push(@abs(st.pop())),
             .select => {
                 const else_v = st.pop();
                 const then_v = st.pop();
                 const cond = st.pop();
                 st.push(if (cond != 0) then_v else else_v);
-            },
-            else => {
-                // The binary ops share the pop-b, pop-a shape.
-                const b = st.pop();
-                const a = st.pop();
-                st.push(switch (ins.op) {
-                    .add => a + b,
-                    .sub => a - b,
-                    .mul => a * b,
-                    .div => if (b == 0) 0 else a / b,
-                    .min => @min(a, b),
-                    .max => @max(a, b),
-                    .gt => if (a > b) @as(f64, 1.0) else 0.0,
-                    .lt => if (a < b) @as(f64, 1.0) else 0.0,
-                    else => unreachable, // the non-binary ops are handled above
-                });
             },
         }
     }
@@ -219,11 +255,14 @@ pub fn run(program: []const Instr, f: rules.Facts, base_score: f64) f64 {
 /// How many operands an op consumes / produces — the basis of the static stack
 /// analysis. (consumed, produced).
 fn arity(op: Op) struct { in: u8, out: u8 } {
+    // EXHAUSTIVE — no `else`. A new opcode must declare its stack effect here, or
+    // the static validator silently mis-sizes the stack for it. Kept in lockstep
+    // with `run` and the decompiler by the opcode cross-check fuzz test.
     return switch (op) {
         .push_const, .push_fact => .{ .in = 0, .out = 1 },
         .neg, .abs => .{ .in = 1, .out = 1 },
+        .add, .sub, .mul, .div, .min, .max, .gt, .lt => .{ .in = 2, .out = 1 },
         .select => .{ .in = 3, .out = 1 },
-        else => .{ .in = 2, .out = 1 }, // the binary ops
     };
 }
 

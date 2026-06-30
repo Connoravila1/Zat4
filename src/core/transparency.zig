@@ -283,15 +283,42 @@ pub const Classification = struct {
     state_budget_bytes: u32,
 };
 
-/// Derive the classification from the config's own numbers (pure). The behavioral
-/// fields checked here are exactly the ones `metaFor` marks `.behavioral` — a
-/// test cross-checks the two so they cannot drift apart.
+/// Is a scalar field "in use" — a non-zero weight or an enabled toggle? The
+/// behavioral fields are all f32 weights; this stays general so the derivation
+/// below works for any field type.
+fn isActive(v: anytype) bool {
+    return switch (@typeInfo(@TypeOf(v))) {
+        .float, .int => v != 0,
+        .bool => v,
+        else => false,
+    };
+}
+
+/// Derive the classification from the config (pure). `uses_behavioral` is DERIVED
+/// by reflection from `metaFor`'s per-field `.behavioral` flags — `metaFor` is the
+/// SINGLE source of truth for what reads attention. So a new behavioral signal
+/// added to the engine, which the `metaFor` completeness `@compileError` already
+/// forces an author to describe, is AUTOMATICALLY reflected in the label: classify
+/// cannot drift behind the engine, and a behavioral knob cannot be added while the
+/// "uses no behavioral data" verdict silently stays clean. `learns` is the
+/// narrower cross-session axis — only the on-device learner weight maintains a
+/// model — so it stays keyed to `behavioral_weight`.
 pub fn classify(config: discover.FeedConfig) Classification {
     const learns = config.behavioral_weight != 0;
-    const uses_behavioral = learns or
-        config.w_bookmark != 0 or
-        config.w_profile_click != 0 or
-        config.w_link_click != 0;
+    var uses_behavioral = learns;
+    inline for (@typeInfo(discover.FeedConfig).@"struct".fields) |f| {
+        if (comptime std.mem.eql(u8, f.name, "rules") or
+            std.mem.eql(u8, f.name, "vm_program") or
+            std.mem.eql(u8, f.name, "query"))
+        {
+            // Logic lists and the retrieval sub-record carry no behavioral SCALAR
+            // weight: the door wall keeps rule/VM facts public, and Query holds
+            // retrieval knobs only. (If a behavioral leaf is ever added to Query,
+            // extend this to flatten it — the cross-drift test will catch it.)
+        } else if (comptime metaFor(f.name).behavioral) {
+            if (isActive(@field(config, f.name))) uses_behavioral = true;
+        }
+    }
     return .{
         .uses_behavioral = uses_behavioral,
         .learns = learns,
@@ -397,46 +424,100 @@ fn vmFactName(f: algo_vm.Fact) []const u8 {
 /// rendered formula is exactly the computation that runs (transparency, not a
 /// paraphrase). `validProgram` guarantees the stack indices below are in bounds.
 pub fn formulaText(arena: Allocator, program: []const algo_vm.Instr) error{OutOfMemory}!?[]const u8 {
-    if (program.len == 0 or !algo_vm.validProgram(program)) return null;
-    var stack: [algo_vm.stack_cap][]const u8 = undefined;
+    // This is a SECOND interpreter of untrusted bytecode (the VM is the first),
+    // reachable from any fetched algorithm's transparency page. So it is written
+    // to be TOTAL on its own — every stack access is guarded and an imbalance
+    // returns null — rather than trusting `algo_vm.run`'s validator. The two stay
+    // in agreement by an explicit cross-check fuzz test: `validProgram(p)` iff
+    // `formulaText(p) != null`. Safety is forced on as a final backstop against a
+    // bug in these very guards, so a slip is a controlled panic and never silent
+    // memory corruption, regardless of the build's optimization mode.
+    @setRuntimeSafety(true);
+    // Empty or over-cap programs are not meaningful formulas (and the latter is
+    // also the DoS bound), matching `algo_vm.validProgram` exactly — a cross-check
+    // fuzz test asserts the two agree on validity.
+    if (program.len == 0 or program.len > algo_vm.max_program_len) return null;
+    const cap = algo_vm.stack_cap;
+    var stack: [cap][]const u8 = undefined;
     var sp: usize = 0;
+    // EXHAUSTIVE — no `else`. A new opcode must be given a rendering here.
     for (program) |ins| {
         switch (ins.op) {
             .push_const => {
+                if (sp >= cap) return null;
                 stack[sp] = try std.fmt.allocPrint(arena, "{d}", .{ins.value});
                 sp += 1;
             },
             .push_fact => {
+                if (sp >= cap) return null;
                 stack[sp] = vmFactName(ins.fact);
                 sp += 1;
             },
-            .neg => stack[sp - 1] = try std.fmt.allocPrint(arena, "(−{s})", .{stack[sp - 1]}),
-            .abs => stack[sp - 1] = try std.fmt.allocPrint(arena, "|{s}|", .{stack[sp - 1]}),
-            .select => {
-                const else_v = stack[sp - 1];
-                const then_v = stack[sp - 2];
-                const cond = stack[sp - 3];
-                sp -= 2;
-                stack[sp - 1] = try std.fmt.allocPrint(arena, "(if {s} then {s} else {s})", .{ cond, then_v, else_v });
+            .neg => {
+                if (sp < 1) return null;
+                stack[sp - 1] = try std.fmt.allocPrint(arena, "(−{s})", .{stack[sp - 1]});
             },
-            else => {
-                const b = stack[sp - 1];
-                const a = stack[sp - 2];
+            .abs => {
+                if (sp < 1) return null;
+                stack[sp - 1] = try std.fmt.allocPrint(arena, "|{s}|", .{stack[sp - 1]});
+            },
+            .add => {
+                if (sp < 2) return null;
+                const r = try std.fmt.allocPrint(arena, "({s} + {s})", .{ stack[sp - 2], stack[sp - 1] });
                 sp -= 1;
-                stack[sp - 1] = switch (ins.op) {
-                    .add => try std.fmt.allocPrint(arena, "({s} + {s})", .{ a, b }),
-                    .sub => try std.fmt.allocPrint(arena, "({s} − {s})", .{ a, b }),
-                    .mul => try std.fmt.allocPrint(arena, "({s} × {s})", .{ a, b }),
-                    .div => try std.fmt.allocPrint(arena, "({s} ÷ {s})", .{ a, b }),
-                    .min => try std.fmt.allocPrint(arena, "min({s}, {s})", .{ a, b }),
-                    .max => try std.fmt.allocPrint(arena, "max({s}, {s})", .{ a, b }),
-                    .gt => try std.fmt.allocPrint(arena, "({s} > {s})", .{ a, b }),
-                    .lt => try std.fmt.allocPrint(arena, "({s} < {s})", .{ a, b }),
-                    else => unreachable, // non-binary ops handled above
-                };
+                stack[sp - 1] = r;
+            },
+            .sub => {
+                if (sp < 2) return null;
+                const r = try std.fmt.allocPrint(arena, "({s} − {s})", .{ stack[sp - 2], stack[sp - 1] });
+                sp -= 1;
+                stack[sp - 1] = r;
+            },
+            .mul => {
+                if (sp < 2) return null;
+                const r = try std.fmt.allocPrint(arena, "({s} × {s})", .{ stack[sp - 2], stack[sp - 1] });
+                sp -= 1;
+                stack[sp - 1] = r;
+            },
+            .div => {
+                if (sp < 2) return null;
+                const r = try std.fmt.allocPrint(arena, "({s} ÷ {s})", .{ stack[sp - 2], stack[sp - 1] });
+                sp -= 1;
+                stack[sp - 1] = r;
+            },
+            .min => {
+                if (sp < 2) return null;
+                const r = try std.fmt.allocPrint(arena, "min({s}, {s})", .{ stack[sp - 2], stack[sp - 1] });
+                sp -= 1;
+                stack[sp - 1] = r;
+            },
+            .max => {
+                if (sp < 2) return null;
+                const r = try std.fmt.allocPrint(arena, "max({s}, {s})", .{ stack[sp - 2], stack[sp - 1] });
+                sp -= 1;
+                stack[sp - 1] = r;
+            },
+            .gt => {
+                if (sp < 2) return null;
+                const r = try std.fmt.allocPrint(arena, "({s} > {s})", .{ stack[sp - 2], stack[sp - 1] });
+                sp -= 1;
+                stack[sp - 1] = r;
+            },
+            .lt => {
+                if (sp < 2) return null;
+                const r = try std.fmt.allocPrint(arena, "({s} < {s})", .{ stack[sp - 2], stack[sp - 1] });
+                sp -= 1;
+                stack[sp - 1] = r;
+            },
+            .select => {
+                if (sp < 3) return null;
+                const r = try std.fmt.allocPrint(arena, "(if {s} then {s} else {s})", .{ stack[sp - 3], stack[sp - 2], stack[sp - 1] });
+                sp -= 2;
+                stack[sp - 1] = r;
             },
         }
     }
+    if (sp != 1) return null; // a well-formed formula leaves exactly one expression
     return stack[sp - 1];
 }
 
@@ -472,7 +553,15 @@ pub const Page = struct {
 /// verdict + every explained field, in `arena`. The caller supplies the human
 /// `name` and the `ref` (CID/id) it resolved the config from.
 pub fn buildPage(arena: Allocator, name: []const u8, ref: []const u8, config: discover.FeedConfig) error{OutOfMemory}!Page {
-    const c = classify(config);
+    // Render the VALIDATED config — the exact form the engine runs (clamped
+    // weights, capped/clipped rule-list, malformed VM program dropped to a
+    // no-op). This makes "what you see is what runs" STRUCTURAL: the page cannot
+    // display an un-clamped weight or a rejected program the scorer would never
+    // execute, regardless of whether the caller validated first. The published
+    // bytes a CID addresses are likewise `serialize(validated(config))`, so the
+    // page and the hash agree by construction (invariant 5).
+    const cfg = discover.validated(config);
+    const c = classify(cfg);
     return .{
         .name = name,
         .ref = ref,
@@ -480,9 +569,9 @@ pub fn buildPage(arena: Allocator, name: []const u8, ref: []const u8, config: di
         .stateful_label = statefulLabel(c),
         .uses_behavioral = c.uses_behavioral,
         .learns = c.learns,
-        .rows = try explain(arena, config),
-        .rule_lines = try ruleLines(arena, config.rules),
-        .formula = try formulaText(arena, config.vm_program),
+        .rows = try explain(arena, cfg),
+        .rule_lines = try ruleLines(arena, cfg.rules),
+        .formula = try formulaText(arena, cfg.vm_program),
     };
 }
 
@@ -712,4 +801,34 @@ test "formulaText: decompiles a VM program to a readable infix expression" {
     // A malformed program (underflow) renders nothing rather than a fragment.
     const bad = [_]algo_vm.Instr{.{ .op = .add }};
     try t.expectEqual(@as(?[]const u8, null), try formulaText(arena, &bad));
+}
+
+test "fuzz: the decompiler is total and agrees with the VM validator" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var prng = std.Random.DefaultPrng.init(0xDEC0_FFEE);
+    const rnd = prng.random();
+    const ops = std.enums.values(algo_vm.Op);
+    const facts = std.enums.values(algo_vm.Fact);
+
+    var buf: [2 * algo_vm.max_program_len]algo_vm.Instr = undefined; // over-cap lengths too
+    var iter: usize = 0;
+    while (iter < 40_000) : (iter += 1) {
+        const len = rnd.uintAtMost(usize, buf.len);
+        for (buf[0..len]) |*ins| ins.* = .{
+            .op = ops[rnd.uintLessThan(usize, ops.len)],
+            .fact = facts[rnd.uintLessThan(usize, facts.len)],
+            .value = @bitCast(rnd.int(u32)),
+        };
+        const prog = buf[0..len];
+        // The decompiler must never crash, and must render a formula EXACTLY when
+        // the VM considers the program valid — the two interpreters cannot drift.
+        const rendered = (try formulaText(arena, prog)) != null;
+        try t.expectEqual(algo_vm.validProgram(prog), rendered);
+        // Reset the arena periodically so 40k iterations don't balloon memory.
+        if (iter % 256 == 0) _ = arena_state.reset(.retain_capacity);
+    }
 }
