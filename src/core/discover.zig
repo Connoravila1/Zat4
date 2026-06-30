@@ -802,6 +802,82 @@ test "score: a malformed VM program is inert (validated to a no-op upstream)" {
     try t.expectEqual(@as(u32, 2), order[1].raw());
 }
 
+test "score: Level-2 rules and the Level-3 VM compose — exclude, then reshape survivors" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // refs 1,2 in-network; ref 3 out-of-network with the highest base. A rule
+    // excludes out-of-network (drops ref 3); the VM then reshapes the survivors
+    // by score = base × reposts, flipping 1 and 2.
+    var c: Candidates = .{};
+    defer c.deinit(t.allocator);
+    var a = mk(1, 3600, 50);
+    a.repost_count = 1; // higher base, few reposts
+    var b = mk(2, 3600, 40);
+    b.repost_count = 5; // lower base, many reposts
+    try c.append(t.allocator, a, true);
+    try c.append(t.allocator, b, true);
+    try c.append(t.allocator, mk(3, 3600, 100), false); // out-of-network, top base — excluded
+
+    const cfg_rules = [_]rules_mod.Rule{.{ .predicate = .{ .kind = .out_of_network }, .action = .{ .kind = .exclude } }};
+    const program = [_]algo_vm.Instr{
+        .{ .op = .push_fact, .fact = .base_score },
+        .{ .op = .push_fact, .fact = .repost_count },
+        .{ .op = .mul },
+    };
+    var cfg = DEFAULT_CONFIG;
+    cfg.rules = &cfg_rules;
+    cfg.vm_program = &program;
+
+    const order = try score(arena, &c, cfg, test_now);
+    try t.expectEqual(@as(usize, 2), order.len); // ref 3 excluded by the L2 rule
+    try t.expectEqual(@as(u32, 2), order[0].raw()); // L3: base≈50×5 > base≈52×1
+    try t.expectEqual(@as(u32, 1), order[1].raw());
+}
+
+test "applyCaps composes with a rule exclusion: a dropped post does not consume an author slot" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Author A owns refs 1, 2, 4; author B owns ref 3. A rule excludes the
+    // out-of-network post (ref 2). With max_per_author = 1, A keeps only its top
+    // SURVIVING post — the excluded one never claimed A's single slot.
+    var c: Candidates = .{};
+    defer c.deinit(t.allocator);
+    try c.append(t.allocator, mk(1, 3600, 30), true); // A, in-network
+    try c.append(t.allocator, mk(2, 3600, 99), false); // A, out-of-network → excluded (would be top)
+    try c.append(t.allocator, mk(3, 3600, 20), true); // B, in-network
+    try c.append(t.allocator, mk(4, 3600, 10), true); // A, in-network
+
+    const cfg_rules = [_]rules_mod.Rule{.{ .predicate = .{ .kind = .out_of_network }, .action = .{ .kind = .exclude } }};
+    var cfg = DEFAULT_CONFIG;
+    cfg.rules = &cfg_rules;
+    cfg.max_per_author = 1;
+
+    const order = try score(arena, &c, cfg, test_now);
+    try t.expectEqual(@as(usize, 3), order.len); // ref 2 excluded; survivors 1,3,4 by base
+
+    // The shell builds author_key + keep parallel to the scored order, then caps.
+    const akey = try arena.alloc(u32, order.len);
+    const keep = try arena.alloc(bool, order.len);
+    for (order, 0..) |ref, i| {
+        akey[i] = switch (ref.raw()) {
+            1, 2, 4 => 0, // author A
+            else => 1, // author B
+        };
+        keep[i] = true; // no moderation removal in this case
+    }
+
+    const final = try applyCaps(arena, order, akey, keep, cfg);
+    try t.expectEqual(@as(usize, 2), final.len); // A capped to 1, B has 1
+    try t.expectEqual(@as(u32, 1), final[0].raw()); // A's top survivor (ref 1)
+    try t.expectEqual(@as(u32, 3), final[1].raw()); // B (ref 3); ref 4 dropped by the cap
+}
+
 test "applyCaps: per-author diversity cap keeps at most N per author, in rank order" {
     const t = std.testing;
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);

@@ -2130,7 +2130,10 @@ pub fn layoutTransparency(
         if (r.behavioral) try rect(gpa, dl, lx, y + 5, 7, 7, accent, 3);
         const row_x = lx + 18;
         const pen = try str(gpa, dl, e, .semibold, row_x, y + 17, ink, 18, r.label);
-        _ = try str(gpa, dl, e, .semibold, pen + 14, y + 17, accent, 18, r.value);
+        const after_val = try str(gpa, dl, e, .semibold, pen + 14, y + 17, accent, 18, r.value);
+        // A declared-but-not-yet-enforced knob is tagged so it never reads as a
+        // live guarantee (the honesty rule — modeled is not the same as active).
+        if (!r.enforced) _ = try str(gpa, dl, e, .semibold, after_val + 12, y + 17, faint, 13, "· not yet active");
         y += 26;
         y = try wrapBody(gpa, dl, e, row_x, y + 15, cw - 18, body_c, 15, r.meaning, 21, true, null);
         y += 18;

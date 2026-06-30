@@ -109,6 +109,12 @@ pub const FieldExplanation = struct {
     meaning: []const u8,
     category: Category,
     behavioral: bool,
+    /// False for a knob that is DECLARED in the config (and so carried in the
+    /// record the CID addresses) but NOT YET enforced by the engine. The page
+    /// marks such a row "not yet active" so it can never advertise a guarantee the
+    /// scorer isn't delivering — honesty is the whole feature, so a modeled-but-
+    /// inert field must say so rather than read as live.
+    enforced: bool,
 };
 
 /// The human metadata for one field (everything but its runtime value).
@@ -118,6 +124,9 @@ const Meta = struct {
     meaning: []const u8,
     category: Category,
     behavioral: bool = false,
+    /// Default true; set false for a config knob the engine does not enforce yet
+    /// (modeled in the record, inert at runtime). See `FieldExplanation.enforced`.
+    enforced: bool = true,
 };
 
 /// The single source of per-field truth. A `comptime` switch over EVERY leaf
@@ -187,8 +196,9 @@ fn metaFor(comptime name: []const u8) Meta {
         .category = .diversity,
     } else if (comptime std.mem.eql(u8, name, "max_per_subtopic")) .{
         .label = "Max posts per sub-topic",
-        .meaning = "The most posts from any single sub-topic per refresh, so no one topic dominates.",
+        .meaning = "Intended to cap how many posts any single sub-topic can take per refresh. Not active yet: enforcement needs the sub-topic index, so this value is carried but does not affect ranking today.",
         .category = .diversity,
+        .enforced = false, // applyCaps enforces per-author only; subtopic index is D2
     } else if (comptime std.mem.eql(u8, name, "source_mix")) .{
         .label = "In-network vs discovery mix",
         .meaning = "The blend of accounts you follow vs discovery. 1.0 is follows only; 0.0 is discovery only.",
@@ -242,6 +252,7 @@ pub fn explain(arena: Allocator, config: discover.FeedConfig) error{OutOfMemory}
                     .meaning = m.meaning,
                     .category = m.category,
                     .behavioral = m.behavioral,
+                    .enforced = m.enforced,
                 });
             }
         } else {
@@ -253,6 +264,7 @@ pub fn explain(arena: Allocator, config: discover.FeedConfig) error{OutOfMemory}
                 .meaning = m.meaning,
                 .category = m.category,
                 .behavioral = m.behavioral,
+                .enforced = m.enforced,
             });
         }
     }
@@ -607,6 +619,28 @@ test "explain: one row per leaf field, every one labeled, valued, and explained"
         try t.expect(r.value.len > 0);
         try t.expect(r.meaning.len > 0); // never a blank "see summary" row
     }
+}
+
+test "explain: a declared-but-unenforced knob is flagged, never advertised as live" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The transparency page must never present a guarantee the engine isn't
+    // delivering. `max_per_subtopic` is modeled but not yet enforced (applyCaps
+    // does per-author only), so it must come back flagged; everything else is live.
+    const rows = try explain(arena, discover.DEFAULT_CONFIG);
+    var found_subtopic = false;
+    for (rows) |r| {
+        if (std.mem.eql(u8, r.field, "max_per_subtopic")) {
+            found_subtopic = true;
+            try t.expect(!r.enforced); // honestly marked "not yet active"
+        } else {
+            try t.expect(r.enforced); // every other knob is actually enforced
+        }
+    }
+    try t.expect(found_subtopic);
 }
 
 test "explain: values are exact and a field maps to its serialized key" {
