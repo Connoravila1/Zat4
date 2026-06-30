@@ -2135,6 +2135,44 @@ pub fn layoutTransparency(
         y = try wrapBody(gpa, dl, e, row_x, y + 15, cw - 18, body_c, 15, r.meaning, 21, true, null);
         y += 18;
     }
+
+    // The creator's authored Level-2 logic, in the order the scorer runs it —
+    // readable as plain "if … then …" sentences. No row carries a behavioral
+    // marker: a rule structurally cannot read your attention (the predicate
+    // vocabulary is public-facts-only), so the logic can never widen the privacy
+    // surface beyond what the field rows above already disclose.
+    if (page.rule_lines.len > 0) {
+        y += 12;
+        try rect(gpa, dl, lx, y, cw, 1, 0x22FFFFFF, 0); // divider
+        y += 30;
+        _ = try str(gpa, dl, e, .semibold, lx, y + 13, muted, 13, "AUTHORED RULES");
+        y += 30;
+        for (page.rule_lines) |rl| {
+            // A small leading dot: rose for a removal, green for a reweight, so the
+            // shape of the logic reads at a glance.
+            try rect(gpa, dl, lx, y + 6, 7, 7, if (rl.excludes) like_c else boost_c, 3);
+            y = try wrapBody(gpa, dl, e, lx + 18, y + 17, cw - 18, ink, 16, rl.text, 22, true, null);
+            y += 20;
+        }
+    }
+
+    // The creator's authored Level-3 scoring formula, decompiled to one readable
+    // expression — exactly the computation the VM runs per post (no behavioral
+    // marker, for the same reason: the formula reads only public signals).
+    if (page.formula) |formula| {
+        y += 12;
+        try rect(gpa, dl, lx, y, cw, 1, 0x22FFFFFF, 0); // divider
+        y += 30;
+        _ = try str(gpa, dl, e, .semibold, lx, y + 13, muted, 13, "SCORING FORMULA");
+        y += 26;
+        y = try wrapBody(gpa, dl, e, lx, y + 14, cw, faint, 13, "The score each post is ranked by, computed from public signals only.", 19, true, null);
+        y += 10;
+        _ = try str(gpa, dl, e, .semibold, lx, y + 15, muted, 14, "score =");
+        y += 24;
+        y = try wrapBody(gpa, dl, e, lx, y + 17, cw, ink, 18, formula, 25, true, null);
+        y += 8;
+    }
+
     y += 48;
     return y - scroll;
 }

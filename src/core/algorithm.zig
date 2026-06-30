@@ -41,6 +41,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const discover = @import("discover.zig");
 const rules = @import("rules.zig");
+const algo_vm = @import("algo_vm.zig");
 const jsonguard = @import("jsonguard.zig");
 
 /// Schema version of the serialized form. Bumped only on an incompatible
@@ -180,6 +181,53 @@ test "serialize/parse: a config's LEVEL-2 rules travel with the record" {
     try t.expectEqual(@as(f32, 1.5), back.rules[0].action.factor);
     try t.expectEqual(rules.ActionKind.exclude, back.rules[1].action.kind);
     try t.expectEqual(@as(f32, 5), back.rules[1].predicate.param);
+}
+
+test "serialize/parse: a config's LEVEL-3 VM program travels with the record" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // An authored scoring formula: base_score * 1.5 + reposts.
+    const program = [_]algo_vm.Instr{
+        .{ .op = .push_fact, .fact = .base_score },
+        .{ .op = .push_const, .value = 1.5 },
+        .{ .op = .mul },
+        .{ .op = .push_fact, .fact = .repost_count },
+        .{ .op = .add },
+    };
+    var cfg = discover.DEFAULT_CONFIG;
+    cfg.vm_program = &program;
+
+    const bytes = try serialize(arena, cfg);
+    const back = try parse(arena, bytes);
+    try t.expectEqual(@as(usize, 5), back.vm_program.len);
+    try t.expectEqual(algo_vm.Op.push_fact, back.vm_program[0].op);
+    try t.expectEqual(algo_vm.Fact.base_score, back.vm_program[0].fact);
+    try t.expectEqual(@as(f32, 1.5), back.vm_program[1].value);
+    try t.expectEqual(algo_vm.Op.add, back.vm_program[4].op);
+
+    // Byte-exact re-serialization (the CID-transparency property holds with a
+    // program present, too).
+    const bytes2 = try serialize(arena, back);
+    try t.expectEqualSlices(u8, bytes, bytes2);
+}
+
+test "parse: a malformed VM program is rejected to a safe no-op on load" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A well-formed JSON record whose program underflows the stack (an `add`
+    // with no operands) — valid to parse, but not a valid formula. `validated`
+    // (run inside parse) must drop it to empty, so nothing untrusted runs.
+    const hostile =
+        \\{ "version": 1, "config": { "vm_program": [ { "op": "add", "fact": "base_score", "value": 0 } ] } }
+    ;
+    const cfg = try parse(arena, hostile);
+    try t.expectEqual(@as(usize, 0), cfg.vm_program.len); // rejected to no-op
 }
 
 test "parse: forward-compatible — unknown fields are ignored (E4)" {

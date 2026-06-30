@@ -32,6 +32,8 @@ const lens_socket = @import("core/lens_socket.zig");
 const lens_catalog = @import("core/lens_catalog.zig");
 const discover = @import("core/discover.zig");
 const transparency = @import("core/transparency.zig");
+const rules = @import("core/rules.zig");
+const algo_vm = @import("core/algo_vm.zig");
 const enroll_view = @import("core/enroll_view.zig");
 const tiling = @import("core/tiling.zig");
 
@@ -140,11 +142,42 @@ pub fn main(init: std.process.Init) !void {
         dl.len = 0;
         var disc = discover.DEFAULT_CONFIG;
         disc.behavioral_weight = 1.0; // the adaptive default
+        // Some authored Level-2 logic, so the readable "AUTHORED RULES" section
+        // renders in the proof (the L2-slice-3 view).
+        const demo_rules = [_]rules.Rule{
+            .{ .predicate = .{ .kind = .out_of_network }, .action = .{ .kind = .boost, .factor = 1.5 } },
+            .{ .predicate = .{ .kind = .min_engagement, .param = 50 }, .action = .{ .kind = .boost, .factor = 1.25 } },
+            .{ .predicate = .{ .kind = .older_than_hrs, .param = 48 }, .action = .{ .kind = .exclude } },
+        };
+        disc.rules = &demo_rules;
+        // An authored Level-3 scoring formula, so the "SCORING FORMULA" section
+        // renders: (base score × 1.5) + (likes ÷ (age (hrs) + 1)).
+        const demo_program = [_]algo_vm.Instr{
+            .{ .op = .push_fact, .fact = .base_score },
+            .{ .op = .push_const, .value = 1.5 },
+            .{ .op = .mul },
+            .{ .op = .push_fact, .fact = .like_count },
+            .{ .op = .push_fact, .fact = .age_hrs },
+            .{ .op = .push_const, .value = 1 },
+            .{ .op = .add },
+            .{ .op = .div },
+            .{ .op = .add },
+        };
+        disc.vm_program = &demo_program;
         const page = try transparency.buildPage(arena, "Zat4 Discover", "zat4:discover", disc);
         _ = try feed_view.layoutTransparency(gpa, &engine, @intCast(W), @intCast(H), &dl, feed_view.accent_house, 0, page);
         try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
         try writePpm(io, gpa, &fb, "/tmp/zat_transparency.ppm");
         std.debug.print("wrote /tmp/zat_transparency.ppm (algorithm transparency page)\n", .{});
+
+        // A scrolled capture so the AUTHORED RULES section (below the field rows)
+        // is visible in the proof.
+        @memset(fb.pixels, clear);
+        dl.len = 0;
+        _ = try feed_view.layoutTransparency(gpa, &engine, @intCast(W), @intCast(H), &dl, feed_view.accent_house, -1820, page);
+        try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+        try writePpm(io, gpa, &fb, "/tmp/zat_transparency_rules.ppm");
+        std.debug.print("wrote /tmp/zat_transparency_rules.ppm (authored-rules section)\n", .{});
     }
 
     // TILING FOUNDATION (S.1) PROOF: the SAME real feed, but its pane geometry

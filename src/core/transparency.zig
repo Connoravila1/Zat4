@@ -37,6 +37,53 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const discover = @import("discover.zig");
+const rules = @import("rules.zig");
+const algo_vm = @import("algo_vm.zig");
+
+// **The behavioral-door wall — the label-honesty guarantee, made structural.**
+// `classify` decides a feed's "uses behavioral data" verdict from its WEIGHTS
+// alone; it never inspects the Level-2 rule-list. That is only honest if a rule
+// CANNOT read attention data in the first place — and it can't, because a
+// predicate reads only `rules.Facts`, which carries public, candidate-side facts
+// and nothing else. This `comptime` block pins that: every field of `Facts` must
+// be on the public allowlist below. Add a behavioral fact (dwell, bookmark, a
+// click) to the predicate vocabulary and the build FAILS here, forcing a
+// deliberate decision — teach `classify` to account for rules, and update the
+// label — instead of a rule-list silently bypassing the "uses no behavioral
+// data" claim. Capability denial by construction, not policy.
+comptime {
+    const public_facts = [_][]const u8{
+        "in_network", "like_count", "repost_count", "reply_count", "age_hrs",
+    };
+    for (@typeInfo(rules.Facts).@"struct".fields) |f| {
+        var allowed = false;
+        for (public_facts) |name| {
+            if (std.mem.eql(u8, f.name, name)) allowed = true;
+        }
+        if (!allowed) @compileError(
+            "transparency: rule fact '" ++ f.name ++ "' is not on the public-fact allowlist. " ++
+                "If it reads behavioral/attention data, `classify` must account for the rule-list " ++
+                "(and the label must change) BEFORE this fact is exposed to predicates — the " ++
+                "behavioral-door wall (label-honesty guarantee).",
+        );
+    }
+    // The SAME wall for the Level-3 expression VM: every value a program can load
+    // must be a public fact (or `base_score`, the engine's own output, whose
+    // behavioral content is already governed by `behavioral_weight` and so already
+    // reflected in `classify`). A new behavioral member on `algo_vm.Fact` would
+    // let a program read attention without the label showing it — fail here first.
+    for (@typeInfo(algo_vm.Fact).@"enum".fields) |vf| {
+        var allowed = std.mem.eql(u8, vf.name, "base_score");
+        for (public_facts) |name| {
+            if (std.mem.eql(u8, vf.name, name)) allowed = true;
+        }
+        if (!allowed) @compileError(
+            "transparency: VM fact '" ++ vf.name ++ "' is not on the public-fact allowlist " ++
+                "(nor `base_score`). A Level-3 program must not be able to read behavioral data " ++
+                "the label doesn't disclose — the behavioral-door wall extends to the VM.",
+        );
+    }
+}
 
 /// Which aspect of ranking a field governs — lets a page group the rows.
 pub const Category = enum {
@@ -178,11 +225,12 @@ fn fmtValue(arena: Allocator, v: anytype) error{OutOfMemory}![]const u8 {
 pub fn explain(arena: Allocator, config: discover.FeedConfig) error{OutOfMemory}![]FieldExplanation {
     var list: std.ArrayListUnmanaged(FieldExplanation) = .empty;
     inline for (@typeInfo(discover.FeedConfig).@"struct".fields) |f| {
-        if (comptime std.mem.eql(u8, f.name, "rules")) {
-            // The Level-2 rule-list is LOGIC, not a scalar — it renders as its own
-            // readable section (the "resembles code" view, L2 slice 3), so it is
-            // intentionally not one of the per-field scalar rows here. Skipped, not
-            // forgotten: this branch keeps the comptime completeness honest.
+        if (comptime std.mem.eql(u8, f.name, "rules") or std.mem.eql(u8, f.name, "vm_program")) {
+            // The Level-2 rule-list and the Level-3 VM program are LOGIC, not
+            // scalars — each renders as its own readable section (rules as
+            // "if … then …" lines, the VM as a decompiled formula), so neither is
+            // a per-field scalar row here. Skipped, not forgotten: this branch
+            // keeps the comptime completeness guarantee honest.
         } else if (comptime std.mem.eql(u8, f.name, "query")) {
             // Flatten the candidate-query sub-record into its own leaf rows.
             inline for (@typeInfo(discover.Query).@"struct".fields) |qf| {
@@ -268,6 +316,131 @@ pub fn statefulLabel(c: Classification) []const u8 {
 }
 
 // ---------------------------------------------------------------------------
+// Level-2 rules as readable logic (the "resembles code" view, honestly)
+// ---------------------------------------------------------------------------
+
+/// One authored rule, rendered as a plain-English line of logic for the page.
+/// `text` is the whole readable sentence ("If the post is from discovery, boost
+/// its score 1.5×."); `excludes` flags a removal so the renderer can mark it.
+/// A7.2: cold view-model — a handful per page, built once on open. Waived.
+pub const RuleLine = struct {
+    text: []const u8,
+    excludes: bool,
+};
+
+/// The condition half of a rule, read straight from the fixed predicate
+/// vocabulary — every kind is covered (the `else`-free switch is the completeness
+/// guarantee, the same discipline `metaFor` uses for scalars).
+fn predicateText(arena: Allocator, p: rules.Predicate) error{OutOfMemory}![]const u8 {
+    return switch (p.kind) {
+        .always => arena.dupe(u8, "every post"),
+        .in_network => arena.dupe(u8, "the post is from someone you follow"),
+        .out_of_network => arena.dupe(u8, "the post is from discovery (out-of-network)"),
+        .min_likes => std.fmt.allocPrint(arena, "the post has at least {d} likes", .{p.param}),
+        .min_reposts => std.fmt.allocPrint(arena, "the post has at least {d} reposts", .{p.param}),
+        .min_replies => std.fmt.allocPrint(arena, "the post has at least {d} replies", .{p.param}),
+        .min_engagement => std.fmt.allocPrint(arena, "the post has at least {d} total interactions", .{p.param}),
+        .newer_than_hrs => std.fmt.allocPrint(arena, "the post is newer than {d} hours", .{p.param}),
+        .older_than_hrs => std.fmt.allocPrint(arena, "the post is older than {d} hours", .{p.param}),
+    };
+}
+
+/// The effect half of a rule. `boost`/`dampen` are the same multiply, named for
+/// the authored intent; `exclude` drops the candidate.
+fn actionText(arena: Allocator, a: rules.Action) error{OutOfMemory}![]const u8 {
+    return switch (a.kind) {
+        .boost => std.fmt.allocPrint(arena, "boost its score {d}×", .{a.factor}),
+        .dampen => std.fmt.allocPrint(arena, "dampen its score to {d}×", .{a.factor}),
+        .exclude => arena.dupe(u8, "remove it from the feed"),
+    };
+}
+
+/// Render a rule-list as ordered readable logic (PURE), in `arena`. Authoring
+/// order is meaningful (later rules see earlier effects), so the lines are in the
+/// same order the scorer runs them — what you read is the order that runs.
+pub fn ruleLines(arena: Allocator, rs: []const rules.Rule) error{OutOfMemory}![]RuleLine {
+    var list: std.ArrayListUnmanaged(RuleLine) = .empty;
+    for (rs) |r| {
+        const cond = try predicateText(arena, r.predicate);
+        const eff = try actionText(arena, r.action);
+        // "For every post, …" reads better than "If every post, …".
+        const sentence = if (r.predicate.kind == .always)
+            try std.fmt.allocPrint(arena, "For {s}, {s}.", .{ cond, eff })
+        else
+            try std.fmt.allocPrint(arena, "If {s}, {s}.", .{ cond, eff });
+        try list.append(arena, .{ .text = sentence, .excludes = r.action.kind == .exclude });
+    }
+    return list.toOwnedSlice(arena);
+}
+
+// ---------------------------------------------------------------------------
+// Level-3 VM program as a readable formula (decompiled, honestly)
+// ---------------------------------------------------------------------------
+
+/// The human name of a VM input fact.
+fn vmFactName(f: algo_vm.Fact) []const u8 {
+    return switch (f) {
+        .base_score => "base score",
+        .in_network => "in-network",
+        .like_count => "likes",
+        .repost_count => "reposts",
+        .reply_count => "replies",
+        .age_hrs => "age (hrs)",
+    };
+}
+
+/// Decompile a VM program into one readable infix formula (PURE), in `arena`, or
+/// null if the program is empty or not well-formed — only a valid program is a
+/// meaningful formula to show (`algo_vm.run` stays safe on the rest, but the page
+/// renders nothing rather than a half-expression). The decompiler is the VM's own
+/// straight-line evaluation done over STRING fragments instead of numbers, so the
+/// rendered formula is exactly the computation that runs (transparency, not a
+/// paraphrase). `validProgram` guarantees the stack indices below are in bounds.
+pub fn formulaText(arena: Allocator, program: []const algo_vm.Instr) error{OutOfMemory}!?[]const u8 {
+    if (program.len == 0 or !algo_vm.validProgram(program)) return null;
+    var stack: [algo_vm.stack_cap][]const u8 = undefined;
+    var sp: usize = 0;
+    for (program) |ins| {
+        switch (ins.op) {
+            .push_const => {
+                stack[sp] = try std.fmt.allocPrint(arena, "{d}", .{ins.value});
+                sp += 1;
+            },
+            .push_fact => {
+                stack[sp] = vmFactName(ins.fact);
+                sp += 1;
+            },
+            .neg => stack[sp - 1] = try std.fmt.allocPrint(arena, "(−{s})", .{stack[sp - 1]}),
+            .abs => stack[sp - 1] = try std.fmt.allocPrint(arena, "|{s}|", .{stack[sp - 1]}),
+            .select => {
+                const else_v = stack[sp - 1];
+                const then_v = stack[sp - 2];
+                const cond = stack[sp - 3];
+                sp -= 2;
+                stack[sp - 1] = try std.fmt.allocPrint(arena, "(if {s} then {s} else {s})", .{ cond, then_v, else_v });
+            },
+            else => {
+                const b = stack[sp - 1];
+                const a = stack[sp - 2];
+                sp -= 1;
+                stack[sp - 1] = switch (ins.op) {
+                    .add => try std.fmt.allocPrint(arena, "({s} + {s})", .{ a, b }),
+                    .sub => try std.fmt.allocPrint(arena, "({s} − {s})", .{ a, b }),
+                    .mul => try std.fmt.allocPrint(arena, "({s} × {s})", .{ a, b }),
+                    .div => try std.fmt.allocPrint(arena, "({s} ÷ {s})", .{ a, b }),
+                    .min => try std.fmt.allocPrint(arena, "min({s}, {s})", .{ a, b }),
+                    .max => try std.fmt.allocPrint(arena, "max({s}, {s})", .{ a, b }),
+                    .gt => try std.fmt.allocPrint(arena, "({s} > {s})", .{ a, b }),
+                    .lt => try std.fmt.allocPrint(arena, "({s} < {s})", .{ a, b }),
+                    else => unreachable, // non-binary ops handled above
+                };
+            },
+        }
+    }
+    return stack[sp - 1];
+}
+
+// ---------------------------------------------------------------------------
 // The page model — what the transparency SCREEN renders (D5 / invariant 5)
 // ---------------------------------------------------------------------------
 
@@ -287,6 +460,12 @@ pub const Page = struct {
     uses_behavioral: bool,
     learns: bool,
     rows: []const FieldExplanation,
+    /// The creator's authored Level-2 logic, rendered as readable lines in run
+    /// order. Empty for a flat-weights (Level-1) algorithm.
+    rule_lines: []const RuleLine,
+    /// The creator's authored Level-3 scoring formula, decompiled to one readable
+    /// expression — or null when the algorithm carries no (valid) VM program.
+    formula: ?[]const u8,
 };
 
 /// Assemble the transparency page for one algorithm (PURE): the classification
@@ -302,6 +481,8 @@ pub fn buildPage(arena: Allocator, name: []const u8, ref: []const u8, config: di
         .uses_behavioral = c.uses_behavioral,
         .learns = c.learns,
         .rows = try explain(arena, config),
+        .rule_lines = try ruleLines(arena, config.rules),
+        .formula = try formulaText(arena, config.vm_program),
     };
 }
 
@@ -314,8 +495,8 @@ pub fn buildPage(arena: Allocator, name: []const u8, ref: []const u8, config: di
 fn leafFieldCount() usize {
     var n: usize = 0;
     inline for (@typeInfo(discover.FeedConfig).@"struct".fields) |f| {
-        if (comptime std.mem.eql(u8, f.name, "rules")) {
-            // not a scalar leaf — rendered as its own logic section (matches explain)
+        if (comptime std.mem.eql(u8, f.name, "rules") or std.mem.eql(u8, f.name, "vm_program")) {
+            // not scalar leaves — rendered as their own logic sections (matches explain)
         } else if (comptime std.mem.eql(u8, f.name, "query")) {
             n += @typeInfo(discover.Query).@"struct".fields.len;
         } else n += 1;
@@ -477,4 +658,58 @@ test "buildPage: assembles the verdict + every field for the renderer" {
     try t.expectEqualStrings("zat4:private-discover", page.ref);
     try t.expect(!page.uses_behavioral); // proven clean
     try t.expectEqual(leafFieldCount(), page.rows.len); // every line present
+    try t.expectEqual(@as(usize, 0), page.rule_lines.len); // a flat-weights config has no logic lines
+}
+
+test "ruleLines: renders authored logic as ordered, readable sentences" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const rs = [_]rules.Rule{
+        .{ .predicate = .{ .kind = .out_of_network }, .action = .{ .kind = .boost, .factor = 1.5 } },
+        .{ .predicate = .{ .kind = .min_engagement, .param = 50 }, .action = .{ .kind = .exclude } },
+    };
+    const lines = try ruleLines(arena, &rs);
+    try t.expectEqual(@as(usize, 2), lines.len);
+    // Order preserved (run order == read order).
+    try t.expectEqualStrings("If the post is from discovery (out-of-network), boost its score 1.5×.", lines[0].text);
+    try t.expect(!lines[0].excludes);
+    try t.expectEqualStrings("If the post has at least 50 total interactions, remove it from the feed.", lines[1].text);
+    try t.expect(lines[1].excludes); // a removal is flagged for the renderer
+
+    // The `always` predicate reads as "For every post, …".
+    const uncond = [_]rules.Rule{.{ .predicate = .{ .kind = .always }, .action = .{ .kind = .dampen, .factor = 0.5 } }};
+    const one = try ruleLines(arena, &uncond);
+    try t.expectEqualStrings("For every post, dampen its score to 0.5×.", one[0].text);
+
+    // An empty rule-list is an empty slice, not an error (E4).
+    const none = try ruleLines(arena, &.{});
+    try t.expectEqual(@as(usize, 0), none.len);
+}
+
+test "formulaText: decompiles a VM program to a readable infix expression" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // (base score × 1.5) + reposts
+    const program = [_]algo_vm.Instr{
+        .{ .op = .push_fact, .fact = .base_score },
+        .{ .op = .push_const, .value = 1.5 },
+        .{ .op = .mul },
+        .{ .op = .push_fact, .fact = .repost_count },
+        .{ .op = .add },
+    };
+    const f = (try formulaText(arena, &program)).?;
+    try t.expectEqualStrings("((base score × 1.5) + reposts)", f);
+
+    // An empty program has no formula to show.
+    try t.expectEqual(@as(?[]const u8, null), try formulaText(arena, &.{}));
+
+    // A malformed program (underflow) renders nothing rather than a fragment.
+    const bad = [_]algo_vm.Instr{.{ .op = .add }};
+    try t.expectEqual(@as(?[]const u8, null), try formulaText(arena, &bad));
 }

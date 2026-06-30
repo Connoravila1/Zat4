@@ -54,6 +54,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const rules_mod = @import("rules.zig");
+const algo_vm = @import("algo_vm.zig");
 
 // ---------------------------------------------------------------------------
 // The candidate — the hot record the scorer consumes (Phase D1)
@@ -242,6 +243,17 @@ pub const FeedConfig = struct {
     /// with the config record (they ARE part of the algorithm). The slice borrows
     /// the caller's memory; for a parsed/built config it lives in that arena.
     rules: []const rules_mod.Rule = &.{},
+
+    /// LEVEL 3 — the creator's authored SCORING FORMULA: a bounded expression-VM
+    /// program (`core/algo_vm.zig`) run per candidate, AFTER the rule-list, with
+    /// the rule-adjusted score exposed as the program's `base_score` input. Empty
+    /// by default (Level-1/2 configs never touch it). The VM is total and reads
+    /// only the same public facts the rules do — a program can shape ranking
+    /// arbitrarily but can neither read your attention nor do anything off-device
+    /// (the capability is not in the opcode set). Travels with the record (it IS
+    /// part of the algorithm); the load path rejects a malformed program to a
+    /// no-op (`validated`). Borrows the caller's memory like `rules`.
+    vm_program: []const algo_vm.Instr = &.{},
 };
 
 /// The hard ceiling on a single algorithm's declared on-device state (10 MiB).
@@ -251,6 +263,14 @@ pub const FeedConfig = struct {
 /// ambitious author may declare into, shown to the user, never granted by
 /// default.
 pub const state_budget_hard_cap: u32 = 10 << 20;
+
+/// The hard ceiling on how many Level-2 rules one algorithm may carry. The
+/// scorer evaluates `candidates × rules` every refresh, so an unbounded rule-list
+/// in a shared (untrusted) config is a CPU denial-of-service vector — `validated`
+/// truncates to this cap, on both the publish and the load path. 64 is far more
+/// than authored scoring logic needs (the built-ins use 1–3); a config asking for
+/// more is malformed input, clipped to a safe length rather than rejected (E4).
+pub const max_rules: usize = 64;
 
 /// The Twitter-like default — Discover. One value of `FeedConfig`, with no
 /// special-casing anywhere: `score(candidates, DEFAULT_CONFIG, now)` IS the
@@ -348,13 +368,24 @@ pub fn score(arena: Allocator, cands: *const Candidates, config: FeedConfig, now
     var i: usize = 0;
     while (i < n) : (i += 1) {
         const c = cands.list.get(i);
-        const base = scoreRow(c, config, now);
-        if (config.rules.len > 0) {
+        var s = scoreRow(c, config, now);
+        // The creator's authored logic, in two composable layers over the same
+        // public facts: the Level-2 rule-list (which may EXCLUDE a candidate),
+        // then the Level-3 expression VM (an arbitrary scoring formula, fed the
+        // rule-adjusted score as its `base_score`). Both are inert when empty, so
+        // a Level-1 feed computes the facts only when a layer is present and pays
+        // nothing otherwise. Moderation/diversity (D4) still run AFTER on the
+        // result — no authored layer can resurface what moderation hides.
+        if (config.rules.len > 0 or config.vm_program.len > 0) {
             const facts = factsOf(c, cands.in_network.isSet(i), now);
-            scores[i] = rules_mod.apply(config.rules, facts, base) orelse continue; // a rule excluded it
-        } else {
-            scores[i] = base;
+            if (config.rules.len > 0) {
+                s = rules_mod.apply(config.rules, facts, s) orelse continue; // a rule excluded it
+            }
+            if (config.vm_program.len > 0) {
+                s = algo_vm.run(config.vm_program, facts, s);
+            }
         }
+        scores[i] = s;
         kept.appendAssumeCapacity(@intCast(i));
     }
     const order = kept.items;
@@ -482,6 +513,15 @@ pub fn validated(c: FeedConfig) FeedConfig {
     v.query.source_mix = clampF(c.query.source_mix, 0, 1, d.query.source_mix);
     if (v.query.max_candidates == 0) v.query.max_candidates = d.query.max_candidates;
     if (v.state_budget_bytes > state_budget_hard_cap) v.state_budget_bytes = state_budget_hard_cap;
+    // Clip a hostile/oversized rule-list to the cap (CPU-DoS wall). Truncating a
+    // const slice borrows the same memory — no allocation, so `validated` stays
+    // pure and total. Extra rules never run and, because serialize() validates
+    // first, never survive a round trip either.
+    if (v.rules.len > max_rules) v.rules = v.rules[0..max_rules];
+    // Reject a malformed or oversized Level-3 program to a safe no-op (the
+    // expression VM). `validatedProgram` keeps a well-formed, within-cap program
+    // and discards the rest — fail-safe, never partially executed (E2/E4).
+    v.vm_program = algo_vm.validatedProgram(v.vm_program);
     return v;
 }
 
@@ -698,6 +738,62 @@ test "score: an exclude rule removes candidates from the ranked pool" {
     try t.expectEqual(@as(u32, 2), order[0].raw()); // only the in-network post survives
 }
 
+test "score: a Level-3 VM program reshapes the ranking via an authored formula" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Two equal-age posts: ref 1 has the higher base (more likes). A formula
+    // multiplies the score by reposts, and ref 2 has far more reposts — so the
+    // authored formula flips the order, something flat weights alone wouldn't do
+    // here. score := base_score × reposts.
+    var c: Candidates = .{};
+    defer c.deinit(t.allocator);
+    var hi = mk(1, 3600, 50); // higher base
+    hi.repost_count = 1;
+    var lo = mk(2, 3600, 40); // lower base
+    lo.repost_count = 5; // but many more reposts
+    try c.append(t.allocator, hi, true);
+    try c.append(t.allocator, lo, true);
+
+    const program = [_]algo_vm.Instr{
+        .{ .op = .push_fact, .fact = .base_score },
+        .{ .op = .push_fact, .fact = .repost_count },
+        .{ .op = .mul },
+    };
+    var cfg = DEFAULT_CONFIG;
+    cfg.vm_program = &program;
+
+    const order = try score(arena, &c, cfg, test_now);
+    try t.expectEqual(@as(usize, 2), order.len);
+    try t.expectEqual(@as(u32, 2), order[0].raw()); // base40×5 = 200 > base50×1 = 50
+    try t.expectEqual(@as(u32, 1), order[1].raw());
+}
+
+test "score: a malformed VM program is inert (validated to a no-op upstream)" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var c: Candidates = .{};
+    defer c.deinit(t.allocator);
+    try c.append(t.allocator, mk(1, 3600, 50), true);
+    try c.append(t.allocator, mk(2, 3600, 10), true);
+
+    // An underflowing program — the load path (`validated`) drops it to empty, so
+    // the ranking is the plain base order. We validate, as the live path does.
+    const bad = [_]algo_vm.Instr{.{ .op = .mul }};
+    var cfg = DEFAULT_CONFIG;
+    cfg.vm_program = &bad;
+
+    const order = try score(arena, &c, validated(cfg), test_now);
+    try t.expectEqual(@as(usize, 2), order.len);
+    try t.expectEqual(@as(u32, 1), order[0].raw()); // base order, unchanged
+    try t.expectEqual(@as(u32, 2), order[1].raw());
+}
+
 test "applyCaps: per-author diversity cap keeps at most N per author, in rank order" {
     const t = std.testing;
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
@@ -760,6 +856,27 @@ test "validated: NaN/Inf and out-of-range fields are sanitized to safe data" {
     const ok = validated(DEFAULT_CONFIG);
     try t.expectEqual(DEFAULT_CONFIG.w_repost, ok.w_repost);
     try t.expectEqual(DEFAULT_CONFIG.recency_half_life_hrs, ok.recency_half_life_hrs);
+}
+
+test "validated: an oversized rule-list is clipped to the cap (CPU-DoS wall)" {
+    const t = std.testing;
+    // A hostile config asking for far more rules than the engine will run.
+    const flood = [_]rules_mod.Rule{
+        .{ .predicate = .{ .kind = .always }, .action = .{ .kind = .boost, .factor = 1.01 } },
+    } ** (max_rules + 50);
+    var hostile = DEFAULT_CONFIG;
+    hostile.rules = &flood;
+
+    const v = validated(hostile);
+    try t.expectEqual(max_rules, v.rules.len); // clipped, not rejected (E4)
+
+    // A within-budget rule-list is untouched (borrows the same memory).
+    const small = [_]rules_mod.Rule{
+        .{ .predicate = .{ .kind = .out_of_network }, .action = .{ .kind = .boost, .factor = 1.5 } },
+    };
+    var ok = DEFAULT_CONFIG;
+    ok.rules = &small;
+    try t.expectEqual(@as(usize, 1), validated(ok).rules.len);
 }
 
 test "applyCaps: max_per_author 0 means no cap; moderation still applies" {
