@@ -66,6 +66,25 @@ pub const act_sign_out: u8 = 1;
 /// The shell reads this row's toggle bit and substitutes pink at the colour
 /// sources. A live effect, not just a display toggle.
 pub const act_julia: u8 = 2;
+// Functional toggles — the shell reads each row's bit (via `rowOf`) into a flag
+// and gates the matching behaviour, the same pattern as Julia mode.
+pub const act_ripples: u8 = 3; // Toy Box: the field ripple + red dye on a like
+pub const act_crt: u8 = 4; // Toy Box: CRT scanline overlay
+pub const act_frametiming: u8 = 5; // Toy Box: fps/frame-time overlay
+pub const act_field: u8 = 6; // Appearance: the living glyph field on/off
+// Account info rows whose value is the REAL session identity (not the table's
+// placeholder); the renderer substitutes the live value for these.
+pub const act_show_handle: u8 = 7;
+pub const act_show_did: u8 = 8;
+pub const act_show_pds: u8 = 9;
+
+/// The GLOBAL row index of the (first) row carrying `action`, or null. Lets the
+/// shell map a functional `act_*` to its runtime toggle bit without hardcoding
+/// an index (so rows can be rearranged freely). Linear scan over a tiny table.
+pub fn rowOf(action: u8) ?u6 {
+    for (rows, 0..) |r, i| if (r.action == action) return @intCast(i);
+    return null;
+}
 
 /// Row flag bits (A6: sparse booleans packed into one byte, not bloating the
 /// struct with `bool` fields).
@@ -126,10 +145,10 @@ pub const sections = [_]Section{
 /// navigable shell; the actions get wired one slice at a time later.
 pub const rows = [_]Row{
     // ── Account ──────────────────────────────────────────────────────────
-    .{ .section = sec_account, .group = 0, .kind = .info, .action = act_none, .flags = 0, .label = "Handle", .value = "@you.zat4.com" },
-    .{ .section = sec_account, .group = 0, .kind = .info, .action = act_none, .flags = 0, .label = "DID", .value = "did:plc:…" },
+    .{ .section = sec_account, .group = 0, .kind = .info, .action = act_show_handle, .flags = 0, .label = "Handle", .value = "@you.zat4.com" },
+    .{ .section = sec_account, .group = 0, .kind = .info, .action = act_show_did, .flags = 0, .label = "DID", .value = "did:plc:…" },
     .{ .section = sec_account, .group = 0, .kind = .disclosure, .action = act_none, .flags = 0, .label = "Edit profile", .value = "" },
-    .{ .section = sec_account, .group = 1, .kind = .choice, .action = act_none, .flags = 0, .label = "Home server (PDS)", .value = "pds.zat4.com" },
+    .{ .section = sec_account, .group = 1, .kind = .choice, .action = act_show_pds, .flags = 0, .label = "Home server (PDS)", .value = "pds.zat4.com" },
     .{ .section = sec_account, .group = 1, .kind = .disclosure, .action = act_none, .flags = 0, .label = "App passwords", .value = "" },
     .{ .section = sec_account, .group = 2, .kind = .action, .action = act_sign_out, .flags = flag_destructive, .label = "Sign out", .value = "" },
 
@@ -137,7 +156,7 @@ pub const rows = [_]Row{
     .{ .section = sec_appearance, .group = 0, .kind = .choice, .action = act_none, .flags = 0, .label = "Theme", .value = "Dark" },
     .{ .section = sec_appearance, .group = 0, .kind = .choice, .action = act_none, .flags = 0, .label = "Accent", .value = "Amber" },
     .{ .section = sec_appearance, .group = 0, .kind = .choice, .action = act_none, .flags = 0, .label = "Text size", .value = "Medium" },
-    .{ .section = sec_appearance, .group = 1, .kind = .toggle, .action = act_none, .flags = flag_on, .label = "Living glyph field", .value = "" },
+    .{ .section = sec_appearance, .group = 1, .kind = .toggle, .action = act_field, .flags = flag_on, .label = "Living glyph field", .value = "" },
     .{ .section = sec_appearance, .group = 1, .kind = .choice, .action = act_none, .flags = 0, .label = "Field intensity", .value = "Subtle" },
     .{ .section = sec_appearance, .group = 1, .kind = .choice, .action = act_none, .flags = 0, .label = "Density", .value = "Cozy" },
 
@@ -168,12 +187,9 @@ pub const rows = [_]Row{
     // off from the polished sections so a half-baked switch never lands in
     // Account by accident.
     .{ .section = sec_toybox, .group = 0, .kind = .toggle, .action = act_julia, .flags = 0, .label = "Julia mode", .value = "" },
-    .{ .section = sec_toybox, .group = 0, .kind = .toggle, .action = act_none, .flags = flag_on, .label = "Ripples on like", .value = "" },
-    .{ .section = sec_toybox, .group = 0, .kind = .toggle, .action = act_none, .flags = 0, .label = "Comet cursor trail", .value = "" },
-    .{ .section = sec_toybox, .group = 0, .kind = .toggle, .action = act_none, .flags = 0, .label = "Confetti on boost", .value = "" },
-    .{ .section = sec_toybox, .group = 1, .kind = .toggle, .action = act_none, .flags = 0, .label = "CRT scanlines", .value = "" },
-    .{ .section = sec_toybox, .group = 1, .kind = .toggle, .action = act_none, .flags = 0, .label = "Extra-juicy springs", .value = "" },
-    .{ .section = sec_toybox, .group = 1, .kind = .toggle, .action = act_none, .flags = 0, .label = "Show frame timing", .value = "" },
+    .{ .section = sec_toybox, .group = 0, .kind = .toggle, .action = act_ripples, .flags = flag_on, .label = "Ripples on like", .value = "" },
+    .{ .section = sec_toybox, .group = 1, .kind = .toggle, .action = act_crt, .flags = 0, .label = "CRT scanlines", .value = "" },
+    .{ .section = sec_toybox, .group = 1, .kind = .toggle, .action = act_frametiming, .flags = 0, .label = "Show frame timing", .value = "" },
 
     // ── About ────────────────────────────────────────────────────────────
     .{ .section = sec_about, .group = 0, .kind = .info, .action = act_none, .flags = 0, .label = "Version", .value = "0.1.0-dev" },

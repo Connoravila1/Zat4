@@ -1344,6 +1344,66 @@ pub fn initHeartRenderer() Error!HeartRenderer {
 }
 
 // ---------------------------------------------------------------------------
+// CRT SCANLINES — a Toy Box post-process: darken every other 2px row over the
+// whole frame. One full-screen triangle, no textures, no uniforms (the row test
+// is pure gl_FragCoord). Drawn last, alpha-blended, when the toggle is on.
+// ---------------------------------------------------------------------------
+
+const scanline_vert_src: [:0]const GLchar =
+    \\attribute vec2 aPos;
+    \\void main() { gl_Position = vec4(aPos, 0.0, 1.0); }
+;
+const scanline_frag_src: [:0]const GLchar =
+    \\precision highp float;
+    \\void main() {
+    \\  // Black with partial alpha on every other 2px row → a CRT scanline.
+    \\  float row = mod(floor(gl_FragCoord.y / 2.0), 2.0);
+    \\  gl_FragColor = vec4(0.0, 0.0, 0.0, row * 0.30);
+    \\}
+;
+
+/// A7.2: cold struct, size guard waived — one per window, process-lifetime like
+/// the other renderers; its hot work is the GPU draw.
+pub const Scanlines = struct {
+    program: GLuint,
+    vbo: GLuint,
+    a_pos: GLint,
+};
+
+pub fn initScanlines() Error!Scanlines {
+    const vs = try compileShader(GL_VERTEX_SHADER, scanline_vert_src);
+    const fs = try compileShader(GL_FRAGMENT_SHADER, scanline_frag_src);
+    const prog = glCreateProgram();
+    glAttachShader(prog, vs);
+    glAttachShader(prog, fs);
+    glLinkProgram(prog);
+    var ok: GLint = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    if (ok == 0) {
+        var log: [1024]GLchar = undefined;
+        var n: GLsizei = 0;
+        glGetProgramInfoLog(prog, log.len, &n, &log);
+        elog("scanline program link FAILED: {s}", .{log[0..@intCast(n)]});
+        return Error.GpuInit;
+    }
+    const tri = [_]f32{ -1, -1, 3, -1, -1, 3 };
+    var vbo: GLuint = 0;
+    glGenBuffers(1, @ptrCast(&vbo));
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, @intCast(tri.len * @sizeOf(f32)), &tri, GL_STATIC_DRAW);
+    return .{ .program = prog, .vbo = vbo, .a_pos = glGetAttribLocation(prog, "aPos") };
+}
+
+pub fn drawScanlines(sr: *Scanlines) void {
+    glUseProgram(sr.program);
+    glBindBuffer(GL_ARRAY_BUFFER, sr.vbo);
+    bindAttrib(sr.a_pos, 2, 2 * @sizeOf(f32), 0);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
+// ---------------------------------------------------------------------------
 // SDF icons — the heart's technique generalised. Each icon is a signed distance
 // field composed from primitives (segments-as-capsules, boxes, rings), drawn as
 // ONE crisp anti-aliased shape — the shippable replacement for the line-art
