@@ -53,6 +53,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
+const rules_mod = @import("rules.zig");
 
 // ---------------------------------------------------------------------------
 // The candidate — the hot record the scorer consumes (Phase D1)
@@ -231,6 +232,16 @@ pub const FeedConfig = struct {
     /// Modeled now so the label vocabulary and the box's scratch budget carry
     /// it without a retrofit; the learner that uses it is D9.
     state_budget_bytes: u32 = 1 << 20, // 1 MiB soft default (digest-class)
+
+    /// LEVEL 2 — the creator's authored LOGIC: a list of `{predicate, action}`
+    /// rules (`core/rules.zig`) applied to each candidate's base score in order,
+    /// after `scoreRow`. Empty by default (a flat-weights config), so this field
+    /// is inert for every Level-1 config. A rule can boost/dampen a score or
+    /// exclude a candidate; it composes only the engine's fixed vocabulary, so it
+    /// is safe to run a shared rule-list with no interpreter. The rules travel
+    /// with the config record (they ARE part of the algorithm). The slice borrows
+    /// the caller's memory; for a parsed/built config it lives in that arena.
+    rules: []const rules_mod.Rule = &.{},
 };
 
 /// The hard ceiling on a single algorithm's declared on-device state (10 MiB).
@@ -323,16 +334,30 @@ pub fn scoreRow(c: Candidate, config: FeedConfig, now: i64) f64 {
 /// pool is an empty order, not an error (E4).
 pub fn score(arena: Allocator, cands: *const Candidates, config: FeedConfig, now: i64) error{OutOfMemory}![]Ref {
     const n = cands.list.len;
-    const out = try arena.alloc(Ref, n);
-    if (n == 0) return out;
+    if (n == 0) return arena.alloc(Ref, 0);
 
+    // Base score per candidate, then the config's LEVEL-2 RULES (if any) adjust
+    // it in order — a rule can boost/dampen the score or EXCLUDE the candidate
+    // from the pool (the creator's authored logic). A rule-less config (every
+    // Level-1 feed) skips this entirely. The non-bypassable moderation/diversity
+    // pass (D4) still runs AFTER, on the result — a rule cannot resurface what
+    // moderation hides.
     const scores = try arena.alloc(f64, n);
-    const order = try arena.alloc(u32, n);
+    var kept: std.ArrayListUnmanaged(u32) = .empty;
+    try kept.ensureTotalCapacity(arena, n);
     var i: usize = 0;
     while (i < n) : (i += 1) {
-        scores[i] = scoreRow(cands.list.get(i), config, now);
-        order[i] = @intCast(i);
+        const c = cands.list.get(i);
+        const base = scoreRow(c, config, now);
+        if (config.rules.len > 0) {
+            const facts = factsOf(c, cands.in_network.isSet(i), now);
+            scores[i] = rules_mod.apply(config.rules, facts, base) orelse continue; // a rule excluded it
+        } else {
+            scores[i] = base;
+        }
+        kept.appendAssumeCapacity(@intCast(i));
     }
+    const order = kept.items;
 
     const refs = cands.list.items(.ref);
     const createds = cands.list.items(.created_at);
@@ -348,8 +373,24 @@ pub fn score(arena: Allocator, cands: *const Candidates, config: FeedConfig, now
     };
     std.sort.block(u32, order, Ctx{ .scores = scores, .createds = createds, .refs = refs }, Ctx.lessThan);
 
+    const out = try arena.alloc(Ref, order.len); // ≤ n when rules excluded some
     for (out, order) |*o, idx| o.* = refs[idx];
     return out;
+}
+
+/// The rule-evaluator facts for one candidate (in-network from the pool's
+/// parallel bitset; age from `now` vs the post's `created_at`). Built only when
+/// a config carries rules. Pure — `now` is the value the scorer was handed (B4).
+fn factsOf(c: Candidate, in_network: bool, now: i64) rules_mod.Facts {
+    const d = now - c.created_at;
+    const age_hrs: f64 = if (d <= 0) 0.0 else @as(f64, @floatFromInt(d)) / 3600.0;
+    return .{
+        .in_network = in_network,
+        .like_count = c.like_count,
+        .repost_count = c.repost_count,
+        .reply_count = c.reply_count,
+        .age_hrs = age_hrs,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -604,6 +645,57 @@ test "score: empty pool is an empty order, not an error" {
     defer c.deinit(t.allocator);
     const order = try score(arena, &c, DEFAULT_CONFIG, test_now);
     try t.expectEqual(@as(usize, 0), order.len);
+}
+
+test "score: a config rule boosts a matching candidate above a higher-base one" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Two equal-age posts: ref 1 has more likes (higher base). A rule boosts
+    // out-of-network posts 3×; ref 2 is out-of-network, ref 1 is in-network.
+    var c: Candidates = .{};
+    defer c.deinit(t.allocator);
+    try c.append(t.allocator, mk(1, 3600, 20), true); // in-network, base 20
+    try c.append(t.allocator, mk(2, 3600, 10), false); // out-of-network, base 10
+
+    const cfg_rules = [_]rules_mod.Rule{.{
+        .predicate = .{ .kind = .out_of_network },
+        .action = .{ .kind = .boost, .factor = 3.0 },
+    }};
+    var cfg = DEFAULT_CONFIG;
+    cfg.rules = &cfg_rules;
+
+    const order = try score(arena, &c, cfg, test_now);
+    try t.expectEqual(@as(usize, 2), order.len);
+    try t.expectEqual(@as(u32, 2), order[0].raw()); // 10×3 = 30 > 20 — the rule lifted it
+    try t.expectEqual(@as(u32, 1), order[1].raw());
+}
+
+test "score: an exclude rule removes candidates from the ranked pool" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var c: Candidates = .{};
+    defer c.deinit(t.allocator);
+    try c.append(t.allocator, mk(1, 3600, 50), false); // out-of-network
+    try c.append(t.allocator, mk(2, 3600, 30), true); // in-network
+    try c.append(t.allocator, mk(3, 3600, 10), false); // out-of-network
+
+    // "Show me only the people I follow."
+    const cfg_rules = [_]rules_mod.Rule{.{
+        .predicate = .{ .kind = .out_of_network },
+        .action = .{ .kind = .exclude },
+    }};
+    var cfg = DEFAULT_CONFIG;
+    cfg.rules = &cfg_rules;
+
+    const order = try score(arena, &c, cfg, test_now);
+    try t.expectEqual(@as(usize, 1), order.len); // two excluded
+    try t.expectEqual(@as(u32, 2), order[0].raw()); // only the in-network post survives
 }
 
 test "applyCaps: per-author diversity cap keeps at most N per author, in rank order" {

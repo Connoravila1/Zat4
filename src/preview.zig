@@ -30,6 +30,8 @@ const feed = @import("core/feed.zig");
 const field = @import("core/field.zig");
 const lens_socket = @import("core/lens_socket.zig");
 const lens_catalog = @import("core/lens_catalog.zig");
+const discover = @import("core/discover.zig");
+const transparency = @import("core/transparency.zig");
 const enroll_view = @import("core/enroll_view.zig");
 const tiling = @import("core/tiling.zig");
 
@@ -128,6 +130,22 @@ pub fn main(init: std.process.Init) !void {
 
     const io = init.io;
     try writePpm(io, gpa, &fb, "/tmp/zat_preview.ppm");
+
+    // ALGORITHM TRANSPARENCY page (DISCOVER invariant 5): the real
+    // transparency.buildPage → feed_view.layoutTransparency path, on the Zat4
+    // Discover config (learns + reads attention, so the behavioral markers +
+    // "learns" verdict show). Every field, its value, and its meaning.
+    {
+        @memset(fb.pixels, clear);
+        dl.len = 0;
+        var disc = discover.DEFAULT_CONFIG;
+        disc.behavioral_weight = 1.0; // the adaptive default
+        const page = try transparency.buildPage(arena, "Zat4 Discover", "zat4:discover", disc);
+        _ = try feed_view.layoutTransparency(gpa, &engine, @intCast(W), @intCast(H), &dl, feed_view.accent_house, 0, page);
+        try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+        try writePpm(io, gpa, &fb, "/tmp/zat_transparency.ppm");
+        std.debug.print("wrote /tmp/zat_transparency.ppm (algorithm transparency page)\n", .{});
+    }
 
     // TILING FOUNDATION (S.1) PROOF: the SAME real feed, but its pane geometry
     // SOLVED by the partition carve (core/tiling.zig) and handed to layout()

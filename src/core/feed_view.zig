@@ -40,6 +40,7 @@ const text_select = @import("text_select.zig");
 const timefmt = @import("timefmt.zig");
 const compose = @import("compose.zig");
 const settings_view = @import("settings_view.zig");
+const transp = @import("transparency.zig");
 
 // Palette, copied from field.zig so the view never reaches across a module
 // for a constant (D4: only the value crosses, by copy). ARGB.
@@ -179,6 +180,11 @@ pub const screen_profile: u8 = 7;
 /// post's tray. Off the rail; renders like Home (title + header socket + feed)
 /// with the zone's name as the title and a back button. (Zat Zones slice 4.)
 pub const screen_zones: u8 = 8;
+/// An algorithm's TRANSPARENCY page (DISCOVER invariant 5) — a wide document
+/// page showing every field of a feed algorithm, its plain meaning, and the
+/// system-proven privacy verdict. Reached from a lens card; renders
+/// `transparency.Page` via `layoutTransparency`. Off the rail, with a back button.
+pub const screen_transparency: u8 = 9;
 
 /// The profile screen's header band — the viewed account's identity over its
 /// post list. Plain data handed in by the shell (B5); the post count is the
@@ -2054,6 +2060,84 @@ pub fn layoutCompose(
 /// Loadout-page sub-tabs (the row under the title). Loadout is built; the
 /// other two are placeholders for later tracks.
 pub const loadout_tabs = [_][]const u8{ "Loadout", "Marketplace", "Create" };
+
+/// A category's screen heading.
+fn transpCategory(c: transp.Category) []const u8 {
+    return switch (c) {
+        .engagement => "ENGAGEMENT",
+        .freshness => "FRESHNESS",
+        .personalization => "PERSONALIZATION",
+        .diversity => "DIVERSITY",
+        .retrieval => "WHAT IT PULLS IN",
+        .privacy_state => "ON-DEVICE MEMORY",
+    };
+}
+
+/// One classification line: a colored dot (the privacy glyph vocabulary) + label.
+fn transpClassLine(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x: i32, y: i32, label: []const u8, dot: u32) !i32 {
+    try rect(gpa, dl, x, y + 3, 9, 9, dot, 4);
+    _ = try str(gpa, dl, e, .semibold, x + 18, y + 14, ink, 16, label);
+    return y + 30;
+}
+
+/// Render an algorithm's TRANSPARENCY page (DISCOVER invariant 5): the title +
+/// its CID/ref, the two system-proven classification lines, then EVERY field —
+/// label, exact value, and plain meaning — grouped by category, with a marker on
+/// the fields that read your attention. Pure draw over `page` (built by
+/// `transparency.buildPage`); returns the content height for scroll clamping.
+/// No in-page hit regions in this cut — `back` (the nav) returns to the feed.
+pub fn layoutTransparency(
+    gpa: Allocator,
+    e: *const text.Engine,
+    width: i32,
+    height: i32,
+    dl: *raster.DrawList,
+    accent: u32,
+    scroll: i32,
+    page: transp.Page,
+) error{OutOfMemory}!i32 {
+    _ = height;
+    const m = metricsPage(width, screen_transparency);
+    const lx = m.lx;
+    const cw = m.cw;
+    var y = 80 + scroll;
+
+    // Header: the algorithm's name + the ref it is proven to be (invariant 5).
+    _ = try str(gpa, dl, e, .semibold, lx, y + 36, ink, 38, page.name);
+    y += 56;
+    _ = try str(gpa, dl, e, .regular, lx, y + 16, faint, 16, page.ref);
+    y += 38;
+
+    // The system-PROVEN classification — green dot for the privacy win, accent
+    // for "uses attention" / "learns".
+    y = try transpClassLine(gpa, dl, e, lx, y, page.behavioral_label, if (page.uses_behavioral) accent else boost_c);
+    y = try transpClassLine(gpa, dl, e, lx, y, page.stateful_label, if (page.learns) accent else muted);
+    y += 16;
+
+    try rect(gpa, dl, lx, y, cw, 1, 0x22FFFFFF, 0); // divider
+    y += 30;
+
+    // Every field, grouped by category — the "exactly what every line is" body.
+    var cur_cat: ?transp.Category = null;
+    for (page.rows) |r| {
+        if (cur_cat == null or cur_cat.? != r.category) {
+            cur_cat = r.category;
+            _ = try str(gpa, dl, e, .semibold, lx, y + 13, muted, 13, transpCategory(r.category));
+            y += 30;
+        }
+        // A field that reads your attention gets the accent marker (the privacy
+        // story, per-line); candidate-side fields have no marker.
+        if (r.behavioral) try rect(gpa, dl, lx, y + 5, 7, 7, accent, 3);
+        const row_x = lx + 18;
+        const pen = try str(gpa, dl, e, .semibold, row_x, y + 17, ink, 18, r.label);
+        _ = try str(gpa, dl, e, .semibold, pen + 14, y + 17, accent, 18, r.value);
+        y += 26;
+        y = try wrapBody(gpa, dl, e, row_x, y + 15, cw - 18, body_c, 15, r.meaning, 21, true, null);
+        y += 18;
+    }
+    y += 48;
+    return y - scroll;
+}
 
 pub fn layoutLoadout(
     gpa: Allocator,

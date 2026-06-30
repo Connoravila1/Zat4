@@ -178,7 +178,12 @@ fn fmtValue(arena: Allocator, v: anytype) error{OutOfMemory}![]const u8 {
 pub fn explain(arena: Allocator, config: discover.FeedConfig) error{OutOfMemory}![]FieldExplanation {
     var list: std.ArrayListUnmanaged(FieldExplanation) = .empty;
     inline for (@typeInfo(discover.FeedConfig).@"struct".fields) |f| {
-        if (comptime std.mem.eql(u8, f.name, "query")) {
+        if (comptime std.mem.eql(u8, f.name, "rules")) {
+            // The Level-2 rule-list is LOGIC, not a scalar — it renders as its own
+            // readable section (the "resembles code" view, L2 slice 3), so it is
+            // intentionally not one of the per-field scalar rows here. Skipped, not
+            // forgotten: this branch keeps the comptime completeness honest.
+        } else if (comptime std.mem.eql(u8, f.name, "query")) {
             // Flatten the candidate-query sub-record into its own leaf rows.
             inline for (@typeInfo(discover.Query).@"struct".fields) |qf| {
                 const m = metaFor(qf.name);
@@ -263,6 +268,44 @@ pub fn statefulLabel(c: Classification) []const u8 {
 }
 
 // ---------------------------------------------------------------------------
+// The page model — what the transparency SCREEN renders (D5 / invariant 5)
+// ---------------------------------------------------------------------------
+
+/// Everything a transparency page shows about one algorithm, assembled from the
+/// foundations: the title + its CID/ref (the artifact identity), the two
+/// system-PROVEN classification labels, and the full per-field explanation. The
+/// renderer (feed_view.layoutTransparency) draws this; the raw byte-exact "file"
+/// it pairs with comes from `algorithm.serialize`. PLAIN DATA (A1).
+/// A7.2: cold view-model — one per transparency-page open. Size guard waived.
+pub const Page = struct {
+    name: []const u8,
+    /// The CID (or, for a built-in, its stable id) — the thing the page proves
+    /// "is what runs" (invariant 5).
+    ref: []const u8,
+    behavioral_label: []const u8,
+    stateful_label: []const u8,
+    uses_behavioral: bool,
+    learns: bool,
+    rows: []const FieldExplanation,
+};
+
+/// Assemble the transparency page for one algorithm (PURE): the classification
+/// verdict + every explained field, in `arena`. The caller supplies the human
+/// `name` and the `ref` (CID/id) it resolved the config from.
+pub fn buildPage(arena: Allocator, name: []const u8, ref: []const u8, config: discover.FeedConfig) error{OutOfMemory}!Page {
+    const c = classify(config);
+    return .{
+        .name = name,
+        .ref = ref,
+        .behavioral_label = behavioralLabel(c),
+        .stateful_label = statefulLabel(c),
+        .uses_behavioral = c.uses_behavioral,
+        .learns = c.learns,
+        .rows = try explain(arena, config),
+    };
+}
+
+// ---------------------------------------------------------------------------
 // Tests — pure, leak-checked (C6)
 // ---------------------------------------------------------------------------
 
@@ -271,7 +314,9 @@ pub fn statefulLabel(c: Classification) []const u8 {
 fn leafFieldCount() usize {
     var n: usize = 0;
     inline for (@typeInfo(discover.FeedConfig).@"struct".fields) |f| {
-        if (comptime std.mem.eql(u8, f.name, "query")) {
+        if (comptime std.mem.eql(u8, f.name, "rules")) {
+            // not a scalar leaf — rendered as its own logic section (matches explain)
+        } else if (comptime std.mem.eql(u8, f.name, "query")) {
             n += @typeInfo(discover.Query).@"struct".fields.len;
         } else n += 1;
     }
@@ -413,4 +458,23 @@ test "classify agrees with explain on the behavioral verdict (no cross-module dr
         }
         try t.expectEqual(classify(c).uses_behavioral, explain_behavioral);
     }
+}
+
+test "buildPage: assembles the verdict + every field for the renderer" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var private = discover.DEFAULT_CONFIG;
+    private.w_bookmark = 0;
+    private.w_profile_click = 0;
+    private.w_link_click = 0;
+    private.behavioral_weight = 0;
+
+    const page = try buildPage(arena, "Zat4 Private Discover", "zat4:private-discover", private);
+    try t.expectEqualStrings("Zat4 Private Discover", page.name);
+    try t.expectEqualStrings("zat4:private-discover", page.ref);
+    try t.expect(!page.uses_behavioral); // proven clean
+    try t.expectEqual(leafFieldCount(), page.rows.len); // every line present
 }

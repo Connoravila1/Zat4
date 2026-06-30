@@ -40,6 +40,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const discover = @import("discover.zig");
+const rules = @import("rules.zig");
 const jsonguard = @import("jsonguard.zig");
 
 /// Schema version of the serialized form. Bumped only on an incompatible
@@ -156,6 +157,29 @@ test "parse: a well-formed but abusive record is sanitized, not trusted" {
     try t.expect(cfg.state_budget_bytes <= discover.state_budget_hard_cap);
     // Fields the record omitted came back as the safe defaults.
     try t.expectEqual(discover.DEFAULT_CONFIG.w_repost, cfg.w_repost);
+}
+
+test "serialize/parse: a config's LEVEL-2 rules travel with the record" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // An algorithm with authored logic: boost strong discovery posts, drop noise.
+    const rule_list = [_]rules.Rule{
+        .{ .predicate = .{ .kind = .out_of_network }, .action = .{ .kind = .boost, .factor = 1.5 } },
+        .{ .predicate = .{ .kind = .min_engagement, .param = 5 }, .action = .{ .kind = .exclude } },
+    };
+    var cfg = discover.DEFAULT_CONFIG;
+    cfg.rules = &rule_list;
+
+    const bytes = try serialize(arena, cfg);
+    const back = try parse(arena, bytes);
+    try t.expectEqual(@as(usize, 2), back.rules.len);
+    try t.expectEqual(rules.PredicateKind.out_of_network, back.rules[0].predicate.kind);
+    try t.expectEqual(@as(f32, 1.5), back.rules[0].action.factor);
+    try t.expectEqual(rules.ActionKind.exclude, back.rules[1].action.kind);
+    try t.expectEqual(@as(f32, 5), back.rules[1].predicate.param);
 }
 
 test "parse: forward-compatible — unknown fields are ignored (E4)" {
