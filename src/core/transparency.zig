@@ -169,6 +169,10 @@ fn metaFor(comptime name: []const u8) Meta {
         .label = "Negative-feedback penalty",
         .meaning = "The penalty when you block, mute, or report. Negative, so it pushes a post down hard.",
         .category = .engagement,
+    } else if (comptime std.mem.eql(u8, name, "engagement_floor")) .{
+        .label = "Cold-start floor",
+        .meaning = "A baseline score every post gets regardless of engagement, so brand-new posts with no likes yet can still surface on freshness. 0 means no floor — a post with no engagement scores 0.",
+        .category = .freshness,
     } else if (comptime std.mem.eql(u8, name, "recency_half_life_hrs")) .{
         .label = "Freshness half-life (hours)",
         .meaning = "How fast a post's freshness fades — after this many hours its freshness score halves. 0 means freshness never decays.",

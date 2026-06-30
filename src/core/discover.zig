@@ -208,6 +208,16 @@ pub const FeedConfig = struct {
     w_link_click: f32 = 22.0, // BEHAVIORAL — followed the content out (Twitter 11)
     w_negative: f32 = -148.0, // block / mute / report — asymmetric punisher (Twitter −74)
 
+    /// A baseline added to the engagement sum for EVERY candidate, so a post with
+    /// no engagement yet still has a non-zero score that freshness can lift — the
+    /// cold-start floor. Because the score is multiplicative, a zero-engagement
+    /// post otherwise scores exactly 0 regardless of recency; this is the knob that
+    /// gives brand-new posts a chance to surface (additive smoothing). **Default 0
+    /// preserves the pure engagement-gated behavior** — the right value for a given
+    /// feed is a measured calibration decision (G2), and an algorithm author can
+    /// tune it, so it lives in the config rather than as a hardcoded constant.
+    engagement_floor: f32 = 0,
+
     // Freshness + boosts (MULTIPLY the engagement sum — see `scoreRow`).
     recency_half_life_hrs: f32 = 6.0,
     velocity_boost: bool = true, // early-engagement (~first 30 min) multiplier
@@ -339,7 +349,8 @@ pub fn scoreRow(c: Candidate, config: FeedConfig, now: i64) f64 {
         @as(f64, @floatFromInt(c.bookmark_count)) * @as(f64, config.w_bookmark) +
         @as(f64, @floatFromInt(c.profile_click_count)) * @as(f64, config.w_profile_click) +
         @as(f64, @floatFromInt(c.link_click_count)) * @as(f64, config.w_link_click) +
-        @as(f64, @floatFromInt(c.negative_count)) * @as(f64, config.w_negative);
+        @as(f64, @floatFromInt(c.negative_count)) * @as(f64, config.w_negative) +
+        @as(f64, config.engagement_floor); // cold-start baseline (default 0)
 
     const d = now - c.created_at;
     const age_hrs: f64 = if (d <= 0) 0.0 else @as(f64, @floatFromInt(d)) / 3600.0;
@@ -513,6 +524,7 @@ pub fn validated(c: FeedConfig) FeedConfig {
     v.w_profile_click = clampF(c.w_profile_click, w_lo, w_hi, d.w_profile_click);
     v.w_link_click = clampF(c.w_link_click, w_lo, w_hi, d.w_link_click);
     v.w_negative = clampF(c.w_negative, w_lo, w_hi, d.w_negative);
+    v.engagement_floor = clampF(c.engagement_floor, 0, w_hi, d.engagement_floor); // ≥ 0, bounded
     v.recency_half_life_hrs = clampF(c.recency_half_life_hrs, 0, 1_000_000, d.recency_half_life_hrs);
     v.author_rep_weight = clampF(c.author_rep_weight, -1000, 1000, d.author_rep_weight);
     v.relevance_weight = clampF(c.relevance_weight, -1000, 1000, d.relevance_weight);
@@ -744,6 +756,35 @@ test "score: an exclude rule removes candidates from the ranked pool" {
     const order = try score(arena, &c, cfg, test_now);
     try t.expectEqual(@as(usize, 1), order.len); // two excluded
     try t.expectEqual(@as(u32, 2), order[0].raw()); // only the in-network post survives
+}
+
+test "scoreRow: the cold-start floor lets a zero-engagement fresh post score above 0" {
+    const t = std.testing;
+    // Default config: a zero-engagement post scores exactly 0, regardless of age.
+    const fresh_quiet = mk(1, 60, 0); // 1 minute old, no engagement
+    try t.expectEqual(@as(f64, 0), scoreRow(fresh_quiet, DEFAULT_CONFIG, test_now));
+
+    // With a floor, the same post scores > 0, and a fresher one outscores an older
+    // one purely on recency (the cold-start behavior we wanted).
+    var cfg = DEFAULT_CONFIG;
+    cfg.engagement_floor = 10;
+    const fresh = scoreRow(mk(1, 60, 0), cfg, test_now);
+    const stale = scoreRow(mk(2, 3600 * 48, 0), cfg, test_now); // 48h old, no engagement
+    try t.expect(fresh > 0);
+    try t.expect(fresh > stale); // freshness now breaks the tie among quiet posts
+
+    // The floor is additive smoothing: a high-engagement post is barely affected.
+    const busy_default = scoreRow(mk(3, 60, 100), DEFAULT_CONFIG, test_now);
+    const busy_floored = scoreRow(mk(3, 60, 100), cfg, test_now);
+    try t.expect(busy_floored > busy_default); // floor added
+    try t.expect((busy_floored - busy_default) / busy_default < 0.5); // but a small relative nudge
+}
+
+test "validated: a negative cold-start floor is clamped to 0" {
+    const t = std.testing;
+    var hostile = DEFAULT_CONFIG;
+    hostile.engagement_floor = -5; // a negative floor would penalize, not seed
+    try t.expectEqual(@as(f32, 0), validated(hostile).engagement_floor);
 }
 
 test "score: a Level-3 VM program reshapes the ranking via an authored formula" {
