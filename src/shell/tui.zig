@@ -391,6 +391,13 @@ pub fn run(
     // regions the pointer handler tests in pixels.
     var gscroll_px: i32 = 0;
     var gcontent_h: i32 = 0;
+    // Pull-to-refresh: an upward wheel while already pinned at the top of Home
+    // accumulates "overscroll"; crossing `pull_refresh_threshold` requests a
+    // manual refresh (handled at the loop top with the auto-refresh). A
+    // downward scroll or a fired refresh resets the accumulator.
+    var overscroll_accum: i32 = 0;
+    var pull_refresh_requested = false;
+    const pull_refresh_threshold: i32 = 112; // ~four wheel notches of pull
     var gregions: feed_view.Regions = .empty;
     defer gregions.deinit(gpa);
     // THE LENS SOCKET loadouts — THREE surfaces (feed / reply / zone),
@@ -760,6 +767,37 @@ pub fn run(
             };
             if (outcome != null and outcome.? == .ok) {
                 _ = cache_shell.saveStore(gpa, environ, store); // E4: a failed save is simply no cache
+            }
+        }
+
+        // Pull-to-refresh: the overscroll gesture asked for a refresh. Unlike the
+        // passive auto-refresh, an EXPLICIT pull asks to SEE the new — so reveal
+        // the staged posts and jump to the top. Failure stays on the status line
+        // (E2); only OOM is fatal.
+        if (pull_refresh_requested) {
+            pull_refresh_requested = false;
+            status = "refreshing...";
+            if (feed_shell.refreshTimeline(gpa, arena, io, environ, session, appview_url, store, 30)) |outcome| {
+                switch (outcome) {
+                    .ok => |stats| {
+                        const revealed_n = feed_core.revealPending(gpa, store) catch 0;
+                        if (revealed_n > 0) {
+                            state.selected = 0;
+                            state.scroll_top = 0;
+                            gview.scroll_rows = 0;
+                            gscroll_px = 0;
+                        }
+                        status = if (stats.items_added == 0 and revealed_n == 0)
+                            "no new posts"
+                        else
+                            std.fmt.bufPrint(&status_buf, "+{d} new at top", .{revealed_n}) catch "new posts";
+                        _ = cache_shell.saveStore(gpa, environ, store);
+                    },
+                    .failed => |failure| status = std.fmt.bufPrint(&status_buf, "refused: {d} {s}", .{ failure.status, failure.code }) catch "refused",
+                }
+            } else |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => status = "network error", // contained (E2)
             }
         }
 
@@ -1232,6 +1270,23 @@ pub fn run(
                                 const min_scroll: i32 = @min(0, view_h - g.content_h.* - 24);
                                 g.scroll.* = @max(min_scroll, @min(0, g.scroll.*));
                                 effect_core.shiftY(g.active, -delta);
+                                // Pull-to-refresh: a wheel-up (button 4 → delta < 0)
+                                // that lands while already pinned at the top of Home
+                                // builds overscroll; past the threshold it asks for a
+                                // refresh. A wheel-down cancels the pull.
+                                if (g.screen.* == feed_view.screen_home and pev.button != 5 and g.scroll.* == 0) {
+                                    overscroll_accum += 28;
+                                    if (overscroll_accum >= pull_refresh_threshold) {
+                                        pull_refresh_requested = true;
+                                        overscroll_accum = 0;
+                                    } else {
+                                        // Visible proof the pull is registering (the
+                                        // animated indicator is the deferred polish).
+                                        status = "↑ keep pulling to refresh";
+                                    }
+                                } else if (pev.button == 5) {
+                                    overscroll_accum = 0;
+                                }
                             },
                             .move => {
                                 // Track the pointer in LOGICAL coords for the hover

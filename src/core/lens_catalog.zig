@@ -33,14 +33,17 @@
 //! sets what it looks like when first loaded); the user is then free to
 //! recolor it, and that override lives on the loadout entry (§11.5).
 //!
-//! The privacy glyph is derived from `flags.learns` here as a stand-in;
-//! when the DISCOVER engine exists it becomes capability-PROVEN, never a
-//! declared flag (DISCOVER invariant 6).
+//! The privacy glyph/label is now capability-PROVEN, not declared (DISCOVER
+//! invariant 6): a card's `learns` bit is DERIVED from `transparency.classify`
+//! over the algorithm's own config (`derivedFlags`), so a card cannot claim
+//! "no behavioral data" unless every behavioral weight is provably zero. The
+//! hand-authored `flags.learns` no longer exists.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const lens_socket = @import("lens_socket.zig");
 const discover = @import("discover.zig");
+const transparency = @import("transparency.zig");
 
 /// One first-party algorithm. A cold, comptime configuration table — low
 /// cardinality, never iterated in a hot loop.
@@ -69,8 +72,19 @@ const b_discover = Builtin{
     .ranks = "engagement + topics",
     .desc = "The well-rounded default: a strong, Twitter-style feed that learns what you engage with — on your device, never sent anywhere.",
     .color = 0, // amber (house accent)
-    .flags = .{ .learns = true, .is_default = true },
-    .config = discover.DEFAULT_CONFIG, // the house algorithm = one config value (invariant 2)
+    .flags = .{ .is_default = true }, // learns bit DERIVED from the config (see derivedFlags)
+    // The adaptive default: the house Discover config WITH the on-device learner
+    // turned on (behavioral_weight > 0). This is what makes "Zat4 Discover learns
+    // what you engage with" a PROVABLE fact (transparency.classify sees the
+    // non-zero weight) rather than a card's claim. Distinct from the neutral
+    // `DEFAULT_CONFIG` baseline (which stays behavioral-off). Inert until on-device
+    // dwell capture ships (D9), but the doorway is open and the label is honest.
+    // The weight is a calibration prior (G1/G2).
+    .config = blk: {
+        var c = discover.DEFAULT_CONFIG;
+        c.behavioral_weight = 1.0;
+        break :blk c;
+    },
 };
 const b_following = Builtin{
     .id = "zat4:following",
@@ -176,6 +190,18 @@ pub const default_reply_seated: u32 = 0;
 pub const zone_builtins = [_]Builtin{ b_discover, b_calm };
 pub const default_zone_seated: u32 = 0;
 
+/// The card's privacy flags, DERIVED from the algorithm's config — never the
+/// author's claim (DISCOVER invariant 6). `learns` (which drives the
+/// always-visible privacy glyph and the "no behavioral data" / "local-learning"
+/// label) is set from `transparency.classify`, so a card MECHANICALLY cannot
+/// misrepresent whether it touches your attention data. A built-in with no config
+/// (the no-scoring Following / Most Recent) reads no behavioral data. `is_default`
+/// is editorial (which lenses ship seated), not a privacy claim, so it stays.
+fn derivedFlags(b: Builtin) lens_socket.LensFlags {
+    const uses_behavioral = if (b.config) |c| transparency.classify(c).uses_behavioral else false;
+    return .{ .learns = uses_behavioral, .is_default = b.flags.is_default };
+}
+
 /// Build a `TrayView` (mutable cards + the text blob their spans point into)
 /// from a built-in catalog slice, into `gpa` (caller owns and frees both).
 /// Pure: same catalog ⇒ same data. Each card's CID is the built-in's stable
@@ -196,7 +222,7 @@ pub fn loadoutFrom(gpa: Allocator, builtins: []const Builtin) !struct { []lens_s
         try blob.appendSlice(gpa, "zat4 default");
         const cid: lens_socket.TextSpan = .{ .off = @intCast(blob.items.len), .len = @intCast(b.id.len) };
         try blob.appendSlice(gpa, b.id);
-        cards[i] = .{ .cid = cid, .name = name, .author = author, .ranks = ranks, .desc = desc, .color = b.color, .flags = b.flags };
+        cards[i] = .{ .cid = cid, .name = name, .author = author, .ranks = ranks, .desc = desc, .color = b.color, .flags = derivedFlags(b) };
     }
     return .{ cards, try blob.toOwnedSlice(gpa) };
 }
@@ -270,7 +296,7 @@ pub fn loadoutFromEntries(gpa: Allocator, entries: []const Entry) !struct { []le
         try blob.appendSlice(gpa, "zat4 default");
         const cid: lens_socket.TextSpan = .{ .off = @intCast(blob.items.len), .len = @intCast(b.id.len) };
         try blob.appendSlice(gpa, b.id);
-        try cards.append(gpa, .{ .cid = cid, .name = name, .author = author, .ranks = ranks, .desc = desc, .color = entry.color, .flags = b.flags });
+        try cards.append(gpa, .{ .cid = cid, .name = name, .author = author, .ranks = ranks, .desc = desc, .color = entry.color, .flags = derivedFlags(b) });
     }
     return .{ try cards.toOwnedSlice(gpa), try blob.toOwnedSlice(gpa) };
 }
