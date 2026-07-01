@@ -612,6 +612,10 @@ pub fn run(
     // On the transparency page: false = the summary, true = the byte-exact source
     // (the "View the exact source" tap-through). Reset when a new algorithm opens.
     var gtransp_source = false;
+    // The config fetch runs on a worker (no UI freeze); true while it's in flight.
+    var inspect_loading = false;
+    var inspectjob: InspectJob = .{};
+    defer stopInspect(&inspectjob); // join any in-flight fetch before exit
     defer {
         if (inspect_bytes) |b| gpa.free(b);
         if (inspect_name.len > 0) gpa.free(inspect_name);
@@ -995,6 +999,22 @@ pub fn run(
         }
         on_market_prev = on_market;
 
+        // Consume a finished background config fetch (View details): after the
+        // worker signals done, join it and copy its page_allocator result into the
+        // render gpa (no concurrency past the join), then free the worker copy.
+        if (inspectjob.active and inspectjob.done.load(.acquire)) {
+            joinInspect(&inspectjob);
+            if (inspectjob.ok) {
+                if (inspectjob.bytes) |b| {
+                    if (inspect_bytes) |old| gpa.free(old);
+                    inspect_bytes = gpa.dupe(u8, b) catch null;
+                    std.heap.page_allocator.free(b);
+                    inspectjob.bytes = null;
+                }
+            } else status = "algorithm: unavailable";
+            inspect_loading = false;
+        }
+
         // The ACTIVE view: Home (one ordering over the store), the profile screen
         // (the TARGET author's posts), a post's THREAD, or a ZONE (a tag query) —
         // each a query over the SAME store. One list of view-models the render +
@@ -1132,7 +1152,7 @@ pub fn run(
         var cur_socket_ui = if (on_thread_screen) reply_ui else if (on_zone_screen) zone_ui else gsocket_ui;
         cur_socket_ui.julia = julia_on;
         const cur_socket_hits = if (on_thread_screen) &reply_hits else if (on_zone_screen) &zone_hits else &gsocket_hits;
-        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .market = if (gscreen == feed_view.screen_loadout and gloadout_tab == 1) market_cards.items else &.{}, .inspect_bytes = inspect_bytes orelse "", .inspect_name = inspect_name, .inspect_ref = inspect_ref, .inspect_source = gtransp_source, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
+        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .market = if (gscreen == feed_view.screen_loadout and gloadout_tab == 1) market_cards.items else &.{}, .inspect_bytes = inspect_bytes orelse "", .inspect_name = inspect_name, .inspect_ref = inspect_ref, .inspect_source = gtransp_source, .inspect_loading = inspect_loading, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
         switch (mode) {
             .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status),
             .compose => {
@@ -1934,27 +1954,28 @@ pub fn run(
                                         // wire); what the page shows is what would run.
                                         .algo_view => if (hit.post < market_catalog.items.len) {
                                             const r = market_catalog.items[hit.post];
-                                            const cfg = algorithm_shell.fetch(gpa, arena, io, environ, session, r.author_did, r.rkey) catch |err| switch (err) {
-                                                error.OutOfMemory => return err,
-                                                else => blk: {
-                                                    status = "algorithm: fetch error";
-                                                    break :blk null;
-                                                },
-                                            };
-                                            if (cfg) |c| {
-                                                if (inspect_name.len > 0) gpa.free(inspect_name);
-                                                if (inspect_ref.len > 0) gpa.free(inspect_ref);
-                                                if (inspect_bytes) |b| gpa.free(b);
-                                                inspect_name = try gpa.dupe(u8, r.name);
-                                                inspect_ref = try gpa.dupe(u8, r.cid);
-                                                // Serialize the fetched config to STABLE gpa bytes (c's
-                                                // slices point into the frame arena, valid only here).
-                                                inspect_bytes = try algorithm_core.serialize(gpa, c);
-                                                transp_return_screen = gscreen;
-                                                gscreen = feed_view.screen_transparency;
-                                                gtransp_source = false; // open on the summary
-                                                gscroll_px = 0;
-                                            } else status = "algorithm: unavailable";
+                                            // Join any still-running fetch (rapid re-tap) before reusing
+                                            // the job, so its thread can't outlive the reused fields.
+                                            if (inspectjob.active) {
+                                                joinInspect(&inspectjob);
+                                                if (inspectjob.ok) if (inspectjob.bytes) |b| std.heap.page_allocator.free(b);
+                                            }
+                                            if (inspect_name.len > 0) gpa.free(inspect_name);
+                                            if (inspect_ref.len > 0) gpa.free(inspect_ref);
+                                            if (inspect_bytes) |b| gpa.free(b);
+                                            inspect_bytes = null;
+                                            inspect_name = try gpa.dupe(u8, r.name);
+                                            inspect_ref = try gpa.dupe(u8, r.cid);
+                                            // Open the page IMMEDIATELY in a loading state; the config
+                                            // fetch runs on a worker (public read), so the UI never
+                                            // freezes on the network round-trip. Author == user at
+                                            // single-user scale, so the user's PDS serves the record.
+                                            startInspect(&inspectjob, io, environ, session.pds_url, r.author_did, r.rkey);
+                                            inspect_loading = true;
+                                            transp_return_screen = gscreen;
+                                            gscreen = feed_view.screen_transparency;
+                                            gtransp_source = false; // open on the summary
+                                            gscroll_px = 0;
                                         },
                                         // "View the exact source" on the transparency
                                         // page → the byte-exact serialized artifact.
@@ -3025,6 +3046,96 @@ fn reorderTray(cards: []lens_socket.LensCard, from: u32, to: u32) void {
     cards[to] = moved;
 }
 
+/// The background config-fetch for the marketplace "View details" page. Fetching
+/// an algorithm's config is a network round-trip; done on the UI thread it FREEZES
+/// the app for the fetch (the "extreme lag going to the info page"). So it runs on
+/// this worker — a public, unauthenticated `getRecord`, so the worker never touches
+/// the shared mutable session. The run loop polls `done`, then copies the
+/// page_allocator result into the render `gpa` after join (no concurrency).
+/// A7.2: cold struct (one live instance, holds a thread), size guard waived.
+const InspectJob = struct {
+    thread: ?std.Thread = null,
+    done: std.atomic.Value(bool) = .init(false),
+    active: bool = false, // a fetch is running (or finished, not yet consumed)
+    ok: bool = false, // a config was produced (read after done-acquire / join)
+    bytes: ?[]u8 = null, // page_allocator-owned serialized config on success
+    // Inputs, COPIED in so the worker never reads run-loop state (which the UI
+    // thread mutates). io/env are shared but read-only / thread-safe.
+    io: std.Io = undefined,
+    env: ?*const std.process.Environ.Map = null,
+    pds: [256]u8 = undefined,
+    pds_len: usize = 0,
+    repo: [128]u8 = undefined,
+    repo_len: usize = 0,
+    rkey: [128]u8 = undefined,
+    rkey_len: usize = 0,
+};
+
+/// Worker body: a public getRecord + serialize, all off the `page_allocator` (a
+/// private arena for the fetch, page_allocator for the surviving result), so the
+/// render allocator is never touched. Publishes via `done` (release).
+fn inspectWorker(job: *InspectJob) void {
+    const a = std.heap.page_allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const scratch = arena_state.allocator();
+    const cfg = algorithm_shell.fetchPublic(scratch, job.io, job.env, job.pds[0..job.pds_len], job.repo[0..job.repo_len], job.rkey[0..job.rkey_len]) catch null;
+    if (cfg) |c| {
+        // Serialize into page_allocator (survives the arena deinit); the main
+        // thread copies it into gpa and frees this after join.
+        if (algorithm_core.serialize(a, c)) |b| {
+            job.bytes = b;
+            job.ok = true;
+        } else |_| job.ok = false;
+    } else job.ok = false;
+    job.done.store(true, .release);
+}
+
+/// Spawn a config fetch for (pds, repo, rkey). The strings are COPIED into the job
+/// so the worker never reads run-loop state. A spawn failure completes the job as
+/// a clean failure (done, ok=false) rather than hanging the loading state forever.
+fn startInspect(job: *InspectJob, io: std.Io, env: ?*const std.process.Environ.Map, pds: []const u8, repo: []const u8, rkey: []const u8) void {
+    const pn = @min(pds.len, job.pds.len);
+    @memcpy(job.pds[0..pn], pds[0..pn]);
+    job.pds_len = pn;
+    const rn = @min(repo.len, job.repo.len);
+    @memcpy(job.repo[0..rn], repo[0..rn]);
+    job.repo_len = rn;
+    const kn = @min(rkey.len, job.rkey.len);
+    @memcpy(job.rkey[0..kn], rkey[0..kn]);
+    job.rkey_len = kn;
+    job.io = io;
+    job.env = env;
+    job.done.store(false, .monotonic);
+    job.ok = false;
+    job.bytes = null;
+    job.active = true;
+    job.thread = std.Thread.spawn(.{}, inspectWorker, .{job}) catch null;
+    if (job.thread == null) job.done.store(true, .release); // spawn failed → done, ok=false
+}
+
+/// Join a finished fetch WITHOUT freeing its result — the caller is about to
+/// CONSUME `bytes` (copy into gpa). Leaves `thread == null` so shutdown skips it.
+fn joinInspect(job: *InspectJob) void {
+    if (job.thread) |th| {
+        th.join();
+        job.thread = null;
+    }
+    job.active = false;
+}
+
+/// Shutdown cleanup (the defer): join any in-flight fetch and free a result the
+/// loop never consumed (landed in the frame the app exits). A no-op if the loop
+/// already took it (`thread == null`), so never a double-free.
+fn stopInspect(job: *InspectJob) void {
+    if (job.thread) |th| {
+        th.join();
+        job.thread = null;
+        if (job.ok) if (job.bytes) |b| std.heap.page_allocator.free(b);
+    }
+    job.active = false;
+}
+
 /// A7.2: cold struct, waived — one per run(), the per-frame bundle of
 /// shared pointers the paint path and input handler both read.
 const Grid = struct {
@@ -3085,6 +3196,8 @@ const Grid = struct {
     inspect_ref: []const u8 = "",
     /// On the transparency page: false = the summary, true = the byte-exact source.
     inspect_source: bool = false,
+    /// True while the background config fetch is in flight (show a loading state).
+    inspect_loading: bool = false,
     /// Out: layoutLoadout writes each page socket's geometry here for the
     /// shell's drag math (feed / reply / zone).
     loadout_geoms: *[3]lens_socket.Geometry = undefined,
@@ -3829,7 +3942,9 @@ fn paintFrame(
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
                 g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market) catch g.content_h.*; // software: draw line-art nav
             } else if (g.screen.* == feed_view.screen_transparency) {
-                if (g.inspect_bytes.len > 0) {
+                if (g.inspect_loading) {
+                    g.content_h.* = feed_view.layoutAlgorithmLoading(gpa, g.engine, @intCast(win.fb.width), g.draw, g.regions, g.accent, g.inspect_name) catch g.content_h.*;
+                } else if (g.inspect_bytes.len > 0) {
                     if (g.inspect_source) {
                         // The byte-exact source IS the stored serialized config.
                         g.content_h.* = feed_view.layoutAlgorithmSource(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.inspect_name, g.inspect_ref, g.inspect_bytes) catch g.content_h.*;
@@ -4170,7 +4285,7 @@ fn paintFrameGpu(
     const over_left_rail = gs.algo_t > 0.5 and g.hover_x >= 0 and @as(f32, @floatFromInt(g.hover_x)) < left_rail_right + 8.0 and g.hover_y >= 0;
     springGeom(&gs.left_hover_t, &gs.left_hover_v, if (over_left_rail) 1.0 else 0.0, 1.0 / 60.0);
     const algo_animating = @abs(gs.algo_t - (if (on_algo) @as(f32, 1.0) else 0.0)) > 0.003 or @abs(gs.algo_v) > 0.003 or @abs(gs.left_hover_t - (if (over_left_rail) @as(f32, 1.0) else 0.0)) > 0.004 or @abs(gs.left_hover_v) > 0.004;
-    const sig = feedSignature(items, g.scroll.*, w, h) ^ (@as(u64, g.screen.*) *% 0x9E37_79B9_7F4A_7C15) ^ (socket_sig *% 0xD1B5_4A32_D192_ED03) ^ (@as(u64, g.settings_section) *% 0xC2B2_AE3D_27D4_EB4F) ^ (g.settings_toggles *% 0x9E6C_63D0_676A_9A99) ^ (g.settings_choices *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, g.settings_picking) *% 0x8A91_7F2B_4D3E_61C7) ^ (@as(u64, @intFromBool(g.inspect_source)) *% 0xF29C_511C_8E3D_45A7);
+    const sig = feedSignature(items, g.scroll.*, w, h) ^ (@as(u64, g.screen.*) *% 0x9E37_79B9_7F4A_7C15) ^ (socket_sig *% 0xD1B5_4A32_D192_ED03) ^ (@as(u64, g.settings_section) *% 0xC2B2_AE3D_27D4_EB4F) ^ (g.settings_toggles *% 0x9E6C_63D0_676A_9A99) ^ (g.settings_choices *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, g.settings_picking) *% 0x8A91_7F2B_4D3E_61C7) ^ (@as(u64, @intFromBool(g.inspect_source)) *% 0xF29C_511C_8E3D_45A7) ^ (@as(u64, @intFromBool(g.inspect_loading)) *% 0xBF58_476D_1CE4_E5B9);
     // A drag/settle animates the socket every frame (lift, reflow, ghost), so
     // bypass the feed cache while it runs — a brief interaction, and the field
     // already rebuilds every frame anyway.
@@ -4223,7 +4338,9 @@ fn paintFrameGpu(
             // The algorithm transparency page: a plain scrolling document (no rail),
             // rebuilt from the inspected config each entry (what you see = what runs).
             // Summary by default; the byte-exact serialized source on the tap-through.
-            if (g.inspect_bytes.len > 0) {
+            if (g.inspect_loading) {
+                g.content_h.* = feed_view.layoutAlgorithmLoading(gpa, g.engine, @intCast(design_w), g.draw, g.regions, g.accent, g.inspect_name) catch g.content_h.*;
+            } else if (g.inspect_bytes.len > 0) {
                 if (g.inspect_source) {
                     g.content_h.* = feed_view.layoutAlgorithmSource(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.inspect_name, g.inspect_ref, g.inspect_bytes) catch g.content_h.*;
                 } else {

@@ -2282,6 +2282,33 @@ pub fn layoutAlgorithmSource(
 /// i16 draw coords could otherwise wrap on a long source). A small negative slack.
 const scroll_guard_min: i32 = -64;
 
+/// The transparency page's LOADING state — shown while the config fetch runs on a
+/// worker thread, so the page opens instantly instead of freezing the UI on the
+/// network round-trip. Just the Back affordance + the algorithm's name + a quiet
+/// "Loading…" line. Pure; emits the `.back` region so a mistap can escape.
+pub fn layoutAlgorithmLoading(
+    gpa: Allocator,
+    e: *const text.Engine,
+    width: i32,
+    dl: *raster.DrawList,
+    regions: ?*Regions,
+    accent: u32,
+    name: []const u8,
+) error{OutOfMemory}!i32 {
+    _ = accent;
+    const m = metricsPage(width, screen_transparency);
+    const lx = m.lx;
+    if (regions) |rg| rg.clearRetainingCapacity();
+    const y: i32 = 80;
+    const back_w: i32 = 78;
+    try rect(gpa, dl, lx, y - 34, back_w, 30, 0x14EDEAE0, 9);
+    _ = try str(gpa, dl, e, .semibold, lx + 16, y - 13, ink, 14, "‹ Back");
+    try emitRegion(gpa, regions, lx, y - 34, back_w, 30, 0, .back);
+    _ = try str(gpa, dl, e, .semibold, lx, y + 36, ink, 38, name);
+    _ = try str(gpa, dl, e, .regular, lx, y + 78, muted, 16, "Loading...");
+    return 0;
+}
+
 pub fn layoutLoadout(
     gpa: Allocator,
     e: *const text.Engine,

@@ -44,6 +44,7 @@ const discover = @import("../core/discover.zig");
 const algorithm_core = @import("../core/algorithm.zig");
 const feed_core = @import("../core/feed.zig");
 const xrpc = @import("../core/xrpc.zig");
+const net = @import("xrpc.zig"); // the shell XRPC transport (unauthenticated reads)
 
 /// The published record (WRITE shape, `*Out` convention — `$type` set, no
 /// defaults): a named algorithm = its config + when it was published.
@@ -172,6 +173,34 @@ pub fn fetch(
     };
 }
 
+/// Fetch an algorithm's config by (repo, rkey) over an UNAUTHENTICATED public
+/// `getRecord` — a public repo read needs no session, so this can run on a WORKER
+/// THREAD without touching the shared, mutable `auth.Session` (that is what the
+/// marketplace "View details" fetch does, off the UI thread). Returns the
+/// validated config, or null on a failed/absent read (E4, the caller falls back).
+/// `pds_url` is the record's host; the SSRF guard is on (network content).
+/// DEFERRED SECURITY (Phase 12): bound the response size before parse — same note
+/// as `fetch` above; `parse` clips after std.json allocates.
+pub fn fetchPublic(
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    pds_url: []const u8,
+    repo: []const u8,
+    rkey: []const u8,
+) !?discover.FeedConfig {
+    const params = [_]xrpc.Param{
+        .{ .name = "repo", .value = repo },
+        .{ .name = "collection", .value = lexicon.collection.algorithm },
+        .{ .name = "rkey", .value = rkey },
+    };
+    const outcome = try net.query(arena, io, environ, pds_url, lexicon.method.get_record, &params, lexicon.GetRecordResponse(AlgorithmRecord), .{ .guard = .untrusted });
+    return switch (outcome) {
+        .ok => |r| algorithm_core.parse(arena, r.value.config) catch discover.DEFAULT_CONFIG,
+        .failed => null,
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Tests — the pure record↔config mapping is leak-checked (C6); the network
 // functions are forced through semantic analysis so they cannot rot.
@@ -214,4 +243,5 @@ test "publish/fetch compile and stay type-correct (network leg)" {
     // surprise at runtime.
     _ = &publish;
     _ = &fetch;
+    _ = &fetchPublic;
 }
