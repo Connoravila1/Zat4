@@ -36,6 +36,9 @@ const Allocator = std.mem.Allocator;
 const text = @import("text.zig");
 const raster = @import("raster.zig");
 const lens_socket = @import("lens_socket.zig");
+const create_flow = @import("create_flow.zig");
+const builder = @import("builder.zig");
+const discover = @import("discover.zig");
 const text_select = @import("text_select.zig");
 const timefmt = @import("timefmt.zig");
 const compose = @import("compose.zig");
@@ -146,7 +149,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save };
 
 /// The six top-level rail destinations, in order. The `Screen` index a nav
 /// region carries is an index into this. Shared by the rail (draw + hit) and
@@ -2499,6 +2502,137 @@ fn drawMarketplace(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, 
         y += card_h + gap;
     }
     return (y - scroll) + 20;
+}
+
+/// The state the Create flow renderer reads (the shell owns + drives it). Plain
+/// values; the config carries the live recap numbers. A7.2: cold — one per frame on
+/// the Create tab, never held in quantity. Waived.
+pub const CreateView = struct {
+    step: create_flow.Step,
+    answers: builder.Answers,
+    config: discover.FeedConfig,
+    name: []const u8,
+    color: u8, // chosen accent palette index (0..8)
+    naming: bool = false, // the name field has focus (draw a caret)
+};
+
+/// Render the simple-Create flow's CURRENT step into the Create tab (PURE draw over
+/// `view`; the shell owns the state + input). Emits a region for every tap target —
+/// option pick, knob steppers, colour swatches, back / continue / create — so the
+/// shell drives the flow entirely through `Action`s. Returns content height.
+pub fn layoutCreate(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawList, m: Metrics, height: i32, scroll: i32, regions: ?*Regions, accent: u32, view: CreateView) error{OutOfMemory}!i32 {
+    _ = height;
+    const x0 = m.lx;
+    const w = m.cw;
+    var y: i32 = 140 + scroll;
+
+    switch (view.step) {
+        .pace, .reach, .conversation, .privacy => {
+            const qi = @intFromEnum(view.step); // 0..3
+            const q = create_flow.questions[qi];
+            var buf: [24]u8 = undefined;
+            const step_lbl = std.fmt.bufPrint(&buf, "STEP {d} OF 4", .{qi + 1}) catch "";
+            _ = try str(gpa, dl, e, .semibold, x0, y + 14, faint, 12, step_lbl);
+            y += 34;
+            _ = try str(gpa, dl, e, .semibold, x0, y + 30, ink, 30, q.title);
+            y += 46;
+            _ = try str(gpa, dl, e, .regular, x0, y + 16, muted, 15, q.prompt);
+            y += 40;
+            const sel = create_flow.answerIndex(view.answers, view.step);
+            for (q.options, 0..) |opt, oi| {
+                const oh: i32 = 76;
+                const chosen = oi == sel;
+                try rect(gpa, dl, x0, y, w, oh, if (chosen) skinPanel(accent) else 0x0EEDEAE0, 14);
+                if (chosen) try rect(gpa, dl, x0, y, 4, oh, accent, 2); // accent spine
+                _ = try str(gpa, dl, e, .semibold, x0 + 22, y + 30, ink, 18, opt.label);
+                _ = try str(gpa, dl, e, .regular, x0 + 22, y + 54, muted, 14, opt.blurb);
+                try emitRegion(gpa, regions, x0, y, @intCast(w), @intCast(oh), @intCast(oi), .create_pick);
+                y += oh + 12;
+            }
+        },
+        .recap => {
+            _ = try str(gpa, dl, e, .semibold, x0, y + 30, ink, 30, "Fine-tune");
+            y += 44;
+            _ = try str(gpa, dl, e, .regular, x0, y + 16, muted, 15, "Adjust anything you like — this feed is just for you.");
+            y += 44;
+            for (std.enums.values(create_flow.Knob)) |k| {
+                const meta = create_flow.knobMeta(k);
+                const val = create_flow.knobValue(view.config, k);
+                _ = try str(gpa, dl, e, .semibold, x0, y + 14, ink, 16, meta.label);
+                var vb: [24]u8 = undefined;
+                const vs = std.fmt.bufPrint(&vb, "{d}", .{val}) catch "";
+                _ = try str(gpa, dl, e, .semibold, x0 + w - 60, y + 14, accent, 16, vs);
+                // − / + steppers, right-aligned above the bar.
+                const sb: i32 = 30;
+                const plus_x = x0 + w - sb;
+                const minus_x = plus_x - sb - 8;
+                try rect(gpa, dl, minus_x, y - 6, sb, sb, 0x14EDEAE0, 8);
+                _ = try str(gpa, dl, e, .semibold, minus_x + 11, y + 13, ink, 18, "-");
+                try emitRegion(gpa, regions, minus_x, y - 6, sb, sb, @intCast(@intFromEnum(k)), .create_knob_dec);
+                try rect(gpa, dl, plus_x, y - 6, sb, sb, 0x14EDEAE0, 8);
+                _ = try str(gpa, dl, e, .semibold, plus_x + 10, y + 13, ink, 18, "+");
+                try emitRegion(gpa, regions, plus_x, y - 6, sb, sb, @intCast(@intFromEnum(k)), .create_knob_inc);
+                y += 26;
+                _ = try str(gpa, dl, e, .regular, x0, y + 12, faint, 13, meta.hint);
+                y += 22;
+                // A slider bar showing the value's position in its range.
+                const bar_w = w - 80;
+                try rect(gpa, dl, x0, y, bar_w, 5, 0x18EDEAE0, 2);
+                const frac = if (meta.max > meta.min) (val - meta.min) / (meta.max - meta.min) else 0;
+                const fill: i32 = @intFromFloat(@as(f32, @floatFromInt(bar_w)) * std.math.clamp(frac, 0, 1));
+                try rect(gpa, dl, x0, y, fill, 5, accent, 2);
+                y += 26;
+            }
+            y += 8;
+            y = try createNav(gpa, e, dl, x0, y, w, regions, accent, "Continue", .create_next);
+        },
+        .name => {
+            _ = try str(gpa, dl, e, .semibold, x0, y + 30, ink, 30, "Name it");
+            y += 52;
+            // The name field (the shell owns the text edit; here we draw the box +
+            // the current text, and a caret when focused).
+            const fh: i32 = 48;
+            try rect(gpa, dl, x0, y, w, fh, 0x12EDEAE0, 12);
+            if (view.naming) try rect(gpa, dl, x0, y, w, fh, 0x00000000, 12);
+            const shown = if (view.name.len > 0) view.name else "My feed";
+            const nc = if (view.name.len > 0) ink else faint;
+            const pen = try str(gpa, dl, e, .semibold, x0 + 18, y + 31, nc, 18, shown);
+            if (view.naming) try rect(gpa, dl, pen + 2, y + 14, 2, 22, accent, 0);
+            // The field is implicitly focused on the name step (the shell routes
+            // keystrokes here), so there is no separate focus region to emit.
+            y += fh + 30;
+            // Accent picker: the 9 palette swatches; the chosen one ringed.
+            _ = try str(gpa, dl, e, .semibold, x0, y + 12, muted, 13, "ACCENT");
+            y += 28;
+            const sw: i32 = 34;
+            const sgap: i32 = 12;
+            for (lens_socket.palette, 0..) |col, ci| {
+                const cx = x0 + @as(i32, @intCast(ci)) * (sw + sgap);
+                if (ci == view.color) try rect(gpa, dl, cx - 3, y - 3, sw + 6, sw + 6, 0x40FFFFFF, 11);
+                try rect(gpa, dl, cx, y, sw, sw, col, 9);
+                try emitRegion(gpa, regions, cx, y, @intCast(sw), @intCast(sw), @intCast(ci), .create_color);
+            }
+            y += sw + 34;
+            y = try createNav(gpa, e, dl, x0, y, w, regions, accent, "Create feed", .create_save);
+        },
+    }
+    return (y - scroll) + 40;
+}
+
+/// The bottom nav row of a Create step: a "‹ Back" ghost + a filled primary button.
+fn createNav(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawList, x0: i32, y: i32, w: i32, regions: ?*Regions, accent: u32, primary: []const u8, primary_action: Action) error{OutOfMemory}!i32 {
+    const bh: i32 = 44;
+    const back_w: i32 = 96;
+    try rect(gpa, dl, x0, y, back_w, bh, 0x12EDEAE0, 11);
+    _ = try str(gpa, dl, e, .semibold, x0 + 24, y + 28, ink, 15, "‹ Back");
+    try emitRegion(gpa, regions, x0, y, @intCast(back_w), @intCast(bh), 0, .create_back);
+    const pw: i32 = 168;
+    const px = x0 + w - pw;
+    try rect(gpa, dl, px, y, pw, bh, accent, 11);
+    const tw: i32 = @intCast(text.measure(e, .semibold, primary, 15));
+    _ = try str(gpa, dl, e, .semibold, px + @divTrunc(pw - tw, 2), y + 28, 0xFF0B0B0F, 15, primary);
+    try emitRegion(gpa, regions, px, y, @intCast(pw), @intCast(bh), 0, primary_action);
+    return y + bh + 20;
 }
 
 /// A zone's icon-tile colour, derived deterministically from its tag so a zone
