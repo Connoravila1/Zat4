@@ -75,6 +75,9 @@ pub const DhKemX25519 = struct {
     pub const Nenc = 32;
     pub const Npk = 32;
     pub const Nsk = 32;
+    /// Encap-seed length — the entropy one encapsulation consumes. For DHKEM
+    /// it IS an ephemeral X25519 secret; hybrid KEMs need more (X-Wing: 64).
+    pub const Nes = 32;
     const sid: []const u8 = &("KEM".* ++ i2osp2(kem_id));
 
     /// One encapsulation: the shared secret and the enc to send.
@@ -107,7 +110,7 @@ pub const DhKemX25519 = struct {
 
     /// Encap with the ephemeral secret PASSED IN (entropy is the caller's,
     /// B3) — deterministic, which is exactly what the golden vectors need.
-    pub fn encapDeterministic(sk_e: [Nsk]u8, pk_r: [Npk]u8) KemError!Encapped {
+    pub fn encapDeterministic(sk_e: [Nes]u8, pk_r: [Npk]u8) KemError!Encapped {
         const dh = X25519.scalarmult(sk_e, pk_r) catch return error.InvalidPublicKey;
         const enc = X25519.recoverPublicKey(sk_e) catch return error.InvalidPublicKey;
         const kem_context: [64]u8 = enc ++ pk_r;
@@ -182,10 +185,12 @@ pub fn Suite(comptime Kem: type, comptime Aead: type) type {
             return ctx;
         }
 
-        /// Sender side, deterministic: the ephemeral KEM secret is passed in
-        /// (the shell rolls it fresh per setup and never reuses it).
-        pub fn setupBaseS(sk_e: [Kem.Nsk]u8, pk_r: [Kem.Npk]u8, info: []const u8) KemError!Sender {
-            const e = try Kem.encapDeterministic(sk_e, pk_r);
+        /// Sender side, deterministic: the encap seed (Kem.Nes bytes of the
+        /// caller's entropy — for DHKEM an ephemeral secret, for a hybrid KEM
+        /// its full randomness) is passed in, rolled fresh per setup and
+        /// never reused.
+        pub fn setupBaseS(es: [Kem.Nes]u8, pk_r: [Kem.Npk]u8, info: []const u8) KemError!Sender {
+            const e = try Kem.encapDeterministic(es, pk_r);
             return .{ .enc = e.enc, .ctx = keySchedule(e.shared, info) };
         }
 
