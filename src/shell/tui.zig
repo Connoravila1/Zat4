@@ -599,7 +599,13 @@ pub fn run(
     // The algorithm being inspected on the transparency page (screen_transparency):
     // its fetched config + name + ref (CID), rebuilt into a page each frame. The
     // screen to return to on Back. Config null ⇒ not inspecting.
-    var inspect_config: ?discover.FeedConfig = null;
+    // The inspected algorithm is held as its SERIALIZED bytes (gpa-owned, stable),
+    // NOT a parsed FeedConfig: a parsed config's `rules`/`vm_program` slices point
+    // into the per-frame arena, which is reset every frame — holding the struct
+    // across frames dangles those slices (a use-after-free that crashes validated()
+    // on any non-empty program). The render re-parses these bytes into the current
+    // frame's arena, and the source view IS these bytes.
+    var inspect_bytes: ?[]const u8 = null;
     var inspect_name: []const u8 = "";
     var inspect_ref: []const u8 = "";
     var transp_return_screen: u8 = feed_view.screen_loadout;
@@ -607,6 +613,7 @@ pub fn run(
     // (the "View the exact source" tap-through). Reset when a new algorithm opens.
     var gtransp_source = false;
     defer {
+        if (inspect_bytes) |b| gpa.free(b);
         if (inspect_name.len > 0) gpa.free(inspect_name);
         if (inspect_ref.len > 0) gpa.free(inspect_ref);
     }
@@ -1125,7 +1132,7 @@ pub fn run(
         var cur_socket_ui = if (on_thread_screen) reply_ui else if (on_zone_screen) zone_ui else gsocket_ui;
         cur_socket_ui.julia = julia_on;
         const cur_socket_hits = if (on_thread_screen) &reply_hits else if (on_zone_screen) &zone_hits else &gsocket_hits;
-        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .market = if (gscreen == feed_view.screen_loadout and gloadout_tab == 1) market_cards.items else &.{}, .inspect_config = inspect_config, .inspect_name = inspect_name, .inspect_ref = inspect_ref, .inspect_source = gtransp_source, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
+        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .market = if (gscreen == feed_view.screen_loadout and gloadout_tab == 1) market_cards.items else &.{}, .inspect_bytes = inspect_bytes orelse "", .inspect_name = inspect_name, .inspect_ref = inspect_ref, .inspect_source = gtransp_source, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
         switch (mode) {
             .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status),
             .compose => {
@@ -1833,7 +1840,8 @@ pub fn run(
                                                     gtransp_source = false;
                                                 } else {
                                                     gscreen = transp_return_screen;
-                                                    inspect_config = null;
+                                                    if (inspect_bytes) |b| gpa.free(b);
+                                                    inspect_bytes = null;
                                                 }
                                             } else {
                                                 gscreen = if (gscreen == feed_view.screen_zones) zone_return_screen else thread_return_screen;
@@ -1936,9 +1944,12 @@ pub fn run(
                                             if (cfg) |c| {
                                                 if (inspect_name.len > 0) gpa.free(inspect_name);
                                                 if (inspect_ref.len > 0) gpa.free(inspect_ref);
+                                                if (inspect_bytes) |b| gpa.free(b);
                                                 inspect_name = try gpa.dupe(u8, r.name);
                                                 inspect_ref = try gpa.dupe(u8, r.cid);
-                                                inspect_config = c;
+                                                // Serialize the fetched config to STABLE gpa bytes (c's
+                                                // slices point into the frame arena, valid only here).
+                                                inspect_bytes = try algorithm_core.serialize(gpa, c);
                                                 transp_return_screen = gscreen;
                                                 gscreen = feed_view.screen_transparency;
                                                 gtransp_source = false; // open on the summary
@@ -3067,7 +3078,9 @@ const Grid = struct {
     /// The transparency page's inspected algorithm (screen_transparency): its
     /// fetched config + name + ref (CID), rebuilt into a page each frame. Null
     /// config ⇒ not inspecting. Set per frame.
-    inspect_config: ?discover.FeedConfig = null,
+    /// The inspected algorithm's SERIALIZED bytes (stable; the render re-parses
+    /// them into the frame arena — see the run-loop note). Empty = not inspecting.
+    inspect_bytes: []const u8 = "",
     inspect_name: []const u8 = "",
     inspect_ref: []const u8 = "",
     /// On the transparency page: false = the summary, true = the byte-exact source.
@@ -3816,13 +3829,16 @@ fn paintFrame(
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
                 g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market) catch g.content_h.*; // software: draw line-art nav
             } else if (g.screen.* == feed_view.screen_transparency) {
-                if (g.inspect_config) |cfg| {
+                if (g.inspect_bytes.len > 0) {
                     if (g.inspect_source) {
-                        // The byte-exact source (what runs = validated config serialized).
-                        if (algorithm_core.serialize(arena, discover.validated(cfg)) catch null) |src|
-                            g.content_h.* = feed_view.layoutAlgorithmSource(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.inspect_name, g.inspect_ref, src) catch g.content_h.*;
-                    } else if (transparency.buildPage(arena, g.inspect_name, g.inspect_ref, cfg) catch null) |pg|
-                        g.content_h.* = feed_view.layoutTransparency(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, pg) catch g.content_h.*;
+                        // The byte-exact source IS the stored serialized config.
+                        g.content_h.* = feed_view.layoutAlgorithmSource(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.inspect_name, g.inspect_ref, g.inspect_bytes) catch g.content_h.*;
+                    } else {
+                        // Re-parse into THIS frame's arena (stable bytes → valid slices).
+                        const cfg = algorithm_core.parse(arena, g.inspect_bytes) catch discover.DEFAULT_CONFIG;
+                        if (transparency.buildPage(arena, g.inspect_name, g.inspect_ref, cfg) catch null) |pg|
+                            g.content_h.* = feed_view.layoutTransparency(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, pg) catch g.content_h.*;
+                    }
                 }
             } else {
                 // Tiling foundation (S.1): geometry comes through the partition
@@ -4207,12 +4223,14 @@ fn paintFrameGpu(
             // The algorithm transparency page: a plain scrolling document (no rail),
             // rebuilt from the inspected config each entry (what you see = what runs).
             // Summary by default; the byte-exact serialized source on the tap-through.
-            if (g.inspect_config) |cfg| {
+            if (g.inspect_bytes.len > 0) {
                 if (g.inspect_source) {
-                    if (algorithm_core.serialize(arena, discover.validated(cfg)) catch null) |src|
-                        g.content_h.* = feed_view.layoutAlgorithmSource(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.inspect_name, g.inspect_ref, src) catch g.content_h.*;
-                } else if (transparency.buildPage(arena, g.inspect_name, g.inspect_ref, cfg) catch null) |pg|
-                    g.content_h.* = feed_view.layoutTransparency(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, pg) catch g.content_h.*;
+                    g.content_h.* = feed_view.layoutAlgorithmSource(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.inspect_name, g.inspect_ref, g.inspect_bytes) catch g.content_h.*;
+                } else {
+                    const cfg = algorithm_core.parse(arena, g.inspect_bytes) catch discover.DEFAULT_CONFIG;
+                    if (transparency.buildPage(arena, g.inspect_name, g.inspect_ref, cfg) catch null) |pg|
+                        g.content_h.* = feed_view.layoutTransparency(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, pg) catch g.content_h.*;
+                }
             }
         } else {
             // skip_heart=true on every screen: the SDF heart pass (drawEngagementHearts,
