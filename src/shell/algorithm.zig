@@ -41,24 +41,32 @@ const Allocator = std.mem.Allocator;
 const auth = @import("auth.zig");
 const lexicon = @import("../core/lexicon.zig");
 const discover = @import("../core/discover.zig");
+const algorithm_core = @import("../core/algorithm.zig");
 const feed_core = @import("../core/feed.zig");
 const xrpc = @import("../core/xrpc.zig");
 
 /// The published record (WRITE shape, `*Out` convention — `$type` set, no
 /// defaults): a named algorithm = its config + when it was published.
+///
+/// `config` is the algorithm's SERIALIZED form (core/algorithm.serialize), NOT
+/// typed fields: the atproto data model forbids floating-point values in records
+/// (a PDS rejects `0.5` with InvalidRequest), and a FeedConfig is all `f32`
+/// weights. The serialized string is byte-exact and is itself the transparency
+/// artifact (the CID commits to it — invariant 5), so nesting it as a string is
+/// the atproto-legal shape, not a workaround that weakens transparency.
 /// A7.2: cold build target, size guard waived.
 const AlgorithmRecordOut = struct {
     @"$type": []const u8 = lexicon.collection.algorithm,
     name: []const u8,
-    config: discover.FeedConfig,
+    config: []const u8, // serialized FeedConfig (see above)
     createdAt: []const u8,
 };
 
-/// The READ shape (all defaulted — absent fields degrade to the default config,
-/// E4). A7.2: cold parse target, size guard waived.
+/// The READ shape (all defaulted — absent fields degrade to an empty config
+/// string, which `parse` maps to the default, E4). A7.2: cold parse target.
 const AlgorithmRecord = struct {
     name: []const u8 = "",
-    config: discover.FeedConfig = .{},
+    config: []const u8 = "", // serialized FeedConfig
     createdAt: []const u8 = "",
 };
 
@@ -93,7 +101,10 @@ pub fn publish(
     var ts_buf: [24]u8 = undefined;
     const record = AlgorithmRecordOut{
         .name = name,
-        .config = discover.validated(config),
+        // Serialize the VALIDATED config to its atproto-legal string form (no
+        // floats on the wire). `serialize` runs on the sanitized config so a NaN
+        // can never be published.
+        .config = try algorithm_core.serialize(arena, discover.validated(config)),
         .createdAt = feed_core.formatTimestamp(&ts_buf, now_epoch),
     };
     const input = lexicon.PutRecordInput(@TypeOf(record)){
@@ -154,7 +165,9 @@ pub fn fetch(
         lexicon.GetRecordResponse(AlgorithmRecord),
     );
     return switch (outcome) {
-        .ok => |r| discover.validated(r.value.config), // never trust the wire (D5)
+        // Parse the serialized config string; `parse` is depth-guarded, validated,
+        // and falls back to DEFAULT on malformed/hostile input (never trust the wire).
+        .ok => |r| try algorithm_core.parse(arena, r.value.config),
         .failed => null,
     };
 }
@@ -164,7 +177,7 @@ pub fn fetch(
 // functions are forced through semantic analysis so they cannot rot.
 // ---------------------------------------------------------------------------
 
-test "algorithm record embeds the config and round-trips through the put/get JSON shape" {
+test "algorithm record carries the SERIALIZED config (no floats on the wire) and round-trips" {
     const t = std.testing;
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
@@ -175,14 +188,22 @@ test "algorithm record embeds the config and round-trips through the put/get JSO
     cfg.velocity_boost = false;
     cfg.query.source_mix = 0.2;
 
-    const out = AlgorithmRecordOut{ .name = "My Feed", .config = cfg, .createdAt = "2026-06-30T00:00:00Z" };
+    // The record carries the config as its serialized string — atproto forbids
+    // floats in records, so the whole (float-bearing) config rides as one string.
+    const out = AlgorithmRecordOut{ .name = "My Feed", .config = try algorithm_core.serialize(arena, cfg), .createdAt = "2026-06-30T00:00:00Z" };
     const json = try std.json.Stringify.valueAlloc(arena, out, .{ .emit_null_optional_fields = false });
-    const back = try std.json.parseFromSliceLeaky(AlgorithmRecord, arena, json, .{ .ignore_unknown_fields = true });
 
+    // The record's JSON must contain NO bare float — every number is inside the
+    // quoted config string, so the PDS's "no floats" rule is satisfied. (A crude
+    // but effective check: the top-level shape has name/config/createdAt strings.)
+    const back = try std.json.parseFromSliceLeaky(AlgorithmRecord, arena, json, .{ .ignore_unknown_fields = true });
     try t.expectEqualStrings("My Feed", back.name);
-    try t.expectEqual(@as(f32, 33.0), back.config.w_reply);
-    try t.expectEqual(false, back.config.velocity_boost);
-    try t.expectEqual(@as(f32, 0.2), back.config.query.source_mix);
+
+    // The serialized config parses back to the same values (byte-exact transparency).
+    const parsed = try algorithm_core.parse(arena, back.config);
+    try t.expectEqual(@as(f32, 33.0), parsed.w_reply);
+    try t.expectEqual(false, parsed.velocity_boost);
+    try t.expectEqual(@as(f32, 0.2), parsed.query.source_mix);
     // The $type marks it as an algorithm record in the repo.
     try t.expect(std.mem.indexOf(u8, json, lexicon.collection.algorithm) != null);
 }

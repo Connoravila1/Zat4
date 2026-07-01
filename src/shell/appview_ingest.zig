@@ -45,6 +45,7 @@ const jetstream = @import("../core/jetstream.zig");
 const lexicon = @import("../core/lexicon.zig");
 const jsonguard = @import("../core/jsonguard.zig");
 const discover = @import("../core/discover.zig");
+const algorithm = @import("../core/algorithm.zig");
 
 /// What a single event did to the index — returned so the pump (and tests)
 /// can count without re-inspecting the index. Plain enum, no payload.
@@ -127,14 +128,15 @@ pub fn ingestEvent(gpa: Allocator, arena: Allocator, idx: *appview.Index, event_
             .ignore_unknown_fields = true,
         }) catch return .ignored;
         const arec = (parsed.commit orelse return .ignored).record;
+        // Decode the serialized config string (validated + fallback inside parse —
+        // never trust the wire, D5/E4). OOM is the only propagating case.
+        const cfg = algorithm.parse(arena, arec.config) catch discover.DEFAULT_CONFIG;
         _ = try appview.indexAlgorithm(gpa, idx, .{
             .cid = commit.cid,
             .author_did = ev.did,
             .rkey = commit.rkey,
             .name = arec.name,
-            // Never trust the wire — the label the index derives must be over a
-            // safe config (D5/E4), the same posture as a client-side fetch.
-            .config = discover.validated(arec.config),
+            .config = cfg,
         });
         return .algorithm;
     }
@@ -153,7 +155,7 @@ const AlgoCommit = struct {
 /// A7.2: cold struct, size guard waived — transient parse target.
 const AlgoRecordFlat = struct {
     name: []const u8 = "",
-    config: discover.FeedConfig = .{},
+    config: []const u8 = "", // serialized FeedConfig string (atproto: no floats)
 };
 
 // --- minimal graph-event wire shapes (transient parse targets, A7.2) ------
@@ -352,10 +354,14 @@ test "ingest: a published algorithm record lands in the marketplace with a deriv
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // An adaptive algorithm (behavioral_weight non-zero ⇒ provably learns).
-    const ev =
-        \\{"did":"did:plc:alice","time_us":1,"kind":"commit","commit":{"operation":"create","collection":"app.zat4.feed.algorithm","rkey":"myfeed","cid":"bafyalg1","record":{"$type":"app.zat4.feed.algorithm","name":"Alice's Feed","config":{"behavioral_weight":1.0},"createdAt":"2026-06-30T00:00:00Z"}}}
-    ;
+    // An adaptive algorithm (behavioral_weight non-zero ⇒ provably learns). The
+    // config rides as a serialized STRING (atproto forbids floats), so build the
+    // event with the serialized config JSON-escaped into the `config` field.
+    var adaptive = discover.DEFAULT_CONFIG;
+    adaptive.behavioral_weight = 1.0;
+    const cfg_str = try algorithm.serialize(arena, adaptive);
+    const cfg_json = try std.json.Stringify.valueAlloc(arena, cfg_str, .{}); // "\"…escaped…\""
+    const ev = try std.fmt.allocPrint(arena, "{{\"did\":\"did:plc:alice\",\"time_us\":1,\"kind\":\"commit\",\"commit\":{{\"operation\":\"create\",\"collection\":\"app.zat4.feed.algorithm\",\"rkey\":\"myfeed\",\"cid\":\"bafyalg1\",\"record\":{{\"$type\":\"app.zat4.feed.algorithm\",\"name\":\"Alice's Feed\",\"config\":{s},\"createdAt\":\"2026-06-30T00:00:00Z\"}}}}}}", .{cfg_json});
     try testing.expectEqual(Reduced.algorithm, try ingestEvent(gpa, arena, &idx, ev));
 
     const rows = try appview.listAlgorithms(arena, &idx, 50);

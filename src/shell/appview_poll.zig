@@ -39,6 +39,7 @@ const lexicon = @import("../core/lexicon.zig");
 const feed = @import("../core/feed.zig");
 const appview = @import("../core/appview.zig");
 const discover = @import("../core/discover.zig");
+const algorithm = @import("../core/algorithm.zig");
 const record_check = @import("../core/record_check.zig");
 const serve = @import("appview_serve.zig");
 const store = @import("appview_store.zig");
@@ -54,9 +55,11 @@ const RefValue = struct { subject: SubjectRef = .{} };
 /// An `app.zat4.actor.profile` record's value — the display name (avatar is a
 /// blob, deferred). A7.2: cold transient parse target.
 const ProfileValue = struct { displayName: []const u8 = "" };
-/// An `app.zat4.feed.algorithm` record's value — the published name + config.
-/// A7.2: cold transient parse target (decomposed into the pooled hot Algorithm).
-const AlgorithmValue = struct { name: []const u8 = "", config: discover.FeedConfig = .{} };
+/// An `app.zat4.feed.algorithm` record's value — the published name + the
+/// SERIALIZED config string (atproto forbids floats in records, so the config
+/// rides as one string; `algorithm.parse` decodes it). A7.2: cold transient
+/// parse target (decomposed into the pooled hot Algorithm).
+const AlgorithmValue = struct { name: []const u8 = "", config: []const u8 = "" };
 
 /// One `listRecords` entry over a record value of type `Value`.
 fn Rec(comptime Value: type) type {
@@ -341,12 +344,15 @@ pub fn pollRepo(
             if (record_check.isBad(vr, r.cid)) continue; // CID failed verification → reject
             // Cap + UTF-8-validate the name before it crosses into the core.
             if (!record_check.textWithinLimits(r.value.name, record_check.max_display_name)) continue;
+            // Decode the serialized config (validated + fallback-on-malformed inside
+            // parse — never trust the wire, D5). OOM is the only propagating case.
+            const cfg = algorithm.parse(arena, r.value.config) catch discover.DEFAULT_CONFIG;
             _ = appview.indexAlgorithm(gpa, idx, .{
                 .cid = r.cid,
                 .author_did = did,
                 .rkey = rkeyFromUri(r.uri),
                 .name = r.value.name,
-                .config = discover.validated(r.value.config), // never trust the wire (D5)
+                .config = cfg,
             }) catch false;
         }
     }
