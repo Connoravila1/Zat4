@@ -2340,6 +2340,19 @@ pub fn run(
             // terminal has no pixel cells), so gated on an engine.
             if (engine != null) if (decoded.event == .char) {
                 const zc = decoded.event.char;
+                // The Create name field: route typing into the feed-name buffer (ASCII
+                // for now — a zone/feed name is short). Backspace via BS/DEL. Consumes
+                // the key so it never falls through to zoom or the feed shortcuts.
+                if (gscreen == feed_view.screen_loadout and gloadout_tab == 2 and gcreate_step == .name) {
+                    if ((zc == 8 or zc == 127)) {
+                        if (gcreate_name_len > 0) gcreate_name_len -= 1;
+                    } else if (zc >= 0x20 and zc < 0x7f and gcreate_name_len < gcreate_name_buf.len) {
+                        gcreate_name_buf[gcreate_name_len] = @intCast(zc);
+                        gcreate_name_len += 1;
+                    }
+                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status);
+                    continue;
+                }
                 if (zc == '+' or zc == '=') {
                     gzoom = std.math.clamp(gzoom + 0.15, zoom_min, zoom_max);
                     status = "zoom in";
