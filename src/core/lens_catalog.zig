@@ -252,8 +252,11 @@ pub const default_zone_seated: u32 = 0;
 /// (the no-scoring Following / Most Recent) reads no behavioral data. `is_default`
 /// is editorial (which lenses ship seated), not a privacy claim, so it stays.
 fn derivedFlags(b: Builtin) lens_socket.LensFlags {
-    const uses_behavioral = if (b.config) |c| transparency.classify(c).uses_behavioral else false;
-    return .{ .learns = uses_behavioral, .is_default = b.flags.is_default };
+    // Both socket bits are PROVEN from the config (invariant 6), never claimed:
+    // `behavioral` = reads your attention (the privacy bit), `learns` = keeps an
+    // on-device model (the adaptive bit). A no-config lens (Following) does neither.
+    const c: transparency.Classification = if (b.config) |cfg| transparency.classify(cfg) else .{ .uses_behavioral = false, .learns = false, .state_budget_bytes = 0 };
+    return .{ .behavioral = c.uses_behavioral, .learns = c.learns, .is_default = b.flags.is_default };
 }
 
 /// Build a `TrayView` (mutable cards + the text blob their spans point into)
@@ -377,17 +380,19 @@ test "default feed loadout: three named lenses, seated id resolves, colors are t
     defer t.allocator.free(cards);
     defer t.allocator.free(blob);
     try t.expectEqual(@as(usize, 3), cards.len);
-    // The seated default is Zat4 Discover, amber, learns-on-device.
+    // The seated default is Zat4 Discover, amber — it reads attention (behavioral)
+    // AND keeps an on-device model (adaptive); both bits PROVEN from the config.
     const seat = cards[default_feed_seated];
     try t.expectEqualStrings("Zat4 Discover", blob[seat.name.off..][0..seat.name.len]);
     try t.expectEqualStrings("zat4:discover", blob[seat.cid.off..][0..seat.cid.len]);
     try t.expectEqual(@as(u8, 0), seat.color);
+    try t.expect(seat.flags.behavioral);
     try t.expect(seat.flags.learns);
-    // Following is grey + not learning (nothing shaping you).
+    // Following is grey + neither behavioral nor adaptive (nothing shaping you).
     try t.expectEqualStrings("Following", blob[cards[1].name.off..][0..cards[1].name.len]);
     try t.expectEqual(@as(u8, 2), cards[1].color);
-    try t.expect(!cards[1].flags.learns);
-    // Private Discover is blue + no behavioral data.
+    try t.expect(!cards[1].flags.behavioral and !cards[1].flags.learns);
+    // Private Discover is blue — no behavioral data, and it keeps no model.
     try t.expectEqual(@as(u8, 1), cards[2].color);
-    try t.expect(!cards[2].flags.learns);
+    try t.expect(!cards[2].flags.behavioral and !cards[2].flags.learns);
 }

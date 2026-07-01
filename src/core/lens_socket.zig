@@ -121,9 +121,10 @@ pub const TextSpan = struct {
 /// label; it is never self-declared. `packed struct(u8)` is its own size
 /// contract (the guard gate accepts packed backings).
 pub const LensFlags = packed struct(u8) {
-    learns: bool = false, // local on-device learning (vs. no behavioral data)
+    behavioral: bool = false, // reads your on-device ATTENTION data (the privacy bit)
+    learns: bool = false, // keeps a cross-session on-device model (the ADAPTIVE bit)
     is_default: bool = false, // a first-party default lens (Following / Discover)
-    _rest: u6 = 0,
+    _rest: u5 = 0,
 };
 
 /// The hot per-lens record — a user may own up to 9 (the cap), iterated
@@ -276,15 +277,23 @@ fn span(tray: TrayView, s: TextSpan) []const u8 {
     return tray.text[s.off..end];
 }
 
-/// The privacy class is system-derived (invariant 6), never self-declared.
+/// The privacy class is system-derived (invariant 6), never self-declared. It keys
+/// off `behavioral` — whether the algorithm reads your attention — NOT `learns`
+/// (which is the separate adaptive/keeps-a-model bit, shown alongside).
 fn privLabel(f: LensFlags) []const u8 {
-    return if (f.learns) "learns" else "private";
+    return if (f.behavioral) "uses attention" else "private";
 }
 fn behaveLabel(f: LensFlags) []const u8 {
-    return if (f.learns) "local-learning" else "no behavioral data";
+    return if (f.behavioral) "uses attention" else "no behavioral data";
 }
 fn privColor(f: LensFlags) u32 {
-    return if (f.learns) priv_learn else priv_clean;
+    return if (f.behavioral) priv_learn else priv_clean;
+}
+/// The adaptive-status marker (the socket's SECOND derived bit): whether the
+/// algorithm keeps an on-device model that changes with you. Empty when static,
+/// so a plain feed carries no marker (no clutter) and only an adaptive one is tagged.
+fn adaptiveMark(f: LensFlags) []const u8 {
+    return if (f.learns) "adaptive" else "";
 }
 
 /// A soft (alpha-reduced) variant of a palette color — the cartridge wash
@@ -545,7 +554,14 @@ pub fn build(
     const meta_px: u16 = @intCast(@max(1, fxi(11.5 * sc)));
     const name_s = if (have) span(tray, seat.name) else "no lens";
     _ = try str(gpa, dl, e, .semibold, txt_x, cart_y + fxi(22 * sc), alphaScale(ink, a), name_px, name_s);
-    _ = try str(gpa, dl, e, .regular, txt_x, cart_y + fxi(38 * sc), alphaScale(muted, a), meta_px, behaveLabel(seat.flags));
+    // The two derived bits: the privacy label, then — separated by a dot — the
+    // adaptive marker when the lens keeps a model (nothing when it's static).
+    const meta_y = cart_y + fxi(38 * sc);
+    const priv_pen = try str(gpa, dl, e, .regular, txt_x, meta_y, alphaScale(muted, a), meta_px, behaveLabel(seat.flags));
+    if (have and seat.flags.learns) {
+        const dot_pen = try str(gpa, dl, e, .regular, priv_pen + fxi(6 * sc), meta_y, alphaScale(faint, a), meta_px, "·");
+        _ = try str(gpa, dl, e, .regular, dot_pen + fxi(6 * sc), meta_y, alphaScale(privColor(seat.flags), a), meta_px, adaptiveMark(seat.flags));
+    }
 
     // "N in tray" + chevron, right-aligned in the reserved strip
     const count_px: u16 = @intCast(@max(1, fxi(12 * sc)));
@@ -852,7 +868,11 @@ pub fn build(
         var fx = try str(gpa, dl, e, .regular, dx, py + fxi(70 * sc), muted, fact_px, "ranks ");
         fx = try str(gpa, dl, e, .semibold, fx, py + fxi(70 * sc), ink, fact_px, span(tray, card.ranks));
         fx = try str(gpa, dl, e, .regular, fx + fxi(14 * sc), py + fxi(70 * sc), muted, fact_px, "privacy ");
-        fx = try str(gpa, dl, e, .semibold, fx, py + fxi(70 * sc), ink, fact_px, if (card.flags.learns) "local-learning" else "no behavioral data");
+        fx = try str(gpa, dl, e, .semibold, fx, py + fxi(70 * sc), ink, fact_px, behaveLabel(card.flags));
+        if (card.flags.learns) {
+            fx = try str(gpa, dl, e, .regular, fx + fxi(10 * sc), py + fxi(70 * sc), faint, fact_px, "· ");
+            fx = try str(gpa, dl, e, .semibold, fx, py + fxi(70 * sc), privColor(card.flags), fact_px, adaptiveMark(card.flags));
+        }
         var cb: [40]u8 = undefined;
         const cid_s = std.fmt.bufPrint(&cb, "cid {s}", .{span(tray, card.cid)}) catch "cid";
         _ = try str(gpa, dl, e, .regular, dx, py + fxi(90 * sc), faint, fact_px, cid_s);
@@ -945,9 +965,9 @@ fn buildSampleTray(arena: Allocator) !TrayView {
     var blob: std.ArrayListUnmanaged(u8) = .empty;
     const Spec = struct { name: []const u8, author: []const u8, ranks: []const u8, desc: []const u8, cid: []const u8, color: u8, flags: LensFlags };
     const specs = [_]Spec{
-        .{ .name = "For You", .author = "zat4 default", .ranks = "engagement + recency", .desc = "The adaptive default.", .cid = "bafy7x2a", .color = 0, .flags = .{ .learns = true, .is_default = true } },
+        .{ .name = "For You", .author = "zat4 default", .ranks = "engagement + recency", .desc = "The adaptive default.", .cid = "bafy7x2a", .color = 0, .flags = .{ .behavioral = true, .learns = true, .is_default = true } },
         .{ .name = "Following", .author = "zat4 default", .ranks = "chronological", .desc = "Reverse-chron of your follows.", .cid = "bafy0c11", .color = 2, .flags = .{ .is_default = true } },
-        .{ .name = "Discover", .author = "zat4 default", .ranks = "popularity + topics", .desc = "Strong posts beyond your follows.", .cid = "bafy9f3d", .color = 1, .flags = .{ .learns = true } },
+        .{ .name = "Discover", .author = "zat4 default", .ranks = "popularity + topics", .desc = "Strong posts beyond your follows.", .cid = "bafy9f3d", .color = 1, .flags = .{ .behavioral = true, .learns = true } },
     };
     var cards = try arena.alloc(LensCard, specs.len);
     for (specs, 0..) |s, i| {
