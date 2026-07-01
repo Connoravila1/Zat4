@@ -212,10 +212,17 @@ test "algorithm record carries the SERIALIZED config (no floats on the wire) and
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    const retrieval = @import("../core/retrieval.zig");
     var cfg = discover.DEFAULT_CONFIG;
     cfg.w_reply = 33.0;
     cfg.velocity_boost = false;
     cfg.query.source_mix = 0.2;
+    // A Phase-0 retrieval query rides with the config too (it IS part of the algorithm).
+    const srcs = [_]retrieval.Source{
+        .{ .kind = .follows, .weight = 2.0 },
+        .{ .kind = .trending, .weight = 0.5, .threshold = 100 },
+    };
+    cfg.query.sources = &srcs;
 
     // The record carries the config as its serialized string — atproto forbids
     // floats in records, so the whole (float-bearing) config rides as one string.
@@ -233,6 +240,12 @@ test "algorithm record carries the SERIALIZED config (no floats on the wire) and
     try t.expectEqual(@as(f32, 33.0), parsed.w_reply);
     try t.expectEqual(false, parsed.velocity_boost);
     try t.expectEqual(@as(f32, 0.2), parsed.query.source_mix);
+    // The retrieval sources survive the round-trip intact (kind + weight + threshold).
+    try t.expectEqual(@as(usize, 2), parsed.query.sources.len);
+    try t.expectEqual(retrieval.SourceKind.follows, parsed.query.sources[0].kind);
+    try t.expectEqual(@as(f32, 2.0), parsed.query.sources[0].weight);
+    try t.expectEqual(retrieval.SourceKind.trending, parsed.query.sources[1].kind);
+    try t.expectEqual(@as(f32, 100), parsed.query.sources[1].threshold);
     // The $type marks it as an algorithm record in the repo.
     try t.expect(std.mem.indexOf(u8, json, lexicon.collection.algorithm) != null);
 }

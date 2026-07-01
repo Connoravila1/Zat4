@@ -55,6 +55,7 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const rules_mod = @import("rules.zig");
 const algo_vm = @import("algo_vm.zig");
+const retrieval = @import("retrieval.zig");
 
 // ---------------------------------------------------------------------------
 // The candidate — the hot record the scorer consumes (Phase D1)
@@ -174,6 +175,16 @@ pub const Query = struct {
     max_candidates: u32 = 500,
     /// Hard recency window in hours; 0 = no window (E4).
     recency_window_hrs: u32 = 0,
+
+    /// PHASE 0 — the creator's authored RETRIEVAL: a list of source operators
+    /// (`core/retrieval.zig`) that shape the candidate POOL — which posts are in,
+    /// and how strongly each source weights them. Empty by default (a config with
+    /// no retrieval query pulls the whole available pool — backward compatible),
+    /// so this is inert for every existing config. The host runs each source over
+    /// its indexes; the author never touches the network (D2), so — like the L2
+    /// rules and the L3 VM — nothing invasive is expressible. Travels with the
+    /// config record (it IS part of the algorithm); borrows the caller's memory.
+    sources: []const retrieval.Source = &.{},
 };
 
 /// The algorithm. Plain data (A1), loaded once per feed selection and never in
@@ -282,6 +293,12 @@ pub const state_budget_hard_cap: u32 = 10 << 20;
 /// more is malformed input, clipped to a safe length rather than rejected (E4).
 pub const max_rules: usize = 64;
 
+/// The hard ceiling on how many retrieval SOURCES one algorithm's query may carry.
+/// The scorer tests `candidates × sources`, so an unbounded source-list in a shared
+/// (untrusted) config is a CPU-DoS dial — `validated` clips it. 32 is far more than
+/// a composed retrieval query needs (a handful of sources shapes any pool).
+pub const max_sources: usize = 32;
+
 /// The hard ceiling on how many candidates one refresh may pull in to rank. The
 /// scorer runs `candidates × (rules + program ops)`, so an unbounded
 /// `max_candidates` in a shared (untrusted) config is the one remaining CPU/
@@ -386,7 +403,18 @@ pub fn score(arena: Allocator, cands: *const Candidates, config: FeedConfig, now
     var i: usize = 0;
     while (i < n) : (i += 1) {
         const c = cands.list.get(i);
-        var s = scoreRow(c, config, now);
+        const in_net = cands.in_network.isSet(i);
+        // RETRIEVAL (Phase 0): the config's candidate query shapes the POOL. Each
+        // source pulls in matching candidates with a weight; a candidate matched by
+        // NO source was never "retrieved" and is dropped here. An empty query pulls
+        // the whole available pool at weight 1 (backward compatible). The scorer
+        // then multiplies the base score by the retrieval weight, so a post pulled
+        // by several sources surfaces stronger.
+        const pool_w: f32 = retrieval.poolWeight(config.query.sources, .{
+            .in_network = in_net,
+            .engagement = c.like_count + c.repost_count + c.reply_count,
+        }) orelse continue; // matched no source ⇒ not in the pool
+        var s = scoreRow(c, config, now) * @as(f64, pool_w);
         // The creator's authored logic, in two composable layers over the same
         // public facts: the Level-2 rule-list (which may EXCLUDE a candidate),
         // then the Level-3 expression VM (an arbitrary scoring formula, fed the
@@ -395,7 +423,7 @@ pub fn score(arena: Allocator, cands: *const Candidates, config: FeedConfig, now
         // nothing otherwise. Moderation/diversity (D4) still run AFTER on the
         // result — no authored layer can resurface what moderation hides.
         if (config.rules.len > 0 or config.vm_program.len > 0) {
-            const facts = factsOf(c, cands.in_network.isSet(i), now);
+            const facts = factsOf(c, in_net, now);
             if (config.rules.len > 0) {
                 s = rules_mod.apply(config.rules, facts, s) orelse continue; // a rule excluded it
             }
@@ -538,6 +566,11 @@ pub fn validated(c: FeedConfig) FeedConfig {
     // pure and total. Extra rules never run and, because serialize() validates
     // first, never survive a round trip either.
     if (v.rules.len > max_rules) v.rules = v.rules[0..max_rules];
+    // Clip a hostile/oversized retrieval source-list to its cap (the scorer runs
+    // `candidates × sources`, so an unbounded list is a CPU-DoS dial). Per-source
+    // weights/thresholds need no clamp — `retrieval.poolWeight` ignores non-finite
+    // / negative weights defensively, so a bad value is already a safe no-op.
+    if (v.query.sources.len > max_sources) v.query.sources = v.query.sources[0..max_sources];
     // Reject a malformed or oversized Level-3 program to a safe no-op (the
     // expression VM). `validatedProgram` keeps a well-formed, within-cap program
     // and discards the rest — fail-safe, never partially executed (E2/E4).
@@ -756,6 +789,54 @@ test "score: an exclude rule removes candidates from the ranked pool" {
     const order = try score(arena, &c, cfg, test_now);
     try t.expectEqual(@as(usize, 1), order.len); // two excluded
     try t.expectEqual(@as(u32, 2), order[0].raw()); // only the in-network post survives
+}
+
+test "score: a retrieval query shapes the POOL — a `follows` source drops out-of-network posts" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var c: Candidates = .{};
+    defer c.deinit(t.allocator);
+    try c.append(t.allocator, mk(1, 3600, 50), false); // out-of-network
+    try c.append(t.allocator, mk(2, 3600, 30), true); // in-network
+    try c.append(t.allocator, mk(3, 3600, 10), false); // out-of-network
+
+    // "Pull only from the people I follow" — a retrieval query, not a rule.
+    const srcs = [_]retrieval.Source{.{ .kind = .follows }};
+    var cfg = DEFAULT_CONFIG;
+    cfg.query.sources = &srcs;
+
+    const order = try score(arena, &c, cfg, test_now);
+    try t.expectEqual(@as(usize, 1), order.len); // only the in-network post was retrieved
+    try t.expectEqual(@as(u32, 2), order[0].raw());
+}
+
+test "score: a source WEIGHT lifts its pool — heavily-weighted follows beats a more-engaged discovery post" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var c: Candidates = .{};
+    defer c.deinit(t.allocator);
+    // Same age. By engagement alone the out-of-network post (100) beats the
+    // in-network one (40).
+    try c.append(t.allocator, mk(1, 3600, 100), false); // out-of-network, high engagement
+    try c.append(t.allocator, mk(2, 3600, 40), true); // in-network, lower engagement
+
+    // A query that heavily weights your follows pulls the in-network post above.
+    const srcs = [_]retrieval.Source{
+        .{ .kind = .follows, .weight = 10.0 },
+        .{ .kind = .discovery, .weight = 1.0 },
+    };
+    var cfg = DEFAULT_CONFIG;
+    cfg.query.sources = &srcs;
+
+    const order = try score(arena, &c, cfg, test_now);
+    try t.expectEqual(@as(usize, 2), order.len); // both retrieved (a source matches each)
+    try t.expectEqual(@as(u32, 2), order[0].raw()); // the follows-weighted post now leads
 }
 
 test "scoreRow: the cold-start floor lets a zero-engagement fresh post score above 0" {

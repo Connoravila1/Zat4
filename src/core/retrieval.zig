@@ -1,0 +1,180 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//
+// Zat4 — a social-media client built on the AT Protocol.
+// Copyright (C) 2026  Connor Avila
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published
+// by the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+//! B1 classification: CORE (pure). **DISCOVER Phase 0 — the retrieval query.**
+//!
+//! Feed quality lives in RETRIEVAL — *which* posts enter the candidate pool —
+//! far more than in the ranking formula. The config tiers so far let a creator
+//! re-rank an engine-chosen pool; this module lets them shape the POOL: a small,
+//! composable set of SOURCE operators ("where do candidates come from") that the
+//! creator picks and weights. The HOST runs each source over its indexes, so the
+//! creator shapes the pool without ever touching the network (D2 discipline) —
+//! nothing invasive is expressible, exactly like the L2 rule / L3 VM vocabularies.
+//!
+//! This is the shared foundation for two tiers at once: it IS the easy-tier menu
+//! (a config field a friendly builder fills), AND it defines the exact retrieval
+//! CAPABILITIES the future guest VM will call (`GUEST_TIER_ROADMAP.md`, Phase 0).
+//!
+//! Decoupling (the `rules.zig` pattern): this module knows nothing about
+//! `discover.Candidate` or the store. The caller fills a plain `Facts` per
+//! candidate from its own indexes and asks a pure question; the module answers
+//! with a pool weight (or "not retrieved"). Same input ⇒ same output, no I/O.
+
+const std = @import("std");
+const assert = std.debug.assert;
+
+/// The source-operator vocabulary — the composable "where do candidates come
+/// from" ingredients a creator picks. FIXED, like the rule/VM vocabularies. The
+/// host runs each source over its own indexes; the creator only names and weights
+/// them, so nothing invasive (no network, no raw traversal) is expressible.
+///
+/// Slice-1 sources read only in-network + engagement facts (cheap, no index
+/// plumbing). The index-backed sources — `tag_scope`, `graph_walk(hops)`,
+/// `network_split`, `similar_to` — attach here as the AppView index becomes
+/// parameterizable (each needs a new `Facts` field + host support); adding one is
+/// a deliberate act, guarded below.
+pub const SourceKind = enum(u8) {
+    all, // every available candidate — the baseline pool
+    follows, // in-network: from accounts the viewer follows
+    discovery, // out-of-network: beyond the follow graph (the discovery pool)
+    trending, // engagement ≥ threshold — viral, regardless of network
+
+    comptime {
+        // Vocabulary guard: exactly these four in slice 1. Widening retrieval is a
+        // deliberate decision (a new source usually needs a new Fact + a host
+        // index) — bump this on purpose, mirroring `algo_vm.Fact`'s count guard.
+        assert(@typeInfo(SourceKind).@"enum".fields.len == 4);
+    }
+};
+
+/// One source in a retrieval query: which operator, how strongly it weights the
+/// candidates it pulls in, and a kind-specific numeric threshold. HOT — iterated
+/// `candidates × sources` in the scorer — so it carries an exact size guard (A7).
+pub const Source = struct {
+    kind: SourceKind,
+    weight: f32 = 1.0, // relative contribution of this source's posts to the pool
+    threshold: f32 = 0, // kind-specific: `trending` = minimum engagement; else unused
+
+    comptime {
+        // Budget 12: two f32 (8) + the enum tag (1), padded to the f32's 4-byte
+        // alignment. Exact. `weight` and `threshold` are both earned (the two
+        // knobs a source needs); the tag rides in the padding.
+        assert(@sizeOf(Source) == 12);
+    }
+};
+
+/// The per-candidate facts a source reads — a plain value the CALLER fills from
+/// its own store (DECOUPLED from `discover.Candidate`, exactly like `rules.Facts`,
+/// so this module never depends on the candidate layout or the index). Slice-1
+/// sources need only these two; richer sources add facts when they land.
+/// A7.2: cold — one is built per candidate at the call site and passed by value.
+pub const Facts = struct {
+    in_network: bool,
+    engagement: u32, // like + repost + reply
+};
+
+/// Does this source pull in the candidate? Pure, total.
+pub fn includes(s: Source, f: Facts) bool {
+    return switch (s.kind) {
+        .all => true,
+        .follows => f.in_network,
+        .discovery => !f.in_network,
+        .trending => @as(f64, @floatFromInt(f.engagement)) >= s.threshold,
+    };
+}
+
+/// The retrieval weight for a candidate under a source list:
+///   - `null`  → NOT retrieved (matched no source) — the caller drops it from the pool.
+///   - `w`     → in the pool; `w` is the SUMMED weight of the matching sources, so a
+///     post pulled by several sources (e.g. in-network AND trending) surfaces
+///     stronger. The scorer multiplies the base score by this.
+///
+/// An EMPTY source list = the whole available pool at weight 1.0, so a config with
+/// no retrieval query behaves exactly as before — backward compatible (F5). Pure,
+/// total, no allocation. DEFENSIVE: a non-finite or non-positive weight is ignored
+/// (it can never poison the pool weight with NaN/Inf or a negative), so a shared,
+/// untrusted query is safe to run with no separate validation pass — same posture
+/// as `rules.apply`.
+pub fn poolWeight(sources: []const Source, f: Facts) ?f32 {
+    if (sources.len == 0) return 1.0; // no query ⇒ include everything (identity)
+    var w: f32 = 0;
+    var matched = false;
+    for (sources) |s| {
+        if (!includes(s, f)) continue;
+        matched = true;
+        if (std.math.isFinite(s.weight) and s.weight > 0) w += s.weight;
+    }
+    return if (matched) w else null;
+}
+
+// ---------------------------------------------------------------------------
+// Tests — pure (B2), no allocation, no I/O.
+// ---------------------------------------------------------------------------
+
+const t = std.testing;
+
+test "guard: Source is exactly sized; the vocabulary is the slice-1 four" {
+    try t.expectEqual(@as(usize, 12), @sizeOf(Source));
+    try t.expectEqual(@as(usize, 4), @typeInfo(SourceKind).@"enum".fields.len);
+}
+
+test "empty query includes everything at weight 1 (backward compatible)" {
+    try t.expectEqual(@as(?f32, 1.0), poolWeight(&.{}, .{ .in_network = true, .engagement = 0 }));
+    try t.expectEqual(@as(?f32, 1.0), poolWeight(&.{}, .{ .in_network = false, .engagement = 999 }));
+}
+
+test "follows pulls in-network only; discovery pulls out-of-network only" {
+    const follows = [_]Source{.{ .kind = .follows }};
+    const discovery = [_]Source{.{ .kind = .discovery }};
+    try t.expectEqual(@as(?f32, 1.0), poolWeight(&follows, .{ .in_network = true, .engagement = 0 }));
+    try t.expectEqual(@as(?f32, null), poolWeight(&follows, .{ .in_network = false, .engagement = 0 })); // dropped
+    try t.expectEqual(@as(?f32, 1.0), poolWeight(&discovery, .{ .in_network = false, .engagement = 0 }));
+    try t.expectEqual(@as(?f32, null), poolWeight(&discovery, .{ .in_network = true, .engagement = 0 }));
+}
+
+test "trending pulls posts at or above the engagement threshold" {
+    const q = [_]Source{.{ .kind = .trending, .threshold = 100 }};
+    try t.expectEqual(@as(?f32, 1.0), poolWeight(&q, .{ .in_network = false, .engagement = 150 }));
+    try t.expectEqual(@as(?f32, null), poolWeight(&q, .{ .in_network = false, .engagement = 99 })); // below → dropped
+}
+
+test "sources COMPOSE: a post matched by several sums their weights (multi-source surfaces stronger)" {
+    // "my follows' posts + viral posts, viral-in-network boosted."
+    const q = [_]Source{
+        .{ .kind = .follows, .weight = 1.0 },
+        .{ .kind = .trending, .weight = 0.5, .threshold = 100 },
+    };
+    // In-network AND trending → both match → 1.0 + 0.5 = 1.5 (boosted).
+    try t.expectEqual(@as(?f32, 1.5), poolWeight(&q, .{ .in_network = true, .engagement = 200 }));
+    // In-network, not trending → only follows → 1.0.
+    try t.expectEqual(@as(?f32, 1.0), poolWeight(&q, .{ .in_network = true, .engagement = 10 }));
+    // Out-of-network, trending → only trending → 0.5.
+    try t.expectEqual(@as(?f32, 0.5), poolWeight(&q, .{ .in_network = false, .engagement = 200 }));
+    // Out-of-network, not trending → matched nothing → dropped from the pool.
+    try t.expectEqual(@as(?f32, null), poolWeight(&q, .{ .in_network = false, .engagement = 10 }));
+}
+
+test "defensive: a hostile non-finite / negative weight can't poison the pool weight" {
+    const q = [_]Source{
+        .{ .kind = .all, .weight = std.math.nan(f32) },
+        .{ .kind = .all, .weight = -5.0 },
+        .{ .kind = .all, .weight = 2.0 },
+    };
+    // Only the finite, positive 2.0 contributes; the candidate is still in the pool.
+    try t.expectEqual(@as(?f32, 2.0), poolWeight(&q, .{ .in_network = true, .engagement = 0 }));
+}

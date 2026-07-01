@@ -246,8 +246,13 @@ pub fn explain(arena: Allocator, config: discover.FeedConfig) error{OutOfMemory}
             // a per-field scalar row here. Skipped, not forgotten: this branch
             // keeps the comptime completeness guarantee honest.
         } else if (comptime std.mem.eql(u8, f.name, "query")) {
-            // Flatten the candidate-query sub-record into its own leaf rows.
+            // Flatten the candidate-query sub-record into its own leaf rows. The
+            // `sources` slice (Phase-0 retrieval) is NOT a scalar — like `rules` /
+            // `vm_program`, it renders as its own readable section (a later slice),
+            // so skip it from the scalar table here (keeping the completeness wall
+            // honest: the skip is explicit, not an oversight).
             inline for (@typeInfo(discover.Query).@"struct".fields) |qf| {
+                if (comptime std.mem.eql(u8, qf.name, "sources")) continue;
                 const m = metaFor(qf.name);
                 try list.append(arena, .{
                     .field = "query." ++ qf.name,
@@ -603,7 +608,12 @@ fn leafFieldCount() usize {
         if (comptime std.mem.eql(u8, f.name, "rules") or std.mem.eql(u8, f.name, "vm_program")) {
             // not scalar leaves — rendered as their own logic sections (matches explain)
         } else if (comptime std.mem.eql(u8, f.name, "query")) {
-            n += @typeInfo(discover.Query).@"struct".fields.len;
+            // Count only the SCALAR query fields; `sources` (retrieval) renders as
+            // its own section and is skipped in `explain`, so exclude it here to
+            // keep the completeness check exact.
+            inline for (@typeInfo(discover.Query).@"struct".fields) |qf| {
+                if (comptime !std.mem.eql(u8, qf.name, "sources")) n += 1;
+            }
         } else n += 1;
     }
     return n;
