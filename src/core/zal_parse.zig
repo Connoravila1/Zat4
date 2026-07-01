@@ -51,6 +51,7 @@ pub const Tag = enum(u8) {
     none, // the index-0 sentinel; never a real node
     // --- expressions ---
     number, // literal; value parsed from the token span
+    string, // "quoted" tag literal; only valid as a tag argument (compiler enforces)
     ident, // a name (fact / local / capability), resolved at type-check
     neg, // unary -a           (a = operand)
     not, // unary !a           (a = operand)
@@ -80,7 +81,7 @@ pub const Tag = enum(u8) {
     //                                          in `extra`; c = body-block)
 
     comptime {
-        assert(@typeInfo(Tag).@"enum".fields.len == 26);
+        assert(@typeInfo(Tag).@"enum".fields.len == 27);
     }
 };
 
@@ -392,6 +393,14 @@ const Parser = struct {
                 p.advance();
                 return n;
             },
+            .string => {
+                // A tag literal; the token span includes the quotes (the compiler
+                // strips them). Only meaningful as a tag argument — the compiler
+                // rejects it anywhere else, so no type is attached here.
+                const n = try p.addNode(.{ .tag = .string, .tok_start = p.tok.start, .tok_len = p.tok.len });
+                p.advance();
+                return n;
+            },
             .identifier => {
                 const name = p.tok;
                 p.advance();
@@ -452,7 +461,7 @@ const t = std.testing;
 
 test "guards + tag count" {
     try t.expectEqual(@as(usize, 24), @sizeOf(Node));
-    try t.expectEqual(@as(usize, 26), @typeInfo(Tag).@"enum".fields.len);
+    try t.expectEqual(@as(usize, 27), @typeInfo(Tag).@"enum".fields.len);
 }
 
 test "parse: a whole function builds a clean AST" {

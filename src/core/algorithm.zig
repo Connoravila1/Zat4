@@ -123,6 +123,36 @@ test "serialize → parse round-trips a config byte-for-byte (transparency core)
     try t.expectEqualSlices(u8, bytes, bytes2);
 }
 
+test "round trip: a guest program's tag-constant pool survives serialize/parse" {
+    const t = std.testing;
+    const zal_parse = @import("zal_parse.zig");
+    const zal_compile = @import("zal_compile.zig");
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A guest program that references two zone tags → a two-entry pool.
+    const src = "fn score() num { if (has_tag(\"zig\")) { return 2.0; } if (has_tag(\"rust\")) { return 1.5; } return like_count; }";
+    const ast = try zal_parse.parse(arena, src);
+    const res = try zal_compile.compile(arena, &ast, "score");
+    try t.expect(res.ok());
+
+    var cfg = discover.DEFAULT_CONFIG;
+    cfg.guest_program = res.program;
+    cfg.guest_strings = res.strings;
+
+    const bytes = try serialize(arena, cfg);
+    const back = try parse(arena, bytes);
+    // The pool round-trips intact — the host resolves the same tag names off disk.
+    try t.expectEqual(@as(usize, 2), back.guest_strings.len);
+    try t.expectEqualStrings("zig", back.guest_strings[0]);
+    try t.expectEqualStrings("rust", back.guest_strings[1]);
+    try t.expect(back.guest_program.len == res.program.len);
+    // What you inspect IS what runs: re-serializing reproduces the same bytes (CID).
+    const bytes2 = try serialize(arena, back);
+    try t.expectEqualSlices(u8, bytes, bytes2);
+}
+
 test "parse: malformed / hostile / empty input falls back to the default (E2/E4)" {
     const t = std.testing;
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);

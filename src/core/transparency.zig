@@ -241,14 +241,15 @@ pub fn explain(arena: Allocator, config: discover.FeedConfig) error{OutOfMemory}
     var list: std.ArrayListUnmanaged(FieldExplanation) = .empty;
     inline for (@typeInfo(discover.FeedConfig).@"struct".fields) |f| {
         if (comptime std.mem.eql(u8, f.name, "rules") or std.mem.eql(u8, f.name, "vm_program") or
-            std.mem.eql(u8, f.name, "guest_program") or std.mem.eql(u8, f.name, "guest_fuel"))
+            std.mem.eql(u8, f.name, "guest_program") or std.mem.eql(u8, f.name, "guest_fuel") or
+            std.mem.eql(u8, f.name, "guest_strings"))
         {
             // The authored LOGIC — the L2 rule-list, the L3 VM program, and the
-            // developer-tier guest program (+ its fuel) — are not per-field scalars;
-            // each renders as its own readable/inspectable section (rules as
-            // "if … then …" lines, the VM as a decompiled formula, the guest program
-            // as its source + capability labels, Phase 6). Skipped, not forgotten:
-            // this branch keeps the comptime completeness guarantee honest.
+            // developer-tier guest program (+ its fuel + its tag-constant pool) — are
+            // not per-field scalars; each renders as its own readable/inspectable
+            // section (rules as "if … then …" lines, the VM as a decompiled formula,
+            // the guest program as its source + capability labels, Phase 6). Skipped,
+            // not forgotten: this branch keeps the comptime completeness guarantee honest.
         } else if (comptime std.mem.eql(u8, f.name, "query")) {
             // Flatten the candidate-query sub-record into its own leaf rows. The
             // `sources` slice (Phase-0 retrieval) is NOT a scalar — like `rules` /
@@ -336,7 +337,8 @@ pub fn classify(config: discover.FeedConfig) Classification {
             std.mem.eql(u8, f.name, "vm_program") or
             std.mem.eql(u8, f.name, "query") or
             std.mem.eql(u8, f.name, "guest_program") or
-            std.mem.eql(u8, f.name, "guest_fuel"))
+            std.mem.eql(u8, f.name, "guest_fuel") or
+            std.mem.eql(u8, f.name, "guest_strings"))
         {
             // Logic lists, the retrieval sub-record, and the developer-tier guest
             // program carry no behavioral SCALAR weight here: the door wall keeps
@@ -647,10 +649,11 @@ fn leafFieldCount() usize {
     var n: usize = 0;
     inline for (@typeInfo(discover.FeedConfig).@"struct".fields) |f| {
         if (comptime std.mem.eql(u8, f.name, "rules") or std.mem.eql(u8, f.name, "vm_program") or
-            std.mem.eql(u8, f.name, "guest_program") or std.mem.eql(u8, f.name, "guest_fuel"))
+            std.mem.eql(u8, f.name, "guest_program") or std.mem.eql(u8, f.name, "guest_fuel") or
+            std.mem.eql(u8, f.name, "guest_strings"))
         {
             // not scalar leaves — the authored logic (rules / L3 formula / the
-            // developer-tier guest program + its fuel) renders as its own section
+            // developer-tier guest program + its fuel + its tag pool) renders as its own section
         } else if (comptime std.mem.eql(u8, f.name, "query")) {
             // Count only the SCALAR query fields; `sources` (retrieval) renders as
             // its own section and is skipped in `explain`, so exclude it here to

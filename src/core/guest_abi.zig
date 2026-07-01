@@ -84,6 +84,14 @@ pub const Capability = enum(u8) {
     source_discovery, // add "beyond your follows (discovery)" to the pool
     source_trending, // add "trending (engagement ≥ threshold)" to the pool
 
+    // --- Content (PUBLIC, non-identity): read a candidate's public topic metadata.
+    //     The argument is a TAG-STRING CONSTANT (an index into the artifact's
+    //     read-only string pool that the host resolves) — the guest never builds or
+    //     inspects strings, and the vocabulary is TAGS ONLY (a public, moderated
+    //     zone name), never an author handle or post text, so this opens NO
+    //     targeting or content-exposure door. ---
+    has_tag, // 1 if the candidate carries the named zone tag, else 0
+
     // --- State: the guest's OWN bounded on-device memory (its learned model),
     //     read at a run's start, written at its end. Bounded by the algorithm's
     //     declared state budget; never leaves the device (no capability could send
@@ -101,10 +109,12 @@ pub const Capability = enum(u8) {
     attention_clicked, // whether the viewer clicked into a candidate
 
     comptime {
-        // The whole capability surface, in one number (3 retrieval + 2 state + 2
-        // behavioral). Bumping it is the deliberate review point for every new door
-        // (targeting / exfiltration / side channel).
-        assert(@typeInfo(Capability).@"enum".fields.len == 7);
+        // The whole capability surface, in one number (3 retrieval + 1 content + 2
+        // state + 2 behavioral). Bumping it is the deliberate review point for every
+        // new door (targeting / exfiltration / side channel). `has_tag` is content:
+        // it reads PUBLIC tag membership, no identity — a widening of what a guest can
+        // read, reviewed and found to open no door (tags only, never handles/text).
+        assert(@typeInfo(Capability).@"enum".fields.len == 8);
     }
 };
 
@@ -115,7 +125,7 @@ pub const Capability = enum(u8) {
 /// until its behavioral status is decided here on purpose.
 pub fn isBehavioral(cap: Capability) bool {
     return switch (cap) {
-        .source_follows, .source_discovery, .source_trending, .state_read, .state_write => false,
+        .source_follows, .source_discovery, .source_trending, .has_tag, .state_read, .state_write => false,
         .attention_dwell, .attention_clicked => true,
     };
 }
@@ -203,7 +213,7 @@ const t = std.testing;
 test "guards: the ABI types are exactly sized (the no-targeting / feature boundary)" {
     try t.expectEqual(@as(usize, 36), @sizeOf(CandidateView));
     try t.expectEqual(@as(usize, 44), @sizeOf(AttentionEvent));
-    try t.expectEqual(@as(usize, 7), @typeInfo(Capability).@"enum".fields.len);
+    try t.expectEqual(@as(usize, 8), @typeInfo(Capability).@"enum".fields.len);
     try t.expectEqual(@as(usize, 3), @typeInfo(EntryPoint).@"enum".fields.len);
 }
 

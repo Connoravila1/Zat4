@@ -132,6 +132,16 @@ pub const Instr = struct {
 /// 65535, comfortably past this.
 pub const max_program_len: usize = 4096;
 
+/// The read-only STRING CONSTANT POOL an artifact may carry — tag-name literals a
+/// guest passes to a content/retrieval capability (`has_tag`, `source_tag_scope`).
+/// The guest never builds or reads string bytes; it references a pool ENTRY by
+/// index (a plain number the host resolves), so the VM value model stays purely
+/// numeric and strings add no runtime string handling to the sandbox. Both bounds
+/// are DoS walls (the publish gate rejects anything larger, Phase 5): a feed
+/// algorithm needs a handful of short zone tags.
+pub const max_strings: usize = 64;
+pub const max_tag_len: usize = 128;
+
 /// The operand-stack depth. A bounded, owned buffer; push past it drops (a
 /// malformed program stays safe rather than trapping), pop past bottom yields 0.
 pub const stack_cap: usize = 64;
@@ -435,6 +445,7 @@ fn mockHostCall(ctx: *anyopaque, cap: guest_abi.Capability, a0: f64, a1: f64) f6
     _ = ctx;
     return switch (cap) {
         .source_follows, .source_discovery, .source_trending => a0 + a1,
+        .has_tag => if (a0 != 0) @as(f64, 1) else 0, // mock: "tagged" iff a non-zero pool index
         .state_read => a0,
         .state_write => 0,
         .attention_dwell => 0.5,

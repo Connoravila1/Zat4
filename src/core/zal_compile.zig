@@ -54,9 +54,13 @@ pub const Error = struct {
 };
 
 /// The compile result. `program` is empty when `errors` is non-empty — a program
-/// with any error is never partially emitted (fail-closed). A7.2: cold, waived.
+/// with any error is never partially emitted (fail-closed). `strings` is the
+/// read-only tag-constant pool the program's `has_tag`/`source_tag_scope` calls
+/// index into (empty on error, or when the program uses no tag literal); it travels
+/// WITH the program as part of the artifact. A7.2: cold, waived.
 pub const Result = struct {
     program: []const Instr,
+    strings: []const []const u8 = &.{},
     errors: []const Error,
     pub fn ok(self: Result) bool {
         return self.errors.len == 0;
@@ -90,6 +94,7 @@ fn capabilityOf(name: []const u8) ?guest_abi.Capability {
         .{ "follows", guest_abi.Capability.source_follows },
         .{ "discovery", guest_abi.Capability.source_discovery },
         .{ "trending", guest_abi.Capability.source_trending },
+        .{ "has_tag", guest_abi.Capability.has_tag },
         .{ "state_read", guest_abi.Capability.state_read },
         .{ "state_write", guest_abi.Capability.state_write },
         .{ "attention_dwell", guest_abi.Capability.attention_dwell },
@@ -97,6 +102,23 @@ fn capabilityOf(name: []const u8) ?guest_abi.Capability {
     };
     inline for (table) |e| if (std.mem.eql(u8, name, e[0])) return e[1];
     return null;
+}
+
+/// Does this capability take a TAG-STRING literal as its first argument (resolved
+/// from the artifact's string pool by the host)? These are the only calls where a
+/// string literal is legal; a string anywhere else is a compile error. Exhaustive
+/// (no `else`), so a new capability must decide here whether it is tag-taking.
+fn capabilityTakesTag(cap: guest_abi.Capability) bool {
+    return switch (cap) {
+        .has_tag => true,
+        .source_follows, .source_discovery, .source_trending, .state_read, .state_write, .attention_dwell, .attention_clicked => false,
+    };
+}
+
+/// Strip the surrounding quotes from a string token's text (`"zig"` → `zig`). The
+/// lexer only emits a `.string` for a terminated `"..."`, so `len >= 2`.
+fn stripQuotes(lit: []const u8) []const u8 {
+    return if (lit.len >= 2) lit[1 .. lit.len - 1] else lit;
 }
 
 const Local = struct { name: []const u8, slot: u16 };
@@ -108,11 +130,32 @@ const Compiler = struct {
     code: std.ArrayListUnmanaged(Instr) = .empty,
     errors: std.ArrayListUnmanaged(Error) = .empty,
     locals: std.ArrayListUnmanaged(Local) = .empty,
+    strings: std.ArrayListUnmanaged([]const u8) = .empty,
     next_slot: u16 = 0,
 
     fn emit(c: *Compiler, ins: Instr) Allocator.Error!u32 {
         const idx: u32 = @intCast(c.code.items.len);
         try c.code.append(c.arena, ins);
+        return idx;
+    }
+
+    /// Intern a tag literal into the read-only string pool, returning its index (a
+    /// small number the guest pushes and the host resolves), or null on a bounds
+    /// error (fail-closed). Deduplicated by value; bounded by the artifact caps.
+    fn internString(c: *Compiler, s: []const u8) Allocator.Error!?u16 {
+        for (c.strings.items, 0..) |existing, i| {
+            if (std.mem.eql(u8, existing, s)) return @intCast(i);
+        }
+        if (s.len > vm.max_tag_len) {
+            try c.err("tag name too long", 0);
+            return null;
+        }
+        if (c.strings.items.len >= vm.max_strings) {
+            try c.err("too many distinct tag names", 0);
+            return null;
+        }
+        const idx: u16 = @intCast(c.strings.items.len);
+        try c.strings.append(c.arena, s);
         return idx;
     }
 
@@ -215,6 +258,11 @@ const Compiler = struct {
                 _ = try c.emit(.{ .op = .max });
             },
             .call => try c.genCall(n),
+            // A string is not a value the VM computes on — it is only legal as a tag
+            // argument, handled in `genCall`. Reaching it here (arithmetic, a
+            // condition, a non-tag call arg) is a type error, caught for every such
+            // misuse in one place.
+            .string => try c.err("a text value is only valid as a tag name, e.g. has_tag(\"zig\")", node.tok_start),
             else => try c.err("cannot compile this expression", node.tok_start),
         }
     }
@@ -244,10 +292,21 @@ const Compiler = struct {
             try c.err("too many arguments (a capability takes at most 2)", node.tok_start);
             return;
         }
-        // Push each argument (arg0 first), then pad to exactly two — `call_host`
-        // always pops two operands (arg1 then arg0), so a 0- or 1-arg capability
-        // gets zeros for the unused slots.
-        for (args) |arg| try c.genExpr(arg);
+        // A tag-taking capability's FIRST argument is a string literal, compiled to a
+        // pool index (arg0); the rest are numeric. Every other capability takes only
+        // numbers, and a string among them falls through to `genExpr`'s `.string`
+        // error. `call_host` always pops two operands, so pad unused slots to zero.
+        if (capabilityTakesTag(cap)) {
+            if (args.len == 0 or c.ast.nodes[args[0]].tag != .string) {
+                try c.err("this capability needs a tag name in quotes, e.g. has_tag(\"zig\")", node.tok_start);
+                return;
+            }
+            const idx = (try c.internString(stripQuotes(c.ast.tokenText(args[0])))) orelse return;
+            _ = try c.emit(.{ .op = .push_const, .value = @floatFromInt(idx) }); // arg0 = pool index
+            for (args[1..]) |arg| try c.genExpr(arg); // remaining args numeric (a string here → error)
+        } else {
+            for (args) |arg| try c.genExpr(arg);
+        }
         var i = args.len;
         while (i < 2) : (i += 1) _ = try c.emit(.{ .op = .push_const, .value = 0 });
         _ = try c.emit(.{ .op = .call_host, .arg = @intFromEnum(cap) });
@@ -359,7 +418,11 @@ pub fn compile(arena: Allocator, ast: *const Ast, entry_name: []const u8) Alloca
     if (c.errors.items.len > 0) {
         return .{ .program = &.{}, .errors = try c.errors.toOwnedSlice(arena) };
     }
-    return .{ .program = try c.code.toOwnedSlice(arena), .errors = &.{} };
+    return .{
+        .program = try c.code.toOwnedSlice(arena),
+        .strings = try c.strings.toOwnedSlice(arena),
+        .errors = &.{},
+    };
 }
 
 /// Does this compiled program read the user's PRIVATE attention data? True iff it
@@ -466,6 +529,49 @@ test "compile+run: the new public signals (viewer_engaged, tag_count) are readab
     const s_seen = vm.run(res.program, seen, 0, vm.default_fuel, null);
     try t.expectEqual(@as(f64, 110.0), s_fresh);
     try t.expect(s_fresh > s_seen); // an already-engaged post is down-ranked
+}
+
+test "compile+run: has_tag compiles to a pooled tag index + a host call" {
+    var a = std.heap.ArenaAllocator.init(t.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    // "double the score for posts in the zig zone."
+    const src = "fn score() num { if (has_tag(\"zig\")) { return like_count * 2.0; } return like_count; }";
+    const ast = try parse.parse(arena, src);
+    const res = try compile(arena, &ast, "score");
+    try t.expect(res.ok());
+    // The literal was interned into the read-only pool (not a VM value).
+    try t.expectEqual(@as(usize, 1), res.strings.len);
+    try t.expectEqualStrings("zig", res.strings[0]);
+
+    // A host that reports "this candidate carries pool tag #0" (the zig index).
+    const H = struct {
+        fn call(ctx: *anyopaque, cap: guest_abi.Capability, a0: f64, a1: f64) f64 {
+            _ = ctx;
+            _ = a1;
+            return if (cap == .has_tag and a0 == 0) 1 else 0;
+        }
+    };
+    var ctx: u8 = 0;
+    const host = vm.Host{ .ctx = &ctx, .call = H.call };
+    try t.expectEqual(@as(f64, 200.0), vm.run(res.program, sample, 0, vm.default_fuel, &host)); // tagged → doubled
+    try t.expectEqual(@as(f64, 100.0), vm.run(res.program, sample, 0, vm.default_fuel, null)); // no host → untagged branch
+}
+
+test "compile: a text literal is rejected outside a tag argument (type discipline, fail-closed)" {
+    var a = std.heap.ArenaAllocator.init(t.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    // A string in arithmetic.
+    const r1 = try compile(arena, &(try parse.parse(arena, "fn score() num { return like_count + \"zig\"; }")), "score");
+    try t.expect(!r1.ok());
+    try t.expectEqual(@as(usize, 0), r1.program.len);
+    // A string to a NON-tag capability.
+    const r2 = try compile(arena, &(try parse.parse(arena, "fn score() num { follows(\"zig\"); return base_score; }")), "score");
+    try t.expect(!r2.ok());
+    // A number where a tag capability needs a tag name.
+    const r3 = try compile(arena, &(try parse.parse(arena, "fn score() num { if (has_tag(5)) { return 1.0; } return base_score; }")), "score");
+    try t.expect(!r3.ok());
 }
 
 test "compile+run: the thread-structure signals (reply_chain, quote_count) are readable" {

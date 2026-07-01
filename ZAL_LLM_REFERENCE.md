@@ -90,6 +90,15 @@ cannot target a specific account.
 
 These are the only callable functions. Each returns a `num`.
 
+**Topic tags (public content).** Ask whether this post carries a named zone tag.
+The tag is written as a quoted literal — a **text value is only ever a tag name**,
+never used in arithmetic and never an author name. Reading tags is public and does
+*not* make your algorithm "use behavioral data."
+
+| Call | Returns |
+|------|---------|
+| `has_tag("zig")` | `1` if this post is in the `zig` zone, else `0` |
+
 **On-device attention (adaptive personalization).** Reading either of these makes
 your algorithm one that "uses behavioral data" — which is shown to the reader.
 The data is read locally and can never leave the device.

@@ -54,6 +54,7 @@ const assert = std.debug.assert;
 pub const Kind = enum(u8) {
     // literals + names
     number,
+    string, // a "double-quoted" literal — only a tag name for a content/retrieval capability
     identifier,
     // keywords
     kw_fn,
@@ -92,7 +93,7 @@ pub const Kind = enum(u8) {
 
     comptime {
         // A fixed vocabulary; a new token kind is a deliberate language change.
-        assert(@typeInfo(Kind).@"enum".fields.len == 32);
+        assert(@typeInfo(Kind).@"enum".fields.len == 33);
     }
 };
 
@@ -185,6 +186,19 @@ pub const Lexer = struct {
             return .{ .kind = .number, .start = start, .len = self.pos - start };
         }
 
+        // String literal: "..." — a tag name for a content/retrieval capability. No
+        // escapes in the first cut (a zone tag is a simple token; add if a real
+        // program needs them, F4). Progress is guaranteed: `pos` moves past the
+        // opening quote regardless. An unterminated string is `.invalid` (reported by
+        // the parser), never a spin.
+        if (c == '"') {
+            self.pos += 1; // past the opening quote
+            while (self.pos < self.src.len and self.src[self.pos] != '"') self.pos += 1;
+            if (self.pos >= self.src.len) return .{ .kind = .invalid, .start = start, .len = self.pos - start };
+            self.pos += 1; // past the closing quote
+            return .{ .kind = .string, .start = start, .len = self.pos - start };
+        }
+
         // Punctuation + operators (multi-char forms checked first).
         return self.operator(start);
     }
@@ -264,7 +278,19 @@ fn kinds(src: []const u8, out: []Kind) usize {
 
 test "guards + vocabulary size" {
     try t.expectEqual(@as(usize, 12), @sizeOf(Token));
-    try t.expectEqual(@as(usize, 32), @typeInfo(Kind).@"enum".fields.len);
+    try t.expectEqual(@as(usize, 33), @typeInfo(Kind).@"enum".fields.len);
+}
+
+test "lex: a string literal spans its quotes; an unterminated one is invalid (total)" {
+    var lx = Lexer.init("has_tag(\"zig\") \"oops");
+    try t.expectEqual(Kind.identifier, lx.next().kind); // has_tag
+    try t.expectEqual(Kind.lparen, lx.next().kind);
+    const s = lx.next();
+    try t.expectEqual(Kind.string, s.kind);
+    try t.expectEqualStrings("\"zig\"", s.text(lx.src)); // span includes the quotes
+    try t.expectEqual(Kind.rparen, lx.next().kind);
+    try t.expectEqual(Kind.invalid, lx.next().kind); // "oops has no closing quote
+    try t.expectEqual(Kind.eof, lx.next().kind); // and scanning still terminates
 }
 
 test "lex: a small function tokenizes to the expected stream" {

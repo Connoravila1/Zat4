@@ -1060,11 +1060,11 @@ pub fn buildDiscoverView(
     try cands.viewer_engaged.resize(arena, cands.list.len, false);
     try cands.tag_count.resize(arena, cands.list.len);
     try cands.quote_count.resize(arena, cands.list.len);
-    // The `tag_scope` retrieval source needs each candidate's tag STRINGS, not just
-    // the count — materialize them out of band, but ONLY when the query actually
-    // references tag_scope (F5: a config without it pays nothing, and the scorer
-    // reads the empty list as "no tags per row").
-    const scope_by_tag = retrieval.needsTags(config.query.sources);
+    // Materialize each candidate's tag STRINGS out of band when something reads them:
+    // a `tag_scope` retrieval source, OR a guest program that carries tag literals
+    // (its `has_tag`/`source_tag_scope` calls). A config with neither pays nothing
+    // (F5), and the scorer then reads the empty list as "no tags per row".
+    const scope_by_tag = retrieval.needsTags(config.query.sources) or config.guest_strings.len > 0;
     if (scope_by_tag) try cands.cand_tags.resize(arena, cands.list.len);
     const cand_refs = cands.list.items(.ref);
     for (0..cands.list.len) |ci| {

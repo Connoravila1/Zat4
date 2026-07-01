@@ -314,6 +314,13 @@ pub const FeedConfig = struct {
     /// The guest program's per-candidate fuel budget (a CPU-DoS wall; the scorer
     /// runs `candidates × fuel`). Clamped to `guest_vm.max_fuel` by `validated`.
     guest_fuel: u32 = guest_vm.default_fuel,
+    /// The guest program's read-only TAG-CONSTANT POOL: the tag names its
+    /// `has_tag`/`source_tag_scope` calls reference by index (the host resolves the
+    /// index against this pool). Travels with the program (part of the artifact),
+    /// empty when the program uses no tag literal. PUBLIC data (zone names), no
+    /// identity — a guest reads tag membership, never a handle. Borrows the caller's
+    /// memory; clamped to `guest_vm.max_strings` by `validated`.
+    guest_strings: []const []const u8 = &.{},
 };
 
 /// The hard ceiling on a single algorithm's declared on-device state (10 MiB).
@@ -420,6 +427,35 @@ pub fn scoreRow(c: Candidate, config: FeedConfig, now: i64) f64 {
     return eng * rec * vel * author * rel * behav;
 }
 
+/// The CONTENT host for a guest score run — the public, non-behavioral capabilities
+/// that read a candidate's tags. `has_tag(idx)` resolves the pool index to a tag
+/// name and reports whether THIS candidate carries it (1/0). PURE: a function of the
+/// pool + the candidate's tags, no I/O, so `score` remains a pure transform. The
+/// attention/state capabilities are NOT answered here (they touch I/O and are gated
+/// in the shell) — an unhandled capability returns 0, exactly as a null host would.
+/// A7.2: cold — one per candidate on the guest path, two borrowed slices. Waived.
+const ScoreHost = struct {
+    strings: []const []const u8, // the artifact's tag-constant pool
+    tags: []const []const u8, // this candidate's public tags
+
+    fn call(ctx: *anyopaque, cap: guest_abi.Capability, arg0: f64, arg1: f64) f64 {
+        _ = arg1;
+        const self: *const ScoreHost = @ptrCast(@alignCast(ctx));
+        switch (cap) {
+            .has_tag => {
+                // Resolve arg0 → a pool index defensively: a NaN/negative/out-of-range
+                // index (the VM sanitizes values but never proves them integral) is
+                // "no such tag" → 0, never an out-of-bounds access.
+                if (!(arg0 >= 0 and arg0 < @as(f64, @floatFromInt(self.strings.len)))) return 0;
+                const want = self.strings[@intFromFloat(arg0)];
+                for (self.tags) |tg| if (std.mem.eql(u8, tg, want)) return 1;
+                return 0;
+            },
+            else => return 0, // retrieval/state/behavioral are not answered on the score path
+        }
+    }
+};
+
 /// Rank a candidate pool: pure transform from (candidates, config, now) → the
 /// candidates' refs in DESCENDING score order, allocated in `arena` (C1/C3).
 /// Diversity caps and moderation are SEPARATE later passes (D4) — this returns
@@ -466,7 +502,13 @@ pub fn score(arena: Allocator, cands: *const Candidates, config: FeedConfig, now
             const quotes: u32 = if (i < cands.quote_count.items.len) cands.quote_count.items[i] else 0;
             const view = candidateView(c, in_net, engaged, tags, quotes, now);
             const base = scoreRow(c, config, now); // available to the guest as `base_score`
-            scores[i] = guest_vm.run(config.guest_program, view, base, config.guest_fuel, null) * @as(f64, pool_w);
+            // The score-side CONTENT host: answers `has_tag` for THIS candidate from
+            // the artifact's tag pool + the candidate's public tags. PURE (no I/O), so
+            // the scorer stays pure; attention/state capabilities are not answered
+            // here (they touch I/O + are gated) — they return 0, exactly as a null host.
+            var host_ctx = ScoreHost{ .strings = config.guest_strings, .tags = row_tags };
+            const host = guest_vm.Host{ .ctx = &host_ctx, .call = ScoreHost.call };
+            scores[i] = guest_vm.run(config.guest_program, view, base, config.guest_fuel, &host) * @as(f64, pool_w);
             kept.appendAssumeCapacity(@intCast(i));
             continue;
         }
@@ -657,6 +699,12 @@ pub fn validated(c: FeedConfig) FeedConfig {
     // guest VM's own validator — the untrusted-compiler / trusted-validator split),
     // and clamp the fuel budget to the DoS ceiling.
     v.guest_program = guest_vm.validatedProgram(v.guest_program);
+    // Clip a hostile/oversized tag-constant pool to its cap (a `has_tag` lookup is
+    // `candidates × pool` in the worst case). Truncating the const slice borrows the
+    // same memory — no allocation, so `validated` stays pure. An index past the
+    // clipped pool resolves to "no such tag" at runtime (the host bounds-checks), so
+    // dropping entries can only make a match fail safe, never read out of bounds.
+    if (v.guest_strings.len > guest_vm.max_strings) v.guest_strings = v.guest_strings[0..guest_vm.max_strings];
     if (v.guest_fuel == 0) v.guest_fuel = guest_vm.default_fuel;
     if (v.guest_fuel > guest_vm.max_fuel) v.guest_fuel = guest_vm.max_fuel;
     return v;
@@ -921,6 +969,38 @@ test "score: a tag_scope query shapes the POOL — only posts in the named zone 
     const order = try score(arena, &c, cfg, test_now);
     try t.expectEqual(@as(usize, 1), order.len); // only the #zig post survived retrieval
     try t.expectEqual(@as(u32, 1), order[0].raw()); // not the higher-engagement untagged post
+}
+
+test "developer tier: a guest ranks by TAG membership via has_tag (content capability, engine host)" {
+    const t = std.testing;
+    const zal_parse = @import("zal_parse.zig");
+    const zal_compile = @import("zal_compile.zig");
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // "posts in the zig zone are worth a lot; otherwise rank by likes."
+    const src = "fn score() num { if (has_tag(\"zig\")) { return 1000.0; } return like_count; }";
+    const ast = try zal_parse.parse(arena, src);
+    const res = try zal_compile.compile(arena, &ast, "score");
+    try t.expect(res.ok());
+    var cfg = DEFAULT_CONFIG;
+    cfg.guest_program = res.program;
+    cfg.guest_strings = res.strings; // the tag pool travels WITH the program
+    cfg = validated(cfg);
+
+    var c: Candidates = .{};
+    defer c.deinit(t.allocator);
+    try c.append(t.allocator, mk(1, 3600, 500), true); // high engagement, untagged
+    try c.append(t.allocator, mk(2, 3600, 5), true); // low engagement, #zig
+    c.cand_tags.items[0] = &.{};
+    c.cand_tags.items[1] = &.{"zig"};
+
+    // The engine built a per-candidate content host, the guest called has_tag("zig"),
+    // and the tag boost carried the low-engagement #zig post above the popular one.
+    const order = try score(arena, &c, cfg, test_now);
+    try t.expectEqual(@as(usize, 2), order.len);
+    try t.expectEqual(@as(u32, 2), order[0].raw()); // 1000 (tagged) > 500 (untagged likes)
 }
 
 test "score: a source WEIGHT lifts its pool — heavily-weighted follows beats a more-engaged discovery post" {
