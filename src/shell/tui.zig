@@ -61,6 +61,8 @@ const textedit = @import("../core/textedit.zig");
 const lens_socket = @import("../core/lens_socket.zig");
 const lens_catalog = @import("../core/lens_catalog.zig");
 const discover = @import("../core/discover.zig");
+const transparency = @import("../core/transparency.zig");
+const algorithm_shell = @import("algorithm.zig");
 const loadout_store = @import("loadout.zig");
 const effect_core = @import("../core/effect.zig");
 const clock_shell = @import("clock.zig");
@@ -565,6 +567,45 @@ pub fn run(
         for (zone_catalog.items) |zc| gpa.free(zc.tag);
         zone_catalog.deinit(gpa);
     }
+    // MARKETPLACE catalog (Algorithms → Marketplace tab): gpa-owned rows from the
+    // AppView's `getAlgorithms`, (re)fetched on entering the tab. `market_catalog`
+    // holds the full row (incl. the author DID + rkey the "View details" fetch
+    // needs); `market_cards` is the display projection handed to the renderer.
+    const MarketRow = struct {
+        name: []const u8,
+        author_disp: []const u8, // "@handle" or the DID
+        author_did: []const u8,
+        rkey: []const u8,
+        cid: []const u8,
+        learns: bool,
+        uses_behavioral: bool,
+        state_budget_bytes: u32,
+    };
+    var market_catalog: std.ArrayList(MarketRow) = .empty;
+    var market_cards: std.ArrayList(feed_view.MarketAlgoCard) = .empty;
+    var on_market_prev = false;
+    defer {
+        for (market_catalog.items) |r| {
+            gpa.free(r.name);
+            gpa.free(r.author_disp);
+            gpa.free(r.author_did);
+            gpa.free(r.rkey);
+            gpa.free(r.cid);
+        }
+        market_catalog.deinit(gpa);
+        market_cards.deinit(gpa);
+    }
+    // The algorithm being inspected on the transparency page (screen_transparency):
+    // its fetched config + name + ref (CID), rebuilt into a page each frame. The
+    // screen to return to on Back. Config null ⇒ not inspecting.
+    var inspect_config: ?discover.FeedConfig = null;
+    var inspect_name: []const u8 = "";
+    var inspect_ref: []const u8 = "";
+    var transp_return_screen: u8 = feed_view.screen_loadout;
+    defer {
+        if (inspect_name.len > 0) gpa.free(inspect_name);
+        if (inspect_ref.len > 0) gpa.free(inspect_ref);
+    }
     // RE-ROOT mode: false when a thread is opened from the timeline (show the WHOLE
     // thread, scroll to the focus); true when a reply is tapped INSIDE the thread
     // (re-root on it: condensed ancestors above + the focus + its subtree).
@@ -889,6 +930,60 @@ pub fn run(
         }
         on_browse_prev = on_browse;
 
+        // MARKETPLACE: on ENTERING the Algorithms → Marketplace tab, fetch the
+        // published algorithms (`getAlgorithms`) into the owned catalog. Metadata,
+        // not posts — it doesn't touch the store. Contained failure (E2).
+        const on_market = mode == .timeline and gscreen == feed_view.screen_loadout and gloadout_tab == 1;
+        if (on_market and !on_market_prev) {
+            const mo = feed_shell.loadAlgorithms(gpa, arena, io, environ, session, appview_url, 50) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => blk: {
+                    status = "marketplace: network error"; // contained
+                    break :blk null;
+                },
+            };
+            if (mo) |result| switch (result) {
+                .ok => |algos| {
+                    for (market_catalog.items) |r| {
+                        gpa.free(r.name);
+                        gpa.free(r.author_disp);
+                        gpa.free(r.author_did);
+                        gpa.free(r.rkey);
+                        gpa.free(r.cid);
+                    }
+                    market_catalog.clearRetainingCapacity();
+                    for (algos) |a| {
+                        const author_disp = if (a.handle.len > 0)
+                            try std.fmt.allocPrint(gpa, "@{s}", .{a.handle})
+                        else
+                            try gpa.dupe(u8, a.author);
+                        try market_catalog.append(gpa, .{
+                            .name = try gpa.dupe(u8, a.name),
+                            .author_disp = author_disp,
+                            .author_did = try gpa.dupe(u8, a.author),
+                            .rkey = try gpa.dupe(u8, a.rkey),
+                            .cid = try gpa.dupe(u8, a.cid),
+                            .learns = a.learns,
+                            .uses_behavioral = a.usesBehavioral,
+                            .state_budget_bytes = a.stateBudgetBytes,
+                        });
+                    }
+                    // Refill the display projection (strings point into the owned
+                    // rows above, which are stable until the next fetch clears them).
+                    market_cards.clearRetainingCapacity();
+                    for (market_catalog.items) |r| try market_cards.append(gpa, .{
+                        .name = r.name,
+                        .author = r.author_disp,
+                        .learns = r.learns,
+                        .uses_behavioral = r.uses_behavioral,
+                        .state_budget_bytes = r.state_budget_bytes,
+                    });
+                },
+                .failed => status = "marketplace: unavailable",
+            };
+        }
+        on_market_prev = on_market;
+
         // The ACTIVE view: Home (one ordering over the store), the profile screen
         // (the TARGET author's posts), a post's THREAD, or a ZONE (a tag query) —
         // each a query over the SAME store. One list of view-models the render +
@@ -1026,7 +1121,7 @@ pub fn run(
         var cur_socket_ui = if (on_thread_screen) reply_ui else if (on_zone_screen) zone_ui else gsocket_ui;
         cur_socket_ui.julia = julia_on;
         const cur_socket_hits = if (on_thread_screen) &reply_hits else if (on_zone_screen) &zone_hits else &gsocket_hits;
-        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
+        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .market = if (gscreen == feed_view.screen_loadout and gloadout_tab == 1) market_cards.items else &.{}, .inspect_config = inspect_config, .inspect_name = inspect_name, .inspect_ref = inspect_ref, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
         switch (mode) {
             .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status),
             .compose => {
@@ -1726,9 +1821,14 @@ pub fn run(
                                         },
                                         // Back (thread top bar) → the prior screen.
                                         .back => {
-                                            // The zone page and the thread share the Back
-                                            // button; each returns to where it was entered from.
-                                            gscreen = if (gscreen == feed_view.screen_zones) zone_return_screen else thread_return_screen;
+                                            // The transparency page, zone page, and thread
+                                            // share Back; each returns where it was entered.
+                                            if (gscreen == feed_view.screen_transparency) {
+                                                gscreen = transp_return_screen;
+                                                inspect_config = null;
+                                            } else {
+                                                gscreen = if (gscreen == feed_view.screen_zones) zone_return_screen else thread_return_screen;
+                                            }
                                             g.scroll.* = 0;
                                         },
                                         // "N new posts" pill → reveal the staged
@@ -1809,6 +1909,37 @@ pub fn run(
                                                 gscroll_px = 0;
                                                 gsocket_ui.open = false;
                                             }
+                                        },
+                                        // Marketplace "View details": fetch this
+                                        // algorithm's full config by (author, rkey) and
+                                        // open its transparency page. The fetched config
+                                        // is validated in the shell leg (never trust the
+                                        // wire); what the page shows is what would run.
+                                        .algo_view => if (hit.post < market_catalog.items.len) {
+                                            const r = market_catalog.items[hit.post];
+                                            const cfg = algorithm_shell.fetch(gpa, arena, io, environ, session, r.author_did, r.rkey) catch |err| switch (err) {
+                                                error.OutOfMemory => return err,
+                                                else => blk: {
+                                                    status = "algorithm: fetch error";
+                                                    break :blk null;
+                                                },
+                                            };
+                                            if (cfg) |c| {
+                                                if (inspect_name.len > 0) gpa.free(inspect_name);
+                                                if (inspect_ref.len > 0) gpa.free(inspect_ref);
+                                                inspect_name = try gpa.dupe(u8, r.name);
+                                                inspect_ref = try gpa.dupe(u8, r.cid);
+                                                inspect_config = c;
+                                                transp_return_screen = gscreen;
+                                                gscreen = feed_view.screen_transparency;
+                                                gscroll_px = 0;
+                                            } else status = "algorithm: unavailable";
+                                        },
+                                        // "Add to loadout" (adopt + score) is the next
+                                        // slice — it needs the fetched config wired into
+                                        // the scoring resolver. Honest until then.
+                                        .algo_add => {
+                                            status = "Add to loadout is coming next — view its details for now.";
                                         },
                                         // Settings → Sign out: flag it and leave the
                                         // run loop. The caller (main) clears the cached
@@ -2914,6 +3045,15 @@ const Grid = struct {
     zone_hits: *lens_socket.HitList = undefined,
     /// The active Algorithms-page sub-tab (0 Loadout / 1 Marketplace / 2 Create).
     loadout_tab: u8 = 0,
+    /// The Marketplace tab's browse cards (published algorithms, mapped from the
+    /// AppView's rows). Empty on every other tab/screen. A value set per frame.
+    market: []const feed_view.MarketAlgoCard = &.{},
+    /// The transparency page's inspected algorithm (screen_transparency): its
+    /// fetched config + name + ref (CID), rebuilt into a page each frame. Null
+    /// config ⇒ not inspecting. Set per frame.
+    inspect_config: ?discover.FeedConfig = null,
+    inspect_name: []const u8 = "",
+    inspect_ref: []const u8 = "",
     /// Out: layoutLoadout writes each page socket's geometry here for the
     /// shell's drag math (feed / reply / zone).
     loadout_geoms: *[3]lens_socket.Geometry = undefined,
@@ -3656,7 +3796,12 @@ fn paintFrame(
             const feed_posts = feed_view.fromTimeline(arena, view_items, now) catch &[_]feed_view.PostView{};
             if (g.screen.* == feed_view.screen_loadout) {
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
-                g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null) catch g.content_h.*; // software: draw line-art nav
+                g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market) catch g.content_h.*; // software: draw line-art nav
+            } else if (g.screen.* == feed_view.screen_transparency) {
+                if (g.inspect_config) |cfg| {
+                    if (transparency.buildPage(arena, g.inspect_name, g.inspect_ref, cfg) catch null) |pg|
+                        g.content_h.* = feed_view.layoutTransparency(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, pg) catch g.content_h.*;
+                }
             } else {
                 // Tiling foundation (S.1): geometry comes through the partition
                 // seam. Slice 1 hands back the screen's own geometry (identical
@@ -4035,7 +4180,14 @@ fn paintFrameGpu(
             }
             gs.content_x = lg.col_x;
             gs.content_w = lg.col_w;
-            g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, true, true, lg) catch g.content_h.*; // GPU: SDF pass strikes the nav icons crisp
+            g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, true, true, lg, g.market) catch g.content_h.*; // GPU: SDF pass strikes the nav icons crisp
+        } else if (g.screen.* == feed_view.screen_transparency) {
+            // The algorithm transparency page: a plain scrolling document (no rail),
+            // rebuilt from the inspected config each entry (what you see = what runs).
+            if (g.inspect_config) |cfg| {
+                if (transparency.buildPage(arena, g.inspect_name, g.inspect_ref, cfg) catch null) |pg|
+                    g.content_h.* = feed_view.layoutTransparency(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, pg) catch g.content_h.*;
+            }
         } else {
             // skip_heart=true on every screen: the SDF heart pass (drawEngagementHearts,
             // below) draws the heart in place for each visible like button of the

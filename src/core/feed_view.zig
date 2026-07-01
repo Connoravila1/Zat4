@@ -146,7 +146,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add };
 
 /// The six top-level rail destinations, in order. The `Screen` index a nav
 /// region carries is an index into this. Shared by the rail (draw + hit) and
@@ -2061,6 +2061,20 @@ pub fn layoutCompose(
 /// other two are placeholders for later tracks.
 pub const loadout_tabs = [_][]const u8{ "Loadout", "Marketplace", "Create" };
 
+/// One marketplace browse card, as the Marketplace tab needs it — the shell fills
+/// it from the AppView's `AlgorithmView` rows (D3: the wire type stays in the
+/// shell; the pure renderer sees only these plain values). `learns` /
+/// `uses_behavioral` are the AppView's config-DERIVED privacy verdict (invariant
+/// 6), so the card's label is proven, never the author's claim.
+/// A7.2: cold — a short browse list, never a hot per-frame loop over quantity.
+pub const MarketAlgoCard = struct {
+    name: []const u8,
+    author: []const u8, // "@handle" or the DID when the handle is unresolved
+    learns: bool,
+    uses_behavioral: bool,
+    state_budget_bytes: u32,
+};
+
 /// A category's screen heading.
 fn transpCategory(c: transp.Category) []const u8 {
     return switch (c) {
@@ -2092,6 +2106,7 @@ pub fn layoutTransparency(
     width: i32,
     height: i32,
     dl: *raster.DrawList,
+    regions: ?*Regions,
     accent: u32,
     scroll: i32,
     page: transp.Page,
@@ -2100,7 +2115,17 @@ pub fn layoutTransparency(
     const m = metricsPage(width, screen_transparency);
     const lx = m.lx;
     const cw = m.cw;
+    if (regions) |rg| rg.clearRetainingCapacity();
     var y = 80 + scroll;
+
+    // A back affordance (the page draws no nav rail): "‹ Back" returns to wherever
+    // the page was entered from (the shell resolves the return screen).
+    {
+        const back_w: i32 = 78;
+        try rect(gpa, dl, lx, y - 34, back_w, 30, 0x14EDEAE0, 9);
+        _ = try str(gpa, dl, e, .semibold, lx + 16, y - 13, ink, 14, "‹ Back");
+        try emitRegion(gpa, regions, lx, y - 34, back_w, 30, 0, .back);
+    }
 
     // Header: the algorithm's name + the ref it is proven to be (invariant 5).
     _ = try str(gpa, dl, e, .semibold, lx, y + 36, ink, 38, page.name);
@@ -2214,6 +2239,10 @@ pub fn layoutLoadout(
     /// Optional partition geometry (the shell expands the loadout content into
     /// the freed space when the left rail condenses). Null ⇒ self-computed.
     pane_geom: ?PaneGeom,
+    /// The Marketplace tab's browse list (the AppView's published algorithms,
+    /// already mapped from the wire). Empty ⇒ the "nothing published yet" state.
+    /// Only read on tab 1; ignored on the others.
+    market: []const MarketAlgoCard,
 ) error{OutOfMemory}!i32 {
     // Algorithms is a WIDE page like the others: the glass spans the full
     // rectangle and the content centres in it — NO floating main-feed sidebar.
@@ -2263,9 +2292,10 @@ pub fn layoutLoadout(
             y += sh + 28;
         }
         content_h = (y - scroll) + 20; // total (unscrolled) height for scroll clamping
+    } else if (tab == 1) {
+        content_h = try drawMarketplace(gpa, dl, e, m, height, scroll, regions, accent, market);
     } else {
-        const msg = if (tab == 1) "Marketplace" else "Create an algorithm";
-        _ = try str(gpa, dl, e, .semibold, m.lx, content_top + 70, ink, 19, msg);
+        _ = try str(gpa, dl, e, .semibold, m.lx, content_top + 70, ink, 19, "Create an algorithm");
         _ = try str(gpa, dl, e, .regular, m.lx, content_top + 98, muted, 14, "Coming soon.");
         content_h = height; // nothing to scroll
     }
@@ -2285,6 +2315,70 @@ pub fn layoutLoadout(
     }
     try rect(gpa, dl, m.col_x, header_h - 1, m.col_w, 1, divider, 0);
     return content_h;
+}
+
+/// The MARKETPLACE tab: browse published algorithms. Each card shows the name,
+/// the author, the config-DERIVED privacy verdict (a coloured dot + label —
+/// proven, never the author's claim, invariant 6), the declared on-device state
+/// ceiling, and two affordances: "Details" (its transparency page) and "Add"
+/// (drop it into the feed loadout). Emits `.algo_view` / `.algo_add` regions
+/// carrying the card index. Empty list ⇒ a calm "nothing here yet" state. Only
+/// cards intersecting the viewport are painted (i16 coord safety). PURE.
+fn drawMarketplace(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, height: i32, scroll: i32, regions: ?*Regions, accent: u32, market: []const MarketAlgoCard) error{OutOfMemory}!i32 {
+    const content_top: i32 = 140;
+    const x0 = m.lx;
+    const w = m.cw;
+
+    if (market.len == 0) {
+        _ = try str(gpa, dl, e, .semibold, x0, content_top + 70, ink, 19, "No algorithms published yet");
+        _ = try str(gpa, dl, e, .regular, x0, content_top + 98, muted, 14, "Publish one and it shows up here to browse and adopt.");
+        return height; // nothing to scroll
+    }
+
+    var y: i32 = content_top + scroll;
+    const card_h: i32 = 128;
+    const gap: i32 = 16;
+    for (market, 0..) |a, i| {
+        if (y + card_h > 0 and y < height) {
+            try rect(gpa, dl, x0, y, w, card_h, skinPanel(accent), 16);
+            try rect(gpa, dl, x0, y, w, 1, 0x14EDEAE0, 16); // lit top edge
+
+            _ = try str(gpa, dl, e, .semibold, x0 + 22, y + 34, ink, 20, a.name);
+            _ = try str(gpa, dl, e, .regular, x0 + 22, y + 58, muted, 14, a.author);
+
+            // The proven privacy line: green when candidate-side (a privacy win),
+            // accent when it reads or learns from your attention.
+            const dot: u32 = if (a.uses_behavioral) accent else boost_c;
+            const label: []const u8 = if (a.learns)
+                "Learns on-device"
+            else if (a.uses_behavioral)
+                "Uses attention signals"
+            else
+                "No behavioral data";
+            try rect(gpa, dl, x0 + 22, y + 78, 9, 9, dot, 4);
+            const after = try str(gpa, dl, e, .semibold, x0 + 40, y + 89, body_c, 14, label);
+            if (a.learns and a.state_budget_bytes > 0) {
+                var buf: [48]u8 = undefined;
+                const kib = (a.state_budget_bytes + 1023) / 1024;
+                const s = std.fmt.bufPrint(&buf, "· up to {d} KB on device", .{kib}) catch "";
+                _ = try str(gpa, dl, e, .regular, after + 12, y + 89, faint, 13, s);
+            }
+
+            // The primary affordance, right-aligned: open this algorithm's
+            // transparency page (browse → inspect exactly what it does). "Add to
+            // loadout" (adopt + score) is the next slice — it needs the fetched
+            // config wired into the scoring resolver.
+            const btn_h: i32 = 34;
+            const btn_y = y + card_h - btn_h - 18;
+            const view_w: i32 = 128;
+            const view_x = x0 + w - view_w - 20;
+            try rect(gpa, dl, view_x, btn_y, view_w, btn_h, 0x14EDEAE0, 10); // ghost
+            _ = try str(gpa, dl, e, .semibold, view_x + 18, btn_y + 22, ink, 14, "View details");
+            try emitRegion(gpa, regions, view_x, btn_y, view_w, btn_h, @intCast(i), .algo_view);
+        }
+        y += card_h + gap;
+    }
+    return (y - scroll) + 20;
 }
 
 /// A zone's icon-tile colour, derived deterministically from its tag so a zone
