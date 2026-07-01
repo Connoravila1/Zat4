@@ -616,6 +616,20 @@ pub fn run(
     var inspect_loading = false;
     var inspectjob: InspectJob = .{};
     defer stopInspect(&inspectjob); // join any in-flight fetch before exit
+    // CID-keyed config cache (A8): an algorithm's config is a content-addressed,
+    // immutable record — same CID ⇒ same bytes ⇒ fetch ONCE, never again. Keyed by
+    // the record CID (duped), value = the serialized config (owned). A re-view is a
+    // local map hit (instant), only a never-seen algorithm pays the network fetch.
+    // (A size cap / eviction is a later concern; the marketplace is small for now.)
+    var config_cache: std.StringHashMapUnmanaged([]u8) = .empty;
+    defer {
+        var it = config_cache.iterator();
+        while (it.next()) |kv| {
+            gpa.free(kv.key_ptr.*);
+            gpa.free(kv.value_ptr.*);
+        }
+        config_cache.deinit(gpa);
+    }
     defer {
         if (inspect_bytes) |b| gpa.free(b);
         if (inspect_name.len > 0) gpa.free(inspect_name);
@@ -1008,6 +1022,20 @@ pub fn run(
                 if (inspectjob.bytes) |b| {
                     if (inspect_bytes) |old| gpa.free(old);
                     inspect_bytes = gpa.dupe(u8, b) catch null;
+                    // Cache the config by CID (A8) so a re-view never re-fetches.
+                    if (inspect_ref.len > 0 and !config_cache.contains(inspect_ref)) {
+                        const k = gpa.dupe(u8, inspect_ref) catch null;
+                        const v = gpa.dupe(u8, b) catch null;
+                        if (k != null and v != null) {
+                            config_cache.put(gpa, k.?, v.?) catch {
+                                gpa.free(k.?);
+                                gpa.free(v.?);
+                            };
+                        } else {
+                            if (k) |kk| gpa.free(kk);
+                            if (v) |vv| gpa.free(vv);
+                        }
+                    }
                     std.heap.page_allocator.free(b);
                     inspectjob.bytes = null;
                 }
@@ -1966,16 +1994,21 @@ pub fn run(
                                             inspect_bytes = null;
                                             inspect_name = try gpa.dupe(u8, r.name);
                                             inspect_ref = try gpa.dupe(u8, r.cid);
-                                            // Open the page IMMEDIATELY in a loading state; the config
-                                            // fetch runs on a worker (public read), so the UI never
-                                            // freezes on the network round-trip. Author == user at
-                                            // single-user scale, so the user's PDS serves the record.
-                                            startInspect(&inspectjob, io, environ, session.pds_url, r.author_did, r.rkey);
-                                            inspect_loading = true;
                                             transp_return_screen = gscreen;
                                             gscreen = feed_view.screen_transparency;
                                             gtransp_source = false; // open on the summary
                                             gscroll_px = 0;
+                                            // A8: a config we've already retrieved is immutable (same
+                                            // CID) — serve it from the cache, INSTANT, no network.
+                                            if (config_cache.get(r.cid)) |cached| {
+                                                inspect_bytes = gpa.dupe(u8, cached) catch null;
+                                                inspect_loading = false;
+                                            } else {
+                                                // Never seen: fetch on a worker (public read, no shared
+                                                // session), page opens in a loading state meanwhile.
+                                                startInspect(&inspectjob, io, environ, session.pds_url, r.author_did, r.rkey);
+                                                inspect_loading = true;
+                                            }
                                         },
                                         // "View the exact source" on the transparency
                                         // page → the byte-exact serialized artifact.
