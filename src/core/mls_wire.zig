@@ -159,6 +159,26 @@ pub fn writeVarint(gpa: Allocator, out: *std.ArrayList(u8), v: u32) WriteError!v
     }
 }
 
+/// Minimal-width varint into a caller stack buffer — for allocation-free
+/// callers (the key schedule's label encoding).
+pub fn varintBytes(buf: *[4]u8, v: u32) error{ValueTooLarge}![]const u8 {
+    if (v < 64) {
+        buf[0] = @intCast(v);
+        return buf[0..1];
+    } else if (v < 16384) {
+        buf[0] = @intCast(0x40 | (v >> 8));
+        buf[1] = @intCast(v & 0xff);
+        return buf[0..2];
+    } else if (v <= varint_max) {
+        buf[0] = @intCast(0x80 | (v >> 24));
+        buf[1] = @intCast((v >> 16) & 0xff);
+        buf[2] = @intCast((v >> 8) & 0xff);
+        buf[3] = @intCast(v & 0xff);
+        return buf[0..4];
+    }
+    return error.ValueTooLarge;
+}
+
 pub fn writeVector(gpa: Allocator, out: *std.ArrayList(u8), bytes: []const u8) WriteError!void {
     if (bytes.len > varint_max) return error.ValueTooLarge;
     try writeVarint(gpa, out, @intCast(bytes.len));
