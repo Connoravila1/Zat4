@@ -242,7 +242,8 @@ pub fn explain(arena: Allocator, config: discover.FeedConfig) error{OutOfMemory}
     inline for (@typeInfo(discover.FeedConfig).@"struct".fields) |f| {
         if (comptime std.mem.eql(u8, f.name, "rules") or std.mem.eql(u8, f.name, "vm_program") or
             std.mem.eql(u8, f.name, "guest_program") or std.mem.eql(u8, f.name, "guest_fuel") or
-            std.mem.eql(u8, f.name, "guest_strings"))
+            std.mem.eql(u8, f.name, "guest_strings") or
+            std.mem.eql(u8, f.name, "guest_retrieve"))
         {
             // The authored LOGIC — the L2 rule-list, the L3 VM program, and the
             // developer-tier guest program (+ its fuel + its tag-constant pool) — are
@@ -338,7 +339,8 @@ pub fn classify(config: discover.FeedConfig) Classification {
             std.mem.eql(u8, f.name, "query") or
             std.mem.eql(u8, f.name, "guest_program") or
             std.mem.eql(u8, f.name, "guest_fuel") or
-            std.mem.eql(u8, f.name, "guest_strings"))
+            std.mem.eql(u8, f.name, "guest_strings") or
+            std.mem.eql(u8, f.name, "guest_retrieve"))
         {
             // Logic lists, the retrieval sub-record, and the developer-tier guest
             // program carry no behavioral SCALAR weight here: the door wall keeps
@@ -650,7 +652,8 @@ fn leafFieldCount() usize {
     inline for (@typeInfo(discover.FeedConfig).@"struct".fields) |f| {
         if (comptime std.mem.eql(u8, f.name, "rules") or std.mem.eql(u8, f.name, "vm_program") or
             std.mem.eql(u8, f.name, "guest_program") or std.mem.eql(u8, f.name, "guest_fuel") or
-            std.mem.eql(u8, f.name, "guest_strings"))
+            std.mem.eql(u8, f.name, "guest_strings") or
+            std.mem.eql(u8, f.name, "guest_retrieve"))
         {
             // not scalar leaves — the authored logic (rules / L3 formula / the
             // developer-tier guest program + its fuel + its tag pool) renders as its own section

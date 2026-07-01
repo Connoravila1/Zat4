@@ -94,6 +94,7 @@ fn capabilityOf(name: []const u8) ?guest_abi.Capability {
         .{ "follows", guest_abi.Capability.source_follows },
         .{ "discovery", guest_abi.Capability.source_discovery },
         .{ "trending", guest_abi.Capability.source_trending },
+        .{ "tag_scope", guest_abi.Capability.source_tag_scope },
         .{ "has_tag", guest_abi.Capability.has_tag },
         .{ "state_read", guest_abi.Capability.state_read },
         .{ "state_write", guest_abi.Capability.state_write },
@@ -110,7 +111,7 @@ fn capabilityOf(name: []const u8) ?guest_abi.Capability {
 /// (no `else`), so a new capability must decide here whether it is tag-taking.
 fn capabilityTakesTag(cap: guest_abi.Capability) bool {
     return switch (cap) {
-        .has_tag => true,
+        .has_tag, .source_tag_scope => true,
         .source_follows, .source_discovery, .source_trending, .state_read, .state_write, .attention_dwell, .attention_clicked => false,
     };
 }
@@ -381,6 +382,27 @@ const Compiler = struct {
         if (n == parse.none) return;
         if (c.ast.nodes[n].tag == .block) return c.genBlock(n) else return c.genStmt(n);
     }
+
+    /// Compile ONE named function's body into a fresh bytecode slice, or null if no
+    /// such function exists. The code + locals reset per entry, but the STRING POOL
+    /// persists across entries of the same program — so a program's `score()` and
+    /// `retrieve()` share one tag-constant pool and their `push_const(index)` indices
+    /// agree with it (`compileArtifact`). Errors accumulate on the shared list.
+    fn compileEntry(c: *Compiler, entry_name: []const u8) Allocator.Error!?[]const Instr {
+        var entry: ?NodeIndex = null;
+        for (c.ast.top) |f| {
+            if (std.mem.eql(u8, c.ast.tokenText(f), entry_name)) entry = f;
+        }
+        if (entry == null) return null;
+        c.code.clearRetainingCapacity();
+        c.locals.clearRetainingCapacity();
+        c.next_slot = 0;
+        try c.genBlock(c.ast.nodes[entry.?].c); // the function body block
+        // Fall-off-the-end ⇒ the engine's base score, so a value is always defined.
+        _ = try c.emit(.{ .op = .push_fact, .fact = .base_score });
+        _ = try c.emit(.{ .op = .halt });
+        return try c.code.toOwnedSlice(c.arena);
+    }
 };
 
 /// Compile the `entry_name` function of a parsed program into `guest_vm` bytecode
@@ -397,29 +419,59 @@ pub fn compile(arena: Allocator, ast: *const Ast, entry_name: []const u8) Alloca
     }
 
     var c: Compiler = .{ .arena = arena, .ast = ast };
-
-    // Find the entry function among the top-level declarations.
-    var entry: ?NodeIndex = null;
-    for (ast.top) |f| {
-        if (std.mem.eql(u8, ast.tokenText(f), entry_name)) entry = f;
-    }
-    if (entry == null) {
+    const prog = (try c.compileEntry(entry_name)) orelse {
         try c.err("no such function", 0);
         return .{ .program = &.{}, .errors = try c.errors.toOwnedSlice(arena) };
-    }
-
-    const body = ast.nodes[entry.?].c; // the function's body block
-    try c.genBlock(body);
-    // If control falls off the end (no explicit return), the natural result is the
-    // engine's base score — emit it so a value is always defined.
-    _ = try c.emit(.{ .op = .push_fact, .fact = .base_score });
-    _ = try c.emit(.{ .op = .halt });
-
+    };
     if (c.errors.items.len > 0) {
         return .{ .program = &.{}, .errors = try c.errors.toOwnedSlice(arena) };
     }
     return .{
-        .program = try c.code.toOwnedSlice(arena),
+        .program = prog,
+        .strings = try c.strings.toOwnedSlice(arena),
+        .errors = &.{},
+    };
+}
+
+/// A whole guest ARTIFACT: a program's entry points compiled together, sharing ONE
+/// tag-constant pool. `score` is required (a feed IS a scoring function); `retrieve`
+/// is optional (empty when the program has no `retrieve()`). Fail-closed: any error
+/// yields empty programs. A7.2: cold, waived.
+pub const Artifact = struct {
+    score: []const Instr,
+    retrieve: []const Instr = &.{},
+    strings: []const []const u8 = &.{},
+    errors: []const Error,
+    pub fn ok(self: Artifact) bool {
+        return self.errors.len == 0;
+    }
+};
+
+/// Compile a parsed program's `score()` (required) and `retrieve()` (optional) into
+/// one artifact with a SHARED tag pool (PURE over `(arena, ast)`). This is the
+/// artifact the developer tier publishes and runs: `score` ranks each candidate,
+/// `retrieve` composes the pool, and both index the same `strings`. Fail-closed —
+/// any parse or compile error yields empty programs (the caller re-validates each
+/// with `guest_vm.validProgram`, the untrusted-compiler / trusted-validator split).
+pub fn compileArtifact(arena: Allocator, ast: *const Ast) Allocator.Error!Artifact {
+    if (!ast.ok()) {
+        const es = try arena.alloc(Error, ast.errors.len);
+        for (es, ast.errors) |*d, s| d.* = .{ .msg = s.msg, .start = s.start };
+        return .{ .score = &.{}, .errors = es };
+    }
+    var c: Compiler = .{ .arena = arena, .ast = ast };
+    const score_prog = (try c.compileEntry("score")) orelse {
+        try c.err("a feed algorithm needs a score() function", 0);
+        return .{ .score = &.{}, .errors = try c.errors.toOwnedSlice(arena) };
+    };
+    // retrieve() is optional; absent ⇒ the declarative query.sources are used.
+    const retrieve_prog: []const Instr = (try c.compileEntry("retrieve")) orelse &.{};
+    if (c.errors.items.len > 0) {
+        return .{ .score = &.{}, .errors = try c.errors.toOwnedSlice(arena) };
+    }
+    return .{
+        .score = score_prog,
+        .retrieve = retrieve_prog,
         .strings = try c.strings.toOwnedSlice(arena),
         .errors = &.{},
     };
@@ -556,6 +608,35 @@ test "compile+run: has_tag compiles to a pooled tag index + a host call" {
     const host = vm.Host{ .ctx = &ctx, .call = H.call };
     try t.expectEqual(@as(f64, 200.0), vm.run(res.program, sample, 0, vm.default_fuel, &host)); // tagged → doubled
     try t.expectEqual(@as(f64, 100.0), vm.run(res.program, sample, 0, vm.default_fuel, null)); // no host → untagged branch
+}
+
+test "compileArtifact: score and retrieve compile together, sharing one tag pool" {
+    var a = std.heap.ArenaAllocator.init(t.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const src =
+        \\fn score() num { if (has_tag("zig")) { return 2.0; } return 1.0; }
+        \\fn retrieve() num { tag_scope("rust", 1.0); return 0.0; }
+    ;
+    const ast = try parse.parse(arena, src);
+    const art = try compileArtifact(arena, &ast);
+    try t.expect(art.ok());
+    try t.expect(art.score.len > 0);
+    try t.expect(art.retrieve.len > 0);
+    // Both literals share ONE pool — score compiles first (zig → 0), then retrieve
+    // (rust → 1) — so each program's push_const index agrees with `strings`.
+    try t.expectEqual(@as(usize, 2), art.strings.len);
+    try t.expectEqualStrings("zig", art.strings[0]);
+    try t.expectEqualStrings("rust", art.strings[1]);
+    // A program with no retrieve() is valid — score alone, empty retrieve.
+    const ast2 = try parse.parse(arena, "fn score() num { return like_count; }");
+    const art2 = try compileArtifact(arena, &ast2);
+    try t.expect(art2.ok());
+    try t.expectEqual(@as(usize, 0), art2.retrieve.len);
+    // Missing score() is an error (a feed IS a scoring function).
+    const ast3 = try parse.parse(arena, "fn retrieve() num { return 0.0; }");
+    const art3 = try compileArtifact(arena, &ast3);
+    try t.expect(!art3.ok());
 }
 
 test "compile: a text literal is rejected outside a tag argument (type discipline, fail-closed)" {

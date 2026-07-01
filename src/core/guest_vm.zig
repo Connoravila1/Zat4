@@ -444,7 +444,7 @@ test "guards + counts" {
 fn mockHostCall(ctx: *anyopaque, cap: guest_abi.Capability, a0: f64, a1: f64) f64 {
     _ = ctx;
     return switch (cap) {
-        .source_follows, .source_discovery, .source_trending => a0 + a1,
+        .source_follows, .source_discovery, .source_trending, .source_tag_scope => a0 + a1,
         .has_tag => if (a0 != 0) @as(f64, 1) else 0, // mock: "tagged" iff a non-zero pool index
         .state_read => a0,
         .state_write => 0,

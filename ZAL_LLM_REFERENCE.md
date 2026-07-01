@@ -26,22 +26,31 @@ job: given the facts about one post, return how good it is for this reader.
 
 ---
 
-## 2. The one entry point
+## 2. The entry points
 
 ```
 fn score() num {
     // ... compute using the facts + functions below ...
     return <a number>;
 }
+
+fn retrieve() num {          // OPTIONAL — shapes which posts enter the feed
+    tag_scope("zig", 1.0);   // add a source; the return value is ignored
+    return 0.0;
+}
 ```
 
-- The program **must** contain a function named exactly `score`.
-- It takes **no parameters** — the current post's data arrives as the *facts* in
-  §4, which you reference by name.
-- It **returns a `num`** (see types below). Return a larger number for posts that
-  should rank higher.
-- You may write other `fn` declarations, but **only `score` is compiled, and it
-  cannot call your other functions yet** — put all your logic inside `score`.
+- The program **must** contain a function named exactly `score`. Return a larger
+  number for posts that should rank higher.
+- It may **optionally** contain a function named exactly `retrieve`, which runs
+  once per refresh to compose the candidate **pool**: call the retrieval functions
+  (`follows`, `discovery`, `trending`, `tag_scope`) to add sources. Each call adds
+  a source; a post is kept if it matches at least one. With no `retrieve()`, the
+  default pool is used. The returned `num` is ignored.
+- Both take **no parameters** — the current post's data arrives as the *facts* in
+  §4 (for `score`), which you reference by name.
+- You may write other `fn` declarations, but **only `score`/`retrieve` are
+  compiled, and they cannot call your other functions yet** — keep logic inline.
 
 ---
 
@@ -120,9 +129,20 @@ There are **no other functions.** No `print`, no `random`, no `now`, no `sqrt`,
 no `exp`, no `pow`, no `log`, no math library. If you need a curve, build it from
 `+ - * /` (see the recency idiom below).
 
-> Retrieval functions (`follows`, `discovery`, `trending`) — which choose *which*
-> posts enter the feed — exist but belong to a separate `retrieve()` entry point
-> that is not yet available. **Do not call them from `score()`.**
+**Retrieval (call from `retrieve()` only, never `score()`).** These choose *which*
+posts enter the pool. Each call adds a source; a post is kept if it matches any.
+
+| Call | Adds to the pool |
+|------|------------------|
+| `follows(weight)` | posts from accounts you follow |
+| `discovery(weight)` | posts from beyond your follows |
+| `trending(threshold, weight)` | posts with engagement ≥ `threshold` |
+| `tag_scope("zig", weight)` | posts in the named zone |
+
+> `tag_scope` (and `has_tag`) take a **tag name in quotes** as the first argument —
+> a text value is *only* ever a tag name, never used in arithmetic and never an
+> author. The out-of-network sources (`discovery`, network graph, similarity) reach
+> a wider pool as the network grows.
 
 ---
 

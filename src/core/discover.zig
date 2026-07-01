@@ -321,6 +321,15 @@ pub const FeedConfig = struct {
     /// identity — a guest reads tag membership, never a handle. Borrows the caller's
     /// memory; clamped to `guest_vm.max_strings` by `validated`.
     guest_strings: []const []const u8 = &.{},
+    /// THE DEVELOPER TIER — the guest's optional `retrieve()` program, compiled from
+    /// the same Zal source as `guest_program` (its `score`). When present it composes
+    /// the candidate QUERY: run ONCE per refresh, its `follows/discovery/trending/
+    /// tag_scope` capability calls append retrieval sources, and those REPLACE
+    /// `query.sources` for the run — the guest shapes its own pool (still host-run
+    /// over indexes, still pre-moderation, invariant 8). Empty ⇒ the declarative
+    /// `query.sources` are used, unchanged. Borrows the caller's memory; validated
+    /// like `guest_program`.
+    guest_retrieve: []const guest_vm.Instr = &.{},
 };
 
 /// The hard ceiling on a single algorithm's declared on-device state (10 MiB).
@@ -456,6 +465,62 @@ const ScoreHost = struct {
     }
 };
 
+/// The query-builder host for a guest `retrieve()` run: each source capability the
+/// guest calls APPENDS a `retrieval.Source` to a list the engine then executes. The
+/// guest never traverses anything — it names + weights sources, exactly the config
+/// tier's vocabulary, so no raw/network reach is expressible (D2). PURE (it grows an
+/// arena list). Capped at `max_sources` (a runaway `retrieve()` can't build an
+/// unbounded query; fuel bounds the loop too). A7.2: cold — one per refresh. Waived.
+const RetrieveHost = struct {
+    arena: Allocator,
+    strings: []const []const u8, // the artifact's tag pool (for source_tag_scope)
+    out: *std.ArrayListUnmanaged(retrieval.Source),
+    oom: bool = false, // an append failed — surfaced after the run (the host fn can't error)
+
+    fn call(ctx: *anyopaque, cap: guest_abi.Capability, arg0: f64, arg1: f64) f64 {
+        const self: *RetrieveHost = @ptrCast(@alignCast(ctx));
+        if (self.out.items.len >= max_sources) return 0; // the DoS wall — ignore further sources
+        const src: ?retrieval.Source = switch (cap) {
+            .source_follows => .{ .kind = .follows, .weight = clampWeight(arg0) },
+            .source_discovery => .{ .kind = .discovery, .weight = clampWeight(arg0) },
+            .source_trending => .{ .kind = .trending, .threshold = clampWeight(arg0), .weight = clampWeight(arg1) },
+            .source_tag_scope => blk: {
+                // arg0 = tag pool index (host-resolved), arg1 = weight.
+                if (!(arg0 >= 0 and arg0 < @as(f64, @floatFromInt(self.strings.len)))) break :blk null;
+                break :blk .{ .kind = .tag_scope, .tag = self.strings[@intFromFloat(arg0)], .weight = clampWeight(arg1) };
+            },
+            else => null, // content/state/behavioral are not query-composing
+        };
+        if (src) |s| self.out.append(self.arena, s) catch {
+            self.oom = true;
+        };
+        return 0;
+    }
+};
+
+/// Keep a guest-supplied weight/threshold finite (a source weight rides through
+/// `retrieval.poolWeight`, which already ignores non-finite/negative, but clamping
+/// here keeps the stored query clean). The VM already sanitizes values.
+fn clampWeight(v: f64) f32 {
+    if (!std.math.isFinite(v)) return 0;
+    return @floatCast(v);
+}
+
+/// Run a guest `retrieve()` program once to compose its candidate query. The guest
+/// has no candidate here (it names sources, not scores posts), so it runs over a
+/// zeroed view; any fact it reads is 0 and any content/state call is inert. Returns
+/// the composed sources (bounded by `max_sources`), or an empty query on OOM (E4:
+/// the caller falls back to the whole pool). Allocates in `arena` (C3). PURE.
+fn composeGuestQuery(arena: Allocator, config: FeedConfig) error{OutOfMemory}![]const retrieval.Source {
+    var out: std.ArrayListUnmanaged(retrieval.Source) = .empty;
+    var host_ctx = RetrieveHost{ .arena = arena, .strings = config.guest_strings, .out = &out };
+    const host = guest_vm.Host{ .ctx = &host_ctx, .call = RetrieveHost.call };
+    const zero_view: guest_abi.CandidateView = .{ .like_count = 0, .repost_count = 0, .reply_count = 0, .age_hrs = 0, .author_rep = 0, .in_network = false };
+    _ = guest_vm.run(config.guest_retrieve, zero_view, 0, config.guest_fuel, &host);
+    if (host_ctx.oom) return error.OutOfMemory;
+    return out.toOwnedSlice(arena);
+}
+
 /// Rank a candidate pool: pure transform from (candidates, config, now) → the
 /// candidates' refs in DESCENDING score order, allocated in `arena` (C1/C3).
 /// Diversity caps and moderation are SEPARATE later passes (D4) — this returns
@@ -472,6 +537,15 @@ pub fn score(arena: Allocator, cands: *const Candidates, config: FeedConfig, now
     // Level-1 feed) skips this entirely. The non-bypassable moderation/diversity
     // pass (D4) still runs AFTER, on the result — a rule cannot resurface what
     // moderation hides.
+    // The EFFECTIVE retrieval query: a guest `retrieve()` program composes its own
+    // sources (run once here), otherwise the declarative `query.sources` are used.
+    // Either way the host runs the query over the pool below — the guest names
+    // sources, never traverses (D2). Composed once, before the per-candidate loop.
+    const eff_sources: []const retrieval.Source = if (config.guest_retrieve.len > 0)
+        try composeGuestQuery(arena, config)
+    else
+        config.query.sources;
+
     const scores = try arena.alloc(f64, n);
     var kept: std.ArrayListUnmanaged(u32) = .empty;
     try kept.ensureTotalCapacity(arena, n);
@@ -486,7 +560,7 @@ pub fn score(arena: Allocator, cands: *const Candidates, config: FeedConfig, now
         // then multiplies the base score by the retrieval weight, so a post pulled
         // by several sources surfaces stronger.
         const row_tags: []const []const u8 = if (i < cands.cand_tags.items.len) cands.cand_tags.items[i] else &.{};
-        const pool_w: f32 = retrieval.poolWeight(config.query.sources, .{
+        const pool_w: f32 = retrieval.poolWeight(eff_sources, .{
             .in_network = in_net,
             .engagement = c.like_count + c.repost_count + c.reply_count,
             .tags = row_tags,
@@ -699,6 +773,10 @@ pub fn validated(c: FeedConfig) FeedConfig {
     // guest VM's own validator — the untrusted-compiler / trusted-validator split),
     // and clamp the fuel budget to the DoS ceiling.
     v.guest_program = guest_vm.validatedProgram(v.guest_program);
+    // The guest's retrieve() program: reject a malformed one to a safe no-op (the
+    // same untrusted-compiler / trusted-validator split as the score program). An
+    // empty retrieve() ⇒ the declarative query.sources are used.
+    v.guest_retrieve = guest_vm.validatedProgram(v.guest_retrieve);
     // Clip a hostile/oversized tag-constant pool to its cap (a `has_tag` lookup is
     // `candidates × pool` in the worst case). Truncating the const slice borrows the
     // same memory — no allocation, so `validated` stays pure. An index past the
@@ -1001,6 +1079,43 @@ test "developer tier: a guest ranks by TAG membership via has_tag (content capab
     const order = try score(arena, &c, cfg, test_now);
     try t.expectEqual(@as(usize, 2), order.len);
     try t.expectEqual(@as(u32, 2), order[0].raw()); // 1000 (tagged) > 500 (untagged likes)
+}
+
+test "developer tier: a guest retrieve() composes its own pool via tag_scope" {
+    const t = std.testing;
+    const zal_parse = @import("zal_parse.zig");
+    const zal_compile = @import("zal_compile.zig");
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // score by likes; retrieve ONLY the zig zone — the guest shapes its own pool.
+    const src =
+        \\fn retrieve() num { tag_scope("zig", 1.0); return 0.0; }
+        \\fn score() num { return like_count; }
+    ;
+    const ast = try zal_parse.parse(arena, src);
+    const art = try zal_compile.compileArtifact(arena, &ast);
+    try t.expect(art.ok());
+    try t.expect(art.retrieve.len > 0);
+    var cfg = DEFAULT_CONFIG;
+    cfg.guest_program = art.score;
+    cfg.guest_retrieve = art.retrieve;
+    cfg.guest_strings = art.strings; // ONE shared pool for score + retrieve
+    cfg = validated(cfg);
+
+    var c: Candidates = .{};
+    defer c.deinit(t.allocator);
+    try c.append(t.allocator, mk(1, 3600, 500), true); // untagged, popular
+    try c.append(t.allocator, mk(2, 3600, 5), true); // #zig, unpopular
+    c.cand_tags.items[0] = &.{};
+    c.cand_tags.items[1] = &.{"zig"};
+
+    // The guest's retrieve() ran once, composed a tag_scope("zig") source, and the
+    // engine kept ONLY the #zig post — the popular untagged one was never retrieved.
+    const order = try score(arena, &c, cfg, test_now);
+    try t.expectEqual(@as(usize, 1), order.len);
+    try t.expectEqual(@as(u32, 2), order[0].raw());
 }
 
 test "score: a source WEIGHT lifts its pool — heavily-weighted follows beats a more-engaged discovery post" {

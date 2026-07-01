@@ -131,15 +131,20 @@ test "round trip: a guest program's tag-constant pool survives serialize/parse" 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // A guest program that references two zone tags → a two-entry pool.
-    const src = "fn score() num { if (has_tag(\"zig\")) { return 2.0; } if (has_tag(\"rust\")) { return 1.5; } return like_count; }";
+    // A guest artifact with BOTH entries: score() reads a tag, retrieve() scopes to
+    // another — a shared two-entry pool, both programs and the pool must round-trip.
+    const src =
+        \\fn score() num { if (has_tag("zig")) { return 2.0; } return like_count; }
+        \\fn retrieve() num { tag_scope("rust", 1.0); return 0.0; }
+    ;
     const ast = try zal_parse.parse(arena, src);
-    const res = try zal_compile.compile(arena, &ast, "score");
-    try t.expect(res.ok());
+    const art = try zal_compile.compileArtifact(arena, &ast);
+    try t.expect(art.ok());
 
     var cfg = discover.DEFAULT_CONFIG;
-    cfg.guest_program = res.program;
-    cfg.guest_strings = res.strings;
+    cfg.guest_program = art.score;
+    cfg.guest_retrieve = art.retrieve;
+    cfg.guest_strings = art.strings;
 
     const bytes = try serialize(arena, cfg);
     const back = try parse(arena, bytes);
@@ -147,7 +152,8 @@ test "round trip: a guest program's tag-constant pool survives serialize/parse" 
     try t.expectEqual(@as(usize, 2), back.guest_strings.len);
     try t.expectEqualStrings("zig", back.guest_strings[0]);
     try t.expectEqualStrings("rust", back.guest_strings[1]);
-    try t.expect(back.guest_program.len == res.program.len);
+    try t.expect(back.guest_program.len == art.score.len);
+    try t.expect(back.guest_retrieve.len == art.retrieve.len); // retrieve() survives too
     // What you inspect IS what runs: re-serializing reproduces the same bytes (CID).
     const bytes2 = try serialize(arena, back);
     try t.expectEqualSlices(u8, bytes, bytes2);
