@@ -90,12 +90,14 @@ pub const Op = enum(u8) {
     select, // cond, then, else ⇒ (cond != 0 ? then : else)
     dup, // push a copy of the top
     pop, // discard the top
+    load, // pop idx; push scratch[idx]  (out-of-range ⇒ 0)
+    store, // pop idx, pop value; scratch[idx] = value  (out-of-range ⇒ no-op)
     jump, // pc = `arg` (unconditional)
     jump_if_zero, // pop cond; if 0, pc = `arg`, else fall through
     halt, // stop; the result is the top of the stack
 
     comptime {
-        assert(@typeInfo(Op).@"enum".fields.len == 18);
+        assert(@typeInfo(Op).@"enum".fields.len == 20);
     }
 };
 
@@ -126,6 +128,14 @@ pub const max_program_len: usize = 4096;
 /// The operand-stack depth. A bounded, owned buffer; push past it drops (a
 /// malformed program stays safe rather than trapping), pop past bottom yields 0.
 pub const stack_cap: usize = 64;
+
+/// The guest's per-run SCRATCH memory, in f64 words — a bounded, owned array the
+/// program reads/writes for its variables and small vectors (accumulators, feature
+/// tallies). ZEROED at the start of every run and discarded at the end: this is
+/// ephemeral working memory, NOT the persistent learned model (that is the
+/// state_read/state_write capability, sub-slice 2c). Every access is bounds-checked
+/// (out-of-range load ⇒ 0, store ⇒ no-op), so there is no path to host memory.
+pub const mem_words: usize = 1024;
 
 /// The default per-run fuel budget (max instructions executed for ONE candidate).
 /// The real budget is declared per-algorithm and capped at `max_fuel`; this is the
@@ -159,6 +169,15 @@ fn factValue(fact: Fact, v: guest_abi.CandidateView, base_score: f64) f64 {
         .author_rep => v.author_rep,
         .in_network => if (v.in_network) 1.0 else 0.0,
     };
+}
+
+/// Resolve an f64 scratch-memory index to an in-range word index, or null when it
+/// is negative, too large, or non-integral-out-of-range. Truncates toward zero.
+/// The index came off the operand stack (already `sanitize`d finite), so the guard
+/// is just the range; `@intFromFloat` is safe because the bounds are checked first.
+fn memIndex(fidx: f64) ?usize {
+    if (!(fidx >= 0 and fidx < @as(f64, @floatFromInt(mem_words)))) return null;
+    return @intFromFloat(fidx);
 }
 
 /// A bounded operand stack (the `algo_vm` design). `push` past the cap drops the
@@ -199,6 +218,7 @@ const Stack = struct {
 pub fn run(program: []const Instr, view: guest_abi.CandidateView, base_score: f64, fuel_budget: u32) f64 {
     @setRuntimeSafety(true); // untrusted bytecode drives `pc` — force checks on regardless of build
     var st: Stack = .{};
+    var mem = [_]f64{0} ** mem_words; // per-run scratch, zeroed; discarded at the end
     var pc: usize = 0;
     var fuel: u32 = 0;
     while (pc < program.len) {
@@ -280,6 +300,17 @@ pub fn run(program: []const Instr, view: guest_abi.CandidateView, base_score: f6
                 _ = st.pop();
                 pc += 1;
             },
+            .load => {
+                const v = if (memIndex(st.pop())) |i| mem[i] else 0;
+                st.push(v);
+                pc += 1;
+            },
+            .store => {
+                const idx = st.pop();
+                const v = st.pop();
+                if (memIndex(idx)) |i| mem[i] = sanitize(v); // out-of-range ⇒ no-op
+                pc += 1;
+            },
             .jump => {
                 // An out-of-range target ends the loop (the `while` guard), so a bad
                 // jump just terminates — safe. A jump to self burns fuel until it's
@@ -340,8 +371,38 @@ const sample: guest_abi.CandidateView = .{
 
 test "guards + counts" {
     try t.expectEqual(@as(usize, 8), @sizeOf(Instr));
-    try t.expectEqual(@as(usize, 18), @typeInfo(Op).@"enum".fields.len);
+    try t.expectEqual(@as(usize, 20), @typeInfo(Op).@"enum".fields.len);
     try t.expectEqual(@as(usize, 7), @typeInfo(Fact).@"enum".fields.len);
+}
+
+test "run: SCRATCH MEMORY as a loop accumulator — sum 1..N into mem[0] = 5050" {
+    // mem[0] = 0; i = N; while (i > 0) { mem[0] += i; i -= 1; }  result = mem[0].
+    // With memory the accumulator lives in mem[0], not juggled on the stack — the
+    // shape a real algorithm uses. N = like_count = 100 ⇒ 100·101/2 = 5050.
+    // store pops idx (top) then value; load pops idx (top), pushes scratch[idx].
+    const prog = [_]Instr{
+        .{ .op = .push_const, .value = 0 }, //  0: value 0        [0]
+        .{ .op = .push_const, .value = 0 }, //  1: idx 0          [0,0]
+        .{ .op = .store }, //  2: mem[0]=0            []
+        .{ .op = .push_fact, .fact = .like_count }, //  3: i=N    [i]
+        .{ .op = .dup }, //  4: loop head             [i,i]
+        .{ .op = .push_const, .value = 0 }, //  5      [i,i,0]
+        .{ .op = .gt }, //  6: i>0?                    [i,cond]
+        .{ .op = .jump_if_zero, .arg = 17 }, //  7: exit → @17  [i]
+        .{ .op = .dup }, //  8: [i,i]
+        .{ .op = .push_const, .value = 0 }, //  9: idx 0   [i,i,0]
+        .{ .op = .load }, // 10: push mem[0]=acc     [i,i,acc]
+        .{ .op = .add }, // 11: acc + i              [i, acc+i]
+        .{ .op = .push_const, .value = 0 }, // 12: idx 0  [i, acc+i, 0]
+        .{ .op = .store }, // 13: mem[0]=acc+i        [i]
+        .{ .op = .push_const, .value = 1 }, // 14      [i,1]
+        .{ .op = .sub }, // 15: i-1                   [i-1]
+        .{ .op = .jump, .arg = 4 }, // 16: loop
+        .{ .op = .pop }, // 17: (end) drop i=0        []
+        .{ .op = .push_const, .value = 0 }, // 18: idx 0  [0]
+        .{ .op = .load }, // 19: result = mem[0]      [5050]
+    };
+    try t.expectEqual(@as(f64, 5050.0), run(&prog, sample, 0, default_fuel));
 }
 
 test "run: empty program leaves the base score untouched (inert by default)" {
