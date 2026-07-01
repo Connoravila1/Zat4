@@ -47,6 +47,8 @@ const transparency = @import("transparency.zig");
 const rules_mod = @import("rules.zig");
 const algo_vm = @import("algo_vm.zig");
 const retrieval = @import("retrieval.zig");
+const algo_library = @import("algo_library.zig");
+const algorithm = @import("algorithm.zig");
 
 // Zat4 Discover's PHASE-0 RETRIEVAL query — where candidates are pulled from,
 // composed. Your follows carry the pool; discovery reaches a bit beyond them; and
@@ -313,6 +315,51 @@ pub fn findById(id: []const u8) ?Builtin {
 pub fn scoringConfigForId(id: []const u8) ?discover.FeedConfig {
     const b = findById(id) orelse return null;
     return b.config;
+}
+
+/// The scoring `FeedConfig` for ANY lens id — a built-in (its static config) OR a
+/// user LIBRARY record (its serialized config, parsed). Null = the no-scoring
+/// chronological path (a built-in / library algo with no config, or an unknown id).
+/// A built-in id takes precedence over a library one (the first-party name is
+/// reserved). The parsed config's slices (rules / programs / sources / tag pool)
+/// live in `arena` (C3), so the caller scores within that arena's lifetime. This is
+/// the library-aware superset of `scoringConfigForId`; callers holding a library use
+/// it, so a created or downloaded algorithm scores through the same one engine.
+pub fn scoringConfig(arena: Allocator, id: []const u8, library: ?*const algo_library.Library) error{OutOfMemory}!?discover.FeedConfig {
+    if (findById(id)) |b| return b.config; // built-in: static config, or null (chronological)
+    if (library) |lib| {
+        if (lib.findById(id)) |rec| {
+            const bytes = lib.configBytes(rec);
+            if (bytes.len == 0) return null; // a no-scoring library algo (E4)
+            return try algorithm.parse(arena, bytes); // validated inside parse
+        }
+    }
+    return null;
+}
+
+test "scoringConfig: resolves a built-in, then a library record, then falls to null" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A built-in resolves to its static config even with a library present.
+    try t.expect((try scoringConfig(arena, "zat4:discover", null)) != null);
+
+    // A user library record resolves by parsing its serialized config.
+    var lib: algo_library.Library = .{};
+    defer lib.deinit(t.allocator);
+    var cfg = discover.DEFAULT_CONFIG;
+    cfg.w_reply = 12.0;
+    const bytes = try algorithm.serialize(arena, cfg);
+    _ = try lib.add(t.allocator, .{ .id = "user:1", .name = "Mine", .ranks = "", .desc = "", .creator = "you", .config = bytes });
+    const resolved = (try scoringConfig(arena, "user:1", &lib)).?;
+    try t.expectEqual(@as(f32, 12.0), resolved.w_reply); // the record's config, parsed back
+
+    // An unknown id, and a no-config library algo, are the no-scoring path.
+    try t.expect((try scoringConfig(arena, "user:unknown", &lib)) == null);
+    _ = try lib.add(t.allocator, .{ .id = "user:chrono", .name = "Chrono", .ranks = "", .desc = "", .creator = "you" });
+    try t.expect((try scoringConfig(arena, "user:chrono", &lib)) == null);
 }
 
 test "scoringConfigForId: Discover scores, Following is the no-scoring path" {
