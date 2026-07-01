@@ -56,6 +56,8 @@ const Allocator = std.mem.Allocator;
 const rules_mod = @import("rules.zig");
 const algo_vm = @import("algo_vm.zig");
 const retrieval = @import("retrieval.zig");
+const guest_vm = @import("guest_vm.zig");
+const guest_abi = @import("guest_abi.zig");
 
 // ---------------------------------------------------------------------------
 // The candidate — the hot record the scorer consumes (Phase D1)
@@ -275,6 +277,20 @@ pub const FeedConfig = struct {
     /// part of the algorithm); the load path rejects a malformed program to a
     /// no-op (`validated`). Borrows the caller's memory like `rules`.
     vm_program: []const algo_vm.Instr = &.{},
+
+    /// THE DEVELOPER TIER — a compiled `guest_vm` program (authored in Zal). When
+    /// present, it IS the ranking: the engine marshals each candidate's public
+    /// features into a `guest_abi.CandidateView` and runs the program to get the
+    /// score, INSTEAD of the L1 formula + L2 rules + L3 VM above. Retrieval still
+    /// shapes the pool BEFORE it, and moderation/diversity (D4) still run AFTER it —
+    /// a guest gets freedom over ranking, never over the pool (invariant 8). Empty
+    /// by default, so every config/rule/L3 algorithm is unaffected. Run here with a
+    /// NULL host (facts only, pure); the on-device attention + state capabilities
+    /// are wired in the shell (they touch I/O — B3/B4). Borrows the caller's memory.
+    guest_program: []const guest_vm.Instr = &.{},
+    /// The guest program's per-candidate fuel budget (a CPU-DoS wall; the scorer
+    /// runs `candidates × fuel`). Clamped to `guest_vm.max_fuel` by `validated`.
+    guest_fuel: u32 = guest_vm.default_fuel,
 };
 
 /// The hard ceiling on a single algorithm's declared on-device state (10 MiB).
@@ -414,6 +430,19 @@ pub fn score(arena: Allocator, cands: *const Candidates, config: FeedConfig, now
             .in_network = in_net,
             .engagement = c.like_count + c.repost_count + c.reply_count,
         }) orelse continue; // matched no source ⇒ not in the pool
+
+        // THE DEVELOPER TIER: a compiled guest program IS the ranking when present —
+        // marshal the candidate's public features and run it (null host: facts only,
+        // pure). It replaces the L1/L2/L3 path below; retrieval already shaped the
+        // pool, and D4 moderation/diversity still runs after (invariant 8).
+        if (config.guest_program.len > 0) {
+            const view = candidateView(c, in_net, now);
+            const base = scoreRow(c, config, now); // available to the guest as `base_score`
+            scores[i] = guest_vm.run(config.guest_program, view, base, config.guest_fuel, null) * @as(f64, pool_w);
+            kept.appendAssumeCapacity(@intCast(i));
+            continue;
+        }
+
         var s = scoreRow(c, config, now) * @as(f64, pool_w);
         // The creator's authored logic, in two composable layers over the same
         // public facts: the Level-2 rule-list (which may EXCLUDE a candidate),
@@ -453,6 +482,23 @@ pub fn score(arena: Allocator, cands: *const Candidates, config: FeedConfig, now
     const out = try arena.alloc(Ref, order.len); // ≤ n when rules excluded some
     for (out, order) |*o, idx| o.* = refs[idx];
     return out;
+}
+
+/// Marshal one candidate's PUBLIC features into a `guest_abi.CandidateView` for the
+/// developer tier — the exact, no-identity feature set a guest program reads (a
+/// guest sees no author DID / "is this me", so it cannot target an account). `now`
+/// is the value the scorer was handed (B4); `age_hrs` is derived here.
+fn candidateView(c: Candidate, in_network: bool, now: i64) guest_abi.CandidateView {
+    const d = now - c.created_at;
+    const age_hrs: f32 = if (d <= 0) 0 else @floatCast(@as(f64, @floatFromInt(d)) / 3600.0);
+    return .{
+        .like_count = c.like_count,
+        .repost_count = c.repost_count,
+        .reply_count = c.reply_count,
+        .age_hrs = age_hrs,
+        .author_rep = c.author_rep,
+        .in_network = in_network,
+    };
 }
 
 /// The rule-evaluator facts for one candidate (in-network from the pool's
@@ -575,6 +621,12 @@ pub fn validated(c: FeedConfig) FeedConfig {
     // expression VM). `validatedProgram` keeps a well-formed, within-cap program
     // and discards the rest — fail-safe, never partially executed (E2/E4).
     v.vm_program = algo_vm.validatedProgram(v.vm_program);
+    // The developer-tier guest program: reject a malformed one to a safe no-op (the
+    // guest VM's own validator — the untrusted-compiler / trusted-validator split),
+    // and clamp the fuel budget to the DoS ceiling.
+    v.guest_program = guest_vm.validatedProgram(v.guest_program);
+    if (v.guest_fuel == 0) v.guest_fuel = guest_vm.default_fuel;
+    if (v.guest_fuel > guest_vm.max_fuel) v.guest_fuel = guest_vm.max_fuel;
     return v;
 }
 
@@ -837,6 +889,38 @@ test "score: a source WEIGHT lifts its pool — heavily-weighted follows beats a
     const order = try score(arena, &c, cfg, test_now);
     try t.expectEqual(@as(usize, 2), order.len); // both retrieved (a source matches each)
     try t.expectEqual(@as(u32, 2), order[0].raw()); // the follows-weighted post now leads
+}
+
+test "developer tier: a compiled Zal program IS the ranking (Discover-in-Zal through the engine)" {
+    const t = std.testing;
+    const zal_parse = @import("zal_parse.zig");
+    const zal_compile = @import("zal_compile.zig");
+    const templates = @import("zal_templates.zig");
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Compile the REAL Zat4 Discover, written in Zal, down to guest bytecode.
+    const ast = try zal_parse.parse(arena, templates.zat4_discover);
+    const res = try zal_compile.compile(arena, &ast, "score");
+    try t.expect(res.ok());
+
+    var cfg = DEFAULT_CONFIG;
+    cfg.guest_program = res.program;
+    cfg = validated(cfg); // the guest VM's validator accepts it; survives the round
+    try t.expect(cfg.guest_program.len > 0);
+
+    var c: Candidates = .{};
+    defer c.deinit(t.allocator);
+    try c.append(t.allocator, mk(1, 3600, 10), true); // low engagement
+    try c.append(t.allocator, mk(2, 3600, 200), true); // high engagement
+
+    // The engine marshalled each candidate into a CandidateView and ran the Zal
+    // program to rank them — the developer tier, end to end through the same
+    // score() every config algorithm uses (one engine, no privileged path).
+    const order = try score(arena, &c, cfg, test_now);
+    try t.expectEqual(@as(usize, 2), order.len);
+    try t.expectEqual(@as(u32, 2), order[0].raw()); // the high-engagement post ranks first
 }
 
 test "scoreRow: the cold-start floor lets a zero-engagement fresh post score above 0" {

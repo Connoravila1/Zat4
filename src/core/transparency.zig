@@ -240,12 +240,15 @@ fn fmtValue(arena: Allocator, v: anytype) error{OutOfMemory}![]const u8 {
 pub fn explain(arena: Allocator, config: discover.FeedConfig) error{OutOfMemory}![]FieldExplanation {
     var list: std.ArrayListUnmanaged(FieldExplanation) = .empty;
     inline for (@typeInfo(discover.FeedConfig).@"struct".fields) |f| {
-        if (comptime std.mem.eql(u8, f.name, "rules") or std.mem.eql(u8, f.name, "vm_program")) {
-            // The Level-2 rule-list and the Level-3 VM program are LOGIC, not
-            // scalars — each renders as its own readable section (rules as
-            // "if … then …" lines, the VM as a decompiled formula), so neither is
-            // a per-field scalar row here. Skipped, not forgotten: this branch
-            // keeps the comptime completeness guarantee honest.
+        if (comptime std.mem.eql(u8, f.name, "rules") or std.mem.eql(u8, f.name, "vm_program") or
+            std.mem.eql(u8, f.name, "guest_program") or std.mem.eql(u8, f.name, "guest_fuel"))
+        {
+            // The authored LOGIC — the L2 rule-list, the L3 VM program, and the
+            // developer-tier guest program (+ its fuel) — are not per-field scalars;
+            // each renders as its own readable/inspectable section (rules as
+            // "if … then …" lines, the VM as a decompiled formula, the guest program
+            // as its source + capability labels, Phase 6). Skipped, not forgotten:
+            // this branch keeps the comptime completeness guarantee honest.
         } else if (comptime std.mem.eql(u8, f.name, "query")) {
             // Flatten the candidate-query sub-record into its own leaf rows. The
             // `sources` slice (Phase-0 retrieval) is NOT a scalar — like `rules` /
@@ -331,12 +334,16 @@ pub fn classify(config: discover.FeedConfig) Classification {
     inline for (@typeInfo(discover.FeedConfig).@"struct".fields) |f| {
         if (comptime std.mem.eql(u8, f.name, "rules") or
             std.mem.eql(u8, f.name, "vm_program") or
-            std.mem.eql(u8, f.name, "query"))
+            std.mem.eql(u8, f.name, "query") or
+            std.mem.eql(u8, f.name, "guest_program") or
+            std.mem.eql(u8, f.name, "guest_fuel"))
         {
-            // Logic lists and the retrieval sub-record carry no behavioral SCALAR
-            // weight: the door wall keeps rule/VM facts public, and Query holds
-            // retrieval knobs only. (If a behavioral leaf is ever added to Query,
-            // extend this to flatten it — the cross-drift test will catch it.)
+            // Logic lists, the retrieval sub-record, and the developer-tier guest
+            // program carry no behavioral SCALAR weight here: the door wall keeps
+            // rule/VM facts public, Query holds retrieval knobs only, and a guest
+            // program's behavioral status is derived SEPARATELY from the capabilities
+            // it calls (`zal_compile.usesBehavioral` — the code-transparency label,
+            // Phase 6), not from a config weight.
         } else if (comptime metaFor(f.name).behavioral) {
             if (isActive(@field(config, f.name))) uses_behavioral = true;
         }
@@ -638,8 +645,11 @@ pub fn buildPage(arena: Allocator, name: []const u8, ref: []const u8, config: di
 fn leafFieldCount() usize {
     var n: usize = 0;
     inline for (@typeInfo(discover.FeedConfig).@"struct".fields) |f| {
-        if (comptime std.mem.eql(u8, f.name, "rules") or std.mem.eql(u8, f.name, "vm_program")) {
-            // not scalar leaves — rendered as their own logic sections (matches explain)
+        if (comptime std.mem.eql(u8, f.name, "rules") or std.mem.eql(u8, f.name, "vm_program") or
+            std.mem.eql(u8, f.name, "guest_program") or std.mem.eql(u8, f.name, "guest_fuel"))
+        {
+            // not scalar leaves — the authored logic (rules / L3 formula / the
+            // developer-tier guest program + its fuel) renders as its own section
         } else if (comptime std.mem.eql(u8, f.name, "query")) {
             // Count only the SCALAR query fields; `sources` (retrieval) renders as
             // its own section and is skipped in `explain`, so exclude it here to
