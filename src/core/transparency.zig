@@ -39,6 +39,7 @@ const Allocator = std.mem.Allocator;
 const discover = @import("discover.zig");
 const rules = @import("rules.zig");
 const algo_vm = @import("algo_vm.zig");
+const retrieval = @import("retrieval.zig");
 
 // **The behavioral-door wall — the label-honesty guarantee, made structural.**
 // `classify` decides a feed's "uses behavioral data" verdict from its WEIGHTS
@@ -422,6 +423,33 @@ pub fn ruleLines(arena: Allocator, rs: []const rules.Rule) error{OutOfMemory}![]
 }
 
 // ---------------------------------------------------------------------------
+// Phase-0 retrieval query as readable "pulls from" lines (honestly)
+// ---------------------------------------------------------------------------
+
+/// One readable retrieval-source line for the transparency page.
+pub const SourceLine = struct { text: []const u8 };
+
+/// Render a retrieval source-list as readable "pulls from" lines (PURE), in
+/// `arena`. Each source names WHERE candidates come from and how strongly it
+/// weights them — the pool-shaping half of the algorithm, shown honestly. The
+/// `switch` is `else`-free, so adding a `SourceKind` fails the build until it has
+/// a description here (the same completeness discipline as `metaFor`/`predicateText`).
+pub fn sourceLines(arena: Allocator, sources: []const retrieval.Source) error{OutOfMemory}![]SourceLine {
+    var list: std.ArrayListUnmanaged(SourceLine) = .empty;
+    for (sources) |s| {
+        const where = switch (s.kind) {
+            .all => try arena.dupe(u8, "every available post"),
+            .follows => try arena.dupe(u8, "accounts you follow"),
+            .discovery => try arena.dupe(u8, "beyond your follows (discovery)"),
+            .trending => try std.fmt.allocPrint(arena, "trending posts (engagement \u{2265} {d})", .{@as(i64, @intFromFloat(@min(@max(s.threshold, 0), 1e12)))}),
+        };
+        const sentence = try std.fmt.allocPrint(arena, "{s}  \u{00B7}  weight {d}\u{00D7}", .{ where, s.weight });
+        try list.append(arena, .{ .text = sentence });
+    }
+    return list.toOwnedSlice(arena);
+}
+
+// ---------------------------------------------------------------------------
 // Level-3 VM program as a readable formula (decompiled, honestly)
 // ---------------------------------------------------------------------------
 
@@ -562,6 +590,10 @@ pub const Page = struct {
     uses_behavioral: bool,
     learns: bool,
     rows: []const FieldExplanation,
+    /// The creator's authored RETRIEVAL query as readable "pulls from" lines — the
+    /// pool-shaping half. Empty when the algorithm carries no retrieval query (it
+    /// pulls the whole available pool).
+    source_lines: []const SourceLine,
     /// The creator's authored Level-2 logic, rendered as readable lines in run
     /// order. Empty for a flat-weights (Level-1) algorithm.
     rule_lines: []const RuleLine,
@@ -591,6 +623,7 @@ pub fn buildPage(arena: Allocator, name: []const u8, ref: []const u8, config: di
         .uses_behavioral = c.uses_behavioral,
         .learns = c.learns,
         .rows = try explain(arena, cfg),
+        .source_lines = try sourceLines(arena, cfg.query.sources),
         .rule_lines = try ruleLines(arena, cfg.rules),
         .formula = try formulaText(arena, cfg.vm_program),
     };
@@ -796,6 +829,30 @@ test "buildPage: assembles the verdict + every field for the renderer" {
     try t.expect(!page.uses_behavioral); // proven clean
     try t.expectEqual(leafFieldCount(), page.rows.len); // every line present
     try t.expectEqual(@as(usize, 0), page.rule_lines.len); // a flat-weights config has no logic lines
+    try t.expectEqual(@as(usize, 0), page.source_lines.len); // no retrieval query = no "pulls from" lines
+}
+
+test "sourceLines: renders a retrieval query as readable 'pulls from' lines" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const srcs = [_]retrieval.Source{
+        .{ .kind = .follows, .weight = 1.0 },
+        .{ .kind = .trending, .weight = 0.5, .threshold = 100 },
+    };
+    const lines = try sourceLines(arena, &srcs);
+    try t.expectEqual(@as(usize, 2), lines.len);
+    try t.expect(std.mem.indexOf(u8, lines[0].text, "accounts you follow") != null);
+    try t.expect(std.mem.indexOf(u8, lines[1].text, "trending") != null);
+    try t.expect(std.mem.indexOf(u8, lines[1].text, "100") != null); // the threshold shows
+
+    // A config carrying a retrieval query surfaces those lines on its page.
+    var cfg = discover.DEFAULT_CONFIG;
+    cfg.query.sources = &srcs;
+    const page = try buildPage(arena, "Retrieval Demo", "demo", cfg);
+    try t.expectEqual(@as(usize, 2), page.source_lines.len);
 }
 
 test "ruleLines: renders authored logic as ordered, readable sentences" {

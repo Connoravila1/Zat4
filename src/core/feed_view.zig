@@ -2175,6 +2175,22 @@ pub fn layoutTransparency(
         y += 18;
     }
 
+    // The creator's authored RETRIEVAL query — WHERE candidates are pulled from,
+    // the pool-shaping half of the algorithm (Phase 0). Public-data sourcing only
+    // (the author never touches the network), so no behavioral marker.
+    if (page.source_lines.len > 0) {
+        y += 12;
+        try rect(gpa, dl, lx, y, cw, 1, 0x22FFFFFF, 0); // divider
+        y += 30;
+        _ = try str(gpa, dl, e, .semibold, lx, y + 13, muted, 13, "PULLS FROM");
+        y += 30;
+        for (page.source_lines) |sl| {
+            try rect(gpa, dl, lx, y + 6, 7, 7, accent, 3);
+            y = try wrapBody(gpa, dl, e, lx + 18, y + 17, cw - 18, ink, 16, sl.text, 22, true, null);
+            y += 20;
+        }
+    }
+
     // The creator's authored Level-2 logic, in the order the scorer runs it —
     // readable as plain "if … then …" sentences. No row carries a behavioral
     // marker: a rule structurally cannot read your attention (the predicate

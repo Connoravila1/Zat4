@@ -46,6 +46,18 @@ const discover = @import("discover.zig");
 const transparency = @import("transparency.zig");
 const rules_mod = @import("rules.zig");
 const algo_vm = @import("algo_vm.zig");
+const retrieval = @import("retrieval.zig");
+
+// Zat4 Discover's PHASE-0 RETRIEVAL query — where candidates are pulled from,
+// composed. Your follows carry the pool; discovery reaches a bit beyond them; and
+// trending posts are pulled in (and stacked on in-network ones, since sources sum).
+// A post matched by no source is not retrieved. The host runs each source over its
+// indexes; the author only names + weights them (nothing invasive is expressible).
+const discover_sources = [_]retrieval.Source{
+    .{ .kind = .follows, .weight = 1.0 },
+    .{ .kind = .discovery, .weight = 0.6 },
+    .{ .kind = .trending, .weight = 0.5, .threshold = 100 },
+};
 
 // Zat4 Discover's Level-2 logic — Twitter-flavoured conditional shaping the flat
 // weight model cannot express. Evaluated IN ORDER, and later rules see earlier
@@ -124,6 +136,7 @@ const b_discover = Builtin{
         // makes it "legitimately complex" rather than just a weighting.
         c.rules = &discover_rules;
         c.vm_program = &discover_program;
+        c.query.sources = &discover_sources;
         break :blk c;
     },
 };
