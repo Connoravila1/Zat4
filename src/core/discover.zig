@@ -148,6 +148,11 @@ pub const Candidates = struct {
     viewer_engaged: std.DynamicBitSetUnmanaged = .{},
     tag_count: std.ArrayListUnmanaged(u8) = .empty,
     quote_count: std.ArrayListUnmanaged(u32) = .empty,
+    /// Per-candidate topic-tag strings (zones), for the `tag_scope` retrieval
+    /// source (A6, out of band). Each element is the candidate's tags; the strings
+    /// borrow the caller's store. Filled ONLY when the query references tag_scope
+    /// (F5) — otherwise left empty, and the scorer reads it as "no tags" per row.
+    cand_tags: std.ArrayListUnmanaged([]const []const u8) = .empty,
 
     /// Append one candidate, growing the parallel out-of-band signals (A6).
     pub fn append(self: *Candidates, gpa: Allocator, c: Candidate, in_network: bool) error{OutOfMemory}!void {
@@ -157,6 +162,7 @@ pub const Candidates = struct {
         try self.viewer_engaged.resize(gpa, self.list.len, false);
         try self.tag_count.append(gpa, 0);
         try self.quote_count.append(gpa, 0);
+        try self.cand_tags.append(gpa, &.{});
     }
 
     pub fn deinit(self: *Candidates, gpa: Allocator) void {
@@ -165,6 +171,7 @@ pub const Candidates = struct {
         self.viewer_engaged.deinit(gpa);
         self.tag_count.deinit(gpa);
         self.quote_count.deinit(gpa);
+        self.cand_tags.deinit(gpa);
         self.* = undefined;
     }
 };
@@ -442,9 +449,11 @@ pub fn score(arena: Allocator, cands: *const Candidates, config: FeedConfig, now
         // the whole available pool at weight 1 (backward compatible). The scorer
         // then multiplies the base score by the retrieval weight, so a post pulled
         // by several sources surfaces stronger.
+        const row_tags: []const []const u8 = if (i < cands.cand_tags.items.len) cands.cand_tags.items[i] else &.{};
         const pool_w: f32 = retrieval.poolWeight(config.query.sources, .{
             .in_network = in_net,
             .engagement = c.like_count + c.repost_count + c.reply_count,
+            .tags = row_tags,
         }) orelse continue; // matched no source ⇒ not in the pool
 
         // THE DEVELOPER TIER: a compiled guest program IS the ranking when present —
@@ -886,6 +895,32 @@ test "score: a retrieval query shapes the POOL — a `follows` source drops out-
     const order = try score(arena, &c, cfg, test_now);
     try t.expectEqual(@as(usize, 1), order.len); // only the in-network post was retrieved
     try t.expectEqual(@as(u32, 2), order[0].raw());
+}
+
+test "score: a tag_scope query shapes the POOL — only posts in the named zone are retrieved" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var c: Candidates = .{};
+    defer c.deinit(t.allocator);
+    try c.append(t.allocator, mk(1, 3600, 50), true); // will carry #zig
+    try c.append(t.allocator, mk(2, 3600, 90), true); // untagged (higher engagement)
+    try c.append(t.allocator, mk(3, 3600, 10), true); // #cooking
+    // Per-candidate tags, out of band (what buildDiscoverView materializes from the store).
+    c.cand_tags.items[0] = &.{"zig"};
+    c.cand_tags.items[1] = &.{};
+    c.cand_tags.items[2] = &.{"cooking"};
+
+    // "Pull from the zig zone" — a retrieval query over the resident tags.
+    const srcs = [_]retrieval.Source{.{ .kind = .tag_scope, .tag = "zig" }};
+    var cfg = DEFAULT_CONFIG;
+    cfg.query.sources = &srcs;
+
+    const order = try score(arena, &c, cfg, test_now);
+    try t.expectEqual(@as(usize, 1), order.len); // only the #zig post survived retrieval
+    try t.expectEqual(@as(u32, 1), order[0].raw()); // not the higher-engagement untagged post
 }
 
 test "score: a source WEIGHT lifts its pool — heavily-weighted follows beats a more-engaged discovery post" {

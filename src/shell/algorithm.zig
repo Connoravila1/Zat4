@@ -221,6 +221,7 @@ test "algorithm record carries the SERIALIZED config (no floats on the wire) and
     const srcs = [_]retrieval.Source{
         .{ .kind = .follows, .weight = 2.0 },
         .{ .kind = .trending, .weight = 0.5, .threshold = 100 },
+        .{ .kind = .tag_scope, .weight = 1.5, .tag = "zig" },
     };
     cfg.query.sources = &srcs;
 
@@ -240,12 +241,14 @@ test "algorithm record carries the SERIALIZED config (no floats on the wire) and
     try t.expectEqual(@as(f32, 33.0), parsed.w_reply);
     try t.expectEqual(false, parsed.velocity_boost);
     try t.expectEqual(@as(f32, 0.2), parsed.query.source_mix);
-    // The retrieval sources survive the round-trip intact (kind + weight + threshold).
-    try t.expectEqual(@as(usize, 2), parsed.query.sources.len);
+    // The retrieval sources survive the round-trip intact (kind + weight + threshold + tag).
+    try t.expectEqual(@as(usize, 3), parsed.query.sources.len);
     try t.expectEqual(retrieval.SourceKind.follows, parsed.query.sources[0].kind);
     try t.expectEqual(@as(f32, 2.0), parsed.query.sources[0].weight);
     try t.expectEqual(retrieval.SourceKind.trending, parsed.query.sources[1].kind);
     try t.expectEqual(@as(f32, 100), parsed.query.sources[1].threshold);
+    try t.expectEqual(retrieval.SourceKind.tag_scope, parsed.query.sources[2].kind);
+    try t.expectEqualStrings("zig", parsed.query.sources[2].tag);
     // The $type marks it as an algorithm record in the repo.
     try t.expect(std.mem.indexOf(u8, json, lexicon.collection.algorithm) != null);
 }

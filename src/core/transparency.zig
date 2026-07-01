@@ -449,6 +449,7 @@ pub fn sourceLines(arena: Allocator, sources: []const retrieval.Source) error{Ou
             .follows => try arena.dupe(u8, "accounts you follow"),
             .discovery => try arena.dupe(u8, "beyond your follows (discovery)"),
             .trending => try std.fmt.allocPrint(arena, "trending posts (engagement \u{2265} {d})", .{@as(i64, @intFromFloat(@min(@max(s.threshold, 0), 1e12)))}),
+            .tag_scope => try std.fmt.allocPrint(arena, "posts in the #{s} zone", .{s.tag}),
         };
         const sentence = try std.fmt.allocPrint(arena, "{s}  \u{00B7}  weight {d}\u{00D7}", .{ where, s.weight });
         try list.append(arena, .{ .text = sentence });

@@ -55,6 +55,7 @@ const Allocator = std.mem.Allocator;
 const lexicon = @import("lexicon.zig");
 const moderation = @import("moderation.zig");
 const discover = @import("discover.zig");
+const retrieval = @import("retrieval.zig");
 const learner = @import("learner.zig");
 
 // ---------------------------------------------------------------------------
@@ -1059,6 +1060,12 @@ pub fn buildDiscoverView(
     try cands.viewer_engaged.resize(arena, cands.list.len, false);
     try cands.tag_count.resize(arena, cands.list.len);
     try cands.quote_count.resize(arena, cands.list.len);
+    // The `tag_scope` retrieval source needs each candidate's tag STRINGS, not just
+    // the count — materialize them out of band, but ONLY when the query actually
+    // references tag_scope (F5: a config without it pays nothing, and the scorer
+    // reads the empty list as "no tags per row").
+    const scope_by_tag = retrieval.needsTags(config.query.sources);
+    if (scope_by_tag) try cands.cand_tags.resize(arena, cands.list.len);
     const cand_refs = cands.list.items(.ref);
     for (0..cands.list.len) |ci| {
         const p = cand_refs[ci].raw();
@@ -1067,6 +1074,7 @@ pub fn buildDiscoverView(
         cands.viewer_engaged.setValue(ci, engaged);
         cands.tag_count.items[ci] = @intCast(@min(store.post_tags.items[p].len, 255));
         cands.quote_count.items[ci] = quotes[p];
+        if (scope_by_tag) cands.cand_tags.items[ci] = try collectRowTags(arena, store, p);
     }
 
     const order = try discover.score(arena, &cands, config, now);

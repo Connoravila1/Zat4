@@ -53,12 +53,17 @@ pub const SourceKind = enum(u8) {
     follows, // in-network: from accounts the viewer follows
     discovery, // out-of-network: beyond the follow graph (the discovery pool)
     trending, // engagement ≥ threshold — viral, regardless of network
+    tag_scope, // posts carrying a named topic tag (zone) — a zone-scoped pool
 
     comptime {
-        // Vocabulary guard: exactly these four in slice 1. Widening retrieval is a
-        // deliberate decision (a new source usually needs a new Fact + a host
-        // index) — bump this on purpose, mirroring `algo_vm.Fact`'s count guard.
-        assert(@typeInfo(SourceKind).@"enum".fields.len == 4);
+        // Vocabulary guard: five sources. Widening retrieval is a deliberate
+        // decision (a new source usually needs a new Fact + a host index) — bump
+        // this on purpose, mirroring `algo_vm.Fact`'s count guard. `tag_scope` is
+        // the first index-backed source with a real on-device data source today
+        // (the resident zone tags); the network-scale sources (`graph_walk`,
+        // `network_split`, `similar_to`) attach the same way when the AppView
+        // candidate-sourcing endpoint lands.
+        assert(@typeInfo(SourceKind).@"enum".fields.len == 5);
     }
 };
 
@@ -69,12 +74,20 @@ pub const Source = struct {
     kind: SourceKind,
     weight: f32 = 1.0, // relative contribution of this source's posts to the pool
     threshold: f32 = 0, // kind-specific: `trending` = minimum engagement; else unused
+    /// `tag_scope` only: the zone tag this source pulls (e.g. "zig"). Empty for
+    /// every other source. Borrows the config record's bytes (it travels IN the
+    /// serialized algorithm, exactly like the guest program / rule params), so a
+    /// source's lifetime is its config's — never freed here (A1: plain data).
+    tag: []const u8 = &.{},
 
     comptime {
-        // Budget 12: two f32 (8) + the enum tag (1), padded to the f32's 4-byte
-        // alignment. Exact. `weight` and `threshold` are both earned (the two
-        // knobs a source needs); the tag rides in the padding.
-        assert(@sizeOf(Source) == 12);
+        // Budget 32: the tag slice (ptr+len = 16, 8-byte aligned) + two f32 (8) +
+        // the enum tag (1) = 25, padded to 32 at the slice's 8-byte alignment. A7.1:
+        // the size grew from 12 to carry `tag_scope`'s one string parameter — the
+        // minimal representation of a named-tag source (an index into a separate
+        // table would cross a module boundary, A5); the slice keeps retrieval
+        // decoupled from any store and lets std.json round-trip it as a plain string.
+        assert(@sizeOf(Source) == 32);
     }
 };
 
@@ -86,6 +99,10 @@ pub const Source = struct {
 pub const Facts = struct {
     in_network: bool,
     engagement: u32, // like + repost + reply
+    /// The candidate's topic tags (zones), each a plain string — filled by the
+    /// caller from its own store, read only by `tag_scope`. Empty when the caller
+    /// doesn't plumb tags (no `tag_scope` in the query) so nothing else pays for it.
+    tags: []const []const u8 = &.{},
 };
 
 /// Does this source pull in the candidate? Pure, total.
@@ -95,7 +112,18 @@ pub fn includes(s: Source, f: Facts) bool {
         .follows => f.in_network,
         .discovery => !f.in_network,
         .trending => @as(f64, @floatFromInt(f.engagement)) >= s.threshold,
+        .tag_scope => for (f.tags) |tag| {
+            if (std.mem.eql(u8, tag, s.tag)) break true;
+        } else false,
     };
+}
+
+/// Does this query reference `tag_scope`? The caller uses this to decide whether to
+/// pay for materializing per-candidate tags (F5: no tag_scope ⇒ no tag plumbing).
+/// Pure, total.
+pub fn needsTags(sources: []const Source) bool {
+    for (sources) |s| if (s.kind == .tag_scope) return true;
+    return false;
 }
 
 /// The retrieval weight for a candidate under a source list:
@@ -128,9 +156,9 @@ pub fn poolWeight(sources: []const Source, f: Facts) ?f32 {
 
 const t = std.testing;
 
-test "guard: Source is exactly sized; the vocabulary is the slice-1 four" {
-    try t.expectEqual(@as(usize, 12), @sizeOf(Source));
-    try t.expectEqual(@as(usize, 4), @typeInfo(SourceKind).@"enum".fields.len);
+test "guard: Source is exactly sized; the source vocabulary count" {
+    try t.expectEqual(@as(usize, 32), @sizeOf(Source));
+    try t.expectEqual(@as(usize, 5), @typeInfo(SourceKind).@"enum".fields.len);
 }
 
 test "empty query includes everything at weight 1 (backward compatible)" {
@@ -167,6 +195,38 @@ test "sources COMPOSE: a post matched by several sums their weights (multi-sourc
     try t.expectEqual(@as(?f32, 0.5), poolWeight(&q, .{ .in_network = false, .engagement = 200 }));
     // Out-of-network, not trending → matched nothing → dropped from the pool.
     try t.expectEqual(@as(?f32, null), poolWeight(&q, .{ .in_network = false, .engagement = 10 }));
+}
+
+test "tag_scope pulls posts carrying the named tag, drops the rest" {
+    const q = [_]Source{.{ .kind = .tag_scope, .tag = "zig" }};
+    const zig_post = Facts{ .in_network = false, .engagement = 0, .tags = &.{ "rust", "zig" } };
+    const other_post = Facts{ .in_network = true, .engagement = 999, .tags = &.{"cooking"} };
+    const untagged = Facts{ .in_network = true, .engagement = 999, .tags = &.{} };
+    try t.expectEqual(@as(?f32, 1.0), poolWeight(&q, zig_post));
+    try t.expectEqual(@as(?f32, null), poolWeight(&q, other_post)); // wrong tag → dropped
+    try t.expectEqual(@as(?f32, null), poolWeight(&q, untagged)); // no tags → dropped
+}
+
+test "tag_scope COMPOSES with a network source (zone posts + your follows)" {
+    // "posts in the zig zone, plus anything from my follows."
+    const q = [_]Source{
+        .{ .kind = .tag_scope, .tag = "zig", .weight = 1.0 },
+        .{ .kind = .follows, .weight = 0.5 },
+    };
+    // In-network AND zig-tagged → both match → 1.5 (a followed zig post surfaces strongest).
+    try t.expectEqual(@as(?f32, 1.5), poolWeight(&q, .{ .in_network = true, .engagement = 0, .tags = &.{"zig"} }));
+    // Out-of-network zig post → only tag_scope → 1.0 (zone reaches beyond the follow graph).
+    try t.expectEqual(@as(?f32, 1.0), poolWeight(&q, .{ .in_network = false, .engagement = 0, .tags = &.{"zig"} }));
+    // In-network, untagged → only follows → 0.5.
+    try t.expectEqual(@as(?f32, 0.5), poolWeight(&q, .{ .in_network = true, .engagement = 0, .tags = &.{} }));
+    // Out-of-network, untagged → nothing → dropped.
+    try t.expectEqual(@as(?f32, null), poolWeight(&q, .{ .in_network = false, .engagement = 0, .tags = &.{} }));
+}
+
+test "needsTags: only a query that references tag_scope asks for tags" {
+    try t.expect(!needsTags(&.{}));
+    try t.expect(!needsTags(&[_]Source{.{ .kind = .follows }}));
+    try t.expect(needsTags(&[_]Source{ .{ .kind = .follows }, .{ .kind = .tag_scope, .tag = "zig" } }));
 }
 
 test "defensive: a hostile non-finite / negative weight can't poison the pool weight" {
