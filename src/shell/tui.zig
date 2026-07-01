@@ -4562,7 +4562,21 @@ fn paintFrameGpu(
     const over_left_rail = gs.algo_t > 0.5 and g.hover_x >= 0 and @as(f32, @floatFromInt(g.hover_x)) < left_rail_right + 8.0 and g.hover_y >= 0;
     springGeom(&gs.left_hover_t, &gs.left_hover_v, if (over_left_rail) 1.0 else 0.0, 1.0 / 60.0);
     const algo_animating = @abs(gs.algo_t - (if (on_algo) @as(f32, 1.0) else 0.0)) > 0.003 or @abs(gs.algo_v) > 0.003 or @abs(gs.left_hover_t - (if (over_left_rail) @as(f32, 1.0) else 0.0)) > 0.004 or @abs(gs.left_hover_v) > 0.004;
-    const sig = feedSignature(items, g.scroll.*, w, h) ^ (@as(u64, g.screen.*) *% 0x9E37_79B9_7F4A_7C15) ^ (socket_sig *% 0xD1B5_4A32_D192_ED03) ^ (@as(u64, g.settings_section) *% 0xC2B2_AE3D_27D4_EB4F) ^ (g.settings_toggles *% 0x9E6C_63D0_676A_9A99) ^ (g.settings_choices *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, g.settings_picking) *% 0x8A91_7F2B_4D3E_61C7) ^ (@as(u64, @intFromBool(g.inspect_source)) *% 0xF29C_511C_8E3D_45A7) ^ (@as(u64, @intFromBool(g.inspect_loading)) *% 0xBF58_476D_1CE4_E5B9);
+    // Zat Chat (U3): the Messages surface renders from the chat store +
+    // selection + draft, none of which the feed signature below can see — a
+    // conversation tap or a local send must invalidate the cached content
+    // vertices or the screen only updates on re-entry (the caching bug the
+    // first live test caught). Fold the chat state in when on the screen.
+    var chat_sig: u64 = 0;
+    if (g.screen.* == feed_view.screen_messages) if (g.chat_store) |cs| {
+        chat_sig = (@as(u64, cs.msgs.len) *% 0x9E37_79B9_7F4A_7C15) ^
+            ((if (g.chat_sel) |sc| @as(u64, @intFromEnum(sc)) +% 1 else 0) *% 0xC2B2_AE3D_27D4_EB4F) ^
+            std.hash.Wyhash.hash(0x5A72_C4A7, g.chat_draft);
+        var unread_sum: u64 = 0;
+        for (cs.convs.items(.unread)) |u| unread_sum +%= u;
+        chat_sig ^= unread_sum *% 0x2545_F491_4F6C_DD1D;
+    };
+    const sig = feedSignature(items, g.scroll.*, w, h) ^ (@as(u64, g.screen.*) *% 0x9E37_79B9_7F4A_7C15) ^ (socket_sig *% 0xD1B5_4A32_D192_ED03) ^ (@as(u64, g.settings_section) *% 0xC2B2_AE3D_27D4_EB4F) ^ (g.settings_toggles *% 0x9E6C_63D0_676A_9A99) ^ (g.settings_choices *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, g.settings_picking) *% 0x8A91_7F2B_4D3E_61C7) ^ (@as(u64, @intFromBool(g.inspect_source)) *% 0xF29C_511C_8E3D_45A7) ^ (@as(u64, @intFromBool(g.inspect_loading)) *% 0xBF58_476D_1CE4_E5B9) ^ chat_sig;
     // A drag/settle animates the socket every frame (lift, reflow, ghost), so
     // bypass the feed cache while it runs — a brief interaction, and the field
     // already rebuilds every frame anyway.
