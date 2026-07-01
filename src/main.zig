@@ -686,6 +686,7 @@ test {
     _ = @import("core/algo_vm.zig");
     _ = @import("core/retrieval.zig");
     _ = @import("core/guest_abi.zig");
+    _ = @import("core/guest_vm.zig");
     _ = @import("shell/algorithm.zig");
     _ = @import("core/feed_view.zig");
     _ = @import("core/settings_view.zig");
