@@ -43,6 +43,8 @@ const Allocator = std.mem.Allocator;
 const tui = @import("../core/tui.zig");
 const timeline_ui = @import("../core/timeline_ui.zig");
 const feed_core = @import("../core/feed.zig");
+const chat_core = @import("../core/chat.zig");
+const chat_view_core = @import("../core/chat_view.zig");
 const feed_shell = @import("feed.zig");
 const stream_shell = @import("stream.zig");
 const cache_shell = @import("cache.zig");
@@ -89,6 +91,12 @@ const debug_effects = true;
 // burst cost is MEASURED on the real machine, not guessed, before any
 // optimization. Zero cost when false (the branch folds away).
 const debug_frame_timing = false;
+/// Zat Chat (ZAT_CHAT_ROADMAP U3): route the Messages rail slot to the chat
+/// surface. DEV GATE — the surface is a local plaintext sandbox (no transport,
+/// no persistence) until the relay (U4/U5) and the E2EE core (M1) land; the
+/// surface itself draws the UNENCRYPTED (DEV) banner. Off ⇒ Messages stays
+/// the titled placeholder. Release builds ship with this off until M1.
+const dev_chat = true;
 
 /// Run the timeline screen until the user quits. The store may arrive
 /// empty; `r` loads pages. Network calls happen inline between frames —
@@ -507,6 +515,29 @@ pub fn run(
     var gcreate_color: u8 = 0;
     var gcreate_name_buf: [64]u8 = undefined;
     var gcreate_name_len: usize = 0;
+    // Zat Chat (U3, dev-gated): the DM store + surface state. SESSION-LOCAL
+    // (memory only) until the relay transport (U4/U5) and persistence (M2)
+    // land — a drivable sandbox behind the UNENCRYPTED (DEV) banner.
+    var gchat_store: chat_core.Store = .{};
+    defer chat_core.deinitStore(gpa, &gchat_store);
+    var gchat_sel: ?chat_core.ConvIndex = null;
+    var gchat_draft_buf: [512]u8 = undefined;
+    var gchat_draft_len: usize = 0;
+    var gchat_input_focus: bool = false;
+    if (dev_chat) {
+        // DEV SANDBOX SEED: sample conversations so the surface is drivable
+        // before any transport exists. Deleted with the plaintext path at M1.
+        const seed_now = clock_shell.unixSeconds();
+        if (chat_core.openConversation(gpa, &gchat_store, "did:plc:dev-maya", "maya.zat4.com") catch null) |c| {
+            _ = chat_core.appendMessage(gpa, &gchat_store, c, .system, "conversation started", seed_now - 7300, false) catch {};
+            _ = chat_core.appendMessage(gpa, &gchat_store, c, .text, "hey — did the lighting pass land?", seed_now - 7200, false) catch {};
+            _ = chat_core.appendMessage(gpa, &gchat_store, c, .text, "It did. The letters catch the light now, and the whole field moves when you touch it.", seed_now - 7100, true) catch {};
+            _ = chat_core.appendMessage(gpa, &gchat_store, c, .text, "show me tonight?", seed_now - 300, false) catch {};
+        }
+        if (chat_core.openConversation(gpa, &gchat_store, "did:plc:dev-oko", "oko.zat") catch null) |c| {
+            _ = chat_core.appendMessage(gpa, &gchat_store, c, .text, "monospace is the most honest a feed can be", seed_now - 86_400, false) catch {};
+        }
+    }
     var gcreate_prepare_frames: u32 = 0; // the .preparing loading beat's progress (frames)
     // Load the user's saved library (created/downloaded feeds); empty on first run
     // or a corrupt file (deserialize is total). Saved after each create/adopt.
@@ -1225,7 +1256,7 @@ pub fn run(
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .market = if (gscreen == feed_view.screen_loadout and gloadout_tab == 1) market_cards.items else &.{}, .create = .{ .step = gcreate_step, .answers = gcreate_answers, .config = gcreate_config, .name = gcreate_name_buf[0..gcreate_name_len], .color = gcreate_color, .naming = gcreate_step == .name, .prepare_t = create_prepare_t }, .bench = bench_tray, .inspect_bytes = inspect_bytes orelse "", .inspect_name = inspect_name, .inspect_ref = inspect_ref, .inspect_source = gtransp_source, .inspect_loading = inspect_loading, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
+        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .market = if (gscreen == feed_view.screen_loadout and gloadout_tab == 1) market_cards.items else &.{}, .create = .{ .step = gcreate_step, .answers = gcreate_answers, .config = gcreate_config, .name = gcreate_name_buf[0..gcreate_name_len], .color = gcreate_color, .naming = gcreate_step == .name, .prepare_t = create_prepare_t }, .bench = bench_tray, .inspect_bytes = inspect_bytes orelse "", .inspect_name = inspect_name, .inspect_ref = inspect_ref, .inspect_source = gtransp_source, .inspect_loading = inspect_loading, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .chat_store = if (dev_chat) &gchat_store else null, .chat_sel = gchat_sel, .chat_draft = gchat_draft_buf[0..gchat_draft_len], .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
         switch (mode) {
             .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status),
             .compose => {
@@ -1461,7 +1492,15 @@ pub fn run(
                                 // the ends (top = 0, bottom exposes the last post
                                 // + a little breathing room). content_h is in the
                                 // layout's space, so the viewport height matches.
-                                g.scroll.* -= delta * 28;
+                                if (dev_chat and g.screen.* == feed_view.screen_messages) {
+                                    // The chat thread is BOTTOM-anchored: wheel UP walks
+                                    // back into history. The shared clamp keeps scroll in
+                                    // [min_scroll, 0]; the dispatch passes -scroll to
+                                    // layoutChat as its positive history offset.
+                                    g.scroll.* += delta * 28;
+                                } else {
+                                    g.scroll.* -= delta * 28;
+                                }
                                 const view_h: i32 = if (g.gpu != null)
                                     @intFromFloat(@as(f32, @floatFromInt(win.fb.height)) / gpu_scale)
                                 else
@@ -2033,10 +2072,32 @@ pub fn run(
                                             } else |_| {}
                                         },
                                         .bookmark, .share, .more, .profile_tab => {},
-                                        // Zat Chat (U2 scaffold): the Messages surface emits
-                                        // these, but the screen isn't routed in the shell until
-                                        // the dev-gated U3 wiring — inert until then.
-                                        .chat_conv, .chat_input, .chat_send => {},
+                                        // Zat Chat (U3): open the tapped conversation. The
+                                        // region carries the LIST ORDINAL; map it back through
+                                        // the same ordering query the list was built from (no
+                                        // store index rides a region, A5).
+                                        .chat_conv => if (dev_chat) {
+                                            if (chat_core.conversationsByActivity(gpa, &gchat_store) catch null) |order| {
+                                                defer gpa.free(order);
+                                                if (hit.post < order.len) {
+                                                    gchat_sel = order[hit.post];
+                                                    chat_core.markRead(&gchat_store, order[hit.post]);
+                                                    gchat_input_focus = true;
+                                                    gscroll_px = 0; // newest, bottom-anchored
+                                                }
+                                            }
+                                        },
+                                        .chat_input => if (dev_chat) {
+                                            gchat_input_focus = true;
+                                        },
+                                        .chat_send => if (dev_chat) {
+                                            if (gchat_draft_len > 0) if (gchat_sel) |sc| {
+                                                _ = chat_core.appendMessage(gpa, &gchat_store, sc, .text, gchat_draft_buf[0..gchat_draft_len], now, true) catch {};
+                                                gchat_draft_len = 0;
+                                                gchat_input_focus = true;
+                                                gscroll_px = 0;
+                                            };
+                                        },
                                         // Tag pill (tray) OR an inline `#tag` in the prose →
                                         // ENTER its zone. Both regions carry the post index in
                                         // `post` and the tag's index in `_pad`; resolve the
@@ -2356,6 +2417,29 @@ pub fn run(
             // terminal has no pixel cells), so gated on an engine.
             if (engine != null) if (decoded.event == .char) {
                 const zc = decoded.event.char;
+                // The Zat Chat composer strip: typing lands in the chat draft while
+                // the field has focus (tap the input to focus, Esc to leave). Enter
+                // sends — a LOCAL append until the transport (U4/U5) exists. ASCII
+                // for now, same as the Create name field; the full textedit (caret,
+                // selection, UTF-8) is the recorded upgrade. Consumes the key.
+                if (dev_chat and gscreen == feed_view.screen_messages and gchat_input_focus) {
+                    if (zc == '\r' or zc == '\n') {
+                        if (gchat_draft_len > 0) if (gchat_sel) |sc| {
+                            _ = chat_core.appendMessage(gpa, &gchat_store, sc, .text, gchat_draft_buf[0..gchat_draft_len], now, true) catch {};
+                            gchat_draft_len = 0;
+                            gscroll_px = 0; // re-anchor to the newest message
+                        };
+                    } else if (zc == 8 or zc == 127) {
+                        if (gchat_draft_len > 0) gchat_draft_len -= 1;
+                    } else if (zc == 27) {
+                        gchat_input_focus = false;
+                    } else if (zc >= 0x20 and zc < 0x7f and gchat_draft_len < gchat_draft_buf.len) {
+                        gchat_draft_buf[gchat_draft_len] = @intCast(zc);
+                        gchat_draft_len += 1;
+                    }
+                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status);
+                    continue;
+                }
                 // The Create name field: route typing into the feed-name buffer (ASCII
                 // for now — a zone/feed name is short). Backspace via BS/DEL. Consumes
                 // the key so it never falls through to zoom or the feed shortcuts.
@@ -2812,6 +2896,37 @@ fn seatedLensConfig(cards: []const lens_socket.LensCard, blob: []const u8, seate
 /// zone. The single place "which view is showing" is decided, for both the main
 /// loop and engageSelected's optimistic repaint. `now` is the shell's clock
 /// reading, handed to the pure scorer (invariant 9).
+/// Zat Chat (U3): the per-frame view bundle for the Messages surface. A7.2:
+/// cold struct, size guard waived — one transient per frame, never collected.
+const ChatFrame = struct {
+    list: []const chat_view_core.ListRow = &.{},
+    thread: []const chat_view_core.BubbleRow = &.{},
+    sel: u16 = std.math.maxInt(u16),
+    peer: []const u8 = "",
+};
+
+/// Resolve the Messages surface's view-models from the one chat store: the
+/// conversation list, the open thread, the selected ordinal, and the peer
+/// label. Pure queries into the frame arena (C3); the ordinal is the value
+/// the surface's tap regions carry.
+fn buildChatFrame(arena: Allocator, cs: *const chat_core.Store, sel: ?chat_core.ConvIndex, now: i64) ChatFrame {
+    const list = chat_view_core.buildList(arena, cs, now) catch return .{};
+    var out: ChatFrame = .{ .list = list };
+    const sc = sel orelse return out;
+    const order = chat_core.conversationsByActivity(arena, cs) catch return out;
+    for (order, 0..) |c, i| {
+        if (c == sc) {
+            out.sel = @intCast(i);
+            break;
+        }
+    }
+    if (out.sel != std.math.maxInt(u16) and out.sel < list.len) {
+        out.peer = list[out.sel].name;
+        out.thread = chat_view_core.buildThread(arena, cs, sc, now) catch &.{};
+    }
+    return out;
+}
+
 fn buildActiveView(arena: Allocator, store: *feed_core.Store, screen: u8, profile_did: []const u8, thread_cid: []const u8, zone_tag: []const u8, rerooted: bool, collapsed: []const []const u8, feed_config: ?discover.FeedConfig, reply_config: ?discover.FeedConfig, now: i64) error{OutOfMemory}![]feed_core.TimelineItem {
     if (screen == feed_view.screen_thread) return feed_core.buildThreadView(arena, store, thread_cid, rerooted, collapsed, now, reply_config);
     if (screen == feed_view.screen_profile) return feed_core.buildAuthorView(arena, store, profile_did);
@@ -3383,6 +3498,12 @@ const Grid = struct {
     /// resolves to (applied to the GPU field each frame).
     settings_choices: u64 = 0,
     settings_picking: u8 = 255,
+    /// Zat Chat (U3, dev-gated): the DM store (null = gate off), the selected
+    /// conversation, and the composer strip's live draft. The view-models are
+    /// built per frame in paintFrame from these (queries over the one store).
+    chat_store: ?*const chat_core.Store = null,
+    chat_sel: ?chat_core.ConvIndex = null,
+    chat_draft: []const u8 = "",
     field_gain: f32 = 0.9,
     /// Toy Box "Julia mode" active — the field renderer pinks its glyph ink.
     julia: bool = false,
@@ -4089,7 +4210,12 @@ fn paintFrame(
             // by the REAL timeline via a pure transform (B5). An empty timeline
             // renders the chrome with no posts — no placeholder content.
             const feed_posts = feed_view.fromTimeline(arena, view_items, now) catch &[_]feed_view.PostView{};
-            if (g.screen.* == feed_view.screen_loadout) {
+            if (g.chat_store != null and g.screen.* == feed_view.screen_messages) {
+                // Zat Chat (U3, dev-gated): the Messages surface. -scroll maps the
+                // shared ≤0 scroll state onto layoutChat's positive history offset.
+                const cf = buildChatFrame(arena, g.chat_store.?, g.chat_sel, now);
+                g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.sel, cf.peer, g.chat_draft) catch g.content_h.*;
+            } else if (g.screen.* == feed_view.screen_loadout) {
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
                 g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market, g.create, g.bench) catch g.content_h.*; // software: draw line-art nav
             } else if (g.screen.* == feed_view.screen_transparency) {
@@ -4485,6 +4611,15 @@ fn paintFrameGpu(
             gs.content_x = lg.col_x;
             gs.content_w = lg.col_w;
             g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, true, true, lg, g.market, g.create, g.bench) catch g.content_h.*; // GPU: SDF pass strikes the nav icons crisp
+        } else if (g.chat_store != null and g.screen.* == feed_view.screen_messages) {
+            // Zat Chat (U3, dev-gated): the Messages surface in the GPU's logical
+            // design space; the rail is the shell's own tile (rail_external), and
+            // -scroll maps the shared ≤0 scroll onto the positive history offset.
+            const lg = feed_view.paneGeomFor(@intCast(design_w), feed_view.screen_messages);
+            gs.content_x = lg.col_x;
+            gs.content_w = lg.col_w;
+            const cf = buildChatFrame(arena, g.chat_store.?, g.chat_sel, now);
+            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.sel, cf.peer, g.chat_draft) catch g.content_h.*;
         } else if (g.screen.* == feed_view.screen_transparency) {
             // The algorithm transparency page: a plain scrolling document (no rail),
             // rebuilt from the inspected config each entry (what you see = what runs).
