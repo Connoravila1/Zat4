@@ -194,6 +194,102 @@ pub const Library = struct {
 };
 
 // ---------------------------------------------------------------------------
+// Persistence — a plain length-prefixed binary form (the shell writes it to disk).
+// Deserialize is TOTAL on hostile/corrupt bytes: it returns whatever it parsed
+// cleanly and drops any record whose spans fall outside the blob (E4, never a
+// crash / OOB) — the same "bad data is ordinary data" posture as the config parse.
+// ---------------------------------------------------------------------------
+
+const magic = "ZALB"; // Zat4 ALgorithm-library Blob
+const ser_version: u8 = 1;
+
+fn putU32(gpa: Allocator, out: *std.ArrayListUnmanaged(u8), v: u32) Allocator.Error!void {
+    try out.appendSlice(gpa, &std.mem.toBytes(v));
+}
+
+/// Serialize the library to bytes (caller owns them). Allocates in `gpa`.
+pub fn serialize(gpa: Allocator, lib: *const Library) Allocator.Error![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, magic);
+    try out.append(gpa, ser_version);
+    try putU32(gpa, &out, @intCast(lib.blob.items.len));
+    try out.appendSlice(gpa, lib.blob.items);
+    try putU32(gpa, &out, @intCast(lib.records.items.len));
+    for (lib.records.items) |r| {
+        inline for (.{ r.id, r.name, r.ranks, r.desc, r.creator, r.config }) |s| {
+            try putU32(gpa, &out, s.off);
+            try putU32(gpa, &out, s.len);
+        }
+        try out.append(gpa, r.color);
+        try out.append(gpa, @intFromEnum(r.visibility));
+        try putU32(gpa, &out, r.rating.sum);
+        try putU32(gpa, &out, r.rating.count);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+// A7.2: cold struct, size guard waived — a transient parse cursor, one per
+// `deserialize` call, never held in a collection or a hot loop.
+const Reader = struct {
+    b: []const u8,
+    i: usize = 0,
+    fn readU32(self: *Reader) ?u32 {
+        if (self.i + 4 > self.b.len) return null;
+        const v = std.mem.readInt(u32, self.b[self.i..][0..4], .little);
+        self.i += 4;
+        return v;
+    }
+    fn byte(self: *Reader) ?u8 {
+        if (self.i >= self.b.len) return null;
+        defer self.i += 1;
+        return self.b[self.i];
+    }
+    fn take(self: *Reader, n: usize) ?[]const u8 {
+        if (self.i + n > self.b.len) return null;
+        defer self.i += n;
+        return self.b[self.i..][0..n];
+    }
+};
+
+/// Parse a library from bytes (TOTAL — bad data ⇒ an empty or partial library, never
+/// a crash). Allocates in `gpa`; caller owns the returned library.
+pub fn deserialize(gpa: Allocator, bytes: []const u8) Allocator.Error!Library {
+    var lib: Library = .{};
+    errdefer lib.deinit(gpa);
+    var r: Reader = .{ .b = bytes };
+    const tag = r.take(magic.len) orelse return lib;
+    if (!std.mem.eql(u8, tag, magic)) return lib;
+    if ((r.byte() orelse return lib) != ser_version) return lib;
+    const blob_len = r.readU32() orelse return lib;
+    const blob = r.take(blob_len) orelse return lib;
+    try lib.blob.appendSlice(gpa, blob);
+    const n = r.readU32() orelse return lib;
+    var k: u32 = 0;
+    while (k < n) : (k += 1) {
+        var spans: [6]Span = undefined;
+        var ok = true;
+        for (&spans) |*s| {
+            s.off = r.readU32() orelse return lib;
+            s.len = r.readU32() orelse return lib;
+            if (@as(usize, s.off) + s.len > lib.blob.items.len) ok = false; // span outside the blob
+        }
+        const color = r.byte() orelse return lib;
+        const vis = r.byte() orelse return lib;
+        const sum = r.readU32() orelse return lib;
+        const cnt = r.readU32() orelse return lib;
+        if (!ok) continue; // drop a record with an out-of-range span (never OOB later)
+        try lib.records.append(gpa, .{
+            .id = spans[0],       .name = spans[1],    .ranks = spans[2],
+            .desc = spans[3],     .creator = spans[4], .config = spans[5],
+            .color = color,       .visibility = @enumFromInt(@min(vis, 1)),
+            .rating = .{ .sum = sum, .count = cnt },
+        });
+    }
+    return lib;
+}
+
+// ---------------------------------------------------------------------------
 // Tests — pure, leak-checked (C6).
 // ---------------------------------------------------------------------------
 
@@ -239,6 +335,33 @@ test "library: add, resolve, config bytes, idempotent adopt" {
     _ = try lib.add(t.allocator, .{ .id = "cid:abc", .name = "Desh Sports", .ranks = "sports", .desc = "", .creator = "@desh.zat", .visibility = .public });
     try t.expectEqual(@as(usize, 2), lib.records.items.len);
     try t.expect(lib.findById("cid:xyz") == null); // unknown id
+}
+
+test "library: serialize/deserialize round-trips; corrupt bytes are total (empty)" {
+    var lib: Library = .{};
+    defer lib.deinit(t.allocator);
+    _ = try lib.add(t.allocator, .{ .id = "user:1", .name = "Mine", .ranks = "engagement", .desc = "d", .creator = "you", .config = "{\"v\":1}", .color = 5, .visibility = .private, .rating = .{ .sum = 8, .count = 2 } });
+    _ = try lib.add(t.allocator, .{ .id = "cid:a", .name = "Desh", .ranks = "sports", .desc = "", .creator = "@desh", .visibility = .public });
+
+    const bytes = try serialize(t.allocator, &lib);
+    defer t.allocator.free(bytes);
+    var back = try deserialize(t.allocator, bytes);
+    defer back.deinit(t.allocator);
+    try t.expectEqual(@as(usize, 2), back.records.items.len);
+    const r0 = back.findById("user:1").?;
+    try t.expectEqualStrings("Mine", back.slice(r0.name));
+    try t.expectEqualStrings("{\"v\":1}", back.configBytes(r0));
+    try t.expectEqual(@as(u8, 5), r0.color);
+    try t.expectEqual(@as(u32, 8), r0.rating.sum);
+    try t.expectEqual(Visibility.public, back.findById("cid:a").?.visibility);
+
+    // Corrupt / truncated / empty input is an empty library, never a crash.
+    var e1 = try deserialize(t.allocator, "");
+    e1.deinit(t.allocator);
+    var e2 = try deserialize(t.allocator, "ZALBnonsense");
+    e2.deinit(t.allocator);
+    var e3 = try deserialize(t.allocator, bytes[0 .. bytes.len - 5]); // truncated tail
+    e3.deinit(t.allocator);
 }
 
 test "library: ratings fold in and clamp" {
