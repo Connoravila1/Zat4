@@ -10,9 +10,10 @@ Screenshot*.png
 file.pub
 
 # Internal guiding documents — kept on disk for working context, never tracked
-# (private infra/strategy). Only the README is public.
+# (private infra/strategy). Public, user-facing docs are excepted below.
 *.md
 !README.md
+!ZAL_LLM_REFERENCE.md
 To_compile_zig
 Zig_References
 mockup_desktop.html
