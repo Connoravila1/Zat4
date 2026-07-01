@@ -40,6 +40,7 @@ const discover = @import("discover.zig");
 const rules = @import("rules.zig");
 const algo_vm = @import("algo_vm.zig");
 const retrieval = @import("retrieval.zig");
+const guest_vm = @import("guest_vm.zig");
 
 // **The behavioral-door wall — the label-honesty guarantee, made structural.**
 // `classify` decides a feed's "uses behavioral data" verdict from its WEIGHTS
@@ -331,8 +332,17 @@ fn isActive(v: anytype) bool {
 /// narrower cross-session axis — only the on-device learner weight maintains a
 /// model — so it stays keyed to `behavioral_weight`.
 pub fn classify(config: discover.FeedConfig) Classification {
-    const learns = config.behavioral_weight != 0;
+    var learns = config.behavioral_weight != 0;
     var uses_behavioral = learns;
+    // The developer-tier guest program: its behavioral + stateful status are DERIVED
+    // from the capabilities the BYTECODE calls (invariant 6), never from a config
+    // weight — so a guest authored in Zal cannot bypass the label by leaving
+    // behavioral_weight at 0. A guest that calls an attention capability uses
+    // behavioral data; one that calls state_write keeps a cross-session model. Both
+    // entry programs (score + retrieve) are scanned.
+    if (guest_vm.usesBehavioral(config.guest_program) or guest_vm.usesBehavioral(config.guest_retrieve)) uses_behavioral = true;
+    if (guest_vm.usedCapabilities(config.guest_program).contains(.state_write) or
+        guest_vm.usedCapabilities(config.guest_retrieve).contains(.state_write)) learns = true;
     inline for (@typeInfo(discover.FeedConfig).@"struct".fields) |f| {
         if (comptime std.mem.eql(u8, f.name, "rules") or
             std.mem.eql(u8, f.name, "vm_program") or
@@ -612,7 +622,47 @@ pub const Page = struct {
     /// The creator's authored Level-3 scoring formula, decompiled to one readable
     /// expression — or null when the algorithm carries no (valid) VM program.
     formula: ?[]const u8,
+    /// The developer-tier guest program, made transparent by DERIVATION — or null
+    /// when the algorithm is a config/rule/L3 one (no guest program).
+    guest: ?GuestSection,
 };
+
+/// The transparency view of a developer-tier GUEST program. Its logic can't be read
+/// line-by-line, so honesty comes from DERIVATION: every field here is provable from
+/// the capabilities the bytecode CALLS (invariant 6) plus its declared budgets — the
+/// crux that makes arbitrary code compatible with an honest privacy label. Plain
+/// data (A1). A7.2: cold — one per transparency page, waived.
+pub const GuestSection = struct {
+    uses_attention: bool, // calls an attention capability — reads your on-device dwell/clicks
+    keeps_state: bool, // calls state_write — keeps a cross-session on-device model
+    composes_retrieval: bool, // has a retrieve() that shapes which posts enter the pool
+    reads_tags: bool, // reads or scopes by zone tag (has_tag / tag_scope)
+    zones: []const []const u8, // the tag pool — exactly which zones it references (public)
+    fuel: u32, // per-candidate instruction budget (the compute ceiling)
+    score_len: usize, // score program size, in instructions
+    retrieve_len: usize, // retrieve program size (0 = no retrieve())
+};
+
+/// Derive the transparency section for a config's guest program, or null when there
+/// is none (PURE, no allocation — `zones` borrows the config's pool). Every fact is
+/// read from the capabilities the bytecode calls, so it is honest even for code we
+/// cannot audit line-by-line.
+pub fn guestSection(config: discover.FeedConfig) ?GuestSection {
+    if (config.guest_program.len == 0) return null;
+    const caps_s = guest_vm.usedCapabilities(config.guest_program);
+    const caps_r = guest_vm.usedCapabilities(config.guest_retrieve);
+    return .{
+        .uses_attention = guest_vm.usesBehavioral(config.guest_program) or guest_vm.usesBehavioral(config.guest_retrieve),
+        .keeps_state = caps_s.contains(.state_write) or caps_r.contains(.state_write),
+        .composes_retrieval = config.guest_retrieve.len > 0,
+        .reads_tags = caps_s.contains(.has_tag) or caps_s.contains(.source_tag_scope) or
+            caps_r.contains(.has_tag) or caps_r.contains(.source_tag_scope),
+        .zones = config.guest_strings,
+        .fuel = config.guest_fuel,
+        .score_len = config.guest_program.len,
+        .retrieve_len = config.guest_retrieve.len,
+    };
+}
 
 /// Assemble the transparency page for one algorithm (PURE): the classification
 /// verdict + every explained field, in `arena`. The caller supplies the human
@@ -638,6 +688,7 @@ pub fn buildPage(arena: Allocator, name: []const u8, ref: []const u8, config: di
         .source_lines = try sourceLines(arena, cfg.query.sources),
         .rule_lines = try ruleLines(arena, cfg.rules),
         .formula = try formulaText(arena, cfg.vm_program),
+        .guest = guestSection(cfg),
     };
 }
 
@@ -847,6 +898,83 @@ test "buildPage: assembles the verdict + every field for the renderer" {
     try t.expectEqual(leafFieldCount(), page.rows.len); // every line present
     try t.expectEqual(@as(usize, 0), page.rule_lines.len); // a flat-weights config has no logic lines
     try t.expectEqual(@as(usize, 0), page.source_lines.len); // no retrieval query = no "pulls from" lines
+}
+
+test "guest transparency: the behavioral label is DERIVED from the capabilities the code calls" {
+    const t = std.testing;
+    const zal_parse = @import("zal_parse.zig");
+    const zal_compile = @import("zal_compile.zig");
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A guest that reads on-device attention is behavioral — even though NO config
+    // weight says so. The label cannot be bypassed by authoring the read in Zal.
+    {
+        const ast = try zal_parse.parse(arena, "fn score() num { return like_count + attention_dwell() * 10.0; }");
+        const res = try zal_compile.compile(arena, &ast, "score");
+        try t.expect(res.ok());
+        var cfg = discover.DEFAULT_CONFIG;
+        cfg.guest_program = res.program;
+        cfg.behavioral_weight = 0; // the config claims nothing...
+        try t.expect(classify(cfg).uses_behavioral); // ...but the bytecode calls attention → derived true
+        try t.expect(guestSection(cfg).?.uses_attention);
+    }
+    // A tag-only guest is PROVABLY not behavioral, and its section names the zones.
+    {
+        const ast = try zal_parse.parse(arena, "fn score() num { if (has_tag(\"zig\")) { return 2.0; } return 1.0; }");
+        const res = try zal_compile.compile(arena, &ast, "score");
+        try t.expect(res.ok());
+        var cfg = discover.DEFAULT_CONFIG;
+        cfg.guest_program = res.program;
+        cfg.guest_strings = res.strings;
+        // A behaviorally-clean base (the config's own click weights feed base_score),
+        // so the ONLY behavioral question left is the guest's — and it asks none.
+        cfg.behavioral_weight = 0;
+        cfg.w_bookmark = 0;
+        cfg.w_profile_click = 0;
+        cfg.w_link_click = 0;
+        try t.expect(!classify(cfg).uses_behavioral);
+        const sec = guestSection(cfg).?;
+        try t.expect(sec.reads_tags and !sec.uses_attention and !sec.composes_retrieval);
+        try t.expectEqual(@as(usize, 1), sec.zones.len);
+        try t.expectEqualStrings("zig", sec.zones[0]);
+    }
+    // No guest program ⇒ no guest section (a config/rule/L3 algorithm).
+    try t.expect(guestSection(discover.DEFAULT_CONFIG) == null);
+}
+
+test "guest transparency: a retrieve() + state guest shows composing-retrieval and keeps-a-model" {
+    const t = std.testing;
+    const zal_parse = @import("zal_parse.zig");
+    const zal_compile = @import("zal_compile.zig");
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const src =
+        \\fn retrieve() num { tag_scope("zig", 1.0); return 0.0; }
+        \\fn score() num { state_write(0, like_count); return like_count; }
+    ;
+    const ast = try zal_parse.parse(arena, src);
+    const art = try zal_compile.compileArtifact(arena, &ast);
+    try t.expect(art.ok());
+    var cfg = discover.DEFAULT_CONFIG;
+    cfg.guest_program = art.score;
+    cfg.guest_retrieve = art.retrieve;
+    cfg.guest_strings = art.strings;
+    cfg.behavioral_weight = 0; // so `learns` below is proven to come from state_write, not the config
+
+    const sec = guestSection(cfg).?;
+    try t.expect(sec.composes_retrieval); // has a retrieve()
+    try t.expect(sec.keeps_state); // calls state_write
+    try t.expect(sec.reads_tags); // tag_scope
+    try t.expect(!sec.uses_attention); // no attention capability
+    try t.expect(classify(cfg).learns); // state_write ⇒ keeps a cross-session model
+    // The whole page carries the section.
+    const page = try buildPage(arena, "Zone Learner", "cid-demo", cfg);
+    try t.expect(page.guest != null);
+    try t.expect(page.guest.?.composes_retrieval);
 }
 
 test "sourceLines: renders a retrieval query as readable 'pulls from' lines" {

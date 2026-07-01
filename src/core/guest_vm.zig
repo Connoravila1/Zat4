@@ -417,6 +417,33 @@ pub fn validatedProgram(program: []const Instr) []const Instr {
     return if (validProgram(program)) program else &.{};
 }
 
+/// The SET of capabilities a program calls — scanned from its `call_host` opcodes.
+/// This is the primitive behind the capability-DERIVED transparency label
+/// (invariant 6): what a guest can reach is provable from the bytecode it runs, no
+/// need to understand what it computes. PURE, total (a call_host with an out-of-range
+/// id — impossible past `validProgram` — is simply skipped).
+pub fn usedCapabilities(program: []const Instr) std.EnumSet(guest_abi.Capability) {
+    var set = std.EnumSet(guest_abi.Capability){};
+    const cap_count = @typeInfo(guest_abi.Capability).@"enum".fields.len;
+    for (program) |ins| {
+        if (ins.op == .call_host and ins.arg < cap_count) set.insert(@enumFromInt(@as(u8, @intCast(ins.arg))));
+    }
+    return set;
+}
+
+/// Does this program read the user's PRIVATE attention data? True iff it calls any
+/// behavioral capability (`guest_abi.isBehavioral`). The capability-derived privacy
+/// label for guest CODE — "uses no behavioral data" is provable as "calls no
+/// behavioral capability", the property that makes an honest label survive code we
+/// cannot audit line-by-line (invariant 6). Pure.
+pub fn usesBehavioral(program: []const Instr) bool {
+    var it = usedCapabilities(program).iterator();
+    while (it.next()) |cap| {
+        if (guest_abi.isBehavioral(cap)) return true;
+    }
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // Tests — pure (B2), no allocation. Turing-completeness, termination-by-fuel,
 // and totality on hostile bytecode.

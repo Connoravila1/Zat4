@@ -477,20 +477,12 @@ pub fn compileArtifact(arena: Allocator, ast: *const Ast) Allocator.Error!Artifa
     };
 }
 
-/// Does this compiled program read the user's PRIVATE attention data? True iff it
-/// calls a behavioral capability (`guest_abi.isBehavioral`). This is the
-/// capability-DERIVED privacy label for guest CODE (invariant 6): "uses no
-/// behavioral data" is provable by scanning the emitted bytecode for a behavioral
-/// call — no need to understand what the program computes, exactly the property
-/// that makes arbitrary code compatible with an honest label. Pure.
+/// Does this compiled program read the user's PRIVATE attention data? The
+/// capability-DERIVED privacy label for guest CODE (invariant 6). Delegates to
+/// `guest_vm.usesBehavioral` — the single source of truth for scanning a program's
+/// capability set — so the compiler and the transparency layer can never disagree.
 pub fn usesBehavioral(program: []const Instr) bool {
-    const cap_count = @typeInfo(guest_abi.Capability).@"enum".fields.len;
-    for (program) |ins| {
-        if (ins.op == .call_host and ins.arg < cap_count) {
-            if (guest_abi.isBehavioral(@enumFromInt(@as(u8, @intCast(ins.arg))))) return true;
-        }
-    }
-    return false;
+    return vm.usesBehavioral(program);
 }
 
 // ---------------------------------------------------------------------------
