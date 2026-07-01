@@ -61,6 +61,9 @@ const textedit = @import("../core/textedit.zig");
 const lens_socket = @import("../core/lens_socket.zig");
 const lens_catalog = @import("../core/lens_catalog.zig");
 const discover = @import("../core/discover.zig");
+const create_flow = @import("../core/create_flow.zig");
+const builder = @import("../core/builder.zig");
+const algo_library = @import("../core/algo_library.zig");
 const transparency = @import("../core/transparency.zig");
 const algorithm_core = @import("../core/algorithm.zig");
 const algorithm_shell = @import("algorithm.zig");
@@ -494,6 +497,19 @@ pub fn run(
     // The active sub-tab on the Algorithms page: 0 = Loadout, 1 = Marketplace,
     // 2 = Create (the latter two are placeholders for now).
     var gloadout_tab: u8 = 0;
+    // The simple-Create flow's state (loadout tab 2): the current step, the
+    // plain-language answers so far, the live config (rebuilt from the answers, then
+    // nudged by the recap knobs), the chosen accent, and the name buffer. The user's
+    // OWNED algorithms land in `algo_lib`; `algo_uid` mints their local ids.
+    var gcreate_step: create_flow.Step = .pace;
+    var gcreate_answers: builder.Answers = .{};
+    var gcreate_config: discover.FeedConfig = builder.build(.{});
+    var gcreate_color: u8 = 0;
+    var gcreate_name_buf: [64]u8 = undefined;
+    var gcreate_name_len: usize = 0;
+    var algo_lib: algo_library.Library = .{};
+    defer algo_lib.deinit(gpa);
+    var algo_uid: u32 = 0;
     // The active top-level Screen (index into feed_view.nav_labels); the rail
     // sets it on a click. 0 = Home (the feed). Lives across frames in run().
     var gscreen: u8 = 0;
@@ -1180,7 +1196,7 @@ pub fn run(
         var cur_socket_ui = if (on_thread_screen) reply_ui else if (on_zone_screen) zone_ui else gsocket_ui;
         cur_socket_ui.julia = julia_on;
         const cur_socket_hits = if (on_thread_screen) &reply_hits else if (on_zone_screen) &zone_hits else &gsocket_hits;
-        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .market = if (gscreen == feed_view.screen_loadout and gloadout_tab == 1) market_cards.items else &.{}, .inspect_bytes = inspect_bytes orelse "", .inspect_name = inspect_name, .inspect_ref = inspect_ref, .inspect_source = gtransp_source, .inspect_loading = inspect_loading, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
+        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .market = if (gscreen == feed_view.screen_loadout and gloadout_tab == 1) market_cards.items else &.{}, .create = .{ .step = gcreate_step, .answers = gcreate_answers, .config = gcreate_config, .name = gcreate_name_buf[0..gcreate_name_len], .color = gcreate_color, .naming = gcreate_step == .name }, .inspect_bytes = inspect_bytes orelse "", .inspect_name = inspect_name, .inspect_ref = inspect_ref, .inspect_source = gtransp_source, .inspect_loading = inspect_loading, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
         switch (mode) {
             .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status),
             .compose => {
@@ -1918,6 +1934,53 @@ pub fn run(
                                         .loadout_tab => {
                                             gloadout_tab = @intCast(hit.post);
                                             gscroll_px = 0; // top of the newly-selected tab
+                                        },
+                                        // ---- The simple-Create flow (loadout tab 2) ----
+                                        // Pick a question option → record the answer, rebuild
+                                        // the config from the answers, and advance a step
+                                        // (privacy → the recap).
+                                        .create_pick => {
+                                            create_flow.applyAnswer(&gcreate_answers, gcreate_step, hit.post);
+                                            gcreate_config = builder.build(gcreate_answers);
+                                            gcreate_step = @enumFromInt(@intFromEnum(gcreate_step) + 1);
+                                            gscroll_px = 0;
+                                        },
+                                        .create_back => {
+                                            const s = @intFromEnum(gcreate_step);
+                                            if (s > 0) gcreate_step = @enumFromInt(s - 1);
+                                            gscroll_px = 0;
+                                        },
+                                        .create_next => { // recap → name
+                                            gcreate_step = .name;
+                                            gscroll_px = 0;
+                                        },
+                                        .create_knob_dec, .create_knob_inc => {
+                                            const k: create_flow.Knob = @enumFromInt(@as(u8, @intCast(hit.post)));
+                                            const step = create_flow.knobMeta(k).step;
+                                            const cur = create_flow.knobValue(gcreate_config, k);
+                                            create_flow.knobSet(&gcreate_config, k, if (hit.kind == .create_knob_inc) cur + step else cur - step);
+                                        },
+                                        .create_color => gcreate_color = @intCast(hit.post),
+                                        // Finalize: serialize the config into a PRIVATE library
+                                        // record (a minted local id), reset the flow, and drop
+                                        // the user back on their loadout with it saved.
+                                        .create_save => {
+                                            var idbuf: [24]u8 = undefined;
+                                            const id = std.fmt.bufPrint(&idbuf, "user:{d}", .{algo_uid}) catch "user:x";
+                                            const nm = if (gcreate_name_len > 0) gcreate_name_buf[0..gcreate_name_len] else "My feed";
+                                            if (create_flow.finalize(arena, gcreate_config, id, nm, gcreate_color)) |new| {
+                                                if (algo_lib.add(gpa, new)) |_| {
+                                                    algo_uid += 1;
+                                                    status = "Saved to your library.";
+                                                    gcreate_step = .pace;
+                                                    gcreate_answers = .{};
+                                                    gcreate_config = builder.build(.{});
+                                                    gcreate_name_len = 0;
+                                                    gcreate_color = 0;
+                                                    gloadout_tab = 0;
+                                                    gscroll_px = 0;
+                                                } else |_| status = "Couldn't save — out of memory.";
+                                            } else |_| status = "Couldn't build that feed.";
                                         },
                                         // Reddit-style collapse: toggle this reply's CID in the
                                         // per-view collapsed set (no network — buildThreadView
@@ -3219,6 +3282,8 @@ const Grid = struct {
     /// The Marketplace tab's browse cards (published algorithms, mapped from the
     /// AppView's rows). Empty on every other tab/screen. A value set per frame.
     market: []const feed_view.MarketAlgoCard = &.{},
+    /// The simple-Create flow's state (loadout tab 2). A value set per frame.
+    create: feed_view.CreateView = .{ .step = .pace, .answers = .{}, .config = discover.DEFAULT_CONFIG, .name = "", .color = 0 },
     /// The transparency page's inspected algorithm (screen_transparency): its
     /// fetched config + name + ref (CID), rebuilt into a page each frame. Null
     /// config ⇒ not inspecting. Set per frame.
@@ -3973,7 +4038,7 @@ fn paintFrame(
             const feed_posts = feed_view.fromTimeline(arena, view_items, now) catch &[_]feed_view.PostView{};
             if (g.screen.* == feed_view.screen_loadout) {
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
-                g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market) catch g.content_h.*; // software: draw line-art nav
+                g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market, g.create) catch g.content_h.*; // software: draw line-art nav
             } else if (g.screen.* == feed_view.screen_transparency) {
                 if (g.inspect_loading) {
                     g.content_h.* = feed_view.layoutAlgorithmLoading(gpa, g.engine, @intCast(win.fb.width), g.draw, g.regions, g.accent, g.inspect_name) catch g.content_h.*;
@@ -4366,7 +4431,7 @@ fn paintFrameGpu(
             }
             gs.content_x = lg.col_x;
             gs.content_w = lg.col_w;
-            g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, true, true, lg, g.market) catch g.content_h.*; // GPU: SDF pass strikes the nav icons crisp
+            g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, true, true, lg, g.market, g.create) catch g.content_h.*; // GPU: SDF pass strikes the nav icons crisp
         } else if (g.screen.* == feed_view.screen_transparency) {
             // The algorithm transparency page: a plain scrolling document (no rail),
             // rebuilt from the inspected config each entry (what you see = what runs).

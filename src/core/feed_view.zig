@@ -2366,6 +2366,8 @@ pub fn layoutLoadout(
     /// already mapped from the wire). Empty ⇒ the "nothing published yet" state.
     /// Only read on tab 1; ignored on the others.
     market: []const MarketAlgoCard,
+    /// The simple-Create flow's state — read only on tab 2 (Create).
+    create: CreateView,
 ) error{OutOfMemory}!i32 {
     // Algorithms is a WIDE page like the others: the glass spans the full
     // rectangle and the content centres in it — NO floating main-feed sidebar.
@@ -2418,9 +2420,7 @@ pub fn layoutLoadout(
     } else if (tab == 1) {
         content_h = try drawMarketplace(gpa, dl, e, m, height, scroll, regions, accent, market);
     } else {
-        _ = try str(gpa, dl, e, .semibold, m.lx, content_top + 70, ink, 19, "Create an algorithm");
-        _ = try str(gpa, dl, e, .regular, m.lx, content_top + 98, muted, 14, "Coming soon.");
-        content_h = height; // nothing to scroll
+        content_h = try layoutCreate(gpa, e, dl, m, height, scroll, regions, accent, create);
     }
 
     // Sticky header: frosted box, title, the tab row, divider — drawn LAST.
