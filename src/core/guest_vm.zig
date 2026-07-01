@@ -95,9 +95,10 @@ pub const Op = enum(u8) {
     jump, // pc = `arg` (unconditional)
     jump_if_zero, // pop cond; if 0, pc = `arg`, else fall through
     halt, // stop; the result is the top of the stack
+    call_host, // pop arg1, arg0; push host.call(Capability(`arg`), arg0, arg1)
 
     comptime {
-        assert(@typeInfo(Op).@"enum".fields.len == 20);
+        assert(@typeInfo(Op).@"enum".fields.len == 21);
     }
 };
 
@@ -209,13 +210,29 @@ const Stack = struct {
     }
 };
 
+/// The VM's ONLY window outside its own stack + scratch: a seam the caller fills.
+/// A guest reaches a capability via the `call_host` opcode (the capability id in
+/// `Instr.arg`); the VM pops its two operands, calls this, and pushes the result.
+/// The SHELL supplies the real implementation (running a retrieval source, reading
+/// on-device attention, touching persistent state) — I/O the pure VM must not do
+/// itself (B3/B4); a test supplies a deterministic mock. `null` ⇒ NO capabilities
+/// are available, so every `call_host` returns 0 (a program with no host runs as a
+/// pure function of its facts + scratch). Only capabilities the guest was GRANTED
+/// are wired by the host; an unknown or ungranted id returns 0. The publish gate
+/// (Phase 5) rejects a program that calls an ungranted capability at author time;
+/// this seam is the runtime backstop. A7.2: cold — one per feed build, waived.
+pub const Host = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, cap: guest_abi.Capability, arg0: f64, arg1: f64) f64,
+};
+
 /// Run a guest program for one candidate and return its score. TOTAL: defined and
 /// finite for ANY bytecode, at any `fuel_budget` — a looping or hostile program is
 /// STOPPED when its fuel runs out (never a hang), operands are bounded, and every
 /// value is sanitized. `base_score` is the engine's score for the candidate (the
 /// `base_score` fact) and the result if the program leaves the stack empty (an
 /// empty program ⇒ base unchanged, so the VM layer is inert by default). Pure.
-pub fn run(program: []const Instr, view: guest_abi.CandidateView, base_score: f64, fuel_budget: u32) f64 {
+pub fn run(program: []const Instr, view: guest_abi.CandidateView, base_score: f64, fuel_budget: u32, host: ?*const Host) f64 {
     @setRuntimeSafety(true); // untrusted bytecode drives `pc` — force checks on regardless of build
     var st: Stack = .{};
     var mem = [_]f64{0} ** mem_words; // per-run scratch, zeroed; discarded at the end
@@ -321,6 +338,21 @@ pub fn run(program: []const Instr, view: guest_abi.CandidateView, base_score: f6
                 if (st.pop() == 0) pc = ins.arg else pc += 1;
             },
             .halt => break,
+            .call_host => {
+                const a1 = st.pop();
+                const a0 = st.pop();
+                // Only a host-backed, in-range capability id reaches out; anything
+                // else (no host, bad id) is 0. The result is sanitized on push, so
+                // even a misbehaving host can't inject NaN/Inf.
+                var result: f64 = 0;
+                if (host) |h| {
+                    if (ins.arg < @typeInfo(guest_abi.Capability).@"enum".fields.len) {
+                        result = h.call(h.ctx, @enumFromInt(@as(u8, @intCast(ins.arg))), a0, a1);
+                    }
+                }
+                st.push(result);
+                pc += 1;
+            },
         }
     }
     return sanitize(if (st.sp > 0) st.buf[st.sp - 1] else base_score);
@@ -340,6 +372,9 @@ pub fn validProgram(program: []const Instr) bool {
             // end, meaning "halt"). Out-of-range would silently terminate at run
             // time — a valid program never relies on that.
             .jump, .jump_if_zero => if (ins.arg > program.len) return false,
+            // A `call_host` must name a real capability; the grant check (is it in
+            // this guest's granted set?) is the publish gate's job (Phase 5).
+            .call_host => if (ins.arg >= @typeInfo(guest_abi.Capability).@"enum".fields.len) return false,
             else => {},
         }
     }
@@ -371,8 +406,35 @@ const sample: guest_abi.CandidateView = .{
 
 test "guards + counts" {
     try t.expectEqual(@as(usize, 8), @sizeOf(Instr));
-    try t.expectEqual(@as(usize, 20), @typeInfo(Op).@"enum".fields.len);
+    try t.expectEqual(@as(usize, 21), @typeInfo(Op).@"enum".fields.len);
     try t.expectEqual(@as(usize, 7), @typeInfo(Fact).@"enum".fields.len);
+}
+
+/// A deterministic, TOTAL mock host for the tests: one canned answer per capability.
+/// Real capabilities land in the shell (Phase 4); this only proves the seam.
+fn mockHostCall(ctx: *anyopaque, cap: guest_abi.Capability, a0: f64, a1: f64) f64 {
+    _ = ctx;
+    return switch (cap) {
+        .source_follows, .source_discovery, .source_trending => a0 + a1,
+        .state_read => a0,
+        .state_write => 0,
+        .attention_dwell => 0.5,
+        .attention_clicked => if (a0 != 0) @as(f64, 1) else 0,
+    };
+}
+
+test "call_host: a capability is dispatched through the host seam; no host ⇒ 0" {
+    var ctx: u8 = 0;
+    const host = Host{ .ctx = &ctx, .call = mockHostCall };
+    // source_trending(10, 5) → the mock returns 10 + 5 = 15.
+    const prog = [_]Instr{
+        .{ .op = .push_const, .value = 10 }, // arg0
+        .{ .op = .push_const, .value = 5 }, // arg1
+        .{ .op = .call_host, .arg = @intFromEnum(guest_abi.Capability.source_trending) },
+    };
+    try t.expectEqual(@as(f64, 15.0), run(&prog, sample, 0, default_fuel, &host));
+    // With NO host, the same call returns 0 (capabilities simply aren't available).
+    try t.expectEqual(@as(f64, 0.0), run(&prog, sample, 0, default_fuel, null));
 }
 
 test "run: SCRATCH MEMORY as a loop accumulator — sum 1..N into mem[0] = 5050" {
@@ -402,11 +464,11 @@ test "run: SCRATCH MEMORY as a loop accumulator — sum 1..N into mem[0] = 5050"
         .{ .op = .push_const, .value = 0 }, // 18: idx 0  [0]
         .{ .op = .load }, // 19: result = mem[0]      [5050]
     };
-    try t.expectEqual(@as(f64, 5050.0), run(&prog, sample, 0, default_fuel));
+    try t.expectEqual(@as(f64, 5050.0), run(&prog, sample, 0, default_fuel, null));
 }
 
 test "run: empty program leaves the base score untouched (inert by default)" {
-    try t.expectEqual(@as(f64, 7.5), run(&.{}, sample, 7.5, default_fuel));
+    try t.expectEqual(@as(f64, 7.5), run(&.{}, sample, 7.5, default_fuel, null));
 }
 
 test "run: arithmetic — base_score × 1.5 + likes" {
@@ -418,7 +480,7 @@ test "run: arithmetic — base_score × 1.5 + likes" {
         .{ .op = .add },
     };
     // 10 × 1.5 + 100 = 115
-    try t.expectEqual(@as(f64, 115.0), run(&prog, sample, 10.0, default_fuel));
+    try t.expectEqual(@as(f64, 115.0), run(&prog, sample, 10.0, default_fuel, null));
 }
 
 test "run: a real LOOP runs to a verifiable result — countdown to 1" {
@@ -435,7 +497,7 @@ test "run: a real LOOP runs to a verifiable result — countdown to 1" {
         .{ .op = .sub }, // 6: i -= 1               [i-1]
         .{ .op = .jump, .arg = 1 }, // 7: back to the loop head
     }; // 8 = end (pc past the last instruction ⇒ halt); result = top = 1
-    try t.expectEqual(@as(f64, 1.0), run(&prog, sample, 0, default_fuel));
+    try t.expectEqual(@as(f64, 1.0), run(&prog, sample, 0, default_fuel, null));
 }
 
 test "run: an infinite loop is STOPPED by fuel (termination is total)" {
@@ -445,7 +507,7 @@ test "run: an infinite loop is STOPPED by fuel (termination is total)" {
         .{ .op = .jump, .arg = 0 },
     };
     // A tiny fuel budget: it must return (not hang) and stay finite.
-    const r = run(&prog, sample, 7.0, 50);
+    const r = run(&prog, sample, 7.0, 50, null);
     try t.expect(std.math.isFinite(r));
 }
 
@@ -457,7 +519,7 @@ test "run: totally safe on hostile / truncated bytecode (underflow, bad jumps)" 
         .{ .op = .jump, .arg = 9999 }, // out of range → loop ends (safe)
         .{ .op = .mul },
     };
-    const r = run(&prog, sample, 3.0, default_fuel);
+    const r = run(&prog, sample, 3.0, default_fuel, null);
     try t.expect(std.math.isFinite(r));
 }
 
@@ -470,6 +532,9 @@ test "fuzz: run is TOTAL on random bytecode — always finite, never hangs (the 
     // the validator reject out-of-range tags before `run` ever sees them).
     var prng = std.Random.DefaultPrng.init(0xC0FFEE_D00D);
     const rand = prng.random();
+    // A live host, so random `call_host` ops are exercised too (the mock is total).
+    var ctx: u8 = 0;
+    const host = Host{ .ctx = &ctx, .call = mockHostCall };
     var buf: [96]Instr = undefined;
     var iter: usize = 0;
     while (iter < 100_000) : (iter += 1) {
@@ -478,11 +543,11 @@ test "fuzz: run is TOTAL on random bytecode — always finite, never hangs (the 
             ins.* = .{
                 .op = @enumFromInt(rand.uintLessThan(u8, @typeInfo(Op).@"enum".fields.len)),
                 .fact = @enumFromInt(rand.uintLessThan(u8, @typeInfo(Fact).@"enum".fields.len)),
-                .arg = rand.int(u16), // random jump targets, often out of range
+                .arg = rand.int(u16), // random jump targets / capability ids, often out of range
                 .value = @bitCast(rand.int(u32)), // any f32 bits — NaN, Inf, huge
             };
         }
-        const r = run(buf[0..len], sample, @bitCast(rand.int(u64)), 3000);
+        const r = run(buf[0..len], sample, @bitCast(rand.int(u64)), 3000, &host);
         try t.expect(std.math.isFinite(r)); // TOTAL: finite, and it returned (no hang)
     }
 }
