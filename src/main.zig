@@ -660,6 +660,7 @@ test {
     _ = @import("core/jws.zig");
     _ = @import("core/pkce.zig");
     _ = @import("core/dpop.zig");
+    _ = @import("core/hpke.zig");
     _ = @import("core/oauth.zig");
     _ = @import("core/oauth_flow.zig");
     _ = @import("core/dagcbor.zig");
