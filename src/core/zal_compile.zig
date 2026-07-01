@@ -358,6 +358,22 @@ pub fn compile(arena: Allocator, ast: *const Ast, entry_name: []const u8) Alloca
     return .{ .program = try c.code.toOwnedSlice(arena), .errors = &.{} };
 }
 
+/// Does this compiled program read the user's PRIVATE attention data? True iff it
+/// calls a behavioral capability (`guest_abi.isBehavioral`). This is the
+/// capability-DERIVED privacy label for guest CODE (invariant 6): "uses no
+/// behavioral data" is provable by scanning the emitted bytecode for a behavioral
+/// call — no need to understand what the program computes, exactly the property
+/// that makes arbitrary code compatible with an honest label. Pure.
+pub fn usesBehavioral(program: []const Instr) bool {
+    const cap_count = @typeInfo(guest_abi.Capability).@"enum".fields.len;
+    for (program) |ins| {
+        if (ins.op == .call_host and ins.arg < cap_count) {
+            if (guest_abi.isBehavioral(@enumFromInt(@as(u8, @intCast(ins.arg))))) return true;
+        }
+    }
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // Tests — pure (B2), arena + leak-checked. The whole point: Zal source RUNS.
 // ---------------------------------------------------------------------------
