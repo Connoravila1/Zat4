@@ -116,6 +116,37 @@ fn capabilityTakesTag(cap: guest_abi.Capability) bool {
     };
 }
 
+/// Is this capability a retrieval SOURCE (it composes the candidate pool)? Sources
+/// belong only in `retrieve()`; everything else reads or adapts to a candidate and
+/// belongs in `score()`/`learn()`. Exhaustive so a new capability decides its side.
+fn isSourceCapability(cap: guest_abi.Capability) bool {
+    return switch (cap) {
+        .source_follows, .source_discovery, .source_trending, .source_tag_scope => true,
+        .has_tag, .state_read, .state_write, .attention_dwell, .attention_clicked => false,
+    };
+}
+
+/// Which entry point a function name compiles as. `score`/`learn` run PER CANDIDATE
+/// (they read + adapt to one post); `retrieve` runs ONCE to compose the pool. The
+/// permitted capability set differs by entry, enforced at compile time (below).
+fn entryKindOf(name: []const u8) guest_abi.EntryPoint {
+    if (std.mem.eql(u8, name, "retrieve")) return .retrieve;
+    if (std.mem.eql(u8, name, "learn")) return .learn;
+    return .score; // score() and any other single-entry compile default to per-candidate rules
+}
+
+/// May `entry` call `cap`? A `retrieve()` composes the pool (sources only, no
+/// candidate exists to read); a `score()`/`learn()` reads/adapts to a candidate
+/// (content + state + attention, never a source). This is the compile-time
+/// capability wall — calling the wrong side is a clean author error, not a silent
+/// no-op at runtime (the eBPF posture: the verifier rejects it).
+fn entryPermits(entry: guest_abi.EntryPoint, cap: guest_abi.Capability) bool {
+    return switch (entry) {
+        .retrieve => isSourceCapability(cap),
+        .score, .learn => !isSourceCapability(cap),
+    };
+}
+
 /// Strip the surrounding quotes from a string token's text (`"zig"` → `zig`). The
 /// lexer only emits a `.string` for a terminated `"..."`, so `len >= 2`.
 fn stripQuotes(lit: []const u8) []const u8 {
@@ -133,6 +164,7 @@ const Compiler = struct {
     locals: std.ArrayListUnmanaged(Local) = .empty,
     strings: std.ArrayListUnmanaged([]const u8) = .empty,
     next_slot: u16 = 0,
+    entry: guest_abi.EntryPoint = .score, // the entry being compiled — gates capabilities
 
     fn emit(c: *Compiler, ins: Instr) Allocator.Error!u32 {
         const idx: u32 = @intCast(c.code.items.len);
@@ -288,6 +320,17 @@ const Compiler = struct {
             try c.err("unknown function or capability", node.tok_start);
             return;
         };
+        // The compile-time capability wall: a retrieval source only in retrieve(), a
+        // candidate-reading capability only in score()/learn(). Calling the wrong
+        // side is a clean author error, never a silent runtime no-op.
+        if (!entryPermits(c.entry, cap)) {
+            const msg = if (isSourceCapability(cap))
+                "a retrieval source composes the pool — call it from retrieve(), not here"
+            else
+                "this reads a candidate — call it from score(), not retrieve()";
+            try c.err(msg, node.tok_start);
+            return;
+        }
         const args = c.ast.extra[node.a..node.b];
         if (args.len > 2) {
             try c.err("too many arguments (a capability takes at most 2)", node.tok_start);
@@ -397,6 +440,7 @@ const Compiler = struct {
         c.code.clearRetainingCapacity();
         c.locals.clearRetainingCapacity();
         c.next_slot = 0;
+        c.entry = entryKindOf(entry_name); // gates which capabilities this body may call
         try c.genBlock(c.ast.nodes[entry.?].c); // the function body block
         // Fall-off-the-end ⇒ the engine's base score, so a value is always defined.
         _ = try c.emit(.{ .op = .push_fact, .fact = .base_score });
@@ -629,6 +673,26 @@ test "compileArtifact: score and retrieve compile together, sharing one tag pool
     const ast3 = try parse.parse(arena, "fn retrieve() num { return 0.0; }");
     const art3 = try compileArtifact(arena, &ast3);
     try t.expect(!art3.ok());
+}
+
+test "compile: the entry-capability wall — sources only in retrieve(), candidate reads only in score()" {
+    var a = std.heap.ArenaAllocator.init(t.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const R = struct {
+        fn bad(ar: Allocator, src: []const u8, entry: []const u8) !bool {
+            const res = try compile(ar, &(try parse.parse(ar, src)), entry);
+            return !res.ok(); // true when correctly REJECTED
+        }
+    };
+    // Wrong side → clean compile error (not a silent runtime no-op).
+    try t.expect(try R.bad(arena, "fn score() num { follows(1.0); return like_count; }", "score")); // source in score()
+    try t.expect(try R.bad(arena, "fn score() num { tag_scope(\"zig\", 1.0); return like_count; }", "score"));
+    try t.expect(try R.bad(arena, "fn retrieve() num { if (has_tag(\"zig\")) {} return 0.0; }", "retrieve")); // content in retrieve()
+    try t.expect(try R.bad(arena, "fn retrieve() num { return attention_dwell(); }", "retrieve")); // attention in retrieve()
+    // Right side → compiles.
+    try t.expect(!try R.bad(arena, "fn retrieve() num { tag_scope(\"zig\", 1.0); return 0.0; }", "retrieve"));
+    try t.expect(!try R.bad(arena, "fn score() num { if (has_tag(\"zig\")) { return 2.0; } return 1.0; }", "score"));
 }
 
 test "compile: a text literal is rejected outside a tag argument (type discipline, fail-closed)" {
