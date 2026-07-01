@@ -67,6 +67,8 @@ they were variables. All are `num`.
 | `like_count` | number of likes | 0 … large |
 | `repost_count` | number of reposts (amplification) | 0 … large |
 | `reply_count` | number of replies (conversation) | 0 … large |
+| `reply_chain` | times the author replied back into this thread (a strong positive) | 0 … |
+| `quote_count` | number of quote-reposts (amplification with commentary) | 0 … large |
 | `age_hrs` | hours since the post was created | 0 … large |
 | `author_rep` | the author's public reputation prior | 0.0 … 1.0 |
 | `in_network` | `1` if from an account you follow, else `0` | 0 or 1 |

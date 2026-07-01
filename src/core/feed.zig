@@ -986,12 +986,28 @@ pub fn buildDiscoverView(
 ) error{OutOfMemory}![]TimelineItem {
     const posts = store.posts.slice();
     const parents = posts.items(.reply_parent);
+    const roots = posts.items(.reply_root);
     const createds = posts.items(.created_at);
     const likes = posts.items(.like_count);
     const reposts = posts.items(.repost_count);
     const replies = posts.items(.reply_count);
+    const quotes = posts.items(.quote_count);
     const post_authors = posts.items(.author);
     const author_dids = store.authors.slice().items(.did);
+
+    // Reply-chain: the author replying back into their OWN thread — the strongest
+    // positive (D2, calibrated `w_reply_chain`). Computed from the resident thread
+    // structure: for each resident reply whose thread-root has the SAME author,
+    // credit the root post. One O(posts) pass, keyed by post index. PUBLIC + no
+    // identity (it's a count on the post, not "who") → no targeting channel. A
+    // thread-root that isn't resident is simply not credited (E4: absence is data).
+    const reply_chain = try arena.alloc(u32, store.posts.len);
+    @memset(reply_chain, 0);
+    for (0..store.posts.len) |r| {
+        const root = roots[r].unwrap() orelse continue; // r is a reply with a known root
+        const ri = @intFromEnum(root);
+        if (post_authors[r] == post_authors[ri]) reply_chain[ri] += 1;
+    }
 
     // The behavioral doorway, in the core: only a config that opts in (weight > 0)
     // and was actually handed a vector reads attention data at all (invariant 6).
@@ -1019,8 +1035,9 @@ pub fn buildDiscoverView(
             .like_count = likes[p],
             .repost_count = reposts[p],
             .reply_count = replies[p],
+            // The author-replied-back count, computed above from the thread structure.
+            .reply_chain_count = reply_chain[p],
             // Signals Zat4 doesn't capture yet (D1) — 0 until a source fills them.
-            .reply_chain_count = 0,
             .bookmark_count = 0,
             .profile_click_count = 0,
             .link_click_count = 0,
@@ -1041,6 +1058,7 @@ pub fn buildDiscoverView(
     // index (that is how the pool was sourced).
     try cands.viewer_engaged.resize(arena, cands.list.len, false);
     try cands.tag_count.resize(arena, cands.list.len);
+    try cands.quote_count.resize(arena, cands.list.len);
     const cand_refs = cands.list.items(.ref);
     for (0..cands.list.len) |ci| {
         const p = cand_refs[ci].raw();
@@ -1048,6 +1066,7 @@ pub fn buildDiscoverView(
             (p < store.reposted.capacity() and store.reposted.isSet(p));
         cands.viewer_engaged.setValue(ci, engaged);
         cands.tag_count.items[ci] = @intCast(@min(store.post_tags.items[p].len, 255));
+        cands.quote_count.items[ci] = quotes[p];
     }
 
     const order = try discover.score(arena, &cands, config, now);

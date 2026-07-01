@@ -131,19 +131,23 @@ pub const CandidateView = struct {
     like_count: u32,
     repost_count: u32,
     reply_count: u32,
+    reply_chain: u32 = 0, // times the author replied back into this thread (strongest positive)
     tag_count: u32 = 0, // how many topic tags (zones) this post carries
+    quote_count: u32 = 0, // quote-reposts (public amplification-with-commentary)
     age_hrs: f32, // hours since the post was created (host computes; the clock never enters the guest)
     author_rep: f32, // public author-reputation prior, in [0,1]
     in_network: bool, // from an account the viewer follows
     viewer_engaged: bool = false, // the viewer already liked or reposted this post
 
     comptime {
-        // Budget 28: 4×u32 (16) + 2×f32 (8) + 2×bool (2) = 26, padded to 28 at the
+        // Budget 36: 6×u32 (24) + 2×f32 (8) + 2×bool (2) = 34, padded to 36 at the
         // 4-byte alignment. Exact. The field SET is the no-targeting boundary — any
-        // change is a deliberate widening of what a guest can see. These additions
-        // are PUBLIC content signals (tag count, your own public engagement), no
-        // per-identity input, so they open no targeting channel.
-        assert(@sizeOf(CandidateView) == 28);
+        // change is a deliberate widening of what a guest can see. A7.1: these
+        // additions (reply_chain, quote_count) are PUBLIC content-engagement signals
+        // keyed to the POST, no per-identity input, so they open no targeting
+        // channel — the same justification the earlier tag_count/viewer_engaged
+        // widening recorded.
+        assert(@sizeOf(CandidateView) == 36);
     }
 };
 
@@ -158,8 +162,8 @@ pub const AttentionEvent = struct {
     clicked: bool, // did the viewer click into it
 
     comptime {
-        // Budget 36: CandidateView (28) + f32 (4) + bool (1) = 33, padded to 36.
-        assert(@sizeOf(AttentionEvent) == 36);
+        // Budget 44: CandidateView (36) + f32 (4) + bool (1) = 41, padded to 44.
+        assert(@sizeOf(AttentionEvent) == 44);
     }
 };
 
@@ -197,8 +201,8 @@ pub fn classifyGrant(granted: []const Capability) GuestClassification {
 const t = std.testing;
 
 test "guards: the ABI types are exactly sized (the no-targeting / feature boundary)" {
-    try t.expectEqual(@as(usize, 28), @sizeOf(CandidateView));
-    try t.expectEqual(@as(usize, 36), @sizeOf(AttentionEvent));
+    try t.expectEqual(@as(usize, 36), @sizeOf(CandidateView));
+    try t.expectEqual(@as(usize, 44), @sizeOf(AttentionEvent));
     try t.expectEqual(@as(usize, 7), @typeInfo(Capability).@"enum".fields.len);
     try t.expectEqual(@as(usize, 3), @typeInfo(EntryPoint).@"enum".fields.len);
 }

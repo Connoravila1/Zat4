@@ -75,6 +75,8 @@ fn factOf(name: []const u8) ?vm.Fact {
         .{ "in_network", vm.Fact.in_network },
         .{ "viewer_engaged", vm.Fact.viewer_engaged },
         .{ "tag_count", vm.Fact.tag_count },
+        .{ "reply_chain", vm.Fact.reply_chain },
+        .{ "quote_count", vm.Fact.quote_count },
     };
     inline for (table) |e| if (std.mem.eql(u8, name, e[0])) return e[1];
     return null;
@@ -464,6 +466,27 @@ test "compile+run: the new public signals (viewer_engaged, tag_count) are readab
     const s_seen = vm.run(res.program, seen, 0, vm.default_fuel, null);
     try t.expectEqual(@as(f64, 110.0), s_fresh);
     try t.expect(s_fresh > s_seen); // an already-engaged post is down-ranked
+}
+
+test "compile+run: the thread-structure signals (reply_chain, quote_count) are readable" {
+    var a = std.heap.ArenaAllocator.init(t.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    // "reward posts the author stayed in (self-replies) and posts others amplified."
+    const src = "fn score() num { return like_count + reply_chain * 150.0 + quote_count * 3.0; }";
+    const ast = try parse.parse(arena, src);
+    const res = try compile(arena, &ast, "score");
+    try t.expect(res.ok());
+
+    const plain = sample; // 100 + 0 + 0 = 100
+    var active = sample;
+    active.reply_chain = 2; // author replied back twice
+    active.quote_count = 4; // 100 + 2*150 + 4*3 = 412
+    const s_plain = vm.run(res.program, plain, 0, vm.default_fuel, null);
+    const s_active = vm.run(res.program, active, 0, vm.default_fuel, null);
+    try t.expectEqual(@as(f64, 100.0), s_plain);
+    try t.expectEqual(@as(f64, 412.0), s_active);
+    try t.expect(s_active > s_plain); // author-active, amplified posts rank higher
 }
 
 test "compile: unknown name and undeclared assignment are clean errors, no bytecode" {
