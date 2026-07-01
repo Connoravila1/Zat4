@@ -541,6 +541,9 @@ fn cursorIdc(shape: layout.Cursor) usize {
         .pointer => idc_hand,
         .text => idc_ibeam,
         .grab => idc_sizeall,
+        // Windows has no themed heart cursor; the engagement hover reads as
+        // the hand until a custom cursor lands with the real port.
+        .heart => idc_hand,
     };
 }
 

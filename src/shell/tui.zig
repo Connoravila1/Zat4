@@ -2033,6 +2033,10 @@ pub fn run(
                                             } else |_| {}
                                         },
                                         .bookmark, .share, .more, .profile_tab => {},
+                                        // Zat Chat (U2 scaffold): the Messages surface emits
+                                        // these, but the screen isn't routed in the shell until
+                                        // the dev-gated U3 wiring — inert until then.
+                                        .chat_conv, .chat_input, .chat_send => {},
                                         // Tag pill (tray) OR an inline `#tag` in the prose →
                                         // ENTER its zone. Both regions carry the post index in
                                         // `post` and the tag's index in `_pad`; resolve the

@@ -678,6 +678,7 @@ test {
     _ = @import("shell/keystore.zig");
     _ = @import("core/feed.zig");
     _ = @import("core/chat.zig");
+    _ = @import("core/chat_view.zig");
     _ = @import("core/discover.zig");
     _ = @import("core/algorithm.zig");
     _ = @import("core/learner.zig");

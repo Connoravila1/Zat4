@@ -44,6 +44,7 @@ const timefmt = @import("timefmt.zig");
 const compose = @import("compose.zig");
 const settings_view = @import("settings_view.zig");
 const transp = @import("transparency.zig");
+const chat_view = @import("chat_view.zig");
 
 // Palette, copied from field.zig so the view never reaches across a module
 // for a constant (D4: only the value crosses, by copy). ARGB.
@@ -149,7 +150,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send };
 
 /// The six top-level rail destinations, in order. The `Screen` index a nav
 /// region carries is an index into this. Shared by the rail (draw + hit) and
@@ -168,6 +169,11 @@ pub const screen_home: u8 = 0;
 /// feed (`screen_zones`). The sub-tabs/categories are present-but-inert scaffold
 /// (like the lens socket) until the standing/manifest/catalog engines land.
 pub const screen_zones_browse: u8 = 1;
+/// The rail's "Messages" slot (index 3) — the Zat Chat surface, a
+/// master–detail page (conversation list + the open thread), rendered by
+/// `layoutChat`. Dev-gated in the shell until the E2EE core lands
+/// (ZAT_CHAT_ROADMAP U3/M1); the surface itself draws the honesty banner.
+pub const screen_messages: u8 = 3;
 /// The loadout page — the rail's "Algorithms" slot (index 4). Renders the
 /// three per-surface sockets (feed / replies / zones) stacked for editing.
 pub const screen_loadout: u8 = 4;
@@ -477,11 +483,12 @@ fn metricsPage(width: i32, active_screen: u8) Metrics {
     if (active_screen == screen_profile) {
         return .{ .rail_x = m.rail_x, .col_x = m.col_x, .col_w = wide_w, .lx = m.lx, .cw = m.cw, .side_x = m.side_x, .wide = true };
     }
-    // SETTINGS is a master–detail surface (a section list + a detail pane), so it
-    // wants the FULL wide column with a modest gutter — not the narrow centred
-    // reading column the other wide pages use. This sits the title + panes left,
-    // toward the rail, so the two panes balance instead of leaving a big left gap.
-    if (active_screen == screen_settings) {
+    // SETTINGS and MESSAGES are master–detail surfaces (a list + a detail
+    // pane), so they want the FULL wide column with a modest gutter — not the
+    // narrow centred reading column the other wide pages use. This sits the
+    // title + panes left, toward the rail, so the two panes balance instead of
+    // leaving a big left gap.
+    if (active_screen == screen_settings or active_screen == screen_messages) {
         const gut: i32 = 34;
         return .{ .rail_x = m.rail_x, .col_x = m.col_x, .col_w = wide_w, .lx = m.col_x + gut, .cw = wide_w - 2 * gut, .side_x = m.col_x + wide_w, .wide = true };
     }
@@ -3366,6 +3373,238 @@ fn emitRegion(gpa: Allocator, regions: ?*Regions, x: i32, y: i32, w: i32, h: u16
 
 const feed = @import("feed.zig");
 
+// ---------------------------------------------------------------------------
+// THE MESSAGES PAGE (screen_messages) — Zat Chat (ZAT_CHAT_ROADMAP U2).
+// Master–detail: the conversation list on the left, the open thread + a
+// composer strip on the right. The surface draws its own honesty banner —
+// this is dev-gated plaintext until milestone M1, and it SAYS so in pixels;
+// the banner and the plaintext path come down in the same commit.
+// ---------------------------------------------------------------------------
+
+/// Draw `s` truncated to `maxw`, with a trailing ellipsis when it overflows.
+fn strEllipsis(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, weight: text.Weight, x0: i32, baseline: i32, color: u32, px: u16, s: []const u8, maxw: i32) !void {
+    if (@as(i32, @intCast(text.measure(e, weight, s, px))) <= maxw) {
+        _ = try str(gpa, dl, e, weight, x0, baseline, color, px, s);
+        return;
+    }
+    const ell: u32 = 0x2026; // …
+    const ellw: i32 = @intCast(text.advance(e, weight, ell, px));
+    var x = x0;
+    var it = (std.unicode.Utf8View.init(s) catch return).iterator();
+    while (it.nextCodepoint()) |cp| {
+        const adv: i32 = @intCast(text.advance(e, weight, cp, px));
+        if (x + adv > x0 + maxw - ellw) break;
+        x = try glyph1(gpa, dl, e, weight, x, baseline, color, px, cp);
+    }
+    _ = try glyph1(gpa, dl, e, weight, x, baseline, color, px, ell);
+}
+
+/// The chat surface. Returns `height` plus the thread's history OVERFLOW
+/// (content that doesn't fit the pane), so the shell's usual
+/// `max_scroll = content_h - viewport` math yields how far back the reader
+/// can scroll. The thread bottom-anchors at scroll 0 (newest visible above
+/// the composer); scroll > 0 reveals older history. The chrome and the
+/// conversation list do not scroll.
+pub fn layoutChat(
+    gpa: Allocator,
+    e: *const text.Engine,
+    width: i32,
+    height: i32,
+    dl: *raster.DrawList,
+    regions: ?*Regions,
+    accent: u32,
+    scroll: i32,
+    /// GPU path: the rail's SDF-icon pass strikes the nav icons (same as
+    /// `layout`'s / `layoutLoadout`'s flag). Software: false.
+    skip_nav: bool,
+    /// When true the shell renders the rail as its own tile.
+    rail_external: bool,
+    pane_geom: ?PaneGeom,
+    /// The conversation list, in `chat_view.buildList` order. A row's tap
+    /// region carries its ORDINAL — the shell maps it back through its own
+    /// copy of the ordering query (no store index crosses here, A5).
+    list: []const chat_view.ListRow,
+    /// The open conversation's bubbles; empty with an empty `peer` = no
+    /// conversation selected.
+    thread: []const chat_view.BubbleRow,
+    /// Ordinal (into `list`) of the selected conversation; ≥ list.len = none.
+    sel: u16,
+    /// Display name of the open conversation's counterparty ("" = none).
+    peer: []const u8,
+    /// The composer strip's draft ("" shows the placeholder). Editing state
+    /// (caret, selection) arrives with the U3 wiring.
+    draft: []const u8,
+) error{OutOfMemory}!i32 {
+    const m: Metrics = if (pane_geom) |g|
+        .{ .rail_x = g.rail_x, .col_x = g.col_x, .col_w = g.col_w, .lx = g.lx, .cw = g.cw, .side_x = g.side_x, .wide = g.wide }
+    else
+        metricsPage(width, screen_messages);
+    if (regions) |rg| rg.clearRetainingCapacity();
+
+    // Glass column over the field + the rail (the layoutLoadout frame).
+    try rect(gpa, dl, m.col_x, 0, m.col_w, height, skinVeil(accent), 0);
+    if (m.wide) {
+        try rect(gpa, dl, m.col_x, 0, 1, height, 0x24EDEAE0, 0);
+        try rect(gpa, dl, m.col_x + m.col_w - 1, 0, 1, height, 0x24EDEAE0, 0);
+        if (!rail_external) try drawRail(gpa, dl, e, m.rail_x, height, screen_messages, regions, accent, skip_nav, 1.0);
+        try drawAgpl(gpa, dl, e, m.lx, height - 40);
+    }
+
+    const x0 = m.lx;
+    const w = m.cw;
+    const top: i32 = if (m.wide) 40 else 30;
+    _ = try str(gpa, dl, e, .semibold, x0, top + 30, ink, 30, "Messages");
+
+    // The honesty banner (ZAT_CHAT_ROADMAP §4 U3 / M1): until the E2EE core
+    // is live, this surface is a development plaintext path and says so.
+    const ban_y = top + 48;
+    const ban_h: i32 = 34;
+    try rect(gpa, dl, x0, ban_y, w, ban_h, 0x26F2762A, 10);
+    try rect(gpa, dl, x0, ban_y, 3, ban_h, 0xFFF2762A, 1);
+    const ban_pen = try str(gpa, dl, e, .semibold, x0 + 14, ban_y + 22, 0xFFF2B27A, 13, "UNENCRYPTED (DEV)");
+    _ = try str(gpa, dl, e, .regular, ban_pen + 10, ban_y + 22, muted, 13, "— messages travel in the clear until the encryption core lands");
+
+    // Pane split (the settings master–detail shape).
+    const body_y = ban_y + ban_h + 18;
+    const list_w: i32 = std.math.clamp(@divTrunc(w * 34, 100), 220, 320);
+    const split_gap: i32 = 28;
+    const detail_x = x0 + list_w + split_gap;
+    const detail_w = w - list_w - split_gap;
+    try rect(gpa, dl, detail_x - @divTrunc(split_gap, 2), body_y, 1, height - body_y - 30, divider, 0);
+
+    // ── Left: the conversation list (avatar + name + preview / age + unread). ──
+    const row_h: i32 = 64;
+    var ly = body_y;
+    if (list.len == 0) {
+        _ = try str(gpa, dl, e, .regular, x0, body_y + 24, faint, 14, "No conversations yet");
+    }
+    for (list, 0..) |row, i| {
+        const on = i == sel;
+        if (on) try rect(gpa, dl, x0, ly, list_w, row_h - 6, (0x1F << 24) | (accent & 0x00FFFFFF), 12);
+        const av: i32 = 40;
+        try rect(gpa, dl, x0 + 10, ly + 9, av, av, tintFor(row.name), 20);
+        const ini = [1]u8{initialOf(row.name)};
+        const iw: i32 = @intCast(text.measure(e, .semibold, &ini, 18));
+        _ = try str(gpa, dl, e, .semibold, x0 + 10 + @divTrunc(av - iw, 2), ly + 36, 0xFF20201A, 18, &ini);
+        const right = x0 + list_w - 12;
+        if (row.age.len > 0) {
+            const aw: i32 = @intCast(text.measure(e, .regular, row.age, 12));
+            _ = try str(gpa, dl, e, .regular, right - aw, ly + 26, faint, 12, row.age);
+        }
+        if (row.unread > 0) {
+            var nbuf: [8]u8 = undefined;
+            const ns = std.fmt.bufPrint(&nbuf, "{d}", .{@min(row.unread, 99)}) catch "99";
+            const nw: i32 = @intCast(text.measure(e, .semibold, ns, 12));
+            const pw = nw + 14;
+            try rect(gpa, dl, right - pw, ly + 34, pw, 20, accent, 10);
+            _ = try str(gpa, dl, e, .semibold, right - pw + 7, ly + 48, 0xFF20201A, 12, ns);
+        }
+        const tx = x0 + 10 + av + 12;
+        const tw = right - 46 - tx; // clear of the age column
+        try strEllipsis(gpa, dl, e, .semibold, tx, ly + 26, if (on) ink else body_c, 15, row.name, tw);
+        if (row.preview.len > 0) {
+            // Unread conversations keep their preview bright (the iOS cue).
+            const pw: text.Weight = if (row.unread > 0) .semibold else .regular;
+            const pc: u32 = if (row.unread > 0) body_c else muted;
+            try strEllipsis(gpa, dl, e, pw, tx, ly + 48, pc, 13, row.preview, tw);
+        }
+        try emitRegion(gpa, regions, x0, ly, list_w, @intCast(row_h - 6), @intCast(i), .chat_conv);
+        ly += row_h;
+    }
+
+    // ── Right: the open thread + the composer strip. ──
+    if (peer.len == 0) {
+        _ = try str(gpa, dl, e, .regular, detail_x + 20, body_y + 40, faint, 15, "Select a conversation");
+        return height;
+    }
+    _ = try str(gpa, dl, e, .semibold, detail_x, body_y + 24, ink, 18, peer);
+    try rect(gpa, dl, detail_x, body_y + 40, detail_w, 1, divider, 0);
+    const thread_top = body_y + 54;
+    const comp_h: i32 = 46;
+    const comp_y = height - comp_h - 24;
+    const thread_bot = comp_y - 12;
+
+    // Bubble geometry: measure pass (draw_it = false), then a bottom-anchored
+    // draw pass. Text is 14px on a 20px line; a bubble is its wrapped text
+    // plus padding; a stamp is a centred relative-time divider.
+    const bub_max: i32 = @min(420, detail_w - 90);
+    const line_h: i32 = 20;
+    const pad_x: i32 = 14;
+    const pad_y: i32 = 10;
+    const stamp_h: i32 = 26;
+    const gap: i32 = 8;
+    const bh = try gpa.alloc(i32, thread.len);
+    defer gpa.free(bh);
+    var total: i32 = 0;
+    for (thread, bh) |b, *hslot| {
+        if (b.kind == .system) {
+            hslot.* = 24;
+        } else {
+            const text_h = try wrapBody(gpa, dl, e, 0, 0, bub_max - 2 * pad_x, 0, 14, b.body, line_h, false, null);
+            hslot.* = text_h + 2 * pad_y - 4;
+        }
+        total += hslot.* + gap;
+        if (b.stamp) total += stamp_h;
+    }
+
+    // Bottom-anchor; scroll > 0 walks back into history. Rows fully outside
+    // the pane are skipped (the shell clamps scroll to the returned overflow,
+    // U3); partially-clipped edge rows are accepted.
+    var y = @max(thread_top, thread_bot - total) + scroll;
+    for (thread, bh) |b, hh| {
+        if (b.stamp) {
+            if (y + stamp_h > thread_top and y < thread_bot) {
+                const aw: i32 = @intCast(text.measure(e, .regular, b.age, 11));
+                _ = try str(gpa, dl, e, .regular, detail_x + @divTrunc(detail_w - aw, 2), y + 16, faint, 11, b.age);
+            }
+            y += stamp_h;
+        }
+        if (y + hh > thread_top and y < thread_bot) {
+            if (b.kind == .system) {
+                const sw2: i32 = @intCast(text.measure(e, .regular, b.body, 12));
+                _ = try str(gpa, dl, e, .regular, detail_x + @divTrunc(detail_w - sw2, 2), y + 16, faint, 12, b.body);
+            } else {
+                // Single-line bubbles shrink-wrap; wrapped ones take the max.
+                const one_w: i32 = @intCast(text.measure(e, .regular, b.body, 14));
+                const fits_one = std.mem.indexOfScalar(u8, b.body, '\n') == null and one_w <= bub_max - 2 * pad_x;
+                const bw = if (fits_one) one_w + 2 * pad_x else bub_max;
+                const bx = if (b.mine) detail_x + detail_w - bw else detail_x;
+                const fill: u32 = if (b.mine) (0x38 << 24) | (accent & 0x00FFFFFF) else skinPanel(accent);
+                try rect(gpa, dl, bx, y, bw, hh, fill, 14);
+                _ = try wrapBody(gpa, dl, e, bx + pad_x, y + pad_y + 12, bub_max - 2 * pad_x, ink, 14, b.body, line_h, true, null);
+            }
+        }
+        y += hh + gap;
+    }
+    if (thread.len == 0) {
+        _ = try str(gpa, dl, e, .regular, detail_x, thread_top + 20, faint, 14, "No messages yet — say hello");
+    }
+
+    // The composer strip: input + Send. Inert scaffold until the U3 wiring
+    // threads the app's textedit through it; the regions are live now so the
+    // shell has targets to arm.
+    const send_w: i32 = 84;
+    const input_w = detail_w - send_w - 12;
+    try rect(gpa, dl, detail_x, comp_y, input_w, comp_h, skinPanel(accent), 14);
+    try rect(gpa, dl, detail_x, comp_y, input_w, 1, 0x14EDEAE0, 14);
+    if (draft.len > 0) {
+        try strEllipsis(gpa, dl, e, .regular, detail_x + 14, comp_y + 29, ink, 14, draft, input_w - 28);
+    } else {
+        var pbuf: [96]u8 = undefined;
+        const ph = std.fmt.bufPrint(&pbuf, "Message {s}", .{peer}) catch "Message";
+        try strEllipsis(gpa, dl, e, .regular, detail_x + 14, comp_y + 29, faint, 14, ph, input_w - 28);
+    }
+    try emitRegion(gpa, regions, detail_x, comp_y, input_w, @intCast(comp_h), 0, .chat_input);
+    const sx = detail_x + detail_w - send_w;
+    const armed = draft.len > 0;
+    try rect(gpa, dl, sx, comp_y, send_w, comp_h, if (armed) accent else skinPanel(accent), 14);
+    const sw3: i32 = @intCast(text.measure(e, .semibold, "Send", 14));
+    _ = try str(gpa, dl, e, .semibold, sx + @divTrunc(send_w - sw3, 2), comp_y + 29, if (armed) 0xFF20201A else faint, 14, "Send");
+    try emitRegion(gpa, regions, sx, comp_y, send_w, @intCast(comp_h), 0, .chat_send);
+
+    return height + @max(0, total - (thread_bot - thread_top));
+}
+
 pub fn fromTimeline(arena: Allocator, items: []const feed.TimelineItem, now: i64) error{OutOfMemory}![]PostView {
     const out = try arena.alloc(PostView, items.len);
     for (items, out) |it, *pv| {
@@ -3656,6 +3895,52 @@ test "profile screen renders the author's posts under a header; other screens st
     // The one wired control survives the rework: Account's Sign out still routes
     // through the live `.sign_out` handler.
     try std.testing.expectEqual(@as(usize, 1), n_sign_out);
+}
+
+test "messages screen: master-detail chat surface (list, thread, composer)" {
+    const gpa = std.testing.allocator;
+    var engine = try text.initEngine();
+    defer text.deinitEngine(gpa, &engine);
+    var dl: raster.DrawList = .{};
+    defer dl.deinit(gpa);
+    var regions: Regions = .empty;
+    defer regions.deinit(gpa);
+
+    const lrows = [_]chat_view.ListRow{
+        .{ .name = "maya.zat4.com", .preview = "You: hey", .age = "2h", .unread = 0 },
+        .{ .name = "did:plc:xyz", .preview = "hello there", .age = "1m", .unread = 3 },
+    };
+    const brows = [_]chat_view.BubbleRow{
+        .{ .body = "hey", .age = "2h", .mine = true, .stamp = true, .kind = .text },
+        .{ .body = "a longer reply that should wrap across the bubble width once it exceeds the maximum line", .age = "2h", .mine = false, .stamp = false, .kind = .text },
+    };
+
+    // Narrow width (460): no rail regions, so the counts are exactly the
+    // surface's own — one region per conversation row + the composer pair.
+    const h = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, 0, "maya.zat4.com", "");
+    var n_conv: usize = 0;
+    var n_input: usize = 0;
+    var n_send: usize = 0;
+    for (regions.items) |r| {
+        if (r.kind == .chat_conv) n_conv += 1;
+        if (r.kind == .chat_input) n_input += 1;
+        if (r.kind == .chat_send) n_send += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), n_conv);
+    try std.testing.expectEqual(@as(usize, 1), n_input);
+    try std.testing.expectEqual(@as(usize, 1), n_send);
+    try std.testing.expectEqual(regions.items.len, n_conv + n_input + n_send);
+    try std.testing.expect(h >= 940); // viewport + any thread overflow
+    try std.testing.expect(dl.len > 0);
+
+    // No conversation selected: the list still renders and taps, but there is
+    // no thread pane and no composer to arm.
+    dl.len = 0;
+    regions.clearRetainingCapacity();
+    const h2 = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, 255, "", "");
+    try std.testing.expectEqual(@as(i32, 940), h2);
+    for (regions.items) |r| try std.testing.expectEqual(Action.chat_conv, r.kind);
+    try std.testing.expectEqual(@as(usize, 2), regions.items.len);
 }
 
 test "zones browse: each catalog entry emits one .zone_open card region carrying its index" {

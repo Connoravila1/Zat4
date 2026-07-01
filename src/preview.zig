@@ -36,6 +36,8 @@ const rules = @import("core/rules.zig");
 const algo_vm = @import("core/algo_vm.zig");
 const enroll_view = @import("core/enroll_view.zig");
 const tiling = @import("core/tiling.zig");
+const chat = @import("core/chat.zig");
+const chat_view = @import("core/chat_view.zig");
 
 /// Solve the three-pane as a PARTITION: nav (fixed 248) | feed (weight) |
 /// sidebar (fixed 352), then map the placed rects into feed_view's PaneGeom.
@@ -165,7 +167,7 @@ pub fn main(init: std.process.Init) !void {
         };
         disc.vm_program = &demo_program;
         const page = try transparency.buildPage(arena, "Zat4 Discover", "zat4:discover", disc);
-        _ = try feed_view.layoutTransparency(gpa, &engine, @intCast(W), @intCast(H), &dl, feed_view.accent_house, 0, page);
+        _ = try feed_view.layoutTransparency(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, page);
         try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
         try writePpm(io, gpa, &fb, "/tmp/zat_transparency.ppm");
         std.debug.print("wrote /tmp/zat_transparency.ppm (algorithm transparency page)\n", .{});
@@ -174,10 +176,39 @@ pub fn main(init: std.process.Init) !void {
         // is visible in the proof.
         @memset(fb.pixels, clear);
         dl.len = 0;
-        _ = try feed_view.layoutTransparency(gpa, &engine, @intCast(W), @intCast(H), &dl, feed_view.accent_house, -1820, page);
+        _ = try feed_view.layoutTransparency(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, -1820, page);
         try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
         try writePpm(io, gpa, &fb, "/tmp/zat_transparency_rules.ppm");
         std.debug.print("wrote /tmp/zat_transparency_rules.ppm (authored-rules section)\n", .{});
+    }
+
+    // ZAT CHAT (ZAT_CHAT_ROADMAP U2): the Messages master–detail surface —
+    // a real chat store → chat_view queries → layoutChat, over the ambient
+    // field, with the honesty banner, stamps, bubbles, and the composer.
+    {
+        @memset(fb.pixels, clear);
+        dl.len = 0;
+        try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
+
+        var cstore: chat.Store = .{};
+        defer chat.deinitStore(gpa, &cstore);
+        const maya = try chat.openConversation(gpa, &cstore, "did:plc:maya", "maya.zat4.com");
+        const oko = try chat.openConversation(gpa, &cstore, "did:plc:oko", "oko.zat");
+        _ = try chat.openConversation(gpa, &cstore, "did:plc:lune", "lune.zat");
+        _ = try chat.appendMessage(gpa, &cstore, maya, .system, "conversation started", now - 7300, false);
+        _ = try chat.appendMessage(gpa, &cstore, maya, .text, "hey — did the lighting pass land?", now - 7200, false);
+        _ = try chat.appendMessage(gpa, &cstore, maya, .text, "It did. The letters catch the light now, and the whole field moves when you touch it.", now - 7100, true);
+        _ = try chat.appendMessage(gpa, &cstore, maya, .text, "show me tonight?", now - 300, false);
+        _ = try chat.appendMessage(gpa, &cstore, maya, .text, "one condition: you bring the coffee", now - 240, true);
+        _ = try chat.appendMessage(gpa, &cstore, oko, .text, "monospace is the most honest a feed can be", now - 86400, false);
+        chat.markRead(&cstore, maya);
+
+        const clist = try chat_view.buildList(arena, &cstore, now);
+        const cthread = try chat_view.buildThread(arena, &cstore, maya, now);
+        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread, 0, "maya.zat4.com", "");
+        try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+        try writePpm(io, gpa, &fb, "/tmp/zat_chat.ppm");
+        std.debug.print("wrote /tmp/zat_chat.ppm (Zat Chat messages surface)\n", .{});
     }
 
     // TILING FOUNDATION (S.1) PROOF: the SAME real feed, but its pane geometry
@@ -454,7 +485,7 @@ pub fn main(init: std.process.Init) !void {
     @memset(fb.pixels, clear);
     dl.len = 0;
     try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
-    _ = try feed_view.layoutLoadout(gpa, &engine, @intCast(W), @intCast(H), &dl, null, lens_socket.seatedAccent(feed_t), 0, 0, null, feed_t, .{}, &fh, reply_t, .{}, &rh, zone_t, .{}, &zh, false, false, null);
+    _ = try feed_view.layoutLoadout(gpa, &engine, @intCast(W), @intCast(H), &dl, null, lens_socket.seatedAccent(feed_t), 0, 0, null, feed_t, .{}, &fh, reply_t, .{}, &rh, zone_t, .{}, &zh, false, false, null, &.{}, .{ .step = .landing, .answers = .{}, .config = discover.DEFAULT_CONFIG, .name = "", .color = 0 }, .{ .cards = &.{}, .text = "", .seated = 0 });
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_loadout.ppm");
     std.debug.print("wrote /tmp/zat_loadout.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
