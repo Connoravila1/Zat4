@@ -96,6 +96,7 @@ fn winOpen(path: []const u8, write: bool) ?*anyopaque {
 }
 const snapshot = @import("../core/snapshot.zig");
 const feed = @import("../core/feed.zig");
+const algo_library = @import("../core/algo_library.zig");
 const auth = @import("auth.zig");
 const keystore = @import("keystore.zig");
 
@@ -116,6 +117,7 @@ const keystore_supported = builtin.os.tag == .linux and !builtin.is_test;
 
 const store_file = "store.zat";
 const session_file = "session.zat";
+const library_file = "algorithms.zat";
 const oauth_session_file = "oauth_session.zat";
 const max_file_bytes = 64 * 1024 * 1024;
 
@@ -385,6 +387,38 @@ pub fn saveStore(gpa: Allocator, environ: ?*const std.process.Environ.Map, store
     const dir = cacheDir(&dir_buf, environ) orelse return false;
     const path = joinFile(&path_buf, dir, store_file) orelse return false;
     return saveStoreAt(gpa, path, store);
+}
+
+// ---------------------------------------------------------------------------
+// The algorithm library — the user's created/downloaded feeds
+// ---------------------------------------------------------------------------
+
+pub fn loadLibraryAt(gpa: Allocator, path: []const u8) ?algo_library.Library {
+    const bytes = readFileAlloc(gpa, path) orelse return null;
+    defer gpa.free(bytes);
+    return algo_library.deserialize(gpa, bytes) catch null;
+}
+
+pub fn saveLibraryAt(gpa: Allocator, path: []const u8, lib: *const algo_library.Library) bool {
+    const bytes = algo_library.serialize(gpa, lib) catch return false;
+    defer gpa.free(bytes);
+    return writeFileAtomic(path, bytes, 0o644);
+}
+
+pub fn loadLibrary(gpa: Allocator, environ: ?*const std.process.Environ.Map) ?algo_library.Library {
+    var dir_buf: [512]u8 = undefined;
+    var path_buf: [512]u8 = undefined;
+    const dir = cacheDir(&dir_buf, environ) orelse return null;
+    const path = joinFile(&path_buf, dir, library_file) orelse return null;
+    return loadLibraryAt(gpa, path);
+}
+
+pub fn saveLibrary(gpa: Allocator, environ: ?*const std.process.Environ.Map, lib: *const algo_library.Library) bool {
+    var dir_buf: [512]u8 = undefined;
+    var path_buf: [512]u8 = undefined;
+    const dir = cacheDir(&dir_buf, environ) orelse return false;
+    const path = joinFile(&path_buf, dir, library_file) orelse return false;
+    return saveLibraryAt(gpa, path, lib);
 }
 
 // ---------------------------------------------------------------------------

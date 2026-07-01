@@ -508,9 +508,20 @@ pub fn run(
     var gcreate_name_buf: [64]u8 = undefined;
     var gcreate_name_len: usize = 0;
     var gcreate_prepare_frames: u32 = 0; // the .preparing loading beat's progress (frames)
-    var algo_lib: algo_library.Library = .{};
+    // Load the user's saved library (created/downloaded feeds); empty on first run
+    // or a corrupt file (deserialize is total). Saved after each create/adopt.
+    var algo_lib: algo_library.Library = cache_shell.loadLibrary(gpa, environ) orelse .{};
     defer algo_lib.deinit(gpa);
     var algo_uid: u32 = 0;
+    // Resume id minting past the highest persisted `user:N`, so a new create can't
+    // collide with a saved one (add is idempotent by id → a collision drops the new).
+    for (algo_lib.records.items) |rec| {
+        const id = algo_lib.slice(rec.id);
+        if (std.mem.startsWith(u8, id, "user:")) {
+            const n = std.fmt.parseInt(u32, id["user:".len..], 10) catch continue;
+            if (n >= algo_uid) algo_uid = n + 1;
+        }
+    }
     // The active top-level Screen (index into feed_view.nav_labels); the rail
     // sets it on a click. 0 = Home (the feed). Lives across frames in run().
     var gscreen: u8 = 0;
@@ -1992,6 +2003,7 @@ pub fn run(
                                             if (create_flow.finalize(arena, gcreate_config, id, nm, gcreate_color)) |new| {
                                                 if (algo_lib.add(gpa, new)) |_| {
                                                     algo_uid += 1;
+                                                    _ = cache_shell.saveLibrary(gpa, environ, &algo_lib); // persist across launches
                                                     status = "Saved to your library.";
                                                     gcreate_step = .pace;
                                                     gcreate_answers = .{};
