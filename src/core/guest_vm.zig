@@ -87,6 +87,8 @@ pub const Op = enum(u8) {
     abs, // unary
     gt, // a > b ? 1 : 0
     lt, // a < b ? 1 : 0
+    eq, // a == b ? 1 : 0
+    not, // a == 0 ? 1 : 0   (logical not / boolean-of; unary)
     select, // cond, then, else ⇒ (cond != 0 ? then : else)
     dup, // push a copy of the top
     pop, // discard the top
@@ -98,7 +100,7 @@ pub const Op = enum(u8) {
     call_host, // pop arg1, arg0; push host.call(Capability(`arg`), arg0, arg1)
 
     comptime {
-        assert(@typeInfo(Op).@"enum".fields.len == 21);
+        assert(@typeInfo(Op).@"enum".fields.len == 23);
     }
 };
 
@@ -302,6 +304,15 @@ pub fn run(program: []const Instr, view: guest_abi.CandidateView, base_score: f6
                 st.push(if (st.pop() < b) @as(f64, 1.0) else 0.0);
                 pc += 1;
             },
+            .eq => {
+                const b = st.pop();
+                st.push(if (st.pop() == b) @as(f64, 1.0) else 0.0);
+                pc += 1;
+            },
+            .not => {
+                st.push(if (st.pop() == 0) @as(f64, 1.0) else 0.0);
+                pc += 1;
+            },
             .select => {
                 const else_v = st.pop();
                 const then_v = st.pop();
@@ -406,7 +417,7 @@ const sample: guest_abi.CandidateView = .{
 
 test "guards + counts" {
     try t.expectEqual(@as(usize, 8), @sizeOf(Instr));
-    try t.expectEqual(@as(usize, 21), @typeInfo(Op).@"enum".fields.len);
+    try t.expectEqual(@as(usize, 23), @typeInfo(Op).@"enum".fields.len);
     try t.expectEqual(@as(usize, 7), @typeInfo(Fact).@"enum".fields.len);
 }
 

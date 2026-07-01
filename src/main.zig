@@ -689,6 +689,7 @@ test {
     _ = @import("core/guest_vm.zig");
     _ = @import("core/zal_lex.zig");
     _ = @import("core/zal_parse.zig");
+    _ = @import("core/zal_compile.zig");
     _ = @import("shell/algorithm.zig");
     _ = @import("core/feed_view.zig");
     _ = @import("core/settings_view.zig");
