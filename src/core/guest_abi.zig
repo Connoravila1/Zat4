@@ -131,15 +131,19 @@ pub const CandidateView = struct {
     like_count: u32,
     repost_count: u32,
     reply_count: u32,
+    tag_count: u32 = 0, // how many topic tags (zones) this post carries
     age_hrs: f32, // hours since the post was created (host computes; the clock never enters the guest)
     author_rep: f32, // public author-reputation prior, in [0,1]
     in_network: bool, // from an account the viewer follows
+    viewer_engaged: bool = false, // the viewer already liked or reposted this post
 
     comptime {
-        // Budget 24: 3×u32 (12) + 2×f32 (8) + bool (1) = 21, padded to 24 at the
+        // Budget 28: 4×u32 (16) + 2×f32 (8) + 2×bool (2) = 26, padded to 28 at the
         // 4-byte alignment. Exact. The field SET is the no-targeting boundary — any
-        // change here is a deliberate widening of what a guest can see.
-        assert(@sizeOf(CandidateView) == 24);
+        // change is a deliberate widening of what a guest can see. These additions
+        // are PUBLIC content signals (tag count, your own public engagement), no
+        // per-identity input, so they open no targeting channel.
+        assert(@sizeOf(CandidateView) == 28);
     }
 };
 
@@ -154,8 +158,8 @@ pub const AttentionEvent = struct {
     clicked: bool, // did the viewer click into it
 
     comptime {
-        // Budget 32: CandidateView (24) + f32 (4) + bool (1) = 29, padded to 32.
-        assert(@sizeOf(AttentionEvent) == 32);
+        // Budget 36: CandidateView (28) + f32 (4) + bool (1) = 33, padded to 36.
+        assert(@sizeOf(AttentionEvent) == 36);
     }
 };
 
@@ -193,8 +197,8 @@ pub fn classifyGrant(granted: []const Capability) GuestClassification {
 const t = std.testing;
 
 test "guards: the ABI types are exactly sized (the no-targeting / feature boundary)" {
-    try t.expectEqual(@as(usize, 24), @sizeOf(CandidateView));
-    try t.expectEqual(@as(usize, 32), @sizeOf(AttentionEvent));
+    try t.expectEqual(@as(usize, 28), @sizeOf(CandidateView));
+    try t.expectEqual(@as(usize, 36), @sizeOf(AttentionEvent));
     try t.expectEqual(@as(usize, 7), @typeInfo(Capability).@"enum".fields.len);
     try t.expectEqual(@as(usize, 3), @typeInfo(EntryPoint).@"enum".fields.len);
 }

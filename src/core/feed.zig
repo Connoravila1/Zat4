@@ -1034,6 +1034,22 @@ pub fn buildDiscoverView(
     }
     try cands.in_network.resize(arena, cands.list.len, true);
 
+    // Developer-tier PUBLIC per-candidate signals (out of band, D2): whether the
+    // viewer already engaged the post, and its topic-tag count — filled from the
+    // resident store so a guest program (a Zal algorithm) can read them. Cheap; a
+    // config algorithm never touches them. Each candidate's `ref` carries its post
+    // index (that is how the pool was sourced).
+    try cands.viewer_engaged.resize(arena, cands.list.len, false);
+    try cands.tag_count.resize(arena, cands.list.len);
+    const cand_refs = cands.list.items(.ref);
+    for (0..cands.list.len) |ci| {
+        const p = cand_refs[ci].raw();
+        const engaged = (p < store.liked.capacity() and store.liked.isSet(p)) or
+            (p < store.reposted.capacity() and store.reposted.isSet(p));
+        cands.viewer_engaged.setValue(ci, engaged);
+        cands.tag_count.items[ci] = @intCast(@min(store.post_tags.items[p].len, 255));
+    }
+
     const order = try discover.score(arena, &cands, config, now);
 
     // D4: the post-scoring filters. Per ranked position, hand the engine the

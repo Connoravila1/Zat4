@@ -61,12 +61,14 @@ pub const Fact = enum(u8) {
     age_hrs,
     author_rep,
     in_network,
+    viewer_engaged, // 1 if you already liked or reposted this post, else 0
+    tag_count, // how many topic tags (zones) this post carries
 
     comptime {
         // Exactly the public CandidateView features + base_score. Adding a fact is
-        // a deliberate act (weigh targeting / behavioral exposure), mirroring
-        // `algo_vm.Fact`'s count guard.
-        assert(@typeInfo(Fact).@"enum".fields.len == 7);
+        // a deliberate act (weigh targeting / behavioral exposure — these two are
+        // PUBLIC content signals, no identity), mirroring `algo_vm.Fact`'s guard.
+        assert(@typeInfo(Fact).@"enum".fields.len == 9);
     }
 };
 
@@ -171,6 +173,8 @@ fn factValue(fact: Fact, v: guest_abi.CandidateView, base_score: f64) f64 {
         .age_hrs => v.age_hrs,
         .author_rep => v.author_rep,
         .in_network => if (v.in_network) 1.0 else 0.0,
+        .viewer_engaged => if (v.viewer_engaged) 1.0 else 0.0,
+        .tag_count => @floatFromInt(v.tag_count),
     };
 }
 
@@ -418,7 +422,7 @@ const sample: guest_abi.CandidateView = .{
 test "guards + counts" {
     try t.expectEqual(@as(usize, 8), @sizeOf(Instr));
     try t.expectEqual(@as(usize, 23), @typeInfo(Op).@"enum".fields.len);
-    try t.expectEqual(@as(usize, 7), @typeInfo(Fact).@"enum".fields.len);
+    try t.expectEqual(@as(usize, 9), @typeInfo(Fact).@"enum".fields.len);
 }
 
 /// A deterministic, TOTAL mock host for the tests: one canned answer per capability.

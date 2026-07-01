@@ -70,6 +70,8 @@ they were variables. All are `num`.
 | `age_hrs` | hours since the post was created | 0 … large |
 | `author_rep` | the author's public reputation prior | 0.0 … 1.0 |
 | `in_network` | `1` if from an account you follow, else `0` | 0 or 1 |
+| `viewer_engaged` | `1` if you already liked or reposted this post, else `0` | 0 or 1 |
+| `tag_count` | how many topic tags (zones) this post carries | 0 … |
 | `base_score` | the engine's own computed score for this post | any |
 
 `base_score` lets you *refine* the engine's ranking; the other facts let you

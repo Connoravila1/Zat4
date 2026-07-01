@@ -73,6 +73,8 @@ fn factOf(name: []const u8) ?vm.Fact {
         .{ "age_hrs", vm.Fact.age_hrs },
         .{ "author_rep", vm.Fact.author_rep },
         .{ "in_network", vm.Fact.in_network },
+        .{ "viewer_engaged", vm.Fact.viewer_engaged },
+        .{ "tag_count", vm.Fact.tag_count },
     };
     inline for (table) |e| if (std.mem.eql(u8, name, e[0])) return e[1];
     return null;
@@ -440,6 +442,28 @@ test "compile+run: comparison + logical operators via the added eq/not ops" {
     // (like_count == 100) && (age_hrs <= 5) → true && true → 1
     const r = try runSource(a.allocator(), "fn score() num { return (like_count == 100.0) && (age_hrs <= 5.0); }", 0);
     try t.expectEqual(@as(f64, 1.0), r);
+}
+
+test "compile+run: the new public signals (viewer_engaged, tag_count) are readable" {
+    var a = std.heap.ArenaAllocator.init(t.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    // "reward tags; halve the score if you already engaged this post (freshness)."
+    const src = "fn score() num { var s = like_count + tag_count * 5.0; if (viewer_engaged) { s = s / 2.0; } return s; }";
+    const ast = try parse.parse(arena, src);
+    const res = try compile(arena, &ast, "score");
+    try t.expect(res.ok());
+
+    var fresh = sample;
+    fresh.viewer_engaged = false;
+    fresh.tag_count = 2; // 100 + 2*5 = 110
+    var seen = sample;
+    seen.viewer_engaged = true;
+    seen.tag_count = 2; // (100 + 10) / 2 = 55
+    const s_fresh = vm.run(res.program, fresh, 0, vm.default_fuel, null);
+    const s_seen = vm.run(res.program, seen, 0, vm.default_fuel, null);
+    try t.expectEqual(@as(f64, 110.0), s_fresh);
+    try t.expect(s_fresh > s_seen); // an already-engaged post is down-ranked
 }
 
 test "compile: unknown name and undeclared assignment are clean errors, no bytecode" {

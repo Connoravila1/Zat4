@@ -138,17 +138,28 @@ pub const Candidate = struct {
 pub const Candidates = struct {
     list: std.MultiArrayList(Candidate) = .empty,
     in_network: std.DynamicBitSetUnmanaged = .{},
+    /// Per-candidate PUBLIC signals the developer tier reads, kept OUT OF BAND (A6)
+    /// like `in_network`: whether the viewer already liked/reposted the post, and
+    /// how many topic tags it carries. The shell fills these from its store; a
+    /// caller that doesn't (a config algorithm, a test) leaves them at the defaults
+    /// (not-engaged, 0 tags), so nothing else is affected.
+    viewer_engaged: std.DynamicBitSetUnmanaged = .{},
+    tag_count: std.ArrayListUnmanaged(u8) = .empty,
 
-    /// Append one candidate, growing the parallel in/out-of-network bit (A6).
+    /// Append one candidate, growing the parallel out-of-band signals (A6).
     pub fn append(self: *Candidates, gpa: Allocator, c: Candidate, in_network: bool) error{OutOfMemory}!void {
         try self.list.append(gpa, c);
         try self.in_network.resize(gpa, self.list.len, false);
         self.in_network.setValue(self.list.len - 1, in_network);
+        try self.viewer_engaged.resize(gpa, self.list.len, false);
+        try self.tag_count.append(gpa, 0);
     }
 
     pub fn deinit(self: *Candidates, gpa: Allocator) void {
         self.list.deinit(gpa);
         self.in_network.deinit(gpa);
+        self.viewer_engaged.deinit(gpa);
+        self.tag_count.deinit(gpa);
         self.* = undefined;
     }
 };
@@ -436,7 +447,9 @@ pub fn score(arena: Allocator, cands: *const Candidates, config: FeedConfig, now
         // pure). It replaces the L1/L2/L3 path below; retrieval already shaped the
         // pool, and D4 moderation/diversity still runs after (invariant 8).
         if (config.guest_program.len > 0) {
-            const view = candidateView(c, in_net, now);
+            const engaged = i < cands.viewer_engaged.capacity() and cands.viewer_engaged.isSet(i);
+            const tags: u8 = if (i < cands.tag_count.items.len) cands.tag_count.items[i] else 0;
+            const view = candidateView(c, in_net, engaged, tags, now);
             const base = scoreRow(c, config, now); // available to the guest as `base_score`
             scores[i] = guest_vm.run(config.guest_program, view, base, config.guest_fuel, null) * @as(f64, pool_w);
             kept.appendAssumeCapacity(@intCast(i));
@@ -488,16 +501,18 @@ pub fn score(arena: Allocator, cands: *const Candidates, config: FeedConfig, now
 /// developer tier — the exact, no-identity feature set a guest program reads (a
 /// guest sees no author DID / "is this me", so it cannot target an account). `now`
 /// is the value the scorer was handed (B4); `age_hrs` is derived here.
-fn candidateView(c: Candidate, in_network: bool, now: i64) guest_abi.CandidateView {
+fn candidateView(c: Candidate, in_network: bool, viewer_engaged: bool, tag_count: u8, now: i64) guest_abi.CandidateView {
     const d = now - c.created_at;
     const age_hrs: f32 = if (d <= 0) 0 else @floatCast(@as(f64, @floatFromInt(d)) / 3600.0);
     return .{
         .like_count = c.like_count,
         .repost_count = c.repost_count,
         .reply_count = c.reply_count,
+        .tag_count = tag_count,
         .age_hrs = age_hrs,
         .author_rep = c.author_rep,
         .in_network = in_network,
+        .viewer_engaged = viewer_engaged,
     };
 }
 
