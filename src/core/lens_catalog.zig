@@ -373,6 +373,69 @@ test "scoringConfigForId: Discover scores, Following is the no-scoring path" {
     try t.expectEqual(@as(f32, 1.0), ml.w_like);
 }
 
+/// The socket flags for a LIBRARY record, DERIVED from its config (invariant 6):
+/// `behavioral` = reads attention, `learns` = keeps a model. Parsed in `scratch`
+/// (transient) then classified — an honest label the creator can't fake. A
+/// no-config record (chronological) reads neither. Pure over its inputs.
+pub fn recordFlags(scratch: Allocator, library: *const algo_library.Library, rec: algo_library.AlgoRecord) lens_socket.LensFlags {
+    const bytes = library.configBytes(rec);
+    if (bytes.len == 0) return .{};
+    const cfg = algorithm.parse(scratch, bytes) catch return .{};
+    const c = transparency.classify(cfg);
+    return .{ .behavioral = c.uses_behavioral, .learns = c.learns };
+}
+
+/// Build socket `LensCard`s for the user's BENCH — the library algorithms not yet
+/// plugged into a socket. For the skeleton the bench is every library record (the
+/// per-surface sockets seat built-ins); excluding already-socketed ids is a later
+/// refinement. Each card's strings are copied into a fresh `gpa`-owned blob (caller
+/// frees both) and its flags are derived from its config (parsed in `scratch`). The
+/// card's `cid` is the record's id, so a drag-to-load resolves it via `scoringConfig`.
+pub fn benchCards(gpa: Allocator, scratch: Allocator, library: *const algo_library.Library) !struct { []lens_socket.LensCard, []const u8 } {
+    var blob: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer blob.deinit(gpa);
+    const cards = try gpa.alloc(lens_socket.LensCard, library.records.items.len);
+    errdefer gpa.free(cards);
+    for (library.records.items, 0..) |rec, i| {
+        const name: lens_socket.TextSpan = .{ .off = @intCast(blob.items.len), .len = rec.name.len };
+        try blob.appendSlice(gpa, library.slice(rec.name));
+        const ranks: lens_socket.TextSpan = .{ .off = @intCast(blob.items.len), .len = rec.ranks.len };
+        try blob.appendSlice(gpa, library.slice(rec.ranks));
+        const desc: lens_socket.TextSpan = .{ .off = @intCast(blob.items.len), .len = rec.desc.len };
+        try blob.appendSlice(gpa, library.slice(rec.desc));
+        const author: lens_socket.TextSpan = .{ .off = @intCast(blob.items.len), .len = rec.creator.len };
+        try blob.appendSlice(gpa, library.slice(rec.creator));
+        const cid: lens_socket.TextSpan = .{ .off = @intCast(blob.items.len), .len = rec.id.len };
+        try blob.appendSlice(gpa, library.slice(rec.id));
+        cards[i] = .{ .cid = cid, .name = name, .author = author, .ranks = ranks, .desc = desc, .color = rec.color, .flags = recordFlags(scratch, library, rec) };
+    }
+    return .{ cards, try blob.toOwnedSlice(gpa) };
+}
+
+test "benchCards: a created library algorithm becomes a socket card with derived flags" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // An adaptive private feed (behavioral_weight on) → derived behavioral + learns.
+    var cfg = discover.DEFAULT_CONFIG;
+    cfg.behavioral_weight = 1.0;
+    const bytes = try algorithm.serialize(arena, cfg);
+    var lib: algo_library.Library = .{};
+    defer lib.deinit(t.allocator);
+    _ = try lib.add(t.allocator, .{ .id = "user:1", .name = "Mine", .ranks = "engagement, adaptive", .desc = "d", .creator = "you", .config = bytes, .color = 5 });
+
+    const cards, const blob = try benchCards(t.allocator, arena, &lib);
+    defer t.allocator.free(cards);
+    defer t.allocator.free(blob);
+    try t.expectEqual(@as(usize, 1), cards.len);
+    try t.expectEqualStrings("Mine", blob[cards[0].name.off..][0..cards[0].name.len]);
+    try t.expectEqualStrings("user:1", blob[cards[0].cid.off..][0..cards[0].cid.len]);
+    try t.expectEqual(@as(u8, 5), cards[0].color);
+    try t.expect(cards[0].flags.behavioral and cards[0].flags.learns); // proven from the config
+}
+
 /// A persisted loadout entry, resolved from the user's record (§10): which
 /// algorithm + the user's color override.
 // A7.2: cold transient (one per persisted lens at load), size guard waived.
