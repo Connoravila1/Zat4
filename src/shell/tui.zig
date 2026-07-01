@@ -1206,7 +1206,15 @@ pub fn run(
             if (gcreate_prepare_frames >= create_prepare_len) gcreate_step = .recap;
         }
         const create_prepare_t: f32 = @min(@as(f32, @floatFromInt(gcreate_prepare_frames)) / @as(f32, @floatFromInt(create_prepare_len)), 1.0);
-        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .market = if (gscreen == feed_view.screen_loadout and gloadout_tab == 1) market_cards.items else &.{}, .create = .{ .step = gcreate_step, .answers = gcreate_answers, .config = gcreate_config, .name = gcreate_name_buf[0..gcreate_name_len], .color = gcreate_color, .naming = gcreate_step == .name, .prepare_t = create_prepare_t }, .inspect_bytes = inspect_bytes orelse "", .inspect_name = inspect_name, .inspect_ref = inspect_ref, .inspect_source = gtransp_source, .inspect_loading = inspect_loading, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
+        // The bench: the user's library algorithms as socket cards, built into the
+        // frame arena (auto-freed). Only on the Loadout tab; empty otherwise.
+        var bench_tray: lens_socket.TrayView = .{ .cards = &.{}, .text = "", .seated = 0 };
+        if (gscreen == feed_view.screen_loadout and gloadout_tab == 0) {
+            if (lens_catalog.benchCards(arena, arena, &algo_lib)) |res| {
+                bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
+            } else |_| {}
+        }
+        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .market = if (gscreen == feed_view.screen_loadout and gloadout_tab == 1) market_cards.items else &.{}, .create = .{ .step = gcreate_step, .answers = gcreate_answers, .config = gcreate_config, .name = gcreate_name_buf[0..gcreate_name_len], .color = gcreate_color, .naming = gcreate_step == .name, .prepare_t = create_prepare_t }, .bench = bench_tray, .inspect_bytes = inspect_bytes orelse "", .inspect_name = inspect_name, .inspect_ref = inspect_ref, .inspect_source = gtransp_source, .inspect_loading = inspect_loading, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
         switch (mode) {
             .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status),
             .compose => {
@@ -3297,6 +3305,9 @@ const Grid = struct {
     market: []const feed_view.MarketAlgoCard = &.{},
     /// The simple-Create flow's state (loadout tab 2). A value set per frame.
     create: feed_view.CreateView = .{ .step = .landing, .answers = .{}, .config = discover.DEFAULT_CONFIG, .name = "", .color = 0 },
+    /// The user's bench — library algorithms not in a socket (Loadout tab). A value
+    /// set per frame (built from the library into the frame arena).
+    bench: lens_socket.TrayView = .{ .cards = &.{}, .text = "", .seated = 0 },
     /// The transparency page's inspected algorithm (screen_transparency): its
     /// fetched config + name + ref (CID), rebuilt into a page each frame. Null
     /// config ⇒ not inspecting. Set per frame.
@@ -4051,7 +4062,7 @@ fn paintFrame(
             const feed_posts = feed_view.fromTimeline(arena, view_items, now) catch &[_]feed_view.PostView{};
             if (g.screen.* == feed_view.screen_loadout) {
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
-                g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market, g.create) catch g.content_h.*; // software: draw line-art nav
+                g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market, g.create, g.bench) catch g.content_h.*; // software: draw line-art nav
             } else if (g.screen.* == feed_view.screen_transparency) {
                 if (g.inspect_loading) {
                     g.content_h.* = feed_view.layoutAlgorithmLoading(gpa, g.engine, @intCast(win.fb.width), g.draw, g.regions, g.accent, g.inspect_name) catch g.content_h.*;
@@ -4444,7 +4455,7 @@ fn paintFrameGpu(
             }
             gs.content_x = lg.col_x;
             gs.content_w = lg.col_w;
-            g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, true, true, lg, g.market, g.create) catch g.content_h.*; // GPU: SDF pass strikes the nav icons crisp
+            g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, true, true, lg, g.market, g.create, g.bench) catch g.content_h.*; // GPU: SDF pass strikes the nav icons crisp
         } else if (g.screen.* == feed_view.screen_transparency) {
             // The algorithm transparency page: a plain scrolling document (no rail),
             // rebuilt from the inspected config each entry (what you see = what runs).

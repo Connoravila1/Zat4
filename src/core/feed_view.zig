@@ -2368,6 +2368,10 @@ pub fn layoutLoadout(
     market: []const MarketAlgoCard,
     /// The simple-Create flow's state — read only on tab 2 (Create).
     create: CreateView,
+    /// The user's BENCH — library algorithms (created/downloaded) not plugged into a
+    /// socket. Rendered as a right-hand shelf on the Loadout tab; drag one into a
+    /// socket to load it. Empty ⇒ the empty-state prompt.
+    bench: lens_socket.TrayView,
 ) error{OutOfMemory}!i32 {
     // Algorithms is a WIDE page like the others: the glass spans the full
     // rectangle and the content centres in it — NO floating main-feed sidebar.
@@ -2417,6 +2421,33 @@ pub fn layoutLoadout(
             y += sh + 28;
         }
         content_h = (y - scroll) + 20; // total (unscrolled) height for scroll clamping
+
+        // The BENCH — a right-hand shelf of library algorithms not in a socket. Drawn
+        // FIXED (it doesn't scroll with the surfaces), in the empty space right of the
+        // content column. Drag one into a socket to load it (the drag is the next slice).
+        const shelf_x = m.lx + m.cw + 40;
+        const shelf_w = m.side_x - shelf_x - 20;
+        if (shelf_w >= 220) {
+            var sy: i32 = content_top;
+            _ = try str(gpa, dl, e, .semibold, shelf_x, sy + 12, muted, 12, "YOUR LIBRARY");
+            sy += 30;
+            if (bench.cards.len == 0) {
+                _ = try wrapBody(gpa, dl, e, shelf_x, sy + 12, shelf_w, faint, 13, "Algorithms you create or download park here. Drag one into a socket to use it.", 19, true, null);
+            } else {
+                for (bench.cards) |card| {
+                    const ch: i32 = 72;
+                    const card_acc = lens_socket.palette[@min(card.color, lens_socket.palette.len - 1)];
+                    try rect(gpa, dl, shelf_x, sy, shelf_w, ch, skinPanel(accent), 12);
+                    try rect(gpa, dl, shelf_x, sy, 4, ch, card_acc, 2); // accent spine
+                    const dot: u32 = if (card.flags.behavioral) accent else boost_c;
+                    try rect(gpa, dl, shelf_x + 18, sy + 20, 8, 8, dot, 4);
+                    _ = try str(gpa, dl, e, .semibold, shelf_x + 34, sy + 28, ink, 15, bench.text[card.name.off..][0..card.name.len]);
+                    _ = try str(gpa, dl, e, .regular, shelf_x + 18, sy + 52, muted, 12, bench.text[card.ranks.off..][0..card.ranks.len]);
+                    _ = try str(gpa, dl, e, .semibold, shelf_x + shelf_w - 26, sy + 44, faint, 15, "\u{22EE}"); // ⋮ drag handle (Part 3 wires the drop)
+                    sy += ch + 12;
+                }
+            }
+        }
     } else if (tab == 1) {
         content_h = try drawMarketplace(gpa, dl, e, m, height, scroll, regions, accent, market);
     } else {
