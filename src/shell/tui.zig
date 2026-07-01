@@ -62,6 +62,7 @@ const lens_socket = @import("../core/lens_socket.zig");
 const lens_catalog = @import("../core/lens_catalog.zig");
 const discover = @import("../core/discover.zig");
 const transparency = @import("../core/transparency.zig");
+const algorithm_core = @import("../core/algorithm.zig");
 const algorithm_shell = @import("algorithm.zig");
 const loadout_store = @import("loadout.zig");
 const effect_core = @import("../core/effect.zig");
@@ -602,6 +603,9 @@ pub fn run(
     var inspect_name: []const u8 = "";
     var inspect_ref: []const u8 = "";
     var transp_return_screen: u8 = feed_view.screen_loadout;
+    // On the transparency page: false = the summary, true = the byte-exact source
+    // (the "View the exact source" tap-through). Reset when a new algorithm opens.
+    var gtransp_source = false;
     defer {
         if (inspect_name.len > 0) gpa.free(inspect_name);
         if (inspect_ref.len > 0) gpa.free(inspect_ref);
@@ -1121,7 +1125,7 @@ pub fn run(
         var cur_socket_ui = if (on_thread_screen) reply_ui else if (on_zone_screen) zone_ui else gsocket_ui;
         cur_socket_ui.julia = julia_on;
         const cur_socket_hits = if (on_thread_screen) &reply_hits else if (on_zone_screen) &zone_hits else &gsocket_hits;
-        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .market = if (gscreen == feed_view.screen_loadout and gloadout_tab == 1) market_cards.items else &.{}, .inspect_config = inspect_config, .inspect_name = inspect_name, .inspect_ref = inspect_ref, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
+        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .market = if (gscreen == feed_view.screen_loadout and gloadout_tab == 1) market_cards.items else &.{}, .inspect_config = inspect_config, .inspect_name = inspect_name, .inspect_ref = inspect_ref, .inspect_source = gtransp_source, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
         switch (mode) {
             .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status),
             .compose => {
@@ -1824,8 +1828,13 @@ pub fn run(
                                             // The transparency page, zone page, and thread
                                             // share Back; each returns where it was entered.
                                             if (gscreen == feed_view.screen_transparency) {
-                                                gscreen = transp_return_screen;
-                                                inspect_config = null;
+                                                if (gtransp_source) {
+                                                    // On the source sub-view → back to the summary.
+                                                    gtransp_source = false;
+                                                } else {
+                                                    gscreen = transp_return_screen;
+                                                    inspect_config = null;
+                                                }
                                             } else {
                                                 gscreen = if (gscreen == feed_view.screen_zones) zone_return_screen else thread_return_screen;
                                             }
@@ -1932,8 +1941,15 @@ pub fn run(
                                                 inspect_config = c;
                                                 transp_return_screen = gscreen;
                                                 gscreen = feed_view.screen_transparency;
+                                                gtransp_source = false; // open on the summary
                                                 gscroll_px = 0;
                                             } else status = "algorithm: unavailable";
+                                        },
+                                        // "View the exact source" on the transparency
+                                        // page → the byte-exact serialized artifact.
+                                        .algo_source => {
+                                            gtransp_source = true;
+                                            gscroll_px = 0;
                                         },
                                         // "Add to loadout" (adopt + score) is the next
                                         // slice — it needs the fetched config wired into
@@ -3054,6 +3070,8 @@ const Grid = struct {
     inspect_config: ?discover.FeedConfig = null,
     inspect_name: []const u8 = "",
     inspect_ref: []const u8 = "",
+    /// On the transparency page: false = the summary, true = the byte-exact source.
+    inspect_source: bool = false,
     /// Out: layoutLoadout writes each page socket's geometry here for the
     /// shell's drag math (feed / reply / zone).
     loadout_geoms: *[3]lens_socket.Geometry = undefined,
@@ -3799,7 +3817,11 @@ fn paintFrame(
                 g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market) catch g.content_h.*; // software: draw line-art nav
             } else if (g.screen.* == feed_view.screen_transparency) {
                 if (g.inspect_config) |cfg| {
-                    if (transparency.buildPage(arena, g.inspect_name, g.inspect_ref, cfg) catch null) |pg|
+                    if (g.inspect_source) {
+                        // The byte-exact source (what runs = validated config serialized).
+                        if (algorithm_core.serialize(arena, discover.validated(cfg)) catch null) |src|
+                            g.content_h.* = feed_view.layoutAlgorithmSource(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.inspect_name, g.inspect_ref, src) catch g.content_h.*;
+                    } else if (transparency.buildPage(arena, g.inspect_name, g.inspect_ref, cfg) catch null) |pg|
                         g.content_h.* = feed_view.layoutTransparency(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, pg) catch g.content_h.*;
                 }
             } else {
@@ -4132,7 +4154,7 @@ fn paintFrameGpu(
     const over_left_rail = gs.algo_t > 0.5 and g.hover_x >= 0 and @as(f32, @floatFromInt(g.hover_x)) < left_rail_right + 8.0 and g.hover_y >= 0;
     springGeom(&gs.left_hover_t, &gs.left_hover_v, if (over_left_rail) 1.0 else 0.0, 1.0 / 60.0);
     const algo_animating = @abs(gs.algo_t - (if (on_algo) @as(f32, 1.0) else 0.0)) > 0.003 or @abs(gs.algo_v) > 0.003 or @abs(gs.left_hover_t - (if (over_left_rail) @as(f32, 1.0) else 0.0)) > 0.004 or @abs(gs.left_hover_v) > 0.004;
-    const sig = feedSignature(items, g.scroll.*, w, h) ^ (@as(u64, g.screen.*) *% 0x9E37_79B9_7F4A_7C15) ^ (socket_sig *% 0xD1B5_4A32_D192_ED03) ^ (@as(u64, g.settings_section) *% 0xC2B2_AE3D_27D4_EB4F) ^ (g.settings_toggles *% 0x9E6C_63D0_676A_9A99) ^ (g.settings_choices *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, g.settings_picking) *% 0x8A91_7F2B_4D3E_61C7);
+    const sig = feedSignature(items, g.scroll.*, w, h) ^ (@as(u64, g.screen.*) *% 0x9E37_79B9_7F4A_7C15) ^ (socket_sig *% 0xD1B5_4A32_D192_ED03) ^ (@as(u64, g.settings_section) *% 0xC2B2_AE3D_27D4_EB4F) ^ (g.settings_toggles *% 0x9E6C_63D0_676A_9A99) ^ (g.settings_choices *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, g.settings_picking) *% 0x8A91_7F2B_4D3E_61C7) ^ (@as(u64, @intFromBool(g.inspect_source)) *% 0xF29C_511C_8E3D_45A7);
     // A drag/settle animates the socket every frame (lift, reflow, ghost), so
     // bypass the feed cache while it runs — a brief interaction, and the field
     // already rebuilds every frame anyway.
@@ -4184,8 +4206,12 @@ fn paintFrameGpu(
         } else if (g.screen.* == feed_view.screen_transparency) {
             // The algorithm transparency page: a plain scrolling document (no rail),
             // rebuilt from the inspected config each entry (what you see = what runs).
+            // Summary by default; the byte-exact serialized source on the tap-through.
             if (g.inspect_config) |cfg| {
-                if (transparency.buildPage(arena, g.inspect_name, g.inspect_ref, cfg) catch null) |pg|
+                if (g.inspect_source) {
+                    if (algorithm_core.serialize(arena, discover.validated(cfg)) catch null) |src|
+                        g.content_h.* = feed_view.layoutAlgorithmSource(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.inspect_name, g.inspect_ref, src) catch g.content_h.*;
+                } else if (transparency.buildPage(arena, g.inspect_name, g.inspect_ref, cfg) catch null) |pg|
                     g.content_h.* = feed_view.layoutTransparency(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, pg) catch g.content_h.*;
             }
         } else {

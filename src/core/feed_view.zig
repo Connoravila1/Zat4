@@ -146,7 +146,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source };
 
 /// The six top-level rail destinations, in order. The `Screen` index a nav
 /// region carries is an index into this. Shared by the rail (draw + hit) and
@@ -2131,7 +2131,18 @@ pub fn layoutTransparency(
     _ = try str(gpa, dl, e, .semibold, lx, y + 36, ink, 38, page.name);
     y += 56;
     _ = try str(gpa, dl, e, .regular, lx, y + 16, faint, 16, page.ref);
-    y += 38;
+    y += 34;
+    // A tap-through to the EXACT serialized source — the byte-for-byte artifact the
+    // CID above commits to (what actually runs), not this hand-written summary. The
+    // summary explains; the source proves. Placed at the top so "show me exactly
+    // what runs" is one tap from the title.
+    {
+        const link = "⟨⟩  View the exact source";
+        const lw: i32 = @intCast(text.measure(e, .semibold, link, 15));
+        _ = try str(gpa, dl, e, .semibold, lx, y + 16, accent, 15, link);
+        try emitRegion(gpa, regions, lx - 6, y - 2, lw + 16, 30, 0, .algo_source);
+    }
+    y += 40;
 
     // The system-PROVEN classification — green dot for the privacy win, accent
     // for "uses attention" / "learns".
@@ -2204,6 +2215,72 @@ pub fn layoutTransparency(
     y += 48;
     return y - scroll;
 }
+
+/// The EXACT SOURCE view — the "show me the code" counterpart to the summary. It
+/// renders the byte-for-byte serialized algorithm (`core/algorithm.serialize`,
+/// passed in as `source`): the exact configuration/logic the engine runs and the
+/// `ref` (CID) commits to, verbatim, with no interpretation. Reached from the
+/// summary's "View the exact source" link; its Back returns to the summary. Pure
+/// draw; returns content height. Only source lines intersecting the viewport are
+/// painted (i16 coord safety on a long program).
+pub fn layoutAlgorithmSource(
+    gpa: Allocator,
+    e: *const text.Engine,
+    width: i32,
+    height: i32,
+    dl: *raster.DrawList,
+    regions: ?*Regions,
+    accent: u32,
+    scroll: i32,
+    name: []const u8,
+    ref: []const u8,
+    source: []const u8,
+) error{OutOfMemory}!i32 {
+    const m = metricsPage(width, screen_transparency);
+    const lx = m.lx;
+    const cw = m.cw;
+    if (regions) |rg| rg.clearRetainingCapacity();
+    var y = 80 + scroll;
+
+    // Back → the summary (not the marketplace; the shell resolves that).
+    {
+        const back_w: i32 = 78;
+        try rect(gpa, dl, lx, y - 34, back_w, 30, 0x14EDEAE0, 9);
+        _ = try str(gpa, dl, e, .semibold, lx + 16, y - 13, ink, 14, "‹ Back");
+        try emitRegion(gpa, regions, lx, y - 34, back_w, 30, 0, .back);
+    }
+
+    _ = try str(gpa, dl, e, .semibold, lx, y + 32, ink, 32, name);
+    y += 48;
+    _ = try str(gpa, dl, e, .regular, lx, y + 14, faint, 15, ref);
+    y += 28;
+    y = try wrapBody(gpa, dl, e, lx, y + 14, cw, muted, 13, "The exact configuration the engine runs — byte-for-byte what the reference above commits to. No interpretation, just the source.", 19, true, null);
+    y += 20;
+
+    // The serialized source in a panel, line by line. ASCII JSON — the
+    // proportional font reads it fine (a monospace face is a later nicety).
+    const pad: i32 = 18;
+    const line_h: i32 = 22;
+    var lines: usize = 1;
+    for (source) |c| {
+        if (c == '\n') lines += 1;
+    }
+    const panel_top = y;
+    const panel_h: i32 = @as(i32, @intCast(lines)) * line_h + pad * 2;
+    try rect(gpa, dl, lx, panel_top, cw, panel_h, skinPanel(accent), 12);
+    var ty = panel_top + pad + 14;
+    var it = std.mem.splitScalar(u8, source, '\n');
+    while (it.next()) |ln| {
+        if (ty > scroll_guard_min and ty < height + 40) // paint only visible lines (i16 safety)
+            _ = try str(gpa, dl, e, .regular, lx + pad, ty, body_c, 14, ln);
+        ty += line_h;
+    }
+    return (panel_top + panel_h + 48) - scroll;
+}
+
+/// Lines above this y are off the top of the window — never paint them (their
+/// i16 draw coords could otherwise wrap on a long source). A small negative slack.
+const scroll_guard_min: i32 = -64;
 
 pub fn layoutLoadout(
     gpa: Allocator,
