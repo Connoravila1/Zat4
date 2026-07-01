@@ -44,10 +44,11 @@ const appview = @import("../core/appview.zig");
 const jetstream = @import("../core/jetstream.zig");
 const lexicon = @import("../core/lexicon.zig");
 const jsonguard = @import("../core/jsonguard.zig");
+const discover = @import("../core/discover.zig");
 
 /// What a single event did to the index — returned so the pump (and tests)
 /// can count without re-inspecting the index. Plain enum, no payload.
-pub const Reduced = enum { post, follow, like, repost, identity, ignored };
+pub const Reduced = enum { post, follow, like, repost, identity, algorithm, ignored };
 
 /// Reduce one Jetstream event-JSON line into the index. PURE over (idx,
 /// json) aside from the index mutation it performs; no I/O, no clock. A line
@@ -116,8 +117,44 @@ pub fn ingestEvent(gpa: Allocator, arena: Allocator, idx: *appview.Index, event_
         try appview.indexEngagement(gpa, idx, .repost, subject_cid);
         return .repost;
     }
+    if (std.mem.eql(u8, commit.collection, lexicon.collection.algorithm)) {
+        // A published feed algorithm — index it for the marketplace. The generic
+        // `rec` above only pulled `subject`; the algorithm carries a typed `name`
+        // + `config`, so re-parse the line for that shape. Need the record cid +
+        // rkey (the fetch ref) or it can't be adopted, so those absent ⇒ ignored.
+        if (ev.did.len == 0 or commit.rkey.len == 0 or commit.cid.len == 0) return .ignored;
+        const parsed = std.json.parseFromSliceLeaky(AlgoEvent, arena, event_json, .{
+            .ignore_unknown_fields = true,
+        }) catch return .ignored;
+        const arec = (parsed.commit orelse return .ignored).record;
+        _ = try appview.indexAlgorithm(gpa, idx, .{
+            .cid = commit.cid,
+            .author_did = ev.did,
+            .rkey = commit.rkey,
+            .name = arec.name,
+            // Never trust the wire — the label the index derives must be over a
+            // safe config (D5/E4), the same posture as a client-side fetch.
+            .config = discover.validated(arec.config),
+        });
+        return .algorithm;
+    }
     return .ignored;
 }
+
+/// The algorithm record's typed shape (name + embedded config), re-parsed only on
+/// the algorithm branch. A7.2: cold parse target, size guard waived.
+const AlgoEvent = struct {
+    commit: ?AlgoCommit = null,
+};
+/// A7.2: cold struct, size guard waived — transient parse target.
+const AlgoCommit = struct {
+    record: AlgoRecordFlat = .{},
+};
+/// A7.2: cold struct, size guard waived — transient parse target.
+const AlgoRecordFlat = struct {
+    name: []const u8 = "",
+    config: discover.FeedConfig = .{},
+};
 
 // --- minimal graph-event wire shapes (transient parse targets, A7.2) ------
 //
@@ -305,6 +342,36 @@ test "ingest: an identity event indexes the author's handle" {
     ;
     try testing.expectEqual(Reduced.identity, try ingestEvent(gpa, arena_state.allocator(), &idx, ev));
     try testing.expectEqualStrings("bob.zat4.com", appview.handleFor(&idx, "did:plc:bob"));
+}
+
+test "ingest: a published algorithm record lands in the marketplace with a derived label" {
+    const gpa = testing.allocator;
+    var idx: appview.Index = .{};
+    defer appview.deinit(gpa, &idx);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // An adaptive algorithm (behavioral_weight non-zero ⇒ provably learns).
+    const ev =
+        \\{"did":"did:plc:alice","time_us":1,"kind":"commit","commit":{"operation":"create","collection":"app.zat4.feed.algorithm","rkey":"myfeed","cid":"bafyalg1","record":{"$type":"app.zat4.feed.algorithm","name":"Alice's Feed","config":{"behavioral_weight":1.0},"createdAt":"2026-06-30T00:00:00Z"}}}
+    ;
+    try testing.expectEqual(Reduced.algorithm, try ingestEvent(gpa, arena, &idx, ev));
+
+    const rows = try appview.listAlgorithms(arena, &idx, 50);
+    try testing.expectEqual(@as(usize, 1), rows.len);
+    try testing.expectEqualStrings("Alice's Feed", rows[0].name);
+    try testing.expectEqualStrings("myfeed", rows[0].rkey); // the fetch ref
+    try testing.expectEqualStrings("did:plc:alice", rows[0].author_did);
+    try testing.expectEqualStrings("bafyalg1", rows[0].cid);
+    try testing.expect(rows[0].learns); // DERIVED from the config (invariant 6)
+
+    // A malformed algorithm record (missing rkey) can't be adopted ⇒ ignored.
+    const bad =
+        \\{"did":"did:plc:alice","time_us":2,"kind":"commit","commit":{"operation":"create","collection":"app.zat4.feed.algorithm","cid":"bafyalg2","record":{"name":"no rkey"}}}
+    ;
+    try testing.expectEqual(Reduced.ignored, try ingestEvent(gpa, arena, &idx, bad));
+    try testing.expectEqual(@as(usize, 1), idx.algorithms.len);
 }
 
 test "isolation: foreign-namespace records never cross the ingest wall (Phase 7)" {

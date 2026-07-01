@@ -43,6 +43,12 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
+// Core→core imports (pure). The algorithm index derives each entry's PROVEN
+// privacy label from the config itself (transparency.classify), so the browse
+// surface can't claim "no behavioral data" for a config that uses it (DISCOVER
+// invariant 6). No cycle: neither module imports appview.
+const discover = @import("discover.zig");
+const transparency = @import("transparency.zig");
 
 /// A half-open byte span into the index's string pool. Strings (DIDs, CIDs,
 /// post text) are interned once and referenced by span, so the hot records
@@ -91,8 +97,43 @@ pub const Follow = struct {
     }
 };
 
+/// One indexed ALGORITHM record (`app.zat4.feed.algorithm`) — a named,
+/// shareable `FeedConfig` a creator published, held in quantity across repos so
+/// the marketplace can browse them. HOT (scanned to build the browse list) → A7.
+/// The privacy `flags` are DERIVED from the config at ingest (never the author's
+/// claim): a card cannot say "no behavioral data" unless every behavioral weight
+/// is provably zero (invariant 6). The full config is NOT stored here — the
+/// client fetches it by (author, rkey) when adopting/inspecting, so what runs is
+/// re-proven from the CID-committed record. A8: keyed by `cid`, immutable-by-hash.
+pub const Algorithm = struct {
+    cid: StrId, // record CID — the immutable key (A8)
+    author: StrId, // publisher DID (interned)
+    rkey: StrId, // record key, so a client can get_record the full config
+    name: Span, // display name in the string pool
+    created_at: i64, // record timestamp (sort key, reverse-chron)
+    state_budget: u32, // classify's declared on-device state ceiling (0 ⇒ stateless)
+    flags: AlgoFlags, // derived privacy bits (uses_behavioral / learns) — A6-style
+
+    comptime {
+        // Budget: name Span(8) + created_at i64(8) = 16, then 4×u32
+        // (cid/author/rkey/state_budget) = 16, + flags(1) = 33, padded to 40 at
+        // the 8-byte alignment of Span/i64. Exact (A7). The derived flags + state
+        // ceiling are the browse card's PROVEN privacy label — earned, kept tight.
+        assert(@sizeOf(Algorithm) == 40);
+    }
+};
+
+/// A published algorithm's derived privacy bits, computed from its OWN config by
+/// `transparency.classify` at ingest — the card's label cannot lie (invariant 6).
+pub const AlgoFlags = packed struct(u8) {
+    uses_behavioral: bool = false, // any attention-derived weight is non-zero
+    learns: bool = false, // the on-device learner is enabled (behavioral_weight != 0)
+    _rest: u6 = 0,
+};
+
 pub const PostList = std.MultiArrayList(Post);
 pub const FollowList = std.MultiArrayList(Follow);
+pub const AlgorithmList = std.MultiArrayList(Algorithm);
 
 /// The index. A7.2: cold container — one per process; its CONTENTS are the
 /// guarded hot arrays above. Owns all its memory (C4); every mutator takes
@@ -103,6 +144,10 @@ pub const FollowList = std.MultiArrayList(Follow);
 pub const Index = struct {
     posts: PostList = .empty,
     follows: FollowList = .empty,
+    /// Published algorithm records (the marketplace's browse pool). A8: deduped
+    /// by cid via `algo_by_cid`.
+    algorithms: AlgorithmList = .empty,
+    algo_by_cid: std.AutoHashMapUnmanaged(StrId, u32) = .empty,
 
     /// String pool: all interned bytes back-to-back, plus a span table so a
     /// StrId resolves to its bytes. A hash map interns DID/CID strings to
@@ -177,6 +222,8 @@ pub const Index = struct {
 pub fn deinit(gpa: Allocator, idx: *Index) void {
     idx.posts.deinit(gpa);
     idx.follows.deinit(gpa);
+    idx.algorithms.deinit(gpa);
+    idx.algo_by_cid.deinit(gpa);
     idx.pool_bytes.deinit(gpa);
     idx.pool_spans.deinit(gpa);
     // The intern map owns a dupe of each key (see internStr) — free them first.
@@ -342,6 +389,54 @@ pub fn indexPost(gpa: Allocator, idx: *Index, in: PostInput) Allocator.Error!boo
     try idx.post_tag_spans.append(gpa, .{ .off = tag_off, .len = tag_len });
 
     try idx.post_by_cid.put(gpa, cid_id, row);
+    return true;
+}
+
+/// A plain algorithm to index, as the shell decoded it from a published
+/// `app.zat4.feed.algorithm` record. Values only (E1). A7.2: cold boundary
+/// value, one per ingested event, decomposed immediately into the pooled hot
+/// `Algorithm`.
+pub const AlgorithmInput = struct {
+    cid: []const u8,
+    author_did: []const u8,
+    rkey: []const u8,
+    name: []const u8,
+    /// The published config — kept ONLY to derive the proven privacy label
+    /// (classify) at ingest. Not stored: the client re-fetches the full config
+    /// by (author, rkey) when it adopts/inspects, so what runs is re-proven.
+    config: discover.FeedConfig,
+    created_at: i64 = 0,
+};
+
+/// Index one published algorithm. A8: a re-seen cid is a no-op (same cid ⇒ same
+/// bytes). The privacy `flags` + `state_budget` are DERIVED from the config here
+/// via `transparency.classify`, so the browse card's label is a proof over the
+/// CID-committed config, never the author's assertion (invariant 6). Returns
+/// true if newly indexed.
+pub fn indexAlgorithm(gpa: Allocator, idx: *Index, in: AlgorithmInput) Allocator.Error!bool {
+    const cid_id = try internStr(gpa, idx, in.cid);
+    if (idx.algo_by_cid.contains(cid_id)) return false; // dedup (A8)
+
+    const author_id = try internStr(gpa, idx, in.author_did);
+    const rkey_id = try internStr(gpa, idx, in.rkey);
+    const name_off: u32 = @intCast(idx.pool_bytes.items.len);
+    try idx.pool_bytes.appendSlice(gpa, in.name);
+    const name_span: Span = .{ .off = name_off, .len = @intCast(in.name.len) };
+
+    // The proven privacy label — derived, not claimed (invariant 6).
+    const c = transparency.classify(in.config);
+
+    const row: u32 = @intCast(idx.algorithms.len);
+    try idx.algorithms.append(gpa, .{
+        .cid = cid_id,
+        .author = author_id,
+        .rkey = rkey_id,
+        .name = name_span,
+        .created_at = in.created_at,
+        .state_budget = c.state_budget_bytes,
+        .flags = .{ .uses_behavioral = c.uses_behavioral, .learns = c.learns },
+    });
+    try idx.algo_by_cid.put(gpa, cid_id, row);
     return true;
 }
 
@@ -675,6 +770,54 @@ pub const ZoneInfo = struct {
     count: usize,
 };
 
+/// The algorithm marketplace: every published `app.zat4.feed.algorithm`, newest
+/// first, up to `limit`. PURE (B2), allocated into `arena`. Each row carries the
+/// browse card's data + the (author, rkey) REF a client uses to fetch and adopt
+/// the full config. The privacy fields are the derived, proven label (invariant
+/// 6) — not the author's claim. Ranking (popularity, adopts) is a later phase;
+/// this is the flat set in reverse-ingest order (a stand-in for recency until a
+/// parsed timestamp sort key is wired).
+pub fn listAlgorithms(arena: Allocator, idx: *const Index, limit: usize) Allocator.Error![]AlgorithmInfo {
+    const total = idx.algorithms.len;
+    const n = @min(limit, total);
+    const out = try arena.alloc(AlgorithmInfo, n);
+    const cids = idx.algorithms.items(.cid);
+    const authors = idx.algorithms.items(.author);
+    const rkeys = idx.algorithms.items(.rkey);
+    const names = idx.algorithms.items(.name);
+    const budgets = idx.algorithms.items(.state_budget);
+    const flags = idx.algorithms.items(.flags);
+    for (out, 0..) |*o, i| {
+        const row = total - 1 - i; // newest (last-ingested) first
+        const s = names[row];
+        o.* = .{
+            .cid = str(idx, cids[row]),
+            .author_did = str(idx, authors[row]),
+            .author_handle = handleForId(idx, authors[row]),
+            .rkey = str(idx, rkeys[row]),
+            .name = idx.pool_bytes.items[s.off .. s.off + s.len],
+            .uses_behavioral = flags[row].uses_behavioral,
+            .learns = flags[row].learns,
+            .state_budget_bytes = budgets[row],
+        };
+    }
+    return out;
+}
+
+/// One marketplace card — a published algorithm as the browse surface needs it.
+/// Boundary value (the shell serializes it; the client fetches the full config by
+/// (author_did, rkey)). A7.2: cold struct, transient, size guard waived.
+pub const AlgorithmInfo = struct {
+    cid: []const u8, // the record CID — its transparency anchor (invariant 5)
+    author_did: []const u8,
+    author_handle: []const u8, // resolved handle, or "" (client falls back to did)
+    rkey: []const u8, // fetch ref: get_record(author_did, algorithm, rkey)
+    name: []const u8,
+    uses_behavioral: bool, // proven from the config (invariant 6), not claimed
+    learns: bool,
+    state_budget_bytes: u32,
+};
+
 /// Shared tail of both feed builders (D2/F4 — extracted once a SECOND caller
 /// appeared): sort the candidate post rows reverse-chron, take `limit`, and
 /// fill plain `TimelineRow`s, stamping each with `viewer_id`'s like record uri
@@ -858,6 +1001,65 @@ test "guard: hot records are exactly sized" {
     try testing.expectEqual(@as(usize, 32), @sizeOf(Post));
     try testing.expectEqual(@as(usize, 8), @sizeOf(Follow));
     try testing.expectEqual(@as(usize, 8), @sizeOf(Span));
+    try testing.expectEqual(@as(usize, 40), @sizeOf(Algorithm));
+    try testing.expectEqual(@as(usize, 1), @sizeOf(AlgoFlags));
+}
+
+test "algorithms: index dedups by cid; listAlgorithms returns newest first with the fetch ref" {
+    const gpa = testing.allocator;
+    var idx: Index = .{};
+    defer deinit(gpa, &idx);
+
+    var behav = discover.DEFAULT_CONFIG;
+    behav.behavioral_weight = 1.0; // an adaptive algorithm — provably learns
+    // A genuinely candidate-side config: every behavioral door shut. (DEFAULT_CONFIG
+    // itself is NOT behavioral-free — it carries non-zero profile/link-click weights
+    // from the D8 calibration, so classify().uses_behavioral is true for it.)
+    var candidate = discover.DEFAULT_CONFIG;
+    candidate.w_profile_click = 0;
+    candidate.w_link_click = 0;
+    candidate.w_bookmark = 0;
+    candidate.behavioral_weight = 0;
+
+    try testing.expect(try indexAlgorithm(gpa, &idx, .{
+        .cid = "bafyA", .author_did = "did:plc:a", .rkey = "r1", .name = "Adaptive", .config = behav, .created_at = 100,
+    }));
+    try testing.expect(try indexAlgorithm(gpa, &idx, .{
+        .cid = "bafyB", .author_did = "did:plc:b", .rkey = "r2", .name = "Candidate-only", .config = candidate, .created_at = 200,
+    }));
+    // Same cid ⇒ no-op (A8), even with different metadata.
+    try testing.expect(!try indexAlgorithm(gpa, &idx, .{
+        .cid = "bafyA", .author_did = "did:plc:a", .rkey = "r1", .name = "Adaptive", .config = behav, .created_at = 100,
+    }));
+    try testing.expectEqual(@as(usize, 2), idx.algorithms.len);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const rows = try listAlgorithms(arena_state.allocator(), &idx, 50);
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    // Newest (last-ingested) first.
+    try testing.expectEqualStrings("Candidate-only", rows[0].name);
+    try testing.expectEqualStrings("r2", rows[0].rkey);
+    try testing.expectEqualStrings("did:plc:b", rows[0].author_did);
+    try testing.expectEqualStrings("Adaptive", rows[1].name);
+    // The privacy label is DERIVED from each config, not claimed (invariant 6).
+    try testing.expect(!rows[0].learns and !rows[0].uses_behavioral); // candidate-side
+    try testing.expect(rows[1].learns and rows[1].uses_behavioral); // adaptive
+}
+
+test "algorithms: listAlgorithms limit caps the rows; empty index is empty (E4)" {
+    const gpa = testing.allocator;
+    var idx: Index = .{};
+    defer deinit(gpa, &idx);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try testing.expectEqual(@as(usize, 0), (try listAlgorithms(arena, &idx, 50)).len);
+    inline for (.{ "b1", "b2", "b3" }) |cid| {
+        _ = try indexAlgorithm(gpa, &idx, .{ .cid = cid, .author_did = "did:plc:a", .rkey = cid, .name = cid, .config = discover.DEFAULT_CONFIG });
+    }
+    try testing.expectEqual(@as(usize, 2), (try listAlgorithms(arena, &idx, 2)).len);
 }
 
 test "index: a post dedups by cid (A8 immutable-by-hash)" {

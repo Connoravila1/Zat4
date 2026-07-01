@@ -41,6 +41,8 @@ const config = @import("shell/config.zig");
 const window_shell = @import("shell/native.zig");
 const lexicon = @import("core/lexicon.zig");
 const write = @import("shell/write.zig");
+const algorithm_shell = @import("shell/algorithm.zig");
+const builder = @import("core/builder.zig");
 const clock_shell = @import("shell/clock.zig");
 
 /// Is there a usable cached session on disk? A cheap pre-auth probe: a new user
@@ -109,6 +111,10 @@ pub fn main(init: std.process.Init) !void {
     // app.zat4.graph.follow from the logged-in account (the positional handle)
     // to the target and exits. The value is the next argument.
     var follow_target: ?[]const u8 = null;
+    // Dev harness: `--publish-algo <name>` writes one app.zat4.feed.algorithm
+    // record (the friendly-builder's default config) into the user's repo, so the
+    // marketplace has content to index before the authoring UI exists.
+    var publish_algo_name: ?[]const u8 = null;
     // Headless sign-up test (enrollment 3b): `--create-account <username>` mints
     // <username>.zat4.com on the PDS with a fresh CSPRNG password and exits,
     // printing the handle/DID/password. No GUI, no display, no tunnel (the PDS is
@@ -167,6 +173,11 @@ pub fn main(init: std.process.Init) !void {
             if (ai + 1 < args.len) {
                 ai += 1;
                 follow_target = args[ai];
+            }
+        } else if (std.mem.eql(u8, arg, "--publish-algo")) {
+            if (ai + 1 < args.len) {
+                ai += 1;
+                publish_algo_name = args[ai];
             }
         } else {
             handle = arg;
@@ -387,7 +398,7 @@ pub fn main(init: std.process.Init) !void {
     // resulting at-uri/cid, and exit. This is the write-leg test: the record
     // lands in the user's OWN PDS under app.zat4.feed.post, from where the
     // firehose carries it to the Zat4 AppView.
-    if (post_text != null or follow_target != null) {
+    if (post_text != null or follow_target != null or publish_algo_name != null) {
         var from_cache = false;
         var session: auth.Session = undefined;
         if (env.get("ZAT_APP_PASSWORD")) |password| {
@@ -402,13 +413,13 @@ pub fn main(init: std.process.Init) !void {
             }
         } else if (session_path) |sp| {
             session = cache_shell.loadSessionAt(gpa, sp) orelse {
-                try out.print("--post/--follow needs credentials: set ZAT_APP_PASSWORD (or run the app once to cache a login)\n", .{});
+                try out.print("--post/--follow/--publish-algo needs credentials: set ZAT_APP_PASSWORD (or run the app once to cache a login)\n", .{});
                 try out.flush();
                 return error.LoginFailed;
             };
             from_cache = true;
         } else {
-            try out.print("--post/--follow needs credentials: set ZAT_APP_PASSWORD\n", .{});
+            try out.print("--post/--follow/--publish-algo needs credentials: set ZAT_APP_PASSWORD\n", .{});
             try out.flush();
             return error.LoginFailed;
         }
@@ -452,6 +463,22 @@ pub fn main(init: std.process.Init) !void {
                 .ok => |ref| try out.print("followed {s}\n  subject: {s}\n  uri: {s}\n", .{ target, subject_did, ref.uri }),
                 .failed => |f| try out.print("follow refused: status {d} {s}: {s}\n", .{ f.status, f.code, f.message }),
             }
+            try out.flush();
+        }
+
+        // The publish-algorithm leg: write one app.zat4.feed.algorithm record (the
+        // friendly builder's calibrated default — an adaptive, on-device-learning
+        // config) into the user's repo, keyed by a fixed dev rkey so re-running
+        // republishes the same slot. From there the AppView's poll indexes it and
+        // `getAlgorithms` lists it — the marketplace's content, before the UI.
+        if (publish_algo_name) |name| {
+            const config_out = builder.build(.{});
+            const published = algorithm_shell.publish(gpa, arena, io, env, &session, name, config_out, "dev-algo", now) catch |err| {
+                try out.print("publish-algo failed: {s}\n", .{@errorName(err)});
+                try out.flush();
+                return err;
+            };
+            try out.print("published app.zat4.feed.algorithm \"{s}\"\n  uri: {s}\n  cid: {s}\n", .{ name, published.uri, published.cid });
             try out.flush();
         }
         return;

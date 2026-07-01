@@ -96,6 +96,8 @@ pub const method = struct {
     // of known tags. Both are plain feed queries (not their own namespace).
     pub const get_posts_for_tag = "app.zat4.feed.getPostsForTag";
     pub const list_tags = "app.zat4.feed.listTags";
+    // The algorithm marketplace: browse published feed algorithms.
+    pub const get_algorithms = "app.zat4.feed.getAlgorithms";
 
     // Protocol methods — shared by every atproto app, NOT Bluesky content.
     // These stay exactly as they are (the wall self-check exempts them).
@@ -361,6 +363,31 @@ pub const TagView = struct {
 pub const TagsPage = struct {
     cursor: ?[]const u8 = null,
     tags: []const TagView = &.{},
+};
+
+/// One published algorithm in the marketplace browse list: its identity + fetch
+/// ref + the PROVEN privacy label the AppView derived from the config itself
+/// (never the author's claim — DISCOVER invariant 6). A client fetches the full
+/// config with `get_record(author, algorithm, rkey)` to adopt/inspect it.
+/// A7.2: cold struct, size guard waived — transient parse/build target.
+pub const AlgorithmView = struct {
+    cid: []const u8 = "", // record CID — the transparency anchor (invariant 5)
+    author: []const u8 = "", // publisher DID
+    handle: []const u8 = "", // resolved handle, or "" (client falls back to did)
+    rkey: []const u8 = "", // fetch ref
+    name: []const u8 = "",
+    usesBehavioral: bool = false, // proven from the config, not claimed
+    learns: bool = false,
+    stateBudgetBytes: u32 = 0,
+};
+
+/// Response of `app.zat4.feed.getAlgorithms`: the published algorithms (the
+/// marketplace browse pool). Ranking is a later phase; this is the flat set,
+/// newest first.
+/// A7.2: cold struct, size guard waived — transient parse/build target.
+pub const AlgorithmsPage = struct {
+    cursor: ?[]const u8 = null,
+    algorithms: []const AlgorithmView = &.{},
 };
 
 // ---------------------------------------------------------------------------
@@ -637,7 +664,7 @@ test "wall: every content collection and owned method is app.zat4, never app.bsk
         try testing.expect(std.mem.startsWith(u8, nsid, "app.zat4."));
         try testing.expect(std.mem.indexOf(u8, nsid, "app.bsky") == null);
     }
-    inline for (.{ method.get_profile, method.get_timeline, method.get_author_feed, method.get_posts_for_tag, method.list_tags }) |nsid| {
+    inline for (.{ method.get_profile, method.get_timeline, method.get_author_feed, method.get_posts_for_tag, method.list_tags, method.get_algorithms }) |nsid| {
         try testing.expect(std.mem.startsWith(u8, nsid, "app.zat4."));
     }
     inline for (.{ richtext.facet_link, richtext.facet_mention, richtext.facet_tag }) |nsid| {

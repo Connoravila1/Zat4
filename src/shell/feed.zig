@@ -304,6 +304,55 @@ pub fn loadZones(
     }
 }
 
+/// The marketplace-browse result: the published algorithms (metadata + fetch
+/// refs + proven privacy labels) on success, a contained failure otherwise. The
+/// `algorithms` slice is allocated in the caller's `arena`. A7.2: cold union,
+/// size guard waived — one browse-load result, matched once.
+pub const AlgorithmsOutcome = union(enum) {
+    ok: []const lexicon.AlgorithmView,
+    failed: xrpc.Failure,
+};
+
+/// Fetch the algorithm MARKETPLACE (`getAlgorithms`) — the flat set of published
+/// feed algorithms, newest first. Metadata + fetch refs, NOT configs: the caller
+/// fetches a chosen algorithm's full config by (author, rkey) via
+/// `shell/algorithm.fetch` when it adopts one. Ranking is a later phase.
+pub fn loadAlgorithms(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    session: *auth.Session,
+    appview_url: []const u8,
+    limit: usize,
+) !AlgorithmsOutcome {
+    var limit_buf: [20]u8 = undefined;
+    const params = [_]xrpc.Param{
+        .{ .name = "limit", .value = std.fmt.bufPrint(&limit_buf, "{d}", .{limit}) catch "50" },
+    };
+    const outcome = try auth.queryHost(
+        gpa,
+        arena,
+        io,
+        environ,
+        session,
+        appview_url,
+        lexicon.method.get_algorithms,
+        &params,
+        lexicon.AlgorithmsPage,
+    );
+    switch (outcome) {
+        .failed => |failure| return .{ .failed = failure },
+        .ok => |page| return .{ .ok = page.algorithms },
+    }
+}
+
+test "loadAlgorithms stays type-correct (browse leg, not yet UI-wired)" {
+    // No live AppView here — force the browse function through analysis so a
+    // signature drift fails the build rather than surprising the marketplace UI.
+    _ = &loadAlgorithms;
+}
+
 // ---------------------------------------------------------------------------
 // Loopback round trip — a scripted fixture PDS serves two timeline pages;
 // the second request must carry the first page's cursor on the wire, and a

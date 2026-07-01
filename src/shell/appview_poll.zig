@@ -38,6 +38,7 @@ const xrpc = @import("xrpc.zig");
 const lexicon = @import("../core/lexicon.zig");
 const feed = @import("../core/feed.zig");
 const appview = @import("../core/appview.zig");
+const discover = @import("../core/discover.zig");
 const record_check = @import("../core/record_check.zig");
 const serve = @import("appview_serve.zig");
 const store = @import("appview_store.zig");
@@ -53,6 +54,9 @@ const RefValue = struct { subject: SubjectRef = .{} };
 /// An `app.zat4.actor.profile` record's value — the display name (avatar is a
 /// blob, deferred). A7.2: cold transient parse target.
 const ProfileValue = struct { displayName: []const u8 = "" };
+/// An `app.zat4.feed.algorithm` record's value — the published name + config.
+/// A7.2: cold transient parse target (decomposed into the pooled hot Algorithm).
+const AlgorithmValue = struct { name: []const u8 = "", config: discover.FeedConfig = .{} };
 
 /// One `listRecords` entry over a record value of type `Value`.
 fn Rec(comptime Value: type) type {
@@ -319,6 +323,31 @@ pub fn pollRepo(
             if (try markSeen(gpa, seen, r.cid)) continue;
             appview.indexEngagement(gpa, idx, .repost, r.value.subject.cid) catch {};
             store.appendEngagement(log, arena, .repost, did, r.value.subject.cid, r.cid, r.uri);
+        }
+    }
+
+    // Algorithms — the published feed algorithms this author shared (the
+    // marketplace pool). indexAlgorithm dedups by cid, so re-polling re-indexes
+    // harmlessly; the browse label is derived from the config at index time.
+    // (Durable-log persistence is deferred: a restart re-polls + re-indexes, and
+    // the cid dedup makes that safe — a deliberate Cut-1 boundary, not an oversight.)
+    if (try fetch(arena, io, environ, pds_url, did, lexicon.collection.algorithm, AlgorithmValue)) |f| {
+        const vr = verifyCids(gpa, f.raw, did, "algorithm", &v_checked, &v_bad);
+        defer record_check.freeReport(gpa, vr);
+        lock.lock();
+        defer lock.unlock();
+        for (f.records) |r| {
+            if (r.cid.len == 0) continue;
+            if (record_check.isBad(vr, r.cid)) continue; // CID failed verification → reject
+            // Cap + UTF-8-validate the name before it crosses into the core.
+            if (!record_check.textWithinLimits(r.value.name, record_check.max_display_name)) continue;
+            _ = appview.indexAlgorithm(gpa, idx, .{
+                .cid = r.cid,
+                .author_did = did,
+                .rkey = rkeyFromUri(r.uri),
+                .name = r.value.name,
+                .config = discover.validated(r.value.config), // never trust the wire (D5)
+            }) catch false;
         }
     }
 

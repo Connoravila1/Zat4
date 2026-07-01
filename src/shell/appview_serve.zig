@@ -188,6 +188,10 @@ fn route(arena: Allocator, idx: *const appview.Index, cfg: ServeConfig, target: 
     if (std.mem.endsWith(u8, path, "app.zat4.feed.listTags")) {
         return listTags(arena, idx);
     }
+    // The algorithm marketplace: the published algorithms available to browse.
+    if (std.mem.endsWith(u8, path, "app.zat4.feed.getAlgorithms")) {
+        return getAlgorithms(arena, idx, cfg, target);
+    }
     if (std.mem.endsWith(u8, path, "app.zat4.actor.getProfile")) {
         return getProfile(arena, idx, target);
     }
@@ -259,6 +263,31 @@ fn listTags(arena: Allocator, idx: *const appview.Index) RouteError![]const u8 {
     const tags = try arena.alloc(lexicon.TagView, zones.len);
     for (tags, zones) |*t, z| t.* = .{ .tag = z.tag, .count = z.count };
     const page: lexicon.TagsPage = .{ .cursor = null, .tags = tags };
+    return std.json.Stringify.valueAlloc(arena, page, .{ .emit_null_optional_fields = false });
+}
+
+/// The algorithm marketplace: the published `app.zat4.feed.algorithm` records,
+/// newest first, each carrying its fetch ref + the derived privacy label. The
+/// client renders these as browse cards and fetches a config's full body by
+/// (author, rkey) when it adopts one.
+fn getAlgorithms(arena: Allocator, idx: *const appview.Index, cfg: ServeConfig, target: []const u8) RouteError![]const u8 {
+    var limit = cfg.default_limit;
+    if (queryValue(target, "limit")) |l| {
+        limit = @min(std.fmt.parseInt(usize, l, 10) catch cfg.default_limit, cfg.max_limit);
+    }
+    const rows = try appview.listAlgorithms(arena, idx, limit);
+    const views = try arena.alloc(lexicon.AlgorithmView, rows.len);
+    for (views, rows) |*v, r| v.* = .{
+        .cid = r.cid,
+        .author = r.author_did,
+        .handle = r.author_handle,
+        .rkey = r.rkey,
+        .name = r.name,
+        .usesBehavioral = r.uses_behavioral,
+        .learns = r.learns,
+        .stateBudgetBytes = r.state_budget_bytes,
+    };
+    const page: lexicon.AlgorithmsPage = .{ .cursor = null, .algorithms = views };
     return std.json.Stringify.valueAlloc(arena, page, .{ .emit_null_optional_fields = false });
 }
 
@@ -537,6 +566,34 @@ test "route: listTags returns the zone catalog with post counts" {
     try testing.expectEqual(@as(usize, 2), page.tags[0].count);
     try testing.expectEqualStrings("rivers", page.tags[1].tag);
     try testing.expectEqual(@as(usize, 1), page.tags[1].count);
+}
+
+test "route: getAlgorithms serves the marketplace with derived privacy labels" {
+    const gpa = testing.allocator;
+    var idx: appview.Index = .{};
+    defer appview.deinit(gpa, &idx);
+
+    const discover = @import("../core/discover.zig");
+    var adaptive = discover.DEFAULT_CONFIG;
+    adaptive.behavioral_weight = 1.0;
+    _ = try appview.indexAlgorithm(gpa, &idx, .{ .cid = "bafyA", .author_did = "did:plc:a", .rkey = "r1", .name = "Adaptive", .config = adaptive, .created_at = 100 });
+    _ = try appview.indexAlgorithm(gpa, &idx, .{ .cid = "bafyB", .author_did = "did:plc:b", .rkey = "r2", .name = "Candidate-only", .config = discover.DEFAULT_CONFIG, .created_at = 200 });
+    try appview.setHandle(gpa, &idx, "did:plc:b", "bob.zat4.com");
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const json = try route(arena, &idx, .{}, "/xrpc/app.zat4.feed.getAlgorithms?limit=10");
+    const page = try std.json.parseFromSliceLeaky(lexicon.AlgorithmsPage, arena, json, .{ .ignore_unknown_fields = true });
+    try testing.expectEqual(@as(usize, 2), page.algorithms.len);
+    // Newest first; the fetch ref + resolved handle ride along.
+    try testing.expectEqualStrings("Candidate-only", page.algorithms[0].name);
+    try testing.expectEqualStrings("r2", page.algorithms[0].rkey);
+    try testing.expectEqualStrings("bob.zat4.com", page.algorithms[0].handle);
+    try testing.expect(!page.algorithms[0].learns); // candidate-side, proven
+    try testing.expectEqualStrings("Adaptive", page.algorithms[1].name);
+    try testing.expect(page.algorithms[1].learns); // adaptive, proven
 }
 
 test "route: an unknown method is NotFound" {
