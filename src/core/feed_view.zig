@@ -149,7 +149,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev };
 
 /// The six top-level rail destinations, in order. The `Screen` index a nav
 /// region carries is an index into this. Shared by the rail (draw + hit) and
@@ -2514,6 +2514,7 @@ pub const CreateView = struct {
     name: []const u8,
     color: u8, // chosen accent palette index (0..8)
     naming: bool = false, // the name field has focus (draw a caret)
+    prepare_t: f32 = 0, // the .preparing beat's progress, 0..1 (the shell's timer)
 };
 
 /// Render the simple-Create flow's CURRENT step into the Create tab (PURE draw over
@@ -2527,8 +2528,40 @@ pub fn layoutCreate(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawList,
     var y: i32 = 140 + scroll;
 
     switch (view.step) {
+        .landing => {
+            _ = try str(gpa, dl, e, .semibold, x0, y + 30, ink, 30, "Your feed, your rules");
+            y += 52;
+            y = try wrapBody(gpa, dl, e, x0, y + 18, w, muted, 16, "An algorithm decides which posts you see and in what order. On Zat4 it's yours to shape — everything runs on your device, and what it can and can't touch is provable, never a black box.", 24, true, null);
+            y += 34;
+            // Primary: the five-minute guided builder (→ the questions).
+            const bh: i32 = 56;
+            try rect(gpa, dl, x0, y, w, bh, accent, 14);
+            _ = try str(gpa, dl, e, .semibold, x0 + 26, y + 30, 0xFF0B0B0F, 17, "Create your own in five minutes");
+            _ = try str(gpa, dl, e, .regular, x0 + 26, y + 46, 0xCC0B0B0F, 13, "A few questions, then fine-tune — saved privately, just for you.");
+            try emitRegion(gpa, regions, x0, y, @intCast(w), @intCast(bh), 0, .create_next);
+            y += bh + 16;
+            // Secondary: the developer submission path (a later slice; honest for now).
+            try rect(gpa, dl, x0, y, w, bh, 0x12EDEAE0, 14);
+            _ = try str(gpa, dl, e, .semibold, x0 + 26, y + 30, ink, 17, "Submit an algorithm you wrote");
+            _ = try str(gpa, dl, e, .regular, x0 + 26, y + 46, muted, 13, "For developers — publish real code to the marketplace.");
+            try emitRegion(gpa, regions, x0, y, @intCast(w), @intCast(bh), 0, .create_dev);
+            y += bh + 20;
+        },
+        .preparing => {
+            y += 120;
+            _ = try str(gpa, dl, e, .semibold, x0, y + 30, ink, 26, "Preparing your custom algorithm");
+            y += 52;
+            _ = try str(gpa, dl, e, .regular, x0, y + 16, muted, 15, "Calibrating the numbers from your answers…");
+            y += 44;
+            // A determinate progress bar the shell fills over the beat, then advances.
+            const bar_w = w - 40;
+            try rect(gpa, dl, x0, y, bar_w, 6, 0x18EDEAE0, 3);
+            const fill: i32 = @intFromFloat(@as(f32, @floatFromInt(bar_w)) * std.math.clamp(view.prepare_t, 0, 1));
+            try rect(gpa, dl, x0, y, fill, 6, accent, 3);
+            y += 40;
+        },
         .pace, .reach, .conversation, .privacy => {
-            const qi = @intFromEnum(view.step); // 0..3
+            const qi = @intFromEnum(view.step) - 1; // .pace is step 1 (landing is 0) → question 0
             const q = create_flow.questions[qi];
             var buf: [24]u8 = undefined;
             const step_lbl = std.fmt.bufPrint(&buf, "STEP {d} OF 4", .{qi + 1}) catch "";
@@ -2559,19 +2592,19 @@ pub fn layoutCreate(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawList,
                 const meta = create_flow.knobMeta(k);
                 const val = create_flow.knobValue(view.config, k);
                 _ = try str(gpa, dl, e, .semibold, x0, y + 14, ink, 16, meta.label);
-                var vb: [24]u8 = undefined;
-                const vs = std.fmt.bufPrint(&vb, "{d}", .{val}) catch "";
-                _ = try str(gpa, dl, e, .semibold, x0 + w - 60, y + 14, accent, 16, vs);
-                // − / + steppers, right-aligned above the bar.
+                // − and + steppers, then the value to the RIGHT of the +.
                 const sb: i32 = 30;
-                const plus_x = x0 + w - sb;
-                const minus_x = plus_x - sb - 8;
+                const minus_x = x0 + w - 118;
+                const plus_x = minus_x + sb + 8;
                 try rect(gpa, dl, minus_x, y - 6, sb, sb, 0x14EDEAE0, 8);
                 _ = try str(gpa, dl, e, .semibold, minus_x + 11, y + 13, ink, 18, "-");
                 try emitRegion(gpa, regions, minus_x, y - 6, sb, sb, @intCast(@intFromEnum(k)), .create_knob_dec);
                 try rect(gpa, dl, plus_x, y - 6, sb, sb, 0x14EDEAE0, 8);
                 _ = try str(gpa, dl, e, .semibold, plus_x + 10, y + 13, ink, 18, "+");
                 try emitRegion(gpa, regions, plus_x, y - 6, sb, sb, @intCast(@intFromEnum(k)), .create_knob_inc);
+                var vb: [24]u8 = undefined;
+                const vs = std.fmt.bufPrint(&vb, "{d}", .{val}) catch "";
+                _ = try str(gpa, dl, e, .semibold, plus_x + sb + 14, y + 14, accent, 16, vs);
                 y += 26;
                 _ = try str(gpa, dl, e, .regular, x0, y + 12, faint, 13, meta.hint);
                 y += 22;

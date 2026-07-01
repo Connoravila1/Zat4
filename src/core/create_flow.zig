@@ -39,9 +39,24 @@ const builder = @import("builder.zig");
 const algorithm = @import("algorithm.zig");
 const algo_library = @import("algo_library.zig");
 
-/// The ordered steps of the flow. The four questions, then the tweakable recap,
-/// then naming + save. The renderer draws one at a time; the shell advances.
-pub const Step = enum(u8) { pace, reach, conversation, privacy, recap, name };
+/// The ordered steps of the flow: a LANDING page (what algorithms are + the entry
+/// buttons), the four questions, a brief PREPARING beat (so it's clear the answers
+/// calibrated the numbers), the tweakable recap, then naming + save. The renderer
+/// draws one at a time; the shell advances (`nextStep`). The `enum(u8)` order is
+/// load-bearing — advancing is `+1`.
+pub const Step = enum(u8) { landing, pace, reach, conversation, privacy, preparing, recap, name };
+
+/// The step after `s` (advancing one), clamped at `name`. PURE.
+pub fn nextStep(s: Step) Step {
+    const n = @typeInfo(Step).@"enum".fields.len;
+    return @enumFromInt(@min(@intFromEnum(s) + 1, n - 1));
+}
+
+/// The step before `s` (going back), clamped at `landing`. PURE.
+pub fn prevStep(s: Step) Step {
+    const i = @intFromEnum(s);
+    return @enumFromInt(if (i > 0) i - 1 else 0);
+}
 
 /// One selectable option in a question: what the user reads, and a one-line blurb
 /// under it. The option INDEX maps to the matching `builder` enum value (same order).
@@ -83,7 +98,7 @@ pub fn applyAnswer(answers: *builder.Answers, step: Step, option: usize) void {
         .reach => answers.reach = enumFromIndex(builder.Reach, option),
         .conversation => answers.conversation = enumFromIndex(builder.Conversation, option),
         .privacy => answers.privacy = enumFromIndex(builder.Privacy, option),
-        .recap, .name => {}, // not a question
+        .landing, .preparing, .recap, .name => {}, // not a question
     }
 }
 
@@ -94,7 +109,7 @@ pub fn answerIndex(answers: builder.Answers, step: Step) usize {
         .reach => @intFromEnum(answers.reach),
         .conversation => @intFromEnum(answers.conversation),
         .privacy => @intFromEnum(answers.privacy),
-        .recap, .name => 0,
+        .landing, .preparing, .recap, .name => 0,
     };
 }
 
