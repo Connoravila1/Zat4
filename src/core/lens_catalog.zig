@@ -44,6 +44,42 @@ const Allocator = std.mem.Allocator;
 const lens_socket = @import("lens_socket.zig");
 const discover = @import("discover.zig");
 const transparency = @import("transparency.zig");
+const rules_mod = @import("rules.zig");
+const algo_vm = @import("algo_vm.zig");
+
+// Zat4 Discover's Level-2 logic — Twitter-flavoured conditional shaping the flat
+// weight model cannot express. Evaluated IN ORDER, and later rules see earlier
+// rules' effect on the score, so these compose: a fresh viral out-of-network
+// discussion stacks all three boosts (~2×), while a 2-day-old one is damped back.
+const discover_rules = [_]rules_mod.Rule{
+    // Give discovery (out-of-network) candidates a foot in the door.
+    .{ .predicate = .{ .kind = .out_of_network }, .action = .{ .kind = .boost, .factor = 1.2 } },
+    // Amplify what's already resonating — the viral signal.
+    .{ .predicate = .{ .kind = .min_engagement, .param = 150 }, .action = .{ .kind = .boost, .factor = 1.35 } },
+    // Reward posts carrying a real conversation, not just likes.
+    .{ .predicate = .{ .kind = .min_replies, .param = 8 }, .action = .{ .kind = .boost, .factor = 1.25 } },
+    // Push stale content below what the smooth recency decay already does.
+    .{ .predicate = .{ .kind = .older_than_hrs, .param = 48 }, .action = .{ .kind = .dampen, .factor = 0.4 } },
+};
+
+// Zat4 Discover's Level-3 scoring formula (RPN for the bounded VM):
+//   score = base_score × (1 + (repost_count + reply_count) ÷ (age_hrs + 2))
+// A velocity term on top of the rule-adjusted score, so fast-accruing amplification
+// + conversation (trending) rises — something a static weight sum can't capture.
+// Runs AFTER the rules (the rule-adjusted score is this program's base_score).
+const discover_program = [_]algo_vm.Instr{
+    .{ .op = .push_fact, .fact = .base_score },
+    .{ .op = .push_const, .value = 1 },
+    .{ .op = .push_fact, .fact = .repost_count },
+    .{ .op = .push_fact, .fact = .reply_count },
+    .{ .op = .add }, // reposts + replies
+    .{ .op = .push_fact, .fact = .age_hrs },
+    .{ .op = .push_const, .value = 2 },
+    .{ .op = .add }, // age_hrs + 2
+    .{ .op = .div }, // (reposts + replies) ÷ (age_hrs + 2)
+    .{ .op = .add }, // 1 + …
+    .{ .op = .mul }, // base_score × …
+};
 
 /// One first-party algorithm. A cold, comptime configuration table — low
 /// cardinality, never iterated in a hot loop.
@@ -83,6 +119,11 @@ const b_discover = Builtin{
     .config = blk: {
         var c = discover.DEFAULT_CONFIG;
         c.behavioral_weight = 1.0;
+        // Zat4 Discover is the full-stack showcase: L1 calibrated weights + L2
+        // conditional rules + an L3 velocity formula (defined above). This is what
+        // makes it "legitimately complex" rather than just a weighting.
+        c.rules = &discover_rules;
+        c.vm_program = &discover_program;
         break :blk c;
     },
 };

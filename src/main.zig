@@ -43,6 +43,7 @@ const lexicon = @import("core/lexicon.zig");
 const write = @import("shell/write.zig");
 const algorithm_shell = @import("shell/algorithm.zig");
 const builder = @import("core/builder.zig");
+const lens_catalog = @import("core/lens_catalog.zig");
 const clock_shell = @import("shell/clock.zig");
 
 /// Is there a usable cached session on disk? A cheap pre-auth probe: a new user
@@ -115,6 +116,9 @@ pub fn main(init: std.process.Init) !void {
     // record (the friendly-builder's default config) into the user's repo, so the
     // marketplace has content to index before the authoring UI exists.
     var publish_algo_name: ?[]const u8 = null;
+    // Dev harness: `--publish-discover` publishes the house Zat4 Discover config
+    // (L1 weights + L2 rules + L3 formula — the full-stack showcase) as a record.
+    var publish_discover = false;
     // Headless sign-up test (enrollment 3b): `--create-account <username>` mints
     // <username>.zat4.com on the PDS with a fresh CSPRNG password and exits,
     // printing the handle/DID/password. No GUI, no display, no tunnel (the PDS is
@@ -179,6 +183,8 @@ pub fn main(init: std.process.Init) !void {
                 ai += 1;
                 publish_algo_name = args[ai];
             }
+        } else if (std.mem.eql(u8, arg, "--publish-discover")) {
+            publish_discover = true;
         } else {
             handle = arg;
         }
@@ -398,7 +404,7 @@ pub fn main(init: std.process.Init) !void {
     // resulting at-uri/cid, and exit. This is the write-leg test: the record
     // lands in the user's OWN PDS under app.zat4.feed.post, from where the
     // firehose carries it to the Zat4 AppView.
-    if (post_text != null or follow_target != null or publish_algo_name != null) {
+    if (post_text != null or follow_target != null or publish_algo_name != null or publish_discover) {
         var from_cache = false;
         var session: auth.Session = undefined;
         if (env.get("ZAT_APP_PASSWORD")) |password| {
@@ -479,6 +485,20 @@ pub fn main(init: std.process.Init) !void {
                 return err;
             };
             try out.print("published app.zat4.feed.algorithm \"{s}\"\n  uri: {s}\n  cid: {s}\n", .{ name, published.uri, published.cid });
+            try out.flush();
+        }
+
+        // The full-stack showcase: publish the house Zat4 Discover (L1 weights +
+        // L2 rules + L3 formula) so the marketplace + transparency page have a
+        // genuinely complex, behavioral algorithm to render.
+        if (publish_discover) {
+            const cfg = lens_catalog.scoringConfigForId("zat4:discover") orelse builder.build(.{});
+            const published = algorithm_shell.publish(gpa, arena, io, env, &session, "Zat4 Discover", cfg, "zat4-discover", now) catch |err| {
+                try out.print("publish-discover failed: {s}\n", .{@errorName(err)});
+                try out.flush();
+                return err;
+            };
+            try out.print("published app.zat4.feed.algorithm \"Zat4 Discover\"\n  uri: {s}\n  cid: {s}\n", .{ published.uri, published.cid });
             try out.flush();
         }
         return;
