@@ -1,7 +1,6 @@
 //! B1 classification: CORE (pure). The MLS wire codec — RFC 9420's TLS
-//! presentation-language encoding (ZAT_CHAT_ROADMAP slice C3, part 1 of 2:
-//! the CODEC; the KeyPackage/LeafNode/Welcome/Commit framing structs build
-//! on it next).
+//! presentation-language encoding (ZAT_CHAT_ROADMAP slice C3, all three
+//! parts: the codec, the join objects, and the handshake/message framing).
 //!
 //! This is the attacker-facing byte boundary of the whole chat system:
 //! everything a counterparty (or the relay) hands us parses through here
@@ -196,8 +195,11 @@ pub fn writeVector(gpa: Allocator, out: *std.ArrayList(u8), bytes: []const u8) W
 
 pub const ParseError = ReadError || error{
     UnsupportedCredential,
+    UnsupportedProposal,
+    UnsupportedVersion,
     InvalidEnum,
     MalformedVector,
+    NonZeroPadding,
 };
 
 /// ProtocolVersion mls10 (the only registered version).
@@ -353,6 +355,10 @@ pub const LeafNode = struct {
     }
 };
 
+/// The group binding an update/commit-sourced LeafNodeTBS carries (§7.2).
+/// A7.2: cold struct, size guard waived — transient parameter.
+pub const GroupBinding = struct { group_id: []const u8, leaf_index: u32 };
+
 /// LeafNodeTBS (§7.2): the signed content. For `update`/`commit` sources
 /// the RFC appends the group binding; `key_package` appends nothing, and
 /// v1 (KeyPackages only) passes null.
@@ -360,7 +366,7 @@ pub fn serializeLeafNodeTBS(
     gpa: Allocator,
     out: *std.ArrayList(u8),
     ln: LeafNode,
-    group: ?struct { group_id: []const u8, leaf_index: u32 },
+    group: ?GroupBinding,
 ) (WriteError || error{MissingGroupBinding})!void {
     try ln.writeUnsigned(gpa, out);
     switch (ln.source) {
@@ -424,11 +430,11 @@ pub const HpkeCiphertext = struct {
     kem_output: []const u8,
     ciphertext: []const u8,
 
-    fn parse(r: *Reader) ParseError!HpkeCiphertext {
+    pub fn parse(r: *Reader) ParseError!HpkeCiphertext {
         return .{ .kem_output = try r.readVector(), .ciphertext = try r.readVector() };
     }
 
-    fn write(h: HpkeCiphertext, gpa: Allocator, out: *std.ArrayList(u8)) WriteError!void {
+    pub fn write(h: HpkeCiphertext, gpa: Allocator, out: *std.ArrayList(u8)) WriteError!void {
         try writeVector(gpa, out, h.kem_output);
         try writeVector(gpa, out, h.ciphertext);
     }
@@ -460,13 +466,17 @@ pub const Welcome = struct {
 
     pub fn parse(bytes: []const u8) ParseError!Welcome {
         var r = Reader.init(bytes);
-        const w: Welcome = .{
+        const w = try parseFrom(&r);
+        try r.finish();
+        return w;
+    }
+
+    pub fn parseFrom(r: *Reader) ParseError!Welcome {
+        return .{
             .cipher_suite = try r.readU16(),
             .secrets_raw = try r.readVector(),
             .encrypted_group_info = try r.readVector(),
         };
-        try r.finish();
-        return w;
     }
 
     pub fn write(w: Welcome, gpa: Allocator, out: *std.ArrayList(u8)) WriteError!void {
@@ -537,6 +547,743 @@ pub fn writeOwnCapabilities(gpa: Allocator, out: *std.ArrayList(u8), cipher_suit
     try writeU16Vec(gpa, out, &.{});
     try writeU16Vec(gpa, out, &caps_creds);
 }
+
+// ---------------------------------------------------------------------------
+// The HANDSHAKE + MESSAGE framing (C3 part 3) — GroupContext/GroupInfo,
+// Proposal/Commit/UpdatePath, FramedContent/PublicMessage/PrivateMessage and
+// their TBS/AAD companions, field-for-field from RFC 9420 §6, §7.1, §8.1,
+// §12.1–§12.4. Same posture as the join objects: borrowed-slice parse views,
+// TBS bytes produced by the same writer minus the signature, vectors of
+// structs kept raw with explicit iterators (a hostile count never sizes an
+// allocation).
+// ---------------------------------------------------------------------------
+
+/// WireFormat registry values (§17.2).
+pub const wire_public_message: u16 = 1;
+pub const wire_private_message: u16 = 2;
+pub const wire_welcome: u16 = 3;
+pub const wire_group_info: u16 = 4;
+pub const wire_key_package: u16 = 5;
+
+/// ExtensionType ratchet_tree (§17.3) — the one extension v1 emits/reads.
+pub const extension_ratchet_tree: u16 = 2;
+
+pub const ContentType = enum(u8) { application = 1, proposal = 2, commit = 3 };
+
+fn contentTypeFrom(b: u8) ParseError!ContentType {
+    return switch (b) {
+        1 => .application,
+        2 => .proposal,
+        3 => .commit,
+        else => error.InvalidEnum,
+    };
+}
+
+/// RFC 9420 §8.1. A7.2: cold struct, size guard waived — parse view.
+pub const GroupContext = struct {
+    version: u16,
+    cipher_suite: u16,
+    group_id: []const u8,
+    epoch: u64,
+    tree_hash: []const u8,
+    confirmed_transcript_hash: []const u8,
+    extensions_raw: []const u8,
+
+    pub fn parse(bytes: []const u8) ParseError!GroupContext {
+        var r = Reader.init(bytes);
+        const gc = try parseFrom(&r);
+        try r.finish();
+        return gc;
+    }
+
+    pub fn parseFrom(r: *Reader) ParseError!GroupContext {
+        return .{
+            .version = try r.readU16(),
+            .cipher_suite = try r.readU16(),
+            .group_id = try r.readVector(),
+            .epoch = try r.readU64(),
+            .tree_hash = try r.readVector(),
+            .confirmed_transcript_hash = try r.readVector(),
+            .extensions_raw = try r.readVector(),
+        };
+    }
+
+    pub fn write(gc: GroupContext, gpa: Allocator, out: *std.ArrayList(u8)) WriteError!void {
+        try writeU16(gpa, out, gc.version);
+        try writeU16(gpa, out, gc.cipher_suite);
+        try writeVector(gpa, out, gc.group_id);
+        try writeU64(gpa, out, gc.epoch);
+        try writeVector(gpa, out, gc.tree_hash);
+        try writeVector(gpa, out, gc.confirmed_transcript_hash);
+        try writeVector(gpa, out, gc.extensions_raw);
+    }
+};
+
+/// One `Extension` (§13.4) as a borrowed view.
+/// A7.2: cold struct, size guard waived — parse view.
+pub const Extension = struct {
+    extension_type: u16,
+    data: []const u8,
+};
+
+/// A7.2: cold struct, size guard waived — transient iterator.
+pub const ExtensionIter = struct {
+    r: Reader,
+
+    pub fn next(it: *ExtensionIter) ParseError!?Extension {
+        if (it.r.remaining() == 0) return null;
+        return .{ .extension_type = try it.r.readU16(), .data = try it.r.readVector() };
+    }
+};
+
+/// Iterate the body of an `Extension extensions<V>` vector (the raw bytes a
+/// parse view carries in `extensions_raw`).
+pub fn extensionsIter(raw: []const u8) ExtensionIter {
+    return .{ .r = Reader.init(raw) };
+}
+
+pub fn writeExtension(gpa: Allocator, out: *std.ArrayList(u8), extension_type: u16, data: []const u8) WriteError!void {
+    try writeU16(gpa, out, extension_type);
+    try writeVector(gpa, out, data);
+}
+
+/// RFC 9420 §7.1. A7.2: cold struct, size guard waived — parse view.
+pub const ParentNode = struct {
+    encryption_key: []const u8,
+    parent_hash: []const u8,
+    /// The raw `uint32 unmerged_leaves<V>` bytes (validated multiple-of-4).
+    unmerged_leaves_raw: []const u8,
+
+    pub fn parseFrom(r: *Reader) ParseError!ParentNode {
+        const pn: ParentNode = .{
+            .encryption_key = try r.readVector(),
+            .parent_hash = try r.readVector(),
+            .unmerged_leaves_raw = try r.readVector(),
+        };
+        if (pn.unmerged_leaves_raw.len % 4 != 0) return error.MalformedVector;
+        return pn;
+    }
+
+    pub fn write(pn: ParentNode, gpa: Allocator, out: *std.ArrayList(u8)) WriteError!void {
+        try writeVector(gpa, out, pn.encryption_key);
+        try writeVector(gpa, out, pn.parent_hash);
+        try writeVector(gpa, out, pn.unmerged_leaves_raw);
+    }
+
+    pub fn unmergedCount(pn: ParentNode) usize {
+        return pn.unmerged_leaves_raw.len / 4;
+    }
+
+    pub fn unmergedAt(pn: ParentNode, i: usize) u32 {
+        return std.mem.readInt(u32, pn.unmerged_leaves_raw[i * 4 ..][0..4], .big);
+    }
+};
+
+pub const node_type_leaf: u8 = 1;
+pub const node_type_parent: u8 = 2;
+
+/// One ratchet-tree slot (§12.4.3.3): a leaf, a parent, or blank.
+/// A7.2: cold union, size guard waived — parse view.
+pub const Node = union(enum) {
+    leaf: LeafNode,
+    parent: ParentNode,
+};
+
+/// A7.2: cold struct, size guard waived — transient iterator.
+pub const RatchetTreeIter = struct {
+    r: Reader,
+
+    /// Yields one `optional<Node>` per call: null at end of tree, `.blank`
+    /// distinguished from a present node by the outer optional.
+    pub fn next(it: *RatchetTreeIter) ParseError!?(?Node) {
+        if (it.r.remaining() == 0) return null;
+        switch (try it.r.readU8()) {
+            0 => return @as(?Node, null),
+            1 => switch (try it.r.readU8()) {
+                node_type_leaf => return @as(?Node, .{ .leaf = try LeafNode.parse(&it.r) }),
+                node_type_parent => return @as(?Node, .{ .parent = try ParentNode.parseFrom(&it.r) }),
+                else => return error.InvalidEnum,
+            },
+            else => return error.InvalidEnum,
+        }
+    }
+};
+
+/// Iterate a serialized `optional<Node> ratchet_tree<V>` (an extension body).
+pub fn ratchetTreeIter(extension_data: []const u8) ParseError!RatchetTreeIter {
+    var r = Reader.init(extension_data);
+    const body = try r.readVector();
+    try r.finish();
+    return .{ .r = Reader.init(body) };
+}
+
+/// RFC 9420 §12.4.3. A7.2: cold struct, size guard waived — parse view.
+pub const GroupInfo = struct {
+    group_context: GroupContext,
+    /// The GroupContext's EXACT wire bytes as parsed — the key schedule
+    /// hashes these; keeping the original span beats re-serialization.
+    group_context_raw: []const u8,
+    extensions_raw: []const u8,
+    confirmation_tag: []const u8,
+    signer: u32,
+    signature: []const u8,
+
+    pub fn parse(bytes: []const u8) ParseError!GroupInfo {
+        var r = Reader.init(bytes);
+        const gi = try parseFrom(&r);
+        try r.finish();
+        return gi;
+    }
+
+    pub fn parseFrom(r: *Reader) ParseError!GroupInfo {
+        const gc_start = r.pos;
+        const group_context = try GroupContext.parseFrom(r);
+        const group_context_raw = r.bytes[gc_start..r.pos];
+        return .{
+            .group_context = group_context,
+            .group_context_raw = group_context_raw,
+            .extensions_raw = try r.readVector(),
+            .confirmation_tag = try r.readVector(),
+            .signer = try r.readU32(),
+            .signature = try r.readVector(),
+        };
+    }
+
+    /// GroupInfoTBS (§12.4.3) — everything above the signature.
+    pub fn writeUnsigned(gi: GroupInfo, gpa: Allocator, out: *std.ArrayList(u8)) WriteError!void {
+        try gi.group_context.write(gpa, out);
+        try writeVector(gpa, out, gi.extensions_raw);
+        try writeVector(gpa, out, gi.confirmation_tag);
+        try writeU32(gpa, out, gi.signer);
+    }
+
+    pub fn write(gi: GroupInfo, gpa: Allocator, out: *std.ArrayList(u8)) WriteError!void {
+        try gi.writeUnsigned(gpa, out);
+        try writeVector(gpa, out, gi.signature);
+    }
+};
+
+/// ProposalType registry values (§17.4) — v1 speaks add/update/remove; the
+/// rest are refused at parse (E3), not skipped.
+pub const proposal_add: u16 = 1;
+pub const proposal_update: u16 = 2;
+pub const proposal_remove: u16 = 3;
+
+/// RFC 9420 §12.1. A7.2: cold union, size guard waived — parse view.
+pub const Proposal = union(enum) {
+    add: KeyPackage,
+    update: LeafNode,
+    remove: u32,
+
+    pub fn parseFrom(r: *Reader) ParseError!Proposal {
+        return switch (try r.readU16()) {
+            proposal_add => .{ .add = try KeyPackage.parseFrom(r) },
+            proposal_update => .{ .update = try LeafNode.parse(r) },
+            proposal_remove => .{ .remove = try r.readU32() },
+            4...7 => error.UnsupportedProposal, // psk/reinit/external_init/gce
+            else => error.InvalidEnum,
+        };
+    }
+
+    pub fn write(p: Proposal, gpa: Allocator, out: *std.ArrayList(u8)) WriteError!void {
+        switch (p) {
+            .add => |kp| {
+                try writeU16(gpa, out, proposal_add);
+                try kp.write(gpa, out);
+            },
+            .update => |ln| {
+                try writeU16(gpa, out, proposal_update);
+                try ln.write(gpa, out);
+            },
+            .remove => |idx| {
+                try writeU16(gpa, out, proposal_remove);
+                try writeU32(gpa, out, idx);
+            },
+        }
+    }
+};
+
+/// RFC 9420 §12.4. A7.2: cold union, size guard waived — parse view.
+pub const ProposalOrRef = union(enum) {
+    proposal: Proposal,
+    reference: []const u8,
+
+    pub fn parseFrom(r: *Reader) ParseError!ProposalOrRef {
+        return switch (try r.readU8()) {
+            1 => .{ .proposal = try Proposal.parseFrom(r) },
+            2 => .{ .reference = try r.readVector() },
+            else => error.InvalidEnum,
+        };
+    }
+
+    pub fn write(p: ProposalOrRef, gpa: Allocator, out: *std.ArrayList(u8)) WriteError!void {
+        switch (p) {
+            .proposal => |prop| {
+                try writeU8(gpa, out, 1);
+                try prop.write(gpa, out);
+            },
+            .reference => |ref| {
+                try writeU8(gpa, out, 2);
+                try writeVector(gpa, out, ref);
+            },
+        }
+    }
+};
+
+/// A7.2: cold struct, size guard waived — transient iterator.
+pub const ProposalOrRefIter = struct {
+    r: Reader,
+
+    pub fn next(it: *ProposalOrRefIter) ParseError!?ProposalOrRef {
+        if (it.r.remaining() == 0) return null;
+        return try ProposalOrRef.parseFrom(&it.r);
+    }
+};
+
+/// RFC 9420 §7.6. A7.2: cold struct, size guard waived — parse view.
+/// `encrypted_path_secrets_raw` is the `HPKECiphertext encrypted_path_secret<V>`
+/// body: one ciphertext per node in the copath resolution.
+pub const UpdatePathNode = struct {
+    encryption_key: []const u8,
+    encrypted_path_secrets_raw: []const u8,
+
+    pub fn parseFrom(r: *Reader) ParseError!UpdatePathNode {
+        return .{
+            .encryption_key = try r.readVector(),
+            .encrypted_path_secrets_raw = try r.readVector(),
+        };
+    }
+
+    pub fn write(n: UpdatePathNode, gpa: Allocator, out: *std.ArrayList(u8)) WriteError!void {
+        try writeVector(gpa, out, n.encryption_key);
+        try writeVector(gpa, out, n.encrypted_path_secrets_raw);
+    }
+
+    pub fn ciphertextsIter(n: UpdatePathNode) HpkeCiphertextIter {
+        return .{ .r = Reader.init(n.encrypted_path_secrets_raw) };
+    }
+};
+
+/// A7.2: cold struct, size guard waived — transient iterator.
+pub const HpkeCiphertextIter = struct {
+    r: Reader,
+
+    pub fn next(it: *HpkeCiphertextIter) ParseError!?HpkeCiphertext {
+        if (it.r.remaining() == 0) return null;
+        return try HpkeCiphertext.parse(&it.r);
+    }
+};
+
+/// RFC 9420 §7.6. A7.2: cold struct, size guard waived — parse view.
+pub const UpdatePath = struct {
+    leaf_node: LeafNode,
+    /// The `UpdatePathNode nodes<V>` body, kept raw.
+    nodes_raw: []const u8,
+
+    pub fn parseFrom(r: *Reader) ParseError!UpdatePath {
+        return .{
+            .leaf_node = try LeafNode.parse(r),
+            .nodes_raw = try r.readVector(),
+        };
+    }
+
+    pub fn write(up: UpdatePath, gpa: Allocator, out: *std.ArrayList(u8)) WriteError!void {
+        try up.leaf_node.write(gpa, out);
+        try writeVector(gpa, out, up.nodes_raw);
+    }
+
+    pub fn nodesIter(up: UpdatePath) UpdatePathNodeIter {
+        return .{ .r = Reader.init(up.nodes_raw) };
+    }
+};
+
+/// A7.2: cold struct, size guard waived — transient iterator.
+pub const UpdatePathNodeIter = struct {
+    r: Reader,
+
+    pub fn next(it: *UpdatePathNodeIter) ParseError!?UpdatePathNode {
+        if (it.r.remaining() == 0) return null;
+        return try UpdatePathNode.parseFrom(&it.r);
+    }
+};
+
+/// RFC 9420 §12.4. A7.2: cold struct, size guard waived — parse view.
+pub const Commit = struct {
+    /// The `ProposalOrRef proposals<V>` body, kept raw.
+    proposals_raw: []const u8,
+    path: ?UpdatePath,
+
+    pub fn parseFrom(r: *Reader) ParseError!Commit {
+        const proposals_raw = try r.readVector();
+        const path: ?UpdatePath = switch (try r.readU8()) {
+            0 => null,
+            1 => try UpdatePath.parseFrom(r),
+            else => return error.InvalidEnum,
+        };
+        return .{ .proposals_raw = proposals_raw, .path = path };
+    }
+
+    pub fn write(c: Commit, gpa: Allocator, out: *std.ArrayList(u8)) WriteError!void {
+        try writeVector(gpa, out, c.proposals_raw);
+        if (c.path) |up| {
+            try writeU8(gpa, out, 1);
+            try up.write(gpa, out);
+        } else {
+            try writeU8(gpa, out, 0);
+        }
+    }
+
+    pub fn proposalsIter(c: Commit) ProposalOrRefIter {
+        return .{ .r = Reader.init(c.proposals_raw) };
+    }
+};
+
+/// RFC 9420 §6. A7.2: cold union, size guard waived — parse view.
+pub const Sender = union(enum) {
+    member: u32, // leaf_index
+    external: u32, // sender_index
+    new_member_proposal,
+    new_member_commit,
+
+    pub fn parseFrom(r: *Reader) ParseError!Sender {
+        return switch (try r.readU8()) {
+            1 => .{ .member = try r.readU32() },
+            2 => .{ .external = try r.readU32() },
+            3 => .new_member_proposal,
+            4 => .new_member_commit,
+            else => error.InvalidEnum,
+        };
+    }
+
+    pub fn write(s: Sender, gpa: Allocator, out: *std.ArrayList(u8)) WriteError!void {
+        switch (s) {
+            .member => |i| {
+                try writeU8(gpa, out, 1);
+                try writeU32(gpa, out, i);
+            },
+            .external => |i| {
+                try writeU8(gpa, out, 2);
+                try writeU32(gpa, out, i);
+            },
+            .new_member_proposal => try writeU8(gpa, out, 3),
+            .new_member_commit => try writeU8(gpa, out, 4),
+        }
+    }
+};
+
+/// The content_type select arm of FramedContent (§6).
+/// A7.2: cold union, size guard waived — parse view.
+pub const FramedBody = union(ContentType) {
+    application: []const u8,
+    proposal: Proposal,
+    commit: Commit,
+
+    pub fn parseFrom(r: *Reader, content_type: ContentType) ParseError!FramedBody {
+        return switch (content_type) {
+            .application => .{ .application = try r.readVector() },
+            .proposal => .{ .proposal = try Proposal.parseFrom(r) },
+            .commit => .{ .commit = try Commit.parseFrom(r) },
+        };
+    }
+
+    pub fn write(b: FramedBody, gpa: Allocator, out: *std.ArrayList(u8)) WriteError!void {
+        switch (b) {
+            .application => |data| try writeVector(gpa, out, data),
+            .proposal => |p| try p.write(gpa, out),
+            .commit => |c| try c.write(gpa, out),
+        }
+    }
+};
+
+/// RFC 9420 §6. A7.2: cold struct, size guard waived — parse view.
+pub const FramedContent = struct {
+    group_id: []const u8,
+    epoch: u64,
+    sender: Sender,
+    authenticated_data: []const u8,
+    body: FramedBody,
+
+    pub fn parseFrom(r: *Reader) ParseError!FramedContent {
+        const group_id = try r.readVector();
+        const epoch = try r.readU64();
+        const sender = try Sender.parseFrom(r);
+        const authenticated_data = try r.readVector();
+        const content_type = try contentTypeFrom(try r.readU8());
+        return .{
+            .group_id = group_id,
+            .epoch = epoch,
+            .sender = sender,
+            .authenticated_data = authenticated_data,
+            .body = try FramedBody.parseFrom(r, content_type),
+        };
+    }
+
+    pub fn write(fc: FramedContent, gpa: Allocator, out: *std.ArrayList(u8)) WriteError!void {
+        try writeVector(gpa, out, fc.group_id);
+        try writeU64(gpa, out, fc.epoch);
+        try fc.sender.write(gpa, out);
+        try writeVector(gpa, out, fc.authenticated_data);
+        try writeU8(gpa, out, @intFromEnum(fc.body));
+        try fc.body.write(gpa, out);
+    }
+};
+
+/// FramedContentTBS (§6.1): what the content signature covers. For member /
+/// new_member_commit senders the RFC binds the GroupContext — passing null
+/// for those senders is an error, never a silently-shorter signed blob.
+pub fn serializeFramedContentTBS(
+    gpa: Allocator,
+    out: *std.ArrayList(u8),
+    wire_format: u16,
+    fc: FramedContent,
+    group_context_bytes: ?[]const u8,
+) (WriteError || error{MissingGroupBinding})!void {
+    try writeU16(gpa, out, protocol_version_mls10);
+    try writeU16(gpa, out, wire_format);
+    try fc.write(gpa, out);
+    switch (fc.sender) {
+        .member, .new_member_commit => {
+            const gc = group_context_bytes orelse return error.MissingGroupBinding;
+            try out.appendSlice(gpa, gc);
+        },
+        .external, .new_member_proposal => {},
+    }
+}
+
+/// RFC 9420 §6.1. A7.2: cold struct, size guard waived — parse view.
+/// `confirmation_tag` is present exactly when the content is a commit.
+pub const FramedContentAuthData = struct {
+    signature: []const u8,
+    confirmation_tag: ?[]const u8,
+
+    pub fn parseFrom(r: *Reader, content_type: ContentType) ParseError!FramedContentAuthData {
+        return .{
+            .signature = try r.readVector(),
+            .confirmation_tag = if (content_type == .commit) try r.readVector() else null,
+        };
+    }
+
+    pub fn write(a: FramedContentAuthData, gpa: Allocator, out: *std.ArrayList(u8)) WriteError!void {
+        try writeVector(gpa, out, a.signature);
+        if (a.confirmation_tag) |tag| try writeVector(gpa, out, tag);
+    }
+};
+
+/// RFC 9420 §6.1 — the transcript-hash unit (also §8.2's hash input).
+/// A7.2: cold struct, size guard waived — parse view.
+pub const AuthenticatedContent = struct {
+    wire_format: u16,
+    content: FramedContent,
+    auth: FramedContentAuthData,
+
+    pub fn parse(bytes: []const u8) ParseError!AuthenticatedContent {
+        var r = Reader.init(bytes);
+        const wire_format = try r.readU16();
+        const content = try FramedContent.parseFrom(&r);
+        const auth = try FramedContentAuthData.parseFrom(&r, content.body);
+        try r.finish();
+        return .{ .wire_format = wire_format, .content = content, .auth = auth };
+    }
+};
+
+/// ConfirmedTranscriptHashInput (§8.2): the commit's AuthenticatedContent up
+/// to and including its signature (the confirmation_tag is the interim
+/// input's job).
+pub fn serializeConfirmedTranscriptHashInput(
+    gpa: Allocator,
+    out: *std.ArrayList(u8),
+    wire_format: u16,
+    fc: FramedContent,
+    signature: []const u8,
+) WriteError!void {
+    assert(fc.body == .commit);
+    try writeU16(gpa, out, wire_format);
+    try fc.write(gpa, out);
+    try writeVector(gpa, out, signature);
+}
+
+/// RFC 9420 §6.2. A7.2: cold struct, size guard waived — parse view.
+/// `membership_tag` is present exactly when the sender is a member.
+pub const PublicMessage = struct {
+    content: FramedContent,
+    auth: FramedContentAuthData,
+    membership_tag: ?[]const u8,
+
+    pub fn parseFrom(r: *Reader) ParseError!PublicMessage {
+        const content = try FramedContent.parseFrom(r);
+        const auth = try FramedContentAuthData.parseFrom(r, content.body);
+        const tag: ?[]const u8 = if (content.sender == .member) try r.readVector() else null;
+        return .{ .content = content, .auth = auth, .membership_tag = tag };
+    }
+
+    pub fn write(pm: PublicMessage, gpa: Allocator, out: *std.ArrayList(u8)) WriteError!void {
+        try pm.content.write(gpa, out);
+        try pm.auth.write(gpa, out);
+        if (pm.membership_tag) |tag| try writeVector(gpa, out, tag);
+    }
+};
+
+/// RFC 9420 §6.3. A7.2: cold struct, size guard waived — parse view.
+pub const PrivateMessage = struct {
+    group_id: []const u8,
+    epoch: u64,
+    content_type: ContentType,
+    authenticated_data: []const u8,
+    encrypted_sender_data: []const u8,
+    ciphertext: []const u8,
+
+    pub fn parseFrom(r: *Reader) ParseError!PrivateMessage {
+        return .{
+            .group_id = try r.readVector(),
+            .epoch = try r.readU64(),
+            .content_type = try contentTypeFrom(try r.readU8()),
+            .authenticated_data = try r.readVector(),
+            .encrypted_sender_data = try r.readVector(),
+            .ciphertext = try r.readVector(),
+        };
+    }
+
+    pub fn write(pm: PrivateMessage, gpa: Allocator, out: *std.ArrayList(u8)) WriteError!void {
+        try writeVector(gpa, out, pm.group_id);
+        try writeU64(gpa, out, pm.epoch);
+        try writeU8(gpa, out, @intFromEnum(pm.content_type));
+        try writeVector(gpa, out, pm.authenticated_data);
+        try writeVector(gpa, out, pm.encrypted_sender_data);
+        try writeVector(gpa, out, pm.ciphertext);
+    }
+};
+
+/// SenderData (§6.3.2) — the 12-byte plaintext inside the sender-data AEAD.
+/// Hot by the tie-break (one per message received); guarded.
+pub const SenderData = struct {
+    leaf_index: u32,
+    generation: u32,
+    reuse_guard: [4]u8,
+
+    comptime {
+        // Two u32s + the 4-byte guard, packed exactly. (A7)
+        assert(@sizeOf(SenderData) == 12);
+    }
+
+    pub const encoded_length = 12;
+
+    pub fn parse(bytes: []const u8) ParseError!SenderData {
+        var r = Reader.init(bytes);
+        const sd: SenderData = .{
+            .leaf_index = try r.readU32(),
+            .generation = try r.readU32(),
+            .reuse_guard = (try r.readBytes(4))[0..4].*,
+        };
+        try r.finish();
+        return sd;
+    }
+
+    pub fn encode(sd: SenderData) [encoded_length]u8 {
+        var out: [encoded_length]u8 = undefined;
+        std.mem.writeInt(u32, out[0..4], sd.leaf_index, .big);
+        std.mem.writeInt(u32, out[4..8], sd.generation, .big);
+        out[8..12].* = sd.reuse_guard;
+        return out;
+    }
+};
+
+/// SenderDataAAD (§6.3.2).
+pub fn serializeSenderDataAAD(
+    gpa: Allocator,
+    out: *std.ArrayList(u8),
+    group_id: []const u8,
+    epoch: u64,
+    content_type: ContentType,
+) WriteError!void {
+    try writeVector(gpa, out, group_id);
+    try writeU64(gpa, out, epoch);
+    try writeU8(gpa, out, @intFromEnum(content_type));
+}
+
+/// PrivateContentAAD (§6.3.1).
+pub fn serializePrivateContentAAD(
+    gpa: Allocator,
+    out: *std.ArrayList(u8),
+    group_id: []const u8,
+    epoch: u64,
+    content_type: ContentType,
+    authenticated_data: []const u8,
+) WriteError!void {
+    try writeVector(gpa, out, group_id);
+    try writeU64(gpa, out, epoch);
+    try writeU8(gpa, out, @intFromEnum(content_type));
+    try writeVector(gpa, out, authenticated_data);
+}
+
+/// PrivateMessageContent (§6.3.1), decrypted side: the content select, the
+/// auth data, then padding that MUST be all zero bytes (the RFC's covert-
+/// channel rule — a non-zero pad rejects the whole message).
+/// A7.2: cold struct, size guard waived — parse view.
+pub const PrivateContent = struct {
+    body: FramedBody,
+    auth: FramedContentAuthData,
+
+    pub fn parse(bytes: []const u8, content_type: ContentType) ParseError!PrivateContent {
+        var r = Reader.init(bytes);
+        const body = try FramedBody.parseFrom(&r, content_type);
+        const auth = try FramedContentAuthData.parseFrom(&r, content_type);
+        for (r.bytes[r.pos..]) |b| if (b != 0) return error.NonZeroPadding;
+        return .{ .body = body, .auth = auth };
+    }
+
+    /// The sender side: content + auth + `pad_len` zero bytes.
+    pub fn write(pc: PrivateContent, gpa: Allocator, out: *std.ArrayList(u8), pad_len: usize) WriteError!void {
+        try pc.body.write(gpa, out);
+        try pc.auth.write(gpa, out);
+        try out.appendNTimes(gpa, 0, pad_len);
+    }
+};
+
+/// MLSMessage (§6) — the outermost framing. A7.2: cold union, waived.
+pub const MlsMessage = union(enum) {
+    public_message: PublicMessage,
+    private_message: PrivateMessage,
+    welcome: Welcome,
+    group_info: GroupInfo,
+    key_package: KeyPackage,
+
+    pub fn parse(bytes: []const u8) ParseError!MlsMessage {
+        var r = Reader.init(bytes);
+        if (try r.readU16() != protocol_version_mls10) return error.UnsupportedVersion;
+        const msg: MlsMessage = switch (try r.readU16()) {
+            wire_public_message => .{ .public_message = try PublicMessage.parseFrom(&r) },
+            wire_private_message => .{ .private_message = try PrivateMessage.parseFrom(&r) },
+            wire_welcome => .{ .welcome = try Welcome.parseFrom(&r) },
+            wire_group_info => .{ .group_info = try GroupInfo.parseFrom(&r) },
+            wire_key_package => .{ .key_package = try KeyPackage.parseFrom(&r) },
+            else => return error.InvalidEnum,
+        };
+        try r.finish();
+        return msg;
+    }
+
+    pub fn wireFormat(m: MlsMessage) u16 {
+        return switch (m) {
+            .public_message => wire_public_message,
+            .private_message => wire_private_message,
+            .welcome => wire_welcome,
+            .group_info => wire_group_info,
+            .key_package => wire_key_package,
+        };
+    }
+
+    pub fn write(m: MlsMessage, gpa: Allocator, out: *std.ArrayList(u8)) WriteError!void {
+        try writeU16(gpa, out, protocol_version_mls10);
+        try writeU16(gpa, out, m.wireFormat());
+        switch (m) {
+            .public_message => |pm| try pm.write(gpa, out),
+            .private_message => |pm| try pm.write(gpa, out),
+            .welcome => |w| try w.write(gpa, out),
+            .group_info => |gi| try gi.write(gpa, out),
+            .key_package => |kp| try kp.write(gpa, out),
+        }
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Tests (C6: leak-checked). The boundary values are the RFC's width
@@ -813,5 +1560,288 @@ test "fuzz: the reader tolerates arbitrary bytes (no crash, no allocation)" {
             _ = r.readU64() catch break;
         }
         r.finish() catch continue;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — C3 part 3 (framing). Round-trips, the TBS-minus-signature proofs,
+// the padding rule, and fuzz over the two attacker-facing parsers.
+// ---------------------------------------------------------------------------
+
+fn sampleGroupContext() GroupContext {
+    return .{
+        .version = protocol_version_mls10,
+        .cipher_suite = 1,
+        .group_id = "a group id",
+        .epoch = 7,
+        .tree_hash = "\x01\x02\x03",
+        .confirmed_transcript_hash = "\x04\x05",
+        .extensions_raw = "",
+    };
+}
+
+test "GroupContext + GroupInfo: round-trip; GroupInfoTBS = wire minus signature" {
+    const gpa = testing.allocator;
+    const gi: GroupInfo = .{
+        .group_context = sampleGroupContext(),
+        .group_context_raw = "",
+        .extensions_raw = "",
+        .confirmation_tag = "\xaa\xbb\xcc\xdd",
+        .signer = 0,
+        .signature = "\xd0\x0d\xfe\xed",
+    };
+    var wire_bytes: std.ArrayList(u8) = .empty;
+    defer wire_bytes.deinit(gpa);
+    try gi.write(gpa, &wire_bytes);
+
+    const back = try GroupInfo.parse(wire_bytes.items);
+    try testing.expectEqual(@as(u64, 7), back.group_context.epoch);
+    try testing.expectEqualSlices(u8, "a group id", back.group_context.group_id);
+    try testing.expectEqualSlices(u8, "\xaa\xbb\xcc\xdd", back.confirmation_tag);
+    try testing.expectEqual(@as(u32, 0), back.signer);
+
+    var tbs: std.ArrayList(u8) = .empty;
+    defer tbs.deinit(gpa);
+    try gi.writeUnsigned(gpa, &tbs);
+    const sig_wire_len = 1 + gi.signature.len;
+    try testing.expectEqualSlices(u8, wire_bytes.items[0 .. wire_bytes.items.len - sig_wire_len], tbs.items);
+}
+
+test "Proposal/ProposalOrRef: arms round-trip; unsupported types are refused" {
+    const gpa = testing.allocator;
+
+    // remove by value, then a reference — iterated back out of a raw body.
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    try ProposalOrRef.write(.{ .proposal = .{ .remove = 1 } }, gpa, &body);
+    try ProposalOrRef.write(.{ .reference = "ref-hash" }, gpa, &body);
+
+    var it: ProposalOrRefIter = .{ .r = Reader.init(body.items) };
+    const first = (try it.next()).?;
+    try testing.expectEqual(@as(u32, 1), first.proposal.remove);
+    const second = (try it.next()).?;
+    try testing.expectEqualSlices(u8, "ref-hash", second.reference);
+    try testing.expectEqual(@as(?ProposalOrRef, null), try it.next());
+
+    // A psk proposal (type 4) is refused, not skipped.
+    var psk: std.ArrayList(u8) = .empty;
+    defer psk.deinit(gpa);
+    try writeU16(gpa, &psk, 4);
+    var r = Reader.init(psk.items);
+    try testing.expectError(error.UnsupportedProposal, Proposal.parseFrom(&r));
+}
+
+test "Commit + UpdatePath: optional path, node iteration, ciphertext iteration" {
+    const gpa = testing.allocator;
+
+    var cts: std.ArrayList(u8) = .empty;
+    defer cts.deinit(gpa);
+    try HpkeCiphertext.write(.{ .kem_output = "\x01\x02", .ciphertext = "\x03\x04\x05" }, gpa, &cts);
+
+    var nodes: std.ArrayList(u8) = .empty;
+    defer nodes.deinit(gpa);
+    try UpdatePathNode.write(.{ .encryption_key = "root-pub", .encrypted_path_secrets_raw = cts.items }, gpa, &nodes);
+
+    const commit: Commit = .{
+        .proposals_raw = "",
+        .path = .{ .leaf_node = sampleLeafNode(), .nodes_raw = nodes.items },
+    };
+    var wire_bytes: std.ArrayList(u8) = .empty;
+    defer wire_bytes.deinit(gpa);
+    try commit.write(gpa, &wire_bytes);
+
+    var r = Reader.init(wire_bytes.items);
+    const back = try Commit.parseFrom(&r);
+    try r.finish();
+    try testing.expectEqual(@as(usize, 0), back.proposals_raw.len);
+    var nit = back.path.?.nodesIter();
+    const node = (try nit.next()).?;
+    try testing.expectEqualSlices(u8, "root-pub", node.encryption_key);
+    var cit = node.ciphertextsIter();
+    const ct = (try cit.next()).?;
+    try testing.expectEqualSlices(u8, "\x03\x04\x05", ct.ciphertext);
+    try testing.expectEqual(@as(?HpkeCiphertext, null), try cit.next());
+    try testing.expectEqual(@as(?UpdatePathNode, null), try nit.next());
+
+    // No path: the null optional round-trips.
+    const empty: Commit = .{ .proposals_raw = "", .path = null };
+    var wire2: std.ArrayList(u8) = .empty;
+    defer wire2.deinit(gpa);
+    try empty.write(gpa, &wire2);
+    var r2 = Reader.init(wire2.items);
+    try testing.expectEqual(@as(?UpdatePath, null), (try Commit.parseFrom(&r2)).path);
+}
+
+test "FramedContent: TBS carries the group binding for member senders only" {
+    const gpa = testing.allocator;
+    const fc: FramedContent = .{
+        .group_id = "gid",
+        .epoch = 3,
+        .sender = .{ .member = 1 },
+        .authenticated_data = "",
+        .body = .{ .application = "hello" },
+    };
+
+    var wire_bytes: std.ArrayList(u8) = .empty;
+    defer wire_bytes.deinit(gpa);
+    try fc.write(gpa, &wire_bytes);
+    var r = Reader.init(wire_bytes.items);
+    const back = try FramedContent.parseFrom(&r);
+    try r.finish();
+    try testing.expectEqualSlices(u8, "hello", back.body.application);
+    try testing.expectEqual(@as(u32, 1), back.sender.member);
+
+    // Member sender without a GroupContext: error, not a shorter signing
+    // blob. (A failed TBS call leaves partial bytes — callers discard the
+    // list on error, so the test uses a separate one.)
+    var rejected: std.ArrayList(u8) = .empty;
+    defer rejected.deinit(gpa);
+    try testing.expectError(error.MissingGroupBinding, serializeFramedContentTBS(gpa, &rejected, wire_private_message, fc, null));
+    var tbs: std.ArrayList(u8) = .empty;
+    defer tbs.deinit(gpa);
+    try serializeFramedContentTBS(gpa, &tbs, wire_private_message, fc, "gc-bytes");
+    try testing.expect(std.mem.endsWith(u8, tbs.items, "gc-bytes"));
+
+    // The TBS prefix is version + wire_format + the FramedContent wire bytes.
+    try testing.expectEqualSlices(u8, wire_bytes.items, tbs.items[4 .. tbs.items.len - "gc-bytes".len]);
+}
+
+test "PrivateMessage + PrivateContent: round-trip; non-zero padding rejected" {
+    const gpa = testing.allocator;
+    const pm: PrivateMessage = .{
+        .group_id = "gid",
+        .epoch = 9,
+        .content_type = .application,
+        .authenticated_data = "ad",
+        .encrypted_sender_data = "esd0123456789",
+        .ciphertext = "ct",
+    };
+    var wire_bytes: std.ArrayList(u8) = .empty;
+    defer wire_bytes.deinit(gpa);
+    try pm.write(gpa, &wire_bytes);
+    var r = Reader.init(wire_bytes.items);
+    const back = try PrivateMessage.parseFrom(&r);
+    try r.finish();
+    try testing.expectEqual(ContentType.application, back.content_type);
+    try testing.expectEqualSlices(u8, "esd0123456789", back.encrypted_sender_data);
+
+    // PrivateMessageContent: padded write parses; a non-zero pad byte rejects.
+    const pc: PrivateContent = .{
+        .body = .{ .application = "msg" },
+        .auth = .{ .signature = "sig", .confirmation_tag = null },
+    };
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(gpa);
+    try pc.write(gpa, &content, 16);
+    const cback = try PrivateContent.parse(content.items, .application);
+    try testing.expectEqualSlices(u8, "msg", cback.body.application);
+    try testing.expectEqualSlices(u8, "sig", cback.auth.signature);
+    content.items[content.items.len - 1] = 1;
+    try testing.expectError(error.NonZeroPadding, PrivateContent.parse(content.items, .application));
+}
+
+test "SenderData: 12-byte encode/parse; trailing bytes rejected" {
+    const sd: SenderData = .{ .leaf_index = 1, .generation = 42, .reuse_guard = .{ 9, 8, 7, 6 } };
+    const enc = sd.encode();
+    const back = try SenderData.parse(&enc);
+    try testing.expectEqual(sd.leaf_index, back.leaf_index);
+    try testing.expectEqual(sd.generation, back.generation);
+    try testing.expectEqualSlices(u8, &sd.reuse_guard, &back.reuse_guard);
+    const long = enc ++ [1]u8{0};
+    try testing.expectError(error.TrailingBytes, SenderData.parse(&long));
+}
+
+test "MLSMessage: dispatch by wire format; bad version/format rejected" {
+    const gpa = testing.allocator;
+    const msg: MlsMessage = .{ .private_message = .{
+        .group_id = "gid",
+        .epoch = 1,
+        .content_type = .commit,
+        .authenticated_data = "",
+        .encrypted_sender_data = "esd",
+        .ciphertext = "ct",
+    } };
+    var wire_bytes: std.ArrayList(u8) = .empty;
+    defer wire_bytes.deinit(gpa);
+    try msg.write(gpa, &wire_bytes);
+    const back = try MlsMessage.parse(wire_bytes.items);
+    try testing.expectEqual(ContentType.commit, back.private_message.content_type);
+
+    // Wrong protocol version.
+    var v = try gpa.dupe(u8, wire_bytes.items);
+    defer gpa.free(v);
+    v[1] = 2;
+    try testing.expectError(error.UnsupportedVersion, MlsMessage.parse(v));
+    v[1] = 1;
+    // Unknown wire format.
+    v[3] = 9;
+    try testing.expectError(error.InvalidEnum, MlsMessage.parse(v));
+}
+
+test "ratchet tree extension: blank/leaf/parent slots iterate" {
+    const gpa = testing.allocator;
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    // leaf 0 present, root parent present, leaf 1 blank.
+    try writeU8(gpa, &body, 1);
+    try writeU8(gpa, &body, node_type_leaf);
+    try sampleLeafNode().write(gpa, &body);
+    try writeU8(gpa, &body, 1);
+    try writeU8(gpa, &body, node_type_parent);
+    try ParentNode.write(.{ .encryption_key = "rk", .parent_hash = "", .unmerged_leaves_raw = "\x00\x00\x00\x01" }, gpa, &body);
+    try writeU8(gpa, &body, 0);
+
+    var ext: std.ArrayList(u8) = .empty;
+    defer ext.deinit(gpa);
+    try writeVector(gpa, &ext, body.items);
+
+    var it = try ratchetTreeIter(ext.items);
+    const slot0 = (try it.next()).?;
+    try testing.expectEqualSlices(u8, "did:plc:maya", slot0.?.leaf.credential.identity);
+    const slot1 = (try it.next()).?;
+    try testing.expectEqual(@as(usize, 1), slot1.?.parent.unmergedCount());
+    try testing.expectEqual(@as(u32, 1), slot1.?.parent.unmergedAt(0));
+    const slot2 = (try it.next()).?;
+    try testing.expectEqual(@as(?Node, null), slot2);
+    try testing.expectEqual(@as(??Node, null), try it.next());
+}
+
+test "fuzz: MLSMessage.parse and PrivateContent.parse tolerate mutated bytes" {
+    const gpa = testing.allocator;
+    const fuzzgen = @import("fuzzgen.zig");
+
+    // Seed with a real private message and a real padded content.
+    var wire_bytes: std.ArrayList(u8) = .empty;
+    defer wire_bytes.deinit(gpa);
+    const msg: MlsMessage = .{ .private_message = .{
+        .group_id = "gid",
+        .epoch = 1,
+        .content_type = .application,
+        .authenticated_data = "ad",
+        .encrypted_sender_data = "esd",
+        .ciphertext = "ciphertext",
+    } };
+    try msg.write(gpa, &wire_bytes);
+
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(gpa);
+    const pc: PrivateContent = .{
+        .body = .{ .application = "msg" },
+        .auth = .{ .signature = "sig", .confirmation_tag = null },
+    };
+    try pc.write(gpa, &content, 8);
+
+    var g = fuzzgen.Gen.init(0x94203);
+    var buf: [256]u8 = undefined;
+    const seeds = [_][]const u8{ wire_bytes.items, content.items };
+    const heads = [_]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x3f, 0x40, 0x7f, 0x80, 0xbf, 0xc0, 0xff };
+    var i: usize = 0;
+    while (i < 4000) : (i += 1) {
+        const input = g.next(&buf, &seeds, &heads, i);
+        // Any error is fine; a crash, hang, or OOB read is the failure.
+        _ = MlsMessage.parse(input) catch {};
+        _ = PrivateContent.parse(input, .commit) catch {};
+        _ = PrivateContent.parse(input, .application) catch {};
     }
 }
