@@ -205,10 +205,21 @@ pub fn main(init: std.process.Init) !void {
 
         const clist = try chat_view.buildList(arena, &cstore, now);
         const cthread = try chat_view.buildThread(arena, &cstore, maya, now);
-        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread, 0, "maya.zat4.com", "", true);
+        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread, 0, "maya.zat4.com", "", true, false, "", "");
         try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
         try writePpm(io, gpa, &fb, "/tmp/zat_chat.ppm");
         std.debug.print("wrote /tmp/zat_chat.ppm (Zat Chat messages surface)\n", .{});
+
+        // The compose-new-conversation flow: the recipient bar open with a
+        // half-typed handle, plus a refusal status line — both states in one
+        // frame ("+ New" pill lit, ring, caret, hint replaced by the status).
+        @memset(fb.pixels, clear);
+        dl.len = 0;
+        try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
+        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread, 0, "maya.zat4.com", "", false, true, "chattest.zat4.com", "No chat keys published for that account");
+        try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+        try writePpm(io, gpa, &fb, "/tmp/zat_chat_compose.ppm");
+        std.debug.print("wrote /tmp/zat_chat_compose.ppm (compose-new-conversation bar)\n", .{});
     }
 
     // TILING FOUNDATION (S.1) PROOF: the SAME real feed, but its pane geometry

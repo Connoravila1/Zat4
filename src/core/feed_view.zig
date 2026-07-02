@@ -150,7 +150,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input };
 
 /// The six top-level rail destinations, in order. The `Screen` index a nav
 /// region carries is an index into this. Shared by the rail (draw + hit) and
@@ -3438,6 +3438,15 @@ pub fn layoutChat(
     /// ring + caret so "can I type?" is answered by the pixels (the owner's
     /// U5 field note — an input with no focus state reads as dead).
     input_focus: bool,
+    /// True while the new-conversation flow is open: a recipient bar renders
+    /// between the banner and the list, and it owns the keyboard.
+    composing: bool,
+    /// The recipient bar's draft (a handle or DID being typed).
+    compose_draft: []const u8,
+    /// One short line under the recipient bar ("" = none): why the last
+    /// attempt didn't start — unresolvable handle, no published keys, relay
+    /// down. Static shell strings; this layer just draws them.
+    compose_status: []const u8,
 ) error{OutOfMemory}!i32 {
     const m: Metrics = if (pane_geom) |g|
         .{ .rail_x = g.rail_x, .col_x = g.col_x, .col_w = g.col_w, .lx = g.lx, .cw = g.cw, .side_x = g.side_x, .wide = g.wide }
@@ -3459,6 +3468,20 @@ pub fn layoutChat(
     const top: i32 = if (m.wide) 40 else 30;
     _ = try str(gpa, dl, e, .semibold, x0, top + 30, ink, 30, "Messages");
 
+    // "+ New" — the new-conversation pill, right-aligned on the title line.
+    // Accent-filled while the recipient bar is open (the toggle reads).
+    {
+        const label = "+ New";
+        const lw: i32 = @intCast(text.measure(e, .semibold, label, 14));
+        const pill_w = lw + 28;
+        const pill_h: i32 = 32;
+        const px0 = x0 + w - pill_w;
+        const py0 = top + 4;
+        try rect(gpa, dl, px0, py0, pill_w, pill_h, if (composing) accent else skinPanel(accent), 16);
+        _ = try str(gpa, dl, e, .semibold, px0 + 14, py0 + 21, if (composing) 0xFF20201A else body_c, 14, label);
+        try emitRegion(gpa, regions, px0, py0, pill_w, @intCast(pill_h), 0, .chat_new);
+    }
+
     // The honesty line (ZAT_CHAT_ROADMAP M1): the plaintext path is gone —
     // messages are end-to-end encrypted (MLS over the relay). The claim is
     // permitted now precisely because M1 is real; it names only what ships
@@ -3471,8 +3494,37 @@ pub fn layoutChat(
     const ban_pen = try str(gpa, dl, e, .semibold, x0 + 14, ban_y + 20, ink, 12, "End-to-end encrypted");
     _ = try str(gpa, dl, e, .regular, ban_pen + 10, ban_y + 20, muted, 12, "— MLS, post-quantum hybrid, forward secrecy");
 
-    // Pane split (the settings master–detail shape).
-    const body_y = ban_y + ban_h + 18;
+    // The recipient bar (new-conversation flow): an input for a handle or
+    // DID, the composer strip's focus vocabulary (ring + caret — composing
+    // means it owns the keyboard), a hint line, and the shell's status line
+    // when the last attempt refused.
+    var body_y = ban_y + ban_h + 18;
+    if (composing) {
+        const bar_h: i32 = 46;
+        try rect(gpa, dl, x0, body_y, w, bar_h, skinPanel(accent), 14);
+        const ring_c = (0xC0 << 24) | (accent & 0x00FFFFFF);
+        try rect(gpa, dl, x0, body_y, w, 1, ring_c, 0);
+        try rect(gpa, dl, x0, body_y + bar_h - 1, w, 1, ring_c, 0);
+        try rect(gpa, dl, x0, body_y, 1, bar_h, ring_c, 0);
+        try rect(gpa, dl, x0 + w - 1, body_y, 1, bar_h, ring_c, 0);
+        const lab_pen = try str(gpa, dl, e, .semibold, x0 + 14, body_y + 29, muted, 14, "To:");
+        if (compose_draft.len > 0) {
+            try strEllipsis(gpa, dl, e, .regular, lab_pen + 8, body_y + 29, ink, 14, compose_draft, x0 + w - 14 - (lab_pen + 8));
+        } else {
+            _ = try str(gpa, dl, e, .regular, lab_pen + 8, body_y + 29, faint, 14, "handle or did:…");
+        }
+        const draft_w: i32 = @intCast(text.measure(e, .regular, compose_draft, 14));
+        const caret_x = lab_pen + 8 + @min(draft_w, x0 + w - 14 - (lab_pen + 8)) + 1;
+        try rect(gpa, dl, caret_x, body_y + 14, 2, bar_h - 28, (0xE0 << 24) | (accent & 0x00FFFFFF), 0);
+        try emitRegion(gpa, regions, x0, body_y, w, @intCast(bar_h), 0, .chat_compose_input);
+        body_y += bar_h + 8;
+        if (compose_status.len > 0) {
+            _ = try str(gpa, dl, e, .regular, x0 + 2, body_y + 12, 0xFFE0A868, 13, compose_status);
+        } else {
+            _ = try str(gpa, dl, e, .regular, x0 + 2, body_y + 12, faint, 12, "Enter to start · Esc to cancel");
+        }
+        body_y += 26;
+    }
     const list_w: i32 = std.math.clamp(@divTrunc(w * 34, 100), 220, 320);
     const split_gap: i32 = 28;
     const detail_x = x0 + list_w + split_gap;
@@ -3938,31 +3990,53 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     };
 
     // Narrow width (460): no rail regions, so the counts are exactly the
-    // surface's own — one region per conversation row + the composer pair.
-    const h = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, 0, "maya.zat4.com", "", true);
+    // surface's own — one region per conversation row + the composer pair +
+    // the "+ New" pill.
+    const h = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, 0, "maya.zat4.com", "", true, false, "", "");
     var n_conv: usize = 0;
     var n_input: usize = 0;
     var n_send: usize = 0;
+    var n_new: usize = 0;
     for (regions.items) |r| {
         if (r.kind == .chat_conv) n_conv += 1;
         if (r.kind == .chat_input) n_input += 1;
         if (r.kind == .chat_send) n_send += 1;
+        if (r.kind == .chat_new) n_new += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), n_conv);
     try std.testing.expectEqual(@as(usize, 1), n_input);
     try std.testing.expectEqual(@as(usize, 1), n_send);
-    try std.testing.expectEqual(regions.items.len, n_conv + n_input + n_send);
+    try std.testing.expectEqual(@as(usize, 1), n_new);
+    try std.testing.expectEqual(regions.items.len, n_conv + n_input + n_send + n_new);
     try std.testing.expect(h >= 940); // viewport + any thread overflow
     try std.testing.expect(dl.len > 0);
 
     // No conversation selected: the list still renders and taps, but there is
-    // no thread pane and no composer to arm.
+    // no thread pane and no composer to arm. The "+ New" pill is always there.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h2 = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, 255, "", "", false);
+    const h2 = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, 255, "", "", false, false, "", "");
     try std.testing.expectEqual(@as(i32, 940), h2);
-    for (regions.items) |r| try std.testing.expectEqual(Action.chat_conv, r.kind);
-    try std.testing.expectEqual(@as(usize, 2), regions.items.len);
+    var n2_conv: usize = 0;
+    var n2_new: usize = 0;
+    for (regions.items) |r| {
+        if (r.kind == .chat_conv) n2_conv += 1;
+        if (r.kind == .chat_new) n2_new += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), n2_conv);
+    try std.testing.expectEqual(@as(usize, 1), n2_new);
+    try std.testing.expectEqual(regions.items.len, n2_conv + n2_new);
+
+    // Composing: the recipient bar renders with its input region; the status
+    // line draws when the shell hands one over.
+    dl.len = 0;
+    regions.clearRetainingCapacity();
+    _ = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, 255, "", "", false, true, "chattest.zat4.com", "Couldn't resolve that handle");
+    var n3_compose: usize = 0;
+    for (regions.items) |r| {
+        if (r.kind == .chat_compose_input) n3_compose += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), n3_compose);
 }
 
 test "zones browse: each catalog entry emits one .zone_open card region carrying its index" {
