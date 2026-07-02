@@ -535,6 +535,11 @@ pub fn run(
     var gchat_peer_buf: [254]u8 = undefined;
     var gchat_peer_len: usize = 0;
     var gchat_compose_status: []const u8 = "";
+    // U6a typing-indicator DEMO (motion only — the transport's ephemeral
+    // ping is the recorded follow-up): ZAT4_CHAT_TYPING_DEMO=1 cycles the
+    // indicator 4s on / 4s off in an open thread, to judge the motion
+    // against the bar. Deleted when the real signal lands.
+    const chat_typing_demo = if (environ) |env| env.get("ZAT4_CHAT_TYPING_DEMO") != null else false;
 
     // The real E2EE session (M1): the crypto state (anchor, keyPackage,
     // per-conversation MLS groups) + the relay link that carries encrypted
@@ -1380,7 +1385,7 @@ pub fn run(
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .market = if (gscreen == feed_view.screen_loadout and gloadout_tab == 1) market_cards.items else &.{}, .create = .{ .step = gcreate_step, .answers = gcreate_answers, .config = gcreate_config, .name = gcreate_name_buf[0..gcreate_name_len], .color = gcreate_color, .naming = gcreate_step == .name, .prepare_t = create_prepare_t }, .bench = bench_tray, .inspect_bytes = inspect_bytes orelse "", .inspect_name = inspect_name, .inspect_ref = inspect_ref, .inspect_source = gtransp_source, .inspect_loading = inspect_loading, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .chat_store = if (dev_chat) &gchat_store else null, .chat_sel = gchat_sel, .chat_draft = gchat_draft_buf[0..gchat_draft_len], .chat_input_focus = gchat_input_focus, .chat_composing = gchat_composing, .chat_compose = gchat_peer_buf[0..gchat_peer_len], .chat_compose_status = gchat_compose_status, .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
+        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .market = if (gscreen == feed_view.screen_loadout and gloadout_tab == 1) market_cards.items else &.{}, .create = .{ .step = gcreate_step, .answers = gcreate_answers, .config = gcreate_config, .name = gcreate_name_buf[0..gcreate_name_len], .color = gcreate_color, .naming = gcreate_step == .name, .prepare_t = create_prepare_t }, .bench = bench_tray, .inspect_bytes = inspect_bytes orelse "", .inspect_name = inspect_name, .inspect_ref = inspect_ref, .inspect_source = gtransp_source, .inspect_loading = inspect_loading, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .chat_store = if (dev_chat) &gchat_store else null, .chat_sel = gchat_sel, .chat_draft = gchat_draft_buf[0..gchat_draft_len], .chat_input_focus = gchat_input_focus, .chat_composing = gchat_composing, .chat_compose = gchat_peer_buf[0..gchat_peer_len], .chat_compose_status = gchat_compose_status, .chat_typing = chat_typing_demo and gscreen == feed_view.screen_messages and gchat_sel != null and @mod(now, 8) < 4, .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
         switch (mode) {
             .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status),
             .compose => {
@@ -3774,6 +3779,10 @@ const Grid = struct {
     chat_composing: bool = false,
     chat_compose: []const u8 = "",
     chat_compose_status: []const u8 = "",
+    /// The typing-indicator SIGNAL (U6a): true = the counterparty is typing.
+    /// Driven by the demo env hook until the transport's ephemeral ping
+    /// lands (receipts-off rules apply — the motion ships first, recorded).
+    chat_typing: bool = false,
     field_gain: f32 = 0.9,
     /// Toy Box "Julia mode" active — the field renderer pinks its glyph ink.
     julia: bool = false,
@@ -3995,6 +4004,21 @@ const GpuState = struct {
     algo_v: f32 = 0,
     left_hover_t: f32 = 0,
     left_hover_v: f32 = 0,
+    /// Zat Chat motion (U6a): the newest bubble's send/arrival springs, the
+    /// typing indicator's grow/melt spring + its pulse clock, and the store
+    /// watermark the triggers derive from. ONE trigger site — the observed
+    /// state transition (the store grew), per ANIMATION_SYSTEM_NOTES.
+    chat_send_t: f32 = 1,
+    chat_send_v: f32 = 0,
+    chat_arrive_t: f32 = 1,
+    chat_arrive_v: f32 = 0,
+    chat_typing_t: f32 = 0,
+    chat_typing_v: f32 = 0,
+    chat_typing_phase: f32 = 0,
+    chat_seen_msgs: usize = 0,
+    /// False until the Messages screen has been seen once — the history
+    /// restore and any pre-visit arrivals must NOT animate on first paint.
+    chat_seen_valid: bool = false,
 };
 
 /// Spring one geometry boundary toward its target (S.2). Stiff + just over
@@ -4003,6 +4027,17 @@ const GpuState = struct {
 fn springGeom(cur: *f32, vel: *f32, target: f32, dt: f32) void {
     const k: f32 = 150.0;
     const c: f32 = 25.0;
+    vel.* += (-k * (cur.* - target) - c * vel.*) * dt;
+    cur.* += vel.* * dt;
+}
+
+/// The message-motion spring (U6a): stiffer and UNDER-damped, so a sent
+/// bubble pops into its seat with a small overshoot and settles — the lively
+/// half of the vocabulary. Geometry morphs must not overshoot (a pane
+/// boundary crossing its target overlaps); a bubble should.
+fn springPop(cur: *f32, vel: *f32, target: f32, dt: f32) void {
+    const k: f32 = 260.0;
+    const c: f32 = 16.0;
     vel.* += (-k * (cur.* - target) - c * vel.*) * dt;
     cur.* += vel.* * dt;
 }
@@ -4484,7 +4519,7 @@ fn paintFrame(
                 // Zat Chat (U3, dev-gated): the Messages surface. -scroll maps the
                 // shared ≤0 scroll state onto layoutChat's positive history offset.
                 const cf = buildChatFrame(arena, g.chat_store.?, g.chat_sel, now);
-                g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status) catch g.content_h.*;
+                g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, .{}) catch g.content_h.*;
             } else if (g.screen.* == feed_view.screen_loadout) {
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
                 g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market, g.create, g.bench) catch g.content_h.*; // software: draw line-art nav
@@ -4853,11 +4888,38 @@ fn paintFrameGpu(
         chat_sig ^= std.hash.Wyhash.hash(0x77E1_A2C9, g.chat_compose);
         chat_sig ^= std.hash.Wyhash.hash(0x3B8F_55D1, g.chat_compose_status);
     };
+
+    // Zat Chat motion (U6a). The trigger is DERIVED, in this one place, from
+    // the observed state transition — the store grew — and the newest
+    // message's direction picks the animation (send pop vs arrival settle).
+    // The springs then run in the one loop on the one clock; the surface
+    // just draws whatever the values say (ANIMATION_SYSTEM_NOTES).
+    var chat_animating = false;
+    if (g.screen.* == feed_view.screen_messages) if (g.chat_store) |cs| {
+        if (gs.chat_seen_valid and cs.msgs.len > gs.chat_seen_msgs) {
+            if (cs.mine.isSet(cs.msgs.len - 1)) {
+                gs.chat_send_t = 0;
+                gs.chat_send_v = 0;
+            } else {
+                gs.chat_arrive_t = 0;
+                gs.chat_arrive_v = 0;
+            }
+        }
+        gs.chat_seen_msgs = cs.msgs.len;
+        gs.chat_seen_valid = true;
+        springPop(&gs.chat_send_t, &gs.chat_send_v, 1.0, 1.0 / 60.0);
+        springPop(&gs.chat_arrive_t, &gs.chat_arrive_v, 1.0, 1.0 / 60.0);
+        springGeom(&gs.chat_typing_t, &gs.chat_typing_v, if (g.chat_typing) 1.0 else 0.0, 1.0 / 60.0);
+        if (gs.chat_typing_t > 0.01) gs.chat_typing_phase += 1.0 / 60.0;
+        chat_animating = @abs(gs.chat_send_t - 1.0) > 0.004 or @abs(gs.chat_send_v) > 0.004 or
+            @abs(gs.chat_arrive_t - 1.0) > 0.004 or @abs(gs.chat_arrive_v) > 0.004 or
+            gs.chat_typing_t > 0.01 or g.chat_typing;
+    };
     const sig = feedSignature(items, g.scroll.*, w, h) ^ (@as(u64, g.screen.*) *% 0x9E37_79B9_7F4A_7C15) ^ (socket_sig *% 0xD1B5_4A32_D192_ED03) ^ (@as(u64, g.settings_section) *% 0xC2B2_AE3D_27D4_EB4F) ^ (g.settings_toggles *% 0x9E6C_63D0_676A_9A99) ^ (g.settings_choices *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, g.settings_picking) *% 0x8A91_7F2B_4D3E_61C7) ^ (@as(u64, @intFromBool(g.inspect_source)) *% 0xF29C_511C_8E3D_45A7) ^ (@as(u64, @intFromBool(g.inspect_loading)) *% 0xBF58_476D_1CE4_E5B9) ^ chat_sig;
     // A drag/settle animates the socket every frame (lift, reflow, ghost), so
     // bypass the feed cache while it runs — a brief interaction, and the field
     // already rebuilds every frame anyway.
-    if (sig != gs.feed_sig or gs.feed.verts.items.len == 0 or g.socket_ui.drag_active != null or search_animating or zones_animating or rail_hover_animating or algo_animating or g.screen.* == feed_view.screen_loadout or g.frametiming_on) {
+    if (sig != gs.feed_sig or gs.feed.verts.items.len == 0 or g.socket_ui.drag_active != null or search_animating or zones_animating or rail_hover_animating or algo_animating or chat_animating or g.screen.* == feed_view.screen_loadout or g.frametiming_on) {
         gs.feed_sig = sig;
         // An empty timeline renders the chrome with no posts (no placeholders).
         const feed_posts = feed_view.fromTimeline(arena, items, now) catch &[_]feed_view.PostView{};
@@ -4910,7 +4972,7 @@ fn paintFrameGpu(
             gs.content_x = lg.col_x;
             gs.content_w = lg.col_w;
             const cf = buildChatFrame(arena, g.chat_store.?, g.chat_sel, now);
-            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status) catch g.content_h.*;
+            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, .{ .send_t = gs.chat_send_t, .arrive_t = gs.chat_arrive_t, .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase }) catch g.content_h.*;
         } else if (g.screen.* == feed_view.screen_transparency) {
             // The algorithm transparency page: a plain scrolling document (no rail),
             // rebuilt from the inspected config each entry (what you see = what runs).

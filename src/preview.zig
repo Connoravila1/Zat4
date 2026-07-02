@@ -205,7 +205,7 @@ pub fn main(init: std.process.Init) !void {
 
         const clist = try chat_view.buildList(arena, &cstore, now);
         const cthread = try chat_view.buildThread(arena, &cstore, maya, now);
-        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread, 0, "maya.zat4.com", "", true, false, "", "");
+        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread, 0, "maya.zat4.com", "", true, false, "", "", .{});
         try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
         try writePpm(io, gpa, &fb, "/tmp/zat_chat.ppm");
         std.debug.print("wrote /tmp/zat_chat.ppm (Zat Chat messages surface)\n", .{});
@@ -216,10 +216,21 @@ pub fn main(init: std.process.Init) !void {
         @memset(fb.pixels, clear);
         dl.len = 0;
         try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
-        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread, 0, "maya.zat4.com", "", false, true, "chattest.zat4.com", "No chat keys published for that account");
+        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread, 0, "maya.zat4.com", "", false, true, "chattest.zat4.com", "No chat keys published for that account", .{});
         try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
         try writePpm(io, gpa, &fb, "/tmp/zat_chat_compose.ppm");
         std.debug.print("wrote /tmp/zat_chat_compose.ppm (compose-new-conversation bar)\n", .{});
+
+        // The U6a motion, mid-flight: the newest own bubble halfway between
+        // the composer and its seat, the typing indicator fully grown with
+        // its dots mid-pulse — one frame of the live animation.
+        @memset(fb.pixels, clear);
+        dl.len = 0;
+        try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
+        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread, 0, "maya.zat4.com", "", true, false, "", "", .{ .send_t = 0.45, .typing_t = 1.0, .typing_phase = 0.6 });
+        try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+        try writePpm(io, gpa, &fb, "/tmp/zat_chat_motion.ppm");
+        std.debug.print("wrote /tmp/zat_chat_motion.ppm (U6a mid-send + typing indicator)\n", .{});
     }
 
     // TILING FOUNDATION (S.1) PROOF: the SAME real feed, but its pane geometry

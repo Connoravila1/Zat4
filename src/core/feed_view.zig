@@ -3381,6 +3381,39 @@ const feed = @import("feed.zig");
 // the banner and the plaintext path come down in the same commit.
 // ---------------------------------------------------------------------------
 
+/// Per-frame chat motion (U6a). Plain values the SHELL's springs drive —
+/// this layer only draws the frame they describe (one loop, one clock;
+/// ANIMATION_SYSTEM_NOTES). At rest every field is its default and the
+/// layout is byte-identical to the unanimated one.
+pub const ChatMotion = struct {
+    /// The newest OWN bubble springing from the composer into its slot:
+    /// 0 = at the composer, 1 = seated (may overshoot slightly — the spring's
+    /// character). Default 1 = no animation.
+    send_t: f32 = 1,
+    /// The newest COUNTERPARTY bubble's arrival settle: rises ~16px and
+    /// fades in as 0 → 1. Default 1 = at rest.
+    arrive_t: f32 = 1,
+    /// The typing indicator: 0 closed, 1 fully grown; intermediate values
+    /// are the grow-in / melt-away. The thread lifts to make room as it
+    /// grows, so the motion is fluid from inception to end.
+    typing_t: f32 = 0,
+    /// The three-dot pulse clock (seconds); only advances while visible.
+    typing_phase: f32 = 0,
+
+    comptime {
+        // Budget: exactly the four f32 knobs. (A7)
+        assert(@sizeOf(ChatMotion) == 16);
+    }
+};
+
+/// `color` with its alpha byte scaled by `a` (0..1) — the fade half of the
+/// motion vocabulary.
+fn scaleAlpha(color: u32, a: f32) u32 {
+    const al: f32 = @floatFromInt(color >> 24);
+    const s: u32 = @intFromFloat(std.math.clamp(al * a, 0, 255));
+    return (s << 24) | (color & 0x00FFFFFF);
+}
+
 /// Draw `s` truncated to `maxw`, with a trailing ellipsis when it overflows.
 fn strEllipsis(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, weight: text.Weight, x0: i32, baseline: i32, color: u32, px: u16, s: []const u8, maxw: i32) !void {
     if (@as(i32, @intCast(text.measure(e, weight, s, px))) <= maxw) {
@@ -3447,6 +3480,8 @@ pub fn layoutChat(
     /// attempt didn't start — unresolvable handle, no published keys, relay
     /// down. Static shell strings; this layer just draws them.
     compose_status: []const u8,
+    /// The frame's motion values (U6a) — shell springs in, pixels out.
+    motion: ChatMotion,
 ) error{OutOfMemory}!i32 {
     const m: Metrics = if (pane_geom) |g|
         .{ .rail_x = g.rail_x, .col_x = g.col_x, .col_w = g.col_w, .lx = g.lx, .cw = g.cw, .side_x = g.side_x, .wide = g.wide }
@@ -3581,7 +3616,12 @@ pub fn layoutChat(
     const thread_top = body_y + 54;
     const comp_h: i32 = 46;
     const comp_y = height - comp_h - 24;
-    const thread_bot = comp_y - 12;
+    // The typing indicator claims space between the thread and the composer
+    // as it grows (typing_t 0→1) — the bubbles above LIFT with it, so the
+    // grow-in / melt-away is fluid, not a pop over the thread.
+    const typing_open = std.math.clamp(motion.typing_t, 0.0, 1.0);
+    const typing_room: i32 = @intFromFloat(@round(46.0 * typing_open));
+    const thread_bot = comp_y - 12 - typing_room;
 
     // Bubble geometry: measure pass (draw_it = false), then a bottom-anchored
     // draw pass. Text is 14px on a 20px line; a bubble is its wrapped text
@@ -3608,9 +3648,13 @@ pub fn layoutChat(
 
     // Bottom-anchor; scroll > 0 walks back into history. Rows fully outside
     // the pane are skipped (the shell clamps scroll to the returned overflow,
-    // U3); partially-clipped edge rows are accepted.
+    // U3); partially-clipped edge rows are accepted. The NEWEST bubble may
+    // carry motion (U6a): an own message springs up out of the composer into
+    // its seat (send_t, spring overshoot welcome); a counterparty message
+    // rises ~16px and fades in (arrive_t). Both may travel through the strip
+    // below the thread, so their clip floor is the composer, not thread_bot.
     var y = @max(thread_top, thread_bot - total) + scroll;
-    for (thread, bh) |b, hh| {
+    for (thread, bh, 0..) |b, hh, idx| {
         if (b.stamp) {
             if (y + stamp_h > thread_top and y < thread_bot) {
                 const aw: i32 = @intCast(text.measure(e, .regular, b.age, 11));
@@ -3618,10 +3662,26 @@ pub fn layoutChat(
             }
             y += stamp_h;
         }
-        if (y + hh > thread_top and y < thread_bot) {
+        var by = y;
+        var fade: f32 = 1.0;
+        var clip_bot = thread_bot;
+        if (idx + 1 == thread.len and b.kind != .system) {
+            if (b.mine and motion.send_t < 0.999) {
+                const from: f32 = @floatFromInt(comp_y + 8 - hh);
+                const to: f32 = @floatFromInt(y);
+                by = @intFromFloat(@round(to + (from - to) * (1.0 - motion.send_t)));
+                clip_bot = comp_y;
+            } else if (!b.mine and motion.arrive_t < 0.999) {
+                const t = std.math.clamp(motion.arrive_t, 0.0, 1.0);
+                by = y + @as(i32, @intFromFloat(@round(16.0 * (1.0 - t))));
+                fade = @min(1.0, t * 1.8);
+                clip_bot = comp_y;
+            }
+        }
+        if (by + hh > thread_top and by < clip_bot) {
             if (b.kind == .system) {
                 const sw2: i32 = @intCast(text.measure(e, .regular, b.body, 12));
-                _ = try str(gpa, dl, e, .regular, detail_x + @divTrunc(detail_w - sw2, 2), y + 16, faint, 12, b.body);
+                _ = try str(gpa, dl, e, .regular, detail_x + @divTrunc(detail_w - sw2, 2), by + 16, faint, 12, b.body);
             } else {
                 // Single-line bubbles shrink-wrap; wrapped ones take the max.
                 const one_w: i32 = @intCast(text.measure(e, .regular, b.body, 14));
@@ -3629,14 +3689,37 @@ pub fn layoutChat(
                 const bw = if (fits_one) one_w + 2 * pad_x else bub_max;
                 const bx = if (b.mine) detail_x + detail_w - bw else detail_x;
                 const fill: u32 = if (b.mine) (0x38 << 24) | (accent & 0x00FFFFFF) else skinPanel(accent);
-                try rect(gpa, dl, bx, y, bw, hh, fill, 14);
-                _ = try wrapBody(gpa, dl, e, bx + pad_x, y + pad_y + 12, bub_max - 2 * pad_x, ink, 14, b.body, line_h, true, null);
+                try rect(gpa, dl, bx, by, bw, hh, scaleAlpha(fill, fade), 14);
+                _ = try wrapBody(gpa, dl, e, bx + pad_x, by + pad_y + 12, bub_max - 2 * pad_x, scaleAlpha(ink, fade), 14, b.body, line_h, true, null);
             }
         }
         y += hh + gap;
     }
     if (thread.len == 0) {
         _ = try str(gpa, dl, e, .regular, detail_x, thread_top + 20, faint, 14, "No messages yet — say hello");
+    }
+
+    // The typing indicator (U6a): a counterparty-side bubble that grows in
+    // from the composer edge, pulses three dots while open, and melts away —
+    // every stage is the same draw at a different typing_t/phase (a pure
+    // transform of the frame's values; the SIGNAL is the shell's concern).
+    if (typing_open > 0.01) {
+        const th: i32 = @intFromFloat(@round(34.0 * typing_open));
+        const tw: i32 = @intFromFloat(@round(64.0 * (0.55 + 0.45 * typing_open)));
+        const ty = comp_y - 12 - th;
+        try rect(gpa, dl, detail_x, ty, tw, th, scaleAlpha(skinPanel(accent), typing_open), 14);
+        if (typing_open > 0.55) {
+            const dot_a = (typing_open - 0.55) / 0.45; // dots arrive after the bubble
+            var di: i32 = 0;
+            while (di < 3) : (di += 1) {
+                const phase = motion.typing_phase * 5.0 - @as(f32, @floatFromInt(di)) * 0.9;
+                const pulse = 0.30 + 0.70 * (0.5 + 0.5 * @sin(phase));
+                const dsz: i32 = 7;
+                const dx = detail_x + @divTrunc(tw, 2) + (di - 1) * 15 - @divTrunc(dsz, 2);
+                const dy = ty + @divTrunc(th, 2) - @divTrunc(dsz, 2) - @as(i32, @intFromFloat(@round(2.0 * (pulse - 0.5))));
+                try rect(gpa, dl, dx, dy, dsz, dsz, scaleAlpha(muted, dot_a * pulse), 3);
+            }
+        }
     }
 
     // The composer strip: input + Send. Inert scaffold until the U3 wiring
@@ -3992,7 +4075,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // Narrow width (460): no rail regions, so the counts are exactly the
     // surface's own — one region per conversation row + the composer pair +
     // the "+ New" pill.
-    const h = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, 0, "maya.zat4.com", "", true, false, "", "");
+    const h = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, 0, "maya.zat4.com", "", true, false, "", "", .{});
     var n_conv: usize = 0;
     var n_input: usize = 0;
     var n_send: usize = 0;
@@ -4015,7 +4098,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // no thread pane and no composer to arm. The "+ New" pill is always there.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h2 = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, 255, "", "", false, false, "", "");
+    const h2 = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, 255, "", "", false, false, "", "", .{});
     try std.testing.expectEqual(@as(i32, 940), h2);
     var n2_conv: usize = 0;
     var n2_new: usize = 0;
@@ -4031,12 +4114,27 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // line draws when the shell hands one over.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, 255, "", "", false, true, "chattest.zat4.com", "Couldn't resolve that handle");
+    _ = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, 255, "", "", false, true, "chattest.zat4.com", "Couldn't resolve that handle", .{});
     var n3_compose: usize = 0;
     for (regions.items) |r| {
         if (r.kind == .chat_compose_input) n3_compose += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), n3_compose);
+
+    // Motion (U6a): an at-rest frame and a fully-animating one (mid-send +
+    // grown typing indicator) both render clean; the typing bubble and its
+    // dots ADD draw items over the at-rest frame; regions are unaffected
+    // (motion never moves a tap target).
+    dl.len = 0;
+    regions.clearRetainingCapacity();
+    _ = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, 0, "maya.zat4.com", "", true, false, "", "", .{});
+    const rest_items = dl.len;
+    const rest_regions = regions.items.len;
+    dl.len = 0;
+    regions.clearRetainingCapacity();
+    _ = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, 0, "maya.zat4.com", "", true, false, "", "", .{ .send_t = 0.4, .arrive_t = 1, .typing_t = 1, .typing_phase = 0.7 });
+    try std.testing.expect(dl.len > rest_items);
+    try std.testing.expectEqual(rest_regions, regions.items.len);
 }
 
 test "zones browse: each catalog entry emits one .zone_open card region carrying its index" {
