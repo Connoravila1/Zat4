@@ -59,6 +59,8 @@ const sig_len = 64; // Ed25519 signature
 const max_generation_skip: u32 = 1024;
 
 pub const MlsError = wire.ParseError || wire.WriteError || error{
+    /// A persisted group blob that is not a group blob (M1 restore).
+    BadMessage,
     UnsupportedPsk,
     MissingGroupBinding,
     BadKey,
@@ -1754,6 +1756,167 @@ fn processCommit(
 }
 
 // ---------------------------------------------------------------------------
+// Group persistence + inbox routing (ZAT_CHAT_ROADMAP M1). A conversation
+// must survive a relaunch, so the whole Group round-trips through plain
+// bytes; the caller (shell/cache) owns where those bytes rest — keystore or
+// 0600 file, the session posture. Serializing LIVE ratchet state is the
+// standard messenger trade (Signal does the same): forward secrecy is
+// preserved because advanced generations are already gone from the state
+// serialized — the wipe points fire BEFORE persistence ever sees the bytes.
+// ---------------------------------------------------------------------------
+
+const group_blob_magic = [4]u8{ 'Z', 'A', 'T', 'G' };
+const group_blob_version: u16 = 1;
+
+/// Serialize the whole group state (gpa-owned; the caller should scrub the
+/// returned bytes after storing them — they contain live key material).
+pub fn serializeGroup(gpa: Allocator, g: *const Group) error{OutOfMemory}![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, &group_blob_magic);
+    try out.appendSlice(gpa, std.mem.asBytes(&group_blob_version));
+    inline for (.{ g.group_id, g.gc_extensions, g.leaf_bytes[0], g.leaf_bytes[1] }) |slice| {
+        var len4: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len4, @intCast(slice.len), .little);
+        try out.appendSlice(gpa, &len4);
+        try out.appendSlice(gpa, slice);
+    }
+    // EpochSecrets is packed exactly (its guard proves 11×32 with no holes),
+    // so its bytes are its serialization.
+    try out.appendSlice(gpa, std.mem.asBytes(&g.secrets));
+    for (g.ratchets) |pair| for (pair) |r| {
+        try out.appendSlice(gpa, &r.secret);
+        var gen4: [4]u8 = undefined;
+        std.mem.writeInt(u32, &gen4, r.generation, .little);
+        try out.appendSlice(gpa, &gen4);
+    };
+    try out.appendSlice(gpa, &g.confirmed_transcript_hash);
+    try out.appendSlice(gpa, &g.interim_hash);
+    try out.appendSlice(gpa, &g.tree_hash);
+    try out.appendSlice(gpa, &g.root_pub);
+    try out.appendSlice(gpa, &g.root_priv);
+    try out.appendSlice(gpa, &g.my_enc_priv);
+    try out.appendSlice(gpa, &g.sig_seed);
+    for (g.leaf_sig_pub) |k| try out.appendSlice(gpa, &k);
+    for (g.leaf_enc_pub) |k| try out.appendSlice(gpa, &k);
+    var tail: [16]u8 = undefined;
+    std.mem.writeInt(u64, tail[0..8], g.epoch, .little);
+    std.mem.writeInt(u32, tail[8..12], g.my_leaf, .little);
+    tail[12] = g.cth_len;
+    tail[13] = @as(u8, @intFromBool(g.root_present)) |
+        (@as(u8, @intFromBool(g.root_priv_present)) << 1) |
+        (@as(u8, @intFromBool(g.ratchets_live)) << 2);
+    tail[14] = 0;
+    tail[15] = 0;
+    try out.appendSlice(gpa, &tail);
+    return out.toOwnedSlice(gpa);
+}
+
+/// Restore a group from `serializeGroup`'s bytes. Strict: any malformed
+/// length is an error, never a half-restored group (E3).
+pub fn deserializeGroup(gpa: Allocator, bytes: []const u8) MlsError!Group {
+    var g: Group = undefined;
+    if (bytes.len < 6 or !std.mem.eql(u8, bytes[0..4], &group_blob_magic)) return error.BadMessage;
+    if (std.mem.bytesToValue(u16, bytes[4..6]) != group_blob_version) return error.BadMessage;
+    var at: usize = 6;
+
+    var slices: [4][]u8 = undefined;
+    var filled: usize = 0;
+    errdefer for (slices[0..filled]) |s| gpa.free(s);
+    for (&slices) |*slot| {
+        if (bytes.len - at < 4) return error.BadMessage;
+        const len = std.mem.readInt(u32, bytes[at..][0..4], .little);
+        at += 4;
+        if (bytes.len - at < len) return error.BadMessage;
+        slot.* = try gpa.dupe(u8, bytes[at .. at + len]);
+        filled += 1;
+        at += len;
+    }
+
+    const fixed_len = @sizeOf(schedule.EpochSecrets) + 4 * 36 + 3 * hash_len + 4 * pk_len + 4 * pk_len + 16;
+    if (bytes.len - at != fixed_len) return error.BadMessage;
+    g.group_id = slices[0];
+    g.gc_extensions = slices[1];
+    g.leaf_bytes = .{ slices[2], slices[3] };
+    g.secrets = std.mem.bytesToValue(schedule.EpochSecrets, bytes[at..][0..@sizeOf(schedule.EpochSecrets)]);
+    at += @sizeOf(schedule.EpochSecrets);
+    for (&g.ratchets) |*pair| for (pair) |*r| {
+        r.secret = bytes[at..][0..32].*;
+        r.generation = std.mem.readInt(u32, bytes[at..][32..36], .little);
+        at += 36;
+    };
+    g.confirmed_transcript_hash = bytes[at..][0..hash_len].*;
+    at += hash_len;
+    g.interim_hash = bytes[at..][0..hash_len].*;
+    at += hash_len;
+    g.tree_hash = bytes[at..][0..hash_len].*;
+    at += hash_len;
+    g.root_pub = bytes[at..][0..pk_len].*;
+    at += pk_len;
+    g.root_priv = bytes[at..][0..pk_len].*;
+    at += pk_len;
+    g.my_enc_priv = bytes[at..][0..pk_len].*;
+    at += pk_len;
+    g.sig_seed = bytes[at..][0..32].*;
+    at += 32;
+    for (&g.leaf_sig_pub) |*k| {
+        k.* = bytes[at..][0..pk_len].*;
+        at += pk_len;
+    }
+    for (&g.leaf_enc_pub) |*k| {
+        k.* = bytes[at..][0..pk_len].*;
+        at += pk_len;
+    }
+    g.epoch = std.mem.readInt(u64, bytes[at..][0..8], .little);
+    g.my_leaf = std.mem.readInt(u32, bytes[at..][8..12], .little);
+    if (g.my_leaf > 1) return error.BadMessage;
+    g.cth_len = bytes[at..][12];
+    if (g.cth_len != 0 and g.cth_len != hash_len) return error.BadMessage;
+    const flags = bytes[at..][13];
+    g.root_present = flags & 1 != 0;
+    g.root_priv_present = flags & 2 != 0;
+    g.ratchets_live = flags & 4 != 0;
+    return g;
+}
+
+/// The counterparty's credential identity (their DID). BORROWS the group's
+/// leaf bytes — copy it out before any group mutation (a commit rebuilds
+/// leaves). Empty while the group is still one member.
+pub fn peerIdentity(g: *const Group) []const u8 {
+    const peer = 1 - g.my_leaf;
+    if (g.leaf_bytes[peer].len == 0) return "";
+    var r = wire.Reader.init(g.leaf_bytes[peer]);
+    const ln = wire.LeafNode.parse(&r) catch return "";
+    return ln.credential.identity;
+}
+
+/// What kind of MLS message a padded inbox bucket carries — the shell's
+/// routing switch (welcome → join path; private_message → an open group).
+pub const MessageKind = enum { welcome, private_message, other };
+
+pub fn messageKind(msg_bytes: []const u8) MessageKind {
+    var r = wire.Reader.init(msg_bytes);
+    const version = r.readU16() catch return .other;
+    if (version != wire.protocol_version_mls10) return .other;
+    const kind = r.readU16() catch return .other;
+    return switch (kind) {
+        wire.wire_welcome => .welcome,
+        wire.wire_private_message => .private_message,
+        else => .other,
+    };
+}
+
+/// A private message's group id (BORROWS `msg_bytes`) — how the shell finds
+/// which conversation's group should `receive` it.
+pub fn privateMessageGroupId(msg_bytes: []const u8) MlsError![]const u8 {
+    var r = wire.Reader.init(msg_bytes);
+    if (try r.readU16() != wire.protocol_version_mls10) return error.UnsupportedVersion;
+    if (try r.readU16() != wire.wire_private_message) return error.UnexpectedMessage;
+    const pm = try wire.PrivateMessage.parseFrom(&r);
+    return pm.group_id;
+}
+
+// ---------------------------------------------------------------------------
 // Tests (C6: leak-checked) — every layer that has a published interop
 // vector is pinned to it (mlswg/mls-implementations, cipher suite 1; the
 // hex lives in mls_vectors.zig), then the end-to-end two-member exchange.
@@ -2287,4 +2450,93 @@ test "wipeEpoch zeroes the schedule and both ratchets in place" {
     for (g.ratchets) |pair| for (pair) |r| {
         try testing.expect(std.mem.allEqual(u8, &r.secret, 0));
     };
+}
+
+test "persistence: a serialized group resumes the conversation exactly (M1)" {
+    const gpa = testing.allocator;
+    const seed_a = [_]u8{0xa1} ** 32;
+    const seed_b = [_]u8{0xb2} ** 32;
+
+    var a = try createGroup(gpa, "did:plc:alice", seed_a, .{
+        .group_id = [_]u8{0x71} ** 32,
+        .enc_seed = [_]u8{0x11} ** 32,
+        .epoch_secret = [_]u8{0x22} ** 32,
+    });
+    defer a.deinit(gpa);
+    var bkp = try generateKeyPackage(gpa, "did:plc:bob", seed_b, 0, std.math.maxInt(u64), .{
+        .init_seed = [_]u8{0x33} ** 32,
+        .enc_seed = [_]u8{0x44} ** 32,
+    });
+    defer bkp.deinit(gpa);
+    const welcome_msg = try addPeer(gpa, &a, bkp.bytes, 1_000_000, .{
+        .enc_seed = [_]u8{0x55} ** 32,
+        .path_secret = [_]u8{0x66} ** 32,
+        .welcome_seed = [_]u8{0x77} ** 32,
+    });
+    defer gpa.free(welcome_msg);
+    var b = try join(gpa, welcome_msg, bkp.bytes, .{
+        .init_priv = bkp.init_priv,
+        .enc_priv = bkp.enc_priv,
+        .sig_seed = seed_b,
+    });
+    defer b.deinit(gpa);
+
+    // Some traffic advances the ratchets, then B "relaunches": serialize,
+    // destroy, restore.
+    const m1 = try encrypt(gpa, &a, "before the restart", 0, .{ 1, 2, 3, 4 });
+    defer gpa.free(m1);
+    const r1 = try receive(gpa, &b, m1);
+    gpa.free(r1.application);
+
+    // The peer identity reads back from the live group (both sides).
+    try testing.expectEqualStrings("did:plc:bob", peerIdentity(&a));
+    try testing.expectEqualStrings("did:plc:alice", peerIdentity(&b));
+
+    const blob = try serializeGroup(gpa, &b);
+    defer {
+        std.crypto.secureZero(u8, blob);
+        gpa.free(blob);
+    }
+    b.deinit(gpa);
+    b = try deserializeGroup(gpa, blob);
+
+    // The restored group continues BOTH directions, then survives a full
+    // rotation (commit) from either side.
+    const m2 = try encrypt(gpa, &a, "after the restart", 0, .{ 5, 6, 7, 8 });
+    defer gpa.free(m2);
+    const r2 = try receive(gpa, &b, m2);
+    try testing.expectEqualSlices(u8, "after the restart", r2.application);
+    gpa.free(r2.application);
+    const m3 = try encrypt(gpa, &b, "resumed and replying", 0, .{ 9, 8, 7, 6 });
+    defer gpa.free(m3);
+    const r3 = try receive(gpa, &a, m3);
+    try testing.expectEqualSlices(u8, "resumed and replying", r3.application);
+    gpa.free(r3.application);
+
+    const rot = try commit(gpa, &b, 0, .{
+        .enc_seed = [_]u8{0x88} ** 32,
+        .path_secret = [_]u8{0x99} ** 32,
+        .seal_seed = [_]u8{0xAA} ** 32,
+        .reuse_guard = .{ 1, 1, 1, 1 },
+    });
+    defer gpa.free(rot);
+    const ra = try receive(gpa, &a, rot);
+    try testing.expectEqual(Received.epoch_advanced, ra);
+    try testing.expectEqual(a.epoch, b.epoch);
+    const m4 = try encrypt(gpa, &a, "new epoch still speaks", 0, .{ 2, 2, 2, 2 });
+    defer gpa.free(m4);
+    const r4 = try receive(gpa, &b, m4);
+    try testing.expectEqualSlices(u8, "new epoch still speaks", r4.application);
+    gpa.free(r4.application);
+
+    // Damage is refused, never half-restored.
+    try testing.expectError(error.BadMessage, deserializeGroup(gpa, blob[0 .. blob.len - 1]));
+    try testing.expectError(error.BadMessage, deserializeGroup(gpa, "not a group"));
+
+    // Routing accessors: a private message routes by group id; a welcome is
+    // recognized by kind.
+    try testing.expectEqual(MessageKind.private_message, messageKind(m4));
+    try testing.expectEqual(MessageKind.welcome, messageKind(welcome_msg));
+    try testing.expectEqualSlices(u8, b.group_id, try privateMessageGroupId(m4));
+    try testing.expectEqual(MessageKind.other, messageKind("zz"));
 }

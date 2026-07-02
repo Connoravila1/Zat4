@@ -64,6 +64,22 @@ pub const Peer = struct {
     anchor_pub: [anchor.pk_len]u8,
 };
 
+/// The BOOTSTRAP mailbox for an anchor key: where first contact (the
+/// Welcome) and v1 traffic land. Derived from the anchor PUBLIC key, so
+/// anyone holding the published record can address it — which is exactly
+/// the recorded caveat (a relay operator who also scrapes repos could link
+/// this mailbox to a DID); per-epoch mailboxes out of the MLS secret tree
+/// are the recorded follow-up. Stable across keyPackage refreshes (the
+/// anchor outlives packages).
+pub fn bootstrapMailbox(anchor_pub: [anchor.pk_len]u8) [32]u8 {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update("Zat4 Chat 1.0 BootstrapMailbox");
+    h.update(&anchor_pub);
+    var out: [32]u8 = undefined;
+    h.final(&out);
+    return out;
+}
+
 /// The fetch-side gate (checks 1–6 above). `repo_did` is the repo the
 /// record was actually read from; `now` is the caller's clock (B4).
 pub fn validate(gpa: Allocator, repo_did: []const u8, rec: Record, now: i64) ValidateError!Peer {

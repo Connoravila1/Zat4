@@ -42,12 +42,10 @@
 //! plaintext TCP: the deployed relay is reached through the SSH tunnel,
 //! the AppView's existing posture; TLS-to-Caddy is the recorded upgrade.
 //!
-//! DEV-PLAINTEXT SCAFFOLDING (deleted at M1, same commit as the banner):
-//! until the MLS core is wired in, the padded bucket carries a dev frame
-//! (`devPack`/`devUnpack`) and mailboxes are derived from bare DIDs
-//! (`devMailboxId`). Both are the plaintext path M1 deletes — the real
-//! bucket is `mls.encrypt` output and real mailbox IDs come from the
-//! keyPackage record (bootstrap) and the MLS secret tree (per-epoch).
+//! This module carries OPAQUE bytes only: it neither packs nor reads the
+//! bucket payload. `shell/chat_e2ee.zig` frames the MLS ciphertext into the
+//! fixed bucket and derives mailbox IDs; here a bucket is just
+//! `relay.bucket_len` bytes in and out.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -440,105 +438,16 @@ fn readAvailable(reader: *std.Io.Reader, dst: []u8) error{ReadFailed}!?usize {
 }
 
 // ---------------------------------------------------------------------------
-// DEV-PLAINTEXT SCAFFOLDING — deleted at M1 with the banner, same commit.
-// Pure helpers (no I/O), kept beside the client they scaffold.
-// ---------------------------------------------------------------------------
-
-/// The dev mailbox for a DID. Real addressing (keyPackage bootstrap +
-/// per-epoch secret-tree IDs) replaces this at U6/M1 — deriving a mailbox
-/// from a bare DID is exactly the linkability the real scheme avoids,
-/// which is why this helper is dev-only and loudly named.
-pub fn devMailboxId(did: []const u8) [relay.mailbox_id_len]u8 {
-    var h = std.crypto.hash.sha2.Sha256.init(.{});
-    h.update("zat4 chat dev mailbox v0:");
-    h.update(did);
-    var out: [relay.mailbox_id_len]u8 = undefined;
-    h.final(&out);
-    return out;
-}
-
-pub const dev_max_text = 3900; // bucket minus the dev header, roomy
-
-/// Pack one dev-plaintext message into a padded bucket:
-/// [1 ver=0][1 did_len][did][8 created_at LE][2 text_len LE][text][zero pad].
-pub fn devPack(out: *[relay.bucket_len]u8, sender_did: []const u8, created_at: i64, text: []const u8) error{TooLong}!void {
-    if (sender_did.len > 255 or text.len > dev_max_text) return error.TooLong;
-    @memset(out, 0);
-    out[0] = 0; // dev-plaintext version marker
-    out[1] = @intCast(sender_did.len);
-    var at: usize = 2;
-    @memcpy(out[at..][0..sender_did.len], sender_did);
-    at += sender_did.len;
-    std.mem.writeInt(i64, out[at..][0..8], created_at, .little);
-    at += 8;
-    std.mem.writeInt(u16, out[at..][0..2], @intCast(text.len), .little);
-    at += 2;
-    @memcpy(out[at..][0..text.len], text);
-}
-
-pub const DevMsg = struct {
-    // A7.2: cold struct, size guard waived — transient parse view (dev-only).
-    sender_did: []const u8,
-    created_at: i64,
-    text: []const u8,
-};
-
-/// Unpack a dev bucket. Views borrow `blob`. Null = not a dev frame /
-/// damaged (an ordinary value, E4 — the caller skips it).
-pub fn devUnpack(blob: []const u8) ?DevMsg {
-    if (blob.len != relay.bucket_len) return null;
-    if (blob[0] != 0) return null;
-    const did_len: usize = blob[1];
-    var at: usize = 2;
-    if (did_len == 0 or at + did_len + 10 > blob.len) return null;
-    const did = blob[at..][0..did_len];
-    at += did_len;
-    const created_at = std.mem.readInt(i64, blob[at..][0..8], .little);
-    at += 8;
-    const text_len: usize = std.mem.readInt(u16, blob[at..][0..2], .little);
-    at += 2;
-    if (text_len > dev_max_text or at + text_len > blob.len) return null;
-    return .{ .sender_did = did, .created_at = created_at, .text = blob[at..][0..text_len] };
-}
-
-// ---------------------------------------------------------------------------
-// Tests (C6) — dev framing round-trip, then the full loopback E2E: two REAL
-// clients through the REAL relay server (relay_serve.run's own loop).
+// Tests (C6) — the full loopback E2E: two REAL clients exchanging an opaque
+// bucket through the REAL relay server (relay_serve.run's own loop). The
+// payload here is arbitrary bytes; the relay carries them blind, exactly as
+// it carries MLS ciphertext in production.
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
 const relay_serve = @import("relay_serve.zig");
 
-test "chat_relay: dev framing round-trips and refuses damage" {
-    var bucket: [relay.bucket_len]u8 = undefined;
-    try devPack(&bucket, "did:plc:sender123", 1_751_400_000, "hello over the relay");
-    const msg = devUnpack(&bucket) orelse return error.TestUnexpectedResult;
-    try testing.expectEqualStrings("did:plc:sender123", msg.sender_did);
-    try testing.expectEqual(@as(i64, 1_751_400_000), msg.created_at);
-    try testing.expectEqualStrings("hello over the relay", msg.text);
-
-    // Padding is zeros — the bucket leaks no stale memory.
-    var tail_zero = true;
-    for (bucket[2 + 17 + 8 + 2 + 20 ..]) |b| {
-        if (b != 0) tail_zero = false;
-    }
-    try testing.expect(tail_zero);
-
-    // Damage and wrong shapes are null, not errors.
-    try testing.expect(devUnpack(bucket[0 .. relay.bucket_len - 1]) == null);
-    bucket[0] = 1; // not the dev version
-    try testing.expect(devUnpack(&bucket) == null);
-    const long = [_]u8{'x'} ** (dev_max_text + 1);
-    try testing.expectError(error.TooLong, devPack(&bucket, "did:plc:s", 0, &long));
-
-    // Distinct DIDs land in distinct dev mailboxes; the same DID is stable.
-    const a = devMailboxId("did:plc:aaa");
-    const b = devMailboxId("did:plc:bbb");
-    try testing.expect(!std.mem.eql(u8, &a, &b));
-    try testing.expectEqualSlices(u8, &a, &devMailboxId("did:plc:aaa"));
-}
-
-test "chat_relay loopback: two clients exchange a dev message through the real relay" {
+test "chat_relay loopback: two clients exchange an opaque bucket through the real relay" {
     const gpa = testing.allocator;
     const io = std.testing.io;
 
@@ -559,58 +468,60 @@ test "chat_relay loopback: two clients exchange a dev message through the real r
     // with backoff anyway; this just keeps the test fast).
     clock.sleepMillis(100);
 
-    const alice_did = "did:plc:alice-u5-test";
-    const bob_did = "did:plc:bob-u5-test";
+    // Opaque mailbox IDs and a bucket of arbitrary bytes (the relay never
+    // interprets either — chat_e2ee owns framing + addressing).
+    const alice_box_id: [relay.mailbox_id_len]u8 = @splat(0xA1);
+    const bob_box_id: [relay.mailbox_id_len]u8 = @splat(0xB2);
+    var payload: [relay.bucket_len]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
 
     var alice_box: Mailbox = .{};
     defer alice_box.deinit(gpa);
     var bob_box: Mailbox = .{};
     defer bob_box.deinit(gpa);
 
-    const alice = try start(gpa, io, &alice_box, "127.0.0.1", port, "u5-test-token", devMailboxId(alice_did));
+    const alice = try start(gpa, io, &alice_box, "127.0.0.1", port, "u5-test-token", alice_box_id);
     defer shutdown(alice);
-    const bob = try start(gpa, io, &bob_box, "127.0.0.1", port, "u5-test-token", devMailboxId(bob_did));
+    const bob = try start(gpa, io, &bob_box, "127.0.0.1", port, "u5-test-token", bob_box_id);
     defer shutdown(bob);
 
-    // Alice → Bob: pack, deposit to Bob's mailbox.
-    var bucket: [relay.bucket_len]u8 = undefined;
-    try devPack(&bucket, alice_did, 1234, "meet at the field");
-    try deposit(alice, devMailboxId(bob_did), &bucket);
+    // Alice → Bob: deposit the bucket to Bob's mailbox.
+    try deposit(alice, bob_box_id, &payload);
 
-    // Bob's drain sees it (bounded, politely).
+    // Bob's drain sees it, byte-identical (bounded, politely).
     var drained: std.ArrayList(Mail) = .empty;
     defer {
         for (drained.items) |m| freeMail(gpa, m);
         drained.deinit(gpa);
     }
-    var got: ?DevMsg = null;
+    var got = false;
     var waited_ms: u64 = 0;
-    while (waited_ms < 10_000 and got == null) {
+    while (waited_ms < 10_000 and !got) {
         try bob_box.drain(gpa, &drained);
         for (drained.items) |m| {
-            if (m == .blob) got = devUnpack(m.blob);
+            if (m == .blob) {
+                try testing.expectEqualSlices(u8, &payload, m.blob);
+                got = true;
+            }
         }
-        if (got != null) break;
+        if (got) break;
         clock.sleepMillis(20);
         waited_ms += 20;
     }
-    const msg = got orelse return error.TestUnexpectedResult;
-    try testing.expectEqualStrings(alice_did, msg.sender_did);
-    try testing.expectEqualStrings("meet at the field", msg.text);
-    try testing.expectEqual(@as(i64, 1234), msg.created_at);
+    try testing.expect(got);
 
     // Bob acked on receipt → the store forgets (delivered means deleted).
     waited_ms = 0;
     while (waited_ms < 5_000) {
         lock.lock();
-        const left = relay.pendingCount(&store, devMailboxId(bob_did));
+        const left = relay.pendingCount(&store, bob_box_id);
         lock.unlock();
         if (left == 0) break;
         clock.sleepMillis(20);
         waited_ms += 20;
     }
     lock.lock();
-    const left = relay.pendingCount(&store, devMailboxId(bob_did));
+    const left = relay.pendingCount(&store, bob_box_id);
     lock.unlock();
     try testing.expectEqual(@as(u32, 0), left);
 }

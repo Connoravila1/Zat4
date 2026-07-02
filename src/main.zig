@@ -746,6 +746,7 @@ test {
     _ = @import("core/keydir.zig");
     _ = @import("shell/chat_relay.zig");
     _ = @import("shell/chat_keys.zig");
+    _ = @import("shell/chat_e2ee.zig");
     _ = @import("core/oauth.zig");
     _ = @import("core/oauth_flow.zig");
     _ = @import("core/dagcbor.zig");

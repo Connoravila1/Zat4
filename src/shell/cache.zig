@@ -879,6 +879,88 @@ fn parseChatKeyPackage(gpa: Allocator, bytes: []const u8, did: []const u8) ?Chat
     return .{ .init_priv = init_priv, .enc_priv = enc_priv, .kp_bytes = kp_bytes };
 }
 
+// --- Chat MLS group-state persistence (Zat Chat milestone M1) ----------------
+//
+// The serialized conversations blob (built/parsed by shell/chat_e2ee.zig —
+// this layer stores opaque bytes). Rewritten after every mutating chat
+// operation; same per-DID posture as the anchor and the keyPackage privates.
+const chat_groups_magic = [4]u8{ 'Z', 'A', 'T', 'S' };
+const chat_groups_version: u16 = 1;
+const chat_groups_keystore_prefix = "chat-groups:";
+
+pub fn chatGroupsPath(buf: []u8, environ: ?*const std.process.Environ.Map, did: []const u8) ?[]const u8 {
+    var dir_buf: [512]u8 = undefined;
+    const dir = cacheDir(&dir_buf, environ) orelse return null;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(did, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest[0..8].*, .lower);
+    var name_buf: [36]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "chatgroups-{s}.zat", .{hex}) catch return null;
+    return joinFile(buf, dir, name);
+}
+
+fn chatGroupsKeystoreKey(buf: *[255]u8, did: []const u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, chat_groups_keystore_prefix ++ "{s}", .{did}) catch null;
+}
+
+pub fn saveChatGroupsAt(gpa: Allocator, path: []const u8, did: []const u8, blob: []const u8) bool {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var out: std.ArrayList(u8) = .empty;
+    out.appendSlice(arena, &chat_groups_magic) catch return false;
+    out.appendSlice(arena, std.mem.asBytes(&chat_groups_version)) catch return false;
+    const dlen: u32 = @intCast(did.len);
+    out.appendSlice(arena, std.mem.asBytes(&dlen)) catch return false;
+    out.appendSlice(arena, did) catch return false;
+    out.appendSlice(arena, blob) catch return false;
+    defer std.crypto.secureZero(u8, out.items); // live ratchet material passed through
+    if (keystore_supported) {
+        var key_buf: [255]u8 = undefined;
+        if (chatGroupsKeystoreKey(&key_buf, did)) |key| {
+            if (keystore.put(gpa, key, out.items)) {
+                unlink(path);
+                return true;
+            }
+        }
+    }
+    return writeFileAtomic(path, out.items, 0o600);
+}
+
+/// The stored conversations blob for `did` (gpa-owned; caller scrubs +
+/// frees), or null.
+pub fn loadChatGroupsAt(gpa: Allocator, path: []const u8, did: []const u8) ?[]u8 {
+    if (keystore_supported) {
+        var key_buf: [255]u8 = undefined;
+        if (chatGroupsKeystoreKey(&key_buf, did)) |key| {
+            if (keystore.get(gpa, key)) |blob| {
+                if (parseChatGroups(gpa, blob, did)) |inner| {
+                    std.crypto.secureZero(u8, blob);
+                    gpa.free(blob);
+                    return inner;
+                }
+                std.crypto.secureZero(u8, blob);
+                gpa.free(blob);
+            }
+        }
+    }
+    const bytes = readFileAlloc(gpa, path) orelse return null;
+    defer {
+        std.crypto.secureZero(u8, bytes);
+        gpa.free(bytes);
+    }
+    return parseChatGroups(gpa, bytes, did);
+}
+
+fn parseChatGroups(gpa: Allocator, bytes: []const u8, did: []const u8) ?[]u8 {
+    if (bytes.len < 10 or !std.mem.eql(u8, bytes[0..4], &chat_groups_magic)) return null;
+    if (std.mem.bytesToValue(u16, bytes[4..6]) != chat_groups_version) return null;
+    const dlen = std.mem.bytesToValue(u32, bytes[6..10]);
+    if (bytes.len - 10 < dlen) return null;
+    if (!std.mem.eql(u8, bytes[10 .. 10 + dlen], did)) return null;
+    return gpa.dupe(u8, bytes[10 + dlen ..]) catch null;
+}
+
 /// A7.2: cold struct, size guard waived — one per chat startup, transient.
 pub const AnchorLoad = struct {
     seed: [anchor_seed_len]u8,

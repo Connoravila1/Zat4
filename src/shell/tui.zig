@@ -46,6 +46,7 @@ const feed_core = @import("../core/feed.zig");
 const chat_core = @import("../core/chat.zig");
 const chat_view_core = @import("../core/chat_view.zig");
 const chat_relay = @import("chat_relay.zig");
+const chat_e2ee = @import("chat_e2ee.zig");
 const feed_shell = @import("feed.zig");
 const stream_shell = @import("stream.zig");
 const cache_shell = @import("cache.zig");
@@ -92,11 +93,12 @@ const debug_effects = true;
 // burst cost is MEASURED on the real machine, not guessed, before any
 // optimization. Zero cost when false (the branch folds away).
 const debug_frame_timing = false;
-/// Zat Chat (ZAT_CHAT_ROADMAP U3): route the Messages rail slot to the chat
-/// surface. DEV GATE — the surface is a local plaintext sandbox (no transport,
-/// no persistence) until the relay (U4/U5) and the E2EE core (M1) land; the
-/// surface itself draws the UNENCRYPTED (DEV) banner. Off ⇒ Messages stays
-/// the titled placeholder. Release builds ship with this off until M1.
+/// Zat Chat (ZAT_CHAT_ROADMAP): route the Messages rail slot to the chat
+/// surface. FEATURE GATE — the transport (relay), E2EE core (MLS), and
+/// persistence are all real now (M1); this flag gates a still-maturing
+/// feature (no compose-new-conversation UI yet — ZAT4_CHAT_PEER is the
+/// entry point — and the iOS-grade motion of U6a is pending). Off ⇒
+/// Messages stays the titled placeholder.
 const dev_chat = true;
 
 /// Run the timeline screen until the user quits. The store may arrive
@@ -516,38 +518,32 @@ pub fn run(
     var gcreate_color: u8 = 0;
     var gcreate_name_buf: [64]u8 = undefined;
     var gcreate_name_len: usize = 0;
-    // Zat Chat (U3, dev-gated): the DM store + surface state. SESSION-LOCAL
-    // (memory only) until the relay transport (U4/U5) and persistence (M2)
-    // land — a drivable sandbox behind the UNENCRYPTED (DEV) banner.
+    // Zat Chat (M1): the DM view store — a QUERY model over the real E2EE
+    // session below (zat-view-model law). Messages are end-to-end encrypted
+    // via MLS; this store holds only the plaintext the local user has typed
+    // or the crypto core has decrypted for display.
     var gchat_store: chat_core.Store = .{};
     defer chat_core.deinitStore(gpa, &gchat_store);
     var gchat_sel: ?chat_core.ConvIndex = null;
     var gchat_draft_buf: [512]u8 = undefined;
     var gchat_draft_len: usize = 0;
     var gchat_input_focus: bool = false;
-    if (dev_chat) {
-        // DEV SANDBOX SEED: sample conversations so the surface is drivable
-        // before any transport exists. Deleted with the plaintext path at M1.
-        const seed_now = clock_shell.unixSeconds();
-        if (chat_core.openConversation(gpa, &gchat_store, "did:plc:dev-maya", "maya.zat4.com") catch null) |c| {
-            _ = chat_core.appendMessage(gpa, &gchat_store, c, .system, "conversation started", seed_now - 7300, false) catch {};
-            _ = chat_core.appendMessage(gpa, &gchat_store, c, .text, "hey — did the lighting pass land?", seed_now - 7200, false) catch {};
-            _ = chat_core.appendMessage(gpa, &gchat_store, c, .text, "It did. The letters catch the light now, and the whole field moves when you touch it.", seed_now - 7100, true) catch {};
-            _ = chat_core.appendMessage(gpa, &gchat_store, c, .text, "show me tonight?", seed_now - 300, false) catch {};
-        }
-        if (chat_core.openConversation(gpa, &gchat_store, "did:plc:dev-oko", "oko.zat") catch null) |c| {
-            _ = chat_core.appendMessage(gpa, &gchat_store, c, .text, "monospace is the most honest a feed can be", seed_now - 86_400, false) catch {};
-        }
-    }
-    // Zat Chat dev TRANSPORT (U5, dev-gated): real store-and-forward through
-    // the relay, still dev-plaintext (the honesty banner stays). Live only
-    // when ZAT4_RELAY=host:port and ZAT_RELAY_TOKEN are set; otherwise the
-    // surface stays the session-local sandbox above. A dead relay is a drain
-    // that comes up empty — never a dead screen (E2/E4).
+
+    // The real E2EE session (M1): the crypto state (anchor, keyPackage,
+    // per-conversation MLS groups) + the relay link that carries encrypted
+    // buckets. Live only when the relay endpoint is configured
+    // (ZAT4_RELAY=host:port + ZAT_RELAY_TOKEN); absent it, Messages shows an
+    // empty, honest surface (no fake seeds). A dead relay is an empty drain,
+    // never a dead screen (E2/E4). A short-lived arena serves the network
+    // legs (publish/fetch); the resident state is gpa-owned.
+    var gchat_arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer gchat_arena_state.deinit();
     var gchat_box: chat_relay.Mailbox = .{};
     defer gchat_box.deinit(gpa);
     var gchat_link: ?*chat_relay.ChatRelay = null;
     defer if (gchat_link) |link| chat_relay.shutdown(link);
+    var gchat_e2ee: ?chat_e2ee.State = null;
+    defer if (gchat_e2ee) |*st| chat_e2ee.deinit(gpa, st);
     var gchat_mail: std.ArrayList(chat_relay.Mail) = .empty;
     defer {
         for (gchat_mail.items) |m| chat_relay.freeMail(gpa, m);
@@ -557,35 +553,48 @@ pub fn run(
         if (environ) |env| {
             if (env.get("ZAT4_RELAY")) |hostport| {
                 const token = env.get("ZAT_RELAY_TOKEN") orelse "";
-                if (std.mem.lastIndexOfScalar(u8, hostport, ':')) |colon| {
-                    const rhost = hostport[0..colon];
-                    const rport = std.fmt.parseInt(u16, hostport[colon + 1 ..], 10) catch 0;
-                    if (rport != 0 and token.len > 0 and rhost.len > 0) {
-                        gchat_link = chat_relay.start(gpa, io, &gchat_box, rhost, rport, token, chat_relay.devMailboxId(session.did)) catch null;
+                const colon = std.mem.lastIndexOfScalar(u8, hostport, ':');
+                const rhost = if (colon) |c| hostport[0..c] else "";
+                const rport = if (colon) |c| std.fmt.parseInt(u16, hostport[c + 1 ..], 10) catch 0 else 0;
+                if (rport != 0 and token.len > 0 and rhost.len > 0) {
+                    // Bring up the crypto (publishes our keyPackage, restores
+                    // saved conversations), then the relay link subscribed to
+                    // our own inbox mailbox.
+                    _ = gchat_arena_state.reset(.retain_capacity);
+                    if (chat_e2ee.init(gpa, gchat_arena_state.allocator(), io, env, session)) |st| {
+                        gchat_e2ee = st;
+                        gchat_link = chat_relay.start(gpa, io, &gchat_box, rhost, rport, token, st.inbox) catch null;
+                        // Mirror restored conversations into the view store so
+                        // they show on launch.
+                        for (st.peer_dids.items) |did| {
+                            _ = chat_core.openConversation(gpa, &gchat_store, did, "") catch {};
+                        }
+                        if (gchat_link != null) {
+                            std.debug.print("[chat] E2EE up -> {s} ({d} conversation(s) restored)\n", .{ hostport, st.peer_dids.items.len });
+                        } else {
+                            std.debug.print("[chat] keyPackage published but the relay link did NOT start\n", .{});
+                        }
+                    } else |err| {
+                        std.debug.print("[chat] E2EE init failed: {s}\n", .{@errorName(err)});
                     }
-                }
-                // Startup diagnostics, the [gpu] pattern: the difference
-                // between "transport off" and "transport broken" must be one
-                // stderr line, not a debugging session.
-                if (gchat_link != null) {
-                    std.debug.print("[chat] relay link up -> {s} (dev transport)\n", .{hostport});
                 } else {
-                    std.debug.print("[chat] ZAT4_RELAY set but the link did NOT start (need host:port, ZAT_RELAY_TOKEN, or spawn failed)\n", .{});
+                    std.debug.print("[chat] ZAT4_RELAY malformed (need host:port) or ZAT_RELAY_TOKEN unset\n", .{});
                 }
-                // ZAT4_CHAT_PEER (dev): open a conversation with a REAL DID so
-                // a message can aim at a real mailbox (the seeds are fakes).
-                // "self" = your own DID — the one-window round-trip test: a
-                // send travels relay-out and arrives back as an incoming
-                // bubble. Real peer discovery is U6's keyPackage fetch.
-                if (gchat_link != null) {
-                    if (env.get("ZAT4_CHAT_PEER")) |peer_raw| {
-                        const peer = if (std.mem.eql(u8, peer_raw, "self")) session.did else peer_raw;
-                        if (peer.len > 0) {
-                            _ = chat_core.openConversation(gpa, &gchat_store, peer, "") catch {};
-                            std.debug.print("[chat] dev peer conversation open: {s}\n", .{peer});
+                // ZAT4_CHAT_PEER=<did>: start a REAL E2EE conversation with a
+                // peer (the entry point until a compose-new-conversation UI
+                // lands). Fetches their published keyPackage, builds the MLS
+                // group, sends the Welcome. Their reply completes the join.
+                if (gchat_e2ee) |*st| if (gchat_link) |link| {
+                    if (env.get("ZAT4_CHAT_PEER")) |peer_did| {
+                        if (peer_did.len > 0 and !chat_e2ee.hasConversation(st, peer_did)) {
+                            _ = gchat_arena_state.reset(.retain_capacity);
+                            if (chat_e2ee.startConversation(gpa, gchat_arena_state.allocator(), io, env, st, link, peer_did)) {
+                                _ = chat_core.openConversation(gpa, &gchat_store, peer_did, "") catch {};
+                                std.debug.print("[chat] conversation started with {s} (Welcome sent)\n", .{peer_did});
+                            } else |err| std.debug.print("[chat] could not start conversation with {s}: {s}\n", .{ peer_did, @errorName(err) });
                         }
                     }
-                }
+                };
             }
         }
     }
@@ -854,18 +863,34 @@ pub fn run(
             }
         }
 
-        // Drain the chat relay's mailbox (U5, dev transport): delivered
-        // buckets become counterparty messages in the one shared store —
-        // the surface repaints via the chat signature exactly as a local
-        // append does. Damaged or foreign buckets are skipped values (E4).
-        if (gchat_link != null) {
+        // Drain the chat relay's mailbox (M1): each delivered bucket is an
+        // MLS message the E2EE session routes — a decrypted application
+        // message becomes a counterparty bubble in the one shared store; a
+        // Welcome opens a new conversation (verified against the directory).
+        // Damaged/foreign buckets are skipped values, never a dead screen
+        // (E2/E4). The surface repaints via the chat signature exactly as a
+        // local append does.
+        if (gchat_link != null) if (gchat_e2ee) |*st| {
             gchat_mail.clearRetainingCapacity();
             try gchat_box.drain(gpa, &gchat_mail);
             for (gchat_mail.items) |m| {
                 switch (m) {
-                    .blob => |b| if (chat_relay.devUnpack(b)) |dm| {
-                        if (chat_core.openConversation(gpa, &gchat_store, dm.sender_did, "") catch null) |c| {
-                            _ = chat_core.appendMessage(gpa, &gchat_store, c, .text, dm.text, dm.created_at, false) catch {};
+                    .blob => |b| {
+                        _ = gchat_arena_state.reset(.retain_capacity);
+                        const inc = chat_e2ee.onBucket(gpa, gchat_arena_state.allocator(), io, environ, st, b) catch null;
+                        if (inc) |ev| {
+                            defer chat_e2ee.freeIncoming(gpa, ev);
+                            switch (ev) {
+                                .message => |msg| {
+                                    if (chat_core.openConversation(gpa, &gchat_store, msg.peer_did, "") catch null) |c| {
+                                        _ = chat_core.appendMessage(gpa, &gchat_store, c, msg.kind, msg.text, now, false) catch {};
+                                    }
+                                },
+                                .started => |s| {
+                                    _ = chat_core.openConversation(gpa, &gchat_store, s.peer_did, "") catch null;
+                                    status = "chat: new conversation";
+                                },
+                            }
                         }
                     },
                     .refused => status = "chat: relay refused the send",
@@ -875,7 +900,7 @@ pub fn run(
                 chat_relay.freeMail(gpa, m);
             }
             gchat_mail.clearRetainingCapacity();
-        }
+        };
 
         // Drain write-worker results (the non-blocking like/unlike/repost
         // replies). On OK, nothing to do — the optimistic state already
@@ -2167,7 +2192,7 @@ pub fn run(
                                         .chat_send => if (dev_chat) {
                                             if (gchat_draft_len > 0) if (gchat_sel) |sc| {
                                                 _ = chat_core.appendMessage(gpa, &gchat_store, sc, .text, gchat_draft_buf[0..gchat_draft_len], now, true) catch {};
-                                                devChatSend(gchat_link, &gchat_store, sc, session.did, gchat_draft_buf[0..gchat_draft_len], now);
+                                                chatSend(gpa, io, environ, if (gchat_e2ee) |*st| st else null, gchat_link, &gchat_store, sc, gchat_draft_buf[0..gchat_draft_len]);
                                                 gchat_draft_len = 0;
                                                 gchat_input_focus = true;
                                                 gscroll_px = 0;
@@ -2501,7 +2526,7 @@ pub fn run(
                     if (zc == '\r' or zc == '\n') {
                         if (gchat_draft_len > 0) if (gchat_sel) |sc| {
                             _ = chat_core.appendMessage(gpa, &gchat_store, sc, .text, gchat_draft_buf[0..gchat_draft_len], now, true) catch {};
-                            devChatSend(gchat_link, &gchat_store, sc, session.did, gchat_draft_buf[0..gchat_draft_len], now);
+                            chatSend(gpa, io, environ, if (gchat_e2ee) |*st| st else null, gchat_link, &gchat_store, sc, gchat_draft_buf[0..gchat_draft_len]);
                             gchat_draft_len = 0;
                             gscroll_px = 0; // re-anchor to the newest message
                         };
@@ -2985,16 +3010,16 @@ const ChatFrame = struct {
 /// conversation list, the open thread, the selected ordinal, and the peer
 /// label. Pure queries into the frame arena (C3); the ordinal is the value
 /// the surface's tap regions carry.
-/// U5 dev transport: pack the just-sent draft into a padded bucket and queue
-/// it for the counterparty's dev mailbox. A null link (no ZAT4_RELAY) keeps
-/// the send local, exactly the U3 sandbox; a full outbox or over-long text
-/// simply doesn't transmit (the local append already showed the message —
-/// dev-only looseness, deleted with the plaintext path at M1).
-fn devChatSend(link: ?*chat_relay.ChatRelay, cs: *const chat_core.Store, conv: chat_core.ConvIndex, my_did: []const u8, text: []const u8, now: i64) void {
+/// M1 send: encrypt the just-typed draft to the conversation's peer and
+/// deposit it on the relay (chat_e2ee owns the crypto + persistence). A null
+/// session/link (no ZAT4_RELAY) keeps the send local-only — the bubble still
+/// shows, it just doesn't transmit. A crypto/relay error is a status line,
+/// never a crash (E2). `env` feeds the persist-after-send.
+fn chatSend(gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, st: ?*chat_e2ee.State, link: ?*chat_relay.ChatRelay, cs: *const chat_core.Store, conv: chat_core.ConvIndex, text: []const u8) void {
+    const state = st orelse return;
     const l = link orelse return;
-    var bucket: [chat_relay.bucket_len]u8 = undefined;
-    chat_relay.devPack(&bucket, my_did, now, text) catch return;
-    chat_relay.deposit(l, chat_relay.devMailboxId(chat_core.conversationDid(cs, conv)), &bucket) catch {};
+    const peer_did = chat_core.conversationDid(cs, conv);
+    chat_e2ee.send(gpa, io, env, state, l, peer_did, .text, text) catch {};
 }
 
 fn buildChatFrame(arena: Allocator, cs: *const chat_core.Store, sel: ?chat_core.ConvIndex, now: i64) ChatFrame {

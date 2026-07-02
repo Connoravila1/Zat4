@@ -3459,14 +3459,17 @@ pub fn layoutChat(
     const top: i32 = if (m.wide) 40 else 30;
     _ = try str(gpa, dl, e, .semibold, x0, top + 30, ink, 30, "Messages");
 
-    // The honesty banner (ZAT_CHAT_ROADMAP §4 U3 / M1): until the E2EE core
-    // is live, this surface is a development plaintext path and says so.
+    // The honesty line (ZAT_CHAT_ROADMAP M1): the plaintext path is gone —
+    // messages are end-to-end encrypted (MLS over the relay). The claim is
+    // permitted now precisely because M1 is real; it names only what ships
+    // (content secrecy + PQ-hybrid + forward secrecy), never metadata
+    // privacy against a global observer — that stays [OPEN] (vision §8).
     const ban_y = top + 48;
-    const ban_h: i32 = 34;
-    try rect(gpa, dl, x0, ban_y, w, ban_h, 0x26F2762A, 10);
-    try rect(gpa, dl, x0, ban_y, 3, ban_h, 0xFFF2762A, 1);
-    const ban_pen = try str(gpa, dl, e, .semibold, x0 + 14, ban_y + 22, 0xFFF2B27A, 13, "UNENCRYPTED (DEV)");
-    _ = try str(gpa, dl, e, .regular, ban_pen + 10, ban_y + 22, muted, 13, "— messages travel in the clear until the encryption core lands");
+    const ban_h: i32 = 30;
+    try rect(gpa, dl, x0, ban_y, w, ban_h, skinPanel(accent), 10);
+    try rect(gpa, dl, x0, ban_y, 3, ban_h, (0xC0 << 24) | (accent & 0x00FFFFFF), 1);
+    const ban_pen = try str(gpa, dl, e, .semibold, x0 + 14, ban_y + 20, ink, 12, "End-to-end encrypted");
+    _ = try str(gpa, dl, e, .regular, ban_pen + 10, ban_y + 20, muted, 12, "— MLS, post-quantum hybrid, forward secrecy");
 
     // Pane split (the settings master–detail shape).
     const body_y = ban_y + ban_h + 18;
