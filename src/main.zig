@@ -43,6 +43,7 @@ const lexicon = @import("core/lexicon.zig");
 const anchor_core = @import("core/anchor.zig");
 const write = @import("shell/write.zig");
 const chat_keys = @import("shell/chat_keys.zig");
+const pay_addr = @import("shell/pay_addr.zig");
 const algorithm_shell = @import("shell/algorithm.zig");
 const builder = @import("core/builder.zig");
 const lens_catalog = @import("core/lens_catalog.zig");
@@ -148,6 +149,14 @@ pub fn main(init: std.process.Init) !void {
     // back through the public directory path and validates the whole chain
     // (anchor binding, suite, expiry, signatures) — the full U6 loop, headless.
     var chat_publish = false;
+    // Payment-address directory test (M5 A2): `--pay-publish <lightning|-> <bitcoin|->`
+    // validates the addresses (full checksums), publishes the anchor-signed
+    // app.zat4.pay.address record, then fetches it back the way a PAYER would
+    // (public getRecord + the core gate against the anchor key) — the full A2
+    // loop, headless. "-" leaves that rail unpublished.
+    var pay_publish_ln: ?[]const u8 = null;
+    var pay_publish_btc: ?[]const u8 = null;
+    var pay_publish = false;
     var ai: usize = 1;
     while (ai < args.len) : (ai += 1) {
         const arg = args[ai];
@@ -180,6 +189,13 @@ pub fn main(init: std.process.Init) !void {
             }
         } else if (std.mem.eql(u8, arg, "--chat-publish")) {
             chat_publish = true;
+        } else if (std.mem.eql(u8, arg, "--pay-publish")) {
+            if (ai + 2 < args.len) {
+                pay_publish_ln = args[ai + 1];
+                pay_publish_btc = args[ai + 2];
+                ai += 2;
+                pay_publish = true;
+            }
         } else if (std.mem.eql(u8, arg, "--tui")) {
             tui_mode = true;
         } else if (std.mem.eql(u8, arg, "--window")) {
@@ -446,7 +462,7 @@ pub fn main(init: std.process.Init) !void {
     // resulting at-uri/cid, and exit. This is the write-leg test: the record
     // lands in the user's OWN PDS under app.zat4.feed.post, from where the
     // firehose carries it to the Zat4 AppView.
-    if (post_text != null or follow_target != null or publish_algo_name != null or publish_discover or chat_publish) {
+    if (post_text != null or follow_target != null or publish_algo_name != null or publish_discover or chat_publish or pay_publish) {
         var from_cache = false;
         var session: auth.Session = undefined;
         if (env.get("ZAT_APP_PASSWORD")) |password| {
@@ -507,6 +523,54 @@ pub fn main(init: std.process.Init) !void {
                 , .{ pub_hex, peer.kp_bytes.len });
             } else {
                 try out.print("[chat] fetch-back found NO record — publish did not land\n", .{});
+            }
+            try out.flush();
+        }
+
+        // The payment-address leg (M5 A2): publish this account's anchor-signed
+        // payment addresses, then fetch them back the way a PAYER would (public
+        // getRecord on the DID's own PDS + the core gate against the anchor key
+        // — here our own, standing in for the one a payer's conversation pins).
+        if (pay_publish) {
+            const ln = if (std.mem.eql(u8, pay_publish_ln.?, "-")) "" else pay_publish_ln.?;
+            const btc = if (std.mem.eql(u8, pay_publish_btc.?, "-")) "" else pay_publish_btc.?;
+            const pub_result = pay_addr.publish(gpa, arena, io, env, &session, ln, btc) catch |err| {
+                try out.print("--pay-publish failed: {s}\n", .{@errorName(err)});
+                try out.flush();
+                return err;
+            };
+            try out.print(
+                \\[pay] address record PUBLISHED
+                \\[pay]   uri: {s}
+                \\[pay]   cid: {s}
+                \\
+            , .{ pub_result.uri, pub_result.cid });
+            try out.flush();
+
+            var own = cache_shell.loadOrCreateAnchorSeed(gpa, io, env, session.did) orelse {
+                try out.print("[pay] fetch-back skipped: no anchor available\n", .{});
+                try out.flush();
+                return error.NoAnchor;
+            };
+            defer std.crypto.secureZero(u8, &own.seed);
+            const own_pub = try anchor_core.publicKey(own.seed);
+            const fetched = pay_addr.fetchPayee(gpa, arena, io, env, session.did, own_pub) catch |err| {
+                try out.print("[pay] fetch-back FAILED: {s}\n", .{@errorName(err)});
+                try out.flush();
+                return err;
+            };
+            if (fetched) |payee| {
+                try out.print(
+                    \\[pay] fetch-back VALID — the address chain holds:
+                    \\[pay]   lightning: {s}
+                    \\[pay]   bitcoin:   {s}
+                    \\
+                , .{
+                    if (payee.lightning.len > 0) payee.lightning else "(not offered)",
+                    if (payee.bitcoin.len > 0) payee.bitcoin else "(not offered)",
+                });
+            } else {
+                try out.print("[pay] fetch-back found NO record — publish did not land\n", .{});
             }
             try out.flush();
         }
@@ -746,6 +810,7 @@ test {
     _ = @import("core/keydir.zig");
     _ = @import("shell/chat_relay.zig");
     _ = @import("shell/chat_keys.zig");
+    _ = @import("shell/pay_addr.zig");
     _ = @import("shell/chat_e2ee.zig");
     _ = @import("core/oauth.zig");
     _ = @import("core/oauth_flow.zig");
@@ -766,6 +831,7 @@ test {
     _ = @import("core/feed.zig");
     _ = @import("core/chat.zig");
     _ = @import("core/chat_view.zig");
+    _ = @import("core/payaddr.zig");
     _ = @import("core/discover.zig");
     _ = @import("core/algorithm.zig");
     _ = @import("core/learner.zig");

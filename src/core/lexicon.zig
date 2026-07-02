@@ -160,6 +160,11 @@ pub const collection = struct {
     /// keyPackage — the key-directory entry, a singleton (rkey "self").
     /// Messages themselves never enter the repo.
     pub const chat_key_package = "app.zat4.chat.keyPackage";
+    /// The payment-address directory entry (PART II §3, slice A2): where
+    /// this DID accepts Bitcoin — lightning and/or on-chain — anchor-signed
+    /// so a PDS can't swap addresses. A singleton (rkey "self"). Payment
+    /// MESSAGES ride the E2EE channel and never enter the repo.
+    pub const pay_address = "app.zat4.pay.address";
 };
 
 /// How a DID became a Zat4 member — a new Zat4 account on our PDS (with a Zat4
