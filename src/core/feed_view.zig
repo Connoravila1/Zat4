@@ -157,7 +157,7 @@ pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_pr
 /// the body (the screen title), so the two never drift.
 /// Rail destinations. Slot 4 is "Algorithms" (the loadout page) — it took the
 /// old Profile slot, since the bottom-left "you" card already opens Profile.
-pub const nav_labels = [_][]const u8{ "Home", "Zones", "Activity", "Messages", "Algorithms", "Settings" };
+pub const nav_labels = [_][]const u8{ "Home", "Zones", "Activity", "Zat Chat", "Algorithms", "Settings" };
 
 /// Named screen indices. The rail nav posts its index as the screen; slots
 /// rendered as real surfaces (home, loadout) have their own branch, the rest
@@ -1072,8 +1072,8 @@ fn drawRail(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, rx: i32
 
     // Visual ORDER of the nav rows (each row's `idx` is still its Screen — the
     // region/icon/active mapping is unchanged; only the on-screen order differs).
-    // Algorithms (4) sits under Zones (1).
-    const nav_order = [_]usize{ 0, 1, 4, 2, 3, 5 };
+    // Algorithms (4) sits under Zones (1); Zat Chat (3) above Activity (2).
+    const nav_order = [_]usize{ 0, 1, 4, 3, 2, 5 };
     var ny: i32 = 108;
     for (nav_order) |idx| {
         const label = nav_labels[idx];
@@ -3545,7 +3545,7 @@ pub fn layoutChat(
     const x0 = m.lx;
     const w = m.cw;
     const top: i32 = if (m.wide) 40 else 30;
-    _ = try str(gpa, dl, e, .semibold, x0, top + 30, ink, 30, "Messages");
+    _ = try str(gpa, dl, e, .semibold, x0, top + 30, ink, 30, "Zat Chat");
 
     // "+ New" — the new-conversation pill, right-aligned on the title line.
     // Accent-filled while the recipient bar is open (the toggle reads).
@@ -3728,7 +3728,13 @@ pub fn layoutChat(
         if (thread[thread.len - 1].stamp) slot_last += stamp_h;
         shift = @intFromFloat(@round(@as(f32, @floatFromInt(slot_last)) * (1.0 - fly_c)));
     }
-    var y = @max(thread_top, thread_bot - total) + scroll;
+    // Bottom-anchor ALWAYS. Once history outgrows the pane,
+    // `thread_bot - total` goes above thread_top and the oldest rows
+    // top-clip — that is correct. The old `@max(thread_top, …)` clamp
+    // silently TOP-anchored an overflowing thread instead, hiding the
+    // NEWEST messages below the composer (the owner's field bug: sends
+    // showed in the list preview but not in the thread).
+    var y = thread_bot - total + scroll;
     for (thread, bh, 0..) |b, hh, idx| {
         const is_fly = flying and idx + 1 == thread.len;
         const row_shift: i32 = if (flying and !is_fly) shift else 0;
