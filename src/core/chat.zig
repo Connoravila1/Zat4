@@ -45,12 +45,25 @@ pub const MsgIndex = enum(u32) { _ };
 /// The message-kind vocabulary, defined ONCE and in full so later features
 /// land as one more kind with zero schema migration (D6). Reserved values
 /// (ZAT_CHAT_ROADMAP §5): 2..15 chat extensions (attachments, reactions,
-/// replies), 16..19 the payment card (ZAT5_PAYMENTS §8, milestone M5).
-/// Until those slices exist, `parseKind` rejects their bytes (E3).
+/// replies). 16/17 are the payment CARD kinds (M5 slice A1): one card per
+/// payment that morphs in place — its live state is the payment row's
+/// `status`, never a second bubble. The settlement wire bytes 18/19 flip an
+/// existing card and are never stored (see `kind_pay_settled_wire`).
+/// Unbuilt bytes stay rejected by `parseKind` (E3).
 pub const Kind = enum(u8) {
     text = 0,
     system = 1,
+    /// A payment card asking the counterparty for an amount (starts
+    /// `requested`; its ChatMsg text is the optional note).
+    payment_request = 16,
+    /// A payment card announcing an initiated payment (starts `broadcast`).
+    payment_sent = 17,
 };
+
+/// True for the kinds that carry a parallel payment row (card ⇔ row, A1).
+pub fn isPaymentKind(kind: Kind) bool {
+    return kind == .payment_request or kind == .payment_sent;
+}
 
 /// The typing-indicator ping's WIRE kind byte (from the reserved chat-
 /// extension range 2..15). Ephemeral by construction: it rides the same
@@ -59,6 +72,15 @@ pub const Kind = enum(u8) {
 /// layer and NEVER enters the store, so `parseKind` keeps rejecting it —
 /// a typing ping that somehow reached a history blob is damage, not data.
 pub const kind_typing_wire: u8 = 2;
+
+/// The settlement-event WIRE bytes (the reserved 18/19). Like the typing
+/// ping they never enter the store as messages — `parseKind` keeps
+/// rejecting them — but unlike it they are not ephemeral: the session layer
+/// correlates the frame's payment_id to an existing card and advances that
+/// card's `status` (settled/failed), which M2 then persists. One card per
+/// payment, morphing in place; never a fifth bubble.
+pub const kind_pay_settled_wire: u8 = 18;
+pub const kind_pay_failed_wire: u8 = 19;
 
 pub const KindError = error{UnknownKind};
 
@@ -69,6 +91,8 @@ pub fn parseKind(byte: u8) KindError!Kind {
     return switch (byte) {
         0 => .text,
         1 => .system,
+        16 => .payment_request,
+        17 => .payment_sent,
         else => error.UnknownKind,
     };
 }
@@ -115,6 +139,106 @@ pub const Conversation = struct {
 };
 
 // ---------------------------------------------------------------------------
+// Payments (M5 slice A1) — plain-data rows parallel to the message array.
+// A payment is one ChatMsg (kind payment_request/payment_sent; created_at,
+// the note as its text span, the conversation, and the direction bit all
+// live THERE and are never duplicated) plus one PaymentRow carrying what a
+// text bubble lacks. The txid / payment hash is colder still and lives out
+// of band in `SettlementRef` (A6). ZAT_CHAT_ROADMAP PART II §8.
+// ---------------------------------------------------------------------------
+
+/// Index into `Store.payments`.
+pub const PayIndex = enum(u32) { _ };
+
+/// The two co-equal rails (PART II §1). They differ only in how settlement
+/// is proven — a preimage (lightning) vs. watched confirmation depth
+/// (onchain); the rail is one field on the card and nothing else forks.
+pub const Rail = enum(u8) { lightning = 0, onchain = 1 };
+
+/// A card's live state. `requested`/`pending` are pre-money, `broadcast`/
+/// `confirming` are in flight, `settled`/`failed` are terminal. Transitions
+/// are monotonic (`advancePayment`) — a card never un-settles.
+pub const PayStatus = enum(u8) {
+    requested = 0,
+    pending = 1,
+    broadcast = 2,
+    confirming = 3,
+    settled = 4,
+    failed = 5,
+};
+
+pub fn isTerminalStatus(s: PayStatus) bool {
+    return s == .settled or s == .failed;
+}
+
+/// Forward-only ordering for `advancePayment`; both terminals rank last.
+fn statusRank(s: PayStatus) u8 {
+    return switch (s) {
+        .requested => 0,
+        .pending => 1,
+        .broadcast => 2,
+        .confirming => 3,
+        .settled, .failed => 4,
+    };
+}
+
+/// Every sat that will ever exist (21e6 BTC × 1e8). An amount of zero or
+/// above this is malformed on its face — rejected at the wire (E3).
+pub const max_amount_sat: u64 = 2_100_000_000_000_000;
+
+/// The on-chain depth at which a card settles (the six-block animation's
+/// last block; PART II §4).
+pub const settle_depth: u8 = 6;
+
+/// The hot payment row, parallel to a payment-kind ChatMsg (card ⇔ row is a
+/// store invariant, enforced at append and at restore).
+pub const PaymentRow = struct {
+    /// Wire correlation id, minted nonzero by the initiating side (the
+    /// shell's randomness — a value here, so this stays pure, B4). Trusted
+    /// only within its conversation (`findPayment`).
+    payment_id: u64,
+    /// Sats on both rails (msat precision deliberately not modeled: the
+    /// card's unit is the sat; a wallet may settle finer, we display sats).
+    amount_sat: u64,
+    /// The card this row details — a within-module back-ref (A4); it never
+    /// crosses out of chat.zig (A5).
+    msg: MsgIndex,
+    rail: Rail,
+    status: PayStatus,
+    /// Watched on-chain depth (drives the six-block animation); 0 for
+    /// lightning, saturating at 255.
+    confirmations: u8,
+
+    comptime {
+        // Budget 24: 2×8 (u64) + 4 (msg) + 3×1 = 23 bytes of payload,
+        // padded to u64 alignment. Same SoA note as ChatMsg. (A7; raising
+        // this requires A7.1 justification.)
+        assert(@sizeOf(PaymentRow) == 24);
+    }
+};
+
+/// Settlement detail, out of band from the hot card (A6): the on-chain txid
+/// or the lightning payment hash — both exactly 32 bytes, so one fixed
+/// field serves both rails. Consulted when a card is watched or tapped,
+/// never in the per-frame render scan.
+pub const SettlementRef = struct {
+    /// The payment row this belongs to. The roadmap sketch keyed this by
+    /// payment_id ("a stable id, not a bare index across modules") — that
+    /// concern is CROSS-module; both tables live here, so the within-module
+    /// index is lawful (A4) and immune to a peer replaying someone else's
+    /// id. The wire still correlates by payment_id.
+    pay: PayIndex,
+    /// txid (onchain) / payment hash (lightning). Never all-zero — zero
+    /// means "none yet", and "none yet" is the absence of a row.
+    ref: [32]u8,
+
+    comptime {
+        // Budget 36: 4 + 32, u32 alignment, no padding. (A7)
+        assert(@sizeOf(SettlementRef) == 36);
+    }
+};
+
+// ---------------------------------------------------------------------------
 // The store — the chat subsystem's resident state
 // ---------------------------------------------------------------------------
 
@@ -142,6 +266,10 @@ pub const Store = struct {
     /// Direction bit, parallel to `msgs` (A6): set = authored by THIS
     /// account, clear = authored by the counterparty.
     mine: std.DynamicBitSetUnmanaged = .{},
+    /// One row per payment card (card ⇔ row; M5 A1).
+    payments: std.MultiArrayList(PaymentRow) = .empty,
+    /// Cold settlement detail, at most one row per payment (A6).
+    settlements: std.MultiArrayList(SettlementRef) = .empty,
 };
 
 /// Release everything the store owns (C4: this subsystem frees its own
@@ -152,6 +280,8 @@ pub fn deinitStore(gpa: Allocator, store: *Store) void {
     store.msgs.deinit(gpa);
     store.conv_by_did.deinit(gpa);
     store.mine.deinit(gpa);
+    store.payments.deinit(gpa);
+    store.settlements.deinit(gpa);
     store.* = undefined;
 }
 
@@ -232,8 +362,22 @@ pub fn openConversation(
 /// Append one message to a conversation. Bumps the conversation's activity
 /// clock and, for a counterparty message, its unread count. `mine` is a
 /// parameter, not a stored bool field — it lands in the out-of-band bitset
-/// (A6).
+/// (A6). Payment kinds must go through `appendPayment` so the card ⇔ row
+/// invariant can never break.
 pub fn appendMessage(
+    gpa: Allocator,
+    store: *Store,
+    conv: ConvIndex,
+    kind: Kind,
+    text: []const u8,
+    created_at: i64,
+    mine: bool,
+) error{OutOfMemory}!MsgIndex {
+    assert(!isPaymentKind(kind));
+    return appendRecord(gpa, store, conv, kind, text, created_at, mine);
+}
+
+fn appendRecord(
     gpa: Allocator,
     store: *Store,
     conv: ConvIndex,
@@ -265,6 +409,234 @@ pub fn appendMessage(
 /// The reader has seen this conversation; its unread count returns to zero.
 pub fn markRead(store: *Store, conv: ConvIndex) void {
     store.convs.slice().items(.unread)[@intFromEnum(conv)] = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Payment mutation — the card ⇔ row pair, and the monotonic state machine
+// ---------------------------------------------------------------------------
+
+/// Append one payment CARD: a ChatMsg (its text is the optional note) plus
+/// its parallel payment row, created together so card ⇔ row never breaks —
+/// the row's capacity is reserved BEFORE the message lands, so an OOM can
+/// never leave a card without its row. Initial status comes from the kind:
+/// a request starts `requested`, a sent card starts `broadcast` (the
+/// payer's wallet already took it). The caller guarantees `payment_id` is
+/// nonzero, unique in the conversation, and the amount is in range — wire
+/// input satisfies this via `parsePaymentFrame` (E3); local input by
+/// construction.
+pub fn appendPayment(
+    gpa: Allocator,
+    store: *Store,
+    conv: ConvIndex,
+    kind: Kind,
+    payment_id: u64,
+    rail: Rail,
+    amount_sat: u64,
+    note: []const u8,
+    created_at: i64,
+    mine: bool,
+) error{OutOfMemory}!PayIndex {
+    assert(isPaymentKind(kind));
+    assert(payment_id != 0);
+    assert(amount_sat >= 1 and amount_sat <= max_amount_sat);
+    assert(findPayment(store, conv, payment_id) == null);
+    try store.payments.ensureUnusedCapacity(gpa, 1);
+    const msg = try appendRecord(gpa, store, conv, kind, note, created_at, mine);
+    const index: u32 = @intCast(store.payments.len);
+    store.payments.appendAssumeCapacity(.{
+        .payment_id = payment_id,
+        .amount_sat = amount_sat,
+        .msg = msg,
+        .rail = rail,
+        .status = if (kind == .payment_request) .requested else .broadcast,
+        .confirmations = 0,
+    });
+    return @enumFromInt(index);
+}
+
+/// The payment row a wire event addresses, matched by (conversation,
+/// payment_id) — an id is trusted only within its own conversation, so a
+/// peer replaying an id seen elsewhere reaches nothing. Linear scan:
+/// payments per store are few, and this runs per event, not per frame (G3).
+pub fn findPayment(store: *const Store, conv: ConvIndex, payment_id: u64) ?PayIndex {
+    const ids = store.payments.items(.payment_id);
+    const msg_col = store.payments.items(.msg);
+    const conv_col = store.msgs.items(.conv);
+    for (ids, msg_col, 0..) |id, mi, i| {
+        if (id == payment_id and conv_col[@intFromEnum(mi)] == conv)
+            return @enumFromInt(i);
+    }
+    return null;
+}
+
+/// The payment row behind a card's ChatMsg (the view resolves bubbles this
+/// way). Same linear-scan posture as `findPayment`.
+pub fn paymentByMsg(store: *const Store, msg: MsgIndex) ?PayIndex {
+    for (store.payments.items(.msg), 0..) |mi, i| {
+        if (mi == msg) return @enumFromInt(i);
+    }
+    return null;
+}
+
+/// Advance a card's status — from a wire event or a local hand-off result.
+/// Monotonic and terminal-absorbing (E4): a terminal card ignores
+/// everything (duplicates and stragglers are no-ops, never corruption); a
+/// non-terminal card accepts either terminal at any time and a forward step
+/// otherwise. A provided `ref` attaches first-wins — a wire event can never
+/// rewrite an already-recorded txid/hash (local re-broadcast goes through
+/// `setSettlementRef` directly, which replaces). Returns whether anything
+/// changed, so the shell persists only on change.
+pub fn advancePayment(
+    gpa: Allocator,
+    store: *Store,
+    pay: PayIndex,
+    to: PayStatus,
+    ref: ?[32]u8,
+) error{OutOfMemory}!bool {
+    const p = @intFromEnum(pay);
+    const status_col = store.payments.items(.status);
+    if (isTerminalStatus(status_col[p])) return false;
+    var changed = false;
+    if (isTerminalStatus(to) or statusRank(to) > statusRank(status_col[p])) {
+        status_col[p] = to;
+        changed = true;
+    }
+    if (ref) |r| {
+        if (settlementRef(store, pay) == null) {
+            try setSettlementRef(gpa, store, pay, r);
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+/// Record the watched on-chain depth (slice A5 feeds this; the view maps
+/// depth → filled blocks). Depth only moves forward; `settle_depth` settles
+/// the card, anything shallower marks it confirming. Terminal cards absorb
+/// (E4). On-chain only — a lightning card has no depth to watch.
+pub fn setConfirmations(store: *Store, pay: PayIndex, depth: u8) bool {
+    const p = @intFromEnum(pay);
+    assert(store.payments.items(.rail)[p] == .onchain);
+    const status_col = store.payments.items(.status);
+    const conf_col = store.payments.items(.confirmations);
+    if (isTerminalStatus(status_col[p])) return false;
+    var changed = false;
+    if (depth > conf_col[p]) {
+        conf_col[p] = depth;
+        changed = true;
+    }
+    const next: PayStatus = if (depth >= settle_depth)
+        .settled
+    else if (depth >= 1)
+        .confirming
+    else
+        status_col[p];
+    if (next != status_col[p] and statusRank(next) > statusRank(status_col[p])) {
+        status_col[p] = next;
+        changed = true;
+    }
+    return changed;
+}
+
+/// Attach (or replace) a card's settlement detail — the upsert primitive;
+/// wire-event policy (first-wins) lives in `advancePayment`. A ref is never
+/// all-zero (zero means "none yet", and that is the absence of a row).
+pub fn setSettlementRef(
+    gpa: Allocator,
+    store: *Store,
+    pay: PayIndex,
+    ref: [32]u8,
+) error{OutOfMemory}!void {
+    assert(!std.mem.allEqual(u8, &ref, 0));
+    for (store.settlements.items(.pay), 0..) |p, i| {
+        if (p == pay) {
+            store.settlements.items(.ref)[i] = ref;
+            return;
+        }
+    }
+    try store.settlements.append(gpa, .{ .pay = pay, .ref = ref });
+}
+
+/// The card's txid / payment hash, when one has been recorded.
+pub fn settlementRef(store: *const Store, pay: PayIndex) ?[32]u8 {
+    for (store.settlements.items(.pay), 0..) |p, i| {
+        if (p == pay) return store.settlements.items(.ref)[i];
+    }
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// The payment wire frame (pure) — what rides after the kind byte for every
+// payment wire byte (16..19). One fixed shape for all four: the card kinds
+// (16/17) create or advance a card; the event bytes (18/19) correlate by
+// payment_id and settle/fail it. Strict little-endian, exact header,
+// explicit errors on parse (E3).
+//
+//   [payment_id u64][amount_sat u64][ref 32B, all-zero = absent][rail u8][note …]
+// ---------------------------------------------------------------------------
+
+/// Frame bytes before the note (the note is everything after).
+pub const payment_frame_min: usize = 49;
+
+pub const zero_ref: [32]u8 = @splat(0);
+
+/// A parsed (or to-build) frame. The note is borrowed from the parse buffer
+/// / the caller (C3-style: the receiver copies what it keeps).
+pub const PaymentFrame = struct {
+    payment_id: u64,
+    amount_sat: u64,
+    /// Borrowed; empty is legal (the note is optional).
+    note: []const u8,
+    /// txid (onchain) / payment hash (lightning); all-zero = none.
+    ref: [32]u8,
+    rail: Rail,
+
+    comptime {
+        // Budget 72: 2×8 + 16 (slice) + 32 + 1 = 65 bytes of payload,
+        // padded to pointer alignment. Transient, but it rides the receive
+        // path — guarded (A7).
+        assert(@sizeOf(PaymentFrame) == 72);
+    }
+};
+
+pub const FrameError = error{Malformed};
+
+/// Serialize a frame into `buf` (no allocation — the shell composes it
+/// straight into the plaintext it encrypts). Asserts validity: the builder
+/// is ours; hostile bytes exist only on parse.
+pub fn buildPaymentFrame(buf: []u8, frame: PaymentFrame) []const u8 {
+    assert(frame.payment_id != 0);
+    assert(frame.amount_sat >= 1 and frame.amount_sat <= max_amount_sat);
+    assert(buf.len >= payment_frame_min + frame.note.len);
+    std.mem.writeInt(u64, buf[0..8], frame.payment_id, .little);
+    std.mem.writeInt(u64, buf[8..16], frame.amount_sat, .little);
+    @memcpy(buf[16..48], &frame.ref);
+    buf[48] = @intFromEnum(frame.rail);
+    @memcpy(buf[payment_frame_min..][0..frame.note.len], frame.note);
+    return buf[0 .. payment_frame_min + frame.note.len];
+}
+
+/// Parse a wire frame — hostile input; every violation is an explicit
+/// error, never a coerced value (E3).
+pub fn parsePaymentFrame(bytes: []const u8) FrameError!PaymentFrame {
+    if (bytes.len < payment_frame_min) return error.Malformed;
+    const id = std.mem.readInt(u64, bytes[0..8], .little);
+    const amount = std.mem.readInt(u64, bytes[8..16], .little);
+    if (id == 0 or amount == 0 or amount > max_amount_sat) return error.Malformed;
+    const rail: Rail = switch (bytes[48]) {
+        0 => .lightning,
+        1 => .onchain,
+        else => return error.Malformed,
+    };
+    var ref: [32]u8 = undefined;
+    @memcpy(&ref, bytes[16..48]);
+    return .{
+        .payment_id = id,
+        .amount_sat = amount,
+        .note = bytes[payment_frame_min..],
+        .ref = ref,
+        .rail = rail,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -337,9 +709,15 @@ pub fn threadSlice(
 // ---------------------------------------------------------------------------
 
 const codec_magic = [4]u8{ 'Z', 'A', 'T', 'H' };
-const codec_version: u16 = 1;
+/// Version 2 (M5 A1) appends the payments + settlements sections. Version-1
+/// blobs (pre-payments history) are still READ — their sections are simply
+/// empty — so an existing transcript survives the upgrade; writes are
+/// always version 2.
+const codec_version: u16 = 2;
 const conv_rec_len = 28; // did span 8 + handle span 8 + i64 8 + u32 4
 const msg_rec_len = 21; // i64 8 + text span 8 + conv 4 + kind 1
+const pay_rec_len = 23; // id 8 + amount 8 + msg 4 + rail 1 + status 1 + conf 1
+const ref_rec_len = 36; // pay 4 + ref 32
 
 pub const DeserializeError = error{ Malformed, OutOfMemory };
 
@@ -349,10 +727,14 @@ pub fn serializeStore(gpa: Allocator, store: *const Store) error{OutOfMemory}![]
     const s_len = store.string_bytes.items.len;
     const c_count = store.convs.len;
     const m_count = store.msgs.len;
+    const p_count = store.payments.len;
+    const r_count = store.settlements.len;
     const total = 4 + 2 + 4 + s_len +
         4 + c_count * conv_rec_len +
         4 + m_count * msg_rec_len +
-        (m_count + 7) / 8;
+        (m_count + 7) / 8 +
+        4 + p_count * pay_rec_len +
+        4 + r_count * ref_rec_len;
     const out = try gpa.alloc(u8, total);
     errdefer gpa.free(out);
 
@@ -402,12 +784,35 @@ pub fn serializeStore(gpa: Allocator, store: *const Store) error{OutOfMemory}![]
 
     // Direction bits, LSB-first within each byte; unused high bits stay zero
     // so the encoding is canonical.
-    const mine_bytes = out[at..];
+    const mine_bytes = out[at..][0 .. (m_count + 7) / 8];
     @memset(mine_bytes, 0);
     for (0..m_count) |i| {
         if (store.mine.isSet(i)) mine_bytes[i / 8] |= @as(u8, 1) << @intCast(i % 8);
     }
     at += (m_count + 7) / 8;
+
+    // Payments + settlements (v2 sections).
+    std.mem.writeInt(u32, out[at..][0..4], @intCast(p_count), .little);
+    at += 4;
+    const pays = store.payments.slice();
+    for (0..p_count) |i| {
+        std.mem.writeInt(u64, out[at..][0..8], pays.items(.payment_id)[i], .little);
+        std.mem.writeInt(u64, out[at + 8 ..][0..8], pays.items(.amount_sat)[i], .little);
+        std.mem.writeInt(u32, out[at + 16 ..][0..4], @intFromEnum(pays.items(.msg)[i]), .little);
+        out[at + 20] = @intFromEnum(pays.items(.rail)[i]);
+        out[at + 21] = @intFromEnum(pays.items(.status)[i]);
+        out[at + 22] = pays.items(.confirmations)[i];
+        at += pay_rec_len;
+    }
+
+    std.mem.writeInt(u32, out[at..][0..4], @intCast(r_count), .little);
+    at += 4;
+    const refs = store.settlements.slice();
+    for (0..r_count) |i| {
+        std.mem.writeInt(u32, out[at..][0..4], @intFromEnum(refs.items(.pay)[i]), .little);
+        @memcpy(out[at + 4 ..][0..32], &refs.items(.ref)[i]);
+        at += ref_rec_len;
+    }
     assert(at == total);
     return out;
 }
@@ -432,7 +837,8 @@ pub fn deserializeStore(gpa: Allocator, bytes: []const u8) DeserializeError!Stor
     errdefer deinitStore(gpa, &store);
 
     if (bytes.len < 10 or !std.mem.eql(u8, bytes[0..4], &codec_magic)) return error.Malformed;
-    if (std.mem.readInt(u16, bytes[4..6], .little) != codec_version) return error.Malformed;
+    const version = std.mem.readInt(u16, bytes[4..6], .little);
+    if (version != 1 and version != 2) return error.Malformed;
     const s_len = std.mem.readInt(u32, bytes[6..10], .little);
     var at: usize = 10;
     if (bytes.len - at < s_len) return error.Malformed;
@@ -499,7 +905,7 @@ pub fn deserializeStore(gpa: Allocator, bytes: []const u8) DeserializeError!Stor
     }
 
     const mine_len = (@as(usize, m_count) + 7) / 8;
-    if (bytes.len - at != mine_len) return error.Malformed; // exact tail — no trailing bytes
+    if (bytes.len - at < mine_len) return error.Malformed;
     try store.mine.resize(gpa, m_count, false);
     for (0..m_count) |i| {
         const bit = (bytes[at + i / 8] >> @intCast(i % 8)) & 1;
@@ -510,6 +916,87 @@ pub fn deserializeStore(gpa: Allocator, bytes: []const u8) DeserializeError!Stor
         const used: u3 = @intCast(m_count % 8);
         if ((bytes[at + mine_len - 1] >> used) != 0) return error.Malformed;
     }
+    at += mine_len;
+
+    // Payments + settlements (v2 sections; a v1 blob simply has none).
+    // Card ⇔ row is validated as a bijection: every row names a payment
+    // card, no card is named twice, and — checked below for BOTH versions —
+    // no payment card is left without its row (a v1 blob can therefore
+    // never smuggle a payment kind in).
+    var claimed: std.DynamicBitSetUnmanaged = .{};
+    defer claimed.deinit(gpa);
+    try claimed.resize(gpa, m_count, false);
+    if (version >= 2) {
+        if (bytes.len - at < 4) return error.Malformed;
+        const p_count = std.mem.readInt(u32, bytes[at..][0..4], .little);
+        at += 4;
+        if (@as(u64, p_count) * pay_rec_len > bytes.len - at) return error.Malformed;
+        try store.payments.setCapacity(gpa, p_count);
+        for (0..p_count) |_| {
+            var row: PaymentRow = undefined;
+            row.payment_id = std.mem.readInt(u64, bytes[at..][0..8], .little);
+            row.amount_sat = std.mem.readInt(u64, bytes[at + 8 ..][0..8], .little);
+            const msg_raw = std.mem.readInt(u32, bytes[at + 16 ..][0..4], .little);
+            row.rail = switch (bytes[at + 20]) {
+                0 => .lightning,
+                1 => .onchain,
+                else => return error.Malformed,
+            };
+            row.status = switch (bytes[at + 21]) {
+                0 => .requested,
+                1 => .pending,
+                2 => .broadcast,
+                3 => .confirming,
+                4 => .settled,
+                5 => .failed,
+                else => return error.Malformed,
+            };
+            row.confirmations = bytes[at + 22];
+            at += pay_rec_len;
+            if (row.payment_id == 0) return error.Malformed;
+            if (row.amount_sat == 0 or row.amount_sat > max_amount_sat) return error.Malformed;
+            if (msg_raw >= m_count) return error.Malformed;
+            if (!isPaymentKind(store.msgs.items(.kind)[msg_raw])) return error.Malformed;
+            if (claimed.isSet(msg_raw)) return error.Malformed;
+            claimed.set(msg_raw);
+            row.msg = @enumFromInt(msg_raw);
+            // (conversation, payment_id) is the correlation key findPayment
+            // trusts — it must be unique.
+            const conv_of = store.msgs.items(.conv)[msg_raw];
+            for (store.payments.items(.payment_id), store.payments.items(.msg)) |other_id, other_msg| {
+                if (other_id == row.payment_id and
+                    store.msgs.items(.conv)[@intFromEnum(other_msg)] == conv_of)
+                    return error.Malformed;
+            }
+            store.payments.appendAssumeCapacity(row);
+        }
+    }
+    for (0..m_count) |i| {
+        if (isPaymentKind(store.msgs.items(.kind)[i]) and !claimed.isSet(i)) return error.Malformed;
+    }
+
+    if (version >= 2) {
+        if (bytes.len - at < 4) return error.Malformed;
+        const r_count = std.mem.readInt(u32, bytes[at..][0..4], .little);
+        at += 4;
+        if (@as(u64, r_count) * ref_rec_len > bytes.len - at) return error.Malformed;
+        try store.settlements.setCapacity(gpa, r_count);
+        for (0..r_count) |_| {
+            const pay_raw = std.mem.readInt(u32, bytes[at..][0..4], .little);
+            var ref: [32]u8 = undefined;
+            @memcpy(&ref, bytes[at + 4 ..][0..32]);
+            at += ref_rec_len;
+            if (pay_raw >= store.payments.len) return error.Malformed;
+            if (std.mem.allEqual(u8, &ref, 0)) return error.Malformed; // zero = absent = no row
+            // At most one ref per payment.
+            for (store.settlements.items(.pay)) |p| {
+                if (@intFromEnum(p) == pay_raw) return error.Malformed;
+            }
+            store.settlements.appendAssumeCapacity(.{ .pay = @enumFromInt(pay_raw), .ref = ref });
+        }
+    }
+
+    if (at != bytes.len) return error.Malformed; // exact tail — no trailing bytes
     return store;
 }
 
@@ -735,8 +1222,15 @@ test "store codec: every class of damage is refused, never half-restored" {
     try expectBad(gpa, bad);
     @memcpy(bad, good);
 
-    // A non-canonical direction byte (unused high bit set; 3 messages).
-    bad[good.len - 1] |= 0x80;
+    // A non-canonical direction byte (unused high bit set; 3 messages, so
+    // the direction byte sits before the two empty v2 section counts).
+    bad[good.len - 9] |= 0x80;
+    try expectBad(gpa, bad);
+    @memcpy(bad, good);
+
+    // A payment-kind byte on a message with no payment row (the card ⇔ row
+    // bijection refuses a rowless card).
+    bad[msgs_at + 20] = 16;
     try expectBad(gpa, bad);
 }
 
@@ -745,8 +1239,278 @@ test "parseKind accepts the built vocabulary and rejects reserved bytes" {
     try std.testing.expectEqual(Kind.system, try parseKind(1));
     // Reserved chat extension range.
     try std.testing.expectError(error.UnknownKind, parseKind(7));
-    // Reserved payment kinds stay rejected until milestone M5.
-    try std.testing.expectError(error.UnknownKind, parseKind(16));
-    try std.testing.expectError(error.UnknownKind, parseKind(19));
+    // The payment CARD kinds are built (M5 A1)…
+    try std.testing.expectEqual(Kind.payment_request, try parseKind(16));
+    try std.testing.expectEqual(Kind.payment_sent, try parseKind(17));
+    // …but the settlement EVENT bytes are wire-only, never stored kinds.
+    try std.testing.expectError(error.UnknownKind, parseKind(kind_pay_settled_wire));
+    try std.testing.expectError(error.UnknownKind, parseKind(kind_pay_failed_wire));
     try std.testing.expectError(error.UnknownKind, parseKind(255));
+}
+
+test "appendPayment creates the card + row pair with kind-derived status" {
+    const gpa = std.testing.allocator;
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+
+    const a = try openConversation(gpa, &store, "did:plc:aaa", "maya.zat4.com");
+    const req = try appendPayment(gpa, &store, a, .payment_request, 0xCAFE, .lightning, 5000, "dinner", 100, false);
+    const sent = try appendPayment(gpa, &store, a, .payment_sent, 0xBEEF, .onchain, 250_000, "", 200, true);
+
+    try std.testing.expectEqual(@as(usize, 2), store.msgs.len);
+    try std.testing.expectEqual(@as(usize, 2), store.payments.len);
+    try std.testing.expectEqual(PayStatus.requested, store.payments.items(.status)[@intFromEnum(req)]);
+    try std.testing.expectEqual(PayStatus.broadcast, store.payments.items(.status)[@intFromEnum(sent)]);
+    // The card is a real message: note text, direction, unread accounting.
+    const req_msg = store.payments.items(.msg)[@intFromEnum(req)];
+    try std.testing.expectEqual(Kind.payment_request, store.msgs.items(.kind)[@intFromEnum(req_msg)]);
+    try std.testing.expectEqualStrings("dinner", sliceSpan(&store, store.msgs.items(.text)[@intFromEnum(req_msg)]));
+    try std.testing.expect(!isMine(&store, req_msg));
+    try std.testing.expectEqual(@as(u32, 1), store.convs.items(.unread)[@intFromEnum(a)]);
+    // Correlation: found in its conversation, invisible from another.
+    try std.testing.expectEqual(req, findPayment(&store, a, 0xCAFE).?);
+    const b = try openConversation(gpa, &store, "did:plc:bbb", "");
+    try std.testing.expect(findPayment(&store, b, 0xCAFE) == null);
+    try std.testing.expectEqual(req, paymentByMsg(&store, req_msg).?);
+}
+
+test "advancePayment is monotonic, terminal-absorbing, and first-wins on refs" {
+    const gpa = std.testing.allocator;
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+    const a = try openConversation(gpa, &store, "did:plc:aaa", "");
+    const pay = try appendPayment(gpa, &store, a, .payment_request, 1, .lightning, 100, "", 10, false);
+
+    // Forward: requested → broadcast. Backward: broadcast → pending is a no-op.
+    try std.testing.expect(try advancePayment(gpa, &store, pay, .broadcast, null));
+    try std.testing.expect(!(try advancePayment(gpa, &store, pay, .pending, null)));
+    try std.testing.expectEqual(PayStatus.broadcast, store.payments.items(.status)[@intFromEnum(pay)]);
+
+    // A ref attaches once; a later wire ref cannot rewrite it.
+    const hash: [32]u8 = @splat(0x11);
+    const other: [32]u8 = @splat(0x22);
+    try std.testing.expect(try advancePayment(gpa, &store, pay, .broadcast, hash));
+    try std.testing.expect(!(try advancePayment(gpa, &store, pay, .broadcast, other)));
+    try std.testing.expectEqualSlices(u8, &hash, &settlementRef(&store, pay).?);
+    // The local upsert primitive DOES replace (re-broadcast).
+    try setSettlementRef(gpa, &store, pay, other);
+    try std.testing.expectEqualSlices(u8, &other, &settlementRef(&store, pay).?);
+    try std.testing.expectEqual(@as(usize, 1), store.settlements.len);
+
+    // Terminal absorbs everything after.
+    try std.testing.expect(try advancePayment(gpa, &store, pay, .settled, null));
+    try std.testing.expect(!(try advancePayment(gpa, &store, pay, .failed, null)));
+    try std.testing.expect(!(try advancePayment(gpa, &store, pay, .broadcast, hash)));
+    try std.testing.expectEqual(PayStatus.settled, store.payments.items(.status)[@intFromEnum(pay)]);
+}
+
+test "setConfirmations walks depth forward and settles at six" {
+    const gpa = std.testing.allocator;
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+    const a = try openConversation(gpa, &store, "did:plc:aaa", "");
+    const pay = try appendPayment(gpa, &store, a, .payment_sent, 2, .onchain, 9000, "", 10, true);
+
+    try std.testing.expect(setConfirmations(&store, pay, 1));
+    try std.testing.expectEqual(PayStatus.confirming, store.payments.items(.status)[@intFromEnum(pay)]);
+    try std.testing.expect(setConfirmations(&store, pay, 3));
+    try std.testing.expect(!setConfirmations(&store, pay, 3)); // no change twice
+    try std.testing.expect(!setConfirmations(&store, pay, 2)); // depth never regresses
+    try std.testing.expectEqual(@as(u8, 3), store.payments.items(.confirmations)[@intFromEnum(pay)]);
+    try std.testing.expect(setConfirmations(&store, pay, settle_depth));
+    try std.testing.expectEqual(PayStatus.settled, store.payments.items(.status)[@intFromEnum(pay)]);
+    try std.testing.expect(!setConfirmations(&store, pay, 7)); // terminal absorbs
+}
+
+test "payment frame round-trips and rejects malformed wire bytes" {
+    var buf: [128]u8 = undefined;
+    const hash: [32]u8 = @splat(0xAB);
+    const frame = PaymentFrame{
+        .payment_id = 0x1122334455667788,
+        .amount_sat = 21_000,
+        .note = "split the fare",
+        .ref = hash,
+        .rail = .onchain,
+    };
+    const wire = buildPaymentFrame(&buf, frame);
+    try std.testing.expectEqual(payment_frame_min + frame.note.len, wire.len);
+    const back = try parsePaymentFrame(wire);
+    try std.testing.expectEqual(frame.payment_id, back.payment_id);
+    try std.testing.expectEqual(frame.amount_sat, back.amount_sat);
+    try std.testing.expectEqual(Rail.onchain, back.rail);
+    try std.testing.expectEqualSlices(u8, &hash, &back.ref);
+    try std.testing.expectEqualStrings("split the fare", back.note);
+
+    // An empty note and an absent ref are legal.
+    const bare = buildPaymentFrame(&buf, .{
+        .payment_id = 7,
+        .amount_sat = 1,
+        .note = "",
+        .ref = zero_ref,
+        .rail = .lightning,
+    });
+    const bare_back = try parsePaymentFrame(bare);
+    try std.testing.expectEqual(@as(usize, 0), bare_back.note.len);
+    try std.testing.expect(std.mem.allEqual(u8, &bare_back.ref, 0));
+
+    // Malformed: short, zero id, zero amount, over-max amount, bad rail.
+    try std.testing.expectError(error.Malformed, parsePaymentFrame(wire[0 .. payment_frame_min - 1]));
+    var bad: [payment_frame_min]u8 = undefined;
+    @memcpy(&bad, wire[0..payment_frame_min]);
+    std.mem.writeInt(u64, bad[0..8], 0, .little);
+    try std.testing.expectError(error.Malformed, parsePaymentFrame(&bad));
+    @memcpy(&bad, wire[0..payment_frame_min]);
+    std.mem.writeInt(u64, bad[8..16], 0, .little);
+    try std.testing.expectError(error.Malformed, parsePaymentFrame(&bad));
+    std.mem.writeInt(u64, bad[8..16], max_amount_sat + 1, .little);
+    try std.testing.expectError(error.Malformed, parsePaymentFrame(&bad));
+    @memcpy(&bad, wire[0..payment_frame_min]);
+    bad[48] = 2;
+    try std.testing.expectError(error.Malformed, parsePaymentFrame(&bad));
+}
+
+test "store codec v2: payments and settlements round-trip" {
+    const gpa = std.testing.allocator;
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+
+    const a = try openConversation(gpa, &store, "did:plc:aaa", "maya.zat4.com");
+    _ = try appendMessage(gpa, &store, a, .text, "hello", 100, true);
+    const req = try appendPayment(gpa, &store, a, .payment_request, 0xCAFE, .lightning, 5000, "dinner", 200, false);
+    const sent = try appendPayment(gpa, &store, a, .payment_sent, 0xBEEF, .onchain, 250_000, "rent", 300, true);
+    _ = try advancePayment(gpa, &store, req, .settled, @as([32]u8, @splat(0x33)));
+    try std.testing.expect(setConfirmations(&store, sent, 2));
+
+    const blob = try serializeStore(gpa, &store);
+    defer gpa.free(blob);
+    var restored = try deserializeStore(gpa, blob);
+    defer deinitStore(gpa, &restored);
+
+    try std.testing.expectEqual(@as(usize, 2), restored.payments.len);
+    try std.testing.expectEqual(@as(usize, 1), restored.settlements.len);
+    const r_req = findPayment(&restored, a, 0xCAFE).?;
+    const r_sent = findPayment(&restored, a, 0xBEEF).?;
+    try std.testing.expectEqual(PayStatus.settled, restored.payments.items(.status)[@intFromEnum(r_req)]);
+    try std.testing.expectEqual(@as(u64, 5000), restored.payments.items(.amount_sat)[@intFromEnum(r_req)]);
+    try std.testing.expectEqual(Rail.onchain, restored.payments.items(.rail)[@intFromEnum(r_sent)]);
+    try std.testing.expectEqual(PayStatus.confirming, restored.payments.items(.status)[@intFromEnum(r_sent)]);
+    try std.testing.expectEqual(@as(u8, 2), restored.payments.items(.confirmations)[@intFromEnum(r_sent)]);
+    try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(0x33)), &settlementRef(&restored, r_req).?);
+    try std.testing.expect(settlementRef(&restored, r_sent) == null);
+    // The note rides the card's message text.
+    const req_msg = restored.payments.items(.msg)[@intFromEnum(r_req)];
+    try std.testing.expectEqualStrings("dinner", sliceSpan(&restored, restored.msgs.items(.text)[@intFromEnum(req_msg)]));
+}
+
+test "store codec: a version-1 blob (pre-payments) still restores" {
+    const gpa = std.testing.allocator;
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+    const a = try openConversation(gpa, &store, "did:plc:aaa", "maya.zat4.com");
+    _ = try appendMessage(gpa, &store, a, .text, "old world", 100, true);
+
+    // A v2 blob with no payments is exactly a v1 blob plus two zero counts:
+    // strip them and stamp version 1 — byte-identical to what M2 wrote.
+    const v2 = try serializeStore(gpa, &store);
+    defer gpa.free(v2);
+    const v1 = try gpa.dupe(u8, v2[0 .. v2.len - 8]);
+    defer gpa.free(v1);
+    std.mem.writeInt(u16, v1[4..6], 1, .little);
+
+    var restored = try deserializeStore(gpa, v1);
+    defer deinitStore(gpa, &restored);
+    try std.testing.expectEqual(@as(usize, 1), restored.msgs.len);
+    try std.testing.expectEqual(@as(usize, 0), restored.payments.len);
+    try std.testing.expectEqualStrings("did:plc:aaa", conversationDid(&restored, a));
+
+    // A v1 blob cannot smuggle a payment kind (it has no rows to pair).
+    const bad = try gpa.dupe(u8, v1);
+    defer gpa.free(bad);
+    const msgs_at = 10 + store.string_bytes.items.len + 4 + conv_rec_len + 4;
+    bad[msgs_at + 20] = 16;
+    try std.testing.expectError(error.Malformed, deserializeStore(gpa, bad));
+}
+
+test "store codec v2: every class of payment-section damage is refused" {
+    const gpa = std.testing.allocator;
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+    const a = try openConversation(gpa, &store, "did:plc:aaa", "");
+    _ = try appendMessage(gpa, &store, a, .text, "text", 100, true);
+    const pay = try appendPayment(gpa, &store, a, .payment_request, 0xCAFE, .lightning, 5000, "n", 200, false);
+    try setSettlementRef(gpa, &store, pay, @splat(0x44));
+
+    const good = try serializeStore(gpa, &store);
+    defer gpa.free(good);
+    {
+        var ok = try deserializeStore(gpa, good);
+        deinitStore(gpa, &ok);
+    }
+    var bad = try gpa.dupe(u8, good);
+    defer gpa.free(bad);
+    const expectBad = struct {
+        fn check(alloc: Allocator, blob: []const u8) !void {
+            try std.testing.expectError(error.Malformed, deserializeStore(alloc, blob));
+        }
+    }.check;
+    // Layout: refs section = last 4 + 36 bytes; payments = the 4 + 23
+    // bytes before it.
+    const ref_at = good.len - ref_rec_len;
+    const pay_at = good.len - ref_rec_len - 4 - pay_rec_len;
+
+    // Row → a non-payment message (message 0 is text).
+    std.mem.writeInt(u32, bad[pay_at + 16 ..][0..4], 0, .little);
+    try expectBad(gpa, bad);
+    // Row → out-of-range message.
+    std.mem.writeInt(u32, bad[pay_at + 16 ..][0..4], 99, .little);
+    try expectBad(gpa, bad);
+    @memcpy(bad, good);
+    // Zero payment id / zero amount / bad rail / bad status byte.
+    std.mem.writeInt(u64, bad[pay_at..][0..8], 0, .little);
+    try expectBad(gpa, bad);
+    @memcpy(bad, good);
+    std.mem.writeInt(u64, bad[pay_at + 8 ..][0..8], 0, .little);
+    try expectBad(gpa, bad);
+    @memcpy(bad, good);
+    bad[pay_at + 20] = 2;
+    try expectBad(gpa, bad);
+    @memcpy(bad, good);
+    bad[pay_at + 21] = 6;
+    try expectBad(gpa, bad);
+    @memcpy(bad, good);
+    // Ref → out-of-range payment row; all-zero ref.
+    std.mem.writeInt(u32, bad[ref_at..][0..4], 9, .little);
+    try expectBad(gpa, bad);
+    @memcpy(bad, good);
+    @memset(bad[ref_at + 4 ..][0..32], 0);
+    try expectBad(gpa, bad);
+    @memcpy(bad, good);
+    // Truncation at every byte boundary still refuses cleanly.
+    var cut: usize = 0;
+    while (cut < good.len) : (cut += 1) try expectBad(gpa, good[0..cut]);
+}
+
+test "store codec v2: duplicate rows and duplicate correlation keys are refused" {
+    const gpa = std.testing.allocator;
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+    const a = try openConversation(gpa, &store, "did:plc:aaa", "");
+    _ = try appendPayment(gpa, &store, a, .payment_request, 0x0AAA, .lightning, 100, "", 100, false);
+    _ = try appendPayment(gpa, &store, a, .payment_sent, 0x0BBB, .lightning, 200, "", 200, true);
+
+    const good = try serializeStore(gpa, &store);
+    defer gpa.free(good);
+    var bad = try gpa.dupe(u8, good);
+    defer gpa.free(bad);
+    // Layout tail: [p_count=2][row0][row1][r_count=0]; rows are 23 bytes.
+    const row1_at = good.len - 4 - pay_rec_len;
+    const row0_at = row1_at - pay_rec_len;
+
+    // Two rows claiming the same card (row1's msg → row0's msg).
+    @memcpy(bad[row1_at + 16 ..][0..4], bad[row0_at + 16 ..][0..4]);
+    try std.testing.expectError(error.Malformed, deserializeStore(gpa, bad));
+    @memcpy(bad, good);
+    // Two cards sharing (conversation, payment_id) — the correlation key.
+    @memcpy(bad[row1_at..][0..8], bad[row0_at..][0..8]);
+    try std.testing.expectError(error.Malformed, deserializeStore(gpa, bad));
 }

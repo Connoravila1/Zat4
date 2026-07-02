@@ -26,6 +26,9 @@
 //!           peer's bootstrap mailbox.
 //!   send    plaintext = [ChatMsg.kind byte][text] → mls.encrypt →
 //!           length-framed into the one fixed bucket size → deposit.
+//!           (Payment kinds carry the core's structured frame instead of
+//!           text — same path, same bucket; the relay can't tell them
+//!           apart. M5 A1.)
 //!   receive a bucket routes by MLS message kind: a Welcome joins (and is
 //!           believed ONLY after the sender's leaf key is re-verified
 //!           against their PUBLISHED keyPackage record — a Welcome may
@@ -50,6 +53,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const assert = std.debug.assert;
 const cache = @import("cache.zig");
 const chat_keys = @import("chat_keys.zig");
 const chat_relay = @import("chat_relay.zig");
@@ -301,7 +305,34 @@ pub fn startConversation(
 
 pub const SendError = error{ NoConversation, TooLong, CryptoFailed, RelayDown, OutOfMemory };
 
-/// Encrypt one message ([kind][text]) into the peer's mailbox.
+/// The shared deposit leg of every send: encrypt one plaintext, persist,
+/// bucket, deposit. ORDER IS LOAD-BEARING: the advanced ratchet reaches
+/// disk BEFORE the ciphertext leaves. A crash after deposit but before
+/// persist would restore yesterday's ratchet and re-issue this generation's
+/// key and nonce for a DIFFERENT plaintext — AEAD nonce reuse, the one
+/// catastrophic failure. Persist-first means a crash costs one lost
+/// message, never a reused key.
+fn depositPlain(
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    st: *State,
+    link: *chat_relay.ChatRelay,
+    idx: usize,
+    plaintext: []const u8,
+) SendError!void {
+    var guard: [4]u8 = undefined;
+    io.randomSecure(&guard) catch return error.CryptoFailed;
+    const msg = mls.encrypt(gpa, &st.groups.items[idx], plaintext, 0, guard) catch return error.CryptoFailed;
+    defer gpa.free(msg);
+    persist(gpa, environ, st);
+    var bucket: [relay.bucket_len]u8 = undefined;
+    bucketPack(&bucket, msg) catch return error.CryptoFailed;
+    chat_relay.deposit(link, keydir.bootstrapMailbox(st.peer_anchors.items[idx]), &bucket) catch return error.RelayDown;
+}
+
+/// Encrypt one message ([kind][text]) into the peer's mailbox. Payment
+/// kinds carry a structured frame and go through `sendPayment`.
 pub fn send(
     gpa: Allocator,
     io: std.Io,
@@ -312,6 +343,7 @@ pub fn send(
     kind: chat.Kind,
     text: []const u8,
 ) SendError!void {
+    assert(!chat.isPaymentKind(kind));
     const idx = conversationIndex(st, peer_did) orelse return error.NoConversation;
     if (text.len + 1 > max_payload) return error.TooLong; // ciphertext ≥ plaintext; cheap early cut
     var plaintext_buf: [1024]u8 = undefined;
@@ -320,21 +352,7 @@ pub fn send(
     @memcpy(plaintext_buf[1..][0..text.len], text);
     const plaintext = plaintext_buf[0 .. 1 + text.len];
     defer std.crypto.secureZero(u8, plaintext);
-
-    var guard: [4]u8 = undefined;
-    io.randomSecure(&guard) catch return error.CryptoFailed;
-    const msg = mls.encrypt(gpa, &st.groups.items[idx], plaintext, 0, guard) catch return error.CryptoFailed;
-    defer gpa.free(msg);
-    // ORDER IS LOAD-BEARING: the advanced ratchet reaches disk BEFORE the
-    // ciphertext leaves. A crash after deposit but before persist would
-    // restore yesterday's ratchet and re-issue this generation's key and
-    // nonce for a DIFFERENT plaintext — AEAD nonce reuse, the one
-    // catastrophic failure. Persist-first means a crash costs one lost
-    // message, never a reused key.
-    persist(gpa, environ, st);
-    var bucket: [relay.bucket_len]u8 = undefined;
-    bucketPack(&bucket, msg) catch return error.CryptoFailed;
-    chat_relay.deposit(link, keydir.bootstrapMailbox(st.peer_anchors.items[idx]), &bucket) catch return error.RelayDown;
+    return depositPlain(gpa, io, environ, st, link, idx, plaintext);
 }
 
 /// One typing-indicator ping (U6a): [kind_typing_wire] alone, through the
@@ -352,15 +370,64 @@ pub fn sendTyping(
     peer_did: []const u8,
 ) SendError!void {
     const idx = conversationIndex(st, peer_did) orelse return error.NoConversation;
-    var guard: [4]u8 = undefined;
-    io.randomSecure(&guard) catch return error.CryptoFailed;
     const ping = [1]u8{chat.kind_typing_wire};
-    const msg = mls.encrypt(gpa, &st.groups.items[idx], &ping, 0, guard) catch return error.CryptoFailed;
-    defer gpa.free(msg);
-    persist(gpa, environ, st); // ORDER IS LOAD-BEARING — see send()
-    var bucket: [relay.bucket_len]u8 = undefined;
-    bucketPack(&bucket, msg) catch return error.CryptoFailed;
-    chat_relay.deposit(link, keydir.bootstrapMailbox(st.peer_anchors.items[idx]), &bucket) catch return error.RelayDown;
+    return depositPlain(gpa, io, environ, st, link, idx, &ping);
+}
+
+/// Encrypt one payment CARD ([kind 16/17][frame]) into the peer's mailbox
+/// (M5 A1). The frame is built by the pure core; this leg only frames,
+/// encrypts and deposits — the same nonce rule as any send. The relay sees
+/// one more fixed-size opaque bucket: a payment is indistinguishable from
+/// a text message on the wire.
+pub fn sendPayment(
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    st: *State,
+    link: *chat_relay.ChatRelay,
+    peer_did: []const u8,
+    kind: chat.Kind,
+    frame: chat.PaymentFrame,
+) SendError!void {
+    assert(chat.isPaymentKind(kind));
+    return sendPaymentBytes(gpa, io, environ, st, link, peer_did, @intFromEnum(kind), frame);
+}
+
+/// A settlement event (wire byte 18/19): the same frame, never a stored
+/// kind — the receiver correlates by payment_id and flips its card.
+pub fn sendPaymentEvent(
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    st: *State,
+    link: *chat_relay.ChatRelay,
+    peer_did: []const u8,
+    settled: bool,
+    frame: chat.PaymentFrame,
+) SendError!void {
+    const byte: u8 = if (settled) chat.kind_pay_settled_wire else chat.kind_pay_failed_wire;
+    return sendPaymentBytes(gpa, io, environ, st, link, peer_did, byte, frame);
+}
+
+fn sendPaymentBytes(
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    st: *State,
+    link: *chat_relay.ChatRelay,
+    peer_did: []const u8,
+    kind_byte: u8,
+    frame: chat.PaymentFrame,
+) SendError!void {
+    const idx = conversationIndex(st, peer_did) orelse return error.NoConversation;
+    var plaintext_buf: [1024]u8 = undefined;
+    const need = 1 + chat.payment_frame_min + frame.note.len;
+    if (need > plaintext_buf.len or need > max_payload) return error.TooLong;
+    plaintext_buf[0] = kind_byte;
+    const body = chat.buildPaymentFrame(plaintext_buf[1..], frame);
+    const plaintext = plaintext_buf[0 .. 1 + body.len];
+    defer std.crypto.secureZero(u8, plaintext); // amounts are content too
+    return depositPlain(gpa, io, environ, st, link, idx, plaintext);
 }
 
 /// What one inbox bucket became. `peer_did`/`text` are gpa-owned by the
@@ -371,6 +438,28 @@ pub const Incoming = union(enum) {
     /// The peer is typing right now — ephemeral; the shell shows the
     /// indicator for a few seconds and lets it lapse. Never stored.
     typing: struct { peer_did: []u8 },
+    /// A payment CARD (kind 16/17), frame already parsed by the pure core.
+    /// The store creates the card — or, when the id names one this
+    /// conversation already has, advances it (one card per payment,
+    /// morphing in place; M5 A1).
+    payment: struct {
+        peer_did: []u8,
+        note: []u8,
+        id: u64,
+        amount_sat: u64,
+        /// txid / payment hash; all-zero = none carried.
+        ref: [32]u8,
+        kind: chat.Kind,
+        rail: chat.Rail,
+    },
+    /// A settlement event (wire byte 18/19): flips an existing card to
+    /// settled/failed. Never stored as a message.
+    payment_update: struct {
+        peer_did: []u8,
+        id: u64,
+        ref: [32]u8,
+        settled: bool,
+    },
 };
 
 pub fn freeIncoming(gpa: Allocator, inc: Incoming) void {
@@ -381,6 +470,11 @@ pub fn freeIncoming(gpa: Allocator, inc: Incoming) void {
         },
         .started => |s| gpa.free(s.peer_did),
         .typing => |t| gpa.free(t.peer_did),
+        .payment => |p| {
+            gpa.free(p.peer_did);
+            gpa.free(p.note);
+        },
+        .payment_update => |u| gpa.free(u.peer_did),
     }
 }
 
@@ -488,7 +582,33 @@ pub fn onBucket(
                     if (data[0] == chat.kind_typing_wire) {
                         return .{ .typing = .{ .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]) } };
                     }
+                    // Settlement events (18/19): wire-only, like the ping —
+                    // but their effect persists (the card flips). A damaged
+                    // frame is dropped, never a crash (E3/E4).
+                    if (data[0] == chat.kind_pay_settled_wire or data[0] == chat.kind_pay_failed_wire) {
+                        const f = chat.parsePaymentFrame(data[1..]) catch return null;
+                        return .{ .payment_update = .{
+                            .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]),
+                            .id = f.payment_id,
+                            .ref = f.ref,
+                            .settled = data[0] == chat.kind_pay_settled_wire,
+                        } };
+                    }
                     const kind = chat.parseKind(data[0]) catch return null; // reserved kinds refused until their milestone
+                    if (chat.isPaymentKind(kind)) {
+                        const f = chat.parsePaymentFrame(data[1..]) catch return null;
+                        const note = try gpa.dupe(u8, f.note);
+                        errdefer gpa.free(note);
+                        return .{ .payment = .{
+                            .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]),
+                            .note = note,
+                            .id = f.payment_id,
+                            .amount_sat = f.amount_sat,
+                            .ref = f.ref,
+                            .kind = kind,
+                            .rail = f.rail,
+                        } };
+                    }
                     const text = try gpa.dupe(u8, data[1..]);
                     errdefer gpa.free(text);
                     return .{ .message = .{
@@ -682,6 +802,71 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
         const inc2 = (try onBucket(gpa, gpa, io, &env, &b2, &bucket2)) orelse return error.TestUnexpectedResult;
         defer freeIncoming(gpa, inc2);
         try testing.expectEqualStrings("after ping", inc2.message.text);
+    }
+
+    // A payment request crosses as a parsed card (M5 A1): kind 16 + frame.
+    {
+        var fbuf: [128]u8 = undefined;
+        const body = chat.buildPaymentFrame(&fbuf, .{
+            .payment_id = 0xCAFE,
+            .amount_sat = 5000,
+            .note = "dinner split",
+            .ref = chat.zero_ref,
+            .rail = .lightning,
+        });
+        var plaintext: [160]u8 = undefined;
+        plaintext[0] = @intFromEnum(chat.Kind.payment_request);
+        @memcpy(plaintext[1..][0..body.len], body);
+        const msg = try mls.encrypt(gpa, &a.groups.items[0], plaintext[0 .. 1 + body.len], 0, .{ 2, 2, 2, 2 });
+        defer gpa.free(msg);
+        var bucket: [relay.bucket_len]u8 = undefined;
+        try bucketPack(&bucket, msg);
+        const inc = (try onBucket(gpa, gpa, io, &env, &b2, &bucket)) orelse return error.TestUnexpectedResult;
+        defer freeIncoming(gpa, inc);
+        try testing.expectEqual(chat.Kind.payment_request, inc.payment.kind);
+        try testing.expectEqual(@as(u64, 0xCAFE), inc.payment.id);
+        try testing.expectEqual(@as(u64, 5000), inc.payment.amount_sat);
+        try testing.expectEqual(chat.Rail.lightning, inc.payment.rail);
+        try testing.expectEqualStrings("dinner split", inc.payment.note);
+        try testing.expect(std.mem.allEqual(u8, &inc.payment.ref, 0));
+    }
+
+    // Its settlement event (wire byte 18) crosses as a card flip carrying
+    // the proof ref, and is never a stored kind.
+    {
+        var fbuf: [128]u8 = undefined;
+        const preimage: [32]u8 = @splat(0x77);
+        const body = chat.buildPaymentFrame(&fbuf, .{
+            .payment_id = 0xCAFE,
+            .amount_sat = 5000,
+            .note = "",
+            .ref = preimage,
+            .rail = .lightning,
+        });
+        var plaintext: [160]u8 = undefined;
+        plaintext[0] = chat.kind_pay_settled_wire;
+        @memcpy(plaintext[1..][0..body.len], body);
+        const msg = try mls.encrypt(gpa, &a.groups.items[0], plaintext[0 .. 1 + body.len], 0, .{ 3, 3, 3, 3 });
+        defer gpa.free(msg);
+        var bucket: [relay.bucket_len]u8 = undefined;
+        try bucketPack(&bucket, msg);
+        const inc = (try onBucket(gpa, gpa, io, &env, &b2, &bucket)) orelse return error.TestUnexpectedResult;
+        defer freeIncoming(gpa, inc);
+        try testing.expect(inc.payment_update.settled);
+        try testing.expectEqual(@as(u64, 0xCAFE), inc.payment_update.id);
+        try testing.expectEqualSlices(u8, &preimage, &inc.payment_update.ref);
+    }
+
+    // A damaged payment frame (short) is dropped, and the ratchet survives.
+    {
+        var plaintext: [8]u8 = undefined;
+        plaintext[0] = @intFromEnum(chat.Kind.payment_sent);
+        @memset(plaintext[1..], 0);
+        const msg = try mls.encrypt(gpa, &a.groups.items[0], &plaintext, 0, .{ 4, 4, 4, 4 });
+        defer gpa.free(msg);
+        var bucket: [relay.bucket_len]u8 = undefined;
+        try bucketPack(&bucket, msg);
+        try testing.expect((try onBucket(gpa, gpa, io, &env, &b2, &bucket)) == null);
     }
 
     // A stranger's random bucket is dropped without a mark.

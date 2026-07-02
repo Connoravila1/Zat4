@@ -933,6 +933,43 @@ pub fn run(
                                     gchat_typing_peer_len = t.peer_did.len;
                                     gchat_typing_deadline = now + 6;
                                 },
+                                // A payment card (M5 A1): a known id advances
+                                // the existing card (one card per payment,
+                                // morphing in place); a fresh one lands as a
+                                // new card + row.
+                                .payment => |p| {
+                                    if (chat_core.openConversation(gpa, &gchat_store, p.peer_did, "") catch null) |c| blk: {
+                                        const ref: ?[32]u8 = if (std.mem.allEqual(u8, &p.ref, 0)) null else p.ref;
+                                        if (chat_core.findPayment(&gchat_store, c, p.id)) |pay| {
+                                            // Only a `sent` card moves an existing
+                                            // card forward (a duplicate request is
+                                            // a no-op).
+                                            if (p.kind == .payment_sent) {
+                                                if (chat_core.advancePayment(gpa, &gchat_store, pay, .broadcast, ref) catch false)
+                                                    chat_mutated = true;
+                                            }
+                                        } else {
+                                            const pay = chat_core.appendPayment(gpa, &gchat_store, c, p.kind, p.id, p.rail, p.amount_sat, p.note, now, false) catch break :blk;
+                                            if (ref) |r| chat_core.setSettlementRef(gpa, &gchat_store, pay, r) catch {};
+                                            chat_mutated = true;
+                                        }
+                                    }
+                                    // A card supersedes its typing bubble too.
+                                    if (std.mem.eql(u8, p.peer_did, gchat_typing_peer_buf[0..gchat_typing_peer_len]))
+                                        gchat_typing_deadline = 0;
+                                },
+                                // A settlement event: flips an existing card;
+                                // an unknown id is a straggler, dropped (E4).
+                                .payment_update => |u| {
+                                    if (chat_core.openConversation(gpa, &gchat_store, u.peer_did, "") catch null) |c| {
+                                        if (chat_core.findPayment(&gchat_store, c, u.id)) |pay| {
+                                            const ref: ?[32]u8 = if (std.mem.allEqual(u8, &u.ref, 0)) null else u.ref;
+                                            const to: chat_core.PayStatus = if (u.settled) .settled else .failed;
+                                            if (chat_core.advancePayment(gpa, &gchat_store, pay, to, ref) catch false)
+                                                chat_mutated = true;
+                                        }
+                                    }
+                                },
                             }
                         }
                     },

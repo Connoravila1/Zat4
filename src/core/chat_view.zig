@@ -67,6 +67,41 @@ fn ageStr(arena: Allocator, now: i64, created: i64) error{OutOfMemory}![]const u
     return arena.dupe(u8, timefmt.format(&buf, now, created));
 }
 
+/// A payment card's one-line body (M5 A1 interim — the rich card with the
+/// six-block animation is slice A4; until then the bubble states the facts
+/// in words, honestly: amount, rail, live status, note). Arena-owned.
+fn paymentLine(
+    arena: Allocator,
+    store: *const chat.Store,
+    msg: chat.MsgIndex,
+    kind: chat.Kind,
+    note: []const u8,
+) error{OutOfMemory}![]const u8 {
+    // A card without its row is impossible by store invariant; degrade to
+    // the note rather than crash if it ever happens (E4).
+    const pay = chat.paymentByMsg(store, msg) orelse return note;
+    const p = @intFromEnum(pay);
+    const amount = store.payments.items(.amount_sat)[p];
+    const status = store.payments.items(.status)[p];
+    const verb: []const u8 = if (kind == .payment_request) "Payment request" else "Payment";
+    const rail: []const u8 = switch (store.payments.items(.rail)[p]) {
+        .lightning => "lightning",
+        .onchain => "on-chain",
+    };
+    var status_buf: [24]u8 = undefined;
+    const state: []const u8 = if (status == .confirming)
+        std.fmt.bufPrint(&status_buf, "{d}/{d} confirmations", .{
+            store.payments.items(.confirmations)[p],
+            chat.settle_depth,
+        }) catch "confirming"
+    else
+        @tagName(status);
+    return if (note.len > 0)
+        std.fmt.allocPrint(arena, "{s} · {d} sats · {s} · {s} — {s}", .{ verb, amount, rail, state, note })
+    else
+        std.fmt.allocPrint(arena, "{s} · {d} sats · {s} · {s}", .{ verb, amount, rail, state });
+}
+
 /// The conversation list, newest activity first — one row per conversation,
 /// in the same order `chat.conversationsByActivity` reports. The row
 /// ordinal is what a tap region carries; the shell maps it back through its
@@ -103,7 +138,10 @@ pub fn buildList(
         var preview: []const u8 = "";
         if (newest[ci] != none) {
             const mi = newest[ci];
-            const body = chat.sliceSpan(store, store.msgs.items(.text)[mi]);
+            const mkind = store.msgs.items(.kind)[mi];
+            var body = chat.sliceSpan(store, store.msgs.items(.text)[mi]);
+            if (chat.isPaymentKind(mkind))
+                body = try paymentLine(arena, store, @enumFromInt(mi), mkind, body);
             preview = if (store.mine.isSet(mi))
                 try std.fmt.allocPrint(arena, "You: {s}", .{body})
             else
@@ -135,12 +173,16 @@ pub fn buildThread(
     for (order, out, 0..) |msg, *row, i| {
         const mi: u32 = @intFromEnum(msg);
         const at = created_col[mi];
+        const kind = store.msgs.items(.kind)[mi];
+        var body = chat.sliceSpan(store, store.msgs.items(.text)[mi]);
+        if (chat.isPaymentKind(kind))
+            body = try paymentLine(arena, store, msg, kind, body);
         row.* = .{
-            .body = chat.sliceSpan(store, store.msgs.items(.text)[mi]),
+            .body = body,
             .age = try ageStr(arena, now, at),
             .mine = chat.isMine(store, msg),
             .stamp = i == 0 or at - prev_at >= stamp_gap,
-            .kind = store.msgs.items(.kind)[mi],
+            .kind = kind,
         };
         prev_at = at;
     }
@@ -239,4 +281,46 @@ test "buildThread: a same-sender run keeps its tail only on the last bubble" {
     try std.testing.expect(!rows[1].tail); // stacked
     try std.testing.expect(rows[2].tail); // the run's last
     try std.testing.expect(rows[3].tail); // thread end
+}
+
+test "payment cards render an honest one-line summary in thread and list" {
+    const gpa = std.testing.allocator;
+    var store: chat.Store = .{};
+    defer chat.deinitStore(gpa, &store);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const a = try chat.openConversation(gpa, &store, "did:plc:aaa", "maya.zat4.com");
+    _ = try chat.appendMessage(gpa, &store, a, .text, "hi", 1000, true);
+    const req = try chat.appendPayment(gpa, &store, a, .payment_request, 0xCAFE, .lightning, 5000, "dinner", 1010, false);
+    const sent = try chat.appendPayment(gpa, &store, a, .payment_sent, 0xBEEF, .onchain, 250_000, "", 1020, true);
+    _ = chat.setConfirmations(&store, sent, 3);
+
+    const rows = try buildThread(arena, &store, a, 2000);
+    try std.testing.expectEqual(@as(usize, 3), rows.len);
+    try std.testing.expectEqual(chat.Kind.payment_request, rows[1].kind);
+    try std.testing.expectEqualStrings(
+        "Payment request · 5000 sats · lightning · requested — dinner",
+        rows[1].body,
+    );
+    try std.testing.expectEqualStrings(
+        "Payment · 250000 sats · on-chain · 3/6 confirmations",
+        rows[2].body,
+    );
+
+    // The list preview speaks the same line ("You: " prefixed — ours).
+    const list = try buildList(arena, &store, 2000);
+    try std.testing.expectEqualStrings(
+        "You: Payment · 250000 sats · on-chain · 3/6 confirmations",
+        list[0].preview,
+    );
+
+    // A settled card reads settled.
+    _ = try chat.advancePayment(gpa, &store, req, .settled, null);
+    const rows2 = try buildThread(arena, &store, a, 2000);
+    try std.testing.expectEqualStrings(
+        "Payment request · 5000 sats · lightning · settled — dinner",
+        rows2[1].body,
+    );
 }
