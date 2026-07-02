@@ -564,6 +564,14 @@ pub fn run(
                         gchat_link = chat_relay.start(gpa, io, &gchat_box, rhost, rport, token, chat_relay.devMailboxId(session.did)) catch null;
                     }
                 }
+                // Startup diagnostics, the [gpu] pattern: the difference
+                // between "transport off" and "transport broken" must be one
+                // stderr line, not a debugging session.
+                if (gchat_link != null) {
+                    std.debug.print("[chat] relay link up -> {s} (dev transport)\n", .{hostport});
+                } else {
+                    std.debug.print("[chat] ZAT4_RELAY set but the link did NOT start (need host:port, ZAT_RELAY_TOKEN, or spawn failed)\n", .{});
+                }
                 // ZAT4_CHAT_PEER (dev): open a conversation with a REAL DID so
                 // a message can aim at a real mailbox (the seeds are fakes).
                 // "self" = your own DID — the one-window round-trip test: a
@@ -572,7 +580,10 @@ pub fn run(
                 if (gchat_link != null) {
                     if (env.get("ZAT4_CHAT_PEER")) |peer_raw| {
                         const peer = if (std.mem.eql(u8, peer_raw, "self")) session.did else peer_raw;
-                        if (peer.len > 0) _ = chat_core.openConversation(gpa, &gchat_store, peer, "") catch {};
+                        if (peer.len > 0) {
+                            _ = chat_core.openConversation(gpa, &gchat_store, peer, "") catch {};
+                            std.debug.print("[chat] dev peer conversation open: {s}\n", .{peer});
+                        }
                     }
                 }
             }
