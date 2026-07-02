@@ -146,6 +146,22 @@ fn didForHandle(
         if (found) |did| return did;
     }
 
+    // Strategy 1.5: a SECOND, independent resolver. A TXT-published handle
+    // whose domain fronts through a CDN (every *.zat4.com handle) has no
+    // working well-known, so a single flaky resolver was a failed LAUNCH —
+    // one transient dns.google miss took the whole app down (field report,
+    // 2026-07-02). Cloudflare speaks the same JSON given the accept header.
+    dns2: {
+        const url = try core.buildDohTxtUrl(scratch, "https://cloudflare-dns.com/dns-query", handle);
+        const resp = http.request(scratch, io, environ, url, .{ .accept = "application/dns-json" }) catch break :dns2;
+        if (resp.status != 200) break :dns2;
+        const found = core.didFromDohJson(scratch, resp.body) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => break :dns2,
+        };
+        if (found) |did| return did;
+    }
+
     const url = try core.buildWellKnownUrl(scratch, handle);
     // The host here is the handle itself — a network-derived, attacker-influenced
     // value — so this fetch carries the SSRF guard (Phase 1).
