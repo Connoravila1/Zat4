@@ -579,6 +579,47 @@ pub fn settlementRef(store: *const Store, pay: PayIndex) ?[32]u8 {
     return null;
 }
 
+/// One on-chain card the watcher should ask the chain about (M5 A5): the
+/// correlation key, the amount, the conversation, and WHOSE published
+/// address receives the money — a request pays its AUTHOR; a sent card
+/// pays the author's counterparty. Plain values out (B5); the shell
+/// resolves DIDs to addresses and anchors.
+/// A7.2: cold struct, size guard waived — a poll-cycle snapshot, few.
+pub const WatchEntry = struct {
+    payment_id: u64,
+    amount_sat: u64,
+    conv: ConvIndex,
+    /// True: the money lands at MY published address; false: at the
+    /// counterparty's.
+    mine_address: bool,
+};
+
+/// Every live on-chain card, as watch entries (arena-owned, C3). Lightning
+/// cards have nothing to watch (preimage settles them); terminal cards are
+/// done.
+pub fn watchList(arena: Allocator, store: *const Store) error{OutOfMemory}![]WatchEntry {
+    const pays = store.payments.slice();
+    var n: usize = 0;
+    for (pays.items(.rail), pays.items(.status)) |r, s| {
+        if (r == .onchain and !isTerminalStatus(s)) n += 1;
+    }
+    const out = try arena.alloc(WatchEntry, n);
+    var i: usize = 0;
+    for (0..store.payments.len) |p| {
+        if (pays.items(.rail)[p] != .onchain or isTerminalStatus(pays.items(.status)[p])) continue;
+        const mi = @intFromEnum(pays.items(.msg)[p]);
+        const mine = store.mine.isSet(mi);
+        out[i] = .{
+            .payment_id = pays.items(.payment_id)[p],
+            .amount_sat = pays.items(.amount_sat)[p],
+            .conv = store.msgs.items(.conv)[mi],
+            .mine_address = if (store.msgs.items(.kind)[mi] == .payment_request) mine else !mine,
+        };
+        i += 1;
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // The payment wire frame (pure) — what rides after the kind byte for every
 // payment wire byte (16..19). One fixed shape for all four: the card kinds
@@ -1502,6 +1543,32 @@ test "store codec v2: every class of payment-section damage is refused" {
     // Truncation at every byte boundary still refuses cleanly.
     var cut: usize = 0;
     while (cut < good.len) : (cut += 1) try expectBad(gpa, good[0..cut]);
+}
+
+test "watchList: live on-chain cards only, with the right address owner" {
+    const gpa = std.testing.allocator;
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+    const a = try openConversation(gpa, &store, "did:plc:aaa", "");
+
+    // MY request (money to MY address), THEIR request (to THEIRS), MY sent
+    // (to THEIRS), a lightning card (not watched), a settled one (done).
+    _ = try appendPayment(gpa, &store, a, .payment_request, 1, .onchain, 100, "", 10, true);
+    _ = try appendPayment(gpa, &store, a, .payment_request, 2, .onchain, 200, "", 20, false);
+    _ = try appendPayment(gpa, &store, a, .payment_sent, 3, .onchain, 300, "", 30, true);
+    _ = try appendPayment(gpa, &store, a, .payment_request, 4, .lightning, 400, "", 40, false);
+    const done = try appendPayment(gpa, &store, a, .payment_sent, 5, .onchain, 500, "", 50, true);
+    _ = try advancePayment(gpa, &store, done, .settled, null);
+
+    const list = try watchList(gpa, &store);
+    defer gpa.free(list);
+    try std.testing.expectEqual(@as(usize, 3), list.len);
+    try std.testing.expectEqual(@as(u64, 1), list[0].payment_id);
+    try std.testing.expect(list[0].mine_address); // my request → my address
+    try std.testing.expectEqual(@as(u64, 2), list[1].payment_id);
+    try std.testing.expect(!list[1].mine_address); // their request → theirs
+    try std.testing.expectEqual(@as(u64, 3), list[2].payment_id);
+    try std.testing.expect(!list[2].mine_address); // my send → theirs
 }
 
 test "store codec v2: duplicate rows and duplicate correlation keys are refused" {

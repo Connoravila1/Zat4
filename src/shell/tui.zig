@@ -50,6 +50,9 @@ const chat_e2ee = @import("chat_e2ee.zig");
 const pay_addr = @import("pay_addr.zig");
 const payuri = @import("../core/payuri.zig");
 const launch = @import("launch.zig");
+const chainwatch_core = @import("../core/chainwatch.zig");
+const chainwatch_shell = @import("chainwatch.zig");
+const anchor_core = @import("../core/anchor.zig");
 const feed_shell = @import("feed.zig");
 const stream_shell = @import("stream.zig");
 const cache_shell = @import("cache.zig");
@@ -561,6 +564,16 @@ pub fn run(
     var gpay_note_len: usize = 0;
     var gpay_focus: u8 = 0;
     var gpay_status: []const u8 = "";
+    // The confirmation-watcher's cycle (M5 A5). At exit an in-flight cycle
+    // is joined (a few HTTP reads at worst) so the worker never outlives
+    // the loop's stack.
+    var gchain_job: ChainJob = .{};
+    var gchain_last: i64 = 0;
+    defer if (gchain_job.thread) |t| {
+        t.join();
+        gchain_job.thread = null;
+        chainJobFree(&gchain_job);
+    };
 
     // The real E2EE session (M1): the crypto state (anchor, keyPackage,
     // per-conversation MLS groups) + the relay link that carries encrypted
@@ -1000,6 +1013,84 @@ pub fn run(
             // decrypted message can NEVER be recovered from the wire again, so
             // it reaches disk before this frame ends.
             if (chat_mutated) chatPersistHistory(gpa, io, environ, st, &gchat_store);
+        };
+
+        // The confirmation-watcher (M5 A5): spawn a poll cycle when one is
+        // due and none is in flight; drain a finished one. Needs no relay —
+        // only the E2EE state (for the pinned anchors) and the store.
+        if (dev_chat) if (gchat_e2ee) |*st| {
+            if (gchain_job.thread == null and now - gchain_last >= chain_poll_seconds) {
+                gchain_last = now;
+                _ = gchat_arena_state.reset(.retain_capacity);
+                const entries = chat_core.watchList(gchat_arena_state.allocator(), &gchat_store) catch &.{};
+                if (entries.len > 0) spawn: {
+                    const a = std.heap.page_allocator;
+                    const my_pub = anchor_core.publicKey(st.anchor_seed) catch break :spawn;
+                    var items: std.ArrayList(ChainItem) = .empty;
+                    for (entries) |en| {
+                        const conv_did = chat_core.conversationDid(&gchat_store, en.conv);
+                        const anchor_pub = if (en.mine_address)
+                            my_pub
+                        else
+                            (chat_e2ee.peerAnchor(st, conv_did) orelse continue);
+                        const cd = a.dupe(u8, conv_did) catch continue;
+                        const od = a.dupe(u8, if (en.mine_address) st.my_did else conv_did) catch {
+                            a.free(cd);
+                            continue;
+                        };
+                        items.append(a, .{
+                            .conv_did = cd,
+                            .owner_did = od,
+                            .owner_anchor = anchor_pub,
+                            .payment_id = en.payment_id,
+                            .amount_sat = en.amount_sat,
+                        }) catch {
+                            a.free(cd);
+                            a.free(od);
+                            break;
+                        };
+                    }
+                    if (items.items.len == 0) {
+                        items.deinit(a);
+                        break :spawn;
+                    }
+                    const owned = items.toOwnedSlice(a) catch {
+                        for (items.items) |it| {
+                            a.free(it.conv_did);
+                            a.free(it.owner_did);
+                        }
+                        items.deinit(a);
+                        break :spawn;
+                    };
+                    gchain_job = .{ .items = owned };
+                    gchain_job.thread = std.Thread.spawn(.{}, chainWorker, .{ &gchain_job, io, environ }) catch {
+                        chainJobFree(&gchain_job);
+                        break :spawn;
+                    };
+                }
+            }
+            if (gchain_job.thread) |t| {
+                if (gchain_job.done.load(.acquire)) {
+                    t.join();
+                    gchain_job.thread = null;
+                    var chain_mutated = false;
+                    for (gchain_job.results) |res| {
+                        const depth = res.depth orelse continue;
+                        const c = chat_core.openConversation(gpa, &gchat_store, res.conv_did, "") catch continue;
+                        const pay = chat_core.findPayment(&gchat_store, c, res.payment_id) orelse continue;
+                        if (depth == 0) {
+                            // Seen in the mempool: network evidence at last —
+                            // the card may say `broadcast` now.
+                            if (chat_core.advancePayment(gpa, &gchat_store, pay, .broadcast, null) catch false)
+                                chain_mutated = true;
+                        } else if (chat_core.setConfirmations(&gchat_store, pay, depth)) {
+                            chain_mutated = true;
+                        }
+                    }
+                    if (chain_mutated) chatPersistHistory(gpa, io, environ, st, &gchat_store);
+                    chainJobFree(&gchain_job);
+                }
+            }
         };
 
         // Drain write-worker results (the non-blocking like/unlike/repost
@@ -3499,6 +3590,86 @@ fn payRowByOrdinal(gpa: Allocator, cs: *const chat_core.Store, conv: chat_core.C
     if (ordinal >= order.len) return null;
     const pay = chat_core.paymentByMsg(cs, order[ordinal]) orelse return null;
     return chat_core.paymentRow(cs, pay);
+}
+
+// ---------------------------------------------------------------------------
+// The confirmation-watcher's poll cycle (M5 A5): a ONE-SHOT worker (the
+// OAuthJob pattern — page_allocator inside, atomic done, join before
+// reading) the run loop spawns every `chain_poll_seconds` while any
+// on-chain card is live. Plain values cross the thread seam both ways
+// (E1); a dead chain source is a skipped cycle — stale cards, never a
+// blocked frame or a broken thread (E2/E4). The six-block animation is
+// this cycle's output arriving through the store's monotonic transitions.
+// ---------------------------------------------------------------------------
+
+/// How often the watcher asks the chain. On-chain blocks land ~10 min
+/// apart; a minute keeps the card honest without hammering the source.
+const chain_poll_seconds: i64 = 60;
+
+/// A7.2: cold struct, size guard waived — a few per poll cycle, worker-owned
+/// page_allocator copies (the worker never touches render memory).
+const ChainItem = struct {
+    conv_did: []u8,
+    owner_did: []u8,
+    owner_anchor: [32]u8,
+    payment_id: u64,
+    amount_sat: u64,
+};
+
+/// A7.2: cold struct, size guard waived. `conv_did` borrows its item's copy.
+const ChainResult = struct {
+    conv_did: []const u8,
+    payment_id: u64,
+    /// null = not seen; 0 = mempool; n ≥ 1 = confirmations.
+    depth: ?u8,
+};
+
+/// A7.2: cold struct, size guard waived — one per run loop.
+const ChainJob = struct {
+    thread: ?std.Thread = null,
+    done: std.atomic.Value(bool) = .init(false),
+    items: []ChainItem = &.{},
+    /// Written by the worker BEFORE `done` flips (release/acquire pairs).
+    results: []ChainResult = &.{},
+};
+
+fn chainJobFree(job: *ChainJob) void {
+    const a = std.heap.page_allocator;
+    for (job.items) |it| {
+        a.free(it.conv_did);
+        a.free(it.owner_did);
+    }
+    if (job.items.len > 0) a.free(job.items);
+    if (job.results.len > 0) a.free(job.results);
+    job.* = .{};
+}
+
+fn chainWorker(job: *ChainJob, io: std.Io, environ: ?*const std.process.Environ.Map) void {
+    const a = std.heap.page_allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const src = chainwatch_shell.source(environ);
+    var results: std.ArrayList(ChainResult) = .empty;
+    const tip = chainwatch_shell.tipHeight(arena_state.allocator(), io, environ, src) catch {
+        job.done.store(true, .release);
+        return; // source down: nothing observed this cycle (E4)
+    };
+    for (job.items) |item| {
+        _ = arena_state.reset(.retain_capacity);
+        const arena = arena_state.allocator();
+        // DID → published address, validated against the PINNED anchor
+        // (A2's redirect defense holds on the watch path too).
+        const payee = (pay_addr.fetchPayee(a, arena, io, environ, item.owner_did, item.owner_anchor) catch continue) orelse continue;
+        if (payee.bitcoin.len == 0) continue;
+        const ob = chainwatch_shell.observe(arena, io, environ, src, payee.bitcoin, item.amount_sat) catch continue;
+        results.append(a, .{
+            .conv_did = item.conv_did,
+            .payment_id = item.payment_id,
+            .depth = chainwatch_core.depthOf(ob, tip),
+        }) catch break;
+    }
+    job.results = results.toOwnedSlice(a) catch &.{};
+    job.done.store(true, .release);
 }
 
 /// The compose flow's one verb: resolve what the user typed (a handle via

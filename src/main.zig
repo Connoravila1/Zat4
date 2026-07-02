@@ -47,6 +47,8 @@ const pay_addr = @import("shell/pay_addr.zig");
 const payuri = @import("core/payuri.zig");
 const chat_core = @import("core/chat.zig");
 const launch = @import("shell/launch.zig");
+const chainwatch_core = @import("core/chainwatch.zig");
+const chainwatch_shell = @import("shell/chainwatch.zig");
 const algorithm_shell = @import("shell/algorithm.zig");
 const builder = @import("core/builder.zig");
 const lens_catalog = @import("core/lens_catalog.zig");
@@ -168,6 +170,12 @@ pub fn main(init: std.process.Init) !void {
     var pay_handoff_addr: ?[]const u8 = null;
     var pay_handoff_sats: ?[]const u8 = null;
     var pay_handoff_note: ?[]const u8 = null;
+    // Confirmation-watcher test (M5 A5): `--watch-address <address> <sats>`
+    // asks the configured chain source (ZAT_CHAIN_API, default mempool.space)
+    // how the network sees that address+amount and prints the verdict the
+    // six-block animation would draw. Purely read-only public data.
+    var watch_addr: ?[]const u8 = null;
+    var watch_sats: ?[]const u8 = null;
     var ai: usize = 1;
     while (ai < args.len) : (ai += 1) {
         const arg = args[ai];
@@ -213,6 +221,12 @@ pub fn main(init: std.process.Init) !void {
                 pay_handoff_sats = args[ai + 2];
                 pay_handoff_note = args[ai + 3];
                 ai += 3;
+            }
+        } else if (std.mem.eql(u8, arg, "--watch-address")) {
+            if (ai + 2 < args.len) {
+                watch_addr = args[ai + 1];
+                watch_sats = args[ai + 2];
+                ai += 2;
             }
         } else if (std.mem.eql(u8, arg, "--tui")) {
             tui_mode = true;
@@ -438,6 +452,42 @@ pub fn main(init: std.process.Init) !void {
             \\[chat]   DID binding signs and verifies (anchor <-> DID)
             \\
         , .{ if (res.created) @as([]const u8, "CREATED") else "LOADED", did, pub_hex });
+        try out.flush();
+        return;
+    }
+
+    // M5 A5 proof: the confirmation-watcher's whole read leg, live — tip
+    // height, the address page, the pure conservative match, and the depth
+    // the six-block animation would draw. Public data only; no session.
+    if (watch_addr) |wa| {
+        const sats = std.fmt.parseInt(u64, watch_sats.?, 10) catch {
+            try out.print("--watch-address: sats must be a positive integer\n", .{});
+            try out.flush();
+            return;
+        };
+        const src = chainwatch_shell.source(env);
+        try out.print("[watch] chain source: {s} ({s})\n", .{ src.base, if (src.guard == .trusted) @as([]const u8, "your endpoint") else "public, guarded" });
+        try out.flush();
+        const tip = chainwatch_shell.tipHeight(arena, io, env, src) catch |err| {
+            try out.print("[watch] tip fetch failed: {s}\n", .{@errorName(err)});
+            try out.flush();
+            return;
+        };
+        const ob = chainwatch_shell.observe(arena, io, env, src, wa, sats) catch |err| {
+            try out.print("[watch] address fetch failed: {s}\n", .{@errorName(err)});
+            try out.flush();
+            return;
+        };
+        const depth = chainwatch_core.depthOf(ob, tip);
+        if (depth) |d| {
+            if (d == 0) {
+                try out.print("[watch] tip {d}: seen in the MEMPOOL (0 confirmations) — the card would read broadcast\n", .{tip});
+            } else {
+                try out.print("[watch] tip {d}: {d} confirmation(s) — the card would read {s}\n", .{ tip, d, if (d >= 6) @as([]const u8, "settled") else "confirming" });
+            }
+        } else {
+            try out.print("[watch] tip {d}: no transaction paying exactly {d} sats to that address in the newest page\n", .{ tip, sats });
+        }
         try out.flush();
         return;
     }
@@ -897,6 +947,8 @@ test {
     _ = @import("core/payaddr.zig");
     _ = @import("core/payuri.zig");
     _ = @import("shell/launch.zig");
+    _ = @import("core/chainwatch.zig");
+    _ = @import("shell/chainwatch.zig");
     _ = @import("core/discover.zig");
     _ = @import("core/algorithm.zig");
     _ = @import("core/learner.zig");
