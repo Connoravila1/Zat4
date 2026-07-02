@@ -304,6 +304,9 @@ pub const InputEvent = union(enum) {
     delete,
     back_tab, // Shift+Tab (CSI Z) — reverse focus traversal
     enter,
+    /// Shift+Enter (the window backend encodes it as '\n'; a terminal's
+    /// Ctrl+J lands here too) — "break the line, don't submit".
+    shift_enter,
     escape,
     none,
 };
@@ -352,7 +355,8 @@ pub fn decodeInput(bytes: []const u8) DecodedInput {
         }
         return .{ .event = .escape, .consumed = if (bytes.len >= 2 and bytes[1] == '[') 2 else 1 };
     }
-    if (bytes[0] == '\r' or bytes[0] == '\n') return .{ .event = .enter, .consumed = 1 };
+    if (bytes[0] == '\r') return .{ .event = .enter, .consumed = 1 };
+    if (bytes[0] == '\n') return .{ .event = .shift_enter, .consumed = 1 };
     const decoded = nextCodepoint(bytes);
     return .{ .event = .{ .char = @intCast(decoded.cp) }, .consumed = decoded.len };
 }
@@ -445,6 +449,7 @@ test "input: keys, arrows, paging, and utf-8 decode to plain events" {
     try testing.expectEqual(InputEvent.page_down, decodeInput("\x1b[6~").event);
     try testing.expectEqual(InputEvent.escape, decodeInput("\x1b").event);
     try testing.expectEqual(InputEvent.enter, decodeInput("\r").event);
+    try testing.expectEqual(InputEvent.shift_enter, decodeInput("\n").event);
 
     const j = decodeInput("j");
     try testing.expectEqual(@as(u21, 'j'), j.event.char);

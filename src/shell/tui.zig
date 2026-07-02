@@ -545,6 +545,9 @@ pub fn run(
     var gchat_typing_peer_buf: [256]u8 = undefined;
     var gchat_typing_peer_len: usize = 0;
     var gchat_typing_sent_at: i64 = 0;
+    // Last chat keystroke (monotonic ns) — the caret's blink clock: lit
+    // while typing, breathing when idle.
+    var gchat_key_ns: u64 = 0;
 
     // The real E2EE session (M1): the crypto state (anchor, keyPackage,
     // per-conversation MLS groups) + the relay link that carries encrypted
@@ -1400,7 +1403,7 @@ pub fn run(
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .market = if (gscreen == feed_view.screen_loadout and gloadout_tab == 1) market_cards.items else &.{}, .create = .{ .step = gcreate_step, .answers = gcreate_answers, .config = gcreate_config, .name = gcreate_name_buf[0..gcreate_name_len], .color = gcreate_color, .naming = gcreate_step == .name, .prepare_t = create_prepare_t }, .bench = bench_tray, .inspect_bytes = inspect_bytes orelse "", .inspect_name = inspect_name, .inspect_ref = inspect_ref, .inspect_source = gtransp_source, .inspect_loading = inspect_loading, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .chat_store = if (dev_chat) &gchat_store else null, .chat_sel = gchat_sel, .chat_draft = gchat_draft_buf[0..gchat_draft_len], .chat_input_focus = gchat_input_focus, .chat_composing = gchat_composing, .chat_compose = gchat_peer_buf[0..gchat_peer_len], .chat_compose_status = gchat_compose_status, .chat_typing = gscreen == feed_view.screen_messages and now < gchat_typing_deadline and gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&gchat_store, gchat_sel.?), gchat_typing_peer_buf[0..gchat_typing_peer_len]), .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
+        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .market = if (gscreen == feed_view.screen_loadout and gloadout_tab == 1) market_cards.items else &.{}, .create = .{ .step = gcreate_step, .answers = gcreate_answers, .config = gcreate_config, .name = gcreate_name_buf[0..gcreate_name_len], .color = gcreate_color, .naming = gcreate_step == .name, .prepare_t = create_prepare_t }, .bench = bench_tray, .inspect_bytes = inspect_bytes orelse "", .inspect_name = inspect_name, .inspect_ref = inspect_ref, .inspect_source = gtransp_source, .inspect_loading = inspect_loading, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .chat_store = if (dev_chat) &gchat_store else null, .chat_sel = gchat_sel, .chat_draft = gchat_draft_buf[0..gchat_draft_len], .chat_input_focus = gchat_input_focus, .chat_composing = gchat_composing, .chat_compose = gchat_peer_buf[0..gchat_peer_len], .chat_compose_status = gchat_compose_status, .chat_typing = gscreen == feed_view.screen_messages and now < gchat_typing_deadline and gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&gchat_store, gchat_sel.?), gchat_typing_peer_buf[0..gchat_typing_peer_len]), .chat_key_ns = gchat_key_ns, .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
         switch (mode) {
             .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status),
             .compose => {
@@ -2249,9 +2252,10 @@ pub fn run(
                                         },
                                         .chat_compose_input => {},
                                         .chat_send => if (dev_chat) {
-                                            if (gchat_draft_len > 0) if (gchat_sel) |sc| {
-                                                _ = chat_core.appendMessage(gpa, &gchat_store, sc, .text, gchat_draft_buf[0..gchat_draft_len], now, true) catch {};
-                                                chatSend(gpa, io, environ, if (gchat_e2ee) |*st| st else null, gchat_link, &gchat_store, sc, gchat_draft_buf[0..gchat_draft_len]);
+                                            const body = std.mem.trimEnd(u8, gchat_draft_buf[0..gchat_draft_len], " \n");
+                                            if (body.len > 0) if (gchat_sel) |sc| {
+                                                _ = chat_core.appendMessage(gpa, &gchat_store, sc, .text, body, now, true) catch {};
+                                                chatSend(gpa, io, environ, if (gchat_e2ee) |*st| st else null, gchat_link, &gchat_store, sc, body);
                                                 chatPersistHistory(gpa, io, environ, if (gchat_e2ee) |*p| p else null, &gchat_store);
                                                 gchat_draft_len = 0;
                                                 gchat_input_focus = true;
@@ -2575,20 +2579,16 @@ pub fn run(
             // block, not the core Action enum. '+'/'=' grow the text,
             // '-'/'_' shrink it; only meaningful in the window (the
             // terminal has no pixel cells), so gated on an engine.
-            if (engine != null) if (decoded.event == .char) {
-                const zc = decoded.event.char;
-                // The Zat Chat composer strip: typing lands in the chat draft while
-                // the field has focus (tap the input to focus, Esc to leave). Enter
-                // sends — a LOCAL append until the transport (U4/U5) exists. ASCII
-                // for now, same as the Create name field; the full textedit (caret,
-                // selection, UTF-8) is the recorded upgrade. Consumes the key.
-                // The recipient bar (compose-new-conversation): while open it
-                // owns the keyboard. Enter resolves + starts (the recorded v1
-                // blocking posture — a rare first-contact event on this
-                // thread); Esc closes; a failed attempt leaves the draft and
-                // shows why. Consumes the key.
-                if (dev_chat and gscreen == feed_view.screen_messages and gchat_composing) {
-                    if (zc == '\r' or zc == '\n') {
+            // Zat Chat's structural keys arrive as decoded EVENTS, not chars
+            // (the terminal decoder owns that mapping — checking for '\r' in
+            // a .char is dead code). Enter SENDS the draft (trailing
+            // whitespace trimmed; all-whitespace sends nothing) or submits
+            // the recipient bar; Shift+Enter breaks the line in the draft;
+            // Escape leaves the focused input. Consumes the key.
+            if (engine != null and dev_chat and gscreen == feed_view.screen_messages and (gchat_composing or gchat_input_focus)) {
+                var chat_key = true;
+                switch (decoded.event) {
+                    .enter => if (gchat_composing) {
                         if (gchat_peer_len > 0) {
                             _ = gchat_arena_state.reset(.retain_capacity);
                             var new_sel: ?chat_core.ConvIndex = null;
@@ -2602,31 +2602,62 @@ pub fn run(
                                 gscroll_px = 0;
                             }
                         }
-                    } else if (zc == 8 or zc == 127) {
-                        if (gchat_peer_len > 0) gchat_peer_len -= 1;
-                    } else if (zc == 27) {
-                        gchat_composing = false;
-                        gchat_compose_status = "";
-                    } else if (zc >= 0x20 and zc < 0x7f and gchat_peer_len < gchat_peer_buf.len) {
-                        gchat_peer_buf[gchat_peer_len] = @intCast(zc);
-                        gchat_peer_len += 1;
-                    }
-                } else if (dev_chat and gscreen == feed_view.screen_messages and gchat_input_focus) {
-                    if (zc == '\r' or zc == '\n') {
-                        if (gchat_draft_len > 0) if (gchat_sel) |sc| {
-                            _ = chat_core.appendMessage(gpa, &gchat_store, sc, .text, gchat_draft_buf[0..gchat_draft_len], now, true) catch {};
-                            chatSend(gpa, io, environ, if (gchat_e2ee) |*st| st else null, gchat_link, &gchat_store, sc, gchat_draft_buf[0..gchat_draft_len]);
+                    } else {
+                        const body = std.mem.trimEnd(u8, gchat_draft_buf[0..gchat_draft_len], " \n");
+                        if (body.len > 0) if (gchat_sel) |sc| {
+                            _ = chat_core.appendMessage(gpa, &gchat_store, sc, .text, body, now, true) catch {};
+                            chatSend(gpa, io, environ, if (gchat_e2ee) |*st| st else null, gchat_link, &gchat_store, sc, body);
                             chatPersistHistory(gpa, io, environ, if (gchat_e2ee) |*p| p else null, &gchat_store);
                             gchat_draft_len = 0;
                             gscroll_px = 0; // re-anchor to the newest message
                         };
-                    } else if (zc == 8 or zc == 127) {
-                        if (gchat_draft_len > 0) gchat_draft_len -= 1;
-                    } else if (zc == 27) {
+                    },
+                    .shift_enter => if (!gchat_composing and gchat_draft_len < gchat_draft_buf.len) {
+                        gchat_draft_buf[gchat_draft_len] = '\n';
+                        gchat_draft_len += 1;
+                        gchat_key_ns = clock_shell.monotonicNanos();
+                    },
+                    .escape => if (gchat_composing) {
+                        gchat_composing = false;
+                        gchat_compose_status = "";
+                    } else {
                         gchat_input_focus = false;
+                    },
+                    else => chat_key = false,
+                }
+                if (chat_key) {
+                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status);
+                    continue;
+                }
+            }
+
+            if (engine != null) if (decoded.event == .char) {
+                const zc = decoded.event.char;
+                // The Zat Chat composer strip: typing lands in the chat draft
+                // while the field has focus (tap the input to focus). ASCII
+                // for now, same as the Create name field; the full textedit
+                // (caret, selection, UTF-8) is the recorded upgrade.
+                // Consumes the key. The recipient bar (compose-new-
+                // conversation) owns the keyboard while open. Every chat
+                // keystroke stamps `gchat_key_ns` — the caret stays lit
+                // while typing and breathes when idle.
+                if (dev_chat and gscreen == feed_view.screen_messages and gchat_composing) {
+                    if (zc == 8 or zc == 127) {
+                        if (gchat_peer_len > 0) gchat_peer_len -= 1;
+                        gchat_key_ns = clock_shell.monotonicNanos();
+                    } else if (zc >= 0x20 and zc < 0x7f and gchat_peer_len < gchat_peer_buf.len) {
+                        gchat_peer_buf[gchat_peer_len] = @intCast(zc);
+                        gchat_peer_len += 1;
+                        gchat_key_ns = clock_shell.monotonicNanos();
+                    }
+                } else if (dev_chat and gscreen == feed_view.screen_messages and gchat_input_focus) {
+                    if (zc == 8 or zc == 127) {
+                        if (gchat_draft_len > 0) gchat_draft_len -= 1;
+                        gchat_key_ns = clock_shell.monotonicNanos();
                     } else if (zc >= 0x20 and zc < 0x7f and gchat_draft_len < gchat_draft_buf.len) {
                         gchat_draft_buf[gchat_draft_len] = @intCast(zc);
                         gchat_draft_len += 1;
+                        gchat_key_ns = clock_shell.monotonicNanos();
                         // One encrypted typing ping per 4s of active typing.
                         // deposit is worker-queued (never blocks the frame);
                         // the ping's persist is the same nonce rule a send
@@ -3804,10 +3835,11 @@ const Grid = struct {
     chat_composing: bool = false,
     chat_compose: []const u8 = "",
     chat_compose_status: []const u8 = "",
-    /// The typing-indicator SIGNAL (U6a): true = the counterparty is typing.
-    /// Driven by the demo env hook until the transport's ephemeral ping
-    /// lands (receipts-off rules apply — the motion ships first, recorded).
+    /// The typing-indicator SIGNAL (U6a): true = the counterparty is typing
+    /// (an encrypted ping armed the deadline).
     chat_typing: bool = false,
+    /// Last chat keystroke (monotonic ns) for the caret blink clock.
+    chat_key_ns: u64 = 0,
     field_gain: f32 = 0.9,
     /// Toy Box "Julia mode" active — the field renderer pinks its glyph ink.
     julia: bool = false,
@@ -4953,9 +4985,11 @@ fn paintFrameGpu(
             rem -= step;
         }
         if (gs.chat_typing_t > 0.01) gs.chat_typing_phase += dt;
+        // A focused input keeps frames coming for the caret's breath.
         chat_animating = @abs(gs.chat_send_t - 1.0) > 0.004 or @abs(gs.chat_send_v) > 0.004 or
             @abs(gs.chat_arrive_t - 1.0) > 0.004 or @abs(gs.chat_arrive_v) > 0.004 or
-            gs.chat_typing_t > 0.01 or g.chat_typing;
+            gs.chat_typing_t > 0.01 or g.chat_typing or
+            g.chat_input_focus or g.chat_composing;
     };
     const sig = feedSignature(items, g.scroll.*, w, h) ^ (@as(u64, g.screen.*) *% 0x9E37_79B9_7F4A_7C15) ^ (socket_sig *% 0xD1B5_4A32_D192_ED03) ^ (@as(u64, g.settings_section) *% 0xC2B2_AE3D_27D4_EB4F) ^ (g.settings_toggles *% 0x9E6C_63D0_676A_9A99) ^ (g.settings_choices *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, g.settings_picking) *% 0x8A91_7F2B_4D3E_61C7) ^ (@as(u64, @intFromBool(g.inspect_source)) *% 0xF29C_511C_8E3D_45A7) ^ (@as(u64, @intFromBool(g.inspect_loading)) *% 0xBF58_476D_1CE4_E5B9) ^ chat_sig;
     // A drag/settle animates the socket every frame (lift, reflow, ghost), so
@@ -5014,7 +5048,14 @@ fn paintFrameGpu(
             gs.content_x = lg.col_x;
             gs.content_w = lg.col_w;
             const cf = buildChatFrame(arena, g.chat_store.?, g.chat_sel, now);
-            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, .{ .send_t = gs.chat_send_t, .arrive_t = gs.chat_arrive_t, .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase }) catch g.content_h.*;
+            // Seconds since the last chat keystroke, wrapped onto one blink
+            // period past the solid window — f32-precise forever, and a
+            // never-touched input still breathes (clock-since-launch).
+            const caret_raw_ns: u64 = if (g.chat_key_ns == 0) gs.chat_clock_ns else gs.chat_clock_ns -| g.chat_key_ns;
+            var caret_ph: f64 = @as(f64, @floatFromInt(caret_raw_ns)) / 1_000_000_000.0;
+            if (caret_ph > 0.55) caret_ph = 0.55 + @mod(caret_ph - 0.55, 1.1);
+            const caret_phase: f32 = @floatCast(caret_ph);
+            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, .{ .send_t = gs.chat_send_t, .arrive_t = gs.chat_arrive_t, .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase }) catch g.content_h.*;
         } else if (g.screen.* == feed_view.screen_transparency) {
             // The algorithm transparency page: a plain scrolling document (no rail),
             // rebuilt from the inspected config each entry (what you see = what runs).

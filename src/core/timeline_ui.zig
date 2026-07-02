@@ -170,7 +170,7 @@ pub const ComposeAction = union(enum) {
 pub fn actionForCompose(event: tui.InputEvent) ComposeAction {
     return switch (event) {
         .escape => .cancel,
-        .enter => .{ .insert = '\n' },
+        .enter, .shift_enter => .{ .insert = '\n' },
         .left => .left,
         .right => .right,
         .home => .home,

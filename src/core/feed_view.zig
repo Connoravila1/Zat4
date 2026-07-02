@@ -551,20 +551,30 @@ fn str(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, weight: text
 /// segment, so it wraps byte-for-byte as before — the height cache and the
 /// long-feed coordinate accounting (the 800-post regression) depend on that.
 fn wrapBody(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32, first_baseline: i32, maxw: i32, color: u32, px: u16, body: []const u8, line_h: i32, draw_it: bool, style: ?*const BodyTags) !i32 {
+    return wrapBodyPen(gpa, dl, e, x0, first_baseline, maxw, color, px, body, line_h, draw_it, style, null);
+}
+
+/// `wrapBody` that also reports the final pen x (the caret seat after the
+/// last drawn glyph) — the editor-shaped surfaces need it; everyone else
+/// calls `wrapBody` and never sees the parameter.
+fn wrapBodyPen(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32, first_baseline: i32, maxw: i32, color: u32, px: u16, body: []const u8, line_h: i32, draw_it: bool, style: ?*const BodyTags, end_x: ?*i32) !i32 {
     var baseline = first_baseline;
     var seg_start: usize = 0;
     while (true) {
         const nl = std.mem.indexOfScalarPos(u8, body, seg_start, '\n') orelse body.len;
-        baseline = try wrapLine(gpa, dl, e, x0, baseline, maxw, color, px, body[seg_start..nl], line_h, draw_it, style);
+        baseline = try wrapLine(gpa, dl, e, x0, baseline, maxw, color, px, body[seg_start..nl], line_h, draw_it, style, end_x);
         if (nl == body.len) break;
         seg_start = nl + 1; // step past the '\n' — the next paragraph starts a fresh line
     }
     return baseline;
 }
 
-/// Word-wrap one paragraph segment (no '\n') to `maxw`; greedy break at the last
-/// space before overflow. The per-line worker behind `wrapBody`.
-fn wrapLine(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32, first_baseline: i32, maxw: i32, color: u32, px: u16, body: []const u8, line_h: i32, draw_it: bool, style: ?*const BodyTags) !i32 {
+/// Word-wrap one paragraph segment (no '\n') to `maxw`; greedy break at the
+/// last space before overflow. A single RUN longer than the whole line (a
+/// long word, a URL, "hmmm…") HARD-BREAKS at the last codepoint that fits —
+/// text never escapes its pane. The per-line worker behind `wrapBody`.
+fn wrapLine(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32, first_baseline: i32, maxw: i32, color: u32, px: u16, body: []const u8, line_h: i32, draw_it: bool, style: ?*const BodyTags, end_x: ?*i32) !i32 {
+    const maxw_u: u32 = @intCast(@max(0, maxw));
     var baseline = first_baseline;
     var line_start: usize = 0;
     var last_space: usize = 0;
@@ -574,16 +584,37 @@ fn wrapLine(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32
         const at_end = i == body.len;
         if (!at_end and body[i] != ' ') continue;
         const candidate = body[line_start..i];
-        if (text.measure(e, .regular, candidate, px) > @as(u32, @intCast(@max(0, maxw))) and have_space) {
-            if (draw_it) try drawBodyRun(gpa, dl, e, x0, baseline, color, px, body, line_start, last_space, style);
+        if (text.measure(e, .regular, candidate, px) > maxw_u) {
+            if (have_space) {
+                if (draw_it) try drawBodyRun(gpa, dl, e, x0, baseline, color, px, body, line_start, last_space, style);
+                baseline += line_h;
+                line_start = last_space + 1;
+                have_space = false;
+                i = line_start;
+                continue;
+            }
+            // No space to break at: hard-break the run mid-word — the
+            // longest codepoint prefix that fits, and always at least one
+            // codepoint so a too-narrow pane still makes progress.
+            var fit = line_start;
+            var probe = line_start;
+            while (probe < i) {
+                const cp_len = std.unicode.utf8ByteSequenceLength(body[probe]) catch 1;
+                const next = @min(probe + cp_len, i);
+                if (fit > line_start and
+                    text.measure(e, .regular, body[line_start..next], px) > maxw_u) break;
+                probe = next;
+                fit = next;
+            }
+            if (draw_it) try drawBodyRun(gpa, dl, e, x0, baseline, color, px, body, line_start, fit, style);
             baseline += line_h;
-            line_start = last_space + 1;
-            have_space = false;
+            line_start = fit;
             i = line_start;
             continue;
         }
         if (at_end) {
             if (draw_it) try drawBodyRun(gpa, dl, e, x0, baseline, color, px, body, line_start, i, style);
+            if (end_x) |ex| ex.* = x0 + @as(i32, @intCast(text.measure(e, .regular, body[line_start..i], px)));
             baseline += line_h;
             break;
         }
@@ -3399,12 +3430,25 @@ pub const ChatMotion = struct {
     typing_t: f32 = 0,
     /// The three-dot pulse clock (seconds); only advances while visible.
     typing_phase: f32 = 0,
+    /// Seconds since the last keystroke in the focused input — the caret
+    /// stays lit while typing and breathes (smooth blink) once idle.
+    caret_phase: f32 = 0,
 
     comptime {
-        // Budget: exactly the four f32 knobs. (A7)
-        assert(@sizeOf(ChatMotion) == 16);
+        // Budget 20: five f32 knobs exactly. (A7.1: grew 16 → 20 for the
+        // caret's blink clock — the fifth knob of the motion vocabulary.)
+        assert(@sizeOf(ChatMotion) == 20);
     }
 };
+
+/// The caret's alpha at `phase` seconds after the last keystroke: solid
+/// while typing (the first 0.55s), then a smooth ~1.1s breath — the premium
+/// blink, not a hard square wave.
+fn caretAlpha(phase: f32) f32 {
+    if (phase < 0.55) return 1.0;
+    const s = 0.5 + 0.5 * @sin((phase - 0.55) * (std.math.tau / 1.1) + std.math.pi / 2.0);
+    return 0.15 + 0.85 * s * s;
+}
 
 /// `color` with its alpha byte scaled by `a` (0..1) — the fade half of the
 /// motion vocabulary.
@@ -3549,8 +3593,8 @@ pub fn layoutChat(
             _ = try str(gpa, dl, e, .regular, lab_pen + 8, body_y + 29, faint, 14, "handle or did:…");
         }
         const draft_w: i32 = @intCast(text.measure(e, .regular, compose_draft, 14));
-        const caret_x = lab_pen + 8 + @min(draft_w, x0 + w - 14 - (lab_pen + 8)) + 1;
-        try rect(gpa, dl, caret_x, body_y + 14, 2, bar_h - 28, (0xE0 << 24) | (accent & 0x00FFFFFF), 0);
+        const bar_caret_x = lab_pen + 8 + @min(draft_w, x0 + w - 14 - (lab_pen + 8)) + 1;
+        try rect(gpa, dl, bar_caret_x, body_y + 14, 2, bar_h - 28, scaleAlpha((0xE0 << 24) | (accent & 0x00FFFFFF), caretAlpha(motion.caret_phase)), 0);
         try emitRegion(gpa, regions, x0, body_y, w, @intCast(bar_h), 0, .chat_compose_input);
         body_y += bar_h + 8;
         if (compose_status.len > 0) {
@@ -3614,7 +3658,18 @@ pub fn layoutChat(
     _ = try str(gpa, dl, e, .semibold, detail_x, body_y + 24, ink, 18, peer);
     try rect(gpa, dl, detail_x, body_y + 40, detail_w, 1, divider, 0);
     const thread_top = body_y + 54;
-    const comp_h: i32 = 46;
+    // The composer GROWS DOWNWARD as the draft wraps (hard word-break
+    // included), so a long message builds lines inside the pane instead of
+    // running off it; the thread above yields the space. Enter sends,
+    // Shift+Enter breaks the line ('\n' in the draft is a real line).
+    const send_w: i32 = 84;
+    const input_w = detail_w - send_w - 12;
+    const input_line_h: i32 = 20;
+    const draft_h: i32 = if (draft.len == 0)
+        input_line_h
+    else
+        try wrapBody(gpa, dl, e, 0, input_line_h, input_w - 28, 0, 14, draft, input_line_h, false, null) - input_line_h;
+    const comp_h: i32 = @max(46, draft_h + 26);
     const comp_y = height - comp_h - 24;
     // The typing indicator claims space between the thread and the composer
     // as it grows (typing_t 0→1) — the bubbles above LIFT with it, so the
@@ -3689,19 +3744,26 @@ pub fn layoutChat(
             y += stamp_h;
         }
         var by = y + row_shift;
-        var fade: f32 = 1.0;
+        var fade_rect: f32 = 1.0;
+        var fade_text: f32 = 1.0;
         var grow: f32 = 1.0;
         if (is_fly) {
             if (b.mine) {
+                // The send MORPH: the bubble leaves the composer small
+                // (45%) and inflates the whole way to its seat — scale,
+                // travel, and fade are one gesture on one spring. The text
+                // materializes as the bubble approaches full size.
                 const from: f32 = @floatFromInt(comp_y + 8 - hh);
                 const to: f32 = @floatFromInt(y);
                 by = @intFromFloat(@round(to + (from - to) * (1.0 - fly_t)));
-                fade = @min(1.0, fly_c * 2.5);
-                grow = 0.82 + 0.18 * fly_c;
+                grow = 0.45 + 0.55 * fly_c;
+                fade_rect = @min(1.0, 0.30 + fly_c * 1.4);
+                fade_text = std.math.clamp((fly_c - 0.45) * 2.2, 0.0, 1.0);
             } else {
-                by = y + @as(i32, @intFromFloat(@round(20.0 * (1.0 - fly_t))));
-                fade = @min(1.0, fly_c * 1.8);
-                grow = 0.92 + 0.08 * fly_c;
+                by = y + @as(i32, @intFromFloat(@round(24.0 * (1.0 - fly_t))));
+                grow = 0.85 + 0.15 * fly_c;
+                fade_rect = @min(1.0, fly_c * 1.6);
+                fade_text = fade_rect;
             }
         }
         if (by + hh > thread_top and by < clip_bot) {
@@ -3715,14 +3777,20 @@ pub fn layoutChat(
                 const bw = if (fits_one) one_w + 2 * pad_x else bub_max;
                 const bx = if (b.mine) detail_x + detail_w - bw else detail_x;
                 const fill: u32 = if (b.mine) (0x38 << 24) | (accent & 0x00FFFFFF) else skinPanel(accent);
-                // The in-flight bubble grows toward full size, anchored to
-                // its composer-side bottom corner (where it came from).
+                // The in-flight bubble inflates toward full size, anchored
+                // to its composer-side bottom corner (where it came from).
                 const bw_a: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(bw)) * grow));
                 const hh_a: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(hh)) * grow));
                 const bx_a = if (b.mine) bx + (bw - bw_a) else bx;
                 const by_a = by + (hh - hh_a);
-                try rect(gpa, dl, bx_a, by_a, bw_a, hh_a, scaleAlpha(fill, fade), 14);
-                _ = try wrapBody(gpa, dl, e, bx_a + pad_x, by_a + pad_y + 12, bub_max - 2 * pad_x, scaleAlpha(ink, fade), 14, b.body, line_h, true, null);
+                try rect(gpa, dl, bx_a, by_a, bw_a, hh_a, scaleAlpha(fill, fade_rect), 14);
+                if (fade_text > 0.01) {
+                    // The text keeps its FINAL x — the bubble inflates
+                    // around it (fading in late hides the mismatch), and a
+                    // shrunken right-anchored rect never pushes the text
+                    // past the pane edge.
+                    _ = try wrapBody(gpa, dl, e, bx + pad_x, by_a + pad_y + 12, bub_max - 2 * pad_x, scaleAlpha(ink, fade_text), 14, b.body, line_h, true, null);
+                }
             }
         }
         y += hh + gap;
@@ -3758,11 +3826,10 @@ pub fn layoutChat(
         }
     }
 
-    // The composer strip: input + Send. Inert scaffold until the U3 wiring
-    // threads the app's textedit through it; the regions are live now so the
-    // shell has targets to arm.
-    const send_w: i32 = 84;
-    const input_w = detail_w - send_w - 12;
+    // The composer: a growing multi-line input + Send. The draft renders
+    // through the same wrap engine as the bubbles (soft wrap + hard
+    // word-break + '\n' from Shift+Enter); the caret sits after the last
+    // glyph and BREATHES when idle (caretAlpha — lit while typing).
     try rect(gpa, dl, detail_x, comp_y, input_w, comp_h, skinPanel(accent), 14);
     try rect(gpa, dl, detail_x, comp_y, input_w, 1, 0x14EDEAE0, 14);
     if (input_focus) {
@@ -3774,26 +3841,28 @@ pub fn layoutChat(
         try rect(gpa, dl, detail_x, comp_y, 1, comp_h, ring_c, 0);
         try rect(gpa, dl, detail_x + input_w - 1, comp_y, 1, comp_h, ring_c, 0);
     }
+    var caret_x: i32 = detail_x + 14;
+    var caret_base: i32 = comp_y + 29;
     if (draft.len > 0) {
-        try strEllipsis(gpa, dl, e, .regular, detail_x + 14, comp_y + 29, ink, 14, draft, input_w - 28);
+        caret_base = try wrapBodyPen(gpa, dl, e, detail_x + 14, comp_y + 29, input_w - 28, ink, 14, draft, input_line_h, true, null, &caret_x) - input_line_h;
     } else {
         var pbuf: [96]u8 = undefined;
         const ph = std.fmt.bufPrint(&pbuf, "Message {s}", .{peer}) catch "Message";
         try strEllipsis(gpa, dl, e, .regular, detail_x + 14, comp_y + 29, faint, 14, ph, input_w - 28);
     }
     if (input_focus) {
-        // The caret, at the end of the draft (or the line start when empty).
-        const draft_w: i32 = @intCast(text.measure(e, .regular, draft, 14));
-        const caret_x = detail_x + 14 + @min(draft_w, input_w - 28) + 1;
-        try rect(gpa, dl, caret_x, comp_y + 14, 2, comp_h - 28, (0xE0 << 24) | (accent & 0x00FFFFFF), 0);
+        const ca = caretAlpha(motion.caret_phase);
+        try rect(gpa, dl, caret_x + 1, caret_base - 14, 2, 18, scaleAlpha((0xE0 << 24) | (accent & 0x00FFFFFF), ca), 0);
     }
     try emitRegion(gpa, regions, detail_x, comp_y, input_w, @intCast(comp_h), 0, .chat_input);
+    // Send pins to the input's bottom edge as the composer grows.
     const sx = detail_x + detail_w - send_w;
+    const sy = comp_y + comp_h - 46;
     const armed = draft.len > 0;
-    try rect(gpa, dl, sx, comp_y, send_w, comp_h, if (armed) accent else skinPanel(accent), 14);
+    try rect(gpa, dl, sx, sy, send_w, 46, if (armed) accent else skinPanel(accent), 14);
     const sw3: i32 = @intCast(text.measure(e, .semibold, "Send", 14));
-    _ = try str(gpa, dl, e, .semibold, sx + @divTrunc(send_w - sw3, 2), comp_y + 29, if (armed) 0xFF20201A else faint, 14, "Send");
-    try emitRegion(gpa, regions, sx, comp_y, send_w, @intCast(comp_h), 0, .chat_send);
+    _ = try str(gpa, dl, e, .semibold, sx + @divTrunc(send_w - sw3, 2), sy + 29, if (armed) 0xFF20201A else faint, 14, "Send");
+    try emitRegion(gpa, regions, sx, sy, send_w, 46, 0, .chat_send);
 
     return height + @max(0, total - (thread_bot - thread_top));
 }

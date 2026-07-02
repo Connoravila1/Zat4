@@ -908,6 +908,10 @@ pub fn pump(
                 // a deferred slice-3 add; this serves the in-app confirm flow.
                 if (ctrl and (sym == 'v' or sym == 'V') and window.clip_len > 0) {
                     try out.appendSlice(gpa, window.clip_buf[0..window.clip_len]);
+                } else if ((sym == 0xFF0D or sym == 0xFF8D) and shifted and !ctrl) {
+                    // Shift+Enter: encoded as '\n' so the decoder can tell it
+                    // from plain Enter ('\r') — "break the line, don't submit".
+                    try out.append(gpa, '\n');
                 } else {
                     var key_buf: [8]u8 = undefined;
                     const len = x11.keyBytes(sym, ctrl, &key_buf);
