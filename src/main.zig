@@ -664,6 +664,7 @@ test {
     _ = @import("core/xwing.zig");
     _ = @import("core/mls_wire.zig");
     _ = @import("core/mls_schedule.zig");
+    _ = @import("core/mls.zig");
     _ = @import("core/oauth.zig");
     _ = @import("core/oauth_flow.zig");
     _ = @import("core/dagcbor.zig");

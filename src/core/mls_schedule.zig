@@ -136,9 +136,23 @@ pub fn epochFromJoiner(
     const member = hkdfExtract(&joiner, &psk_secret);
     var epoch: Secret = undefined;
     expandWithLabel(member, "epoch", group_context, &epoch);
+    return tableFrom(epoch, joiner, deriveSecret(member, "welcome"));
+}
+
+/// Group creation (RFC 9420 §11): epoch 0 starts from a FRESH RANDOM epoch
+/// secret (the shell's entropy, passed in). No joiner/welcome exist for
+/// epoch 0 — nobody joins an epoch that predates its group's first commit —
+/// so those two table slots are zero.
+pub fn epochFromRaw(epoch_secret: Secret) EpochSecrets {
+    const zero: Secret = @splat(0);
+    return tableFrom(epoch_secret, zero, zero);
+}
+
+/// The §8 Table 4 derivations, shared by every epoch entry point.
+fn tableFrom(epoch: Secret, joiner: Secret, welcome: Secret) EpochSecrets {
     return .{
         .joiner = joiner,
-        .welcome = deriveSecret(member, "welcome"),
+        .welcome = welcome,
         .sender_data = deriveSecret(epoch, "sender data"),
         .encryption = deriveSecret(epoch, "encryption"),
         .exporter = deriveSecret(epoch, "exporter"),
@@ -149,6 +163,13 @@ pub fn epochFromJoiner(
         .epoch_authenticator = deriveSecret(epoch, "authentication"),
         .init = deriveSecret(epoch, "init"),
     };
+}
+
+/// The welcome secret (§8): derived from the joiner secret + PSK input
+/// BEFORE the GroupContext enters the chain — which is what lets a joiner
+/// decrypt the GroupInfo that CONTAINS the context.
+pub fn welcomeSecretFromJoiner(joiner: Secret, psk_secret: Secret) Secret {
+    return deriveSecret(hkdfExtract(&joiner, &psk_secret), "welcome");
 }
 
 /// RFC 9420 §8.5: MLS-Exporter(Label, Context, Length).
