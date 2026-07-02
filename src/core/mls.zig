@@ -796,6 +796,37 @@ fn validateKeyPackage(gpa: Allocator, kp: wire.KeyPackage, kp_body: []const u8, 
     try verifyWithLabel(gpa, kp.leaf_node.signature_key[0..pk_len].*, "KeyPackageTBS", kp_body[0..tbs_len], kp.signature);
 }
 
+/// A7.2: cold struct, size guard waived — transient fetch-validation view.
+pub const KeyPackageInfo = struct {
+    /// The leaf's signature key — the ANCHOR public key (C6): what the
+    /// keyPackage record's DID binding verifies against.
+    signature_key: [pk_len]u8,
+    /// The leaf credential's identity (borrows `msg_bytes`) — the DID.
+    identity: []const u8,
+    /// The KeyPackage's own lifetime end (seconds).
+    not_after: u64,
+};
+
+/// Full structural + signature validation of an MLSMessage(KeyPackage) for
+/// the key directory (U6 fetch): everything `addPeer` checks, without a
+/// group. Returns the plain facts the record layer binds against — no wire
+/// types cross this boundary (D3).
+pub fn checkKeyPackage(gpa: Allocator, msg_bytes: []const u8, now: u64) MlsError!KeyPackageInfo {
+    var kr = wire.Reader.init(msg_bytes);
+    if (try kr.readU16() != wire.protocol_version_mls10) return error.UnsupportedVersion;
+    if (try kr.readU16() != wire.wire_key_package) return error.UnexpectedMessage;
+    const kp_body = msg_bytes[4..];
+    const kp = try wire.KeyPackage.parseFrom(&kr);
+    try kr.finish();
+    try validateKeyPackage(gpa, kp, kp_body, now);
+    if (kp.leaf_node.signature_key.len != pk_len) return error.BadKeyPackage;
+    return .{
+        .signature_key = kp.leaf_node.signature_key[0..pk_len].*,
+        .identity = kp.leaf_node.credential.identity,
+        .not_after = kp.leaf_node.source.key_package.not_after,
+    };
+}
+
 // ---------------------------------------------------------------------------
 // The group state. One instance per open conversation — hot by the tie-
 // break rule, so it carries the guard.

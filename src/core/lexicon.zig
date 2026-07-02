@@ -156,6 +156,10 @@ pub const collection = struct {
     /// the join timestamp, how they joined (new account vs imported DID), and the
     /// load-bearing consent record.
     pub const membership = "app.zat4.actor.membership";
+    /// Zat Chat's ONE public record (ZAT_CHAT_ROADMAP U6): the last-resort
+    /// keyPackage — the key-directory entry, a singleton (rkey "self").
+    /// Messages themselves never enter the repo.
+    pub const chat_key_package = "app.zat4.chat.keyPackage";
 };
 
 /// How a DID became a Zat4 member — a new Zat4 account on our PDS (with a Zat4

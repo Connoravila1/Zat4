@@ -42,6 +42,7 @@ const window_shell = @import("shell/native.zig");
 const lexicon = @import("core/lexicon.zig");
 const anchor_core = @import("core/anchor.zig");
 const write = @import("shell/write.zig");
+const chat_keys = @import("shell/chat_keys.zig");
 const algorithm_shell = @import("shell/algorithm.zig");
 const builder = @import("core/builder.zig");
 const lens_catalog = @import("core/lens_catalog.zig");
@@ -142,6 +143,11 @@ pub fn main(init: std.process.Init) !void {
     // and self-verifies the DID binding. Run twice: "created" then "loaded"
     // with the SAME public key proves persistence (keystore or 0600 file).
     var chat_anchor_did: ?[]const u8 = null;
+    // Chat key-directory test (U6): `--chat-publish` (with a handle + password)
+    // publishes THIS account's last-resort keyPackage record, then fetches it
+    // back through the public directory path and validates the whole chain
+    // (anchor binding, suite, expiry, signatures) — the full U6 loop, headless.
+    var chat_publish = false;
     var ai: usize = 1;
     while (ai < args.len) : (ai += 1) {
         const arg = args[ai];
@@ -172,6 +178,8 @@ pub fn main(init: std.process.Init) !void {
                 ai += 1;
                 chat_anchor_did = args[ai];
             }
+        } else if (std.mem.eql(u8, arg, "--chat-publish")) {
+            chat_publish = true;
         } else if (std.mem.eql(u8, arg, "--tui")) {
             tui_mode = true;
         } else if (std.mem.eql(u8, arg, "--window")) {
@@ -438,7 +446,7 @@ pub fn main(init: std.process.Init) !void {
     // resulting at-uri/cid, and exit. This is the write-leg test: the record
     // lands in the user's OWN PDS under app.zat4.feed.post, from where the
     // firehose carries it to the Zat4 AppView.
-    if (post_text != null or follow_target != null or publish_algo_name != null or publish_discover) {
+    if (post_text != null or follow_target != null or publish_algo_name != null or publish_discover or chat_publish) {
         var from_cache = false;
         var session: auth.Session = undefined;
         if (env.get("ZAT_APP_PASSWORD")) |password| {
@@ -467,6 +475,41 @@ pub fn main(init: std.process.Init) !void {
         if (session_path) |sp| _ = cache_shell.saveSessionAt(gpa, sp, &session); // persist rotated tokens (E4)
 
         const now = clock_shell.unixSeconds();
+
+        // The chat key-directory leg (U6): publish this account's last-resort
+        // keyPackage, then fetch it back the way a COUNTERPARTY would (public
+        // getRecord on the DID's own PDS) and validate the whole chain.
+        if (chat_publish) {
+            const pub_result = chat_keys.ensurePublished(gpa, arena, io, env, &session) catch |err| {
+                try out.print("--chat-publish failed: {s}\n", .{@errorName(err)});
+                try out.flush();
+                return err;
+            };
+            try out.print(
+                \\[chat] keyPackage record {s}
+                \\[chat]   uri: {s}
+                \\[chat]   cid: {s}
+                \\
+            , .{ if (pub_result.minted) @as([]const u8, "PUBLISHED (fresh package minted)") else "REPUBLISHED (stored package)", pub_result.uri, pub_result.cid });
+            try out.flush();
+            const fetched = chat_keys.fetchPeer(gpa, arena, io, env, session.did) catch |err| {
+                try out.print("[chat] fetch-back FAILED: {s}\n", .{@errorName(err)});
+                try out.flush();
+                return err;
+            };
+            if (fetched) |peer| {
+                const pub_hex = std.fmt.bytesToHex(peer.anchor_pub, .lower);
+                try out.print(
+                    \\[chat] fetch-back VALID — the directory chain holds:
+                    \\[chat]   anchor key: {s}
+                    \\[chat]   keyPackage: {d} bytes, suite + signatures + DID binding verified
+                    \\
+                , .{ pub_hex, peer.kp_bytes.len });
+            } else {
+                try out.print("[chat] fetch-back found NO record — publish did not land\n", .{});
+            }
+            try out.flush();
+        }
 
         // The post leg: publish one app.zat4.feed.post into the user's own PDS,
         // from where the AppView's poll/firehose carries it into Zat4.
@@ -700,7 +743,9 @@ test {
     _ = @import("core/mls_schedule.zig");
     _ = @import("core/mls.zig");
     _ = @import("core/anchor.zig");
+    _ = @import("core/keydir.zig");
     _ = @import("shell/chat_relay.zig");
+    _ = @import("shell/chat_keys.zig");
     _ = @import("core/oauth.zig");
     _ = @import("core/oauth_flow.zig");
     _ = @import("core/dagcbor.zig");

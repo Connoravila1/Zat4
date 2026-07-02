@@ -765,6 +765,120 @@ fn parseAnchorSeed(bytes: []const u8, did: []const u8) ?[anchor_seed_len]u8 {
     return bytes[10 + dlen ..][0..anchor_seed_len].*;
 }
 
+// --- Chat last-resort KeyPackage persistence (Zat Chat slice U6) ------------
+//
+// The published keyPackage record is public; its PRIVATE halves (the init and
+// encryption keys `mls.generateKeyPackage` returned, plus the exact published
+// wire bytes they belong to) must survive relaunches — a Welcome addressed to
+// this package can arrive weeks after it was minted. Same posture as the
+// anchor: per-DID, keystore preferred, 0600 file fallback, never cleared by
+// sign-out.
+const chat_kp_magic = [4]u8{ 'Z', 'A', 'T', 'K' };
+const chat_kp_version: u16 = 1;
+const chat_kp_keystore_prefix = "chat-kp:";
+
+/// A7.2: cold struct, size guard waived — one per chat identity, transient.
+pub const ChatKeyPackage = struct {
+    init_priv: [32]u8,
+    enc_priv: [32]u8,
+    /// The published MLSMessage(KeyPackage) bytes these keys belong to
+    /// (gpa-owned; free with `freeChatKeyPackage`).
+    kp_bytes: []u8,
+};
+
+pub fn freeChatKeyPackage(gpa: Allocator, kp: *ChatKeyPackage) void {
+    std.crypto.secureZero(u8, &kp.init_priv);
+    std.crypto.secureZero(u8, &kp.enc_priv);
+    gpa.free(kp.kp_bytes);
+    kp.kp_bytes = &.{};
+}
+
+pub fn chatKeyPackagePath(buf: []u8, environ: ?*const std.process.Environ.Map, did: []const u8) ?[]const u8 {
+    var dir_buf: [512]u8 = undefined;
+    const dir = cacheDir(&dir_buf, environ) orelse return null;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(did, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest[0..8].*, .lower);
+    var name_buf: [32]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "chatkp-{s}.zat", .{hex}) catch return null;
+    return joinFile(buf, dir, name);
+}
+
+fn chatKpKeystoreKey(buf: *[255]u8, did: []const u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, chat_kp_keystore_prefix ++ "{s}", .{did}) catch null;
+}
+
+pub fn saveChatKeyPackageAt(gpa: Allocator, path: []const u8, did: []const u8, kp: *const ChatKeyPackage) bool {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var out: std.ArrayList(u8) = .empty;
+    out.appendSlice(arena, &chat_kp_magic) catch return false;
+    out.appendSlice(arena, std.mem.asBytes(&chat_kp_version)) catch return false;
+    const dlen: u32 = @intCast(did.len);
+    out.appendSlice(arena, std.mem.asBytes(&dlen)) catch return false;
+    out.appendSlice(arena, did) catch return false;
+    out.appendSlice(arena, &kp.init_priv) catch return false;
+    out.appendSlice(arena, &kp.enc_priv) catch return false;
+    const klen: u32 = @intCast(kp.kp_bytes.len);
+    out.appendSlice(arena, std.mem.asBytes(&klen)) catch return false;
+    out.appendSlice(arena, kp.kp_bytes) catch return false;
+    if (keystore_supported) {
+        var key_buf: [255]u8 = undefined;
+        if (chatKpKeystoreKey(&key_buf, did)) |key| {
+            if (keystore.put(gpa, key, out.items)) {
+                unlink(path);
+                return true;
+            }
+        }
+    }
+    return writeFileAtomic(path, out.items, 0o600);
+}
+
+/// The stored last-resort package for `did`, or null (none / damaged / a
+/// different DID's blob). Keystore first, then the 0600 file.
+pub fn loadChatKeyPackageAt(gpa: Allocator, path: []const u8, did: []const u8) ?ChatKeyPackage {
+    if (keystore_supported) {
+        var key_buf: [255]u8 = undefined;
+        if (chatKpKeystoreKey(&key_buf, did)) |key| {
+            if (keystore.get(gpa, key)) |blob| {
+                defer {
+                    std.crypto.secureZero(u8, blob);
+                    gpa.free(blob);
+                }
+                if (parseChatKeyPackage(gpa, blob, did)) |kp| return kp;
+            }
+        }
+    }
+    const bytes = readFileAlloc(gpa, path) orelse return null;
+    defer {
+        std.crypto.secureZero(u8, bytes);
+        gpa.free(bytes);
+    }
+    return parseChatKeyPackage(gpa, bytes, did);
+}
+
+fn parseChatKeyPackage(gpa: Allocator, bytes: []const u8, did: []const u8) ?ChatKeyPackage {
+    // 4 magic + 2 version + 4 did-len = 10 byte header minimum.
+    if (bytes.len < 10 or !std.mem.eql(u8, bytes[0..4], &chat_kp_magic)) return null;
+    if (std.mem.bytesToValue(u16, bytes[4..6]) != chat_kp_version) return null;
+    const dlen = std.mem.bytesToValue(u32, bytes[6..10]);
+    var at: usize = 10;
+    if (bytes.len - at < dlen) return null;
+    if (!std.mem.eql(u8, bytes[at .. at + dlen], did)) return null;
+    at += dlen;
+    if (bytes.len - at < 64 + 4) return null;
+    const init_priv: [32]u8 = bytes[at..][0..32].*;
+    at += 32;
+    const enc_priv: [32]u8 = bytes[at..][0..32].*;
+    at += 32;
+    const klen = std.mem.bytesToValue(u32, bytes[at..][0..4]);
+    at += 4;
+    if (bytes.len - at != klen) return null;
+    const kp_bytes = gpa.dupe(u8, bytes[at..]) catch return null;
+    return .{ .init_priv = init_priv, .enc_priv = enc_priv, .kp_bytes = kp_bytes };
+}
+
 /// A7.2: cold struct, size guard waived — one per chat startup, transient.
 pub const AnchorLoad = struct {
     seed: [anchor_seed_len]u8,
@@ -935,6 +1049,35 @@ test "cache: anchor seed round-trips per DID behind 0600 and refuses mismatches"
     // Absence means "no anchor yet".
     unlink(path);
     try testing.expectEqual(@as(?[anchor_seed_len]u8, null), loadAnchorSeedAt(gpa, path, did));
+}
+
+test "cache: chat keyPackage privates round-trip per DID and refuse mismatches" {
+    const gpa = testing.allocator; // C6
+    var path_buf: [128]u8 = undefined;
+    const path = tmpPath(&path_buf, "chatkp");
+    defer unlink(path);
+
+    const did = "did:plc:kpkpkpkpkpkpkpkpkpkpkpkp";
+    var kp: ChatKeyPackage = .{
+        .init_priv = [_]u8{0xA1} ** 32,
+        .enc_priv = [_]u8{0xB2} ** 32,
+        .kp_bytes = try gpa.dupe(u8, "fake-key-package-wire-bytes"),
+    };
+    defer freeChatKeyPackage(gpa, &kp);
+
+    try testing.expect(saveChatKeyPackageAt(gpa, path, did, &kp));
+    var loaded = loadChatKeyPackageAt(gpa, path, did) orelse return error.TestUnexpectedResult;
+    defer freeChatKeyPackage(gpa, &loaded);
+    try testing.expectEqualSlices(u8, &kp.init_priv, &loaded.init_priv);
+    try testing.expectEqualSlices(u8, &kp.enc_priv, &loaded.enc_priv);
+    try testing.expectEqualStrings("fake-key-package-wire-bytes", loaded.kp_bytes);
+
+    // Another DID sees nothing; corruption is null; absence is null.
+    try testing.expect(loadChatKeyPackageAt(gpa, path, "did:plc:nnnnnnnnnnnnnnnnnnnnnnnn") == null);
+    try testing.expect(writeFileAtomic(path, "garbage", 0o600));
+    try testing.expect(loadChatKeyPackageAt(gpa, path, did) == null);
+    unlink(path);
+    try testing.expect(loadChatKeyPackageAt(gpa, path, did) == null);
 }
 
 test "cache: anchorPath keys files by DID" {
