@@ -670,6 +670,127 @@ pub fn oauthSessionPath(buf: []u8, environ: ?*const std.process.Environ.Map) ?[]
     return joinFile(buf, dir, oauth_session_file);
 }
 
+// --- Chat anchor key persistence (Zat Chat slice C6) -------------------------
+//
+// The anchor key is the device-bound Ed25519 seed that IS the user's chat
+// identity (core/anchor.zig) — never delegated to the PDS, never in the repo.
+// Same storage posture as the sessions above: OS keystore preferred, 0600 file
+// fallback, a verified keystore store deletes the plaintext sibling.
+//
+// Keyed PER DID: a device can host several accounts over time, and one
+// account's anchor must never clobber another's (losing an anchor seed is an
+// IDENTITY change — peers see a new key). For the same reason `clearSession`
+// deliberately does NOT touch anchors: sign-out ends the session, not the
+// device's chat identity; signing back into the same account finds the same
+// anchor and the published keyPackage stays valid.
+const anchor_magic = [4]u8{ 'Z', 'A', 'T', 'A' };
+const anchor_version: u16 = 1;
+const anchor_seed_len = 32;
+const anchor_keystore_prefix = "chat-anchor:";
+
+/// Cache-file path for a DID's anchor: `anchor-<16 hex of sha256(did)>.zat`.
+/// Hashed because DIDs contain ':' (illegal in Windows filenames) and can be
+/// long; the DID itself is stored inside the blob and checked on load.
+pub fn anchorPath(buf: []u8, environ: ?*const std.process.Environ.Map, did: []const u8) ?[]const u8 {
+    var dir_buf: [512]u8 = undefined;
+    const dir = cacheDir(&dir_buf, environ) orelse return null;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(did, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest[0..8].*, .lower);
+    var name_buf: [32]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "anchor-{s}.zat", .{hex}) catch return null;
+    return joinFile(buf, dir, name);
+}
+
+/// The per-DID keystore key, or null when the DID is too long for the
+/// keystore's key buffer (then the file is the only store).
+fn anchorKeystoreKey(buf: *[255]u8, did: []const u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, anchor_keystore_prefix ++ "{s}", .{did}) catch null;
+}
+
+pub fn saveAnchorSeedAt(gpa: Allocator, path: []const u8, did: []const u8, seed: [anchor_seed_len]u8) bool {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var out: std.ArrayList(u8) = .empty;
+    out.appendSlice(arena, &anchor_magic) catch return false;
+    out.appendSlice(arena, std.mem.asBytes(&anchor_version)) catch return false;
+    const dlen: u32 = @intCast(did.len);
+    out.appendSlice(arena, std.mem.asBytes(&dlen)) catch return false;
+    out.appendSlice(arena, did) catch return false;
+    out.appendSlice(arena, &seed) catch return false;
+    if (keystore_supported) {
+        var key_buf: [255]u8 = undefined;
+        if (anchorKeystoreKey(&key_buf, did)) |key| {
+            if (keystore.put(gpa, key, out.items)) {
+                unlink(path);
+                return true;
+            }
+        }
+    }
+    return writeFileAtomic(path, out.items, 0o600);
+}
+
+/// The anchor seed for `did`, or null if none is stored (first chat use) or
+/// the stored blob is damaged / for a different DID. Keystore first, then the
+/// 0600 file.
+pub fn loadAnchorSeedAt(gpa: Allocator, path: []const u8, did: []const u8) ?[anchor_seed_len]u8 {
+    if (keystore_supported) {
+        var key_buf: [255]u8 = undefined;
+        if (anchorKeystoreKey(&key_buf, did)) |key| {
+            if (keystore.get(gpa, key)) |blob| {
+                defer {
+                    std.crypto.secureZero(u8, blob);
+                    gpa.free(blob);
+                }
+                if (parseAnchorSeed(blob, did)) |seed| return seed;
+            }
+        }
+    }
+    const bytes = readFileAlloc(gpa, path) orelse return null;
+    defer {
+        std.crypto.secureZero(u8, bytes);
+        gpa.free(bytes);
+    }
+    return parseAnchorSeed(bytes, did);
+}
+
+fn parseAnchorSeed(bytes: []const u8, did: []const u8) ?[anchor_seed_len]u8 {
+    // 4 magic + 2 version + 4 did-len = 10 byte header minimum.
+    if (bytes.len < 10 or !std.mem.eql(u8, bytes[0..4], &anchor_magic)) return null;
+    if (std.mem.bytesToValue(u16, bytes[4..6]) != anchor_version) return null;
+    const dlen = std.mem.bytesToValue(u32, bytes[6..10]);
+    if (bytes.len != 10 + @as(usize, dlen) + anchor_seed_len) return null;
+    if (!std.mem.eql(u8, bytes[10 .. 10 + dlen], did)) return null;
+    return bytes[10 + dlen ..][0..anchor_seed_len].*;
+}
+
+/// A7.2: cold struct, size guard waived — one per chat startup, transient.
+pub const AnchorLoad = struct {
+    seed: [anchor_seed_len]u8,
+    /// True when this call minted (and persisted) a fresh anchor.
+    created: bool,
+};
+
+/// The one entry point chat uses: the stored anchor for `did`, or a freshly
+/// generated one (CSPRNG) persisted before it is handed out. Null means no
+/// anchor is possible right now (no cache dir AND no keystore, or no entropy)
+/// — a caller must treat that as "chat identity unavailable", NEVER mint an
+/// ephemeral key, because an unpersisted anchor would silently become a new
+/// identity on every launch.
+pub fn loadOrCreateAnchorSeed(gpa: Allocator, io: std.Io, environ: ?*const std.process.Environ.Map, did: []const u8) ?AnchorLoad {
+    var path_buf: [512]u8 = undefined;
+    const path = anchorPath(&path_buf, environ, did) orelse return null;
+    if (loadAnchorSeedAt(gpa, path, did)) |seed| return .{ .seed = seed, .created = false };
+    var seed: [anchor_seed_len]u8 = undefined;
+    io.randomSecure(&seed) catch return null;
+    if (!saveAnchorSeedAt(gpa, path, did, seed)) {
+        std.crypto.secureZero(u8, &seed);
+        return null;
+    }
+    return .{ .seed = seed, .created = true };
+}
+
 // ---------------------------------------------------------------------------
 // Tests (C6) — real files under /tmp, cleaned up
 // ---------------------------------------------------------------------------
@@ -781,4 +902,52 @@ test "cache: OAuth session round-trips key, tokens, and nonce" {
     const loaded2 = loadOAuthSessionAt(gpa, path2) orelse return error.TestUnexpectedResult;
     defer auth.freeSession(gpa, loaded2);
     try testing.expectEqual(@as(?[]const u8, null), loaded2.nonce);
+}
+
+test "cache: anchor seed round-trips per DID behind 0600 and refuses mismatches" {
+    const gpa = testing.allocator; // C6
+    var path_buf: [128]u8 = undefined;
+    const path = tmpPath(&path_buf, "anchor");
+    defer unlink(path);
+
+    const did = "did:plc:eeeeeeeeeeeeeeeeeeeeeeee";
+    var seed: [anchor_seed_len]u8 = undefined;
+    for (&seed, 0..) |*b, i| b.* = @intCast(i * 3 & 0xff);
+
+    try testing.expect(saveAnchorSeedAt(gpa, path, did, seed));
+    const loaded = loadAnchorSeedAt(gpa, path, did) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, &seed, &loaded);
+
+    // 0600: the anchor is a secret at rest.
+    var z: [512]u8 = undefined;
+    var stx: linux.Statx = undefined;
+    const stat_rc = linux.statx(linux.AT.FDCWD, zPath(&z, path).?, 0, .{ .MODE = true }, &stx);
+    try testing.expect(stat_rc == 0);
+    try testing.expectEqual(@as(u16, 0o600), stx.mode & 0o777);
+
+    // Another DID's lookup must NOT see this seed (the blob self-identifies).
+    try testing.expectEqual(@as(?[anchor_seed_len]u8, null), loadAnchorSeedAt(gpa, path, "did:plc:ffffffffffffffffffffffff"));
+
+    // Corruption is refused quietly (first chat use then regenerates).
+    try testing.expect(writeFileAtomic(path, "not an anchor", 0o600));
+    try testing.expectEqual(@as(?[anchor_seed_len]u8, null), loadAnchorSeedAt(gpa, path, did));
+
+    // Absence means "no anchor yet".
+    unlink(path);
+    try testing.expectEqual(@as(?[anchor_seed_len]u8, null), loadAnchorSeedAt(gpa, path, did));
+}
+
+test "cache: anchorPath keys files by DID" {
+    // Two DIDs must land in two files; the same DID must be stable.
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("ZAT_CACHE_DIR", "/tmp/zat-anchor-test");
+    var b1: [512]u8 = undefined;
+    var b2: [512]u8 = undefined;
+    var b3: [512]u8 = undefined;
+    const p1 = anchorPath(&b1, &env, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa") orelse return error.TestUnexpectedResult;
+    const p2 = anchorPath(&b2, &env, "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb") orelse return error.TestUnexpectedResult;
+    const p3 = anchorPath(&b3, &env, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa") orelse return error.TestUnexpectedResult;
+    try testing.expect(!std.mem.eql(u8, p1, p2));
+    try testing.expectEqualStrings(p1, p3);
 }

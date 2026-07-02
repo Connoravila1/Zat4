@@ -40,6 +40,7 @@ const cache_shell = @import("shell/cache.zig");
 const config = @import("shell/config.zig");
 const window_shell = @import("shell/native.zig");
 const lexicon = @import("core/lexicon.zig");
+const anchor_core = @import("core/anchor.zig");
 const write = @import("shell/write.zig");
 const algorithm_shell = @import("shell/algorithm.zig");
 const builder = @import("core/builder.zig");
@@ -136,6 +137,11 @@ pub fn main(init: std.process.Init) !void {
     // session and makes an authenticated call WITHOUT re-login, proving the key
     // and tokens survive across launches.
     var oauth_resume = false;
+    // Chat anchor test (Zat Chat slice C6): `--chat-anchor <did>` loads or
+    // creates the device-bound anchor key for that DID, prints its public key,
+    // and self-verifies the DID binding. Run twice: "created" then "loaded"
+    // with the SAME public key proves persistence (keystore or 0600 file).
+    var chat_anchor_did: ?[]const u8 = null;
     var ai: usize = 1;
     while (ai < args.len) : (ai += 1) {
         const arg = args[ai];
@@ -161,6 +167,11 @@ pub fn main(init: std.process.Init) !void {
             }
         } else if (std.mem.eql(u8, arg, "--oauth-resume")) {
             oauth_resume = true;
+        } else if (std.mem.eql(u8, arg, "--chat-anchor")) {
+            if (ai + 1 < args.len) {
+                ai += 1;
+                chat_anchor_did = args[ai];
+            }
         } else if (std.mem.eql(u8, arg, "--tui")) {
             tui_mode = true;
         } else if (std.mem.eql(u8, arg, "--window")) {
@@ -362,6 +373,29 @@ pub fn main(init: std.process.Init) !void {
         }
         // Re-save: the nonce (and possibly tokens) rotated during the call.
         _ = cache_shell.saveOAuthSessionAt(gpa, sp, &sess);
+        try out.flush();
+        return;
+    }
+
+    // Zat Chat C6 proof: the device-bound anchor key survives relaunches and
+    // its DID binding self-verifies. Purely local — no network, no session.
+    if (chat_anchor_did) |did| {
+        var res = cache_shell.loadOrCreateAnchorSeed(gpa, io, env, did) orelse {
+            try out.print("--chat-anchor: could not create or persist an anchor (no keystore, no writable cache dir, or no entropy)\n", .{});
+            try out.flush();
+            return;
+        };
+        defer std.crypto.secureZero(u8, &res.seed);
+        const anchor_pub = try anchor_core.publicKey(res.seed);
+        const sig = try anchor_core.signDidBinding(res.seed, did);
+        try anchor_core.verifyDidBinding(anchor_pub, did, &sig);
+        const pub_hex = std.fmt.bytesToHex(anchor_pub, .lower);
+        try out.print(
+            \\[chat] anchor {s} for {s}
+            \\[chat]   public key: {s}
+            \\[chat]   DID binding signs and verifies (anchor <-> DID)
+            \\
+        , .{ if (res.created) @as([]const u8, "CREATED") else "LOADED", did, pub_hex });
         try out.flush();
         return;
     }
@@ -665,6 +699,7 @@ test {
     _ = @import("core/mls_wire.zig");
     _ = @import("core/mls_schedule.zig");
     _ = @import("core/mls.zig");
+    _ = @import("core/anchor.zig");
     _ = @import("core/oauth.zig");
     _ = @import("core/oauth_flow.zig");
     _ = @import("core/dagcbor.zig");
