@@ -82,13 +82,38 @@ pub fn build(b: *std.Build) void {
     const appview_test_step = b.step("test-appview", "Run the AppView's offline unit tests (leak-checked)");
     appview_test_step.dependOn(&run_appview_tests.step);
 
+    // The Zat Chat thin relay (ZAT_CHAT_ROADMAP U4) — like the AppView, a
+    // separate headless binary that cross-compiles to the box:
+    // `zig build -Dtarget=x86_64-linux relay`.
+    const relay_mod = b.createModule(.{
+        .root_source_file = b.path("src/relay_main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const relay_exe = b.addExecutable(.{
+        .name = "zat4-relay",
+        .root_module = relay_mod,
+    });
+    b.installArtifact(relay_exe);
+    const relay_run = b.addRunArtifact(relay_exe);
+    relay_run.step.dependOn(b.getInstallStep());
+    if (b.args) |args| relay_run.addArgs(args);
+    const relay_step = b.step("relay", "Run the Zat Chat relay (store-and-forward for E2EE blobs)");
+    relay_step.dependOn(&relay_run.step);
+
+    const relay_tests = b.addTest(.{ .root_module = relay_mod });
+    const run_relay_tests = b.addRunArtifact(relay_tests);
+    const relay_test_step = b.step("test-relay", "Run the relay's offline unit tests (leak-checked)");
+    relay_test_step.dependOn(&run_relay_tests.step);
+
     const unit_tests = b.addTest(.{ .root_module = exe_mod });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run offline unit tests (leak-checked)");
     test_step.dependOn(&run_unit_tests.step);
-    // The AppView's tests ride the default test step too, so `zig build test`
-    // covers the whole project including Phase C.
+    // The AppView's and relay's tests ride the default test step too, so
+    // `zig build test` covers the whole project including the servers.
     test_step.dependOn(&run_appview_tests.step);
+    test_step.dependOn(&run_relay_tests.step);
 
     const live_mod = b.createModule(.{
         .root_source_file = b.path("src/live_tests.zig"),
