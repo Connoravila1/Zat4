@@ -45,10 +45,15 @@ pub const BubbleRow = struct {
     /// message, or a gap of `stamp_gap` seconds since the previous one).
     stamp: bool,
     kind: chat.Kind,
+    /// True on the LAST bubble of a consecutive same-sender run (a
+    /// different sender, a time-divider gap, or the thread's end closes a
+    /// run) — the speech-bubble TAIL draws only there; stacked bubbles
+    /// above it stay plain (the grouped-messenger grammar).
+    tail: bool = false,
 
     comptime {
-        // Budget 40: 2 slices (32) + 3 bytes = 35, padded to pointer
-        // alignment. (A7)
+        // Budget 40: 2 slices (32) + 4 bytes = 36, padded to pointer
+        // alignment — `tail` landed in existing padding. (A7)
         assert(@sizeOf(BubbleRow) == 40);
     }
 };
@@ -139,6 +144,11 @@ pub fn buildThread(
         };
         prev_at = at;
     }
+    // Close each same-sender run: the tail goes on its last bubble (a sender
+    // change, a time-divider gap, or the end of the thread ends a run).
+    for (out, 0..) |*row, i| {
+        row.tail = i + 1 == out.len or out[i + 1].mine != row.mine or out[i + 1].stamp;
+    }
     return out;
 }
 
@@ -202,4 +212,31 @@ test "buildThread orders bubbles and computes stamps at silences" {
     try std.testing.expect(!rows[1].stamp); // 30s gap: no divider
     try std.testing.expect(rows[2].stamp); // the silence earns one
     try std.testing.expectEqual(chat.Kind.text, rows[2].kind);
+    // Tails close the runs: [0] ends its run (sender change), [1] ends its
+    // run too (the divider after it breaks the group even though [2] is the
+    // same sender), [2] is the thread's end.
+    try std.testing.expect(rows[0].tail);
+    try std.testing.expect(rows[1].tail);
+    try std.testing.expect(rows[2].tail);
+}
+
+test "buildThread: a same-sender run keeps its tail only on the last bubble" {
+    const gpa = std.testing.allocator;
+    var store: chat.Store = .{};
+    defer chat.deinitStore(gpa, &store);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const a = try chat.openConversation(gpa, &store, "did:plc:aaa", "maya.zat4.com");
+    _ = try chat.appendMessage(gpa, &store, a, .text, "one", 1000, true);
+    _ = try chat.appendMessage(gpa, &store, a, .text, "two", 1010, true);
+    _ = try chat.appendMessage(gpa, &store, a, .text, "three", 1020, true);
+    _ = try chat.appendMessage(gpa, &store, a, .text, "reply", 1030, false);
+
+    const rows = try buildThread(arena, &store, a, 2000);
+    try std.testing.expect(!rows[0].tail); // stacked
+    try std.testing.expect(!rows[1].tail); // stacked
+    try std.testing.expect(rows[2].tail); // the run's last
+    try std.testing.expect(rows[3].tail); // thread end
 }

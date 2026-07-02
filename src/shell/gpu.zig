@@ -766,6 +766,19 @@ pub fn buildVertices(
             const uv = [4][2]f32{ .{ ua, va }, .{ ub, va }, .{ ub, vb }, .{ ua, vb } };
             try pushQuad(&verts, gpa, p, uv, zero_local, .{ 0, 0 }, 0, mode_glyph, argb(it.color));
         },
+        .tri => {
+            const it = bare.tri;
+            const ax: f32 = @as(f32, @floatFromInt(it.x0)) * scale;
+            const ay: f32 = @as(f32, @floatFromInt(it.y0)) * scale;
+            const tbx: f32 = @as(f32, @floatFromInt(it.x1)) * scale;
+            const tby: f32 = @as(f32, @floatFromInt(it.y1)) * scale;
+            const cx: f32 = @as(f32, @floatFromInt(it.x2)) * scale;
+            const cy: f32 = @as(f32, @floatFromInt(it.y2)) * scale;
+            // One solid triangle as a degenerate quad (two coincident
+            // corners → the second of pushQuad's triangles is zero-area).
+            const p = [4][2]f32{ .{ ax, ay }, .{ tbx, tby }, .{ cx, cy }, .{ cx, cy } };
+            try pushQuad(&verts, gpa, p, zero_uv, zero_local, .{ 0, 0 }, 0, mode_solid, argb(it.color));
+        },
         .cell => {}, // the embedded-strike fallback path is not used by the feed/field
     };
     return verts;

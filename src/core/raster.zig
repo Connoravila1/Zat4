@@ -124,6 +124,26 @@ pub const LineItem = struct {
     }
 };
 
+/// One solid triangle, alpha-blended — the speech-bubble tail's primitive
+/// (Zat Chat), available to any surface that needs a pointed shape the
+/// rect/line vocabulary can't make. HOT → A7.
+pub const TriItem = struct {
+    x0: i16,
+    y0: i16,
+    x1: i16,
+    y1: i16,
+    x2: i16,
+    y2: i16,
+    /// 0xAARRGGBB; AA respected.
+    color: u32,
+
+    comptime {
+        // Budget: 6×2 + 4 = 16 bytes, exact (A7) — the vocabulary's
+        // common payload size.
+        assert(@sizeOf(TriItem) == 16);
+    }
+};
+
 /// The paint vocabulary. Each variant is guarded above; the union's
 /// bare payload is their common 16 bytes, the tag rides its own SoA
 /// array (MultiArrayList splits tagged unions exactly this way).
@@ -132,14 +152,16 @@ pub const DrawItem = union(enum) {
     text: TextItem,
     rect: RectItem,
     line: LineItem,
+    tri: TriItem,
 
     comptime {
         // HOT (thousands per frame, stored in DrawList). Each variant is a
         // guarded 16 bytes; the union adds the active-variant tag, padded up
-        // to the payload's 4-byte alignment → 20. An exact guard so a fifth
-        // variant or a widened payload fails the build (A7). NOTE the bulk
-        // cost is lower than this: DrawList is a MultiArrayList, which stores
-        // the 1-byte tag and the 16-byte payload in SEPARATE arrays.
+        // to the payload's 4-byte alignment → 20. An exact guard so a new
+        // variant with a WIDENED payload fails the build (A7; `tri` joined
+        // at the same 16 — the guard held). NOTE the bulk cost is lower
+        // than this: DrawList is a MultiArrayList, which stores the 1-byte
+        // tag and the 16-byte payload in SEPARATE arrays.
         assert(@sizeOf(DrawItem) == 20);
     }
 };
@@ -194,6 +216,7 @@ pub fn paint(
         },
         .rect => drawRect(fb, bare.rect),
         .line => drawLine(fb, bare.line),
+        .tri => drawTri(fb, bare.tri),
         .text => if (engine) |e| {
             const it = bare.text;
             const g = try text.glyph(gpa, e, @enumFromInt(it.weight), it.codepoint, it.px);
@@ -298,6 +321,45 @@ fn drawRect(fb: *Framebuffer, r: RectItem) void {
             if (px < 0 or px >= fb.width) continue;
             const at = @as(usize, @intCast(py)) * fb.width + @as(usize, @intCast(px));
             fb.pixels[at] = if (src_a == 255) r.color else blend(r.color, fb.pixels[at], src_a);
+        }
+    }
+}
+
+/// Solid triangle fill: integer edge functions over the bounding box —
+/// a pixel is in when all three half-plane tests agree with the winding
+/// (either winding accepted). Small shapes by design (a bubble tail is
+/// ~16px); the bounding-box loop is exact and cheap at that size.
+fn drawTri(fb: *Framebuffer, t: TriItem) void {
+    const src_a: u32 = t.color >> 24;
+    if (src_a == 0) return;
+    const x0: i32 = t.x0;
+    const y0: i32 = t.y0;
+    const x1: i32 = t.x1;
+    const y1: i32 = t.y1;
+    const x2: i32 = t.x2;
+    const y2: i32 = t.y2;
+    const area = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
+    if (area == 0) return;
+    const fbw: i32 = @intCast(fb.width);
+    const fbh: i32 = @intCast(fb.height);
+    const minx = @max(0, @min(x0, @min(x1, x2)));
+    const maxx = @min(fbw - 1, @max(x0, @max(x1, x2)));
+    const miny = @max(0, @min(y0, @min(y1, y2)));
+    const maxy = @min(fbh - 1, @max(y0, @max(y1, y2)));
+    var py = miny;
+    while (py <= maxy) : (py += 1) {
+        var px = minx;
+        while (px <= maxx) : (px += 1) {
+            const w0 = (x1 - x0) * (py - y0) - (y1 - y0) * (px - x0);
+            const w1 = (x2 - x1) * (py - y1) - (y2 - y1) * (px - x1);
+            const w2 = (x0 - x2) * (py - y2) - (y0 - y2) * (px - x2);
+            const in = if (area > 0)
+                w0 >= 0 and w1 >= 0 and w2 >= 0
+            else
+                w0 <= 0 and w1 <= 0 and w2 <= 0;
+            if (!in) continue;
+            const at = @as(usize, @intCast(py)) * fb.width + @as(usize, @intCast(px));
+            fb.pixels[at] = if (src_a == 255) t.color else blend(t.color, fb.pixels[at], src_a);
         }
     }
 }
@@ -469,6 +531,39 @@ test "paint: out-of-bounds items are skipped whole, never written" {
     try list.append(gpa, .{ .cell = .{ .x = 1, .y = 0, .codepoint = 'X', .fg = 0xFFFFFFFF, .bg = 0 } });
     try paint(gpa, null, list.slice(), &fb, 0);
     for (fb.pixels) |p| try testing.expectEqual(@as(u32, 0), p);
+}
+
+test "tri: fills inside, leaves outside, clips the frame edge, blends alpha" {
+    const gpa = testing.allocator;
+    var fb: Framebuffer = .{};
+    defer deinit(gpa, &fb);
+    try resize(gpa, &fb, 32, 32, 0xFF000000);
+
+    var list: DrawList = .empty;
+    defer list.deinit(gpa);
+    // A right triangle: (4,4) (20,4) (4,20) — both windings must fill.
+    try list.append(gpa, .{ .tri = .{ .x0 = 4, .y0 = 4, .x1 = 20, .y1 = 4, .x2 = 4, .y2 = 20, .color = 0xFFFF0000 } });
+    // A second, half-alpha, poking past the right edge: clipped, not wrapped.
+    try list.append(gpa, .{ .tri = .{ .x0 = 28, .y0 = 24, .x1 = 40, .y1 = 24, .x2 = 28, .y2 = 30, .color = 0x80FFFFFF } });
+    try paint(gpa, null, list.slice(), &fb, 0xFF000000);
+
+    const at = struct {
+        fn px(f: *const Framebuffer, x: usize, y: usize) u32 {
+            return f.pixels[y * f.width + x];
+        }
+    };
+    try testing.expectEqual(@as(u32, 0xFFFF0000), at.px(&fb, 6, 6)); // inside
+    try testing.expectEqual(@as(u32, 0xFF000000), at.px(&fb, 19, 19)); // outside the hypotenuse
+    try testing.expect(at.px(&fb, 29, 25) != 0xFF000000); // clipped tri still fills in-frame
+    // Half-alpha blended over black: grey, not white, not black.
+    const g = at.px(&fb, 29, 25) & 0xFF;
+    try testing.expect(g > 0x40 and g < 0xC0);
+    // Degenerate (zero area) draws nothing.
+    var list2: DrawList = .empty;
+    defer list2.deinit(gpa);
+    try list2.append(gpa, .{ .tri = .{ .x0 = 2, .y0 = 2, .x1 = 2, .y1 = 2, .x2 = 2, .y2 = 2, .color = 0xFFFFFFFF } });
+    try paint(gpa, null, list2.slice(), &fb, 0xFF000000);
+    for (fb.pixels) |p| try testing.expectEqual(@as(u32, 0xFF000000), p);
 }
 
 test "blend: exact at both endpoints, monotone between" {

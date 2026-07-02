@@ -520,6 +520,34 @@ fn rect(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, w: i32, h: i32, co
     } });
 }
 
+fn tri(gpa: Allocator, dl: *raster.DrawList, x0: i32, y0: i32, x1: i32, y1: i32, x2: i32, y2: i32, color: u32) !void {
+    try dl.append(gpa, .{ .tri = .{
+        .x0 = @intCast(x0),
+        .y0 = @intCast(y0),
+        .x1 = @intCast(x1),
+        .y1 = @intCast(y1),
+        .x2 = @intCast(x2),
+        .y2 = @intCast(y2),
+        .color = color,
+    } });
+}
+
+/// The speech-bubble tail: a small triangle hugging the bubble's bottom
+/// composer-side corner, pointing back at its sender — sent bubbles point
+/// bottom-right, received bottom-left. It covers the corner's rounding and
+/// pokes just past the edge, so the corner reads as the classic messenger
+/// point. Drawn only where `BubbleRow.tail` says a same-sender run ends.
+fn bubbleTail(gpa: Allocator, dl: *raster.DrawList, mine: bool, bx: i32, by: i32, bw: i32, hh: i32, color: u32) !void {
+    const bot = by + hh;
+    const nib = @min(14, @max(0, hh - 4)); // stay inside a mid-growth bubble
+    if (mine) {
+        const cx = bx + bw;
+        try tri(gpa, dl, cx - nib, bot, cx, bot - nib, cx + 6, bot + 1, color);
+    } else {
+        try tri(gpa, dl, bx + nib, bot, bx, bot - nib, bx - 6, bot + 1, color);
+    }
+}
+
 /// One proportional glyph; returns the pen x after it.
 fn glyph1(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, weight: text.Weight, x: i32, baseline: i32, color: u32, px: u16, cp: u32) !i32 {
     try dl.append(gpa, .{ .text = .{
@@ -3763,59 +3791,34 @@ pub fn layoutChat(
                 const fill: u32 = if (b.mine) (0x38 << 24) | (accent & 0x00FFFFFF) else skinPanel(accent);
                 if (!is_fly) {
                     try rect(gpa, dl, bx, by, bw, hh, fill, 14);
+                    if (b.tail) try bubbleTail(gpa, dl, b.mine, bx, by, bw, hh, fill);
                     _ = try wrapBody(gpa, dl, e, bx + pad_x, by + pad_y + 12, bub_max - 2 * pad_x, ink, 14, b.body, line_h, true, null);
                 } else {
-                    // THE MORPH. Spring physics, not easing: position and
-                    // scale ride the SAME spring (unclamped t — a gentle
-                    // ~2% overshoot that settles is what reads as native),
-                    // and opacity ramps FASTER than the transform (opaque
-                    // by 60% of the motion, so the bubble is solid while
-                    // it is still settling — a bubble translucent at rest
-                    // reads as cheap). Anchors: sent scales from its
-                    // bottom-right (out of the composer), received from
-                    // its bottom-left (out of the typing indicator's slot
-                    // — the indicator melts as this grows, so it reads as
-                    // the dots BECOMING the message).
+                    // THE MORPH. Spring physics, not easing: rise and scale
+                    // ride the SAME spring (unclamped t — a gentle ~2%
+                    // overshoot that settles reads as native). The motion
+                    // is VERTICAL only — a rise from just below the seat
+                    // (the composer / typing-indicator slot is right
+                    // there); a cross-pane sweep read wrong. The rect (and
+                    // its tail) does the scaling, TIGHT (86%+), anchored at
+                    // the sender-side bottom corner; the text stays at its
+                    // final size and position — the renderer rasterizes
+                    // text at integer px, so continuous glyph scaling
+                    // STEPS between sizes (the chop). Opacity ramps faster
+                    // than the transform: opaque by 60% of the motion, so
+                    // the bubble is solid while it is still settling.
                     const fade = std.math.clamp(fly_c / 0.6, 0.0, 1.0);
+                    const grow = 0.86 + 0.14 * fly_t;
                     const seat_bot: f32 = @floatFromInt(y + hh);
-                    if (fits_one) {
-                        // One line: rect and GLYPHS travel + scale as one
-                        // unit (true text scaling — no wrap, no reflow).
-                        const grow = 0.62 + 0.38 * fly_t;
-                        const origin_bot: f32 = if (b.mine)
-                            @floatFromInt(comp_y + 4)
-                        else
-                            @floatFromInt(comp_y - 10);
-                        const bot_a = seat_bot + (origin_bot - seat_bot) * (1.0 - fly_t);
-                        const px_a: u16 = @intFromFloat(std.math.clamp(@round(14.0 * grow), 9.0, 16.0));
-                        const tw_a: i32 = @intCast(text.measure(e, .regular, b.body, px_a));
-                        const pad_a: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(pad_x)) * grow));
-                        const w_a = tw_a + 2 * pad_a;
-                        const h_a: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(hh)) * grow));
-                        const x_final: f32 = @floatFromInt(bx);
-                        const x_origin: f32 = if (b.mine) @floatFromInt(detail_x + 14) else x_final;
-                        const x_a: i32 = @intFromFloat(@round(x_final + (x_origin - x_final) * (1.0 - fly_c)));
-                        const y_a = @as(i32, @intFromFloat(@round(bot_a))) - h_a;
-                        try rect(gpa, dl, x_a, y_a, w_a, h_a, scaleAlpha(fill, fade), 14);
-                        _ = try str(gpa, dl, e, .regular, x_a + pad_a, y_a + h_a - @as(i32, @intFromFloat(@round(14.0 * grow))), scaleAlpha(ink, fade), px_a, b.body);
-                    } else {
-                        // Wrapped text cannot rescale without reflowing, so
-                        // the multi-line morph keeps the scale TIGHT (90%+,
-                        // where the rect/text mismatch is invisible under
-                        // the unified fade) and leans on travel + push.
-                        const grow = 0.90 + 0.10 * fly_t;
-                        const origin_bot: f32 = if (b.mine)
-                            @floatFromInt(comp_y + 4)
-                        else
-                            seat_bot + 24.0;
-                        const bot_a = seat_bot + (origin_bot - seat_bot) * (1.0 - fly_t);
-                        const bw_a: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(bw)) * grow));
-                        const hh_a: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(hh)) * grow));
-                        const bx_a = if (b.mine) bx + (bw - bw_a) else bx;
-                        const by_a = @as(i32, @intFromFloat(@round(bot_a))) - hh_a;
-                        try rect(gpa, dl, bx_a, by_a, bw_a, hh_a, scaleAlpha(fill, fade), 14);
-                        _ = try wrapBody(gpa, dl, e, bx + pad_x, by_a + pad_y + 12, bub_max - 2 * pad_x, scaleAlpha(ink, fade), 14, b.body, line_h, true, null);
-                    }
+                    const bot_a = seat_bot + 28.0 * (1.0 - fly_t);
+                    const bw_a: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(bw)) * grow));
+                    const hh_a: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(hh)) * grow));
+                    const bx_a = if (b.mine) bx + (bw - bw_a) else bx;
+                    const by_a = @as(i32, @intFromFloat(@round(bot_a))) - hh_a;
+                    const fill_a = scaleAlpha(fill, fade);
+                    try rect(gpa, dl, bx_a, by_a, bw_a, hh_a, fill_a, 14);
+                    if (b.tail) try bubbleTail(gpa, dl, b.mine, bx_a, by_a, bw_a, hh_a, fill_a);
+                    _ = try wrapBody(gpa, dl, e, bx + pad_x, by_a + pad_y + 12, bub_max - 2 * pad_x, scaleAlpha(ink, fade), 14, b.body, line_h, true, null);
                 }
             }
         }
@@ -3838,6 +3841,10 @@ pub fn layoutChat(
         const tw: i32 = @intFromFloat(@round(64.0 * (0.55 + 0.45 * tt)));
         const ty = comp_y - 12 - th;
         try rect(gpa, dl, detail_x, ty, tw, th, scaleAlpha(skinPanel(accent), typing_open), 14);
+        // The indicator is a received-side bubble: it wears the tail too —
+        // and the arriving message grows out of this same slot, so the
+        // handoff reads as the dots becoming the message.
+        try bubbleTail(gpa, dl, false, detail_x, ty, tw, th, scaleAlpha(skinPanel(accent), typing_open));
         if (typing_open > 0.55) {
             const dot_a = (typing_open - 0.55) / 0.45; // dots arrive after the bubble
             var di: i32 = 0;
@@ -4199,8 +4206,8 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
         .{ .name = "did:plc:xyz", .preview = "hello there", .age = "1m", .unread = 3 },
     };
     const brows = [_]chat_view.BubbleRow{
-        .{ .body = "hey", .age = "2h", .mine = true, .stamp = true, .kind = .text },
-        .{ .body = "a longer reply that should wrap across the bubble width once it exceeds the maximum line", .age = "2h", .mine = false, .stamp = false, .kind = .text },
+        .{ .body = "hey", .age = "2h", .mine = true, .stamp = true, .kind = .text, .tail = true },
+        .{ .body = "a longer reply that should wrap across the bubble width once it exceeds the maximum line", .age = "2h", .mine = false, .stamp = false, .kind = .text, .tail = true },
     };
 
     // Narrow width (460): no rail regions, so the counts are exactly the
