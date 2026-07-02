@@ -45,6 +45,7 @@ const timeline_ui = @import("../core/timeline_ui.zig");
 const feed_core = @import("../core/feed.zig");
 const chat_core = @import("../core/chat.zig");
 const chat_view_core = @import("../core/chat_view.zig");
+const chat_relay = @import("chat_relay.zig");
 const feed_shell = @import("feed.zig");
 const stream_shell = @import("stream.zig");
 const cache_shell = @import("cache.zig");
@@ -538,6 +539,34 @@ pub fn run(
             _ = chat_core.appendMessage(gpa, &gchat_store, c, .text, "monospace is the most honest a feed can be", seed_now - 86_400, false) catch {};
         }
     }
+    // Zat Chat dev TRANSPORT (U5, dev-gated): real store-and-forward through
+    // the relay, still dev-plaintext (the honesty banner stays). Live only
+    // when ZAT4_RELAY=host:port and ZAT_RELAY_TOKEN are set; otherwise the
+    // surface stays the session-local sandbox above. A dead relay is a drain
+    // that comes up empty — never a dead screen (E2/E4).
+    var gchat_box: chat_relay.Mailbox = .{};
+    defer gchat_box.deinit(gpa);
+    var gchat_link: ?*chat_relay.ChatRelay = null;
+    defer if (gchat_link) |link| chat_relay.shutdown(link);
+    var gchat_mail: std.ArrayList(chat_relay.Mail) = .empty;
+    defer {
+        for (gchat_mail.items) |m| chat_relay.freeMail(gpa, m);
+        gchat_mail.deinit(gpa);
+    }
+    if (dev_chat) {
+        if (environ) |env| {
+            if (env.get("ZAT4_RELAY")) |hostport| {
+                const token = env.get("ZAT_RELAY_TOKEN") orelse "";
+                if (std.mem.lastIndexOfScalar(u8, hostport, ':')) |colon| {
+                    const rhost = hostport[0..colon];
+                    const rport = std.fmt.parseInt(u16, hostport[colon + 1 ..], 10) catch 0;
+                    if (rport != 0 and token.len > 0 and rhost.len > 0) {
+                        gchat_link = chat_relay.start(gpa, io, &gchat_box, rhost, rport, token, chat_relay.devMailboxId(session.did)) catch null;
+                    }
+                }
+            }
+        }
+    }
     var gcreate_prepare_frames: u32 = 0; // the .preparing loading beat's progress (frames)
     // Load the user's saved library (created/downloaded feeds); empty on first run
     // or a corrupt file (deserialize is total). Saved after each create/adopt.
@@ -801,6 +830,29 @@ pub fn run(
                     }
                 },
             }
+        }
+
+        // Drain the chat relay's mailbox (U5, dev transport): delivered
+        // buckets become counterparty messages in the one shared store —
+        // the surface repaints via the chat signature exactly as a local
+        // append does. Damaged or foreign buckets are skipped values (E4).
+        if (gchat_link != null) {
+            gchat_mail.clearRetainingCapacity();
+            try gchat_box.drain(gpa, &gchat_mail);
+            for (gchat_mail.items) |m| {
+                switch (m) {
+                    .blob => |b| if (chat_relay.devUnpack(b)) |dm| {
+                        if (chat_core.openConversation(gpa, &gchat_store, dm.sender_did, "") catch null) |c| {
+                            _ = chat_core.appendMessage(gpa, &gchat_store, c, .text, dm.text, dm.created_at, false) catch {};
+                        }
+                    },
+                    .refused => status = "chat: relay refused the send",
+                    .status => {},
+                    .failure => {},
+                }
+                chat_relay.freeMail(gpa, m);
+            }
+            gchat_mail.clearRetainingCapacity();
         }
 
         // Drain write-worker results (the non-blocking like/unlike/repost
@@ -2093,6 +2145,7 @@ pub fn run(
                                         .chat_send => if (dev_chat) {
                                             if (gchat_draft_len > 0) if (gchat_sel) |sc| {
                                                 _ = chat_core.appendMessage(gpa, &gchat_store, sc, .text, gchat_draft_buf[0..gchat_draft_len], now, true) catch {};
+                                                devChatSend(gchat_link, &gchat_store, sc, session.did, gchat_draft_buf[0..gchat_draft_len], now);
                                                 gchat_draft_len = 0;
                                                 gchat_input_focus = true;
                                                 gscroll_px = 0;
@@ -2426,6 +2479,7 @@ pub fn run(
                     if (zc == '\r' or zc == '\n') {
                         if (gchat_draft_len > 0) if (gchat_sel) |sc| {
                             _ = chat_core.appendMessage(gpa, &gchat_store, sc, .text, gchat_draft_buf[0..gchat_draft_len], now, true) catch {};
+                            devChatSend(gchat_link, &gchat_store, sc, session.did, gchat_draft_buf[0..gchat_draft_len], now);
                             gchat_draft_len = 0;
                             gscroll_px = 0; // re-anchor to the newest message
                         };
@@ -2909,6 +2963,18 @@ const ChatFrame = struct {
 /// conversation list, the open thread, the selected ordinal, and the peer
 /// label. Pure queries into the frame arena (C3); the ordinal is the value
 /// the surface's tap regions carry.
+/// U5 dev transport: pack the just-sent draft into a padded bucket and queue
+/// it for the counterparty's dev mailbox. A null link (no ZAT4_RELAY) keeps
+/// the send local, exactly the U3 sandbox; a full outbox or over-long text
+/// simply doesn't transmit (the local append already showed the message —
+/// dev-only looseness, deleted with the plaintext path at M1).
+fn devChatSend(link: ?*chat_relay.ChatRelay, cs: *const chat_core.Store, conv: chat_core.ConvIndex, my_did: []const u8, text: []const u8, now: i64) void {
+    const l = link orelse return;
+    var bucket: [chat_relay.bucket_len]u8 = undefined;
+    chat_relay.devPack(&bucket, my_did, now, text) catch return;
+    chat_relay.deposit(l, chat_relay.devMailboxId(chat_core.conversationDid(cs, conv)), &bucket) catch {};
+}
+
 fn buildChatFrame(arena: Allocator, cs: *const chat_core.Store, sel: ?chat_core.ConvIndex, now: i64) ChatFrame {
     const list = chat_view_core.buildList(arena, cs, now) catch return .{};
     var out: ChatFrame = .{ .list = list };

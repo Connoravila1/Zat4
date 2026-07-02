@@ -700,6 +700,7 @@ test {
     _ = @import("core/mls_schedule.zig");
     _ = @import("core/mls.zig");
     _ = @import("core/anchor.zig");
+    _ = @import("shell/chat_relay.zig");
     _ = @import("core/oauth.zig");
     _ = @import("core/oauth_flow.zig");
     _ = @import("core/dagcbor.zig");

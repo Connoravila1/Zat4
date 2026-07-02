@@ -157,6 +157,12 @@ pub fn isMine(store: *const Store, msg: MsgIndex) bool {
     return store.mine.isSet(@intFromEnum(msg));
 }
 
+/// The counterparty DID of a conversation — identity crosses module
+/// boundaries as the DID (A5); the shell addresses transport with it.
+pub fn conversationDid(store: *const Store, conv: ConvIndex) []const u8 {
+    return sliceSpan(store, store.convs.items(.did)[@intFromEnum(conv)]);
+}
+
 /// Append a string (plus a NUL so the span can serve as an interning key)
 /// and return its span.
 fn appendString(gpa: Allocator, store: *Store, s: []const u8) error{OutOfMemory}!TextSpan {

@@ -288,7 +288,9 @@ const ws2 = struct {
     extern "ws2_32" fn shutdown(s: usize, how: i32) callconv(.winapi) i32;
 };
 
-fn handleToI64(h: anytype) i64 {
+/// Pub for chat_relay.zig — generic socket plumbing (the shutdown-wake
+/// trick), not jetstream-specific; second consumer arrived with U5.
+pub fn handleToI64(h: anytype) i64 {
     const u: u64 = switch (@typeInfo(@TypeOf(h))) {
         .pointer => @intFromPtr(h),
         else => @intCast(h),
@@ -296,7 +298,8 @@ fn handleToI64(h: anytype) i64 {
     return @bitCast(u);
 }
 
-fn shutdownSocket(fd: i64) void {
+/// Pub for chat_relay.zig — see handleToI64.
+pub fn shutdownSocket(fd: i64) void {
     if (comptime builtin.os.tag == .windows) {
         _ = ws2.shutdown(@intCast(@as(u64, @bitCast(fd))), 2); // SD_BOTH
     } else if (comptime builtin.os.tag.isDarwin()) {
