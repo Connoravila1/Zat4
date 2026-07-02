@@ -5471,6 +5471,29 @@ fn paintFrameGpu(
         chat_sig ^= @as(u64, @intFromBool(g.chat_composing)) *% 0xF29C_511C_8E3D_45A7;
         chat_sig ^= std.hash.Wyhash.hash(0x77E1_A2C9, g.chat_compose);
         chat_sig ^= std.hash.Wyhash.hash(0x3B8F_55D1, g.chat_compose_status);
+        // The pay sheet (M5 A4): open/close, the rail toggle, every chip
+        // tap and keystroke, the focus hop, and the refusal line — each
+        // must repaint (and re-emit the TAP REGIONS) the frame it changes.
+        // The first live test caught exactly this: a sheet drawn from a
+        // lucky rebuild whose buttons hit-tested against the previous
+        // frame's regions — dead buttons.
+        chat_sig ^= @as(u64, @intFromBool(g.chat_pay.open)) *% 0xBF58_476D_1CE4_E5B9;
+        chat_sig ^= (@as(u64, @intFromEnum(g.chat_pay.rail)) +% 1) *% 0x94D0_49BB_1331_11EB;
+        chat_sig ^= (@as(u64, g.chat_pay.focus) +% 1) *% 0xD6E8_FEB8_6659_FD93;
+        chat_sig ^= std.hash.Wyhash.hash(0x1F83_D9AB, g.chat_pay.amount);
+        chat_sig ^= std.hash.Wyhash.hash(0x9B05_688C, g.chat_pay.note);
+        chat_sig ^= std.hash.Wyhash.hash(0x510E_527F, g.chat_pay.status);
+        // Payment CARDS advance without the message count moving (a wire
+        // event or the watcher flips status/confirmations on an existing
+        // row) — fold every row's live state in so the card repaints the
+        // frame it changes (M5 A5's six blocks arrive through here).
+        var pay_sum: u64 = 0;
+        const pay_status = cs.payments.items(.status);
+        const pay_conf = cs.payments.items(.confirmations);
+        for (pay_status, pay_conf, 0..) |s, c, i| {
+            pay_sum +%= ((@as(u64, @intFromEnum(s)) << 8) +% @as(u64, c) +% 1) *% (i + 2);
+        }
+        chat_sig ^= (@as(u64, cs.payments.len) << 32) ^ (pay_sum *% 0x2545_F491_4F6C_DD1D);
     };
 
     // Zat Chat motion (U6a). The trigger is DERIVED, in this one place, from
@@ -5507,11 +5530,12 @@ fn paintFrameGpu(
             rem -= step;
         }
         if (gs.chat_typing_t > 0.01) gs.chat_typing_phase += dt;
-        // A focused input keeps frames coming for the caret's breath.
+        // A focused input keeps frames coming for the caret's breath — the
+        // pay sheet always holds a focused field while open (M5 A4).
         chat_animating = @abs(gs.chat_send_t - 1.0) > 0.004 or @abs(gs.chat_send_v) > 0.004 or
             @abs(gs.chat_arrive_t - 1.0) > 0.004 or @abs(gs.chat_arrive_v) > 0.004 or
             gs.chat_typing_t > 0.01 or g.chat_typing or
-            g.chat_input_focus or g.chat_composing;
+            g.chat_input_focus or g.chat_composing or g.chat_pay.open;
     };
     const sig = feedSignature(items, g.scroll.*, w, h) ^ (@as(u64, g.screen.*) *% 0x9E37_79B9_7F4A_7C15) ^ (socket_sig *% 0xD1B5_4A32_D192_ED03) ^ (@as(u64, g.settings_section) *% 0xC2B2_AE3D_27D4_EB4F) ^ (g.settings_toggles *% 0x9E6C_63D0_676A_9A99) ^ (g.settings_choices *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, g.settings_picking) *% 0x8A91_7F2B_4D3E_61C7) ^ (@as(u64, @intFromBool(g.inspect_source)) *% 0xF29C_511C_8E3D_45A7) ^ (@as(u64, @intFromBool(g.inspect_loading)) *% 0xBF58_476D_1CE4_E5B9) ^ chat_sig;
     // A drag/settle animates the socket every frame (lift, reflow, ghost), so
