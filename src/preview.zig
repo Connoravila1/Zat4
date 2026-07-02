@@ -205,7 +205,7 @@ pub fn main(init: std.process.Init) !void {
 
         const clist = try chat_view.buildList(arena, &cstore, now);
         const cthread = try chat_view.buildThread(arena, &cstore, maya, now);
-        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread, 0, "maya.zat4.com", "");
+        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread, 0, "maya.zat4.com", "", true);
         try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
         try writePpm(io, gpa, &fb, "/tmp/zat_chat.ppm");
         std.debug.print("wrote /tmp/zat_chat.ppm (Zat Chat messages surface)\n", .{});

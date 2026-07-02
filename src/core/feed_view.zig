@@ -3434,6 +3434,10 @@ pub fn layoutChat(
     /// The composer strip's draft ("" shows the placeholder). Editing state
     /// (caret, selection) arrives with the U3 wiring.
     draft: []const u8,
+    /// True while the composer owns the keyboard: the strip shows an accent
+    /// ring + caret so "can I type?" is answered by the pixels (the owner's
+    /// U5 field note — an input with no focus state reads as dead).
+    input_focus: bool,
 ) error{OutOfMemory}!i32 {
     const m: Metrics = if (pane_geom) |g|
         .{ .rail_x = g.rail_x, .col_x = g.col_x, .col_w = g.col_w, .lx = g.lx, .cw = g.cw, .side_x = g.side_x, .wide = g.wide }
@@ -3587,12 +3591,27 @@ pub fn layoutChat(
     const input_w = detail_w - send_w - 12;
     try rect(gpa, dl, detail_x, comp_y, input_w, comp_h, skinPanel(accent), 14);
     try rect(gpa, dl, detail_x, comp_y, input_w, 1, 0x14EDEAE0, 14);
+    if (input_focus) {
+        // Focus ring: a one-pixel accent outline (the rounded fill draws
+        // first, so four thin edge rects read as a ring at this radius).
+        const ring_c = (0xC0 << 24) | (accent & 0x00FFFFFF);
+        try rect(gpa, dl, detail_x, comp_y, input_w, 1, ring_c, 0);
+        try rect(gpa, dl, detail_x, comp_y + comp_h - 1, input_w, 1, ring_c, 0);
+        try rect(gpa, dl, detail_x, comp_y, 1, comp_h, ring_c, 0);
+        try rect(gpa, dl, detail_x + input_w - 1, comp_y, 1, comp_h, ring_c, 0);
+    }
     if (draft.len > 0) {
         try strEllipsis(gpa, dl, e, .regular, detail_x + 14, comp_y + 29, ink, 14, draft, input_w - 28);
     } else {
         var pbuf: [96]u8 = undefined;
         const ph = std.fmt.bufPrint(&pbuf, "Message {s}", .{peer}) catch "Message";
         try strEllipsis(gpa, dl, e, .regular, detail_x + 14, comp_y + 29, faint, 14, ph, input_w - 28);
+    }
+    if (input_focus) {
+        // The caret, at the end of the draft (or the line start when empty).
+        const draft_w: i32 = @intCast(text.measure(e, .regular, draft, 14));
+        const caret_x = detail_x + 14 + @min(draft_w, input_w - 28) + 1;
+        try rect(gpa, dl, caret_x, comp_y + 14, 2, comp_h - 28, (0xE0 << 24) | (accent & 0x00FFFFFF), 0);
     }
     try emitRegion(gpa, regions, detail_x, comp_y, input_w, @intCast(comp_h), 0, .chat_input);
     const sx = detail_x + detail_w - send_w;
@@ -3917,7 +3936,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
 
     // Narrow width (460): no rail regions, so the counts are exactly the
     // surface's own — one region per conversation row + the composer pair.
-    const h = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, 0, "maya.zat4.com", "");
+    const h = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, 0, "maya.zat4.com", "", true);
     var n_conv: usize = 0;
     var n_input: usize = 0;
     var n_send: usize = 0;
@@ -3937,7 +3956,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // no thread pane and no composer to arm.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h2 = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, 255, "", "");
+    const h2 = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, 255, "", "", false);
     try std.testing.expectEqual(@as(i32, 940), h2);
     for (regions.items) |r| try std.testing.expectEqual(Action.chat_conv, r.kind);
     try std.testing.expectEqual(@as(usize, 2), regions.items.len);

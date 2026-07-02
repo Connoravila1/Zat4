@@ -1330,7 +1330,7 @@ pub fn run(
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .market = if (gscreen == feed_view.screen_loadout and gloadout_tab == 1) market_cards.items else &.{}, .create = .{ .step = gcreate_step, .answers = gcreate_answers, .config = gcreate_config, .name = gcreate_name_buf[0..gcreate_name_len], .color = gcreate_color, .naming = gcreate_step == .name, .prepare_t = create_prepare_t }, .bench = bench_tray, .inspect_bytes = inspect_bytes orelse "", .inspect_name = inspect_name, .inspect_ref = inspect_ref, .inspect_source = gtransp_source, .inspect_loading = inspect_loading, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .chat_store = if (dev_chat) &gchat_store else null, .chat_sel = gchat_sel, .chat_draft = gchat_draft_buf[0..gchat_draft_len], .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
+        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .market = if (gscreen == feed_view.screen_loadout and gloadout_tab == 1) market_cards.items else &.{}, .create = .{ .step = gcreate_step, .answers = gcreate_answers, .config = gcreate_config, .name = gcreate_name_buf[0..gcreate_name_len], .color = gcreate_color, .naming = gcreate_step == .name, .prepare_t = create_prepare_t }, .bench = bench_tray, .inspect_bytes = inspect_bytes orelse "", .inspect_name = inspect_name, .inspect_ref = inspect_ref, .inspect_source = gtransp_source, .inspect_loading = inspect_loading, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .chat_store = if (dev_chat) &gchat_store else null, .chat_sel = gchat_sel, .chat_draft = gchat_draft_buf[0..gchat_draft_len], .chat_input_focus = gchat_input_focus, .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
         switch (mode) {
             .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status),
             .compose => {
@@ -3592,6 +3592,7 @@ const Grid = struct {
     chat_store: ?*const chat_core.Store = null,
     chat_sel: ?chat_core.ConvIndex = null,
     chat_draft: []const u8 = "",
+    chat_input_focus: bool = false,
     field_gain: f32 = 0.9,
     /// Toy Box "Julia mode" active — the field renderer pinks its glyph ink.
     julia: bool = false,
@@ -4302,7 +4303,7 @@ fn paintFrame(
                 // Zat Chat (U3, dev-gated): the Messages surface. -scroll maps the
                 // shared ≤0 scroll state onto layoutChat's positive history offset.
                 const cf = buildChatFrame(arena, g.chat_store.?, g.chat_sel, now);
-                g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.sel, cf.peer, g.chat_draft) catch g.content_h.*;
+                g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus) catch g.content_h.*;
             } else if (g.screen.* == feed_view.screen_loadout) {
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
                 g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market, g.create, g.bench) catch g.content_h.*; // software: draw line-art nav
@@ -4663,6 +4664,8 @@ fn paintFrameGpu(
         var unread_sum: u64 = 0;
         for (cs.convs.items(.unread)) |u| unread_sum +%= u;
         chat_sig ^= unread_sum *% 0x2545_F491_4F6C_DD1D;
+        // The composer focus ring must appear the frame the input is tapped.
+        chat_sig ^= @as(u64, @intFromBool(g.chat_input_focus)) *% 0x8A91_7F2B_4D3E_61C7;
     };
     const sig = feedSignature(items, g.scroll.*, w, h) ^ (@as(u64, g.screen.*) *% 0x9E37_79B9_7F4A_7C15) ^ (socket_sig *% 0xD1B5_4A32_D192_ED03) ^ (@as(u64, g.settings_section) *% 0xC2B2_AE3D_27D4_EB4F) ^ (g.settings_toggles *% 0x9E6C_63D0_676A_9A99) ^ (g.settings_choices *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, g.settings_picking) *% 0x8A91_7F2B_4D3E_61C7) ^ (@as(u64, @intFromBool(g.inspect_source)) *% 0xF29C_511C_8E3D_45A7) ^ (@as(u64, @intFromBool(g.inspect_loading)) *% 0xBF58_476D_1CE4_E5B9) ^ chat_sig;
     // A drag/settle animates the socket every frame (lift, reflow, ghost), so
@@ -4721,7 +4724,7 @@ fn paintFrameGpu(
             gs.content_x = lg.col_x;
             gs.content_w = lg.col_w;
             const cf = buildChatFrame(arena, g.chat_store.?, g.chat_sel, now);
-            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.sel, cf.peer, g.chat_draft) catch g.content_h.*;
+            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus) catch g.content_h.*;
         } else if (g.screen.* == feed_view.screen_transparency) {
             // The algorithm transparency page: a plain scrolling document (no rail),
             // rebuilt from the inspected config each entry (what you see = what runs).
