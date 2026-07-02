@@ -3749,29 +3749,7 @@ pub fn layoutChat(
             }
             y += stamp_h;
         }
-        var by = y + row_shift;
-        var fade_rect: f32 = 1.0;
-        var fade_text: f32 = 1.0;
-        var grow: f32 = 1.0;
-        if (is_fly) {
-            if (b.mine) {
-                // The send MORPH: the bubble leaves the composer small
-                // (45%) and inflates the whole way to its seat — scale,
-                // travel, and fade are one gesture on one spring. The text
-                // materializes as the bubble approaches full size.
-                const from: f32 = @floatFromInt(comp_y + 8 - hh);
-                const to: f32 = @floatFromInt(y);
-                by = @intFromFloat(@round(to + (from - to) * (1.0 - fly_t)));
-                grow = 0.45 + 0.55 * fly_c;
-                fade_rect = @min(1.0, 0.30 + fly_c * 1.4);
-                fade_text = std.math.clamp((fly_c - 0.45) * 2.2, 0.0, 1.0);
-            } else {
-                by = y + @as(i32, @intFromFloat(@round(24.0 * (1.0 - fly_t))));
-                grow = 0.85 + 0.15 * fly_c;
-                fade_rect = @min(1.0, fly_c * 1.6);
-                fade_text = fade_rect;
-            }
-        }
+        const by = y + row_shift;
         if (by + hh > thread_top and by < clip_bot) {
             if (b.kind == .system) {
                 const sw2: i32 = @intCast(text.measure(e, .regular, b.body, 12));
@@ -3783,19 +3761,61 @@ pub fn layoutChat(
                 const bw = if (fits_one) one_w + 2 * pad_x else bub_max;
                 const bx = if (b.mine) detail_x + detail_w - bw else detail_x;
                 const fill: u32 = if (b.mine) (0x38 << 24) | (accent & 0x00FFFFFF) else skinPanel(accent);
-                // The in-flight bubble inflates toward full size, anchored
-                // to its composer-side bottom corner (where it came from).
-                const bw_a: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(bw)) * grow));
-                const hh_a: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(hh)) * grow));
-                const bx_a = if (b.mine) bx + (bw - bw_a) else bx;
-                const by_a = by + (hh - hh_a);
-                try rect(gpa, dl, bx_a, by_a, bw_a, hh_a, scaleAlpha(fill, fade_rect), 14);
-                if (fade_text > 0.01) {
-                    // The text keeps its FINAL x — the bubble inflates
-                    // around it (fading in late hides the mismatch), and a
-                    // shrunken right-anchored rect never pushes the text
-                    // past the pane edge.
-                    _ = try wrapBody(gpa, dl, e, bx + pad_x, by_a + pad_y + 12, bub_max - 2 * pad_x, scaleAlpha(ink, fade_text), 14, b.body, line_h, true, null);
+                if (!is_fly) {
+                    try rect(gpa, dl, bx, by, bw, hh, fill, 14);
+                    _ = try wrapBody(gpa, dl, e, bx + pad_x, by + pad_y + 12, bub_max - 2 * pad_x, ink, 14, b.body, line_h, true, null);
+                } else {
+                    // THE MORPH. Spring physics, not easing: position and
+                    // scale ride the SAME spring (unclamped t — a gentle
+                    // ~2% overshoot that settles is what reads as native),
+                    // and opacity ramps FASTER than the transform (opaque
+                    // by 60% of the motion, so the bubble is solid while
+                    // it is still settling — a bubble translucent at rest
+                    // reads as cheap). Anchors: sent scales from its
+                    // bottom-right (out of the composer), received from
+                    // its bottom-left (out of the typing indicator's slot
+                    // — the indicator melts as this grows, so it reads as
+                    // the dots BECOMING the message).
+                    const fade = std.math.clamp(fly_c / 0.6, 0.0, 1.0);
+                    const seat_bot: f32 = @floatFromInt(y + hh);
+                    if (fits_one) {
+                        // One line: rect and GLYPHS travel + scale as one
+                        // unit (true text scaling — no wrap, no reflow).
+                        const grow = 0.62 + 0.38 * fly_t;
+                        const origin_bot: f32 = if (b.mine)
+                            @floatFromInt(comp_y + 4)
+                        else
+                            @floatFromInt(comp_y - 10);
+                        const bot_a = seat_bot + (origin_bot - seat_bot) * (1.0 - fly_t);
+                        const px_a: u16 = @intFromFloat(std.math.clamp(@round(14.0 * grow), 9.0, 16.0));
+                        const tw_a: i32 = @intCast(text.measure(e, .regular, b.body, px_a));
+                        const pad_a: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(pad_x)) * grow));
+                        const w_a = tw_a + 2 * pad_a;
+                        const h_a: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(hh)) * grow));
+                        const x_final: f32 = @floatFromInt(bx);
+                        const x_origin: f32 = if (b.mine) @floatFromInt(detail_x + 14) else x_final;
+                        const x_a: i32 = @intFromFloat(@round(x_final + (x_origin - x_final) * (1.0 - fly_c)));
+                        const y_a = @as(i32, @intFromFloat(@round(bot_a))) - h_a;
+                        try rect(gpa, dl, x_a, y_a, w_a, h_a, scaleAlpha(fill, fade), 14);
+                        _ = try str(gpa, dl, e, .regular, x_a + pad_a, y_a + h_a - @as(i32, @intFromFloat(@round(14.0 * grow))), scaleAlpha(ink, fade), px_a, b.body);
+                    } else {
+                        // Wrapped text cannot rescale without reflowing, so
+                        // the multi-line morph keeps the scale TIGHT (90%+,
+                        // where the rect/text mismatch is invisible under
+                        // the unified fade) and leans on travel + push.
+                        const grow = 0.90 + 0.10 * fly_t;
+                        const origin_bot: f32 = if (b.mine)
+                            @floatFromInt(comp_y + 4)
+                        else
+                            seat_bot + 24.0;
+                        const bot_a = seat_bot + (origin_bot - seat_bot) * (1.0 - fly_t);
+                        const bw_a: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(bw)) * grow));
+                        const hh_a: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(hh)) * grow));
+                        const bx_a = if (b.mine) bx + (bw - bw_a) else bx;
+                        const by_a = @as(i32, @intFromFloat(@round(bot_a))) - hh_a;
+                        try rect(gpa, dl, bx_a, by_a, bw_a, hh_a, scaleAlpha(fill, fade), 14);
+                        _ = try wrapBody(gpa, dl, e, bx + pad_x, by_a + pad_y + 12, bub_max - 2 * pad_x, scaleAlpha(ink, fade), 14, b.body, line_h, true, null);
+                    }
                 }
             }
         }

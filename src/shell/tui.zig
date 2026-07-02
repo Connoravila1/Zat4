@@ -4091,15 +4091,14 @@ fn springGeom(cur: *f32, vel: *f32, target: f32, dt: f32) void {
     cur.* += vel.* * dt;
 }
 
-/// The message-motion spring (U6a): stiff and mildly UNDER-damped
-/// (damping ratio ≈ 0.77) — a sent bubble snaps into its seat in ~0.35s
-/// with one small overshoot, the tuned response of a platform-native
-/// message send. Geometry morphs keep springGeom (no overshoot — a pane
-/// boundary must not cross its target); a bubble should breathe past its
-/// seat and settle.
+/// The message-motion spring (U6a): stiffness 230, damping 24, mass 1 —
+/// damping ratio ≈ 0.79, one gentle ~2% overshoot that settles (the
+/// native-messenger response: springs, not easing curves). Geometry
+/// morphs keep springGeom (no overshoot — a pane boundary must not cross
+/// its target); a bubble should breathe past its seat and settle.
 fn springPop(cur: *f32, vel: *f32, target: f32, dt: f32) void {
-    const k: f32 = 380.0;
-    const c: f32 = 30.0;
+    const k: f32 = 230.0;
+    const c: f32 = 24.0;
     vel.* += (-k * (cur.* - target) - c * vel.*) * dt;
     cur.* += vel.* * dt;
 }
