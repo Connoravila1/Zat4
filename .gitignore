@@ -21,4 +21,5 @@ sample_events.jsonl
 
 # local launcher (holds the AppView read token)
 run-local.sh
+chat-test.sh
 transparency-preview.png
