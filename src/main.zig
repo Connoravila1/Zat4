@@ -44,6 +44,9 @@ const anchor_core = @import("core/anchor.zig");
 const write = @import("shell/write.zig");
 const chat_keys = @import("shell/chat_keys.zig");
 const pay_addr = @import("shell/pay_addr.zig");
+const payuri = @import("core/payuri.zig");
+const chat_core = @import("core/chat.zig");
+const launch = @import("shell/launch.zig");
 const algorithm_shell = @import("shell/algorithm.zig");
 const builder = @import("core/builder.zig");
 const lens_catalog = @import("core/lens_catalog.zig");
@@ -157,6 +160,14 @@ pub fn main(init: std.process.Init) !void {
     var pay_publish_ln: ?[]const u8 = null;
     var pay_publish_btc: ?[]const u8 = null;
     var pay_publish = false;
+    // Payment hand-off test (M5 A3): `--pay-handoff <address> <sats> <note|->`
+    // builds the standard wallet URI (BIP-21 for an on-chain address,
+    // lightning: for a LUD-16 one — picked by shape), prints it, and hands it
+    // to the OS default handler. Purely local — no network, no session. If no
+    // wallet is registered for the scheme, the printed URI is the fallback.
+    var pay_handoff_addr: ?[]const u8 = null;
+    var pay_handoff_sats: ?[]const u8 = null;
+    var pay_handoff_note: ?[]const u8 = null;
     var ai: usize = 1;
     while (ai < args.len) : (ai += 1) {
         const arg = args[ai];
@@ -195,6 +206,13 @@ pub fn main(init: std.process.Init) !void {
                 pay_publish_btc = args[ai + 2];
                 ai += 2;
                 pay_publish = true;
+            }
+        } else if (std.mem.eql(u8, arg, "--pay-handoff")) {
+            if (ai + 3 < args.len) {
+                pay_handoff_addr = args[ai + 1];
+                pay_handoff_sats = args[ai + 2];
+                pay_handoff_note = args[ai + 3];
+                ai += 3;
             }
         } else if (std.mem.eql(u8, arg, "--tui")) {
             tui_mode = true;
@@ -420,6 +438,51 @@ pub fn main(init: std.process.Init) !void {
             \\[chat]   DID binding signs and verifies (anchor <-> DID)
             \\
         , .{ if (res.created) @as([]const u8, "CREATED") else "LOADED", did, pub_hex });
+        try out.flush();
+        return;
+    }
+
+    // M5 A3 proof: the wallet hand-off, end to end minus the wallet itself.
+    // Build the standard URI (validated address, exact BIP-21 amount, encoded
+    // note) and give it to the OS. Purely local — no network, no session.
+    if (pay_handoff_addr) |addr| {
+        const sats = std.fmt.parseInt(u64, pay_handoff_sats.?, 10) catch {
+            try out.print("--pay-handoff: sats must be a positive integer\n", .{});
+            try out.flush();
+            return;
+        };
+        if (sats == 0 or sats > chat_core.max_amount_sat) {
+            try out.print("--pay-handoff: sats out of range\n", .{});
+            try out.flush();
+            return;
+        }
+        const note = if (std.mem.eql(u8, pay_handoff_note.?, "-")) "" else pay_handoff_note.?;
+        var uri_buf: [payuri.max_uri_len]u8 = undefined;
+        const is_ln = std.mem.indexOfScalar(u8, addr, '@') != null;
+        const uri = (if (is_ln)
+            payuri.buildLightningUri(&uri_buf, addr)
+        else
+            payuri.buildBitcoinUri(&uri_buf, addr, sats, "", note)) catch |err| {
+            try out.print("--pay-handoff: {s}\n", .{@errorName(err)});
+            try out.flush();
+            return;
+        };
+        try out.print(
+            \\[pay] {s} hand-off URI (amount {s}):
+            \\[pay]   {s}
+            \\
+        , .{
+            if (is_ln) @as([]const u8, "lightning") else "on-chain",
+            if (is_ln) @as([]const u8, "chosen in the wallet — LUD-16") else pay_handoff_sats.?,
+            uri,
+        });
+        try out.flush();
+        launch.openUri(io, uri) catch |err| {
+            try out.print("[pay] no handler opened ({s}) — use the URI above directly\n", .{@errorName(err)});
+            try out.flush();
+            return;
+        };
+        try out.print("[pay] handed to the OS default handler\n", .{});
         try out.flush();
         return;
     }
@@ -832,6 +895,8 @@ test {
     _ = @import("core/chat.zig");
     _ = @import("core/chat_view.zig");
     _ = @import("core/payaddr.zig");
+    _ = @import("core/payuri.zig");
+    _ = @import("shell/launch.zig");
     _ = @import("core/discover.zig");
     _ = @import("core/algorithm.zig");
     _ = @import("core/learner.zig");

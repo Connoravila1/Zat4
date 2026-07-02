@@ -35,6 +35,7 @@ const Allocator = std.mem.Allocator;
 const http = @import("http.zig");
 const config = @import("config.zig");
 const auth = @import("auth.zig");
+const launch = @import("launch.zig");
 const oauth = @import("../core/oauth.zig");
 const oauth_flow = @import("../core/oauth_flow.zig");
 const pkce = @import("../core/pkce.zig");
@@ -329,16 +330,10 @@ const success_page =
     \\</div></body></html>
 ;
 
-/// Open `url` in the system browser. Linux: `xdg-open`. (mac `open` / win
-/// `start` are the cross-platform follow-ups, like the GPU seam.)
+/// Open `url` in the system browser — the shared OS-handler seam
+/// (shell/launch.zig; the payment hand-off is its other caller).
 fn openBrowser(io: std.Io, url: []const u8) !void {
-    var child = try std.process.spawn(io, .{
-        .argv = &.{ "xdg-open", url },
-        .stdin = .ignore,
-        .stdout = .ignore,
-        .stderr = .ignore,
-    });
-    _ = child.wait(io) catch {};
+    return launch.openUri(io, url);
 }
 
 /// `n` CSPRNG bytes as base64url (unreserved, URL-safe) — for `state`.
