@@ -337,11 +337,40 @@ pub fn send(
     chat_relay.deposit(link, keydir.bootstrapMailbox(st.peer_anchors.items[idx]), &bucket) catch return error.RelayDown;
 }
 
+/// One typing-indicator ping (U6a): [kind_typing_wire] alone, through the
+/// full E2EE path — encrypt, persist-before-deposit (the same nonce rule as
+/// a message; a ping advances the ratchet exactly like one), one fixed
+/// bucket. The relay cannot tell it from a message; only the peer can. The
+/// persist makes each ping cost a keystore write — throttled by the caller
+/// (one ping per few seconds of typing), recorded as acceptable.
+pub fn sendTyping(
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    st: *State,
+    link: *chat_relay.ChatRelay,
+    peer_did: []const u8,
+) SendError!void {
+    const idx = conversationIndex(st, peer_did) orelse return error.NoConversation;
+    var guard: [4]u8 = undefined;
+    io.randomSecure(&guard) catch return error.CryptoFailed;
+    const ping = [1]u8{chat.kind_typing_wire};
+    const msg = mls.encrypt(gpa, &st.groups.items[idx], &ping, 0, guard) catch return error.CryptoFailed;
+    defer gpa.free(msg);
+    persist(gpa, environ, st); // ORDER IS LOAD-BEARING — see send()
+    var bucket: [relay.bucket_len]u8 = undefined;
+    bucketPack(&bucket, msg) catch return error.CryptoFailed;
+    chat_relay.deposit(link, keydir.bootstrapMailbox(st.peer_anchors.items[idx]), &bucket) catch return error.RelayDown;
+}
+
 /// What one inbox bucket became. `peer_did`/`text` are gpa-owned by the
 /// event; release with `freeIncoming`. A7.2: cold union, transient.
 pub const Incoming = union(enum) {
     message: struct { peer_did: []u8, kind: chat.Kind, text: []u8 },
     started: struct { peer_did: []u8 },
+    /// The peer is typing right now — ephemeral; the shell shows the
+    /// indicator for a few seconds and lets it lapse. Never stored.
+    typing: struct { peer_did: []u8 },
 };
 
 pub fn freeIncoming(gpa: Allocator, inc: Incoming) void {
@@ -351,6 +380,7 @@ pub fn freeIncoming(gpa: Allocator, inc: Incoming) void {
             gpa.free(m.text);
         },
         .started => |s| gpa.free(s.peer_did),
+        .typing => |t| gpa.free(t.peer_did),
     }
 }
 
@@ -453,6 +483,11 @@ pub fn onBucket(
                 .application => |data| {
                     defer gpa.free(data);
                     if (data.len < 1) return null;
+                    // The typing ping is consumed HERE — an ephemeral event,
+                    // never a stored message (chat.kind_typing_wire).
+                    if (data[0] == chat.kind_typing_wire) {
+                        return .{ .typing = .{ .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]) } };
+                    }
                     const kind = chat.parseKind(data[0]) catch return null; // reserved kinds refused until their milestone
                     const text = try gpa.dupe(u8, data[1..]);
                     errdefer gpa.free(text);
@@ -622,6 +657,31 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
         const inc = (try onBucket(gpa, gpa, io, &env, &a, &bucket)) orelse return error.TestUnexpectedResult;
         defer freeIncoming(gpa, inc);
         try testing.expectEqualStrings("hi alice", inc.message.text);
+    }
+
+    // A typing ping crosses as an ephemeral event (never a message), and
+    // the ratchet keeps working after it.
+    {
+        var ping: [16]u8 = undefined;
+        ping[0] = chat.kind_typing_wire;
+        const msg = try mls.encrypt(gpa, &a.groups.items[0], ping[0..1], 0, .{ 7, 7, 7, 7 });
+        defer gpa.free(msg);
+        var bucket: [relay.bucket_len]u8 = undefined;
+        try bucketPack(&bucket, msg);
+        const inc = (try onBucket(gpa, gpa, io, &env, &b2, &bucket)) orelse return error.TestUnexpectedResult;
+        defer freeIncoming(gpa, inc);
+        try testing.expectEqualStrings(a.my_did, inc.typing.peer_did);
+
+        var plaintext: [16]u8 = undefined;
+        plaintext[0] = 0;
+        @memcpy(plaintext[1..][0..10], "after ping");
+        const msg2 = try mls.encrypt(gpa, &a.groups.items[0], plaintext[0..11], 0, .{ 8, 8, 8, 8 });
+        defer gpa.free(msg2);
+        var bucket2: [relay.bucket_len]u8 = undefined;
+        try bucketPack(&bucket2, msg2);
+        const inc2 = (try onBucket(gpa, gpa, io, &env, &b2, &bucket2)) orelse return error.TestUnexpectedResult;
+        defer freeIncoming(gpa, inc2);
+        try testing.expectEqualStrings("after ping", inc2.message.text);
     }
 
     // A stranger's random bucket is dropped without a mark.

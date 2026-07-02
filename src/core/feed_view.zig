@@ -3648,34 +3648,60 @@ pub fn layoutChat(
 
     // Bottom-anchor; scroll > 0 walks back into history. Rows fully outside
     // the pane are skipped (the shell clamps scroll to the returned overflow,
-    // U3); partially-clipped edge rows are accepted. The NEWEST bubble may
-    // carry motion (U6a): an own message springs up out of the composer into
-    // its seat (send_t, spring overshoot welcome); a counterparty message
-    // rises ~16px and fades in (arrive_t). Both may travel through the strip
-    // below the thread, so their clip floor is the composer, not thread_bot.
+    // U3); partially-clipped edge rows are accepted.
+    //
+    // U6a — the newest bubble may be IN FLIGHT, and the whole thread rides
+    // the same spring with it (one motion, one clock — never a one-frame
+    // snap): while it flies, every OLDER row is drawn shifted DOWN by the
+    // newest slot's height, sliding up to seat as t → 1; the accumulator
+    // stays in destination coordinates, so t = 1 is byte-identical to the
+    // resting layout. The newest bubble itself: an own message springs up
+    // out of the composer (unclamped t — the overshoot carries it a breath
+    // past its seat, then it settles), growing from 82% and fading in; a
+    // counterparty message rises ~20px, growing from 92% and fading in.
+    var fly_t: f32 = 1.0;
+    if (thread.len > 0 and thread[thread.len - 1].kind != .system) {
+        if (thread[thread.len - 1].mine) {
+            if (motion.send_t < 0.999) fly_t = motion.send_t;
+        } else if (motion.arrive_t < 0.999) fly_t = motion.arrive_t;
+    }
+    const flying = fly_t < 0.999;
+    const fly_c = std.math.clamp(fly_t, 0.0, 1.0);
+    var shift: i32 = 0;
+    if (flying) {
+        var slot_last = bh[thread.len - 1] + gap;
+        if (thread[thread.len - 1].stamp) slot_last += stamp_h;
+        shift = @intFromFloat(@round(@as(f32, @floatFromInt(slot_last)) * (1.0 - fly_c)));
+    }
     var y = @max(thread_top, thread_bot - total) + scroll;
     for (thread, bh, 0..) |b, hh, idx| {
+        const is_fly = flying and idx + 1 == thread.len;
+        const row_shift: i32 = if (flying and !is_fly) shift else 0;
+        const clip_bot = if (flying) comp_y else thread_bot;
         if (b.stamp) {
-            if (y + stamp_h > thread_top and y < thread_bot) {
+            const sy = y + row_shift;
+            if (sy + stamp_h > thread_top and sy < clip_bot) {
                 const aw: i32 = @intCast(text.measure(e, .regular, b.age, 11));
-                _ = try str(gpa, dl, e, .regular, detail_x + @divTrunc(detail_w - aw, 2), y + 16, faint, 11, b.age);
+                // A flying row's divider fades in with its bubble.
+                const sc = if (is_fly) scaleAlpha(faint, fly_c) else faint;
+                _ = try str(gpa, dl, e, .regular, detail_x + @divTrunc(detail_w - aw, 2), sy + 16, sc, 11, b.age);
             }
             y += stamp_h;
         }
-        var by = y;
+        var by = y + row_shift;
         var fade: f32 = 1.0;
-        var clip_bot = thread_bot;
-        if (idx + 1 == thread.len and b.kind != .system) {
-            if (b.mine and motion.send_t < 0.999) {
+        var grow: f32 = 1.0;
+        if (is_fly) {
+            if (b.mine) {
                 const from: f32 = @floatFromInt(comp_y + 8 - hh);
                 const to: f32 = @floatFromInt(y);
-                by = @intFromFloat(@round(to + (from - to) * (1.0 - motion.send_t)));
-                clip_bot = comp_y;
-            } else if (!b.mine and motion.arrive_t < 0.999) {
-                const t = std.math.clamp(motion.arrive_t, 0.0, 1.0);
-                by = y + @as(i32, @intFromFloat(@round(16.0 * (1.0 - t))));
-                fade = @min(1.0, t * 1.8);
-                clip_bot = comp_y;
+                by = @intFromFloat(@round(to + (from - to) * (1.0 - fly_t)));
+                fade = @min(1.0, fly_c * 2.5);
+                grow = 0.82 + 0.18 * fly_c;
+            } else {
+                by = y + @as(i32, @intFromFloat(@round(20.0 * (1.0 - fly_t))));
+                fade = @min(1.0, fly_c * 1.8);
+                grow = 0.92 + 0.08 * fly_c;
             }
         }
         if (by + hh > thread_top and by < clip_bot) {
@@ -3689,8 +3715,14 @@ pub fn layoutChat(
                 const bw = if (fits_one) one_w + 2 * pad_x else bub_max;
                 const bx = if (b.mine) detail_x + detail_w - bw else detail_x;
                 const fill: u32 = if (b.mine) (0x38 << 24) | (accent & 0x00FFFFFF) else skinPanel(accent);
-                try rect(gpa, dl, bx, by, bw, hh, scaleAlpha(fill, fade), 14);
-                _ = try wrapBody(gpa, dl, e, bx + pad_x, by + pad_y + 12, bub_max - 2 * pad_x, scaleAlpha(ink, fade), 14, b.body, line_h, true, null);
+                // The in-flight bubble grows toward full size, anchored to
+                // its composer-side bottom corner (where it came from).
+                const bw_a: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(bw)) * grow));
+                const hh_a: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(hh)) * grow));
+                const bx_a = if (b.mine) bx + (bw - bw_a) else bx;
+                const by_a = by + (hh - hh_a);
+                try rect(gpa, dl, bx_a, by_a, bw_a, hh_a, scaleAlpha(fill, fade), 14);
+                _ = try wrapBody(gpa, dl, e, bx_a + pad_x, by_a + pad_y + 12, bub_max - 2 * pad_x, scaleAlpha(ink, fade), 14, b.body, line_h, true, null);
             }
         }
         y += hh + gap;
@@ -3704,8 +3736,12 @@ pub fn layoutChat(
     // every stage is the same draw at a different typing_t/phase (a pure
     // transform of the frame's values; the SIGNAL is the shell's concern).
     if (typing_open > 0.01) {
-        const th: i32 = @intFromFloat(@round(34.0 * typing_open));
-        const tw: i32 = @intFromFloat(@round(64.0 * (0.55 + 0.45 * typing_open)));
+        // The bubble's own scale rides the UNCLAMPED spring a little, so the
+        // grow-in pops a breath past full size and settles (the thread's
+        // lift above stays clamped — layout never overshoots).
+        const tt = std.math.clamp(motion.typing_t, 0.0, 1.12);
+        const th: i32 = @intFromFloat(@round(34.0 * tt));
+        const tw: i32 = @intFromFloat(@round(64.0 * (0.55 + 0.45 * tt)));
         const ty = comp_y - 12 - th;
         try rect(gpa, dl, detail_x, ty, tw, th, scaleAlpha(skinPanel(accent), typing_open), 14);
         if (typing_open > 0.55) {

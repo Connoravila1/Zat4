@@ -535,11 +535,16 @@ pub fn run(
     var gchat_peer_buf: [254]u8 = undefined;
     var gchat_peer_len: usize = 0;
     var gchat_compose_status: []const u8 = "";
-    // U6a typing-indicator DEMO (motion only — the transport's ephemeral
-    // ping is the recorded follow-up): ZAT4_CHAT_TYPING_DEMO=1 cycles the
-    // indicator 4s on / 4s off in an open thread, to judge the motion
-    // against the bar. Deleted when the real signal lands.
-    const chat_typing_demo = if (environ) |env| env.get("ZAT4_CHAT_TYPING_DEMO") != null else false;
+    // The peer-is-typing signal (U6a, real): an ENCRYPTED ping on the
+    // reserved wire kind (chat.kind_typing_wire) — the relay sees one more
+    // fixed-size bucket; only the peer can read it. Receiving one arms a
+    // deadline; the indicator shows in the matching open thread until it
+    // lapses (or the message itself arrives). The sender throttles to one
+    // ping per 4s of active typing.
+    var gchat_typing_deadline: i64 = 0;
+    var gchat_typing_peer_buf: [256]u8 = undefined;
+    var gchat_typing_peer_len: usize = 0;
+    var gchat_typing_sent_at: i64 = 0;
 
     // The real E2EE session (M1): the crypto state (anchor, keyPackage,
     // per-conversation MLS groups) + the relay link that carries encrypted
@@ -909,11 +914,21 @@ pub fn run(
                                         _ = chat_core.appendMessage(gpa, &gchat_store, c, msg.kind, msg.text, now, false) catch {};
                                         chat_mutated = true;
                                     }
+                                    // The message supersedes its typing bubble.
+                                    if (std.mem.eql(u8, msg.peer_did, gchat_typing_peer_buf[0..gchat_typing_peer_len]))
+                                        gchat_typing_deadline = 0;
                                 },
                                 .started => |s| {
                                     _ = chat_core.openConversation(gpa, &gchat_store, s.peer_did, "") catch null;
                                     chat_mutated = true;
                                     status = "chat: new conversation";
+                                },
+                                // Ephemeral: arm the indicator's deadline;
+                                // nothing enters the store (M2 never sees it).
+                                .typing => |t| if (t.peer_did.len <= gchat_typing_peer_buf.len) {
+                                    @memcpy(gchat_typing_peer_buf[0..t.peer_did.len], t.peer_did);
+                                    gchat_typing_peer_len = t.peer_did.len;
+                                    gchat_typing_deadline = now + 6;
                                 },
                             }
                         }
@@ -1385,7 +1400,7 @@ pub fn run(
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .market = if (gscreen == feed_view.screen_loadout and gloadout_tab == 1) market_cards.items else &.{}, .create = .{ .step = gcreate_step, .answers = gcreate_answers, .config = gcreate_config, .name = gcreate_name_buf[0..gcreate_name_len], .color = gcreate_color, .naming = gcreate_step == .name, .prepare_t = create_prepare_t }, .bench = bench_tray, .inspect_bytes = inspect_bytes orelse "", .inspect_name = inspect_name, .inspect_ref = inspect_ref, .inspect_source = gtransp_source, .inspect_loading = inspect_loading, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .chat_store = if (dev_chat) &gchat_store else null, .chat_sel = gchat_sel, .chat_draft = gchat_draft_buf[0..gchat_draft_len], .chat_input_focus = gchat_input_focus, .chat_composing = gchat_composing, .chat_compose = gchat_peer_buf[0..gchat_peer_len], .chat_compose_status = gchat_compose_status, .chat_typing = chat_typing_demo and gscreen == feed_view.screen_messages and gchat_sel != null and @mod(now, 8) < 4, .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
+        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .market = if (gscreen == feed_view.screen_loadout and gloadout_tab == 1) market_cards.items else &.{}, .create = .{ .step = gcreate_step, .answers = gcreate_answers, .config = gcreate_config, .name = gcreate_name_buf[0..gcreate_name_len], .color = gcreate_color, .naming = gcreate_step == .name, .prepare_t = create_prepare_t }, .bench = bench_tray, .inspect_bytes = inspect_bytes orelse "", .inspect_name = inspect_name, .inspect_ref = inspect_ref, .inspect_source = gtransp_source, .inspect_loading = inspect_loading, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .chat_store = if (dev_chat) &gchat_store else null, .chat_sel = gchat_sel, .chat_draft = gchat_draft_buf[0..gchat_draft_len], .chat_input_focus = gchat_input_focus, .chat_composing = gchat_composing, .chat_compose = gchat_peer_buf[0..gchat_peer_len], .chat_compose_status = gchat_compose_status, .chat_typing = gscreen == feed_view.screen_messages and now < gchat_typing_deadline and gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&gchat_store, gchat_sel.?), gchat_typing_peer_buf[0..gchat_typing_peer_len]), .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
         switch (mode) {
             .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status),
             .compose => {
@@ -2612,6 +2627,16 @@ pub fn run(
                     } else if (zc >= 0x20 and zc < 0x7f and gchat_draft_len < gchat_draft_buf.len) {
                         gchat_draft_buf[gchat_draft_len] = @intCast(zc);
                         gchat_draft_len += 1;
+                        // One encrypted typing ping per 4s of active typing.
+                        // deposit is worker-queued (never blocks the frame);
+                        // the ping's persist is the same nonce rule a send
+                        // pays — one keystore write per ping, throttled.
+                        if (now - gchat_typing_sent_at >= 4) if (gchat_sel) |sc| {
+                            if (gchat_e2ee) |*st| if (gchat_link) |l| {
+                                chat_e2ee.sendTyping(gpa, io, environ, st, l, chat_core.conversationDid(&gchat_store, sc)) catch {};
+                                gchat_typing_sent_at = now;
+                            };
+                        };
                     }
                     try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status);
                     continue;
@@ -4019,6 +4044,9 @@ const GpuState = struct {
     /// False until the Messages screen has been seen once — the history
     /// restore and any pre-visit arrivals must NOT animate on first paint.
     chat_seen_valid: bool = false,
+    /// The chat springs' frame-clock watermark (monotonic ns): motion
+    /// advances by MEASURED time, not a fixed per-frame tick.
+    chat_clock_ns: u64 = 0,
 };
 
 /// Spring one geometry boundary toward its target (S.2). Stiff + just over
@@ -4031,13 +4059,15 @@ fn springGeom(cur: *f32, vel: *f32, target: f32, dt: f32) void {
     cur.* += vel.* * dt;
 }
 
-/// The message-motion spring (U6a): stiffer and UNDER-damped, so a sent
-/// bubble pops into its seat with a small overshoot and settles — the lively
-/// half of the vocabulary. Geometry morphs must not overshoot (a pane
-/// boundary crossing its target overlaps); a bubble should.
+/// The message-motion spring (U6a): stiff and mildly UNDER-damped
+/// (damping ratio ≈ 0.77) — a sent bubble snaps into its seat in ~0.35s
+/// with one small overshoot, the tuned response of a platform-native
+/// message send. Geometry morphs keep springGeom (no overshoot — a pane
+/// boundary must not cross its target); a bubble should breathe past its
+/// seat and settle.
 fn springPop(cur: *f32, vel: *f32, target: f32, dt: f32) void {
-    const k: f32 = 260.0;
-    const c: f32 = 16.0;
+    const k: f32 = 380.0;
+    const c: f32 = 30.0;
     vel.* += (-k * (cur.* - target) - c * vel.*) * dt;
     cur.* += vel.* * dt;
 }
@@ -4907,10 +4937,22 @@ fn paintFrameGpu(
         }
         gs.chat_seen_msgs = cs.msgs.len;
         gs.chat_seen_valid = true;
-        springPop(&gs.chat_send_t, &gs.chat_send_v, 1.0, 1.0 / 60.0);
-        springPop(&gs.chat_arrive_t, &gs.chat_arrive_v, 1.0, 1.0 / 60.0);
-        springGeom(&gs.chat_typing_t, &gs.chat_typing_v, if (g.chat_typing) 1.0 else 0.0, 1.0 / 60.0);
-        if (gs.chat_typing_t > 0.01) gs.chat_typing_phase += 1.0 / 60.0;
+        // MEASURED frame time, sub-stepped for stability: the motion is
+        // identical at 60Hz, 144Hz, or across a dropped frame — smoothness
+        // comes from advancing by real elapsed time, never a fixed tick.
+        const spring_now = clock_shell.monotonicNanos();
+        var dt: f32 = if (gs.chat_clock_ns == 0) 1.0 / 60.0 else @as(f32, @floatFromInt(spring_now -| gs.chat_clock_ns)) / 1_000_000_000.0;
+        gs.chat_clock_ns = spring_now;
+        dt = std.math.clamp(dt, 0.0, 0.05);
+        var rem = dt;
+        while (rem > 1e-6) {
+            const step = @min(rem, 1.0 / 240.0);
+            springPop(&gs.chat_send_t, &gs.chat_send_v, 1.0, step);
+            springPop(&gs.chat_arrive_t, &gs.chat_arrive_v, 1.0, step);
+            springPop(&gs.chat_typing_t, &gs.chat_typing_v, if (g.chat_typing) 1.0 else 0.0, step);
+            rem -= step;
+        }
+        if (gs.chat_typing_t > 0.01) gs.chat_typing_phase += dt;
         chat_animating = @abs(gs.chat_send_t - 1.0) > 0.004 or @abs(gs.chat_send_v) > 0.004 or
             @abs(gs.chat_arrive_t - 1.0) > 0.004 or @abs(gs.chat_arrive_v) > 0.004 or
             gs.chat_typing_t > 0.01 or g.chat_typing;

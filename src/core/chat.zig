@@ -52,6 +52,14 @@ pub const Kind = enum(u8) {
     system = 1,
 };
 
+/// The typing-indicator ping's WIRE kind byte (from the reserved chat-
+/// extension range 2..15). Ephemeral by construction: it rides the same
+/// E2EE channel as a message ([kind][…] → mls.encrypt → bucket — the relay
+/// sees one more fixed-size opaque blob), but it is consumed at the session
+/// layer and NEVER enters the store, so `parseKind` keeps rejecting it —
+/// a typing ping that somehow reached a history blob is damage, not data.
+pub const kind_typing_wire: u8 = 2;
+
 pub const KindError = error{UnknownKind};
 
 /// Wire byte -> kind. Reserved and unknown bytes are explicit errors, not
