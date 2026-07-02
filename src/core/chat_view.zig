@@ -50,12 +50,42 @@ pub const BubbleRow = struct {
     /// run) — the speech-bubble TAIL draws only there; stacked bubbles
     /// above it stay plain (the grouped-messenger grammar).
     tail: bool = false,
+    /// Payment cards only (M5 A4): ordinal into the thread's parallel
+    /// `PayCard` slice; `no_pay` for every other kind. For a card, `body`
+    /// is the NOTE — the renderer draws amount/rail/status itself.
+    pay: u32 = no_pay,
 
     comptime {
-        // Budget 40: 2 slices (32) + 4 bytes = 36, padded to pointer
-        // alignment — `tail` landed in existing padding. (A7)
+        // Budget 40: 2 slices (32) + 4 bytes + u32 = 40 — `pay` landed in
+        // what was padding. (A7)
         assert(@sizeOf(BubbleRow) == 40);
     }
+};
+
+pub const no_pay: u32 = std.math.maxInt(u32);
+
+/// A payment card's display facts, parallel to the thread rows (M5 A4).
+/// `payment_id` is the wire correlation key — the value a tap hands back
+/// to the shell, which resolves it through `chat.findPayment` (no store
+/// index crosses here, A5). Per-frame loop ⇒ guarded (A7).
+pub const PayCard = struct {
+    payment_id: u64,
+    amount_sat: u64,
+    rail: chat.Rail,
+    status: chat.PayStatus,
+    confirmations: u8,
+
+    comptime {
+        // Budget 24: 2×8 (u64) + 3×1 = 19, padded to u64 alignment. (A7)
+        assert(@sizeOf(PayCard) == 24);
+    }
+};
+
+/// `buildThread`'s result: the rows plus the payment cards they point at.
+/// A7.2: cold struct, size guard waived — one transient per frame.
+pub const Thread = struct {
+    rows: []BubbleRow = &.{},
+    cards: []PayCard = &.{},
 };
 
 /// A gap this long between consecutive messages earns a time divider.
@@ -159,30 +189,53 @@ pub fn buildList(
 }
 
 /// One conversation's bubbles, oldest first, with time dividers computed
-/// (first message, and any `stamp_gap` silence).
+/// (first message, and any `stamp_gap` silence). Payment cards ride as
+/// rows whose `pay` points into the parallel `cards` slice; their `body`
+/// is the note.
 pub fn buildThread(
     arena: Allocator,
     store: *const chat.Store,
     conv: chat.ConvIndex,
     now: i64,
-) error{OutOfMemory}![]BubbleRow {
+) error{OutOfMemory}!Thread {
     const order = try chat.threadSlice(arena, store, conv);
     const created_col = store.msgs.items(.created_at);
     const out = try arena.alloc(BubbleRow, order.len);
+    var n_pay: usize = 0;
+    for (order) |msg| {
+        if (chat.isPaymentKind(store.msgs.items(.kind)[@intFromEnum(msg)])) n_pay += 1;
+    }
+    const cards = try arena.alloc(PayCard, n_pay);
+    var next_card: u32 = 0;
     var prev_at: i64 = 0;
     for (order, out, 0..) |msg, *row, i| {
         const mi: u32 = @intFromEnum(msg);
         const at = created_col[mi];
         const kind = store.msgs.items(.kind)[mi];
-        var body = chat.sliceSpan(store, store.msgs.items(.text)[mi]);
-        if (chat.isPaymentKind(kind))
-            body = try paymentLine(arena, store, msg, kind, body);
+        var pay: u32 = no_pay;
+        if (chat.isPaymentKind(kind)) {
+            // A card without its row is impossible by store invariant;
+            // degrade to a plain note bubble rather than crash (E4).
+            if (chat.paymentByMsg(store, msg)) |p| {
+                const pi = @intFromEnum(p);
+                cards[next_card] = .{
+                    .payment_id = store.payments.items(.payment_id)[pi],
+                    .amount_sat = store.payments.items(.amount_sat)[pi],
+                    .rail = store.payments.items(.rail)[pi],
+                    .status = store.payments.items(.status)[pi],
+                    .confirmations = store.payments.items(.confirmations)[pi],
+                };
+                pay = next_card;
+                next_card += 1;
+            }
+        }
         row.* = .{
-            .body = body,
+            .body = chat.sliceSpan(store, store.msgs.items(.text)[mi]),
             .age = try ageStr(arena, now, at),
             .mine = chat.isMine(store, msg),
             .stamp = i == 0 or at - prev_at >= stamp_gap,
             .kind = kind,
+            .pay = pay,
         };
         prev_at = at;
     }
@@ -191,7 +244,7 @@ pub fn buildThread(
     for (out, 0..) |*row, i| {
         row.tail = i + 1 == out.len or out[i + 1].mine != row.mine or out[i + 1].stamp;
     }
-    return out;
+    return .{ .rows = out, .cards = cards[0..next_card] };
 }
 
 // ---------------------------------------------------------------------------
@@ -244,7 +297,7 @@ test "buildThread orders bubbles and computes stamps at silences" {
     _ = try chat.appendMessage(gpa, &store, a, .text, "quick reply", 1030, false);
     _ = try chat.appendMessage(gpa, &store, a, .text, "much later", 1030 + stamp_gap, false);
 
-    const rows = try buildThread(arena, &store, a, 10_000);
+    const rows = (try buildThread(arena, &store, a, 10_000)).rows;
 
     try std.testing.expectEqual(@as(usize, 3), rows.len);
     try std.testing.expectEqualStrings("hi", rows[0].body);
@@ -276,14 +329,14 @@ test "buildThread: a same-sender run keeps its tail only on the last bubble" {
     _ = try chat.appendMessage(gpa, &store, a, .text, "three", 1020, true);
     _ = try chat.appendMessage(gpa, &store, a, .text, "reply", 1030, false);
 
-    const rows = try buildThread(arena, &store, a, 2000);
+    const rows = (try buildThread(arena, &store, a, 2000)).rows;
     try std.testing.expect(!rows[0].tail); // stacked
     try std.testing.expect(!rows[1].tail); // stacked
     try std.testing.expect(rows[2].tail); // the run's last
     try std.testing.expect(rows[3].tail); // thread end
 }
 
-test "payment cards render an honest one-line summary in thread and list" {
+test "payment cards ride rows with parallel card facts; list previews summarize" {
     const gpa = std.testing.allocator;
     var store: chat.Store = .{};
     defer chat.deinitStore(gpa, &store);
@@ -297,30 +350,31 @@ test "payment cards render an honest one-line summary in thread and list" {
     const sent = try chat.appendPayment(gpa, &store, a, .payment_sent, 0xBEEF, .onchain, 250_000, "", 1020, true);
     _ = chat.setConfirmations(&store, sent, 3);
 
-    const rows = try buildThread(arena, &store, a, 2000);
-    try std.testing.expectEqual(@as(usize, 3), rows.len);
-    try std.testing.expectEqual(chat.Kind.payment_request, rows[1].kind);
-    try std.testing.expectEqualStrings(
-        "Payment request · 5000 sats · lightning · requested — dinner",
-        rows[1].body,
-    );
-    try std.testing.expectEqualStrings(
-        "Payment · 250000 sats · on-chain · 3/6 confirmations",
-        rows[2].body,
-    );
+    const th = try buildThread(arena, &store, a, 2000);
+    try std.testing.expectEqual(@as(usize, 3), th.rows.len);
+    try std.testing.expectEqual(@as(usize, 2), th.cards.len);
+    // The text bubble points at no card; the cards point in thread order.
+    try std.testing.expectEqual(no_pay, th.rows[0].pay);
+    try std.testing.expectEqual(chat.Kind.payment_request, th.rows[1].kind);
+    try std.testing.expectEqual(@as(u32, 0), th.rows[1].pay);
+    try std.testing.expectEqualStrings("dinner", th.rows[1].body); // body = the NOTE
+    try std.testing.expectEqual(@as(u64, 0xCAFE), th.cards[0].payment_id);
+    try std.testing.expectEqual(@as(u64, 5000), th.cards[0].amount_sat);
+    try std.testing.expectEqual(chat.Rail.lightning, th.cards[0].rail);
+    try std.testing.expectEqual(chat.PayStatus.requested, th.cards[0].status);
+    try std.testing.expectEqual(@as(u32, 1), th.rows[2].pay);
+    try std.testing.expectEqual(chat.PayStatus.confirming, th.cards[1].status);
+    try std.testing.expectEqual(@as(u8, 3), th.cards[1].confirmations);
 
-    // The list preview speaks the same line ("You: " prefixed — ours).
+    // The list preview keeps the one-line summary ("You: " prefixed — ours).
     const list = try buildList(arena, &store, 2000);
     try std.testing.expectEqualStrings(
         "You: Payment · 250000 sats · on-chain · 3/6 confirmations",
         list[0].preview,
     );
 
-    // A settled card reads settled.
+    // A settled card reads settled in the card facts.
     _ = try chat.advancePayment(gpa, &store, req, .settled, null);
-    const rows2 = try buildThread(arena, &store, a, 2000);
-    try std.testing.expectEqualStrings(
-        "Payment request · 5000 sats · lightning · settled — dinner",
-        rows2[1].body,
-    );
+    const th2 = try buildThread(arena, &store, a, 2000);
+    try std.testing.expectEqual(chat.PayStatus.settled, th2.cards[0].status);
 }

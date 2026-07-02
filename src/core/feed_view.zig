@@ -45,6 +45,7 @@ const compose = @import("compose.zig");
 const settings_view = @import("settings_view.zig");
 const transp = @import("transparency.zig");
 const chat_view = @import("chat_view.zig");
+const chat_msg = @import("chat.zig");
 
 // Palette, copied from field.zig so the view never reaches across a module
 // for a constant (D4: only the value crosses, by copy). ARGB.
@@ -150,7 +151,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received };
 
 /// The six top-level rail destinations, in order. The `Screen` index a nav
 /// region carries is an index into this. Shared by the rail (draw + hit) and
@@ -3486,6 +3487,172 @@ fn scaleAlpha(color: u32, a: f32) u32 {
     return (s << 24) | (color & 0x00FFFFFF);
 }
 
+// ---------------------------------------------------------------------------
+// Payments in the thread (M5 A4): the card and the pay sheet. The card is a
+// document, not a text bubble — rail tag, the amount large, the note, and a
+// LIVE status line (the six-block confirmation animation when on-chain depth
+// is climbing). The sheet composes a request/send: rail toggle, amount chips,
+// two small inputs, three verbs. Everything here is a pure transform of the
+// frame's values (B2) — the shell owns state, springs, and every side effect.
+// ---------------------------------------------------------------------------
+
+/// The pay sheet's per-frame state — shell values in, pixels out.
+/// A7.2: cold struct, size guard waived — one transient parameter carrier.
+pub const ChatPaySheet = struct {
+    open: bool = false,
+    rail: chat_msg.Rail = .lightning,
+    /// The amount draft (digits only — the shell filters keystrokes).
+    amount: []const u8 = "",
+    note: []const u8 = "",
+    /// 0 = the amount field owns the keyboard, 1 = the note.
+    focus: u8 = 0,
+    /// One short amber line ("" = none): why the last attempt refused.
+    status: []const u8 = "",
+};
+
+/// The sheet's amount chips (sats) — one tap fills the amount field. The
+/// tap region's `post` is the index into this table.
+pub const pay_chips = [4]u64{ 1_000, 5_000, 10_000, 25_000 };
+
+/// Digits grouped in thousands ("250,000") — money is read in groups.
+/// 20 digits + 6 separators bounds the buffer.
+fn groupSats(buf: *[27]u8, v: u64) []const u8 {
+    var tmp: [20]u8 = undefined;
+    const digits = std.fmt.bufPrint(&tmp, "{d}", .{v}) catch unreachable;
+    var n: usize = 0;
+    for (digits, 0..) |d, i| {
+        if (i > 0 and (digits.len - i) % 3 == 0) {
+            buf[n] = ',';
+            n += 1;
+        }
+        buf[n] = d;
+        n += 1;
+    }
+    return buf[0..n];
+}
+
+/// The one action a payment card offers in its current state, if any: Pay
+/// (a counterparty's open request), Cancel (own just-initiated send, still
+/// unobserved), or Mark received (own request — the payee's wallet is the
+/// only place a lightning receipt shows, so the payee closes that loop
+/// until the on-chain watcher (A5) automates its rail).
+fn payCardAction(mine: bool, kind: chat_msg.Kind, status: chat_msg.PayStatus) ?Action {
+    if (!mine and kind == .payment_request and status == .requested) return .pay_card_pay;
+    if (mine and kind == .payment_sent and status == .pending) return .pay_card_cancel;
+    if (mine and kind == .payment_request and !chat_msg.isTerminalStatus(status)) return .pay_card_received;
+    return null;
+}
+
+/// The status line's words ("" = the confirming blocks draw instead).
+/// Every word claims exactly what is known — `pending` means "initiated,
+/// unobserved", never "sent" (§6 honesty).
+fn payStatusWord(status: chat_msg.PayStatus) []const u8 {
+    return switch (status) {
+        .requested => "requested",
+        .pending => "waiting on the wallet…",
+        .broadcast => "broadcast…",
+        .confirming => "",
+        .settled => "settled",
+        .failed => "didn't complete",
+    };
+}
+
+const pay_card_w_max: i32 = 280;
+
+/// A card's height for the thread's measure pass — the same arithmetic the
+/// draw pass walks, so the two can never disagree.
+fn payCardHeight(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, b: chat_view.BubbleRow, card: chat_view.PayCard, cw2: i32) !i32 {
+    var h: i32 = 12 + 16 + 30 + 26 + 10; // pads + rail tag + amount + status
+    if (b.body.len > 0)
+        h += try wrapBody(gpa, dl, e, 0, 0, cw2 - 28, 0, 13, b.body, 18, false, null) + 4;
+    if (payCardAction(b.mine, b.kind, card.status) != null) h += 44;
+    return h;
+}
+
+/// Draw one payment card at its seat. `ordinal` is the row's index in the
+/// thread — what a button tap hands back to the shell (the shell re-derives
+/// the payment through its own thread query; no store index crosses, A5).
+fn drawPayCard(
+    gpa: Allocator,
+    dl: *raster.DrawList,
+    e: *const text.Engine,
+    regions: ?*Regions,
+    accent: u32,
+    bx: i32,
+    by: i32,
+    bw: i32,
+    bh_card: i32,
+    b: chat_view.BubbleRow,
+    card: chat_view.PayCard,
+    ordinal: u16,
+) !void {
+    const settled_c: u32 = 0xFF9BCE9B; // soft success green
+    const fill: u32 = if (b.mine) (0x38 << 24) | (accent & 0x00FFFFFF) else skinPanel(accent);
+    try rect(gpa, dl, bx, by, bw, bh_card, fill, 14);
+    if (b.tail) try bubbleTail(gpa, dl, b.mine, bx, by, bw, bh_card, fill);
+    if (!chat_msg.isTerminalStatus(card.status)) {
+        // A live card wears a faint accent ring; terminal cards sit quiet.
+        const ring_c = (0x60 << 24) | (accent & 0x00FFFFFF);
+        try rect(gpa, dl, bx, by, bw, 1, ring_c, 0);
+        try rect(gpa, dl, bx, by + bh_card - 1, bw, 1, ring_c, 0);
+        try rect(gpa, dl, bx, by, 1, bh_card, ring_c, 0);
+        try rect(gpa, dl, bx + bw - 1, by, 1, bh_card, ring_c, 0);
+    }
+    var ty = by + 12;
+    _ = try str(gpa, dl, e, .semibold, bx + 14, ty + 11, faint, 11, if (card.rail == .lightning) "LIGHTNING" else "ON-CHAIN");
+    ty += 16;
+    var gb: [27]u8 = undefined;
+    const amt = groupSats(&gb, card.amount_sat);
+    const pen = try str(gpa, dl, e, .semibold, bx + 14, ty + 22, ink, 22, amt);
+    _ = try str(gpa, dl, e, .regular, pen + 6, ty + 22, muted, 13, "sats");
+    ty += 30;
+    if (b.body.len > 0) {
+        const note_h = try wrapBody(gpa, dl, e, 0, 0, bw - 28, 0, 13, b.body, 18, false, null);
+        _ = try wrapBody(gpa, dl, e, bx + 14, ty + 13, bw - 28, muted, 13, b.body, 18, true, null);
+        ty += note_h + 4;
+    }
+    if (card.status == .confirming) {
+        // The six-block animation: one block fills per confirmation, live
+        // in the conversation — the thread IS the receipt (§4).
+        var i: i32 = 0;
+        while (i < chat_msg.settle_depth) : (i += 1) {
+            const on = i < card.confirmations;
+            try rect(gpa, dl, bx + 14 + i * 19, ty + 5, 14, 14, if (on) accent else 0x2AEDEAE0, 4);
+        }
+        var cb: [8]u8 = undefined;
+        const cs = std.fmt.bufPrint(&cb, "{d}/{d}", .{ card.confirmations, chat_msg.settle_depth }) catch "";
+        _ = try str(gpa, dl, e, .regular, bx + 14 + 6 * 19 + 6, ty + 16, muted, 12, cs);
+    } else {
+        const word = payStatusWord(card.status);
+        const wc: u32 = switch (card.status) {
+            .settled => settled_c,
+            .failed => faint,
+            else => muted,
+        };
+        if (card.status == .settled) {
+            try rect(gpa, dl, bx + 14, ty + 8, 8, 8, settled_c, 4);
+            _ = try str(gpa, dl, e, .semibold, bx + 28, ty + 16, wc, 12, word);
+        } else {
+            _ = try str(gpa, dl, e, .regular, bx + 14, ty + 16, wc, 12, word);
+        }
+    }
+    ty += 26;
+    if (payCardAction(b.mine, b.kind, card.status)) |act| {
+        const label: []const u8 = switch (act) {
+            .pay_card_pay => "Pay",
+            .pay_card_cancel => "Cancel",
+            .pay_card_received => "Mark received",
+            else => unreachable,
+        };
+        const lw: i32 = @intCast(text.measure(e, .semibold, label, 13));
+        const pw = lw + 32;
+        const primary = act == .pay_card_pay;
+        try rect(gpa, dl, bx + 14, ty + 4, pw, 34, if (primary) accent else 0x2AEDEAE0, 12);
+        _ = try str(gpa, dl, e, .semibold, bx + 30, ty + 26, if (primary) 0xFF20201A else body_c, 13, label);
+        try emitRegion(gpa, regions, bx + 14, ty + 4, pw, 34, ordinal, act);
+    }
+}
+
 /// Draw `s` truncated to `maxw`, with a trailing ellipsis when it overflows.
 fn strEllipsis(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, weight: text.Weight, x0: i32, baseline: i32, color: u32, px: u16, s: []const u8, maxw: i32) !void {
     if (@as(i32, @intCast(text.measure(e, weight, s, px))) <= maxw) {
@@ -3532,6 +3699,8 @@ pub fn layoutChat(
     /// The open conversation's bubbles; empty with an empty `peer` = no
     /// conversation selected.
     thread: []const chat_view.BubbleRow,
+    /// The thread's payment cards, addressed by `BubbleRow.pay` (M5 A4).
+    cards: []const chat_view.PayCard,
     /// Ordinal (into `list`) of the selected conversation; ≥ list.len = none.
     sel: u16,
     /// Display name of the open conversation's counterparty ("" = none).
@@ -3552,6 +3721,8 @@ pub fn layoutChat(
     /// attempt didn't start — unresolvable handle, no published keys, relay
     /// down. Static shell strings; this layer just draws them.
     compose_status: []const u8,
+    /// The pay sheet's state (M5 A4); `.{}` = closed.
+    pay: ChatPaySheet,
     /// The frame's motion values (U6a) — shell springs in, pixels out.
     motion: ChatMotion,
 ) error{OutOfMemory}!i32 {
@@ -3691,7 +3862,10 @@ pub fn layoutChat(
     // running off it; the thread above yields the space. Enter sends,
     // Shift+Enter breaks the line ('\n' in the draft is a real line).
     const send_w: i32 = 84;
-    const input_w = detail_w - send_w - 12;
+    // The pay button (M5 A4) sits left of the input; the input yields it room.
+    const pay_btn: i32 = 40;
+    const input_x = detail_x + pay_btn + 8;
+    const input_w = detail_w - send_w - 12 - pay_btn - 8;
     const input_line_h: i32 = 20;
     const draft_h: i32 = if (draft.len == 0)
         input_line_h
@@ -3721,6 +3895,8 @@ pub fn layoutChat(
     for (thread, bh) |b, *hslot| {
         if (b.kind == .system) {
             hslot.* = 24;
+        } else if (b.pay != chat_view.no_pay and b.pay < cards.len) {
+            hslot.* = try payCardHeight(gpa, dl, e, b, cards[b.pay], @min(pay_card_w_max, bub_max));
         } else {
             const text_h = try wrapBody(gpa, dl, e, 0, 0, bub_max - 2 * pad_x, 0, 14, b.body, line_h, false, null);
             hslot.* = text_h + 2 * pad_y - 4;
@@ -3782,6 +3958,14 @@ pub fn layoutChat(
             if (b.kind == .system) {
                 const sw2: i32 = @intCast(text.measure(e, .regular, b.body, 12));
                 _ = try str(gpa, dl, e, .regular, detail_x + @divTrunc(detail_w - sw2, 2), by + 16, faint, 12, b.body);
+            } else if (b.pay != chat_view.no_pay and b.pay < cards.len) {
+                // A payment card draws at its seat even when it is the
+                // newest row mid-flight — the thread still slides as one; a
+                // card is a document, not a chat pop (motion polish can
+                // revisit under judgment).
+                const cw2 = @min(pay_card_w_max, bub_max);
+                const cbx = if (b.mine) detail_x + detail_w - cw2 else detail_x;
+                try drawPayCard(gpa, dl, e, regions, accent, cbx, by, cw2, hh, b, cards[b.pay], @intCast(@min(idx, std.math.maxInt(u16))));
             } else {
                 // Single-line bubbles shrink-wrap; wrapped ones take the max.
                 const one_w: i32 = @intCast(text.measure(e, .regular, b.body, 14));
@@ -3863,31 +4047,45 @@ pub fn layoutChat(
     // through the same wrap engine as the bubbles (soft wrap + hard
     // word-break + '\n' from Shift+Enter); the caret sits after the last
     // glyph and BREATHES when idle (caretAlpha — lit while typing).
-    try rect(gpa, dl, detail_x, comp_y, input_w, comp_h, skinPanel(accent), 14);
-    try rect(gpa, dl, detail_x, comp_y, input_w, 1, 0x14EDEAE0, 14);
+    try rect(gpa, dl, input_x, comp_y, input_w, comp_h, skinPanel(accent), 14);
+    try rect(gpa, dl, input_x, comp_y, input_w, 1, 0x14EDEAE0, 14);
     if (input_focus) {
         // Focus ring: a one-pixel accent outline (the rounded fill draws
         // first, so four thin edge rects read as a ring at this radius).
         const ring_c = (0xC0 << 24) | (accent & 0x00FFFFFF);
-        try rect(gpa, dl, detail_x, comp_y, input_w, 1, ring_c, 0);
-        try rect(gpa, dl, detail_x, comp_y + comp_h - 1, input_w, 1, ring_c, 0);
-        try rect(gpa, dl, detail_x, comp_y, 1, comp_h, ring_c, 0);
-        try rect(gpa, dl, detail_x + input_w - 1, comp_y, 1, comp_h, ring_c, 0);
+        try rect(gpa, dl, input_x, comp_y, input_w, 1, ring_c, 0);
+        try rect(gpa, dl, input_x, comp_y + comp_h - 1, input_w, 1, ring_c, 0);
+        try rect(gpa, dl, input_x, comp_y, 1, comp_h, ring_c, 0);
+        try rect(gpa, dl, input_x + input_w - 1, comp_y, 1, comp_h, ring_c, 0);
     }
-    var caret_x: i32 = detail_x + 14;
+    var caret_x: i32 = input_x + 14;
     var caret_base: i32 = comp_y + 29;
     if (draft.len > 0) {
-        caret_base = try wrapBodyPen(gpa, dl, e, detail_x + 14, comp_y + 29, input_w - 28, ink, 14, draft, input_line_h, true, null, &caret_x) - input_line_h;
+        caret_base = try wrapBodyPen(gpa, dl, e, input_x + 14, comp_y + 29, input_w - 28, ink, 14, draft, input_line_h, true, null, &caret_x) - input_line_h;
     } else {
         var pbuf: [96]u8 = undefined;
         const ph = std.fmt.bufPrint(&pbuf, "Message {s}", .{peer}) catch "Message";
-        try strEllipsis(gpa, dl, e, .regular, detail_x + 14, comp_y + 29, faint, 14, ph, input_w - 28);
+        try strEllipsis(gpa, dl, e, .regular, input_x + 14, comp_y + 29, faint, 14, ph, input_w - 28);
     }
     if (input_focus) {
         const ca = caretAlpha(motion.caret_phase);
         try rect(gpa, dl, caret_x + 1, caret_base - 14, 2, 18, scaleAlpha((0xE0 << 24) | (accent & 0x00FFFFFF), ca), 0);
     }
-    try emitRegion(gpa, regions, detail_x, comp_y, input_w, @intCast(comp_h), 0, .chat_input);
+    try emitRegion(gpa, regions, input_x, comp_y, input_w, @intCast(comp_h), 0, .chat_input);
+    // The pay button: a "B" wearing the two ₿ ticks (the embedded fonts
+    // carry no bitcoin glyph; the line-art spelling is ours). Pins to the
+    // input's bottom edge like Send; accent-filled while the sheet is open.
+    {
+        const py = comp_y + comp_h - 46;
+        try rect(gpa, dl, detail_x, py, pay_btn, 46, if (pay.open) accent else skinPanel(accent), 14);
+        const bc: u32 = if (pay.open) 0xFF20201A else body_c;
+        const bw2: i32 = @intCast(text.measure(e, .semibold, "B", 17));
+        const bx2 = detail_x + @divTrunc(pay_btn - bw2, 2);
+        _ = try str(gpa, dl, e, .semibold, bx2, py + 29, bc, 17, "B");
+        try rect(gpa, dl, bx2 + @divTrunc(bw2, 2) - 1, py + 11, 2, 4, bc, 0);
+        try rect(gpa, dl, bx2 + @divTrunc(bw2, 2) - 1, py + 31, 2, 4, bc, 0);
+        try emitRegion(gpa, regions, detail_x, py, pay_btn, 46, 0, .pay_open);
+    }
     // Send pins to the input's bottom edge as the composer grows.
     const sx = detail_x + detail_w - send_w;
     const sy = comp_y + comp_h - 46;
@@ -3896,6 +4094,118 @@ pub fn layoutChat(
     const sw3: i32 = @intCast(text.measure(e, .semibold, "Send", 14));
     _ = try str(gpa, dl, e, .semibold, sx + @divTrunc(send_w - sw3, 2), sy + 29, if (armed) 0xFF20201A else faint, 14, "Send");
     try emitRegion(gpa, regions, sx, sy, send_w, 46, 0, .chat_send);
+
+    // ── The pay sheet (M5 A4): compose a request or a send. Sits above the
+    // composer; drawn (and its regions emitted) LAST, so it shadows anything
+    // beneath it (hitTest is last-wins). Near-opaque — the thread must not
+    // bleed through a surface that talks about money. ──
+    if (pay.open) {
+        const status_extra: i32 = if (pay.status.len > 0) 24 else 0;
+        const sheet_h: i32 = 254 + status_extra;
+        const sy0 = comp_y - sheet_h - 12;
+        try rect(gpa, dl, detail_x, sy0, detail_w, sheet_h, 0xFF201F18, 16);
+        const ring_c = (0x90 << 24) | (accent & 0x00FFFFFF);
+        try rect(gpa, dl, detail_x, sy0, detail_w, 1, ring_c, 0);
+        try rect(gpa, dl, detail_x, sy0 + sheet_h - 1, detail_w, 1, ring_c, 0);
+        try rect(gpa, dl, detail_x, sy0, 1, sheet_h, ring_c, 0);
+        try rect(gpa, dl, detail_x + detail_w - 1, sy0, 1, sheet_h, ring_c, 0);
+
+        var py = sy0 + 16;
+        // Header: who, and the rail toggle (two pills, selected = accent).
+        {
+            var hbuf: [96]u8 = undefined;
+            const hs = std.fmt.bufPrint(&hbuf, "Pay {s}", .{peer}) catch "Pay";
+            try strEllipsis(gpa, dl, e, .semibold, detail_x + 18, py + 14, ink, 14, hs, detail_w - 260);
+            var rx = detail_x + detail_w - 18;
+            const rails = [2][]const u8{ "On-chain", "Lightning" }; // drawn right-to-left
+            for (rails, 0..) |label, ri| {
+                const rail_val: chat_msg.Rail = if (ri == 0) .onchain else .lightning;
+                const on = pay.rail == rail_val;
+                const lw: i32 = @intCast(text.measure(e, .semibold, label, 12));
+                const pw = lw + 22;
+                rx -= pw;
+                try rect(gpa, dl, rx, py - 3, pw, 28, if (on) accent else 0x2AEDEAE0, 14);
+                _ = try str(gpa, dl, e, .semibold, rx + 11, py + 15, if (on) 0xFF20201A else body_c, 12, label);
+                try emitRegion(gpa, regions, rx, py - 3, pw, 28, @intFromEnum(rail_val), .pay_rail);
+                rx -= 8;
+            }
+        }
+        py += 38;
+        // Amount chips: one tap fills the amount.
+        {
+            var cx = detail_x + 18;
+            for (pay_chips, 0..) |chip, ci| {
+                var gb: [27]u8 = undefined;
+                const cs = groupSats(&gb, chip);
+                const lw: i32 = @intCast(text.measure(e, .regular, cs, 13));
+                const pw = lw + 24;
+                try rect(gpa, dl, cx, py, pw, 30, 0x2AEDEAE0, 12);
+                _ = try str(gpa, dl, e, .regular, cx + 12, py + 20, body_c, 13, cs);
+                try emitRegion(gpa, regions, cx, py, pw, 30, @intCast(ci), .pay_chip);
+                cx += pw + 8;
+            }
+        }
+        py += 40;
+        // The two inputs: amount (digits) and note. The focused one wears
+        // the ring + caret — the composer's focus vocabulary.
+        const fields = [2]struct { draft: []const u8, ph: []const u8, act: Action }{
+            .{ .draft = pay.amount, .ph = "amount in sats", .act = .pay_amount },
+            .{ .draft = pay.note, .ph = "note (optional)", .act = .pay_note },
+        };
+        for (fields, 0..) |fld, fi| {
+            const focused = pay.focus == fi;
+            try rect(gpa, dl, detail_x + 18, py, detail_w - 36, 38, 0x22EDEAE0, 12);
+            if (focused) {
+                const fr = (0xC0 << 24) | (accent & 0x00FFFFFF);
+                try rect(gpa, dl, detail_x + 18, py, detail_w - 36, 1, fr, 0);
+                try rect(gpa, dl, detail_x + 18, py + 37, detail_w - 36, 1, fr, 0);
+                try rect(gpa, dl, detail_x + 18, py, 1, 38, fr, 0);
+                try rect(gpa, dl, detail_x + detail_w - 19, py, 1, 38, fr, 0);
+            }
+            var fpen: i32 = detail_x + 32;
+            if (fld.draft.len > 0) {
+                fpen = try str(gpa, dl, e, if (fi == 0) .semibold else .regular, detail_x + 32, py + 25, ink, 14, fld.draft);
+                if (fi == 0) _ = try str(gpa, dl, e, .regular, fpen + 6, py + 25, muted, 12, "sats");
+            } else {
+                _ = try str(gpa, dl, e, .regular, detail_x + 32, py + 25, faint, 14, fld.ph);
+            }
+            if (focused) {
+                const ca = caretAlpha(motion.caret_phase);
+                try rect(gpa, dl, fpen + 2, py + 10, 2, 18, scaleAlpha((0xE0 << 24) | (accent & 0x00FFFFFF), ca), 0);
+            }
+            try emitRegion(gpa, regions, detail_x + 18, py, detail_w - 36, 38, 0, fld.act);
+            py += 46;
+        }
+        if (pay.status.len > 0) {
+            _ = try str(gpa, dl, e, .regular, detail_x + 20, py + 12, 0xFFE0A868, 13, pay.status);
+            py += 24;
+        }
+        // The verbs: Cancel | Request | Send. Request asks the peer for
+        // this amount; Send resolves their published address and hands off
+        // to YOUR wallet (§0 — approval happens there).
+        {
+            const armed2 = pay.amount.len > 0;
+            const cancel_w: i32 = 92;
+            const rest = detail_w - 36 - cancel_w - 16;
+            const req_w = @divTrunc(rest, 2);
+            const send_w2 = rest - req_w;
+            var bx3 = detail_x + 18;
+            try rect(gpa, dl, bx3, py, cancel_w, 42, 0x2AEDEAE0, 14);
+            const clw: i32 = @intCast(text.measure(e, .semibold, "Cancel", 13));
+            _ = try str(gpa, dl, e, .semibold, bx3 + @divTrunc(cancel_w - clw, 2), py + 27, body_c, 13, "Cancel");
+            try emitRegion(gpa, regions, bx3, py, cancel_w, 42, 0, .pay_cancel);
+            bx3 += cancel_w + 8;
+            try rect(gpa, dl, bx3, py, req_w, 42, 0x2AEDEAE0, 14);
+            const rlw: i32 = @intCast(text.measure(e, .semibold, "Request", 13));
+            _ = try str(gpa, dl, e, .semibold, bx3 + @divTrunc(req_w - rlw, 2), py + 27, if (armed2) ink else faint, 13, "Request");
+            try emitRegion(gpa, regions, bx3, py, req_w, 42, 0, .pay_request);
+            bx3 += req_w + 8;
+            try rect(gpa, dl, bx3, py, send_w2, 42, if (armed2) accent else skinPanel(accent), 14);
+            const slw: i32 = @intCast(text.measure(e, .semibold, "Send", 13));
+            _ = try str(gpa, dl, e, .semibold, bx3 + @divTrunc(send_w2 - slw, 2), py + 27, if (armed2) 0xFF20201A else faint, 13, "Send");
+            try emitRegion(gpa, regions, bx3, py, send_w2, 42, 0, .pay_send);
+        }
+    }
 
     return height + @max(0, total - (thread_bot - thread_top));
 }
@@ -4213,22 +4523,25 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // Narrow width (460): no rail regions, so the counts are exactly the
     // surface's own — one region per conversation row + the composer pair +
     // the "+ New" pill.
-    const h = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, 0, "maya.zat4.com", "", true, false, "", "", .{});
+    const h = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", true, false, "", "", .{}, .{});
     var n_conv: usize = 0;
     var n_input: usize = 0;
     var n_send: usize = 0;
     var n_new: usize = 0;
+    var n_pay: usize = 0;
     for (regions.items) |r| {
         if (r.kind == .chat_conv) n_conv += 1;
         if (r.kind == .chat_input) n_input += 1;
         if (r.kind == .chat_send) n_send += 1;
         if (r.kind == .chat_new) n_new += 1;
+        if (r.kind == .pay_open) n_pay += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), n_conv);
     try std.testing.expectEqual(@as(usize, 1), n_input);
     try std.testing.expectEqual(@as(usize, 1), n_send);
     try std.testing.expectEqual(@as(usize, 1), n_new);
-    try std.testing.expectEqual(regions.items.len, n_conv + n_input + n_send + n_new);
+    try std.testing.expectEqual(@as(usize, 1), n_pay); // the pay button (M5 A4)
+    try std.testing.expectEqual(regions.items.len, n_conv + n_input + n_send + n_new + n_pay);
     try std.testing.expect(h >= 940); // viewport + any thread overflow
     try std.testing.expect(dl.len > 0);
 
@@ -4236,7 +4549,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // no thread pane and no composer to arm. The "+ New" pill is always there.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h2 = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, 255, "", "", false, false, "", "", .{});
+    const h2 = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", false, false, "", "", .{}, .{});
     try std.testing.expectEqual(@as(i32, 940), h2);
     var n2_conv: usize = 0;
     var n2_new: usize = 0;
@@ -4252,7 +4565,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // line draws when the shell hands one over.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, 255, "", "", false, true, "chattest.zat4.com", "Couldn't resolve that handle", .{});
+    _ = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", false, true, "chattest.zat4.com", "Couldn't resolve that handle", .{}, .{});
     var n3_compose: usize = 0;
     for (regions.items) |r| {
         if (r.kind == .chat_compose_input) n3_compose += 1;
@@ -4265,14 +4578,89 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // (motion never moves a tap target).
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, 0, "maya.zat4.com", "", true, false, "", "", .{});
+    _ = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", true, false, "", "", .{}, .{});
     const rest_items = dl.len;
     const rest_regions = regions.items.len;
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, 0, "maya.zat4.com", "", true, false, "", "", .{ .send_t = 0.4, .arrive_t = 1, .typing_t = 1, .typing_phase = 0.7 });
+    _ = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", true, false, "", "", .{}, .{ .send_t = 0.4, .arrive_t = 1, .typing_t = 1, .typing_phase = 0.7 });
     try std.testing.expect(dl.len > rest_items);
     try std.testing.expectEqual(rest_regions, regions.items.len);
+}
+
+test "messages screen: payment cards and the pay sheet emit their regions (M5 A4)" {
+    const gpa = std.testing.allocator;
+    var engine = try text.initEngine();
+    defer text.deinitEngine(gpa, &engine);
+    var dl: raster.DrawList = .{};
+    defer dl.deinit(gpa);
+    var regions: Regions = .empty;
+    defer regions.deinit(gpa);
+
+    const lrows = [_]chat_view.ListRow{
+        .{ .name = "maya.zat4.com", .preview = "Payment request · 5000 sats", .age = "2h", .unread = 0 },
+    };
+    // A peer's open request (offers Pay), our pending send (offers Cancel),
+    // our own request (offers Mark received), and a confirming card (the
+    // six-block row, no action).
+    const brows = [_]chat_view.BubbleRow{
+        .{ .body = "dinner", .age = "2h", .mine = false, .stamp = true, .kind = .payment_request, .tail = true, .pay = 0 },
+        .{ .body = "", .age = "1h", .mine = true, .stamp = false, .kind = .payment_sent, .tail = true, .pay = 1 },
+        .{ .body = "rent", .age = "1h", .mine = true, .stamp = false, .kind = .payment_request, .tail = true, .pay = 2 },
+        .{ .body = "", .age = "1h", .mine = true, .stamp = false, .kind = .payment_sent, .tail = true, .pay = 3 },
+    };
+    const cards = [_]chat_view.PayCard{
+        .{ .payment_id = 1, .amount_sat = 5000, .rail = .lightning, .status = .requested, .confirmations = 0 },
+        .{ .payment_id = 2, .amount_sat = 21_000, .rail = .onchain, .status = .pending, .confirmations = 0 },
+        .{ .payment_id = 3, .amount_sat = 250_000, .rail = .lightning, .status = .requested, .confirmations = 0 },
+        .{ .payment_id = 4, .amount_sat = 9_000, .rail = .onchain, .status = .confirming, .confirmations = 3 },
+    };
+
+    // Sheet closed: the card buttons carry their thread ordinals.
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", false, false, "", "", .{}, .{});
+    var pay_at: u16 = 999;
+    var cancel_at: u16 = 999;
+    var received_at: u16 = 999;
+    for (regions.items) |r| {
+        if (r.kind == .pay_card_pay) pay_at = r.post;
+        if (r.kind == .pay_card_cancel) cancel_at = r.post;
+        if (r.kind == .pay_card_received) received_at = r.post;
+    }
+    try std.testing.expectEqual(@as(u16, 0), pay_at);
+    try std.testing.expectEqual(@as(u16, 1), cancel_at);
+    try std.testing.expectEqual(@as(u16, 2), received_at);
+
+    // Sheet open: rail toggle ×2, chips ×4, the two inputs, three verbs —
+    // and the amber status line renders without disturbing the regions.
+    dl.len = 0;
+    regions.clearRetainingCapacity();
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", false, false, "", "", .{ .open = true, .rail = .onchain, .amount = "5000", .note = "dinner", .status = "They haven't set up payments" }, .{});
+    var n_rail: usize = 0;
+    var n_chip: usize = 0;
+    var n_amount: usize = 0;
+    var n_note: usize = 0;
+    var n_req: usize = 0;
+    var n_sendv: usize = 0;
+    var n_cancel: usize = 0;
+    for (regions.items) |r| {
+        switch (r.kind) {
+            .pay_rail => n_rail += 1,
+            .pay_chip => n_chip += 1,
+            .pay_amount => n_amount += 1,
+            .pay_note => n_note += 1,
+            .pay_request => n_req += 1,
+            .pay_send => n_sendv += 1,
+            .pay_cancel => n_cancel += 1,
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), n_rail);
+    try std.testing.expectEqual(@as(usize, 4), n_chip);
+    try std.testing.expectEqual(@as(usize, 1), n_amount);
+    try std.testing.expectEqual(@as(usize, 1), n_note);
+    try std.testing.expectEqual(@as(usize, 1), n_req);
+    try std.testing.expectEqual(@as(usize, 1), n_sendv);
+    try std.testing.expectEqual(@as(usize, 1), n_cancel);
 }
 
 test "zones browse: each catalog entry emits one .zone_open card region carrying its index" {

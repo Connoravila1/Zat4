@@ -168,6 +168,15 @@ pub fn hasConversation(st: *const State, peer_did: []const u8) bool {
     return conversationIndex(st, peer_did) != null;
 }
 
+/// The pinned anchor key for an open conversation — what the payment
+/// record gate validates against (M5 A2/A4: the pin is why a compromised
+/// PDS cannot redirect a payment inside an established conversation).
+/// Null = no such conversation.
+pub fn peerAnchor(st: *const State, peer_did: []const u8) ?[32]u8 {
+    const idx = conversationIndex(st, peer_did) orelse return null;
+    return st.peer_anchors.items[idx];
+}
+
 // ---------------------------------------------------------------------------
 // Persistence: every group serialized into one per-account blob, rewritten
 // after each mutating operation (ratchets advance on every send/receive).

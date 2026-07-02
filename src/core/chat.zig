@@ -301,6 +301,18 @@ pub fn conversationDid(store: *const Store, conv: ConvIndex) []const u8 {
     return sliceSpan(store, store.convs.items(.did)[@intFromEnum(conv)]);
 }
 
+/// The counterparty's display handle ("" until known) — a label, not an
+/// identity (the DID above is the identity).
+pub fn conversationHandle(store: *const Store, conv: ConvIndex) []const u8 {
+    return sliceSpan(store, store.convs.items(.handle)[@intFromEnum(conv)]);
+}
+
+/// One payment row, by value — the shell reads facts through this, never
+/// the arrays (D3 by convention, same as the accessors above).
+pub fn paymentRow(store: *const Store, pay: PayIndex) PaymentRow {
+    return store.payments.get(@intFromEnum(pay));
+}
+
 /// Append a string (plus a NUL so the span can serve as an interning key)
 /// and return its span.
 fn appendString(gpa: Allocator, store: *Store, s: []const u8) error{OutOfMemory}!TextSpan {
@@ -419,8 +431,10 @@ pub fn markRead(store: *Store, conv: ConvIndex) void {
 /// its parallel payment row, created together so card ⇔ row never breaks —
 /// the row's capacity is reserved BEFORE the message lands, so an OOM can
 /// never leave a card without its row. Initial status comes from the kind:
-/// a request starts `requested`, a sent card starts `broadcast` (the
-/// payer's wallet already took it). The caller guarantees `payment_id` is
+/// a request starts `requested`, a sent card starts `pending` — initiated
+/// but UNOBSERVED. `broadcast`/`confirming` are network-evidence states
+/// (the A5 watcher's), and a card never claims evidence nobody has (§6
+/// honesty). The caller guarantees `payment_id` is
 /// nonzero, unique in the conversation, and the amount is in range — wire
 /// input satisfies this via `parsePaymentFrame` (E3); local input by
 /// construction.
@@ -448,7 +462,7 @@ pub fn appendPayment(
         .amount_sat = amount_sat,
         .msg = msg,
         .rail = rail,
-        .status = if (kind == .payment_request) .requested else .broadcast,
+        .status = if (kind == .payment_request) .requested else .pending,
         .confirmations = 0,
     });
     return @enumFromInt(index);
@@ -1260,7 +1274,7 @@ test "appendPayment creates the card + row pair with kind-derived status" {
     try std.testing.expectEqual(@as(usize, 2), store.msgs.len);
     try std.testing.expectEqual(@as(usize, 2), store.payments.len);
     try std.testing.expectEqual(PayStatus.requested, store.payments.items(.status)[@intFromEnum(req)]);
-    try std.testing.expectEqual(PayStatus.broadcast, store.payments.items(.status)[@intFromEnum(sent)]);
+    try std.testing.expectEqual(PayStatus.pending, store.payments.items(.status)[@intFromEnum(sent)]);
     // The card is a real message: note text, direction, unread accounting.
     const req_msg = store.payments.items(.msg)[@intFromEnum(req)];
     try std.testing.expectEqual(Kind.payment_request, store.msgs.items(.kind)[@intFromEnum(req_msg)]);

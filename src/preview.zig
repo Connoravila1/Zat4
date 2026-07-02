@@ -201,11 +201,16 @@ pub fn main(init: std.process.Init) !void {
         _ = try chat.appendMessage(gpa, &cstore, maya, .text, "show me tonight?", now - 300, false);
         _ = try chat.appendMessage(gpa, &cstore, maya, .text, "one condition: you bring the coffee", now - 240, true);
         _ = try chat.appendMessage(gpa, &cstore, oko, .text, "monospace is the most honest a feed can be", now - 86400, false);
+        // Payments (M5 A4): a peer's open lightning request (offers Pay)
+        // and our on-chain send mid-confirmation (the six-block row).
+        _ = try chat.appendPayment(gpa, &cstore, maya, .payment_request, 0xCAFE, .lightning, 5_000, "dinner split", now - 180, false);
+        const psent = try chat.appendPayment(gpa, &cstore, maya, .payment_sent, 0xBEEF, .onchain, 250_000, "rent", now - 120, true);
+        _ = chat.setConfirmations(&cstore, psent, 3);
         chat.markRead(&cstore, maya);
 
         const clist = try chat_view.buildList(arena, &cstore, now);
         const cthread = try chat_view.buildThread(arena, &cstore, maya, now);
-        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread, 0, "maya.zat4.com", "", true, false, "", "", .{});
+        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread.rows, cthread.cards, 0, "maya.zat4.com", "", true, false, "", "", .{}, .{});
         try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
         try writePpm(io, gpa, &fb, "/tmp/zat_chat.ppm");
         std.debug.print("wrote /tmp/zat_chat.ppm (Zat Chat messages surface)\n", .{});
@@ -216,7 +221,7 @@ pub fn main(init: std.process.Init) !void {
         @memset(fb.pixels, clear);
         dl.len = 0;
         try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
-        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread, 0, "maya.zat4.com", "", false, true, "chattest.zat4.com", "No chat keys published for that account", .{});
+        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread.rows, cthread.cards, 0, "maya.zat4.com", "", false, true, "chattest.zat4.com", "No chat keys published for that account", .{}, .{});
         try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
         try writePpm(io, gpa, &fb, "/tmp/zat_chat_compose.ppm");
         std.debug.print("wrote /tmp/zat_chat_compose.ppm (compose-new-conversation bar)\n", .{});
@@ -227,10 +232,21 @@ pub fn main(init: std.process.Init) !void {
         @memset(fb.pixels, clear);
         dl.len = 0;
         try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
-        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread, 0, "maya.zat4.com", "", true, false, "", "", .{ .send_t = 0.45, .typing_t = 1.0, .typing_phase = 0.6 });
+        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread.rows, cthread.cards, 0, "maya.zat4.com", "", true, false, "", "", .{}, .{ .send_t = 0.45, .typing_t = 1.0, .typing_phase = 0.6 });
         try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
         try writePpm(io, gpa, &fb, "/tmp/zat_chat_motion.ppm");
         std.debug.print("wrote /tmp/zat_chat_motion.ppm (U6a mid-send + typing indicator)\n", .{});
+
+        // The pay sheet (M5 A4), open over the same thread: rail toggle,
+        // amount chips, both inputs (amount focused, mid-draft), the three
+        // verbs — plus the cards above it (Pay pill, six-block row).
+        @memset(fb.pixels, clear);
+        dl.len = 0;
+        try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
+        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread.rows, cthread.cards, 0, "maya.zat4.com", "", false, false, "", "", .{ .open = true, .rail = .lightning, .amount = "5000", .note = "dinner split" }, .{});
+        try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+        try writePpm(io, gpa, &fb, "/tmp/zat_chat_pay.ppm");
+        std.debug.print("wrote /tmp/zat_chat_pay.ppm (payment cards + the pay sheet)\n", .{});
     }
 
     // TILING FOUNDATION (S.1) PROOF: the SAME real feed, but its pane geometry
