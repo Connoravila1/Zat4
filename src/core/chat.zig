@@ -321,6 +321,191 @@ pub fn threadSlice(
 }
 
 // ---------------------------------------------------------------------------
+// Persistence codec (pure) — the store's byte round-trip (Zat Chat M2).
+// The shell owns WHERE the bytes live (cache, sealed at rest); this layer
+// owns only WHAT they are. Explicit little-endian, exact lengths, and a
+// malformed blob is an error, never a half-restored store — the same
+// posture as mls.serializeGroup (E3).
+// ---------------------------------------------------------------------------
+
+const codec_magic = [4]u8{ 'Z', 'A', 'T', 'H' };
+const codec_version: u16 = 1;
+const conv_rec_len = 28; // did span 8 + handle span 8 + i64 8 + u32 4
+const msg_rec_len = 21; // i64 8 + text span 8 + conv 4 + kind 1
+
+pub const DeserializeError = error{ Malformed, OutOfMemory };
+
+/// The store as one canonical byte blob (gpa-owned). The `conv_by_did`
+/// interning map is derived state and is not written — restore rebuilds it.
+pub fn serializeStore(gpa: Allocator, store: *const Store) error{OutOfMemory}![]u8 {
+    const s_len = store.string_bytes.items.len;
+    const c_count = store.convs.len;
+    const m_count = store.msgs.len;
+    const total = 4 + 2 + 4 + s_len +
+        4 + c_count * conv_rec_len +
+        4 + m_count * msg_rec_len +
+        (m_count + 7) / 8;
+    const out = try gpa.alloc(u8, total);
+    errdefer gpa.free(out);
+
+    var at: usize = 0;
+    @memcpy(out[at..][0..4], &codec_magic);
+    at += 4;
+    std.mem.writeInt(u16, out[at..][0..2], codec_version, .little);
+    at += 2;
+    std.mem.writeInt(u32, out[at..][0..4], @intCast(s_len), .little);
+    at += 4;
+    @memcpy(out[at..][0..s_len], store.string_bytes.items);
+    at += s_len;
+
+    std.mem.writeInt(u32, out[at..][0..4], @intCast(c_count), .little);
+    at += 4;
+    const convs = store.convs.slice();
+    for (0..c_count) |i| {
+        const spans = [2]TextSpan{ convs.items(.did)[i], convs.items(.handle)[i] };
+        for (spans) |span| {
+            std.mem.writeInt(u32, out[at..][0..4], span.offset, .little);
+            at += 4;
+            std.mem.writeInt(u32, out[at..][0..4], span.len, .little);
+            at += 4;
+        }
+        std.mem.writeInt(i64, out[at..][0..8], convs.items(.last_activity)[i], .little);
+        at += 8;
+        std.mem.writeInt(u32, out[at..][0..4], convs.items(.unread)[i], .little);
+        at += 4;
+    }
+
+    std.mem.writeInt(u32, out[at..][0..4], @intCast(m_count), .little);
+    at += 4;
+    const msgs = store.msgs.slice();
+    for (0..m_count) |i| {
+        std.mem.writeInt(i64, out[at..][0..8], msgs.items(.created_at)[i], .little);
+        at += 8;
+        const span = msgs.items(.text)[i];
+        std.mem.writeInt(u32, out[at..][0..4], span.offset, .little);
+        at += 4;
+        std.mem.writeInt(u32, out[at..][0..4], span.len, .little);
+        at += 4;
+        std.mem.writeInt(u32, out[at..][0..4], @intFromEnum(msgs.items(.conv)[i]), .little);
+        at += 4;
+        out[at] = @intFromEnum(msgs.items(.kind)[i]);
+        at += 1;
+    }
+
+    // Direction bits, LSB-first within each byte; unused high bits stay zero
+    // so the encoding is canonical.
+    const mine_bytes = out[at..];
+    @memset(mine_bytes, 0);
+    for (0..m_count) |i| {
+        if (store.mine.isSet(i)) mine_bytes[i / 8] |= @as(u8, 1) << @intCast(i % 8);
+    }
+    at += (m_count + 7) / 8;
+    assert(at == total);
+    return out;
+}
+
+/// True when `span` names a real NUL-terminated string inside `bytes` (the
+/// appendString invariant every restored span must satisfy). The empty span
+/// is TextSpan.empty exactly.
+fn spanOk(bytes: []const u8, span: TextSpan) bool {
+    if (span.len == 0) return span.offset == 0;
+    const end = @as(u64, span.offset) + span.len; // u64: no overflow on hostile input
+    if (end + 1 > bytes.len) return false;
+    return bytes[@intCast(end)] == 0;
+}
+
+/// Rebuild a store from `serializeStore` bytes. Strict: every span is
+/// bounds-checked and NUL-terminated, every message's conversation exists,
+/// every kind byte is in the built vocabulary, DIDs are unique, and the blob
+/// length is exact. Any violation is `error.Malformed` and the partial store
+/// is fully released — the caller never sees half a restore.
+pub fn deserializeStore(gpa: Allocator, bytes: []const u8) DeserializeError!Store {
+    var store: Store = .{};
+    errdefer deinitStore(gpa, &store);
+
+    if (bytes.len < 10 or !std.mem.eql(u8, bytes[0..4], &codec_magic)) return error.Malformed;
+    if (std.mem.readInt(u16, bytes[4..6], .little) != codec_version) return error.Malformed;
+    const s_len = std.mem.readInt(u32, bytes[6..10], .little);
+    var at: usize = 10;
+    if (bytes.len - at < s_len) return error.Malformed;
+    try store.string_bytes.appendSlice(gpa, bytes[at .. at + s_len]);
+    at += s_len;
+
+    if (bytes.len - at < 4) return error.Malformed;
+    const c_count = std.mem.readInt(u32, bytes[at..][0..4], .little);
+    at += 4;
+    if (@as(u64, c_count) * conv_rec_len > bytes.len - at) return error.Malformed;
+    try store.convs.setCapacity(gpa, c_count);
+    for (0..c_count) |i| {
+        var conv: Conversation = undefined;
+        conv.did = .{
+            .offset = std.mem.readInt(u32, bytes[at..][0..4], .little),
+            .len = std.mem.readInt(u32, bytes[at + 4 ..][0..4], .little),
+        };
+        conv.handle = .{
+            .offset = std.mem.readInt(u32, bytes[at + 8 ..][0..4], .little),
+            .len = std.mem.readInt(u32, bytes[at + 12 ..][0..4], .little),
+        };
+        conv.last_activity = std.mem.readInt(i64, bytes[at + 16 ..][0..8], .little);
+        conv.unread = std.mem.readInt(u32, bytes[at + 24 ..][0..4], .little);
+        at += conv_rec_len;
+
+        // A conversation IS its counterparty DID: non-empty, clean for the
+        // interning map (no interior NUL), and unique.
+        if (conv.did.len == 0 or !spanOk(store.string_bytes.items, conv.did)) return error.Malformed;
+        const did = sliceSpan(&store, conv.did);
+        if (std.mem.indexOfScalar(u8, did, 0) != null) return error.Malformed;
+        if (!spanOk(store.string_bytes.items, conv.handle)) return error.Malformed;
+        store.convs.appendAssumeCapacity(conv);
+
+        const gop = try store.conv_by_did.getOrPutContextAdapted(
+            gpa,
+            did,
+            std.hash_map.StringIndexAdapter{ .bytes = &store.string_bytes },
+            std.hash_map.StringIndexContext{ .bytes = &store.string_bytes },
+        );
+        if (gop.found_existing) return error.Malformed;
+        gop.key_ptr.* = conv.did.offset;
+        gop.value_ptr.* = @intCast(i);
+    }
+
+    if (bytes.len - at < 4) return error.Malformed;
+    const m_count = std.mem.readInt(u32, bytes[at..][0..4], .little);
+    at += 4;
+    if (@as(u64, m_count) * msg_rec_len > bytes.len - at) return error.Malformed;
+    try store.msgs.setCapacity(gpa, m_count);
+    for (0..m_count) |_| {
+        var msg: ChatMsg = undefined;
+        msg.created_at = std.mem.readInt(i64, bytes[at..][0..8], .little);
+        msg.text = .{
+            .offset = std.mem.readInt(u32, bytes[at + 8 ..][0..4], .little),
+            .len = std.mem.readInt(u32, bytes[at + 12 ..][0..4], .little),
+        };
+        const conv_raw = std.mem.readInt(u32, bytes[at + 16 ..][0..4], .little);
+        msg.kind = parseKind(bytes[at + 20]) catch return error.Malformed;
+        at += msg_rec_len;
+        if (conv_raw >= c_count) return error.Malformed;
+        msg.conv = @enumFromInt(conv_raw);
+        if (!spanOk(store.string_bytes.items, msg.text)) return error.Malformed;
+        store.msgs.appendAssumeCapacity(msg);
+    }
+
+    const mine_len = (@as(usize, m_count) + 7) / 8;
+    if (bytes.len - at != mine_len) return error.Malformed; // exact tail — no trailing bytes
+    try store.mine.resize(gpa, m_count, false);
+    for (0..m_count) |i| {
+        const bit = (bytes[at + i / 8] >> @intCast(i % 8)) & 1;
+        store.mine.setValue(i, bit == 1);
+    }
+    if (m_count % 8 != 0) {
+        // Canonical encoding: the last byte's unused high bits must be zero.
+        const used: u3 = @intCast(m_count % 8);
+        if ((bytes[at + mine_len - 1] >> used) != 0) return error.Malformed;
+    }
+    return store;
+}
+
+// ---------------------------------------------------------------------------
 // Tests (C6: leak-checked by std.testing.allocator)
 // ---------------------------------------------------------------------------
 
@@ -416,6 +601,135 @@ test "conversation list orders by activity and only moves forward" {
     try std.testing.expectEqual(a, list[1]);
     // c has no messages: activity 0, sorted last.
     try std.testing.expectEqual(c, list[2]);
+}
+
+test "store codec: full round-trip, and the restored store keeps working" {
+    const gpa = std.testing.allocator;
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+
+    const a = try openConversation(gpa, &store, "did:plc:aaa", "maya.zat4.com");
+    const b = try openConversation(gpa, &store, "did:plc:bbb", "");
+    _ = try appendMessage(gpa, &store, a, .text, "hello", 100, true);
+    _ = try appendMessage(gpa, &store, a, .text, "hey back", 110, false);
+    _ = try appendMessage(gpa, &store, b, .system, "conversation started", 120, false);
+    markRead(&store, b);
+
+    const blob = try serializeStore(gpa, &store);
+    defer gpa.free(blob);
+
+    var restored = try deserializeStore(gpa, blob);
+    defer deinitStore(gpa, &restored);
+
+    try std.testing.expectEqual(store.convs.len, restored.convs.len);
+    try std.testing.expectEqual(store.msgs.len, restored.msgs.len);
+    try std.testing.expectEqualStrings("did:plc:aaa", conversationDid(&restored, a));
+    try std.testing.expectEqualStrings(
+        "maya.zat4.com",
+        sliceSpan(&restored, restored.convs.items(.handle)[@intFromEnum(a)]),
+    );
+    // Unread survives: a still carries its counterparty message, b was read.
+    try std.testing.expectEqual(@as(u32, 1), restored.convs.items(.unread)[@intFromEnum(a)]);
+    try std.testing.expectEqual(@as(u32, 0), restored.convs.items(.unread)[@intFromEnum(b)]);
+    // Direction bits and text survive, oldest-first through the same query.
+    const thread = try threadSlice(gpa, &restored, a);
+    defer gpa.free(thread);
+    try std.testing.expectEqual(@as(usize, 2), thread.len);
+    try std.testing.expect(isMine(&restored, thread[0]));
+    try std.testing.expect(!isMine(&restored, thread[1]));
+    try std.testing.expectEqualStrings(
+        "hey back",
+        sliceSpan(&restored, restored.msgs.items(.text)[@intFromEnum(thread[1])]),
+    );
+    // The interning map was REBUILT, not just the arrays: an existing DID
+    // dedupes and a fresh append lands in the restored world.
+    const a2 = try openConversation(gpa, &restored, "did:plc:aaa", "");
+    try std.testing.expectEqual(a, a2);
+    _ = try appendMessage(gpa, &restored, a2, .text, "post-restore", 200, true);
+    try std.testing.expectEqual(@as(usize, 4), restored.msgs.len);
+}
+
+test "store codec: the empty store round-trips" {
+    const gpa = std.testing.allocator;
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+    const blob = try serializeStore(gpa, &store);
+    defer gpa.free(blob);
+    var restored = try deserializeStore(gpa, blob);
+    defer deinitStore(gpa, &restored);
+    try std.testing.expectEqual(@as(usize, 0), restored.convs.len);
+    try std.testing.expectEqual(@as(usize, 0), restored.msgs.len);
+}
+
+test "store codec: every class of damage is refused, never half-restored" {
+    const gpa = std.testing.allocator;
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+    const a = try openConversation(gpa, &store, "did:plc:aaa", "maya");
+    const b = try openConversation(gpa, &store, "did:plc:bbb", "");
+    _ = try appendMessage(gpa, &store, a, .text, "one", 100, true);
+    _ = try appendMessage(gpa, &store, b, .text, "two", 110, false);
+    _ = try appendMessage(gpa, &store, a, .text, "three", 120, false);
+    const good = try serializeStore(gpa, &store);
+    defer gpa.free(good);
+    const s_len = store.string_bytes.items.len;
+    const convs_at = 10 + s_len + 4; // header + strings + conv count
+
+    // The good blob restores (the baseline for every mutation below).
+    {
+        var ok = try deserializeStore(gpa, good);
+        deinitStore(gpa, &ok);
+    }
+    const expectBad = struct {
+        fn check(alloc: Allocator, blob: []const u8) !void {
+            try std.testing.expectError(error.Malformed, deserializeStore(alloc, blob));
+        }
+    }.check;
+
+    var bad = try gpa.dupe(u8, good);
+    defer gpa.free(bad);
+
+    bad[0] ^= 1; // magic
+    try expectBad(gpa, bad);
+    bad[0] ^= 1;
+
+    std.mem.writeInt(u16, bad[4..6], codec_version + 1, .little); // version
+    try expectBad(gpa, bad);
+    std.mem.writeInt(u16, bad[4..6], codec_version, .little);
+
+    // Truncation at every byte boundary.
+    var cut: usize = 0;
+    while (cut < good.len) : (cut += 1) try expectBad(gpa, good[0..cut]);
+
+    // A trailing byte (the tail must be exact).
+    const longer = try std.mem.concat(gpa, u8, &.{ good, &.{0} });
+    defer gpa.free(longer);
+    try expectBad(gpa, longer);
+
+    // An out-of-bounds handle span on conversation 0.
+    std.mem.writeInt(u32, bad[convs_at + 12 ..][0..4], 0xFFFF, .little);
+    try expectBad(gpa, bad);
+    @memcpy(bad, good);
+
+    // A duplicate DID: conversation 1's did span redirected onto 0's.
+    @memcpy(bad[convs_at + conv_rec_len ..][0..8], bad[convs_at..][0..8]);
+    try expectBad(gpa, bad);
+    @memcpy(bad, good);
+
+    // A reserved kind byte on message 0.
+    const msgs_at = convs_at + 2 * conv_rec_len + 4;
+    bad[msgs_at + 20] = 7;
+    try expectBad(gpa, bad);
+    @memcpy(bad, good);
+
+    // A message pointing at a conversation that does not exist.
+    std.mem.writeInt(u32, bad[msgs_at + 16 ..][0..4], 99, .little);
+    try expectBad(gpa, bad);
+    @memcpy(bad, good);
+
+    // A non-canonical direction byte (unused high bit set; 3 messages).
+    bad[good.len - 1] |= 0x80;
+    try expectBad(gpa, bad);
 }
 
 test "parseKind accepts the built vocabulary and rejects reserved bytes" {

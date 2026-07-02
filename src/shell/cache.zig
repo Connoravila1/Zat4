@@ -961,6 +961,161 @@ fn parseChatGroups(gpa: Allocator, bytes: []const u8, did: []const u8) ?[]u8 {
     return gpa.dupe(u8, bytes[10 + dlen ..]) catch null;
 }
 
+// --- Chat displayed-history persistence (Zat Chat milestone M2) --------------
+//
+// The serialized VIEW store (core/chat.zig's codec — this layer stores opaque
+// bytes). The posture deliberately differs from the groups blob above: the
+// transcript grows without bound, and a keystore is the wrong shape for a
+// growing database (a D-Bus round-trip per message, per-item size ceilings,
+// and a stale keystore copy shadowing a newer file once puts start failing).
+// So the KEY lives in the keystore (32 bytes, fixed) and the DATA lives in a
+// 0600 file sealed with XChaCha20-Poly1305; the whole header is the AEAD's
+// associated data, so a header swapped to another DID or a downgraded mode
+// byte fails authentication instead of decrypting. Without a keystore the
+// file falls back to plaintext 0600 — the same at-rest posture the groups
+// blob already accepts on such systems. The mode is recorded in the file, so
+// load never guesses.
+const chat_history_magic = [4]u8{ 'Z', 'A', 'T', 'V' };
+const chat_history_version: u16 = 1;
+const chat_history_key_prefix = "chat-history-key:";
+const HistoryAead = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
+const history_header_min = 11; // magic 4 + version 2 + mode 1 + did-len 4
+
+pub fn chatHistoryPath(buf: []u8, environ: ?*const std.process.Environ.Map, did: []const u8) ?[]const u8 {
+    var dir_buf: [512]u8 = undefined;
+    const dir = cacheDir(&dir_buf, environ) orelse return null;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(did, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest[0..8].*, .lower);
+    var name_buf: [40]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "chathistory-{s}.zat", .{hex}) catch return null;
+    return joinFile(buf, dir, name);
+}
+
+fn chatHistoryKeystoreKey(buf: *[255]u8, did: []const u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, chat_history_key_prefix ++ "{s}", .{did}) catch null;
+}
+
+/// The per-DID history sealing key: keystore-held, minted (CSPRNG) and
+/// persisted on first use. Null = no keystore key is possible right now —
+/// the caller writes plaintext-0600 instead. NEVER an ephemeral key: a key
+/// that didn't reach the keystore would brick the history file on the next
+/// launch.
+fn loadOrCreateHistoryKey(gpa: Allocator, io: std.Io, did: []const u8) ?[HistoryAead.key_length]u8 {
+    if (!keystore_supported) return null;
+    var key_buf: [255]u8 = undefined;
+    const name = chatHistoryKeystoreKey(&key_buf, did) orelse return null;
+    if (keystore.get(gpa, name)) |blob| {
+        defer {
+            std.crypto.secureZero(u8, blob);
+            gpa.free(blob);
+        }
+        if (blob.len == HistoryAead.key_length) return blob[0..HistoryAead.key_length].*;
+        return null; // a damaged item: refuse, never mint a second key beside it
+    }
+    var key: [HistoryAead.key_length]u8 = undefined;
+    io.randomSecure(&key) catch return null;
+    if (!keystore.put(gpa, name, &key)) {
+        std.crypto.secureZero(u8, &key);
+        return null;
+    }
+    return key;
+}
+
+/// The full file image for a history write (arena-owned), sealed when a key
+/// is present. Split from the keystore so the sealed path is testable.
+fn historyImage(arena: Allocator, io: std.Io, key: ?[HistoryAead.key_length]u8, did: []const u8, blob: []const u8) ?[]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    out.appendSlice(arena, &chat_history_magic) catch return null;
+    out.appendSlice(arena, std.mem.asBytes(&chat_history_version)) catch return null;
+    out.append(arena, if (key != null) 1 else 0) catch return null;
+    const dlen: u32 = @intCast(did.len);
+    out.appendSlice(arena, std.mem.asBytes(&dlen)) catch return null;
+    out.appendSlice(arena, did) catch return null;
+    if (key) |k| {
+        var nonce: [HistoryAead.nonce_length]u8 = undefined;
+        io.randomSecure(&nonce) catch return null;
+        const header_len = out.items.len;
+        const ct = arena.alloc(u8, blob.len) catch return null;
+        var tag: [HistoryAead.tag_length]u8 = undefined;
+        HistoryAead.encrypt(ct, &tag, blob, out.items[0..header_len], nonce, k);
+        out.appendSlice(arena, &nonce) catch return null;
+        out.appendSlice(arena, &tag) catch return null;
+        out.appendSlice(arena, ct) catch return null;
+    } else {
+        out.appendSlice(arena, blob) catch return null;
+    }
+    return out.items;
+}
+
+/// The blob out of a history file image (gpa-owned), or null on any damage,
+/// a DID mismatch, or a sealed body without its key. `key` is consulted only
+/// for a sealed image.
+fn historyBlobFromImage(gpa: Allocator, key: ?[HistoryAead.key_length]u8, did: []const u8, bytes: []const u8) ?[]u8 {
+    if (bytes.len < history_header_min or !std.mem.eql(u8, bytes[0..4], &chat_history_magic)) return null;
+    if (std.mem.bytesToValue(u16, bytes[4..6]) != chat_history_version) return null;
+    const mode = bytes[6];
+    const dlen = std.mem.bytesToValue(u32, bytes[7..11]);
+    if (bytes.len - history_header_min < dlen) return null;
+    if (!std.mem.eql(u8, bytes[history_header_min .. history_header_min + dlen], did)) return null;
+    const header_len = history_header_min + dlen;
+    const body = bytes[header_len..];
+    switch (mode) {
+        0 => return gpa.dupe(u8, body) catch null,
+        1 => {
+            const k = key orelse return null;
+            if (body.len < HistoryAead.nonce_length + HistoryAead.tag_length) return null;
+            const nonce = body[0..HistoryAead.nonce_length].*;
+            const tag = body[HistoryAead.nonce_length..][0..HistoryAead.tag_length].*;
+            const ct = body[HistoryAead.nonce_length + HistoryAead.tag_length ..];
+            const plain = gpa.alloc(u8, ct.len) catch return null;
+            HistoryAead.decrypt(plain, ct, tag, bytes[0..header_len], nonce, k) catch {
+                gpa.free(plain);
+                return null;
+            };
+            return plain;
+        },
+        else => return null,
+    }
+}
+
+pub fn saveChatHistoryAt(gpa: Allocator, io: std.Io, path: []const u8, did: []const u8, blob: []const u8) bool {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    var key = loadOrCreateHistoryKey(gpa, io, did);
+    defer if (key) |*k| std.crypto.secureZero(u8, k);
+    const image = historyImage(arena_state.allocator(), io, key, did, blob) orelse return false;
+    defer std.crypto.secureZero(u8, image); // the transcript passes through
+    return writeFileAtomic(path, image, 0o600);
+}
+
+/// The stored history blob for `did` (gpa-owned; caller scrubs + frees), or
+/// null (absent, damaged, another account's file, or sealed with a key this
+/// system no longer has).
+pub fn loadChatHistoryAt(gpa: Allocator, path: []const u8, did: []const u8) ?[]u8 {
+    const bytes = readFileAlloc(gpa, path) orelse return null;
+    defer {
+        std.crypto.secureZero(u8, bytes);
+        gpa.free(bytes);
+    }
+    var key: ?[HistoryAead.key_length]u8 = null;
+    defer if (key) |*k| std.crypto.secureZero(u8, k);
+    if (bytes.len > 6 and bytes[6] == 1) {
+        // Sealed image: fetch the key only when the file says it needs one.
+        if (!keystore_supported) return null;
+        var key_buf: [255]u8 = undefined;
+        const name = chatHistoryKeystoreKey(&key_buf, did) orelse return null;
+        const kb = keystore.get(gpa, name) orelse return null;
+        defer {
+            std.crypto.secureZero(u8, kb);
+            gpa.free(kb);
+        }
+        if (kb.len != HistoryAead.key_length) return null;
+        key = kb[0..HistoryAead.key_length].*;
+    }
+    return historyBlobFromImage(gpa, key, did, bytes);
+}
+
 /// A7.2: cold struct, size guard waived — one per chat startup, transient.
 pub const AnchorLoad = struct {
     seed: [anchor_seed_len]u8,
@@ -1160,6 +1315,57 @@ test "cache: chat keyPackage privates round-trip per DID and refuse mismatches" 
     try testing.expect(loadChatKeyPackageAt(gpa, path, did) == null);
     unlink(path);
     try testing.expect(loadChatKeyPackageAt(gpa, path, did) == null);
+}
+
+test "cache: chat history round-trips; the sealed image binds body, header, and key" {
+    const gpa = testing.allocator; // C6
+    const io = testing.io;
+    var path_buf: [128]u8 = undefined;
+    const path = tmpPath(&path_buf, "chathistory");
+    defer unlink(path);
+
+    const did = "did:plc:history-owner";
+    const blob = "serialized view-store bytes";
+
+    // File-level round-trip (plaintext mode here — the keystore is fenced
+    // off under test), a DID mismatch refused, absence a cold start.
+    try testing.expect(saveChatHistoryAt(gpa, io, path, did, blob));
+    const loaded = loadChatHistoryAt(gpa, path, did) orelse return error.TestUnexpectedResult;
+    defer gpa.free(loaded);
+    try testing.expectEqualStrings(blob, loaded);
+    try testing.expect(loadChatHistoryAt(gpa, path, "did:plc:someone-else") == null);
+    unlink(path);
+    try testing.expect(loadChatHistoryAt(gpa, path, did) == null);
+
+    // The sealed path, driven directly with a fixed key: round-trip, then
+    // the refusals — a tampered body, the wrong key, a sealed body with no
+    // key at all. A mode byte flipped to "plaintext" must never surface the
+    // transcript (the body it returns is still ciphertext; the strict store
+    // codec upstream rejects it).
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const key: [HistoryAead.key_length]u8 = @splat(0x42);
+    const image = historyImage(arena, io, key, did, blob) orelse return error.TestUnexpectedResult;
+
+    const opened = historyBlobFromImage(gpa, key, did, image) orelse return error.TestUnexpectedResult;
+    defer gpa.free(opened);
+    try testing.expectEqualStrings(blob, opened);
+
+    const bad = try arena.dupe(u8, image);
+    bad[bad.len - 1] ^= 1;
+    try testing.expect(historyBlobFromImage(gpa, key, did, bad) == null);
+
+    const wrong_key: [HistoryAead.key_length]u8 = @splat(0x43);
+    try testing.expect(historyBlobFromImage(gpa, wrong_key, did, image) == null);
+    try testing.expect(historyBlobFromImage(gpa, null, did, image) == null);
+
+    @memcpy(bad, image);
+    bad[6] = 0; // the downgrade flip
+    if (historyBlobFromImage(gpa, key, did, bad)) |downgraded| {
+        defer gpa.free(downgraded);
+        try testing.expect(!std.mem.eql(u8, downgraded, blob));
+    }
 }
 
 test "cache: anchorPath keys files by DID" {

@@ -564,11 +564,32 @@ pub fn run(
                     if (chat_e2ee.init(gpa, gchat_arena_state.allocator(), io, env, session)) |st| {
                         gchat_e2ee = st;
                         gchat_link = chat_relay.start(gpa, io, &gchat_box, rhost, rport, token, st.inbox) catch null;
+                        // Restore the displayed history (M2) first. A missing
+                        // or corrupt blob is a cold start, never a half-restore
+                        // (the codec is strict) — the mirror below still
+                        // recovers the conversation LIST from the MLS groups;
+                        // only the transcript would be gone.
+                        var hist_path_buf: [512]u8 = undefined;
+                        if (cache_shell.chatHistoryPath(&hist_path_buf, env, st.my_did)) |hist_path| {
+                            if (cache_shell.loadChatHistoryAt(gpa, hist_path, st.my_did)) |blob| {
+                                defer {
+                                    std.crypto.secureZero(u8, blob);
+                                    gpa.free(blob);
+                                }
+                                if (chat_core.deserializeStore(gpa, blob)) |restored| {
+                                    chat_core.deinitStore(gpa, &gchat_store);
+                                    gchat_store = restored;
+                                } else |_| {}
+                            }
+                        }
                         // Mirror restored conversations into the view store so
-                        // they show on launch.
+                        // they show on launch (openConversation dedupes by DID,
+                        // so ones already in the history blob are found, not
+                        // doubled), then persist once to heal any divergence.
                         for (st.peer_dids.items) |did| {
                             _ = chat_core.openConversation(gpa, &gchat_store, did, "") catch {};
                         }
+                        chatPersistHistory(gpa, io, env, &st, &gchat_store);
                         if (gchat_link != null) {
                             std.debug.print("[chat] E2EE up -> {s} ({d} conversation(s) restored)\n", .{ hostport, st.peer_dids.items.len });
                         } else {
@@ -590,6 +611,7 @@ pub fn run(
                             _ = gchat_arena_state.reset(.retain_capacity);
                             if (chat_e2ee.startConversation(gpa, gchat_arena_state.allocator(), io, env, st, link, peer_did)) {
                                 _ = chat_core.openConversation(gpa, &gchat_store, peer_did, "") catch {};
+                                chatPersistHistory(gpa, io, env, st, &gchat_store);
                                 std.debug.print("[chat] conversation started with {s} (Welcome sent)\n", .{peer_did});
                             } else |err| std.debug.print("[chat] could not start conversation with {s}: {s}\n", .{ peer_did, @errorName(err) });
                         }
@@ -873,6 +895,7 @@ pub fn run(
         if (gchat_link != null) if (gchat_e2ee) |*st| {
             gchat_mail.clearRetainingCapacity();
             try gchat_box.drain(gpa, &gchat_mail);
+            var chat_mutated = false;
             for (gchat_mail.items) |m| {
                 switch (m) {
                     .blob => |b| {
@@ -884,10 +907,12 @@ pub fn run(
                                 .message => |msg| {
                                     if (chat_core.openConversation(gpa, &gchat_store, msg.peer_did, "") catch null) |c| {
                                         _ = chat_core.appendMessage(gpa, &gchat_store, c, msg.kind, msg.text, now, false) catch {};
+                                        chat_mutated = true;
                                     }
                                 },
                                 .started => |s| {
                                     _ = chat_core.openConversation(gpa, &gchat_store, s.peer_did, "") catch null;
+                                    chat_mutated = true;
                                     status = "chat: new conversation";
                                 },
                             }
@@ -900,6 +925,11 @@ pub fn run(
                 chat_relay.freeMail(gpa, m);
             }
             gchat_mail.clearRetainingCapacity();
+            // M2: one history write per drain that changed the store. This
+            // matters more than the send-side write — forward secrecy means a
+            // decrypted message can NEVER be recovered from the wire again, so
+            // it reaches disk before this frame ends.
+            if (chat_mutated) chatPersistHistory(gpa, io, environ, st, &gchat_store);
         };
 
         // Drain write-worker results (the non-blocking like/unlike/repost
@@ -2181,6 +2211,8 @@ pub fn run(
                                                 if (hit.post < order.len) {
                                                     gchat_sel = order[hit.post];
                                                     chat_core.markRead(&gchat_store, order[hit.post]);
+                                                    // M2: read-state survives a relaunch too.
+                                                    chatPersistHistory(gpa, io, environ, if (gchat_e2ee) |*p| p else null, &gchat_store);
                                                     gchat_input_focus = true;
                                                     gscroll_px = 0; // newest, bottom-anchored
                                                 }
@@ -2193,6 +2225,7 @@ pub fn run(
                                             if (gchat_draft_len > 0) if (gchat_sel) |sc| {
                                                 _ = chat_core.appendMessage(gpa, &gchat_store, sc, .text, gchat_draft_buf[0..gchat_draft_len], now, true) catch {};
                                                 chatSend(gpa, io, environ, if (gchat_e2ee) |*st| st else null, gchat_link, &gchat_store, sc, gchat_draft_buf[0..gchat_draft_len]);
+                                                chatPersistHistory(gpa, io, environ, if (gchat_e2ee) |*p| p else null, &gchat_store);
                                                 gchat_draft_len = 0;
                                                 gchat_input_focus = true;
                                                 gscroll_px = 0;
@@ -2527,6 +2560,7 @@ pub fn run(
                         if (gchat_draft_len > 0) if (gchat_sel) |sc| {
                             _ = chat_core.appendMessage(gpa, &gchat_store, sc, .text, gchat_draft_buf[0..gchat_draft_len], now, true) catch {};
                             chatSend(gpa, io, environ, if (gchat_e2ee) |*st| st else null, gchat_link, &gchat_store, sc, gchat_draft_buf[0..gchat_draft_len]);
+                            chatPersistHistory(gpa, io, environ, if (gchat_e2ee) |*p| p else null, &gchat_store);
                             gchat_draft_len = 0;
                             gscroll_px = 0; // re-anchor to the newest message
                         };
@@ -3020,6 +3054,24 @@ fn chatSend(gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, st
     const l = link orelse return;
     const peer_did = chat_core.conversationDid(cs, conv);
     chat_e2ee.send(gpa, io, env, state, l, peer_did, .text, text) catch {};
+}
+
+/// M2 persist: the displayed history survives a relaunch. Serialize the view
+/// store (pure core codec) and hand cache the blob — sealed at rest under a
+/// keystore-held key, per account. A quiet no-op without a live E2EE session
+/// (no DID to key the file by, and nothing durable to show); a failed write
+/// drops this snapshot, never the frame — the next mutation rewrites the
+/// whole blob anyway.
+fn chatPersistHistory(gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, st: ?*const chat_e2ee.State, cs: *const chat_core.Store) void {
+    const state = st orelse return;
+    const blob = chat_core.serializeStore(gpa, cs) catch return;
+    defer {
+        std.crypto.secureZero(u8, blob); // the transcript passes through
+        gpa.free(blob);
+    }
+    var path_buf: [512]u8 = undefined;
+    const path = cache_shell.chatHistoryPath(&path_buf, env, state.my_did) orelse return;
+    _ = cache_shell.saveChatHistoryAt(gpa, io, path, state.my_did, blob);
 }
 
 fn buildChatFrame(arena: Allocator, cs: *const chat_core.Store, sel: ?chat_core.ConvIndex, now: i64) ChatFrame {
