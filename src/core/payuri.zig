@@ -155,6 +155,26 @@ pub fn buildLightningUri(buf: []u8, address: []const u8) UriError![]const u8 {
     return c.slice();
 }
 
+/// The EXACT-amount lightning hand-off: `lightning:<bolt11>`. Where a bare
+/// address lets the wallet prompt for any amount, a BOLT11 invoice pins the
+/// amount the card promised — the recipient's LN provider minted it for that
+/// number (the shell's LNURL-pay leg). The invoice is bech32 (URI-safe by
+/// construction); this re-checks the charset so a hostile provider can never
+/// splice anything but an invoice into the URI, and requires the `lnbc`
+/// mainnet prefix (mainnet-only, matching the address gate).
+pub fn buildLightningInvoiceUri(buf: []u8, bolt11: []const u8) UriError![]const u8 {
+    if (bolt11.len < 4) return error.BadAddress;
+    if (!std.ascii.eqlIgnoreCase(bolt11[0..4], "lnbc")) return error.BadAddress;
+    for (bolt11) |ch| switch (ch) {
+        'a'...'z', 'A'...'Z', '0'...'9' => {},
+        else => return error.BadAddress, // never splice a non-bech32 byte
+    };
+    var c = Cursor{ .buf = buf };
+    try c.put("lightning:");
+    try c.put(bolt11);
+    return c.slice();
+}
+
 // ---------------------------------------------------------------------------
 // Tests (B2, C6: nothing here allocates)
 // ---------------------------------------------------------------------------
@@ -208,4 +228,16 @@ test "buildLightningUri: golden string and refusal" {
         try buildLightningUri(&buf, "maya@wallet.example"),
     );
     try testing.expectError(error.BadAddress, buildLightningUri(&buf, "not-an-address"));
+}
+
+test "buildLightningInvoiceUri: golden string, charset + prefix gate" {
+    var buf: [max_uri_len]u8 = undefined;
+    const inv = "lnbc250n1p3xyzabc09qypqrs"; // shape only; charset is what matters
+    try testing.expectEqualStrings("lightning:" ++ inv, try buildLightningInvoiceUri(&buf, inv));
+    // Not a mainnet invoice.
+    try testing.expectError(error.BadAddress, buildLightningInvoiceUri(&buf, "lntb250n1pxyz"));
+    try testing.expectError(error.BadAddress, buildLightningInvoiceUri(&buf, "http://evil"));
+    // A byte that would break out of the URI is refused.
+    try testing.expectError(error.BadAddress, buildLightningInvoiceUri(&buf, "lnbc1 whitespace"));
+    try testing.expectError(error.BadAddress, buildLightningInvoiceUri(&buf, "lnb"));
 }

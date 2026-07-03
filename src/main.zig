@@ -45,6 +45,7 @@ const write = @import("shell/write.zig");
 const chat_keys = @import("shell/chat_keys.zig");
 const pay_addr = @import("shell/pay_addr.zig");
 const payuri = @import("core/payuri.zig");
+const lnurl = @import("shell/lnurl.zig");
 const chat_core = @import("core/chat.zig");
 const launch = @import("shell/launch.zig");
 const chainwatch_core = @import("core/chainwatch.zig");
@@ -176,6 +177,12 @@ pub fn main(init: std.process.Init) !void {
     // six-block animation would draw. Purely read-only public data.
     var watch_addr: ?[]const u8 = null;
     var watch_sats: ?[]const u8 = null;
+    // LNURL-pay exactness test: `--pay-invoice <lightning-address> <sats>` runs
+    // the real LUD-06/16 leg against a live provider (resolve the address →
+    // fetch a BOLT11 for exactly that amount) and prints the `lightning:`
+    // hand-off URI the wallet would receive. Read-only, no session.
+    var invoice_addr: ?[]const u8 = null;
+    var invoice_sats: ?[]const u8 = null;
     var ai: usize = 1;
     while (ai < args.len) : (ai += 1) {
         const arg = args[ai];
@@ -221,6 +228,12 @@ pub fn main(init: std.process.Init) !void {
                 pay_handoff_sats = args[ai + 2];
                 pay_handoff_note = args[ai + 3];
                 ai += 3;
+            }
+        } else if (std.mem.eql(u8, arg, "--pay-invoice")) {
+            if (ai + 2 < args.len) {
+                invoice_addr = args[ai + 1];
+                invoice_sats = args[ai + 2];
+                ai += 2;
             }
         } else if (std.mem.eql(u8, arg, "--watch-address")) {
             if (ai + 2 < args.len) {
@@ -533,6 +546,38 @@ pub fn main(init: std.process.Init) !void {
             return;
         };
         try out.print("[pay] handed to the OS default handler\n", .{});
+        try out.flush();
+        return;
+    }
+
+    // LNURL-pay exactness proof: the real LUD-06/16 leg against a live provider.
+    if (invoice_addr) |addr| {
+        const sats = std.fmt.parseInt(u64, invoice_sats.?, 10) catch {
+            try out.print("--pay-invoice: sats must be a positive integer\n", .{});
+            try out.flush();
+            return;
+        };
+        if (sats == 0 or sats > chat_core.max_amount_sat) {
+            try out.print("--pay-invoice: sats out of range\n", .{});
+            try out.flush();
+            return;
+        }
+        const bolt11 = lnurl.resolveInvoice(arena, io, init.environ_map, addr, sats) catch |err| {
+            try out.print("[pay] LNURL resolve failed: {s}\n", .{@errorName(err)});
+            try out.flush();
+            return;
+        };
+        var uri_buf: [payuri.max_uri_len]u8 = undefined;
+        const uri = payuri.buildLightningInvoiceUri(&uri_buf, bolt11) catch |err| {
+            try out.print("[pay] invoice rejected by the URI gate: {s}\n", .{@errorName(err)});
+            try out.flush();
+            return;
+        };
+        try out.print(
+            \\[pay] LNURL-pay invoice for {d} sats from {s}:
+            \\[pay]   {s}
+            \\
+        , .{ sats, addr, uri });
         try out.flush();
         return;
     }

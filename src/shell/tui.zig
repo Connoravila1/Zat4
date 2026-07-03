@@ -49,6 +49,7 @@ const spring = @import("../core/spring.zig");
 const chat_relay = @import("chat_relay.zig");
 const chat_e2ee = @import("chat_e2ee.zig");
 const pay_addr = @import("pay_addr.zig");
+const lnurl = @import("lnurl.zig");
 const payuri = @import("../core/payuri.zig");
 const launch = @import("launch.zig");
 const chainwatch_core = @import("../core/chainwatch.zig");
@@ -4291,10 +4292,24 @@ fn paySend(
         .onchain => "They don't take on-chain — try lightning",
     };
     var uri_buf: [payuri.max_uri_len]u8 = undefined;
-    const uri = (switch (rail) {
-        .lightning => payuri.buildLightningUri(&uri_buf, addr),
-        .onchain => payuri.buildBitcoinUri(&uri_buf, addr, amount_sat, chat_core.conversationHandle(cs, conv), note),
-    }) catch return "Their published address didn't validate";
+    const uri: []const u8 = switch (rail) {
+        .onchain => payuri.buildBitcoinUri(&uri_buf, addr, amount_sat, chat_core.conversationHandle(cs, conv), note) catch
+            return "Their published address didn't validate",
+        // Lightning EXACTNESS (LNURL-pay): resolve the address to a BOLT11
+        // invoice for THIS amount, so the wallet can't send a different number
+        // than the card shows. A bare `lightning:<address>` would leave the
+        // amount to the payer's wallet — the honesty gap on-chain never had.
+        .lightning => ln: {
+            const bolt11 = lnurl.resolveInvoice(arena, io, env, addr, amount_sat) catch |err| return switch (err) {
+                error.AmountOutOfRange => "That amount is outside their wallet's limits",
+                error.NotPayEndpoint, error.BadAddress => "Their Lightning address didn't resolve",
+                error.OutOfMemory => "Out of memory",
+                else => "Couldn't reach their Lightning wallet \u{2014} try again",
+            };
+            break :ln payuri.buildLightningInvoiceUri(&uri_buf, bolt11) catch
+                return "Their wallet returned a bad invoice";
+        },
+    };
     launch.openUri(io, uri) catch return "No wallet answered the hand-off";
     // The card: a fresh sent-card, or the paid request advancing — both to
     // `pending` (initiated, unobserved; §6 honesty).
