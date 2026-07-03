@@ -112,8 +112,10 @@ pub fn includes(s: Source, f: Facts) bool {
         .follows => f.in_network,
         .discovery => !f.in_network,
         .trending => @as(f64, @floatFromInt(f.engagement)) >= s.threshold,
+        // Zones are case-insensitive (invariant 1): a candidate's display-cased
+        // tag matches the scope literal regardless of casing, so #Foo == #foo.
         .tag_scope => for (f.tags) |tag| {
-            if (std.mem.eql(u8, tag, s.tag)) break true;
+            if (std.ascii.eqlIgnoreCase(tag, s.tag)) break true;
         } else false,
     };
 }

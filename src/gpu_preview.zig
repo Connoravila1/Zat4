@@ -93,10 +93,10 @@ pub fn main(init: std.process.Init) !void {
         mk("oko.zat", "Okonkwo", "monospace is the most honest a feed can be. same column, same weight, nobody shouts louder by being wider.", now - 3600, 73, 18, 24, false, false),
         mk("lune.zat", "lune", "woke up to the field still drifting where i left it. it kept the light on.", now - 10800, 39, 7, 3, false, false),
     };
-    const posts = try feed_view.fromTimeline(arena, &items, now);
+    const posts = try feed_view.fromTimeline(arena, &items, now, &.{});
     // Lay the feed out at the fixed logical design width and a proportional
     // logical height; buildVertices scales it to fill the window, crisp.
-    _ = try feed_view.layout(gpa, &engine, @intCast(design_w), @intCast(logicalH(W, H)), posts, 0, &dl, null, null, false, 0, null, 0, feed_view.accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{}, 0, 255);
+    _ = try feed_view.layout(gpa, &engine, @intCast(design_w), @intCast(logicalH(W, H)), posts, 0, &dl, null, null, false, 0, null, 0, feed_view.accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{}, 0, 255, null);
 
     // Bring up GL and the renderer.
     var g = gpu.init(win.wid) catch {
@@ -181,7 +181,7 @@ pub fn main(init: std.process.Init) !void {
             gpa.free(bias);
             bias = new_bias;
             dl.len = 0;
-            _ = feed_view.layout(gpa, &engine, @intCast(design_w), @intCast(logicalH(cur_w, cur_h)), posts, 0, &dl, null, null, false, 0, null, 0, feed_view.accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{}, 0, 255) catch break;
+            _ = feed_view.layout(gpa, &engine, @intCast(design_w), @intCast(logicalH(cur_w, cur_h)), posts, 0, &dl, null, null, false, 0, null, 0, feed_view.accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{}, 0, 255, null) catch break;
             gpu.feedBuild(&feed_path, gpa, &engine, dl.slice(), uiScale(cur_w)) catch break;
         }
 

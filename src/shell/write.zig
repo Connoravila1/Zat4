@@ -99,6 +99,8 @@ pub fn createPost(
     text: []const u8,
     facets: []const lexicon.Facet,
     reply: ?ReplyTarget,
+    /// The quoted post's strong ref when this is a quote-post; null otherwise.
+    quote: ?lexicon.RecordRef,
     now_epoch: i64,
 ) !WriteOutcome {
     var ts_buf: [24]u8 = undefined;
@@ -110,6 +112,7 @@ pub fn createPost(
             .parent = .{ .uri = r.parent_uri, .cid = r.parent_cid },
         } else null,
         .facets = if (facets.len > 0) facets else null,
+        .embed = if (quote) |q| .{ .record = q } else null,
     };
 
     // ── Volume tax (ANTIBOT Layer 4): pay the memory-hard PoW before the
@@ -362,7 +365,7 @@ test "loopback round trip: faceted reply posted with exact wire body, then a lik
         .root_cid = "bafyreialice1",
         .parent_uri = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.zat4.feed.post/3kali1",
         .parent_cid = "bafyreialice1",
-    }, 1_767_323_045);
+    }, null, 1_767_323_045);
     try std.testing.expectEqualStrings("bafyreinewpost", posted.ok.cid);
     try std.testing.expect(posted.ok.uri.len > 0);
 

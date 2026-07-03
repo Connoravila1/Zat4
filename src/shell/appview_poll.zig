@@ -248,6 +248,7 @@ pub fn pollRepo(
             }
             const reply_parent_cid: []const u8 = if (r.value.reply) |rep| rep.parent.cid else "";
             const reply_root_cid: []const u8 = if (r.value.reply) |rep| rep.root.cid else "";
+            const quote_of_cid: []const u8 = if (r.value.embed) |em| em.record.cid else "";
             // Zone tags ('#' stripped) from the record's facets — the same flat
             // values the firehose reducer produces, so both ingest paths agree.
             const tags = lexicon.collectTags(arena, r.value.facets) catch &.{};
@@ -258,13 +259,14 @@ pub fn pollRepo(
                 .created_at = feed.parseTimestamp(r.value.createdAt) catch 0,
                 .reply_parent_cid = reply_parent_cid,
                 .reply_root_cid = reply_root_cid,
+                .quote_of_cid = quote_of_cid,
                 .tags = tags,
             }) catch false;
             if (is_new) {
                 added += 1;
                 // Carry the reply refs AND the facets into the durable log so a
                 // restart's replay (jetstream.reduce) restores linkage + tags.
-                store.appendPost(log, arena, did, rkeyFromUri(r.uri), r.cid, r.value.text, r.value.createdAt, r.value.reply, r.value.facets);
+                store.appendPost(log, arena, did, rkeyFromUri(r.uri), r.cid, r.value.text, r.value.createdAt, r.value.reply, r.value.facets, if (r.value.embed) |em| lexicon.EmbedRecordOut{ .record = em.record } else null);
             }
         }
     }

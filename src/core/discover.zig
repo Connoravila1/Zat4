@@ -457,7 +457,9 @@ const ScoreHost = struct {
                 // "no such tag" → 0, never an out-of-bounds access.
                 if (!(arg0 >= 0 and arg0 < @as(f64, @floatFromInt(self.strings.len)))) return 0;
                 const want = self.strings[@intFromFloat(arg0)];
-                for (self.tags) |tg| if (std.mem.eql(u8, tg, want)) return 1;
+                // Case-insensitive: zones fold ASCII case (invariant 1), so a
+                // guest's has_tag("Foo") matches a candidate tagged #foo.
+                for (self.tags) |tg| if (std.ascii.eqlIgnoreCase(tg, want)) return 1;
                 return 0;
             },
             else => return 0, // retrieval/state/behavioral are not answered on the score path

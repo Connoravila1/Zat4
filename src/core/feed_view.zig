@@ -151,7 +151,12 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, expand, compose_add, compose_remove, quote_open, quote_new, repost_do };
+
+/// Main-feed Read-more: a post whose body wraps to more than this many visual
+/// lines is clamped to it (with a "Read more" doorway) until the reader expands
+/// it. Home feed only — threads and detail views always render in full.
+pub const feed_clamp_lines: u32 = 10;
 
 /// The six top-level rail destinations, in order. The `Screen` index a nav
 /// region carries is an index into this. Shared by the rail (draw + hit) and
@@ -322,18 +327,30 @@ pub const PostView = struct {
     /// Thread lens: this post has replies, and the reader has collapsed it.
     has_kids: bool = false,
     collapsed: bool = false,
+    /// Main-feed "Read more": the reader has expanded this post, so its body is
+    /// laid out in FULL rather than clamped to `feed_clamp_lines`. View-derived
+    /// (a per-reader lens, never on the record); false everywhere but Home.
+    expanded: bool = false,
     /// The post's zone tags (display casing) — the tray of tappable zone-doorways
     /// the renderer paints below the post. A slice like the other variable-length
     /// view fields; empty ⇒ untagged.
     tags: []const []const u8 = &.{},
+    /// Quote-post: the quoted post's DISPLAY snapshot for the quote card (name +
+    /// @handle + text). The tap target's uri/cid ride the shell's parallel
+    /// TimelineItem, so the view needs only what it draws. `quote_text` empty ⇒
+    /// not a quote.
+    quote_author_name: []const u8 = "",
+    quote_author_handle: []const u8 = "",
+    quote_text: []const u8 = "",
 
     comptime {
-        // Budget: 6 slices (6×16=96) + 4 u32 (16) + 8 bytes (initial/liked/boosted/
-        // depth/is_focus/stitched/has_kids/collapsed) = 120, no padding.
-        // (A7.1 raise 104 → 120: the `tags` tray is a real view field — same kind
-        // of variable-length view data as `replying_to` (the prior 88→104 raise),
-        // built for a handful of visible rows, so the +16 is fine.)
-        assert(@sizeOf(PostView) == 120);
+        // Budget: 9 slices (9×16=144) + 4 u32 (16) + 9 flag bytes = 169, rounded
+        // to the 8-byte slice alignment = 176.
+        // (A7.1 raise 128 → 176: three quote-card display slices — the same kind of
+        // variable-length view data as `tags`/`replying_to`, empty on non-quotes.
+        // This struct is built for a handful of VISIBLE rows, never the bulk store,
+        // so the absolute cost is a few dozen bytes per frame.)
+        assert(@sizeOf(PostView) == 176);
     }
 };
 
@@ -579,21 +596,69 @@ fn str(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, weight: text
 /// shows (`wrapDraft` already honours '\n'). A body with NO '\n' is a single
 /// segment, so it wraps byte-for-byte as before — the height cache and the
 /// long-feed coordinate accounting (the 800-post regression) depend on that.
+/// A quote-post's embedded card: a bordered mini-post (quoted name · @handle,
+/// then the quoted text) drawn between the body and the engagement row. Dual-use
+/// like `trayLayout` — returns the card height for the measure pass; when
+/// `draw_it`, also paints it and emits a `.quote_open` tap region carrying the
+/// QUOTING post index `pi` (the shell opens the quoted thread from that item's
+/// quote_uri/cid). The quoted text is clamped to a few lines so a card stays
+/// compact. Pure.
+fn quoteCard(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32, y0: i32, w: i32, name: []const u8, handle: []const u8, body: []const u8, draw_it: bool, regions: ?*Regions, pi: usize) error{OutOfMemory}!i32 {
+    const qpad: i32 = 12;
+    const qline: i32 = 19;
+    const inner = w - qpad * 2;
+    const head_base = y0 + qpad + 13;
+    const text_top = head_base + 7 + qline;
+    // Measure the (clamped) quoted text to size the border, then draw border →
+    // header → text so the text lands on top of the fill.
+    const text_end = try wrapBodyLimited(gpa, dl, e, x0 + qpad, text_top, inner, muted, 14, body, qline, false, null, 4, null);
+    const h = (text_end - qline) - y0 + qpad + 8;
+    if (draw_it) {
+        try rect(gpa, dl, x0, y0, w, h, (0x10 << 24) | 0x00FFFFFF, 12); // faint inset fill = the card
+        const nm = if (name.len > 0) name else handle;
+        var hx = try str(gpa, dl, e, .semibold, x0 + qpad, head_base, ink, 14, nm);
+        if (name.len > 0) {
+            hx = try str(gpa, dl, e, .regular, hx + 6, head_base, faint, 13, "@");
+            _ = try str(gpa, dl, e, .regular, hx, head_base, faint, 13, handle);
+        }
+        _ = try wrapBodyLimited(gpa, dl, e, x0 + qpad, text_top, inner, muted, 14, body, qline, true, null, 4, null);
+        try emitRegion(gpa, regions, x0, y0, w, @intCast(@max(0, @min(32767, h))), @intCast(pi), .quote_open);
+    }
+    return h;
+}
+
 fn wrapBody(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32, first_baseline: i32, maxw: i32, color: u32, px: u16, body: []const u8, line_h: i32, draw_it: bool, style: ?*const BodyTags) !i32 {
-    return wrapBodyPen(gpa, dl, e, x0, first_baseline, maxw, color, px, body, line_h, draw_it, style, null);
+    return wrapBodyPen(gpa, dl, e, x0, first_baseline, maxw, color, px, body, line_h, draw_it, style, null, null, null);
+}
+
+/// `wrapBody` clamped to at most `max_lines` visual lines (main-feed Read-more).
+/// Sets `overflow.*` = true when the body had more than fit, so the caller can
+/// draw the "Read more" doorway. `max_lines` null ⇒ unclamped (identical to
+/// `wrapBody`). The measure and paint passes call this with the SAME max_lines,
+/// so their geometry agrees.
+fn wrapBodyLimited(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32, first_baseline: i32, maxw: i32, color: u32, px: u16, body: []const u8, line_h: i32, draw_it: bool, style: ?*const BodyTags, max_lines: ?u32, overflow: ?*bool) !i32 {
+    return wrapBodyPen(gpa, dl, e, x0, first_baseline, maxw, color, px, body, line_h, draw_it, style, null, max_lines, overflow);
 }
 
 /// `wrapBody` that also reports the final pen x (the caret seat after the
 /// last drawn glyph) — the editor-shaped surfaces need it; everyone else
-/// calls `wrapBody` and never sees the parameter.
-fn wrapBodyPen(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32, first_baseline: i32, maxw: i32, color: u32, px: u16, body: []const u8, line_h: i32, draw_it: bool, style: ?*const BodyTags, end_x: ?*i32) !i32 {
+/// calls `wrapBody` and never sees the parameter. `max_lines`/`overflow` drive
+/// the main-feed Read-more clamp (null ⇒ unclamped, the original behaviour).
+fn wrapBodyPen(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32, first_baseline: i32, maxw: i32, color: u32, px: u16, body: []const u8, line_h: i32, draw_it: bool, style: ?*const BodyTags, end_x: ?*i32, max_lines: ?u32, overflow: ?*bool) !i32 {
     var baseline = first_baseline;
     var seg_start: usize = 0;
+    // The line budget shared across paragraphs; unclamped calls get a budget so
+    // large no real body reaches it (std.math.maxInt keeps the arithmetic total).
+    var budget: i32 = if (max_lines) |m| @intCast(m) else std.math.maxInt(i32);
     while (true) {
         const nl = std.mem.indexOfScalarPos(u8, body, seg_start, '\n') orelse body.len;
-        baseline = try wrapLine(gpa, dl, e, x0, baseline, maxw, color, px, body[seg_start..nl], line_h, draw_it, style, end_x);
+        baseline = try wrapLine(gpa, dl, e, x0, baseline, maxw, color, px, body[seg_start..nl], line_h, draw_it, style, end_x, &budget, overflow);
         if (nl == body.len) break;
         seg_start = nl + 1; // step past the '\n' — the next paragraph starts a fresh line
+        if (budget <= 0) { // more paragraphs remain but the clamp is spent
+            if (overflow) |o| o.* = true;
+            break;
+        }
     }
     return baseline;
 }
@@ -602,21 +667,30 @@ fn wrapBodyPen(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: 
 /// last space before overflow. A single RUN longer than the whole line (a
 /// long word, a URL, "hmmm…") HARD-BREAKS at the last codepoint that fits —
 /// text never escapes its pane. The per-line worker behind `wrapBody`.
-fn wrapLine(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32, first_baseline: i32, maxw: i32, color: u32, px: u16, body: []const u8, line_h: i32, draw_it: bool, style: ?*const BodyTags, end_x: ?*i32) !i32 {
+fn wrapLine(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32, first_baseline: i32, maxw: i32, color: u32, px: u16, body: []const u8, line_h: i32, draw_it: bool, style: ?*const BodyTags, end_x: ?*i32, budget: *i32, overflow: ?*bool) !i32 {
     const maxw_u: u32 = @intCast(@max(0, maxw));
     var baseline = first_baseline;
     var line_start: usize = 0;
     var last_space: usize = 0;
     var have_space = false;
     var i: usize = 0;
+    // The main-feed Read-more clamp: `budget` counts the visual lines this post
+    // may still commit. When it runs out with content left, stop and flag the
+    // overflow — the caller draws a "Read more" doorway and expands on tap. An
+    // unclamped call passes a huge budget, so every commit is unblocked.
     while (i <= body.len) : (i += 1) {
         const at_end = i == body.len;
         if (!at_end and body[i] != ' ') continue;
         const candidate = body[line_start..i];
         if (text.measure(e, .regular, candidate, px) > maxw_u) {
             if (have_space) {
+                if (budget.* <= 0) {
+                    if (overflow) |o| o.* = true;
+                    return baseline;
+                }
                 if (draw_it) try drawBodyRun(gpa, dl, e, x0, baseline, color, px, body, line_start, last_space, style);
                 baseline += line_h;
+                budget.* -= 1;
                 line_start = last_space + 1;
                 have_space = false;
                 i = line_start;
@@ -635,16 +709,26 @@ fn wrapLine(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32
                 probe = next;
                 fit = next;
             }
+            if (budget.* <= 0) {
+                if (overflow) |o| o.* = true;
+                return baseline;
+            }
             if (draw_it) try drawBodyRun(gpa, dl, e, x0, baseline, color, px, body, line_start, fit, style);
             baseline += line_h;
+            budget.* -= 1;
             line_start = fit;
             i = line_start;
             continue;
         }
         if (at_end) {
+            if (budget.* <= 0) {
+                if (overflow) |o| o.* = true;
+                return baseline;
+            }
             if (draw_it) try drawBodyRun(gpa, dl, e, x0, baseline, color, px, body, line_start, i, style);
             if (end_x) |ex| ex.* = x0 + @as(i32, @intCast(text.measure(e, .regular, body[line_start..i], px)));
             baseline += line_h;
+            budget.* -= 1;
             break;
         }
         last_space = i;
@@ -1359,6 +1443,9 @@ pub fn layout(
     settings_choices: u64,
     /// The action of the choice whose picker popover is OPEN, or 255 = none.
     settings_picking: u8,
+    /// The VIEW index of the post whose repost/quote menu is OPEN, or null. The
+    /// menu (Repost · Quote post) is drawn AFTER the post loop so it floats on top.
+    repost_menu: ?usize,
 ) error{OutOfMemory}!i32 {
     const m: Metrics = if (geom) |g|
         .{ .rail_x = g.rail_x, .col_x = g.col_x, .col_w = g.col_w, .lx = g.lx, .cw = g.cw, .side_x = g.side_x, .wide = g.wide }
@@ -1501,6 +1588,9 @@ pub fn layout(
     var chain_bottom_off: i32 = 0;
     var chain_head_idx: u32 = 0;
 
+    // The repost/quote menu's anchor (the repost button of the open-menu post),
+    // captured during the loop and drawn AFTER it so the menu floats on top.
+    var menu_anchor: ?struct { x: i32, y: i32, boosted: bool } = null;
     var y: i32 = feed_y0 + scroll;
     for (posts, 0..) |p, pi| {
         // The reply socket precedes this post (its seam in the thread).
@@ -1603,25 +1693,41 @@ pub fn layout(
         // the costly, scroll-invariant text-shaping result. The tray height is
         // cheap and recomputed every frame (and a future per-reader fold then
         // stays cache-free), so it is added on top, not stored.
+        // Main-feed Read-more: clamp a long body to `feed_clamp_lines` on Home
+        // (never in a thread/detail view, and never once the reader expanded it).
+        // The clamp height (body + the "Read more" line) is baked into the cached
+        // advance; the paint pass below re-derives the overflow to draw the doorway.
+        const clamp_lines: ?u32 = if (!is_thread and active_screen == screen_home and !p.expanded) feed_clamp_lines else null;
+        const more_line_h: i32 = body_line + 6; // the "Read more" doorway's own line
         const cached: ?i32 = if (heights) |hh| (if (pi < hh.len and hh[pi] >= 0) hh[pi] else null) else null;
         var body_end: i32 = undefined;
         if (cached) |adv| {
             body_end = post_top + adv;
         } else {
-            body_end = try wrapBody(gpa, dl, e, cx, post_top + body_top_off, content_w, body_c, 16, p.body, body_line, false, null);
+            var body_ovf = false;
+            const raw = try wrapBodyLimited(gpa, dl, e, cx, post_top + body_top_off, content_w, body_c, 16, p.body, body_line, false, null, clamp_lines, &body_ovf);
+            body_end = raw + (if (body_ovf) more_line_h else 0);
             if (heights) |hh| if (pi < hh.len) {
                 hh[pi] = body_end - post_top;
             };
         }
+        // Quote-post card: a bordered mini-post below the body, before the
+        // engagement row. Measured here (cheap, recomputed each frame like the
+        // tray) so the row + next post drop by its height; empty ⇒ no card, and
+        // an unquoted post lays out byte-for-byte as before.
+        const quote_extra: i32 = if (p.quote_text.len > 0)
+            (try quoteCard(gpa, dl, e, cx, 0, content_w, p.quote_author_name, p.quote_author_handle, p.quote_text, false, null, pi)) + 12
+        else
+            0;
         // Roomier vertical rhythm: body_end + 60 = erow(+22) + row(+22) + gap(+16).
-        const erow = body_end + 22;
+        const erow = body_end + quote_extra + 22;
         // The tag tray sits below the engagement row; measure it now so the
         // divider + next post drop by its height (0 when the post is untagged, so
         // an untagged post lays out byte-for-byte as before).
         const tray_h = try trayLayout(gpa, dl, e, cx, 0, content_w, p.tags, accent, false, null, pi);
         const tray_extra: i32 = if (tray_h > 0) tray_h + 12 else 0;
         const bottom = erow + 22 + tray_extra;
-        const next_y = body_end + 60 + tray_extra;
+        const next_y = body_end + quote_extra + 60 + tray_extra;
         const visible = next_y > 0 and post_top < height;
 
         if (visible) {
@@ -1714,7 +1820,21 @@ pub fn layout(
             // the thread's rooted post both get clickable hashtags.
             const body_from = dl.len;
             const body_style: BodyTags = .{ .color = tag_blue, .regions = regions, .pi = pi, .tags = p.tags };
-            _ = try wrapBody(gpa, dl, e, cx, post_top + body_top_off, content_w, body_c, 16, p.body, body_line, true, &body_style);
+            var paint_ovf = false;
+            const paint_baseline = try wrapBodyLimited(gpa, dl, e, cx, post_top + body_top_off, content_w, body_c, 16, p.body, body_line, true, &body_style, clamp_lines, &paint_ovf);
+            // "Read more" doorway (main feed, clamped body): an accent line under
+            // the clamped text; its `.expand` region is emitted AFTER the whole-post
+            // `.post_body` region, so the reverse hit-test lets it win — a tap
+            // expands the post in place rather than opening the thread.
+            if (paint_ovf) {
+                const mw = try str(gpa, dl, e, .semibold, cx, paint_baseline, accent, 15, "Read more");
+                try emitRegion(gpa, regions, cx, paint_baseline - 15, mw - cx, 22, @intCast(pi), .expand);
+            }
+            // Quote-post card (paint) — anchored at body_end (which already folds in
+            // any Read-more line), so it sits below the doorway and above the row.
+            if (p.quote_text.len > 0) {
+                _ = try quoteCard(gpa, dl, e, cx, body_end + 6, content_w, p.quote_author_name, p.quote_author_handle, p.quote_text, true, regions, pi);
+            }
             // The rooted post (thread screen) is the one selectable post: capture
             // its body glyphs for the read-only selection layer (ZONES inv. 4 —
             // selection is a query over this transient map, never a stored copy).
@@ -1748,6 +1868,7 @@ pub fn layout(
             ex += is + cgap;
             _ = try str(gpa, dl, e, .regular, ex, erow, if (p.boosted) boost_c else muted, 13, std.fmt.bufPrint(&nb, "{d}", .{p.boost}) catch "0");
             try emitRegion(gpa, regions, rt_x, tap_y, slot_w, tap_h, @intCast(pi), .repost);
+            if (repost_menu == pi) menu_anchor = .{ .x = rt_x, .y = tap_y, .boosted = p.boosted };
             const like_x = rt_x + slot_w + ggap;
             // Liked → FILLED red heart; unliked → HOLLOW outline. On the GPU path
             // this is SKIPPED — the SDF heart pass draws it in place.
@@ -1821,6 +1942,31 @@ pub fn layout(
         _ = try str(gpa, dl, e, .semibold, px + 20, py + 25, bg, 14, label);
         try emitRegion(gpa, regions, px, py, pw, pill_h, 0, .reveal_new);
     }
+    // The repost/quote menu — a small floating panel below the tapped repost
+    // button (the middle action doubles as Repost + Quote, the universal pattern).
+    // Drawn LAST so it lands on top of the posts and the top bar; its rows carry
+    // the menu post's index. Only drawn when that post was visible this frame.
+    if (menu_anchor) |ma| if (repost_menu) |mp| {
+        const menu_w: i32 = 196;
+        const row_h: i32 = 46;
+        const menu_h: i32 = row_h * 2 + 12;
+        var mx = ma.x - 12;
+        if (mx + menu_w > width - 10) mx = width - 10 - menu_w;
+        if (mx < 10) mx = 10;
+        // Below the button, unless that runs off the bottom → flip above.
+        var my = ma.y + 40;
+        if (my + menu_h > height - 10) my = ma.y - menu_h - 8;
+        try rect(gpa, dl, mx, my, menu_w, menu_h, 0xF61E1E18, 14); // opaque panel
+        try rect(gpa, dl, mx, my, menu_w, menu_h, 0x22000000, 14); // subtle edge darken
+        const r1y = my + 6;
+        const r2y = r1y + row_h;
+        _ = try str(gpa, dl, e, .semibold, mx + 18, r1y + 29, if (ma.boosted) boost_c else ink, 15, if (ma.boosted) "Undo repost" else "Repost");
+        try emitRegion(gpa, regions, mx, r1y, menu_w, @intCast(row_h), @intCast(mp), .repost_do);
+        try rect(gpa, dl, mx + 14, r2y, menu_w - 28, 1, divider, 0); // row divider
+        _ = try str(gpa, dl, e, .semibold, mx + 18, r2y + 29, ink, 15, "Quote post");
+        try emitRegion(gpa, regions, mx, r2y, menu_w, @intCast(row_h), @intCast(mp), .quote_new);
+    };
+
     if (chain_out) |co| co.* = .{
         .present = is_thread and chain_seen_head,
         .head_index = chain_head_idx,
@@ -2030,6 +2176,9 @@ pub fn layoutCompose(
     ctx: ComposeContext,
     /// "@handle" of the post being replied to, when `ctx == .reply`; else "".
     reply_handle: []const u8,
+    /// The quoted post's author handle (no '@') when composing a quote-post; ""
+    /// otherwise. Draws a "Quoting @x" line so the composer shows what it embeds.
+    quoting: []const u8,
     draft: []const u8,
     /// Byte offset of the insertion point in `draft` (the textedit caret).
     caret: usize,
@@ -2040,6 +2189,11 @@ pub fn layoutCompose(
     blink_on: bool,
     /// A status / hint line shown in the footer (the shell's compose status).
     status: []const u8,
+    /// Finalized thread segments stacked above the active box (empty ⇒ a lone
+    /// post). Each renders as a compact preview with an ✕ (`.compose_remove`,
+    /// carrying its index); the "Add" button (`.compose_add`) appends the active
+    /// box here, and Send publishes them all as one self-reply chain.
+    segments: []const []const u8,
     dl: *raster.DrawList,
     regions: ?*Regions,
 ) error{OutOfMemory}!void {
@@ -2050,11 +2204,16 @@ pub fn layoutCompose(
     // composer reads as a focused overlay; the field still glows faintly through.
     try rect(gpa, dl, 0, 0, width, height, header_veil, 0);
 
-    // The card: centred in the feed column, a comfortable fixed height.
+    // The card: centred in the feed column. It grows to fit any finalized thread
+    // segments (each a compact row), capped by the window; a lone post keeps the
+    // comfortable fixed height.
     const cx0 = m.col_x + 16;
     const cw = m.col_w - 32;
     const card_y: i32 = 92;
-    const card_h: i32 = @min(height - card_y - 40, 380);
+    const body_line: i32 = @max(24, @as(i32, @intCast(text.lineMetrics(e, .regular, 17).height)));
+    const seg_row: i32 = body_line + 10;
+    const stack_h: i32 = if (segments.len > 0) @as(i32, @intCast(segments.len)) * seg_row + 14 else 0;
+    const card_h: i32 = @min(height - card_y - 40, 380 + stack_h);
     try rect(gpa, dl, cx0, card_y, cw, card_h, skinPanel(accent), 18);
 
     const pad: i32 = 24;
@@ -2064,7 +2223,7 @@ pub fn layoutCompose(
     // Context line: who/what this is.
     const send_label: []const u8 = switch (ctx) {
         .reply => "Reply",
-        .post => "Post",
+        .post => if (segments.len > 0) "Post all" else "Post",
         .profile => "Save",
     };
     const hx = try str(gpa, dl, e, .semibold, lx, card_y + 34, ink, 18, switch (ctx) {
@@ -2075,13 +2234,41 @@ pub fn layoutCompose(
     if (ctx == .reply and reply_handle.len > 0) _ = try str(gpa, dl, e, .semibold, hx, card_y + 34, accent, 18, reply_handle);
     try rect(gpa, dl, cx0, card_y + 50, cw, 1, divider, 0);
 
-    // The draft (or a faint placeholder), wrapped from just under the divider.
-    const body_line: i32 = @max(24, @as(i32, @intCast(text.lineMetrics(e, .regular, 17).height)));
-    const text_top = card_y + 50 + 14 + body_line;
+    // Quote-post: a "Quoting @x" line under the header so the composer shows what
+    // it will embed (the quoted post's full card renders in the feed after send).
+    var stack_y = card_y + 50 + 10;
+    if (quoting.len > 0) {
+        const qx = try str(gpa, dl, e, .regular, lx, stack_y + 14, muted, 13, "Quoting @");
+        _ = try str(gpa, dl, e, .semibold, qx, stack_y + 14, accent, 13, quoting);
+        stack_y += 26;
+    }
+
+    // The finalized thread segments: compact previews under the header, tied by a
+    // thin rail into one thread, each with a ✕ to drop it. Only posts chain.
+    if (segments.len > 0) {
+        const rail_x = lx + 3;
+        const n: i32 = @intCast(segments.len);
+        try rect(gpa, dl, rail_x, stack_y + 6, 2, n * seg_row - 10, scaleAlpha(accent, 0.5), 0);
+        for (segments, 0..) |seg, si| {
+            const ry = stack_y + @as(i32, @intCast(si)) * seg_row;
+            const baseline = ry + body_line - 6;
+            try rect(gpa, dl, rail_x - 2, baseline - 9, 6, 6, accent, 3); // node dot
+            const rmw: i32 = 22; // reserved for the ✕
+            try strEllipsis(gpa, dl, e, .regular, lx + 18, baseline, muted, 15, seg, inner_w - 18 - rmw - 8);
+            _ = try str(gpa, dl, e, .semibold, cx0 + cw - pad - rmw, baseline, faint, 15, "\xC3\x97"); // ×
+            try emitRegion(gpa, regions, cx0 + cw - pad - rmw - 6, ry, rmw + 12, @intCast(seg_row), @intCast(si), .compose_remove);
+        }
+        stack_y += n * seg_row;
+        try rect(gpa, dl, cx0, stack_y + 4, cw, 1, divider, 0);
+        stack_y += 4;
+    }
+
+    // The draft (or a faint placeholder), wrapped from just under the stack.
+    const text_top = stack_y + 14 + body_line;
     const cursor: Pen = if (draft.len == 0) blk: {
         const ph: []const u8 = switch (ctx) {
             .reply => "Write your reply…",
-            .post => "What's on the field?",
+            .post => if (segments.len > 0) "Add another post…" else "What's on the field?",
             .profile => "Your display name",
         };
         _ = try str(gpa, dl, e, .regular, lx, text_top, faint, 17, ph);
@@ -2105,6 +2292,17 @@ pub fn layoutCompose(
     try rect(gpa, dl, sx, fy, sw, 34, accent, 16);
     _ = try str(gpa, dl, e, .semibold, sx + 20, fy + 22, bg, 14, send_label);
     try emitRegion(gpa, regions, sx, fy, sw, 34, 0, .compose_send);
+    // "+ Add" — finalize the active draft as a thread segment (posts only). A
+    // subtle outlined pill left of Send, so Send stays the primary action; the
+    // handler no-ops on an empty box, so it can always show as an affordance.
+    if (ctx == .post) {
+        const add_label = "+ Add";
+        const add_w: i32 = @intCast(text.measure(e, .semibold, add_label, 14) + 32);
+        const add_x = sx - add_w - 12;
+        try rect(gpa, dl, add_x, fy, add_w, 34, 0x33000000, 14);
+        _ = try str(gpa, dl, e, .semibold, add_x + 16, fy + 22, muted, 14, add_label);
+        try emitRegion(gpa, regions, add_x, fy, add_w, 34, 0, .compose_add);
+    }
     // Char count (posts/replies only) between the two buttons.
     if (ctx != .profile) {
         var cb: [16]u8 = undefined;
@@ -4061,7 +4259,7 @@ pub fn layoutChat(
     var caret_x: i32 = input_x + 14;
     var caret_base: i32 = comp_y + 29;
     if (draft.len > 0) {
-        caret_base = try wrapBodyPen(gpa, dl, e, input_x + 14, comp_y + 29, input_w - 28, ink, 14, draft, input_line_h, true, null, &caret_x) - input_line_h;
+        caret_base = try wrapBodyPen(gpa, dl, e, input_x + 14, comp_y + 29, input_w - 28, ink, 14, draft, input_line_h, true, null, &caret_x, null, null) - input_line_h;
     } else {
         var pbuf: [96]u8 = undefined;
         const ph = std.fmt.bufPrint(&pbuf, "Message {s}", .{peer}) catch "Message";
@@ -4210,7 +4408,14 @@ pub fn layoutChat(
     return height + @max(0, total - (thread_bot - thread_top));
 }
 
-pub fn fromTimeline(arena: Allocator, items: []const feed.TimelineItem, now: i64) error{OutOfMemory}![]PostView {
+/// True when `cid` is one of the reader's expanded posts (Read-more). Linear
+/// over a handful of expanded cids — the set is tiny (what fits on screen).
+fn cidIn(cids: []const []const u8, cid: []const u8) bool {
+    for (cids) |c| if (std.mem.eql(u8, c, cid)) return true;
+    return false;
+}
+
+pub fn fromTimeline(arena: Allocator, items: []const feed.TimelineItem, now: i64, expanded: []const []const u8) error{OutOfMemory}![]PostView {
     const out = try arena.alloc(PostView, items.len);
     for (items, out) |it, *pv| {
         const name = if (it.author_display_name.len > 0) it.author_display_name else it.author_handle;
@@ -4235,7 +4440,11 @@ pub fn fromTimeline(arena: Allocator, items: []const feed.TimelineItem, now: i64
             .stitched = it.stitched,
             .has_kids = it.has_kids,
             .collapsed = it.collapsed,
+            .expanded = cidIn(expanded, it.cid),
             .tags = it.tags,
+            .quote_author_name = it.quote_author_display_name,
+            .quote_author_handle = it.quote_author_handle,
+            .quote_text = it.quote_text,
         };
     }
     return out;
@@ -4278,7 +4487,7 @@ test "fromTimeline: display-name fallback, counts, age, deterministic tint" {
         .{ .uri = "", .cid = "", .author_handle = "mara.zat", .author_display_name = "Mara Vesper", .reposted_by_handle = "", .replying_to_handle = "", .text = "hello field", .created_at = 1000, .like_count = 48, .repost_count = 9, .reply_count = 6, .quote_count = 0, .label_flags = .{}, .item_flags = .{ .viewer_liked = true } },
         .{ .uri = "", .cid = "", .author_handle = "oko.zat", .author_display_name = "", .reposted_by_handle = "", .replying_to_handle = "", .text = "monospace", .created_at = 0, .like_count = 73, .repost_count = 18, .reply_count = 24, .quote_count = 0, .label_flags = .{}, .item_flags = .{} },
     };
-    const out = try fromTimeline(arena, &items, 1000 + 120);
+    const out = try fromTimeline(arena, &items, 1000 + 120, &.{});
 
     try std.testing.expectEqualStrings("Mara Vesper", out[0].name);
     try std.testing.expectEqualStrings("@mara.zat", out[0].handle);
@@ -4306,7 +4515,7 @@ test "layout emits 4 tap regions per post (avatar + 3 engagement); hitTest resol
     const posts = [_]PostView{
         .{ .name = "A", .handle = "@a.zat", .age = "1m", .body = "hello there field", .tint = 0xFFAAAAAA, .reply = 1, .boost = 2, .like = 3, .initial = 'A', .liked = true, .boosted = false },
     };
-    const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{}, 0, 255);
+    const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{}, 0, 255, null);
     try std.testing.expect(h > 112); // content extends below the top bar
     // 8 regions per post: body tap + avatar + reply/repost/like + bookmark/share/more.
     try std.testing.expectEqual(@as(usize, 8), regions.items.len);
@@ -4351,14 +4560,14 @@ test "layout captures the rooted post's body glyphs for selection (thread screen
         .{ .name = "A", .handle = "@a.zat", .age = "1m", .body = "hello there field", .tint = 0xFFAAAAAA, .reply = 0, .boost = 0, .like = 0, .initial = 'A', .liked = false, .boosted = false, .is_focus = true },
     };
     // A WIDE layout so the focus post is on-screen and the body is drawn.
-    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_thread, null, 0, accent_house, null, .{}, null, null, &sel, "", &.{}, null, 0, 0, .{}, 0, 255);
+    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_thread, null, 0, accent_house, null, .{}, null, null, &sel, "", &.{}, null, 0, 0, .{}, 0, 255, null);
     // "hello there field" = 15 visible glyphs (spaces are emitted too): the body
     // captured into the selection map, in reading order.
     try std.testing.expect(sel.items.len > 0);
     try std.testing.expectEqual(@as(u32, 'h'), sel.items[0].cp);
 
     // A non-thread screen captures nothing (only the rooted post is selectable).
-    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_home, null, 0, accent_house, null, .{}, null, null, &sel, "", &.{}, null, 0, 0, .{}, 0, 255);
+    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_home, null, 0, accent_house, null, .{}, null, null, &sel, "", &.{}, null, 0, 0, .{}, 0, 255, null);
     try std.testing.expectEqual(@as(usize, 0), sel.items.len);
 }
 
@@ -4373,7 +4582,7 @@ test "layoutCompose emits send + cancel regions; multi-line draft + empty draft 
 
     // A reply draft spanning an explicit newline (Enter inserts '\n').
     const draft_ml = "line one\nline two is a bit longer so it wraps";
-    try layoutCompose(gpa, &engine, 1300, 900, accent_house, .reply, "@mara.zat", draft_ml, 5, 9, 17, true, "", &dl, &regions);
+    try layoutCompose(gpa, &engine, 1300, 900, accent_house, .reply, "@mara.zat", "", draft_ml, 5, 9, 17, true, "", &.{}, &dl, &regions);
     try std.testing.expect(dl.len > 0);
     var saw_send = false;
     var saw_cancel = false;
@@ -4393,7 +4602,7 @@ test "layoutCompose emits send + cancel regions; multi-line draft + empty draft 
 
     // An empty profile draft renders the placeholder path without crashing.
     dl.len = 0;
-    try layoutCompose(gpa, &engine, 700, 800, accent_house, .profile, "", "", 0, 0, 0, true, "saving...", &dl, &regions);
+    try layoutCompose(gpa, &engine, 700, 800, accent_house, .profile, "", "", "", 0, 0, 0, true, "saving...", &.{}, &dl, &regions);
     try std.testing.expect(dl.len > 0);
 
     // The inverse (click → caret offset) replays the same wrap: a click far
@@ -4420,7 +4629,7 @@ test "long timeline does not overflow draw coordinates (off-screen posts skipped
     const posts = try arena.alloc(PostView, n);
     for (posts) |*pv| pv.* = .{ .name = "x", .handle = "@x.zat", .age = "1m", .body = "a body line that wraps a little across the feed column width here", .tint = 0xFF888888, .reply = 1, .boost = 2, .like = 3, .initial = 'x', .liked = false, .boosted = false };
 
-    const h = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{}, 0, 255); // must not panic
+    const h = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{}, 0, 255, null); // must not panic
     try std.testing.expect(h > 940 * 10); // height accounts for the whole list
     try std.testing.expect(regions.items.len < 4 * 24); // only on-screen posts are tappable
 
@@ -4434,11 +4643,11 @@ test "long timeline does not overflow draw coordinates (off-screen posts skipped
     @memset(heights, -1);
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h_fill = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{}, 0, 255);
+    const h_fill = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{}, 0, 255, null);
     const fill_regions = regions.items.len;
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h_cached = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{}, 0, 255);
+    const h_cached = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{}, 0, 255, null);
     try std.testing.expectEqual(h, h_fill);
     try std.testing.expectEqual(h, h_cached);
     try std.testing.expectEqual(fill_regions, regions.items.len);
@@ -4461,7 +4670,7 @@ test "profile screen renders the author's posts under a header; other screens st
     // Profile screen: 8 post tap regions (body + avatar + reply/repost/like +
     // bookmark/share/more) + 4 profile-nav tab regions in the sticky header
     // (the header here isn't editable, so no edit-profile region).
-    const hp = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_profile, header, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{}, 0, 255);
+    const hp = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_profile, header, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{}, 0, 255, null);
     try std.testing.expect(hp > 112);
     try std.testing.expectEqual(@as(usize, 12), regions.items.len);
 
@@ -4469,7 +4678,7 @@ test "profile screen renders the author's posts under a header; other screens st
     // so no tap regions, and the height clamps to the viewport (no post stack).
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const he = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, 2, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{}, 0, 255); // Activity (a still-bare placeholder)
+    const he = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, 2, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{}, 0, 255, null); // Activity (a still-bare placeholder)
     try std.testing.expectEqual(@as(i32, 940), he);
     try std.testing.expectEqual(@as(usize, 0), regions.items.len);
 
@@ -4482,7 +4691,7 @@ test "profile screen renders the author's posts under a header; other screens st
     regions.clearRetainingCapacity();
     // Narrow width (460): `m.wide` is false so the rail emits no regions — the
     // only regions are the settings surface's own, keeping the count exact.
-    _ = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_settings, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, settings_view.sec_account, 0, .{}, 0, 255);
+    _ = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_settings, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, settings_view.sec_account, 0, .{}, 0, 255, null);
     // Rows that emit a tap region: not info, and not WIP-greyed (those are inert).
     var account_interactive: usize = 0;
     for (settings_view.rows) |r| {
@@ -4678,7 +4887,7 @@ test "zones browse: each catalog entry emits one .zone_open card region carrying
         .{ .tag = "zig", .count = 913 },
         .{ .tag = "small-net", .count = 1 },
     };
-    const h = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_zones_browse, null, 0, accent_house, null, .{}, null, null, null, "", &zones, null, 0, 0, .{}, 0, 255);
+    const h = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_zones_browse, null, 0, accent_house, null, .{}, null, null, null, "", &zones, null, 0, 0, .{}, 0, 255, null);
     try std.testing.expect(h > 0);
     // The inert chrome (tabs/search/categories) emits no regions; the rail does
     // (it flanks every wide screen), so filter to the card taps: one `.zone_open`

@@ -186,11 +186,12 @@ pub fn appendPost(
     created_at: []const u8,
     reply: ?lexicon.ReplyRefOut,
     facets: ?[]const lexicon.Facet,
+    embed: ?lexicon.EmbedRecordOut,
 ) void {
     if (store.fd < 0 or rkey.len == 0 or cid.len == 0) return;
     const env: PostEnvelope = .{
         .did = author_did,
-        .commit = .{ .rkey = rkey, .cid = cid, .record = .{ .text = text, .createdAt = created_at, .reply = reply, .facets = facets } },
+        .commit = .{ .rkey = rkey, .cid = cid, .record = .{ .text = text, .createdAt = created_at, .reply = reply, .facets = facets, .embed = embed } },
     };
     writeEnvelope(store, arena, env);
 }
@@ -391,7 +392,7 @@ test "store: append then replay rebuilds the index (posts, follows, likes)" {
         defer close(&store);
         try testing.expect(store.fd >= 0);
         appendFollow(&store, arena, "did:plc:me", "did:plc:author", "bafy-follow-1");
-        appendPost(&store, arena, "did:plc:author", "rk1", "bafy-post-1", "hello zat4", "2026-06-14T00:00:00Z", null, null);
+        appendPost(&store, arena, "did:plc:author", "rk1", "bafy-post-1", "hello zat4", "2026-06-14T00:00:00Z", null, null, null);
         appendEngagement(&store, arena, .like, "did:plc:me", "bafy-post-1", "bafy-like-1", "at://did:plc:me/app.zat4.feed.like/r1");
     }
 
@@ -437,7 +438,7 @@ test "store: a post's #tag facets survive a restart (replay restores the zone)" 
             .index = .{ .byteStart = 5, .byteEnd = 11 },
             .features = &.{.{ .@"$type" = lexicon.richtext.facet_tag, .tag = "water" }},
         }};
-        appendPost(&store, arena, "did:plc:author", "rk1", "bafy-post-1", "love #water", "2026-06-14T00:00:00Z", null, &facets);
+        appendPost(&store, arena, "did:plc:author", "rk1", "bafy-post-1", "love #water", "2026-06-14T00:00:00Z", null, &facets, null);
     }
 
     // A fresh process replays the log: the zone membership is rebuilt.
@@ -470,7 +471,7 @@ test "store: a post body with newlines/quotes round-trips as ONE log line" {
     {
         var s = open(path);
         defer close(&s);
-        appendPost(&s, arena, "did:plc:a", "rk1", "cidNL", tricky, "2026-06-14T00:00:00Z", null, null);
+        appendPost(&s, arena, "did:plc:a", "rk1", "cidNL", tricky, "2026-06-14T00:00:00Z", null, null, null);
     }
 
     var idx: appview.Index = .{};
@@ -500,7 +501,7 @@ test "store: replaying the same log twice does not double-apply (idempotent rest
         var store = open(path);
         defer close(&store);
         appendFollow(&store, arena, "did:plc:me", "did:plc:a", "bafy-f1");
-        appendPost(&store, arena, "did:plc:a", "rk1", "bafy-p1", "p", "2026-06-14T00:00:00Z", null, null);
+        appendPost(&store, arena, "did:plc:a", "rk1", "bafy-p1", "p", "2026-06-14T00:00:00Z", null, null, null);
         appendEngagement(&store, arena, .like, "did:plc:me", "bafy-p1", "bafy-l1", "at://did:plc:me/app.zat4.feed.like/r1");
     }
 
@@ -527,7 +528,7 @@ test "store: a disabled store (no path) is a silent no-op, replay of nothing is 
     var store = open(""); // disabled
     defer close(&store);
     try testing.expect(store.fd < 0);
-    appendPost(&store, arena_state.allocator(), "did:x", "rk", "cid", "t", "2026-06-14T00:00:00Z", null, null); // no crash
+    appendPost(&store, arena_state.allocator(), "did:x", "rk", "cid", "t", "2026-06-14T00:00:00Z", null, null, null); // no crash
 
     var idx: appview.Index = .{};
     defer appview.deinit(gpa, &idx);

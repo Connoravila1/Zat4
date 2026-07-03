@@ -290,14 +290,32 @@ pub fn run(
     defer compose_arena_state.deinit();
     var reply_target: ?write.ReplyTarget = null;
     var reply_handle: []const u8 = "";
+    // Quote-post: the quoted post's strong ref (compose-arena-owned, like
+    // reply_target) + its @handle for the composer's "Quoting" line. Set when the
+    // quote button opens the composer; cleared on send/cancel.
+    var quote_target: ?lexicon.RecordRef = null;
+    var quoting_handle: []const u8 = "";
+    // The VIEW index of the post whose Repost/Quote menu is open, or null. A
+    // transient popover: closed by picking a row, tapping elsewhere, or scrolling.
+    var grepost_menu: ?u16 = null;
     // The compose flow is reused for the profile editor: .post writes a feed
     // post on send; .profile upserts the self profile record with the buffer as
     // the display name. Set when the editor / composer is opened.
     var compose_kind: ComposeKind = .post;
     // A post/reply optimistically shown, its create write queued for the loop to
-    // run after the post is on screen (0ms posting). At most one in flight.
-    var pending_send: ?SendJob = null;
-    defer if (pending_send) |job| freeSendJob(gpa, job);
+    // run after the post is on screen (0ms posting). At most one chain in flight;
+    // a lone post is a chain of one.
+    var pending_send: ?ChainSend = null;
+    defer if (pending_send) |cs| freeChain(gpa, cs);
+    // Thread composer: the FINALIZED segments above the active box. Tapping "Add"
+    // pushes the active draft here and clears the box for the next post; Send
+    // publishes these plus the active box as one self-reply chain. gpa-owned
+    // texts, freed on send/cancel/exit (C5).
+    var chain_segments: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (chain_segments.items) |s| gpa.free(s);
+        chain_segments.deinit(gpa);
+    }
     // A queued profile-edit save (the display name to putProfile after it's
     // shown optimistically). gpa-owned; at most one in flight.
     var pending_profile_save: ?[]const u8 = null;
@@ -821,6 +839,14 @@ pub fn run(
         for (gcollapsed.items) |c| gpa.free(c);
         gcollapsed.deinit(gpa);
     }
+    // Expanded post CIDs (main-feed Read-more) — per-view state, same shape as
+    // gcollapsed: gpa-owned dupes, cleared on exit. Passed to fromTimeline so a
+    // clamped body lays out in full once the reader taps "Read more".
+    var gexpanded: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (gexpanded.items) |c| gpa.free(c);
+        gexpanded.deinit(gpa);
+    }
 
     // The pointer's last position in LOGICAL coords (for the hover highlight),
     // updated on every motion event; <0 until the first move.
@@ -1287,23 +1313,46 @@ pub fn run(
         // touch the store. Contained failure (E2): the grid just stays as it was.
         const on_browse = mode == .timeline and gscreen == feed_view.screen_zones_browse;
         if (on_browse and !on_browse_prev) {
+            // The catalog the client can see NOW: derive it from the resident store
+            // so a zone whose posts are loaded lists IMMEDIATELY, independent of the
+            // AppView's `listTags` (ZONES inv. 4 — a zone catalog is a query, the
+            // same as its feed). This is why a zone reachable by tapping its hashtag
+            // must also appear here. The server's wider set merges on top.
+            for (zone_catalog.items) |zc| gpa.free(zc.tag);
+            zone_catalog.clearRetainingCapacity();
+            if (feed_core.listZonesLocal(arena, store) catch null) |local| {
+                for (local) |t| {
+                    const dup = gpa.dupe(u8, t.tag) catch continue;
+                    zone_catalog.append(gpa, .{ .tag = dup, .count = t.count }) catch gpa.free(dup);
+                }
+            }
+            // Merge the AppView's catalog: a server count is authoritative (it spans
+            // posts this client hasn't loaded), and a server-only zone is appended.
             const zo = feed_shell.loadZones(gpa, arena, io, environ, session, appview_url) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => blk: {
-                    status = "zones: network error"; // contained
+                    status = "zones: network error"; // contained — the local set still shows
                     break :blk null;
                 },
             };
             if (zo) |result| switch (result) {
                 .ok => |tags| {
-                    for (zone_catalog.items) |zc| gpa.free(zc.tag);
-                    zone_catalog.clearRetainingCapacity();
                     for (tags) |t| {
-                        const dup = try gpa.dupe(u8, t.tag);
-                        try zone_catalog.append(gpa, .{ .tag = dup, .count = t.count });
+                        var found = false;
+                        for (zone_catalog.items) |*zc| {
+                            if (std.ascii.eqlIgnoreCase(zc.tag, t.tag)) {
+                                zc.count = t.count;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) {
+                            const dup = gpa.dupe(u8, t.tag) catch continue;
+                            zone_catalog.append(gpa, .{ .tag = dup, .count = t.count }) catch gpa.free(dup);
+                        }
                     }
                 },
-                .failed => status = "zones: unavailable",
+                .failed => status = "zones: unavailable", // local set still shows
             };
         }
         on_browse_prev = on_browse;
@@ -1488,6 +1537,17 @@ pub fn run(
         }
         socket_was_open = gsocket_ui.open;
         prev_screen = gscreen;
+        // The feed-socket hit list is rebuilt every frame by layout()/
+        // layoutLoadout() (both clear it at entry). Zat Chat and the transparency
+        // reader are the two dispatch branches that render NEITHER, so without this
+        // they scan the previous screen's stale seats — the cursor, the GPU hover
+        // wash, and the click path all read g.socket_hits, which is why the
+        // Algorithms grid stayed lit behind the chat. Clear it on those screens
+        // (before the event pump) so they present no phantom socket targets. The
+        // reply/zone hit lists are already screen-gated to the loadout page, so
+        // only this list can leak across the switch.
+        if (gscreen == feed_view.screen_messages or gscreen == feed_view.screen_transparency)
+            gsocket_hits.clearRetainingCapacity();
         // pix exists exactly when a window backend has a live engine; the
         // composer and profile screens stay on the cell path this cut
         // (their pixel port is the recorded next slice).
@@ -1546,7 +1606,7 @@ pub fn run(
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .market = if (gscreen == feed_view.screen_loadout and gloadout_tab == 1) market_cards.items else &.{}, .create = .{ .step = gcreate_step, .answers = gcreate_answers, .config = gcreate_config, .name = gcreate_name_buf[0..gcreate_name_len], .color = gcreate_color, .naming = gcreate_step == .name, .prepare_t = create_prepare_t }, .bench = bench_tray, .inspect_bytes = inspect_bytes orelse "", .inspect_name = inspect_name, .inspect_ref = inspect_ref, .inspect_source = gtransp_source, .inspect_loading = inspect_loading, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .chat_store = if (dev_chat) &gchat_store else null, .chat_sel = gchat_sel, .chat_draft = gchat_draft_buf[0..gchat_draft_len], .chat_input_focus = gchat_input_focus, .chat_composing = gchat_composing, .chat_compose = gchat_peer_buf[0..gchat_peer_len], .chat_compose_status = gchat_compose_status, .chat_typing = gscreen == feed_view.screen_messages and now < gchat_typing_deadline and gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&gchat_store, gchat_sel.?), gchat_typing_peer_buf[0..gchat_typing_peer_len]), .chat_key_ns = gchat_key_ns, .chat_pay = .{ .open = gpay_open, .rail = gpay_rail, .amount = gpay_amount_buf[0..gpay_amount_len], .note = gpay_note_buf[0..gpay_note_len], .focus = gpay_focus, .status = gpay_status }, .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
+        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .market = if (gscreen == feed_view.screen_loadout and gloadout_tab == 1) market_cards.items else &.{}, .create = .{ .step = gcreate_step, .answers = gcreate_answers, .config = gcreate_config, .name = gcreate_name_buf[0..gcreate_name_len], .color = gcreate_color, .naming = gcreate_step == .name, .prepare_t = create_prepare_t }, .bench = bench_tray, .inspect_bytes = inspect_bytes orelse "", .inspect_name = inspect_name, .inspect_ref = inspect_ref, .inspect_source = gtransp_source, .inspect_loading = inspect_loading, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .chat_store = if (dev_chat) &gchat_store else null, .chat_sel = gchat_sel, .chat_draft = gchat_draft_buf[0..gchat_draft_len], .chat_input_focus = gchat_input_focus, .chat_composing = gchat_composing, .chat_compose = gchat_peer_buf[0..gchat_peer_len], .chat_compose_status = gchat_compose_status, .chat_typing = gscreen == feed_view.screen_messages and now < gchat_typing_deadline and gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&gchat_store, gchat_sel.?), gchat_typing_peer_buf[0..gchat_typing_peer_len]), .chat_key_ns = gchat_key_ns, .chat_pay = .{ .open = gpay_open, .rail = gpay_rail, .amount = gpay_amount_buf[0..gpay_amount_len], .note = gpay_note_buf[0..gpay_note_len], .focus = gpay_focus, .status = gpay_status }, .expanded = gexpanded.items, .repost_menu = if (grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
         switch (mode) {
             .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status),
             .compose => {
@@ -1560,7 +1620,7 @@ pub fn run(
                             const ctx: feed_view.ComposeContext = if (compose_kind == .profile)
                                 .profile
                             else if (reply_handle.len > 0) .reply else .post;
-                            paintComposeGpu(gpa, win, g, gs, ctx, reply_handle, textedit.view(&compose), compose.caret, textedit.selStart(&compose), textedit.selEnd(&compose), composeBlinkOn(caret_anchor_ns), status) catch {};
+                            paintComposeGpu(gpa, win, g, gs, ctx, reply_handle, quoting_handle, textedit.view(&compose), compose.caret, textedit.selStart(&compose), textedit.selEnd(&compose), composeBlinkOn(caret_anchor_ns), status, chain_segments.items) catch {};
                         } else {
                             // Software fallback: the glyph-field cell composer.
                             const cell = cellSize(win.fb.width, gzoom);
@@ -1623,28 +1683,66 @@ pub fn run(
         // temp cid to the server's (keep the post) or drop it on failure. The
         // write blocks briefly, but the post is already on screen — it FELT
         // instant. Network failure is contained (E2); only OOM is fatal.
-        if (pending_send) |job| {
+        if (pending_send) |chain| {
             pending_send = null;
-            defer freeSendJob(gpa, job);
-            const facets = write.resolveFacets(arena, io, environ, session, job.text) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => &[_]lexicon.Facet{}, // post without facets rather than fail
-            };
-            const posted = write.createPost(gpa, arena, io, environ, session, job.text, facets, job.target, now) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => blk: {
-                    feed_core.dropOptimisticPost(store, job.temp_cid);
-                    status = "send failed";
-                    break :blk null;
-                },
-            };
-            if (posted) |result| switch (result) {
-                .ok => |ref| feed_core.reconcileOptimisticPost(gpa, store, job.temp_cid, ref.cid, ref.uri) catch {},
-                .failed => |f| {
-                    feed_core.dropOptimisticPost(store, job.temp_cid);
-                    status = std.fmt.bufPrint(&status_buf, "send refused: {d} {s}", .{ f.status, f.code }) catch "refused";
-                },
-            };
+            defer freeChain(gpa, chain);
+            // Publish each segment in order, THREADING it to the one just created:
+            // the root is the base reply's root (a reply-chain) or segment 0's own
+            // created ref (a fresh thread); the parent is the previous segment. A
+            // segment's refusal/failure stops the chain and drops the remaining
+            // optimistic posts (E2 — contained; only OOM is fatal).
+            var chain_root: ?lexicon.RecordRef = null; // resolved after segment 0
+            var prev_ref: ?lexicon.RecordRef = null; // the previous segment's ref
+            var stopped = false;
+            for (chain.segments) |seg| {
+                if (stopped) {
+                    feed_core.dropOptimisticPost(store, seg.temp_cid);
+                    continue;
+                }
+                const facets = write.resolveFacets(arena, io, environ, session, seg.text) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => &[_]lexicon.Facet{}, // post without facets rather than fail
+                };
+                // This segment's reply target: segment 0 uses the external base;
+                // later segments reply to the previous segment under the resolved
+                // thread root.
+                const seg_target: ?write.ReplyTarget = if (prev_ref == null)
+                    chain.base_target
+                else .{
+                    .root_uri = chain_root.?.uri,
+                    .root_cid = chain_root.?.cid,
+                    .parent_uri = prev_ref.?.uri,
+                    .parent_cid = prev_ref.?.cid,
+                };
+                // The quote embed attaches to segment 0 only (prev_ref == null).
+                const seg_quote: ?lexicon.RecordRef = if (prev_ref == null) chain.base_quote else null;
+                const posted = write.createPost(gpa, arena, io, environ, session, seg.text, facets, seg_target, seg_quote, now) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => blk: {
+                        feed_core.dropOptimisticPost(store, seg.temp_cid);
+                        status = "send failed";
+                        stopped = true;
+                        break :blk null;
+                    },
+                };
+                if (posted) |result| switch (result) {
+                    .ok => |ref| {
+                        feed_core.reconcileOptimisticPost(gpa, store, seg.temp_cid, ref.cid, ref.uri) catch {};
+                        // The thread root: the base reply's root when replying out,
+                        // else segment 0's own created ref. Set once, on segment 0.
+                        if (chain_root == null) chain_root = if (chain.base_target) |bt|
+                            .{ .uri = bt.root_uri, .cid = bt.root_cid }
+                        else
+                            ref;
+                        prev_ref = ref;
+                    },
+                    .failed => |f| {
+                        feed_core.dropOptimisticPost(store, seg.temp_cid);
+                        status = std.fmt.bufPrint(&status_buf, "send refused: {d} {s}", .{ f.status, f.code }) catch "refused";
+                        stopped = true;
+                    },
+                };
+            }
         }
 
         // 0ms profile-name save: the name is already shown optimistically (and
@@ -1774,6 +1872,7 @@ pub fn run(
                         switch (pev.kind) {
                             .wheel => {
                                 if (g.gpu) |gs| gs.menu_open = false; // scrolling dismisses the menu
+                                grepost_menu = null; // …and the Repost/Quote popover
                                 const delta: i32 = if (pev.button == 5) 3 else -3;
                                 g.view.scroll_rows += delta;
                                 // The premium feed scrolls in PIXELS. Wheel down
@@ -2134,7 +2233,12 @@ pub fn run(
                                 if (armed_kind) |ak| {
                                     if (feed_view.hitTest(g.regions.items, rx, ry)) |hit| {
                                         if (hit.kind == ak and hit.post == armed_post) {
-                                            switch (hit.kind) {
+                                            // An open Repost/Quote menu is dismissed by any tap
+                                            // outside its rows (and the repost button that toggles
+                                            // it), and the tap is swallowed — the popover norm.
+                                            if (grepost_menu != null and hit.kind != .repost_do and hit.kind != .quote_new and hit.kind != .repost) {
+                                                grepost_menu = null;
+                                            } else switch (hit.kind) {
                                         // Left-rail destination: switch the active screen
                                         // (post carries the Screen index). Selecting Profile
                                         // targets YOUR own profile; the next frame re-renders.
@@ -2185,10 +2289,23 @@ pub fn run(
                                         // Works in ANY view: engageSelected is CID-keyed on
                                         // the one shared store, so a like from the profile
                                         // updates the same record Home shows (ZONES inv. 4).
-                                        .like, .repost => if (hit.post < view_items.len) {
+                                        .like => if (hit.post < view_items.len) {
                                             state.selected = hit.post;
-                                            const ek: Engagement = if (hit.kind == .like) .like else .repost;
-                                            const r = try engageSelected(ek, gpa, arena, session, store, view_items[hit.post], hit.post, gscreen, profile_target_did, thread_focus_cid, zone_tag, thread_rerooted, gcollapsed.items, feed_config, reply_config, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
+                                            const r = try engageSelected(.like, gpa, arena, session, store, view_items[hit.post], hit.post, gscreen, profile_target_did, thread_focus_cid, zone_tag, thread_rerooted, gcollapsed.items, feed_config, reply_config, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
+                                            if (r.status.len > 0) status = r.status;
+                                        },
+                                        // Repost button → OPEN the Repost/Quote menu for
+                                        // this post (a second tap closes it). The middle
+                                        // action doubles as repost + quote (the universal
+                                        // pattern); the choice is made in the menu below.
+                                        .repost => if (hit.post < view_items.len) {
+                                            grepost_menu = if (grepost_menu == @as(u16, @intCast(hit.post))) null else @intCast(hit.post);
+                                        },
+                                        // Menu "Repost" row → the optimistic repost toggle.
+                                        .repost_do => if (hit.post < view_items.len) {
+                                            grepost_menu = null;
+                                            state.selected = hit.post;
+                                            const r = try engageSelected(.repost, gpa, arena, session, store, view_items[hit.post], hit.post, gscreen, profile_target_did, thread_focus_cid, zone_tag, thread_rerooted, gcollapsed.items, feed_config, reply_config, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
                                             if (r.status.len > 0) status = r.status;
                                         },
                                         // Reply → open the premium composer in reply
@@ -2213,6 +2330,53 @@ pub fn run(
                                                 textedit.clear(&compose);
                                                 status = "";
                                                 mode = .compose;
+                                            }
+                                        },
+                                        // Quote → open the composer with the tapped post
+                                        // attached as the quote embed (attaches to the
+                                        // first segment on send). Refs copied into the
+                                        // compose arena (they outlive this frame).
+                                        .quote_new => if (hit.post < view_items.len) {
+                                            grepost_menu = null;
+                                            const item = view_items[hit.post];
+                                            if (item.uri.len > 0 and item.cid.len > 0) {
+                                                _ = compose_arena_state.reset(.retain_capacity);
+                                                const compose_arena = compose_arena_state.allocator();
+                                                quote_target = .{
+                                                    .uri = try compose_arena.dupe(u8, item.uri),
+                                                    .cid = try compose_arena.dupe(u8, item.cid),
+                                                };
+                                                quoting_handle = try compose_arena.dupe(u8, item.author_handle);
+                                                reply_target = null;
+                                                reply_handle = "";
+                                                compose_kind = .post;
+                                                textedit.clear(&compose);
+                                                status = "";
+                                                mode = .compose;
+                                            }
+                                        },
+                                        // Quote card tap → open the QUOTED post's thread
+                                        // (its uri/cid ride the quoting item, resolved from
+                                        // the store's quote_of edge). Mirrors .post_body.
+                                        .quote_open => if (hit.post < view_items.len) {
+                                            const item = view_items[hit.post];
+                                            if (item.quote_cid.len > 0 and item.quote_cid.len <= thread_focus_cid_buf.len and item.quote_uri.len <= thread_focus_uri_buf.len) {
+                                                @memcpy(thread_focus_cid_buf[0..item.quote_cid.len], item.quote_cid);
+                                                thread_focus_cid = thread_focus_cid_buf[0..item.quote_cid.len];
+                                                @memcpy(thread_focus_uri_buf[0..item.quote_uri.len], item.quote_uri);
+                                                thread_focus_uri = thread_focus_uri_buf[0..item.quote_uri.len];
+                                                const was_in_thread = gscreen == feed_view.screen_thread;
+                                                if (!was_in_thread) thread_return_screen = gscreen;
+                                                gscreen = feed_view.screen_thread;
+                                                thread_dirty = true;
+                                                thread_rerooted = was_in_thread;
+                                                g.scroll.* = 0;
+                                                if (g.gpu) |gs| {
+                                                    gs.scroll_to_focus = true;
+                                                    gs.sel_anchor = 0;
+                                                    gs.sel_focus = 0;
+                                                    gs.sel_dragging = false;
+                                                }
                                             }
                                         },
                                         // Post body tap → open this post's THREAD
@@ -2283,7 +2447,7 @@ pub fn run(
                                         // The composer's footer buttons never appear
                                         // on the timeline; they are handled in compose
                                         // mode below.
-                                        .compose_send, .compose_cancel => {},
+                                        .compose_send, .compose_cancel, .compose_add, .compose_remove => {},
                                         // Not wired yet — drawn for the fuller row /
                                         // profile tabs; their regions exist so hover
                                         // can highlight them and a later slice wires
@@ -2359,6 +2523,25 @@ pub fn run(
                                                 _ = gcollapsed.swapRemove(ix);
                                             } else if (gpa.dupe(u8, cid)) |d| {
                                                 gcollapsed.append(gpa, d) catch gpa.free(d);
+                                            } else |_| {}
+                                        },
+                                        // Main-feed Read-more: toggle this post's CID in the
+                                        // per-view expanded set (no network — fromTimeline stamps
+                                        // PostView.expanded next frame, and the height cache is
+                                        // invalidated because the expanded set feeds the content
+                                        // signature; ZONES inv. 4).
+                                        .expand => if (hit.post < view_items.len) {
+                                            const cid = view_items[hit.post].cid;
+                                            var found: ?usize = null;
+                                            for (gexpanded.items, 0..) |c, ix| if (std.mem.eql(u8, c, cid)) {
+                                                found = ix;
+                                                break;
+                                            };
+                                            if (found) |ix| {
+                                                gpa.free(gexpanded.items[ix]);
+                                                _ = gexpanded.swapRemove(ix);
+                                            } else if (gpa.dupe(u8, cid)) |d| {
+                                                gexpanded.append(gpa, d) catch gpa.free(d);
                                             } else |_| {}
                                         },
                                         .bookmark, .share, .more, .profile_tab => {},
@@ -2491,7 +2674,9 @@ pub fn run(
                                             if (hit._pad < tags.len) {
                                                 const t = tags[hit._pad];
                                                 if (t.len > 0 and t.len <= zone_tag_buf.len) {
-                                                    @memcpy(zone_tag_buf[0..t.len], t);
+                                                    // Zones are canonical lowercase (invariant 1):
+                                                    // fold the tapped tag so #Foo opens zone "foo".
+                                                    for (t, 0..) |c, i| zone_tag_buf[i] = std.ascii.toLower(c);
                                                     // Back returns to where we came FROM (don't
                                                     // overwrite it on a zone→zone hop).
                                                     if (gscreen != feed_view.screen_zones) zone_return_screen = gscreen;
@@ -2510,7 +2695,8 @@ pub fn run(
                                         .zone_open => if (hit.post < zone_catalog.items.len) {
                                             const t = zone_catalog.items[hit.post].tag;
                                             if (t.len > 0 and t.len <= zone_tag_buf.len) {
-                                                @memcpy(zone_tag_buf[0..t.len], t);
+                                                // Canonical lowercase zone name (invariant 1).
+                                                for (t, 0..) |c, i| zone_tag_buf[i] = std.ascii.toLower(c);
                                                 if (gscreen != feed_view.screen_zones) zone_return_screen = gscreen;
                                                 zone_tag = zone_tag_buf[0..t.len];
                                                 gscreen = feed_view.screen_zones;
@@ -2653,8 +2839,12 @@ pub fn run(
                                 if (pev.button != 1) continue;
                                 if (feed_view.hitTest(g.regions.items, rx, ry)) |hit| switch (hit.kind) {
                                     // Release-activation: arm the footer button; it fires
-                                    // on button_up if the release is still on it.
-                                    .compose_send, .compose_cancel => armed_compose = hit.kind,
+                                    // on button_up if the release is still on it. A
+                                    // segment's ✕ carries its index in `post`.
+                                    .compose_send, .compose_cancel, .compose_add, .compose_remove => {
+                                        armed_compose = hit.kind;
+                                        armed_post = hit.post;
+                                    },
                                     else => {},
                                 } else {
                                     // Press in the text area. Count consecutive
@@ -2701,6 +2891,23 @@ pub fn run(
                                         if (hit.kind == ac) switch (ac) {
                                             .compose_send => try pumped_bytes.append(gpa, 4), // ctrl-D
                                             .compose_cancel => try pumped_bytes.append(gpa, 3), // ctrl-C
+                                            // "Add": finalize the active draft as a thread
+                                            // segment and clear the box for the next post.
+                                            .compose_add => {
+                                                const active = textedit.view(&compose);
+                                                if (active.len > 0 and chain_segments.items.len < max_chain_segments - 1) {
+                                                    if (gpa.dupe(u8, active)) |d| {
+                                                        chain_segments.append(gpa, d) catch gpa.free(d);
+                                                        textedit.clear(&compose);
+                                                        caret_anchor_ns = clock_shell.monotonicNanos();
+                                                    } else |_| {}
+                                                }
+                                            },
+                                            // A segment's ✕: drop it, preserving order.
+                                            .compose_remove => if (armed_post < chain_segments.items.len) {
+                                                gpa.free(chain_segments.items[armed_post]);
+                                                _ = chain_segments.orderedRemove(armed_post);
+                                            },
                                             else => {},
                                         };
                                     }
@@ -2785,7 +2992,7 @@ pub fn run(
                     caret_anchor_ns = clock_shell.monotonicNanos();
                     continue;
                 };
-                try handleComposeInput(gpa, session, &status, &mode, store, &compose, &reply_target, &reply_handle, compose_kind, pix, &pending_send, &pending_profile_save, decoded.event, now);
+                try handleComposeInput(gpa, session, &status, &mode, store, &compose, &chain_segments, &reply_target, &reply_handle, &quote_target, compose_kind, pix, &pending_send, &pending_profile_save, decoded.event, now);
                 if (mode != .compose) compose_drag = false; // composer closed → end any drag
                 caret_anchor_ns = clock_shell.monotonicNanos(); // keystroke/move → solid caret
                 continue;
@@ -2972,7 +3179,20 @@ pub fn run(
                 }
             };
 
-            switch (timeline_ui.actionFor(decoded.event)) {
+            const kbd_action = timeline_ui.actionFor(decoded.event);
+            // Mouse-only in the window app: the keyboard SELECTION CURSOR
+            // (j/k/g/G/PgUp/PgDn) and the ENGAGE-THROUGH-SELECTED verbs
+            // (l/b/R/f/p/x) are obsolete here. They drove `state.selected`, an
+            // invisible cursor the mouse never tracks — feed_view draws no gutter,
+            // only the terminal card renderer does — so a keystroke engaged a
+            // possibly off-screen post: the stale-cursor glitch. The pure-terminal
+            // TUI keeps every key; the window swallows just these. Mouse taps
+            // engage via the pointer dispatch above (hit.post), untouched.
+            if (backend == .window) switch (kbd_action) {
+                .move_up, .move_down, .page_up, .page_down, .go_top, .go_bottom, .like, .repost, .reply, .follow, .profile, .toggle_reveal => continue,
+                else => {},
+            };
+            switch (kbd_action) {
                 .quit => break :main_loop,
                 .refresh => {
                     status = "refreshing...";
@@ -3243,10 +3463,28 @@ fn handleProfileInput(
 /// real one (or drops the post on failure). Owns its strings (gpa) — they
 /// outlive the cleared compose draft. One in flight at a time.
 /// A7.2: cold struct, size guard waived — at most one in flight, transient.
+// One post in a queued chain: its optimistic temp cid and its text. The
+// inter-segment reply refs are NOT stored — they depend on each createPost's
+// real result, so the drain threads them as it goes (seg i replies to seg i-1).
 const SendJob = struct {
     temp_cid: []const u8,
     text: []const u8,
-    target: ?write.ReplyTarget,
+};
+
+// The most posts one thread composer can queue at once (active box + finalized
+// segments). A soft ceiling — a chain longer than this is almost never intended.
+const max_chain_segments: usize = 25;
+
+// A queued publish: one or more segments in thread order. `base_target` is what
+// segment 0 replies to (a reply-chain), or null for a fresh thread. A single
+// post is a one-segment chain with the whole feature collapsing to the old path.
+// A7.2: cold struct, size guard waived — at most one in flight per compose.
+const ChainSend = struct {
+    segments: []SendJob,
+    base_target: ?write.ReplyTarget,
+    /// The quoted post's strong ref when segment 0 is a quote-post; null else.
+    /// gpa-owned (dupe'd on send), freed in freeChain.
+    base_quote: ?lexicon.RecordRef = null,
 };
 
 fn dupeTarget(gpa: Allocator, t: ?write.ReplyTarget) !?write.ReplyTarget {
@@ -3259,14 +3497,24 @@ fn dupeTarget(gpa: Allocator, t: ?write.ReplyTarget) !?write.ReplyTarget {
     };
 }
 
-fn freeSendJob(gpa: Allocator, job: SendJob) void {
-    gpa.free(job.temp_cid);
-    if (job.text.len > 0) gpa.free(job.text);
-    if (job.target) |t| {
-        gpa.free(t.root_uri);
-        gpa.free(t.root_cid);
-        gpa.free(t.parent_uri);
-        gpa.free(t.parent_cid);
+fn freeTarget(gpa: Allocator, t: ?write.ReplyTarget) void {
+    const tt = t orelse return;
+    gpa.free(tt.root_uri);
+    gpa.free(tt.root_cid);
+    gpa.free(tt.parent_uri);
+    gpa.free(tt.parent_cid);
+}
+
+fn freeChain(gpa: Allocator, cs: ChainSend) void {
+    for (cs.segments) |seg| {
+        gpa.free(seg.temp_cid);
+        if (seg.text.len > 0) gpa.free(seg.text);
+    }
+    gpa.free(cs.segments);
+    freeTarget(gpa, cs.base_target);
+    if (cs.base_quote) |q| {
+        gpa.free(q.uri);
+        gpa.free(q.cid);
     }
 }
 
@@ -3282,14 +3530,20 @@ fn handleComposeInput(
     /// INSTANTLY (the 5s refresh would otherwise gate it).
     store: *feed_core.Store,
     compose: *textedit.Field,
+    /// The finalized thread segments above the active box (empty for a lone post).
+    /// On send they publish before the active box, all as one self-reply chain.
+    chain_segments: *std.ArrayList([]const u8),
     reply_target: *?write.ReplyTarget,
     reply_handle: *[]const u8,
+    /// The quoted post's strong ref when composing a quote-post; null otherwise.
+    /// Cleared on send/cancel like reply_target. Attaches to the first segment.
+    quote_target: *?lexicon.RecordRef,
     compose_kind: ComposeKind,
     /// The live render grid (for the post-send scroll-to-top).
     pix: ?Grid,
-    /// Set by a post/reply send: the queued create-write the loop performs AFTER
-    /// the optimistic post is on screen (0ms). Null when nothing is queued.
-    pending_send: *?SendJob,
+    /// Set by a post/reply send: the queued create-write(s) the loop performs
+    /// AFTER the optimistic posts are on screen (0ms). Null when nothing queued.
+    pending_send: *?ChainSend,
     /// Set by a profile-edit save: the display name to putProfile, run by the
     /// loop after the name is optimistically shown. gpa-owned; null when idle.
     pending_profile_save: *?[]const u8,
@@ -3298,6 +3552,11 @@ fn handleComposeInput(
 ) !void {
     switch (timeline_ui.actionForCompose(ev)) {
         .cancel => {
+            // Drop any finalized thread segments so they don't leak or bleed into
+            // the next compose session (C5).
+            for (chain_segments.items) |s| gpa.free(s);
+            chain_segments.clearRetainingCapacity();
+            quote_target.* = null;
             mode.* = .timeline;
             status.* = "cancelled";
         },
@@ -3317,53 +3576,97 @@ fn handleComposeInput(
             }
         },
         .send => {
-            if (compose.len == 0) {
-                status.* = if (compose_kind == .profile) "name can't be empty" else "nothing to post";
-                return;
-            }
+            const active = textedit.view(compose);
             // Profile editor: upsert the self profile record, then return to the
             // profile screen (mode→timeline re-enters it and re-fetches, so the
             // new name shows once the AppView re-polls the record).
             if (compose_kind == .profile) {
+                if (active.len == 0) {
+                    status.* = "name can't be empty";
+                    return;
+                }
                 // 0ms: set the display name locally NOW (guarded against a stale
                 // refresh), close to the profile, and queue the putProfile write
                 // for the loop to run after — the new name shows instantly.
-                feed_core.setOwnDisplayName(gpa, store, session.did, textedit.view(compose)) catch {};
-                pending_profile_save.* = gpa.dupe(u8, textedit.view(compose)) catch null;
+                feed_core.setOwnDisplayName(gpa, store, session.did, active) catch {};
+                pending_profile_save.* = gpa.dupe(u8, active) catch null;
                 textedit.clear(compose);
                 mode.* = .timeline;
                 status.* = "name updated";
                 return;
             }
-            // TRULY 0ms: seat the post in the store under a TEMPORARY cid and
-            // return to the feed immediately — it renders THIS frame. The actual
-            // create write is queued (`pending_send`) and run by the loop AFTER
-            // the optimistic post is on screen; it then reconciles the temp cid
-            // to the server's real one, or drops the post on failure. The temp
-            // cid is unique: `posts.len` only grows.
-            const target = reply_target.*;
-            const temp_cid = try std.fmt.allocPrint(gpa, "pending:{d}", .{store.posts.len});
-            _ = feed_core.ingestLivePost(gpa, store, .{
-                .did = session.did,
-                .handle = session.handle,
-                .uri = "",
-                .cid = temp_cid,
-                .text = textedit.view(compose),
-                .reply_parent_cid = if (target) |t| t.parent_cid else "",
-                .reply_root_cid = if (target) |t| t.root_cid else "",
-                .created_at = now,
-            }) catch {};
-            if (target) |t| feed_core.bumpReplyCount(store, t.parent_cid);
-            pending_send.* = .{
-                .temp_cid = temp_cid,
-                .text = try gpa.dupe(u8, textedit.view(compose)),
-                .target = try dupeTarget(gpa, target),
-            };
+            // The ordered segment texts: the finalized chain, then the active box
+            // if it still holds anything. A lone post is a chain of one.
+            const total = chain_segments.items.len + @as(usize, if (active.len > 0) 1 else 0);
+            if (total == 0) {
+                status.* = "nothing to post";
+                return;
+            }
+            const base = reply_target.*;
+            const quote = quote_target.*; // attaches to segment 0 only
+            // TRULY 0ms: seat every segment in the store under TEMPORARY cids,
+            // threaded to each other so they render as a stitched self-thread THIS
+            // frame; the create writes are queued (`pending_send`) and run by the
+            // loop after, reconciling each temp cid to the server's real one. The
+            // temp cids are unique: `posts.len` only grows as we ingest.
+            var segs = try gpa.alloc(SendJob, total);
+            var filled: usize = 0;
+            errdefer {
+                for (segs[0..filled]) |s| {
+                    gpa.free(s.temp_cid);
+                    if (s.text.len > 0) gpa.free(s.text);
+                }
+                gpa.free(segs);
+            }
+            var prev_temp: []const u8 = ""; // previous segment's temp cid → next parent
+            var root_temp: []const u8 = ""; // first segment's temp cid → the thread root
+            var i: usize = 0;
+            while (i < total) : (i += 1) {
+                const seg_text = if (i < chain_segments.items.len)
+                    chain_segments.items[i]
+                else
+                    active;
+                const temp_cid = try std.fmt.allocPrint(gpa, "pending:{d}", .{store.posts.len});
+                // Segment 0 replies to the external base (or nothing); later
+                // segments reply to the previous segment, rooted at the base's
+                // root when replying, else at segment 0.
+                const parent_cid = if (i == 0) (if (base) |b| b.parent_cid else "") else prev_temp;
+                const root_cid = if (i == 0)
+                    (if (base) |b| b.root_cid else "")
+                else
+                    (if (base) |b| b.root_cid else root_temp);
+                _ = feed_core.ingestLivePost(gpa, store, .{
+                    .did = session.did,
+                    .handle = session.handle,
+                    .uri = "",
+                    .cid = temp_cid,
+                    .text = seg_text,
+                    .reply_parent_cid = parent_cid,
+                    .reply_root_cid = root_cid,
+                    .quote_of_cid = if (i == 0) (if (quote) |q| q.cid else "") else "",
+                    .created_at = now + @as(i64, @intCast(i)), // keep chain order stable
+                }) catch {};
+                segs[i] = .{ .temp_cid = temp_cid, .text = try gpa.dupe(u8, seg_text) };
+                filled = i + 1;
+                if (i == 0) root_temp = temp_cid;
+                prev_temp = temp_cid;
+            }
+            if (base) |t| feed_core.bumpReplyCount(store, t.parent_cid); // only seg 0 replies out
+            const base_quote: ?lexicon.RecordRef = if (quote) |q|
+                .{ .uri = try gpa.dupe(u8, q.uri), .cid = try gpa.dupe(u8, q.cid) }
+            else
+                null;
+            pending_send.* = .{ .segments = segs, .base_target = try dupeTarget(gpa, base), .base_quote = base_quote };
+            // Ownership of the queued texts now rides `segs`; release the finalized
+            // drafts and reset the composer.
+            for (chain_segments.items) |s| gpa.free(s);
+            chain_segments.clearRetainingCapacity();
             textedit.clear(compose);
             reply_target.* = null;
             reply_handle.* = "";
+            quote_target.* = null;
             mode.* = .timeline;
-            if (pix) |g| g.scroll.* = 0; // jump to top so you see your post land
+            if (pix) |g| g.scroll.* = 0; // jump to top so you see your posts land
             status.* = "";
         },
         .none => {},
@@ -4363,6 +4666,11 @@ const Grid = struct {
     chat_key_ns: u64 = 0,
     /// The pay sheet's frame state (M5 A4) — closed by default.
     chat_pay: feed_view.ChatPaySheet = .{},
+    /// The reader's expanded posts (main-feed Read-more): CIDs stamped onto
+    /// PostView.expanded by fromTimeline so a clamped body lays out in full.
+    expanded: []const []const u8 = &.{},
+    /// The VIEW index of the post whose Repost/Quote menu is open, or null.
+    repost_menu: ?usize = null,
     field_gain: f32 = 0.9,
     /// Toy Box "Julia mode" active — the field renderer pinks its glyph ink.
     julia: bool = false,
@@ -5098,7 +5406,7 @@ fn paintFrame(
             // row, dividers) painted OVER the field as proportional items, fed
             // by the REAL timeline via a pure transform (B5). An empty timeline
             // renders the chrome with no posts — no placeholder content.
-            const feed_posts = feed_view.fromTimeline(arena, view_items, now) catch &[_]feed_view.PostView{};
+            const feed_posts = feed_view.fromTimeline(arena, view_items, now, g.expanded) catch &[_]feed_view.PostView{};
             if (g.chat_store != null and g.screen.* == feed_view.screen_messages) {
                 // Zat Chat (U3, dev-gated): the Messages surface. -scroll maps the
                 // shared ≤0 scroll state onto layoutChat's positive history offset.
@@ -5126,7 +5434,7 @@ fn paintFrame(
                 // seam. Slice 1 hands back the screen's own geometry (identical
                 // render); the animated morph springs this between screens.
                 const sw_geom = feed_view.paneGeomFor(@intCast(win.fb.width), g.screen.*);
-                g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, null, null, g.zone_title, g.zones, sw_geom, g.settings_section, g.settings_toggles, g.settings_account, g.settings_choices, g.settings_picking) catch g.content_h.*;
+                g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, null, null, g.zone_title, g.zones, sw_geom, g.settings_section, g.settings_toggles, g.settings_account, g.settings_choices, g.settings_picking, g.repost_menu) catch g.content_h.*;
             }
             const t_layout = if (debug_frame_timing) clock_shell.monotonicNanos() else 0;
             window_shell.presentDrawList(win, gpa, g.engine, g.draw.slice(), field_core.background) catch {}; // E2: a lost blit is the next frame's problem
@@ -5276,12 +5584,15 @@ fn paintComposeGpu(
     gs: *GpuState,
     ctx: feed_view.ComposeContext,
     reply_handle: []const u8,
+    quoting: []const u8,
     draft: []const u8,
     caret: usize,
     sel_start: usize,
     sel_end: usize,
     blink_on: bool,
     status: []const u8,
+    /// Finalized thread segments above the active box (empty for a lone post).
+    segments: []const []const u8,
 ) !void {
     const w: u32 = win.fb.width;
     const h: u32 = win.fb.height;
@@ -5297,7 +5608,7 @@ fn paintComposeGpu(
     // the feed lays out — so the emitted button regions map back through gs.scale.
     const lh = logicalH(w, h);
     g.draw.len = 0;
-    feed_view.layoutCompose(gpa, g.engine, @intCast(design_w), @intCast(lh), g.accent, ctx, reply_handle, draft, caret, sel_start, sel_end, blink_on, status, g.draw, g.regions) catch {};
+    feed_view.layoutCompose(gpa, g.engine, @intCast(design_w), @intCast(lh), g.accent, ctx, reply_handle, quoting, draft, caret, sel_start, sel_end, blink_on, status, segments, g.draw, g.regions) catch {};
     if (g.julia) feed_view.juliaRemapText(g.draw); // light theme: dark text
     gpu.feedBuild(&gs.feed, gpa, g.engine, g.draw.slice(), scale) catch {};
     gs.feed_sig = 0; // force a timeline rebuild when the composer closes
@@ -5537,19 +5848,34 @@ fn paintFrameGpu(
             gs.chat_typing_t > 0.01 or g.chat_typing or
             g.chat_input_focus or g.chat_composing or g.chat_pay.open;
     };
-    const sig = feedSignature(items, g.scroll.*, w, h) ^ (@as(u64, g.screen.*) *% 0x9E37_79B9_7F4A_7C15) ^ (socket_sig *% 0xD1B5_4A32_D192_ED03) ^ (@as(u64, g.settings_section) *% 0xC2B2_AE3D_27D4_EB4F) ^ (g.settings_toggles *% 0x9E6C_63D0_676A_9A99) ^ (g.settings_choices *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, g.settings_picking) *% 0x8A91_7F2B_4D3E_61C7) ^ (@as(u64, @intFromBool(g.inspect_source)) *% 0xF29C_511C_8E3D_45A7) ^ (@as(u64, @intFromBool(g.inspect_loading)) *% 0xBF58_476D_1CE4_E5B9) ^ chat_sig;
+    // Read-more expanded set → a set hash (XOR of each CID's FNV, order-free). It
+    // rides BOTH the frame signature (so a Read-more tap forces a rebuild — the
+    // tap changes PostView.expanded, not `items`, so nothing else would) and the
+    // content signature below (so the height cache re-measures clamped/full).
+    var exp_sig: u64 = 0;
+    for (g.expanded) |c| {
+        var eh: u64 = 1469598103934665603;
+        for (c) |b| {
+            eh ^= b;
+            eh *%= 1099511628211;
+        }
+        exp_sig ^= eh;
+    }
+    const sig = feedSignature(items, g.scroll.*, w, h) ^ (@as(u64, g.screen.*) *% 0x9E37_79B9_7F4A_7C15) ^ (socket_sig *% 0xD1B5_4A32_D192_ED03) ^ (@as(u64, g.settings_section) *% 0xC2B2_AE3D_27D4_EB4F) ^ (g.settings_toggles *% 0x9E6C_63D0_676A_9A99) ^ (g.settings_choices *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, g.settings_picking) *% 0x8A91_7F2B_4D3E_61C7) ^ (@as(u64, @intFromBool(g.inspect_source)) *% 0xF29C_511C_8E3D_45A7) ^ (@as(u64, @intFromBool(g.inspect_loading)) *% 0xBF58_476D_1CE4_E5B9) ^ chat_sig ^ (exp_sig *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, if (g.repost_menu) |m| m + 1 else 0) *% 0xA0761D6478BD642F);
     // A drag/settle animates the socket every frame (lift, reflow, ghost), so
     // bypass the feed cache while it runs — a brief interaction, and the field
     // already rebuilds every frame anyway.
     if (sig != gs.feed_sig or gs.feed.verts.items.len == 0 or g.socket_ui.drag_active != null or search_animating or zones_animating or rail_hover_animating or algo_animating or chat_animating or g.screen.* == feed_view.screen_loadout or g.frametiming_on) {
         gs.feed_sig = sig;
         // An empty timeline renders the chrome with no posts (no placeholders).
-        const feed_posts = feed_view.fromTimeline(arena, items, now) catch &[_]feed_view.PostView{};
+        const feed_posts = feed_view.fromTimeline(arena, items, now, g.expanded) catch &[_]feed_view.PostView{};
         // Per-post height cache: post heights are scroll-invariant, so only
         // reset the cache when the CONTENT or WIDTH changed (scroll/height
         // zeroed in this signature). A pure scroll then reuses every post's
         // measured height and skips the text-shaping pass — the scroll-lag fix.
-        const content_sig = feedSignature(items, 0, w, 0);
+        // The expanded set also rides the content signature (exp_sig computed
+        // above), so toggling a post's expansion re-measures it clamped/full.
+        const content_sig = feedSignature(items, 0, w, 0) ^ (exp_sig *% 0x100000001b3);
         if (content_sig != gs.feed_content_sig or gs.heights.len != feed_posts.len) {
             gs.feed_content_sig = content_sig;
             if (gs.heights.len != feed_posts.len) {
@@ -5650,7 +5976,7 @@ fn paintFrameGpu(
             }
             gs.content_x = gp_geom.col_x; // for the field panel-softening (tracks the live content)
             gs.content_w = gp_geom.col_w;
-            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, &chain_info, &gs.sel_glyphs, g.zone_title, g.zones, gp_geom, g.settings_section, g.settings_toggles, g.settings_account, g.settings_choices, g.settings_picking) catch g.content_h.*;
+            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, &chain_info, &gs.sel_glyphs, g.zone_title, g.zones, gp_geom, g.settings_section, g.settings_toggles, g.settings_account, g.settings_choices, g.settings_picking, g.repost_menu) catch g.content_h.*;
         }
         if (g.julia) feed_view.juliaRemapText(g.draw); // light theme: dark text
         // "Show frame timing": ride the fps/ms badge on the feed buffer. The gate
@@ -5851,7 +6177,7 @@ fn drawHoverOverlay(gpa: Allocator, g: Grid, gs: *GpuState, scale: f32, vw: i32,
             switch (r.kind) {
                 .post_body => wash = r,
                 .tag_inline => {}, // an inline hashtag underlines in drawSocketHoverTop (on TOP of the feed); the post wash here still fires via .post_body
-                .compose_send, .compose_cancel => {},
+                .compose_send, .compose_cancel, .compose_add, .compose_remove => {},
                 else => button = r, // engagement, avatar, nav, tabs, edit, pill, back…
             }
         }

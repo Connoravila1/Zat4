@@ -62,6 +62,7 @@ pub const LivePost = struct {
     text: []const u8,
     reply_parent_cid: []const u8, // "" when not a reply
     reply_root_cid: []const u8, // "" when not a reply
+    quote_of_cid: []const u8, // "" when not a quote-post
     /// The post's zone tags ('#' stripped), extracted from the record's `#tag`
     /// facets. Empty when none. The doorway data that routes a post into its
     /// zones at ingest. Borrows the reduction arena, like the slices above.
@@ -70,12 +71,12 @@ pub const LivePost = struct {
     time_us: i64, // the stream cursor: resume-from on reconnect
 
     comptime {
-        // Budget: 7 slices + 2 i64 = 128 on 64-bit, zero padding. A7.1: raised
-        // from 112 to carry `tags` — Zat Zones routes a post into its zones from
-        // these. One added slice; LivePost is transient (one reduced per event,
-        // consumed and copied into the pooled `Post` immediately, never bulk-
-        // resident), so the cost is a single live instance, not a resident array.
-        if (@sizeOf(usize) == 8) assert(@sizeOf(LivePost) == 128);
+        // Budget: 8 slices + 2 i64 = 144 on 64-bit, zero padding. A7.1 (raise
+        // 128 → 144): `quote_of_cid` carries the quoted post's cid so the AppView
+        // records the quote edge at ingest — one added slice. LivePost is transient
+        // (one reduced per event, copied into the pooled `Post` immediately, never
+        // bulk-resident), so the cost is a single live instance.
+        if (@sizeOf(usize) == 8) assert(@sizeOf(LivePost) == 144);
     }
 };
 
@@ -106,6 +107,9 @@ pub fn reduce(arena: Allocator, event_json: []const u8) error{OutOfMemory}!?Live
         parent_cid = reply.parent.cid;
         root_cid = reply.root.cid;
     }
+    // A quote-post's embed carries the quoted record's cid (empty for other
+    // embed types / no embed) — the AppView records the quote edge from it.
+    const quote_of_cid: []const u8 = if (record.embed) |em| em.record.cid else "";
     return .{
         .did = event.did,
         .uri = uri,
@@ -113,6 +117,7 @@ pub fn reduce(arena: Allocator, event_json: []const u8) error{OutOfMemory}!?Live
         .text = record.text,
         .reply_parent_cid = parent_cid,
         .reply_root_cid = root_cid,
+        .quote_of_cid = quote_of_cid,
         .tags = try lexicon.collectTags(arena, record.facets),
         .created_at = feed.parseTimestamp(record.createdAt) catch 0,
         .time_us = event.time_us,

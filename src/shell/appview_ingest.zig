@@ -69,6 +69,7 @@ pub fn ingestEvent(gpa: Allocator, arena: Allocator, idx: *appview.Index, event_
             .created_at = p.created_at,
             .reply_parent_cid = p.reply_parent_cid,
             .reply_root_cid = p.reply_root_cid,
+            .quote_of_cid = p.quote_of_cid,
             .tags = p.tags, // zone routing (the reducer pulled these from facets)
         });
         return .post;

@@ -317,6 +317,9 @@ fn feedViewPostFor(arena: Allocator, r: appview.TimelineRow) RouteError!lexicon.
         .parent = if (r.reply_parent) |pt| try replyPostView(arena, pt) else .{},
         .root = if (r.reply_root) |rt| try replyPostView(arena, rt) else .{},
     } else null;
+    // The quote embed (when this post quotes another): the hydrated quoted post,
+    // so the client renders the quote card and can intern it.
+    const embed: ?lexicon.EmbedView = if (r.quote) |q| .{ .record = try quotedView(arena, q) } else null;
     return .{
         .post = .{
             .uri = uri,
@@ -330,7 +333,8 @@ fn feedViewPostFor(arena: Allocator, r: appview.TimelineRow) RouteError!lexicon.
             .likeCount = r.like_count,
             .repostCount = r.repost_count,
             .replyCount = r.reply_count,
-            .quoteCount = 0,
+            .quoteCount = r.quote_count,
+            .embed = embed,
             .indexedAt = "",
             // viewer.like: the viewer's own like record uri — the client shows
             // the filled heart from it on reload AND deletes it to unlike.
@@ -370,6 +374,27 @@ fn replyPostView(arena: Allocator, t: appview.ReplyTargetRow) RouteError!lexicon
             .displayName = if (t.author_display_name.len > 0) t.author_display_name else null,
         },
         .record = .{ .text = t.text, .createdAt = "" },
+    };
+}
+
+/// The hydrated quoted post for a quote-post's `embed.record#view` — built from
+/// the same reply-target row shape (cid + author + text), with a synthesized uri.
+fn quotedView(arena: Allocator, q: appview.ReplyTargetRow) RouteError!lexicon.QuotedView {
+    var uri: []const u8 = "";
+    if (q.author_did.len > 0 and q.cid.len > 0) {
+        const buf = try arena.alloc(u8, q.author_did.len + q.cid.len + 64);
+        uri = std.fmt.bufPrint(buf, "at://{s}/{s}/{s}", .{ q.author_did, lexicon.collection.post, q.cid }) catch q.cid;
+    }
+    return .{
+        .uri = uri,
+        .cid = q.cid,
+        .author = .{
+            .did = q.author_did,
+            .handle = if (q.author_handle.len > 0) q.author_handle else q.author_did,
+            .displayName = if (q.author_display_name.len > 0) q.author_display_name else null,
+        },
+        .text = q.text,
+        .createdAt = "",
     };
 }
 
@@ -562,7 +587,7 @@ test "route: listTags returns the zone catalog with post counts" {
     const json = try route(arena, &idx, .{}, "/xrpc/app.zat4.feed.listTags");
     const page = try std.json.parseFromSliceLeaky(lexicon.TagsPage, arena, json, .{ .ignore_unknown_fields = true });
     try testing.expectEqual(@as(usize, 2), page.tags.len);
-    try testing.expectEqualStrings("Water", page.tags[0].tag); // first-seen casing
+    try testing.expectEqualStrings("water", page.tags[0].tag); // canonical lowercase (#Water → water)
     try testing.expectEqual(@as(usize, 2), page.tags[0].count);
     try testing.expectEqualStrings("rivers", page.tags[1].tag);
     try testing.expectEqual(@as(usize, 1), page.tags[1].count);

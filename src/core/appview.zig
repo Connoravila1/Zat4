@@ -169,6 +169,11 @@ pub const Index = struct {
     /// id (internStr dedups) — the reverse lookup is exact.
     reply_parent: std.ArrayList(StrId) = .empty,
     reply_root: std.ArrayList(StrId) = .empty,
+    /// Per-post QUOTE linkage, OUT OF BAND (A6), parallel to `posts`: the interned
+    /// cid id of the post this row QUOTES, or `no_str`. A post's quote_count is a
+    /// scan over this array (like reply_count over reply_parent); serving hydrates
+    /// the quoted post from its own row via `hydrateReplyTarget`.
+    quote_of: std.ArrayList(StrId) = .empty,
 
     /// REPOSTS whose subject post is not indexed YET (out-of-order ingest, e.g.
     /// across repos). Keyed by the subject's cid; `indexPost` drains these into
@@ -199,14 +204,15 @@ pub const Index = struct {
     // --- Zat Zones: the tag index (A6, all OUT OF BAND — the hot `Post` stays
     // 32 bytes). A zone is not a stored container; it is these derived indexes
     // over the post array. Normalized tag (case-folded + trimmed) is the key
-    // (invariant 1); the first-seen display casing is shown.
+    // (invariant 1); zones are canonical lowercase, so the key IS what is shown.
 
     /// Normalized-tag id → the rows of every post bearing it: the zone's
     /// candidate pool, in ingest order. A `getPostsForTag` is a scan of this
     /// list (materialized reverse-chron). Each list is owned and freed in deinit.
     tag_posts: std.AutoHashMapUnmanaged(StrId, std.ArrayListUnmanaged(u32)) = .empty,
-    /// Normalized-tag id → first-seen DISPLAY-form id (both interned). Its key
-    /// set IS the set of known zones; the value is what the catalog shows.
+    /// Normalized-tag id → its display-form id. Zones are canonical lowercase,
+    /// so the value is the normalized key itself. Its key set IS the set of
+    /// known zones; the value is what the catalog shows.
     tag_display: std.AutoHashMapUnmanaged(StrId, StrId) = .empty,
     /// Normalized-tag ids in first-seen order — a stable catalog ordering for
     /// `listTags` (manifest-state / ranking are later phases).
@@ -233,6 +239,7 @@ pub fn deinit(gpa: Allocator, idx: *Index) void {
     idx.post_by_cid.deinit(gpa);
     idx.reply_parent.deinit(gpa);
     idx.reply_root.deinit(gpa);
+    idx.quote_of.deinit(gpa);
     idx.pending_reposts.deinit(gpa);
     idx.like_edges.deinit(gpa);
     idx.handles.deinit(gpa);
@@ -288,6 +295,9 @@ pub const PostInput = struct {
     /// thread root. "" when the post is not a reply. Indexed out of band (A6).
     reply_parent_cid: []const u8 = "",
     reply_root_cid: []const u8 = "",
+    /// The cid of the post this one QUOTES (from the record's embed), or "" when
+    /// it is not a quote-post. Indexed out of band (A6), like the reply refs.
+    quote_of_cid: []const u8 = "",
     /// The post's zone tags ('#' stripped), as the shell extracted them from the
     /// record's facets (`lexicon.collectTags`). Plain values only (D3 — the wire
     /// facet type never reaches this core). Empty ⇒ untagged.
@@ -326,6 +336,7 @@ pub fn indexPost(gpa: Allocator, idx: *Index, in: PostInput) Allocator.Error!boo
     // when this isn't a reply) so they share the parent post's own cid id.
     const reply_parent_id: StrId = if (in.reply_parent_cid.len > 0) try internStr(gpa, idx, in.reply_parent_cid) else no_str;
     const reply_root_id: StrId = if (in.reply_root_cid.len > 0) try internStr(gpa, idx, in.reply_root_cid) else no_str;
+    const quote_of_id: StrId = if (in.quote_of_cid.len > 0) try internStr(gpa, idx, in.quote_of_cid) else no_str;
 
     const row: u32 = @intCast(idx.posts.len);
     // Out-of-order ingest. Reposts were held PENDING against this cid (drained
@@ -346,9 +357,10 @@ pub fn indexPost(gpa: Allocator, idx: *Index, in: PostInput) Allocator.Error!boo
     // sole appender of `posts`).
     try idx.reply_parent.append(gpa, reply_parent_id);
     try idx.reply_root.append(gpa, reply_root_id);
+    try idx.quote_of.append(gpa, quote_of_id);
 
     // Zone tag index (A6, out of band). For each distinct tag this post bears:
-    // register the zone (normalized key, first-seen display casing — invariant
+    // register the zone (normalized key, canonical lowercase display — invariant
     // 1), add this row to the zone's candidate pool, and record the display id
     // in this row's tray list. Deduped within the post so "#water #Water" is one
     // zone membership and one tray entry.
@@ -372,10 +384,11 @@ pub fn indexPost(gpa: Allocator, idx: *Index, in: PostInput) Allocator.Error!boo
         seen[seen_n] = norm_id;
         seen_n += 1;
 
-        const display_id = try internStr(gpa, idx, raw_tag);
         const dgop = try idx.tag_display.getOrPut(gpa, norm_id);
         if (!dgop.found_existing) {
-            dgop.value_ptr.* = display_id; // first-seen casing wins
+            // Zones are canonical lowercase (invariant 1): the display name IS the
+            // normalized key, so #Foo and #foo present one zone named "foo".
+            dgop.value_ptr.* = norm_id;
             try idx.tag_order.append(gpa, norm_id);
         }
         const pgop = try idx.tag_posts.getOrPut(gpa, norm_id);
@@ -649,6 +662,11 @@ pub const TimelineRow = struct {
     /// from the index. null ⇒ not a reply.
     reply_parent: ?ReplyTargetRow = null,
     reply_root: ?ReplyTargetRow = null,
+    /// How many indexed posts QUOTE this one (derived from the quote_of edges).
+    quote_count: u32 = 0,
+    /// When this post is a quote-post: the quoted post, hydrated from the index
+    /// (reusing the reply-target shape — cid + author + text). null ⇒ not a quote.
+    quote: ?ReplyTargetRow = null,
     /// The post's zone tags (display casing) — its tray. Built into the request
     /// arena by `fillRow`. Empty ⇒ untagged.
     tags: []const []const u8 = &.{},
@@ -844,7 +862,9 @@ fn materializeRows(
 
     var reply_counts = try buildReplyCounts(arena, idx);
     defer reply_counts.deinit(arena);
-    for (out, rows[0..n]) |*o, row| o.* = try fillRow(arena, idx, viewer_id, row, &reply_counts);
+    var quote_counts = try buildQuoteCounts(arena, idx);
+    defer quote_counts.deinit(arena);
+    for (out, rows[0..n]) |*o, row| o.* = try fillRow(arena, idx, viewer_id, row, &reply_counts, &quote_counts);
     return out;
 }
 
@@ -862,10 +882,23 @@ fn buildReplyCounts(arena: Allocator, idx: *const Index) Allocator.Error!std.Aut
     return reply_counts;
 }
 
+/// Quote tally: quoted cid id ⇒ number of posts quoting it. One pass over the
+/// quote_of edges (O(posts)), keyed by the quoted post's own cid id — the exact
+/// mirror of `buildReplyCounts`. Caller owns the arena backing.
+fn buildQuoteCounts(arena: Allocator, idx: *const Index) Allocator.Error!std.AutoHashMapUnmanaged(StrId, u32) {
+    var quote_counts: std.AutoHashMapUnmanaged(StrId, u32) = .empty;
+    for (idx.quote_of.items) |qid| {
+        if (qid == no_str) continue;
+        const gop = try quote_counts.getOrPut(arena, qid);
+        gop.value_ptr.* = (if (gop.found_existing) gop.value_ptr.* else 0) + 1;
+    }
+    return quote_counts;
+}
+
 /// Fill one indexed post `row` into a plain `TimelineRow`, stamping the viewer's
 /// like uri + the reply count + hydrated reply targets. PURE read — the single
 /// per-post boundary projection, shared by every feed/thread builder.
-fn fillRow(arena: Allocator, idx: *const Index, viewer_id: ?StrId, row: u32, reply_counts: *const std.AutoHashMapUnmanaged(StrId, u32)) Allocator.Error!TimelineRow {
+fn fillRow(arena: Allocator, idx: *const Index, viewer_id: ?StrId, row: u32, reply_counts: *const std.AutoHashMapUnmanaged(StrId, u32), quote_counts: *const std.AutoHashMapUnmanaged(StrId, u32)) Allocator.Error!TimelineRow {
     const cid_id = idx.posts.items(.cid)[row];
     const author_id = idx.posts.items(.author)[row];
     const s = idx.posts.items(.text)[row];
@@ -895,6 +928,8 @@ fn fillRow(arena: Allocator, idx: *const Index, viewer_id: ?StrId, row: u32, rep
         .reply_count = reply_counts.get(cid_id) orelse 0,
         .reply_parent = hydrateReplyTarget(idx, idx.reply_parent.items[row]),
         .reply_root = hydrateReplyTarget(idx, idx.reply_root.items[row]),
+        .quote_count = quote_counts.get(cid_id) orelse 0,
+        .quote = hydrateReplyTarget(idx, idx.quote_of.items[row]),
         .tags = tags,
     };
 }
@@ -927,6 +962,8 @@ pub fn buildPostThread(
 
     var reply_counts = try buildReplyCounts(arena, idx);
     defer reply_counts.deinit(arena);
+    var quote_counts = try buildQuoteCounts(arena, idx);
+    defer quote_counts.deinit(arena);
 
     // Walk the parent chain up to the thread root (cycle-guarded).
     var root_row = focus_row;
@@ -962,7 +999,7 @@ pub fn buildPostThread(
     var head: usize = 0;
     while (head < queue.items.len and out.items.len < limit) : (head += 1) {
         const row = queue.items[head];
-        try out.append(arena, try fillRow(arena, idx, viewer_id, row, &reply_counts));
+        try out.append(arena, try fillRow(arena, idx, viewer_id, row, &reply_counts, &quote_counts));
         if (children.get(row)) |kids| {
             for (kids.items) |k| try queue.append(arena, k);
         }
@@ -1092,7 +1129,7 @@ test "zones: buildTagFeed returns a tag's posts, newest first, normalized key" {
     try testing.expectEqual(@as(usize, 2), water.len);
     try testing.expectEqualStrings("newer", water[0].text);
     try testing.expectEqualStrings("older", water[1].text);
-    // The tray on a row carries the zone's first-seen display casing ("water").
+    // The tray on a row carries the zone's canonical lowercase name ("water").
     try testing.expectEqual(@as(usize, 2), water[0].tags.len); // water + rivers
     try testing.expectEqualStrings("water", water[1].tags[0]);
 
@@ -1117,7 +1154,7 @@ test "zones: a post with the same tag twice joins the zone once (dedup within po
     try testing.expectEqual(@as(usize, 1), water[0].tags.len); // one tray entry
 }
 
-test "zones: listZones lists every zone once with its post count, first-seen casing" {
+test "zones: listZones lists every zone once with its post count, canonical lowercase" {
     const gpa = testing.allocator;
     var idx: Index = .{};
     defer deinit(gpa, &idx);
@@ -1131,7 +1168,7 @@ test "zones: listZones lists every zone once with its post count, first-seen cas
 
     const zones = try listZones(arena, &idx);
     try testing.expectEqual(@as(usize, 2), zones.len); // water + rivers, water not doubled
-    try testing.expectEqualStrings("Water", zones[0].tag); // first-seen casing
+    try testing.expectEqualStrings("water", zones[0].tag); // canonical lowercase (#Water → water)
     try testing.expectEqual(@as(usize, 2), zones[0].count); // two posts in water
     try testing.expectEqualStrings("rivers", zones[1].tag);
     try testing.expectEqual(@as(usize, 1), zones[1].count);
@@ -1291,6 +1328,43 @@ test "reply linkage: a reply bumps its parent's reply_count and carries a hydrat
     const orphan_parent = alice2[0].reply_parent orelse return error.NoReplyParent;
     try testing.expectEqualStrings("cMissing", orphan_parent.cid);
     try testing.expectEqualStrings("", orphan_parent.author_handle);
+}
+
+test "quote linkage: a quote-post bumps the quoted post's quote_count and carries a hydrated quote" {
+    const gpa = testing.allocator;
+    var idx: Index = .{};
+    defer deinit(gpa, &idx);
+
+    // bob posts; alice quotes it; the quoted author's handle is known.
+    _ = try indexPost(gpa, &idx, .{ .cid = "cQuoted", .author_did = "did:bob", .text = "the quoted post", .created_at = 10 });
+    try setHandle(gpa, &idx, "did:bob", "bob.zat4.com");
+    _ = try indexPost(gpa, &idx, .{ .cid = "cQuote", .author_did = "did:alice", .text = "look at this", .created_at = 20, .quote_of_cid = "cQuoted" });
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    // The quoted post: quote_count == 1, not itself a quote.
+    const quoted_feed = try buildAuthorFeed(arena_state.allocator(), &idx, "did:bob", "did:x", 10);
+    try testing.expectEqual(@as(usize, 1), quoted_feed.len);
+    try testing.expectEqual(@as(u32, 1), quoted_feed[0].quote_count);
+    try testing.expect(quoted_feed[0].quote == null);
+
+    // The quote-post: quote_count 0, and a quote target hydrated from the index.
+    const quote_feed = try buildAuthorFeed(arena_state.allocator(), &idx, "did:alice", "did:x", 10);
+    try testing.expectEqual(@as(usize, 1), quote_feed.len);
+    try testing.expectEqual(@as(u32, 0), quote_feed[0].quote_count);
+    const q = quote_feed[0].quote orelse return error.NoQuote;
+    try testing.expectEqualStrings("cQuoted", q.cid);
+    try testing.expectEqualStrings("did:bob", q.author_did);
+    try testing.expectEqualStrings("bob.zat4.com", q.author_handle);
+    try testing.expectEqualStrings("the quoted post", q.text);
+
+    // A quote whose target isn't indexed: cid-only, still flagged a quote.
+    _ = try indexPost(gpa, &idx, .{ .cid = "cOrphanQ", .author_did = "did:alice", .text = "quoting the void", .created_at = 30, .quote_of_cid = "cGone" });
+    const alice2 = try buildAuthorFeed(arena_state.allocator(), &idx, "did:alice", "did:x", 10);
+    const orphan_q = alice2[0].quote orelse return error.NoQuote; // newest first
+    try testing.expectEqualStrings("cGone", orphan_q.cid);
+    try testing.expectEqualStrings("", orphan_q.author_handle);
 }
 
 test "post thread: ancestors walk to root, direct replies in chronological order" {

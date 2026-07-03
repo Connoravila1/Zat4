@@ -223,6 +223,7 @@ fn applyEvent(
                 .created_at = feed.parseTimestamp(p.created_at) catch 0,
                 .reply_parent_cid = p.reply_parent_cid,
                 .reply_root_cid = p.reply_root_cid,
+                .quote_of_cid = p.quote_of_cid,
                 .tags = lexicon.collectTags(arena, p.facets) catch &.{}, // zone routing
             }) catch false;
             lock.unlock();
@@ -233,7 +234,12 @@ fn applyEvent(
                     .{ .root = .{ .cid = p.reply_root_cid }, .parent = .{ .cid = p.reply_parent_cid } }
                 else
                     null;
-                store.appendPost(log, arena, p.did, p.rkey, p.cid, p.text, p.created_at, reply, p.facets);
+                // Cid-only embed (the durable replay reads the quoted cid).
+                const embed: ?lexicon.EmbedRecordOut = if (p.quote_of_cid.len > 0)
+                    .{ .record = .{ .cid = p.quote_of_cid } }
+                else
+                    null;
+                store.appendPost(log, arena, p.did, p.rkey, p.cid, p.text, p.created_at, reply, p.facets, embed);
             }
             return is_new;
         },

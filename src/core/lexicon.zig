@@ -135,6 +135,11 @@ pub const collection = struct {
     pub const post = "app.zat4.feed.post";
     pub const like = "app.zat4.feed.like";
     pub const repost = "app.zat4.feed.repost";
+    /// A quote-post's embed: a strong ref to the quoted record, carried in a
+    /// post's `embed` (the atproto `app.bsky.embed.record` analogue). The quoted
+    /// post is hydrated by the AppView into the served view's `embed`.
+    pub const embed_record = "app.zat4.embed.record";
+    pub const embed_record_view = "app.zat4.embed.record#view";
     pub const follow = "app.zat4.graph.follow";
     /// Fresh Zat4-native profile (Phase A decision 2). Self-contained; an
     /// optional one-time import at enrollment may prefill its fields, but the
@@ -279,6 +284,17 @@ pub const PostRecord = struct {
     /// ingest to route a post into its zones (see `collectTags`); absent ⇒ no
     /// facets. Same wire object as the write side's `PostRecordOut.facets`.
     facets: ?[]const Facet = null,
+    /// A quote-post's embed — the strong ref to the quoted record. The AppView
+    /// reads this on ingest to record the quote edge and hydrate on serve. Other
+    /// embed types (images/external) parse with an empty `record` cid ⇒ no quote.
+    embed: ?EmbedRecordIn = null,
+};
+
+/// The `embed` as read off a fetched/firehose record: only the quoted record
+/// ref matters to the AppView. A non-record embed leaves `record.cid` empty.
+/// A7.2: cold struct, size guard waived — transient parse target.
+pub const EmbedRecordIn = struct {
+    record: RecordRef = .{},
 };
 
 /// The session account's relationship to a post (present only on
@@ -317,6 +333,29 @@ pub const PostView = struct {
     /// AppView from the record's `#tag` facets — the post's tray. Each is a
     /// tappable doorway into a zone. Absent/empty ⇒ no tags.
     tags: []const []const u8 = &.{},
+    /// A quote-post's HYDRATED embed: the quoted post's author + text + refs,
+    /// resolved by the AppView from its own index. Absent ⇒ not a quote (or the
+    /// quoted post is unknown to the AppView). One level only — the quoted view
+    /// carries no nested embed, bounding recursion.
+    embed: ?EmbedView = null,
+};
+
+/// The hydrated quoted post inside a quote-post's served view — enough to render
+/// the quote card and open its thread. Deliberately lighter than a full PostView
+/// (no counts/viewer/embed) so a quote never recurses.
+/// A7.2: cold struct, size guard waived — transient parse/build target.
+pub const QuotedView = struct {
+    uri: []const u8 = "",
+    cid: []const u8 = "",
+    author: ProfileViewBasic = .{},
+    text: []const u8 = "",
+    createdAt: []const u8 = "",
+};
+
+/// `app.zat4.embed.record#view` — the quoted record, hydrated.
+/// A7.2: cold struct, size guard waived — transient parse/build target.
+pub const EmbedView = struct {
+    record: QuotedView = .{},
 };
 
 /// `app.zat4.feed.defs#replyRef` — root and parent, hydrated.
@@ -358,7 +397,7 @@ pub const ThreadView = struct {
     posts: []const FeedViewPost = &.{},
 };
 
-/// One zone in the catalog: its display tag (first-seen casing, '#' stripped)
+/// One zone in the catalog: its display tag (canonical lowercase, '#' stripped)
 /// and how many posts bear it. The catalog is the set of these.
 /// A7.2: cold struct, size guard waived — transient parse/build target.
 pub const TagView = struct {
@@ -465,6 +504,13 @@ pub const ReplyRefOut = struct {
     parent: RecordRef,
 };
 
+/// Outgoing quote embed — a strong ref to the quoted record.
+/// A7.2: cold struct, size guard waived — transient build target.
+pub const EmbedRecordOut = struct {
+    @"$type": []const u8 = collection.embed_record,
+    record: RecordRef,
+};
+
 /// Outgoing `app.zat4.feed.post`.
 /// A7.2: cold struct, size guard waived — transient build target.
 pub const PostRecordOut = struct {
@@ -473,6 +519,7 @@ pub const PostRecordOut = struct {
     createdAt: []const u8,
     reply: ?ReplyRefOut = null,
     facets: ?[]const Facet = null,
+    embed: ?EmbedRecordOut = null,
 };
 
 /// Outgoing like/repost — the two share one shape, distinguished by $type.

@@ -691,7 +691,7 @@ pub fn main(init: std.process.Init) !void {
         // The post leg: publish one app.zat4.feed.post into the user's own PDS,
         // from where the AppView's poll/firehose carries it into Zat4.
         if (post_text) |text| {
-            const outcome = write.createPost(gpa, arena, io, env, &session, text, &[_]lexicon.Facet{}, null, now) catch |err| {
+            const outcome = write.createPost(gpa, arena, io, env, &session, text, &[_]lexicon.Facet{}, null, null, now) catch |err| {
                 try out.print("post failed: {s}\n", .{@errorName(err)});
                 try out.flush();
                 return err;

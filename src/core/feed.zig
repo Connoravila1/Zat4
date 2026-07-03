@@ -127,6 +127,11 @@ pub const Post = struct {
     author: AuthorIndex,
     reply_parent: OptionalPostIndex,
     reply_root: OptionalPostIndex,
+    /// The post this one QUOTES (a quote-post), or `.none`. A store index like
+    /// reply_parent/root: the quoted post is ingested into `posts` (CID-keyed,
+    /// A8) and referenced here, so a quote card is a QUERY over the shared store
+    /// (ZONES inv. 4), never a duplicated snapshot on the post.
+    quote_of: OptionalPostIndex,
     like_count: u32,
     repost_count: u32,
     reply_count: u32,
@@ -136,14 +141,13 @@ pub const Post = struct {
     label_flags: moderation.LabelFlags,
 
     comptime {
-        // Budget 64: 8 (i64) + 3×8 (spans) + 7×4 (u32) + 2 (flags) = 62
-        // bytes of payload; @sizeOf reports 64 because i64 alignment pads
-        // the tail — the flags rode in on existing padding, budget unmoved.
-        // In the SoA store every field lives in its own array, so that pad
-        // never materializes in memory — the guard pins the honest @sizeOf
-        // and forces a decision the moment any field grows. (A7;
-        // raising this number requires A7.1 justification.)
-        assert(@sizeOf(Post) == 64);
+        // Budget: 8 (i64) + 3×8 (spans) + 8×4 (u32: author + 3 post-indexes +
+        // 4 counts) + 2 (flags) = 66 payload; i64 alignment pads the tail to 72.
+        // In the SoA store every field lives in its own array, so that pad never
+        // materializes; the guard pins the honest @sizeOf. (A7.1 raise 64 → 72:
+        // `quote_of` is a real quote-post edge — the same kind of OptionalPostIndex
+        // as reply_parent/root, +4 bytes, crossing the i64-alignment boundary.)
+        assert(@sizeOf(Post) == 72);
     }
 };
 
@@ -644,6 +648,22 @@ fn internPost(
     // is ordinary, and one post's bad clock must not sink its neighbors (E2).
     const created_at = parseTimestamp(view.record.createdAt) catch 0;
 
+    // Quote-post: ingest the AppView-hydrated quoted view as its own store post
+    // (A8 dedup by CID) and reference it. It arrives as a QuotedView (author +
+    // text + refs, no counts), so treat it like a context reference — it never
+    // clobbers a resident post's counts. Ingested BEFORE this post so its index
+    // is stable; a quote card is then a query over the store (ZONES inv. 4).
+    var quote_of: OptionalPostIndex = .none;
+    if (view.embed) |emb| if (emb.record.cid.len > 0) {
+        const quoted: lexicon.PostView = .{
+            .uri = emb.record.uri,
+            .cid = emb.record.cid,
+            .author = emb.record.author,
+            .record = .{ .text = emb.record.text, .createdAt = emb.record.createdAt },
+        };
+        quote_of = OptionalPostIndex.from(try internPost(gpa, store, quoted, stats, true));
+    };
+
     const index: u32 = @intCast(store.posts.len);
     try store.posts.append(gpa, .{
         .created_at = created_at,
@@ -653,6 +673,7 @@ fn internPost(
         .author = author,
         .reply_parent = .none,
         .reply_root = .none,
+        .quote_of = quote_of,
         .like_count = view.likeCount,
         .repost_count = view.repostCount,
         .reply_count = view.replyCount,
@@ -770,18 +791,27 @@ pub const TimelineItem = struct {
     /// Empty ⇒ untagged. (ZONES inv. 4: derived from the post's facets, never a
     /// stored container.)
     tags: []const []const u8 = &.{},
+    /// Quote-post: the QUOTED post's snapshot for the quote card, resolved from
+    /// the store's `quote_of` edge (ZONES inv. 4 — a query, not a stored copy).
+    /// All "" ⇒ not a quote. `quote_uri`+`quote_cid` are the tap target (open the
+    /// quoted thread); the strings borrow the store's bytes.
+    quote_author_handle: []const u8 = "",
+    quote_author_display_name: []const u8 = "",
+    quote_text: []const u8 = "",
+    quote_uri: []const u8 = "",
+    quote_cid: []const u8 = "",
 
     comptime {
         // Produced in bulk every build — hot, so guarded (A7). Slices make
         // the size pointer-width-dependent; the budget is pinned where the
         // record is its packed self and degrades to nothing off 64-bit.
-        // (A7.1 record, FOURTH raise: 144 → 160. Zat Zones puts the post's tag
-        // tray on the view-model — one more slice, the same kind of variable-
-        // length view field as name/body/replying_to (the third raise's +16 for
-        // replying_to was justified identically). 8×16 slices + 8 i64 + 16 counts
-        // + 2 + 1 = 155 payload, 5 pad → 160. Second raise: +2 LabelFlags. First:
-        // the guard caught a budget that counted four slices when five existed.)
-        if (@sizeOf(usize) == 8) assert(@sizeOf(TimelineItem) == 160);
+        // (A7.1 record, FIFTH raise: 160 → 240. Quote-posts put the quoted post's
+        // display snapshot on the view-model — five more slices, the SAME kind of
+        // variable-length view data as the tag tray (4th raise) and replying_to
+        // (3rd). Empty on the ~non-quote majority; a quote is a minority of posts
+        // but the field must exist on the one struct every view shares. 13×16
+        // slices + 8 i64 + 16 counts + 8 (flags/depth) = 240, no padding.)
+        if (@sizeOf(usize) == 8) assert(@sizeOf(TimelineItem) == 240);
     }
 };
 
@@ -823,6 +853,23 @@ fn fillTimelineItem(arena: Allocator, store: *const Store, p: usize, reposted_by
     else
         "";
 
+    // Quote-post: resolve the `quote_of` edge into the quoted post's snapshot —
+    // a query over the same store, exactly like replying_to above (ZONES inv. 4).
+    var q_handle: []const u8 = "";
+    var q_display: []const u8 = "";
+    var q_text: []const u8 = "";
+    var q_uri: []const u8 = "";
+    var q_cid: []const u8 = "";
+    if (posts.items(.quote_of)[p].unwrap()) |q| {
+        const qi = @intFromEnum(q);
+        const qa = @intFromEnum(post_authors[qi]);
+        q_handle = sliceSpan(store, author_handles[qa]);
+        q_display = sliceSpan(store, author_display_names[qa]);
+        q_text = sliceSpan(store, posts.items(.text)[qi]);
+        q_uri = sliceSpan(store, posts.items(.uri)[qi]);
+        q_cid = sliceSpan(store, posts.items(.cid)[qi]);
+    }
+
     return .{
         .uri = sliceSpan(store, posts.items(.uri)[p]),
         .cid = sliceSpan(store, posts.items(.cid)[p]),
@@ -842,6 +889,11 @@ fn fillTimelineItem(arena: Allocator, store: *const Store, p: usize, reposted_by
             .viewer_reposted = store.reposted.isSet(p),
         },
         .tags = try collectRowTags(arena, store, p),
+        .quote_author_handle = q_handle,
+        .quote_author_display_name = q_display,
+        .quote_text = q_text,
+        .quote_uri = q_uri,
+        .quote_cid = q_cid,
     };
 }
 
@@ -937,6 +989,46 @@ pub fn buildTagView(arena: Allocator, store: *const Store, tag: []const u8) erro
     std.sort.block(u32, rows.items, Ctx{ .createds = createds }, Ctx.lessThan);
     const out = try arena.alloc(TimelineItem, rows.items.len);
     for (rows.items, out) |p, *item| item.* = try fillTimelineItem(arena, store, p, .none);
+    return out;
+}
+
+/// The zone CATALOG derived from the SHARED store (ZONES inv. 4 — a query, not a
+/// container): every distinct zone borne by a resident post, canonical lowercase,
+/// with a resident-post count (a post counts once per zone). First-seen order.
+/// This is what lets the browse page list a zone the client already knows even
+/// before/without the AppView's `listTags` — the shell merges the server's wider
+/// set on top. Allocates into `arena` (C3); the strings are arena-owned.
+pub fn listZonesLocal(arena: Allocator, store: *const Store) error{OutOfMemory}![]lexicon.TagView {
+    var order: std.ArrayList([]const u8) = .empty; // zone names, first-seen order
+    defer order.deinit(arena);
+    var counts: std.StringHashMapUnmanaged(usize) = .empty;
+    defer counts.deinit(arena);
+    var nbuf: [128]u8 = undefined;
+    var pbuf: [128]u8 = undefined;
+    for (0..store.posts.len) |p| {
+        if (p >= store.post_tags.items.len) continue;
+        const r = store.post_tags.items[p];
+        var i: u32 = 0;
+        next_tag: while (i < r.len) : (i += 1) {
+            const norm = normalizeTagClient(sliceSpan(store, store.tag_pool.items[r.off + i]), &nbuf) orelse continue;
+            // Per-post dedup: skip if an earlier tag of THIS post folded the same
+            // (so "#water #Water" counts the post once).
+            var j: u32 = 0;
+            while (j < i) : (j += 1) {
+                const prev = normalizeTagClient(sliceSpan(store, store.tag_pool.items[r.off + j]), &pbuf) orelse continue;
+                if (std.mem.eql(u8, prev, norm)) continue :next_tag;
+            }
+            if (counts.getPtr(norm)) |cp| {
+                cp.* += 1;
+            } else {
+                const dup = try arena.dupe(u8, norm);
+                try counts.put(arena, dup, 1);
+                try order.append(arena, dup);
+            }
+        }
+    }
+    const out = try arena.alloc(lexicon.TagView, order.items.len);
+    for (out, order.items) |*t, name| t.* = .{ .tag = name, .count = counts.get(name).? };
     return out;
 }
 
@@ -1306,6 +1398,7 @@ pub const LivePostInput = struct {
     text: []const u8,
     reply_parent_cid: []const u8, // "" when not a reply
     reply_root_cid: []const u8,
+    quote_of_cid: []const u8 = "", // "" when not a quote-post
     created_at: i64,
 };
 
@@ -1350,6 +1443,10 @@ pub fn ingestLivePost(
             .none,
         .reply_root = if (input.reply_root_cid.len > 0)
             optionalIndexForCid(store, input.reply_root_cid)
+        else
+            .none,
+        .quote_of = if (input.quote_of_cid.len > 0)
+            optionalIndexForCid(store, input.quote_of_cid)
         else
             .none,
         .like_count = 0,
@@ -1932,6 +2029,41 @@ test "zones: a post's tags are stored out of band and surface on the timeline it
     // An untagged post yields an empty tray (E4) — and the parallel arrays stay
     // aligned (the untagged row doesn't borrow the tagged row's window).
     try testing.expectEqual(@as(usize, 0), items[1].tags.len);
+}
+
+test "zones: listZonesLocal derives the catalog from resident posts, case-folded (ZONES inv. 4)" {
+    const gpa = testing.allocator; // C6
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+
+    const page: lexicon.TimelinePage = .{ .feed = &.{
+        .{ .post = .{
+            .uri = "at://did:plc:a/app.zat4.feed.post/r1",
+            .cid = "bafyz1",
+            .author = .{ .did = "did:plc:a", .handle = "a.zat4.com" },
+            .record = .{ .text = "love #water", .createdAt = "2026-06-28T00:00:00Z" },
+            .tags = &.{ "water", "rivers" },
+        } },
+        .{ .post = .{
+            .uri = "at://did:plc:b/app.zat4.feed.post/r2",
+            .cid = "bafyz2",
+            .author = .{ .did = "did:plc:b", .handle = "b.zat4.com" },
+            .record = .{ .text = "more #Water", .createdAt = "2026-06-28T00:00:01Z" },
+            .tags = &.{"Water"}, // different casing → the same zone
+        } },
+    } };
+    _ = try ingestPage(gpa, &store, page);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const zones = try listZonesLocal(arena_state.allocator(), &store);
+    // water (×2, #Water folds in) + rivers (×1) — the browse page's catalog even
+    // without the AppView, so a zone reachable by tapping its hashtag lists here.
+    try testing.expectEqual(@as(usize, 2), zones.len);
+    try testing.expectEqualStrings("water", zones[0].tag); // canonical lowercase, first-seen
+    try testing.expectEqual(@as(usize, 2), zones[0].count);
+    try testing.expectEqualStrings("rivers", zones[1].tag);
+    try testing.expectEqual(@as(usize, 1), zones[1].count);
 }
 
 test "zones/dates: a reply-parent placeholder gets created_at + tags filled by its full view" {

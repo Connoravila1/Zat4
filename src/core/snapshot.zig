@@ -43,7 +43,7 @@ pub const magic = [4]u8{ 'Z', 'A', 'T', 'C' };
 // tags, rather than a desynced post_tags shorter than posts. (This is the
 // cache-version mechanism: a data-shape change bumps the version, old caches
 // drop themselves — the production-safe answer to "I changed server data".)
-pub const version: u16 = 2;
+pub const version: u16 = 3;
 
 /// A7.2: cold struct, size guard waived — one per encode/decode.
 const Header = struct {
@@ -91,6 +91,7 @@ pub fn encode(arena: Allocator, store: *const feed.Store) error{OutOfMemory}![]u
     try appendField(arena, &out, posts.items(.author));
     try appendField(arena, &out, posts.items(.reply_parent));
     try appendField(arena, &out, posts.items(.reply_root));
+    try appendField(arena, &out, posts.items(.quote_of));
     try appendField(arena, &out, posts.items(.like_count));
     try appendField(arena, &out, posts.items(.repost_count));
     try appendField(arena, &out, posts.items(.reply_count));
@@ -213,6 +214,7 @@ pub fn decode(gpa: Allocator, bytes: []const u8) DecodeError!feed.Store {
     try takeField(&c, posts.items(.author));
     try takeField(&c, posts.items(.reply_parent));
     try takeField(&c, posts.items(.reply_root));
+    try takeField(&c, posts.items(.quote_of));
     try takeField(&c, posts.items(.like_count));
     try takeField(&c, posts.items(.repost_count));
     try takeField(&c, posts.items(.reply_count));
@@ -267,6 +269,7 @@ pub fn decode(gpa: Allocator, bytes: []const u8) DecodeError!feed.Store {
     }
     for (posts.items(.reply_parent)) |opt| try validateOptionalPost(opt, header.posts_len);
     for (posts.items(.reply_root)) |opt| try validateOptionalPost(opt, header.posts_len);
+    for (posts.items(.quote_of)) |opt| try validateOptionalPost(opt, header.posts_len);
     for (items.items(.post)) |post| {
         if (@intFromEnum(post) >= header.posts_len) return error.InvalidSnapshot;
     }
