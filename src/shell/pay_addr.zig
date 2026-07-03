@@ -169,6 +169,31 @@ pub fn publish(
     };
 }
 
+/// Remove the session account's published receive record — deleting the
+/// singleton `app.zat4.pay.address`/"self" so the account reads as walletless
+/// again (a payer's `fetchPayee` gets null → the honest S2 offer, not a
+/// stale address). Idempotent at the network: deleting an absent record is a
+/// success, not an error (E4). A brand-new user who never published just
+/// wipes local state; there is nothing on the PDS to remove.
+pub fn unpublish(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    session: *auth.Session,
+) !void {
+    const input = lexicon.DeleteRecordOut{
+        .repo = session.did,
+        .collection = lexicon.collection.pay_address,
+        .rkey = "self",
+    };
+    const outcome = try auth.procedure(gpa, arena, io, environ, session, lexicon.method.delete_record, input, lexicon.DeleteRecordResponse);
+    return switch (outcome) {
+        .ok => {},
+        .failed => error.UnpublishFailed,
+    };
+}
+
 /// Fetch + validate `did`'s payment addresses: resolve the DID to ITS OWN
 /// PDS (never a guessed host), read the public record, decode, and let the
 /// core gate decide against the anchor key the caller PINS. Null = no

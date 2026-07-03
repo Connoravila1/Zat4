@@ -624,6 +624,7 @@ pub fn run(
     var gchain_job: ChainJob = .{};
     var gchain_last: i64 = 0;
     var gexpire_last: i64 = 0;
+    var greceive_job: ReceiveJob = .{};
     defer if (gchain_job.thread) |t| {
         t.join();
         gchain_job.thread = null;
@@ -1095,6 +1096,49 @@ pub fn run(
             // it reaches disk before this frame ends.
             if (chat_mutated) chatPersistHistory(gpa, io, environ, st, &gchat_store);
         };
+
+        // Prefetch OUR own receive-setup once, in the background, the first
+        // time we're on the messages screen — so the ₿ button opens the pay
+        // sheet with no stall (loadOwnReceive is a PDS fetch; on the click it
+        // blocked the render thread). If the user taps before this lands,
+        // `.pay_open` still falls back to the sync fetch.
+        if (dev_chat and gscreen == feed_view.screen_messages and !grecv_known) {
+            if (greceive_job.thread == null) {
+                const a = std.heap.page_allocator;
+                if (a.dupe(u8, session.did)) |did_copy| {
+                    greceive_job.did = did_copy;
+                    greceive_job.done.store(false, .monotonic);
+                    greceive_job.found = false;
+                    greceive_job.ln_len = 0;
+                    greceive_job.btc_len = 0;
+                    greceive_job.thread = std.Thread.spawn(.{}, receiveWorker, .{ &greceive_job, io, environ }) catch th: {
+                        a.free(did_copy);
+                        break :th null;
+                    };
+                    // Spawn failed → don't retry every frame; the sync fallback covers it.
+                    if (greceive_job.thread == null) grecv_known = true;
+                } else |_| grecv_known = true;
+            } else if (greceive_job.done.load(.acquire)) {
+                greceive_job.thread.?.join();
+                greceive_job.thread = null;
+                // Only adopt the result if the sync path hasn't already answered
+                // (it sets grecv_known), so a race can't clobber a fresh save.
+                if (!grecv_known) {
+                    if (greceive_job.found) {
+                        @memcpy(grecv_ln_buf[0..greceive_job.ln_len], greceive_job.ln[0..greceive_job.ln_len]);
+                        grecv_ln_len = greceive_job.ln_len;
+                        @memcpy(grecv_btc_buf[0..greceive_job.btc_len], greceive_job.btc[0..greceive_job.btc_len]);
+                        grecv_btc_len = greceive_job.btc_len;
+                        grecv_set = greceive_job.ln_len > 0 or greceive_job.btc_len > 0;
+                    } else {
+                        grecv_set = false;
+                    }
+                    grecv_known = true;
+                }
+                std.heap.page_allocator.free(greceive_job.did);
+                greceive_job.did = &.{};
+            }
+        }
 
         // Expire stale offers/requests (S2, §6): a pure, local sweep to
         // `expired` for any pre-money card older than the 24h TTL — both sides
@@ -2787,6 +2831,22 @@ pub fn run(
                                                 announceReceiveReady(gpa, io, environ, if (gchat_e2ee) |*p| p else null, gchat_link, &gchat_store);
                                             }
                                         },
+                                        // Remove wallet: unpublish the record (walletless
+                                        // again) and clear the fields — one tap, not
+                                        // delete-every-char-then-Cancel.
+                                        .recv_remove => if (dev_chat) {
+                                            _ = gchat_arena_state.reset(.retain_capacity);
+                                            if (pay_addr.unpublish(gpa, gchat_arena_state.allocator(), io, environ, session)) |_| {
+                                                grecv_ln_len = 0;
+                                                grecv_btc_len = 0;
+                                                grecv_set = false;
+                                                grecv_saved = false;
+                                                grecv_focus = 0;
+                                                grecv_status = "Removed \u{2014} you no longer receive payments here";
+                                            } else |_| {
+                                                grecv_status = "Couldn't remove it \u{2014} try again";
+                                            }
+                                        },
                                         // Compose "Send": run the per-action gate
                                         // (§5). A walletless recipient → an OFFER
                                         // straight away (no wallet to approve, so no
@@ -2834,7 +2894,23 @@ pub fn run(
                                                 } else {
                                                     const note = std.mem.trim(u8, gpay_note_buf[0..gpay_note_len], " ");
                                                     if (hit.kind == .pay_request) {
-                                                        gpay_status = payRequest(gpa, io, environ, if (gchat_e2ee) |*p| p else null, gchat_link, &gchat_store, sc, gpay_rail, amount, note, now);
+                                                        // Request gate (§5): you can only ASK to be
+                                                        // paid on a rail you can actually RECEIVE on
+                                                        // — otherwise the money would have nowhere to
+                                                        // land. Your own published addresses are
+                                                        // already loaded (grecv_*).
+                                                        const have_rail = switch (gpay_rail) {
+                                                            .lightning => grecv_ln_len > 0,
+                                                            .onchain => grecv_btc_len > 0,
+                                                        };
+                                                        if (!have_rail) {
+                                                            gpay_status = switch (gpay_rail) {
+                                                                .lightning => "Add your Lightning address first \u{2014} tap \u{201C}Set up how you get paid\u{201D}",
+                                                                .onchain => "Add your Bitcoin address first \u{2014} tap \u{201C}Set up how you get paid\u{201D}",
+                                                            };
+                                                        } else {
+                                                            gpay_status = payRequest(gpa, io, environ, if (gchat_e2ee) |*p| p else null, gchat_link, &gchat_store, sc, gpay_rail, amount, note, now);
+                                                        }
                                                     } else {
                                                         _ = gchat_arena_state.reset(.retain_capacity);
                                                         gpay_status = paySend(gpa, gchat_arena_state.allocator(), io, environ, if (gchat_e2ee) |*p| p else null, gchat_link, &gchat_store, sc, gpay_rail, amount, note, null, now);
@@ -4507,6 +4583,42 @@ fn chainWorker(job: *ChainJob, io: std.Io, environ: ?*const std.process.Environ.
         }) catch break;
     }
     job.results = results.toOwnedSlice(a) catch &.{};
+    job.done.store(true, .release);
+}
+
+/// A7.2: cold struct, size guard waived — a singleton, one prefetch per app run.
+/// Worker-owned; plain values cross the seam (E1). Buffers written BEFORE
+/// `done` flips (release/acquire pair on the join).
+const ReceiveJob = struct {
+    thread: ?std.Thread = null,
+    done: std.atomic.Value(bool) = .init(false),
+    /// The account DID to resolve (page-alloc'd copy, freed on join).
+    did: []u8 = &.{},
+    found: bool = false,
+    ln: [160]u8 = undefined,
+    ln_len: usize = 0,
+    btc: [160]u8 = undefined,
+    btc_len: usize = 0,
+};
+
+/// Resolve OUR OWN published receive record off the render thread — the ₿
+/// button opens the pay sheet instantly instead of stalling on this fetch.
+/// A public getRecord (no auth), so only the DID crosses the seam.
+fn receiveWorker(job: *ReceiveJob, io: std.Io, environ: ?*const std.process.Environ.Map) void {
+    const a = std.heap.page_allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    if (pay_addr.fetchOwn(a, arena_state.allocator(), io, environ, job.did) catch null) |own| {
+        job.found = true;
+        if (own.lightning.len <= job.ln.len) {
+            @memcpy(job.ln[0..own.lightning.len], own.lightning);
+            job.ln_len = own.lightning.len;
+        }
+        if (own.bitcoin.len <= job.btc.len) {
+            @memcpy(job.btc[0..own.bitcoin.len], own.bitcoin);
+            job.btc_len = own.bitcoin.len;
+        }
+    }
     job.done.store(true, .release);
 }
 

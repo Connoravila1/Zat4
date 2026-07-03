@@ -189,7 +189,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, pay_arm, pay_confirm_back };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -4786,9 +4786,12 @@ pub fn layoutChat(
     // can pay you. Same chrome as the pay sheet; mutually exclusive with it. ──
     if (recv.open) {
         const status_extra: i32 = if (recv.status.len > 0) 24 else 0;
+        // The paste form grows by one line when the Remove link shows (an
+        // address is present and we're not on the just-saved confirmation).
+        const remove_extra: i32 = if (recv.mode == .paste and !recv.saved and (recv.lightning.len > 0 or recv.bitcoin.len > 0)) 26 else 0;
         const sheet_h: i32 = switch (recv.mode) {
             .onboard => 224,
-            .paste => 236 + status_extra,
+            .paste => 236 + status_extra + remove_extra,
             .wallets => 24 + 28 + 30 + @as(i32, @intCast(recv_wallets.len)) * 56 + 54,
         };
         const sy0 = comp_y - sheet_h - 12;
@@ -4861,6 +4864,16 @@ pub fn layoutChat(
                     }
                     try emitRegion(gpa, regions, detail_x + 18, py, detail_w - 36, 38, 0, fld.act);
                     py += 46;
+                }
+                // A one-tap Remove when an address is present (was: clear every
+                // char, then Cancel — unintuitive). It unpublishes the record so
+                // you read as walletless again. Right-aligned, quiet red.
+                if (!recv.saved and (recv.lightning.len > 0 or recv.bitcoin.len > 0)) {
+                    const rl = "Remove wallet";
+                    const rw: i32 = @intCast(text.measure(e, .semibold, rl, 12));
+                    _ = try str(gpa, dl, e, .semibold, detail_x + detail_w - 18 - rw, py + 10, 0xFFD98A7A, 12, rl);
+                    try emitRegion(gpa, regions, detail_x + detail_w - 26 - rw, py - 2, rw + 16, 26, 0, .recv_remove);
+                    py += 26;
                 }
                 if (recv.status.len > 0) {
                     const sc: u32 = if (recv.saved) 0xFF9BCE9B else 0xFFE0A868;
