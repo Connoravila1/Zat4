@@ -82,6 +82,37 @@ pub const kind_typing_wire: u8 = 2;
 pub const kind_pay_settled_wire: u8 = 18;
 pub const kind_pay_failed_wire: u8 = 19;
 
+/// The send-to-a-walletless-recipient LIFECYCLE wire bytes (S2,
+/// PAYMENT_UX_SPEC §11). Same posture as the settlement bytes above —
+/// wire-only, `parseKind` keeps rejecting them, correlate by payment_id —
+/// but they drive the pre-money offer handshake, never a transfer:
+///   20 offer   — payer → recipient: "I want to pay you, but you have no
+///                wallet." The recipient's drain CREATES a card at
+///                `pending_setup` (never inferred from setup state — that is
+///                a race that would imply money is coming when none is, §11.1).
+///   21 ready   — recipient → payer: "I set up a wallet." Advances to `ready`.
+///   22 cancel  — the initiator withdrew → `cancelled`.
+///   23 decline — the other side declined → `declined`.
+pub const kind_pay_offer_wire: u8 = 20;
+pub const kind_pay_ready_wire: u8 = 21;
+pub const kind_pay_cancel_wire: u8 = 22;
+pub const kind_pay_decline_wire: u8 = 23;
+
+/// True for a lifecycle wire byte that FLIPS an existing card to a known
+/// terminal-or-forward status (21/22/23 and the settlement 18/19) — as
+/// opposed to the offer byte 20, which CREATES one. The mapped status is the
+/// receiver's target (`advancePayment`); an unmapped byte returns null.
+pub fn payEventStatus(byte: u8) ?PayStatus {
+    return switch (byte) {
+        kind_pay_settled_wire => .settled,
+        kind_pay_failed_wire => .failed,
+        kind_pay_ready_wire => .ready,
+        kind_pay_cancel_wire => .cancelled,
+        kind_pay_decline_wire => .declined,
+        else => null,
+    };
+}
+
 pub const KindError = error{UnknownKind};
 
 /// Wire byte -> kind. Reserved and unknown bytes are explicit errors, not
@@ -182,6 +213,18 @@ pub const PayStatus = enum(u8) {
 pub fn isTerminalStatus(s: PayStatus) bool {
     return switch (s) {
         .settled, .failed, .cancelled, .declined, .expired => true,
+        else => false,
+    };
+}
+
+/// True once a card has NETWORK evidence behind it — seen in a mempool or
+/// deeper (`broadcast`/`confirming`/`settled`). Money is (or may be) in
+/// motion. A peer's withdrawal event (cancel/decline) must never retire such
+/// a card: doing so would hide a real transfer, the worst golden-rule
+/// violation. The shell gates remote withdrawals on this at the wire boundary.
+pub fn hasNetworkEvidence(s: PayStatus) bool {
+    return switch (s) {
+        .broadcast, .confirming, .settled => true,
         else => false,
     };
 }
@@ -327,6 +370,25 @@ pub fn conversationHandle(store: *const Store, conv: ConvIndex) []const u8 {
 /// the arrays (D3 by convention, same as the accessors above).
 pub fn paymentRow(store: *const Store, pay: PayIndex) PaymentRow {
     return store.payments.get(@intFromEnum(pay));
+}
+
+/// How many payment rows the store holds — the sweep/announce loops walk
+/// `0..paymentCount` (the index never leaves this module, A5).
+pub fn paymentCount(store: *const Store) u32 {
+    return @intCast(store.payments.len);
+}
+
+/// The conversation a payment belongs to — resolved through its card's
+/// ChatMsg, the single source of the conv/direction facts (A1).
+pub fn paymentConv(store: *const Store, pay: PayIndex) ConvIndex {
+    const msg = store.payments.items(.msg)[@intFromEnum(pay)];
+    return store.msgs.items(.conv)[@intFromEnum(msg)];
+}
+
+/// Whether the session account authored this payment card (the offer/send
+/// initiator vs. the counterparty), via the same out-of-band direction bit.
+pub fn paymentMine(store: *const Store, pay: PayIndex) bool {
+    return isMine(store, store.payments.items(.msg)[@intFromEnum(pay)]);
 }
 
 /// Append a string (plus a NUL so the span can serve as an interning key)
@@ -484,6 +546,17 @@ pub fn appendPayment(
     return @enumFromInt(index);
 }
 
+/// Set a FRESHLY-appended card's status directly, before it has begun its
+/// lifecycle. This is the one legitimate bypass of the monotonic gate: a
+/// `payment_sent` OFFERED to a walletless recipient must start at
+/// `pending_setup` (rank 0), which `advancePayment` cannot reach from the
+/// kind's default `pending` (rank 2) — the ranks only climb. Never call on a
+/// card that has already advanced; the offer create-path (S2) is the sole
+/// caller on both sides.
+pub fn initPaymentStatus(store: *Store, pay: PayIndex, status: PayStatus) void {
+    store.payments.items(.status)[@intFromEnum(pay)] = status;
+}
+
 /// The payment row a wire event addresses, matched by (conversation,
 /// payment_id) — an id is trusted only within its own conversation, so a
 /// peer replaying an id seen elsewhere reaches nothing. Linear scan:
@@ -564,6 +637,38 @@ pub fn setConfirmations(store: *Store, pay: PayIndex, depth: u8) bool {
     if (next != status_col[p] and statusRank(next) > statusRank(status_col[p])) {
         status_col[p] = next;
         changed = true;
+    }
+    return changed;
+}
+
+/// How long an unanswered OFFER or REQUEST stands before it lapses (§6). 24h
+/// survives an overnight so nobody misses it, then clears — we custody
+/// nothing, so a stale offer is only thread clutter, and the initiator
+/// re-sends in one tap. One tunable constant.
+pub const payment_offer_ttl_s: i64 = 24 * 3600;
+
+/// Retire every unanswered offer/request older than the TTL to `expired`,
+/// pure and local — both sides run it against the same immutable `created_at`
+/// and reach the same terminal, no wire needed (§11.3). ONLY the pre-commit
+/// states lapse: `pending_setup`/`ready`/`requested` moved no money, so
+/// expiring them is honest; a `pending`/`broadcast`/`confirming` card has a
+/// hand-off or a mempool sighting behind it and must NEVER be silently
+/// retired (that would hide a possible transfer — the golden rule). Returns
+/// whether anything changed, so the shell persists only on change.
+pub fn sweepExpired(store: *Store, now: i64, ttl_s: i64) bool {
+    const status_col = store.payments.items(.status);
+    const msg_col = store.payments.items(.msg);
+    const created_col = store.msgs.items(.created_at);
+    var changed = false;
+    for (status_col, msg_col) |*s, mi| {
+        switch (s.*) {
+            .pending_setup, .ready, .requested => {},
+            else => continue,
+        }
+        if (now - created_col[@intFromEnum(mi)] >= ttl_s) {
+            s.* = .expired;
+            changed = true;
+        }
     }
     return changed;
 }
@@ -1321,7 +1426,66 @@ test "parseKind accepts the built vocabulary and rejects reserved bytes" {
     // …but the settlement EVENT bytes are wire-only, never stored kinds.
     try std.testing.expectError(error.UnknownKind, parseKind(kind_pay_settled_wire));
     try std.testing.expectError(error.UnknownKind, parseKind(kind_pay_failed_wire));
+    // The S2 lifecycle bytes (offer/ready/cancel/decline) are wire-only too.
+    try std.testing.expectError(error.UnknownKind, parseKind(kind_pay_offer_wire));
+    try std.testing.expectError(error.UnknownKind, parseKind(kind_pay_ready_wire));
+    try std.testing.expectError(error.UnknownKind, parseKind(kind_pay_cancel_wire));
+    try std.testing.expectError(error.UnknownKind, parseKind(kind_pay_decline_wire));
     try std.testing.expectError(error.UnknownKind, parseKind(255));
+    // payEventStatus maps the flip bytes and only those.
+    try std.testing.expectEqual(PayStatus.settled, payEventStatus(kind_pay_settled_wire).?);
+    try std.testing.expectEqual(PayStatus.ready, payEventStatus(kind_pay_ready_wire).?);
+    try std.testing.expectEqual(PayStatus.cancelled, payEventStatus(kind_pay_cancel_wire).?);
+    try std.testing.expectEqual(PayStatus.declined, payEventStatus(kind_pay_decline_wire).?);
+    try std.testing.expect(payEventStatus(kind_pay_offer_wire) == null); // create, not flip
+    try std.testing.expect(payEventStatus(0) == null);
+}
+
+test "S2 offer: create at pending_setup, ready advances, expiry only lapses pre-commit" {
+    const gpa = std.testing.allocator;
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+    const a = try openConversation(gpa, &store, "did:plc:payee", "");
+
+    // A walletless-recipient offer starts BELOW the kind default and needs
+    // the direct create-path (advancePayment could never reach rank 0).
+    const offer = try appendPayment(gpa, &store, a, .payment_sent, 0x501, .onchain, 7000, "coffee", 100, false);
+    initPaymentStatus(&store, offer, .pending_setup);
+    try std.testing.expectEqual(PayStatus.pending_setup, store.payments.items(.status)[@intFromEnum(offer)]);
+
+    // Recipient sets up → ready (rank 0 → 1, a legal forward step).
+    try std.testing.expect(try advancePayment(gpa, &store, offer, .ready, null));
+    try std.testing.expectEqual(PayStatus.ready, store.payments.items(.status)[@intFromEnum(offer)]);
+
+    // A second, in-flight card must be immune to the expiry sweep.
+    const live = try appendPayment(gpa, &store, a, .payment_sent, 0x502, .onchain, 9000, "", 100, true);
+    _ = try advancePayment(gpa, &store, live, .broadcast, null);
+
+    // Well before the TTL: nothing lapses.
+    try std.testing.expect(!sweepExpired(&store, 100, payment_offer_ttl_s));
+    // Past the TTL: the ready offer lapses; the broadcast card does NOT
+    // (money may be in motion behind it — the golden rule).
+    try std.testing.expect(sweepExpired(&store, 100 + payment_offer_ttl_s, payment_offer_ttl_s));
+    try std.testing.expectEqual(PayStatus.expired, store.payments.items(.status)[@intFromEnum(offer)]);
+    try std.testing.expectEqual(PayStatus.broadcast, store.payments.items(.status)[@intFromEnum(live)]);
+    // Idempotent: a second sweep changes nothing (expired is terminal).
+    try std.testing.expect(!sweepExpired(&store, 100 + 2 * payment_offer_ttl_s, payment_offer_ttl_s));
+
+    // Accessors resolve the card's conv and direction.
+    try std.testing.expectEqual(a, paymentConv(&store, offer));
+    try std.testing.expect(!paymentMine(&store, offer));
+    try std.testing.expect(paymentMine(&store, live));
+    try std.testing.expectEqual(@as(u32, 2), paymentCount(&store));
+
+    // The trust gate: a card with network evidence is a withdrawal's floor —
+    // the shell drops a remote cancel/decline on it (checked here as the
+    // pure predicate the gate consults).
+    try std.testing.expect(hasNetworkEvidence(.broadcast));
+    try std.testing.expect(hasNetworkEvidence(.confirming));
+    try std.testing.expect(hasNetworkEvidence(.settled));
+    try std.testing.expect(!hasNetworkEvidence(.pending_setup));
+    try std.testing.expect(!hasNetworkEvidence(.ready));
+    try std.testing.expect(!hasNetworkEvidence(.pending));
 }
 
 test "appendPayment creates the card + row pair with kind-derived status" {

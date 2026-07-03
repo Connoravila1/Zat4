@@ -276,6 +276,29 @@ pub fn main(init: std.process.Init) !void {
         try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
         try writePpm(io, gpa, &fb, "/tmp/zat_chat_pay.ppm");
         std.debug.print("wrote /tmp/zat_chat_pay.ppm (payment cards + the pay sheet)\n", .{});
+
+        // The S2 walletless-recipient offer cards (PAYMENT_UX_SPEC §4.1): an
+        // offer I RECEIVED (they want to send me sats; I have no wallet → "Set
+        // up a wallet to accept" + Decline), an offer I SENT that's now READY
+        // (they set up → "Send now?" + Cancel), and one still waiting. Every
+        // card's subline is honest that no money has moved.
+        {
+            const offer_in = try chat.appendPayment(gpa, &cstore, maya, .payment_sent, 0x5201, .onchain, 12_000, "for the prints", now - 90, false);
+            chat.initPaymentStatus(&cstore, offer_in, .pending_setup);
+            const offer_ready = try chat.appendPayment(gpa, &cstore, maya, .payment_sent, 0x5202, .lightning, 3_000, "", now - 60, true);
+            chat.initPaymentStatus(&cstore, offer_ready, .ready);
+            const offer_wait = try chat.appendPayment(gpa, &cstore, maya, .payment_sent, 0x5203, .onchain, 8_000, "coffee", now - 30, true);
+            chat.initPaymentStatus(&cstore, offer_wait, .pending_setup);
+
+            const s2_thread = try chat_view.buildThread(arena, &cstore, maya, now);
+            @memset(fb.pixels, clear);
+            dl.len = 0;
+            try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
+            _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, s2_thread.rows, s2_thread.cards, 0, "maya.zat4.com", "", true, false, "", "", .{}, .{}, &.{}, .{});
+            try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+            try writePpm(io, gpa, &fb, "/tmp/zat_chat_pay_s2.ppm");
+            std.debug.print("wrote /tmp/zat_chat_pay_s2.ppm (S2 walletless offer cards)\n", .{});
+        }
     }
 
     // TILING FOUNDATION (S.1) PROOF: the SAME real feed, but its pane geometry

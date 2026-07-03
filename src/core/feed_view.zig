@@ -162,7 +162,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, pay_arm, pay_confirm_back };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, pay_arm, pay_confirm_back };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -3831,16 +3831,54 @@ fn groupSats(buf: *[27]u8, v: u64) []const u8 {
     return buf[0..n];
 }
 
-/// The one action a payment card offers in its current state, if any: Pay
-/// (a counterparty's open request), Cancel (own just-initiated send, still
-/// unobserved), or Mark received (own request — the payee's wallet is the
-/// only place a lightning receipt shows, so the payee closes that loop
-/// until the on-chain watcher (A5) automates its rail).
-fn payCardAction(mine: bool, kind: chat_msg.Kind, status: chat_msg.PayStatus) ?Action {
-    if (!mine and kind == .payment_request and status == .requested) return .pay_card_pay;
-    if (mine and kind == .payment_sent and status == .pending) return .pay_card_cancel;
-    if (mine and kind == .payment_request and !chat_msg.isTerminalStatus(status)) return .pay_card_received;
-    return null;
+/// The actions a payment card offers in its current state. A card shows a
+/// PRIMARY (accent) button and, in the S2 offer states, an optional SECONDARY
+/// (muted) one — every action here moves no money until a wallet is opened.
+/// A7.2: cold transient, size guard waived — one per card render.
+const CardActions = struct { primary: ?Action = null, secondary: ?Action = null };
+
+/// What a card offers now:
+///   - counterparty's open REQUEST → **Pay**.
+///   - own REQUEST, still open → **Mark received** (the payee's wallet is the
+///     only place a lightning receipt shows, so the payee closes that loop
+///     until the on-chain watcher (A5) automates its rail).
+///   - S2 SEND offer (`pending_setup`) — recipient sees **Set up wallet** +
+///     **Decline**; the offering payer sees **Cancel**.
+///   - S2 `ready` (recipient set up) — the payer sees **Send** + **Cancel**;
+///     the recipient just waits.
+///   - own send handed to the wallet (`pending`) → **Cancel**.
+fn payCardActions(mine: bool, kind: chat_msg.Kind, status: chat_msg.PayStatus) CardActions {
+    if (kind == .payment_request) {
+        if (!mine and status == .requested) return .{ .primary = .pay_card_pay };
+        if (mine and !chat_msg.isTerminalStatus(status)) return .{ .primary = .pay_card_received };
+        return .{};
+    }
+    // payment_sent (a send / send-offer card).
+    switch (status) {
+        .pending_setup => return if (mine)
+            .{ .primary = .pay_card_cancel }
+        else
+            .{ .primary = .pay_card_setup, .secondary = .pay_card_decline },
+        .ready => return if (mine)
+            .{ .primary = .pay_card_send, .secondary = .pay_card_cancel }
+        else
+            .{}, // recipient waits for the payer to send
+        .pending => return if (mine) .{ .primary = .pay_card_cancel } else .{},
+        else => return .{},
+    }
+}
+
+/// The label a card action wears on its button.
+fn payActionLabel(act: Action) []const u8 {
+    return switch (act) {
+        .pay_card_pay => "Pay",
+        .pay_card_cancel => "Cancel",
+        .pay_card_received => "Mark received",
+        .pay_card_setup => "Set up wallet",
+        .pay_card_decline => "Decline",
+        .pay_card_send => "Send",
+        else => unreachable,
+    };
 }
 
 /// The status line's words ("" = the confirming blocks draw instead).
@@ -3926,7 +3964,7 @@ fn payCardHeight(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, b:
     var h: i32 = 12 + 16 + 30 + 38 + 10; // pads + rail tag + amount + status(head+sub)
     if (b.body.len > 0)
         h += try wrapBody(gpa, dl, e, 0, 0, cw2 - 28, 0, 13, b.body, 18, false, null) + 4;
-    if (payCardAction(b.mine, b.kind, card.status) != null) h += 44;
+    if (payCardActions(b.mine, b.kind, card.status).primary != null) h += 44;
     return h;
 }
 
@@ -4002,19 +4040,26 @@ fn drawPayCard(
             _ = try str(gpa, dl, e, .regular, bx + 14, ty + 32, muted, 11, pl.sub);
     }
     ty += 38;
-    if (payCardAction(b.mine, b.kind, card.status)) |act| {
-        const label: []const u8 = switch (act) {
-            .pay_card_pay => "Pay",
-            .pay_card_cancel => "Cancel",
-            .pay_card_received => "Mark received",
-            else => unreachable,
-        };
+    const acts = payCardActions(b.mine, b.kind, card.status);
+    if (acts.primary) |act| {
+        // The primary reads as the affirmative move (accent-filled), unless
+        // it is a Cancel — a withdrawal is never the loud button.
+        const filled = act != .pay_card_cancel;
+        const label = payActionLabel(act);
         const lw: i32 = @intCast(text.measure(e, .semibold, label, 13));
         const pw = lw + 32;
-        const primary = act == .pay_card_pay;
-        try rect(gpa, dl, bx + 14, ty + 4, pw, 34, if (primary) accent else 0x2AEDEAE0, 12);
-        _ = try str(gpa, dl, e, .semibold, bx + 30, ty + 26, if (primary) 0xFF20201A else body_c, 13, label);
+        try rect(gpa, dl, bx + 14, ty + 4, pw, 34, if (filled) accent else 0x2AEDEAE0, 12);
+        _ = try str(gpa, dl, e, .semibold, bx + 30, ty + 26, if (filled) 0xFF20201A else body_c, 13, label);
         try emitRegion(gpa, regions, bx + 14, ty + 4, pw, 34, ordinal, act);
+        if (acts.secondary) |sec| {
+            // A quiet secondary (Cancel/Decline) sits to the right, ghosted.
+            const slabel = payActionLabel(sec);
+            const slw: i32 = @intCast(text.measure(e, .semibold, slabel, 13));
+            const spw = slw + 28;
+            const sx = bx + 14 + pw + 10;
+            _ = try str(gpa, dl, e, .semibold, sx + 14, ty + 26, muted, 13, slabel);
+            try emitRegion(gpa, regions, sx, ty + 4, spw, 34, ordinal, sec);
+        }
     }
 }
 

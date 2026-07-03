@@ -418,6 +418,24 @@ pub fn sendPaymentEvent(
     return sendPaymentBytes(gpa, io, environ, st, link, peer_did, byte, frame);
 }
 
+/// An S2 lifecycle wire event (offer/ready/cancel/decline, bytes 20-23): the
+/// same frame the settlement events carry, never a stored kind. The offer
+/// (20) makes the receiver CREATE a `pending_setup` card; 21/22/23 flip an
+/// existing one. The `kind_byte` is the caller's contract (`kind_pay_*_wire`).
+pub fn sendPaymentSignal(
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    st: *State,
+    link: *chat_relay.ChatRelay,
+    peer_did: []const u8,
+    kind_byte: u8,
+    frame: chat.PaymentFrame,
+) SendError!void {
+    assert(kind_byte >= chat.kind_pay_offer_wire and kind_byte <= chat.kind_pay_decline_wire);
+    return sendPaymentBytes(gpa, io, environ, st, link, peer_did, kind_byte, frame);
+}
+
 fn sendPaymentBytes(
     gpa: Allocator,
     io: std.Io,
@@ -460,14 +478,20 @@ pub const Incoming = union(enum) {
         ref: [32]u8,
         kind: chat.Kind,
         rail: chat.Rail,
+        /// This is an S2 OFFER (wire byte 20) to a walletless recipient —
+        /// the drain creates the card at `pending_setup` (no money in
+        /// motion), not the kind's default. A stored payment_request/
+        /// payment_sent card carries `false`.
+        is_offer: bool,
     },
-    /// A settlement event (wire byte 18/19): flips an existing card to
-    /// settled/failed. Never stored as a message.
+    /// A lifecycle event that FLIPS an existing card (settlement bytes 18/19
+    /// or the S2 ready/cancel/decline 21/22/23): the receiver correlates by
+    /// id and advances the card to `status`. Never stored as a message.
     payment_update: struct {
         peer_did: []u8,
         id: u64,
         ref: [32]u8,
-        settled: bool,
+        status: chat.PayStatus,
     },
 };
 
@@ -591,16 +615,37 @@ pub fn onBucket(
                     if (data[0] == chat.kind_typing_wire) {
                         return .{ .typing = .{ .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]) } };
                     }
-                    // Settlement events (18/19): wire-only, like the ping —
-                    // but their effect persists (the card flips). A damaged
-                    // frame is dropped, never a crash (E3/E4).
-                    if (data[0] == chat.kind_pay_settled_wire or data[0] == chat.kind_pay_failed_wire) {
+                    // Card-FLIP events (settlement 18/19, S2 ready/cancel/
+                    // decline 21/22/23): wire-only, like the ping — but their
+                    // effect persists (the card advances). A damaged frame is
+                    // dropped, never a crash (E3/E4).
+                    if (chat.payEventStatus(data[0])) |to| {
                         const f = chat.parsePaymentFrame(data[1..]) catch return null;
                         return .{ .payment_update = .{
                             .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]),
                             .id = f.payment_id,
                             .ref = f.ref,
-                            .settled = data[0] == chat.kind_pay_settled_wire,
+                            .status = to,
+                        } };
+                    }
+                    // The S2 OFFER (20): a card CREATE, not a flip — the
+                    // recipient has no wallet, so no money is coming. Carries
+                    // a full frame like a stored payment card; the drain lands
+                    // it at `pending_setup` (never inferred from setup state,
+                    // §11.1). Modeled as `.payment` with `is_offer`.
+                    if (data[0] == chat.kind_pay_offer_wire) {
+                        const f = chat.parsePaymentFrame(data[1..]) catch return null;
+                        const note = try gpa.dupe(u8, f.note);
+                        errdefer gpa.free(note);
+                        return .{ .payment = .{
+                            .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]),
+                            .note = note,
+                            .id = f.payment_id,
+                            .amount_sat = f.amount_sat,
+                            .ref = f.ref,
+                            .kind = .payment_sent, // an offer to SEND me money
+                            .rail = f.rail,
+                            .is_offer = true,
                         } };
                     }
                     const kind = chat.parseKind(data[0]) catch return null; // reserved kinds refused until their milestone
@@ -616,6 +661,7 @@ pub fn onBucket(
                             .ref = f.ref,
                             .kind = kind,
                             .rail = f.rail,
+                            .is_offer = false,
                         } };
                     }
                     const text = try gpa.dupe(u8, data[1..]);
@@ -861,9 +907,58 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
         try bucketPack(&bucket, msg);
         const inc = (try onBucket(gpa, gpa, io, &env, &b2, &bucket)) orelse return error.TestUnexpectedResult;
         defer freeIncoming(gpa, inc);
-        try testing.expect(inc.payment_update.settled);
+        try testing.expectEqual(chat.PayStatus.settled, inc.payment_update.status);
         try testing.expectEqual(@as(u64, 0xCAFE), inc.payment_update.id);
         try testing.expectEqualSlices(u8, &preimage, &inc.payment_update.ref);
+    }
+
+    // An S2 offer (wire byte 20) crosses as a CREATE card marked is_offer,
+    // kind payment_sent (an offer to send me money) — never a stored kind.
+    {
+        var fbuf: [128]u8 = undefined;
+        const body = chat.buildPaymentFrame(&fbuf, .{
+            .payment_id = 0x0FFE,
+            .amount_sat = 7000,
+            .note = "coffee",
+            .ref = chat.zero_ref,
+            .rail = .onchain,
+        });
+        var plaintext: [160]u8 = undefined;
+        plaintext[0] = chat.kind_pay_offer_wire;
+        @memcpy(plaintext[1..][0..body.len], body);
+        const msg = try mls.encrypt(gpa, &a.groups.items[0], plaintext[0 .. 1 + body.len], 0, .{ 4, 4, 4, 4 });
+        defer gpa.free(msg);
+        var bucket: [relay.bucket_len]u8 = undefined;
+        try bucketPack(&bucket, msg);
+        const inc = (try onBucket(gpa, gpa, io, &env, &b2, &bucket)) orelse return error.TestUnexpectedResult;
+        defer freeIncoming(gpa, inc);
+        try testing.expect(inc.payment.is_offer);
+        try testing.expectEqual(chat.Kind.payment_sent, inc.payment.kind);
+        try testing.expectEqual(@as(u64, 0x0FFE), inc.payment.id);
+        try testing.expectEqual(@as(u64, 7000), inc.payment.amount_sat);
+    }
+
+    // An S2 ready signal (wire byte 21) crosses as a flip to `ready`.
+    {
+        var fbuf: [128]u8 = undefined;
+        const body = chat.buildPaymentFrame(&fbuf, .{
+            .payment_id = 0x0FFE,
+            .amount_sat = 7000,
+            .note = "",
+            .ref = chat.zero_ref,
+            .rail = .onchain,
+        });
+        var plaintext: [160]u8 = undefined;
+        plaintext[0] = chat.kind_pay_ready_wire;
+        @memcpy(plaintext[1..][0..body.len], body);
+        const msg = try mls.encrypt(gpa, &a.groups.items[0], plaintext[0 .. 1 + body.len], 0, .{ 5, 5, 5, 5 });
+        defer gpa.free(msg);
+        var bucket: [relay.bucket_len]u8 = undefined;
+        try bucketPack(&bucket, msg);
+        const inc = (try onBucket(gpa, gpa, io, &env, &b2, &bucket)) orelse return error.TestUnexpectedResult;
+        defer freeIncoming(gpa, inc);
+        try testing.expectEqual(chat.PayStatus.ready, inc.payment_update.status);
+        try testing.expectEqual(@as(u64, 0x0FFE), inc.payment_update.id);
     }
 
     // A damaged payment frame (short) is dropped, and the ratchet survives.

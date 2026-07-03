@@ -623,6 +623,7 @@ pub fn run(
     // the loop's stack.
     var gchain_job: ChainJob = .{};
     var gchain_last: i64 = 0;
+    var gexpire_last: i64 = 0;
     defer if (gchain_job.thread) |t| {
         t.join();
         gchain_job.thread = null;
@@ -1029,18 +1030,25 @@ pub fn run(
                                     if (chat_core.openConversation(gpa, &gchat_store, p.peer_did, "") catch null) |c| blk: {
                                         const ref: ?[32]u8 = if (std.mem.allEqual(u8, &p.ref, 0)) null else p.ref;
                                         if (chat_core.findPayment(&gchat_store, c, p.id)) |pay| {
-                                            // Only a `sent` card moves an existing
-                                            // card forward (a duplicate request is
-                                            // a no-op). To `pending` — the payer
-                                            // INITIATED; network evidence
-                                            // (broadcast/confirming) is A5's.
-                                            if (p.kind == .payment_sent) {
+                                            // An offer we already hold is a
+                                            // duplicate — no-op (E4). Otherwise
+                                            // only a `sent` card moves forward.
+                                            // To `pending` — the payer INITIATED;
+                                            // network evidence (broadcast/
+                                            // confirming) is A5's.
+                                            if (!p.is_offer and p.kind == .payment_sent) {
                                                 if (chat_core.advancePayment(gpa, &gchat_store, pay, .pending, ref) catch false)
                                                     chat_mutated = true;
                                             }
                                         } else {
                                             const pay = chat_core.appendPayment(gpa, &gchat_store, c, p.kind, p.id, p.rail, p.amount_sat, p.note, now, false) catch break :blk;
-                                            if (ref) |r| chat_core.setSettlementRef(gpa, &gchat_store, pay, r) catch {};
+                                            // S2: an offer to a walletless me lands
+                                            // BELOW the kind default — "{P} wants to
+                                            // send you {amt}", no money in motion.
+                                            if (p.is_offer)
+                                                chat_core.initPaymentStatus(&gchat_store, pay, .pending_setup)
+                                            else if (ref) |r|
+                                                chat_core.setSettlementRef(gpa, &gchat_store, pay, r) catch {};
                                             chat_mutated = true;
                                         }
                                     }
@@ -1048,15 +1056,26 @@ pub fn run(
                                     if (std.mem.eql(u8, p.peer_did, gchat_typing_peer_buf[0..gchat_typing_peer_len]))
                                         gchat_typing_deadline = 0;
                                 },
-                                // A settlement event: flips an existing card;
-                                // an unknown id is a straggler, dropped (E4).
+                                // A card-flip event (settlement, or S2 ready/
+                                // cancel/decline): advances an existing card to
+                                // the carried status; an unknown id is a
+                                // straggler, dropped (E4).
                                 .payment_update => |u| {
                                     if (chat_core.openConversation(gpa, &gchat_store, u.peer_did, "") catch null) |c| {
                                         if (chat_core.findPayment(&gchat_store, c, u.id)) |pay| {
-                                            const ref: ?[32]u8 = if (std.mem.allEqual(u8, &u.ref, 0)) null else u.ref;
-                                            const to: chat_core.PayStatus = if (u.settled) .settled else .failed;
-                                            if (chat_core.advancePayment(gpa, &gchat_store, pay, to, ref) catch false)
-                                                chat_mutated = true;
+                                            // Trust gate (§0 golden rule): a peer's
+                                            // WITHDRAWAL (cancel/decline) may not
+                                            // retire a card the chain has already
+                                            // witnessed — that would hide a real
+                                            // transfer. Settlement/forward events
+                                            // are unaffected. Dropped straggler = E4.
+                                            const cur = chat_core.paymentRow(&gchat_store, pay).status;
+                                            const withdrawal = u.status == .cancelled or u.status == .declined;
+                                            if (!(withdrawal and chat_core.hasNetworkEvidence(cur))) {
+                                                const ref: ?[32]u8 = if (std.mem.allEqual(u8, &u.ref, 0)) null else u.ref;
+                                                if (chat_core.advancePayment(gpa, &gchat_store, pay, u.status, ref) catch false)
+                                                    chat_mutated = true;
+                                            }
                                         }
                                     }
                                 },
@@ -1075,6 +1094,19 @@ pub fn run(
             // decrypted message can NEVER be recovered from the wire again, so
             // it reaches disk before this frame ends.
             if (chat_mutated) chatPersistHistory(gpa, io, environ, st, &gchat_store);
+        };
+
+        // Expire stale offers/requests (S2, §6): a pure, local sweep to
+        // `expired` for any pre-money card older than the 24h TTL — both sides
+        // reach the same terminal from the same `created_at`, no wire. Cheap
+        // (linear over a handful of payments); riding the 60s chain cadence
+        // keeps it off the per-frame path. Persist only on an actual change.
+        if (dev_chat) if (gchat_e2ee) |*st| {
+            if (now - gexpire_last >= chain_poll_seconds) {
+                gexpire_last = now;
+                if (chat_core.sweepExpired(&gchat_store, now, chat_core.payment_offer_ttl_s))
+                    chatPersistHistory(gpa, io, environ, st, &gchat_store);
+            }
         };
 
         // The confirmation-watcher (M5 A5): spawn a poll cycle when one is
@@ -2691,7 +2723,14 @@ pub fn run(
                                             gpay_confirm = false;
                                             gpay_status = "";
                                         },
-                                        .recv_open => if (dev_chat) {
+                                        // The pay sheet's "Set up how you get
+                                        // paid" link AND an incoming offer card's
+                                        // "Set up wallet to accept" both open the
+                                        // receive onboarding (S2, PAYMENT_UX_SPEC
+                                        // §4.1). On save, `announceReceiveReady`
+                                        // flips the offer to ready + signals the
+                                        // payer — so the tap just opens the sheet.
+                                        .recv_open, .pay_card_setup => if (dev_chat) {
                                             if (!grecv_known) {
                                                 grecv_known = true;
                                                 _ = gchat_arena_state.reset(.retain_capacity);
@@ -2741,7 +2780,12 @@ pub fn run(
                                             const btc = std.mem.trim(u8, grecv_btc_buf[0..grecv_btc_len], " ");
                                             _ = gchat_arena_state.reset(.retain_capacity);
                                             grecv_status = saveReceiveAddress(gpa, gchat_arena_state.allocator(), io, environ, session, ln, btc, &grecv_saved);
-                                            if (grecv_saved) grecv_set = true;
+                                            if (grecv_saved) {
+                                                grecv_set = true;
+                                                // Now that I can receive, every offer
+                                                // waiting on me can proceed (S2).
+                                                announceReceiveReady(gpa, io, environ, if (gchat_e2ee) |*p| p else null, gchat_link, &gchat_store);
+                                            }
                                         },
                                         // Compose "Send" ARMS the confirm face (no
                                         // money yet); the real hand-off is .pay_send.
@@ -2794,10 +2838,47 @@ pub fn run(
                                                 }
                                             }
                                         },
-                                        .pay_card_cancel, .pay_card_received => if (dev_chat) {
+                                        .pay_card_received => if (dev_chat) {
                                             if (gchat_sel) |sc| {
                                                 if (payRowByOrdinal(gpa, &gchat_store, sc, hit.post)) |row| {
-                                                    payCardEvent(gpa, io, environ, if (gchat_e2ee) |*p| p else null, gchat_link, &gchat_store, sc, row.payment_id, hit.kind == .pay_card_received);
+                                                    payCardEvent(gpa, io, environ, if (gchat_e2ee) |*p| p else null, gchat_link, &gchat_store, sc, row.payment_id, true);
+                                                }
+                                            }
+                                        },
+                                        // Withdraw an offer/send (→ cancelled) or
+                                        // turn down an incoming offer (→ declined):
+                                        // both flip BOTH sides and move no money
+                                        // (S2). Each terminal names itself (§8.5).
+                                        .pay_card_cancel, .pay_card_decline => if (dev_chat) {
+                                            if (gchat_sel) |sc| {
+                                                if (payRowByOrdinal(gpa, &gchat_store, sc, hit.post)) |row| {
+                                                    const decline = hit.kind == .pay_card_decline;
+                                                    payCardSignal(
+                                                        gpa,
+                                                        io,
+                                                        environ,
+                                                        if (gchat_e2ee) |*p| p else null,
+                                                        gchat_link,
+                                                        &gchat_store,
+                                                        sc,
+                                                        row.payment_id,
+                                                        if (decline) .declined else .cancelled,
+                                                        if (decline) chat_core.kind_pay_decline_wire else chat_core.kind_pay_cancel_wire,
+                                                    );
+                                                }
+                                            }
+                                        },
+                                        // A `ready` offer card's Send: the peer
+                                        // set up a wallet, so the standard send leg
+                                        // now resolves — re-confirm has already
+                                        // happened at the card (money-critical, so
+                                        // the hand-off is a deliberate tap).
+                                        .pay_card_send => if (dev_chat) {
+                                            if (gchat_sel) |sc| {
+                                                if (payRowByOrdinal(gpa, &gchat_store, sc, hit.post)) |row| {
+                                                    _ = gchat_arena_state.reset(.retain_capacity);
+                                                    const verdict = paySend(gpa, gchat_arena_state.allocator(), io, environ, if (gchat_e2ee) |*p| p else null, gchat_link, &gchat_store, sc, row.rail, row.amount_sat, "", row.payment_id, now);
+                                                    status = if (verdict.len == 0) "pay: handed to your wallet" else verdict;
                                                 }
                                             }
                                         },
@@ -3168,7 +3249,10 @@ pub fn run(
                         const btc = std.mem.trim(u8, grecv_btc_buf[0..grecv_btc_len], " ");
                         _ = gchat_arena_state.reset(.retain_capacity);
                         grecv_status = saveReceiveAddress(gpa, gchat_arena_state.allocator(), io, environ, session, ln, btc, &grecv_saved);
-                        if (grecv_saved) grecv_set = true;
+                        if (grecv_saved) {
+                            grecv_set = true;
+                            announceReceiveReady(gpa, io, environ, if (gchat_e2ee) |*p| p else null, gchat_link, &gchat_store);
+                        }
                     },
                     .char => |zc| if (grecv_mode == .paste) {
                         if (zc == 8 or zc == 127) {
@@ -4068,8 +4152,15 @@ fn paySend(
     const anchor_pub = chat_e2ee.peerAnchor(state, peer_did) orelse
         return "No secure conversation with them yet";
     const rails = (pay_addr.fetchPayee(gpa, arena, io, env, peer_did, anchor_pub) catch
-        return "Couldn't verify their payment record") orelse
-        return "They haven't set up payments";
+        return "Couldn't verify their payment record") orelse {
+        // They have published no receive address. A FRESH send becomes an
+        // in-thread OFFER (S2) — no money moves; when they set up a wallet
+        // they signal ready and the payer re-confirms (PAYMENT_UX_SPEC §4.1).
+        // Paying an existing REQUEST with no payee is a stale record, not an
+        // offer — the requester asked to be paid, so they had an address.
+        if (paying != null) return "They haven't set up payments";
+        return payOffer(gpa, io, env, state, l, cs, conv, rail, amount_sat, note, now);
+    };
     const addr = switch (rail) {
         .lightning => rails.lightning,
         .onchain => rails.bitcoin,
@@ -4107,6 +4198,109 @@ fn paySend(
         .rail = rail,
     }) catch return "Wallet opened, but the card couldn't reach them";
     return "";
+}
+
+/// A FRESH send to a walletless recipient (S2): mint the card at
+/// `pending_setup` (no money moves — "Waiting to send"), persist, and send
+/// the offer wire byte (20) so the peer sees "{P} wants to send you {amt}".
+/// No `launch.openUri` — there is no address to hand a wallet yet. Returns
+/// the status line ("" = the offer stands).
+fn payOffer(
+    gpa: Allocator,
+    io: std.Io,
+    env: ?*const std.process.Environ.Map,
+    state: *chat_e2ee.State,
+    l: *chat_relay.ChatRelay,
+    cs: *chat_core.Store,
+    conv: chat_core.ConvIndex,
+    rail: chat_core.Rail,
+    amount_sat: u64,
+    note: []const u8,
+    now: i64,
+) []const u8 {
+    const id = payMintId(io) orelse return "No entropy — try again";
+    if (chat_core.findPayment(cs, conv, id) != null) return "Try again"; // 2^-64 event
+    const pay = chat_core.appendPayment(gpa, cs, conv, .payment_sent, id, rail, amount_sat, note, now, true) catch
+        return "Out of memory";
+    chat_core.initPaymentStatus(cs, pay, .pending_setup);
+    chatPersistHistory(gpa, io, env, state, cs);
+    chat_e2ee.sendPaymentSignal(gpa, io, env, state, l, chat_core.conversationDid(cs, conv), chat_core.kind_pay_offer_wire, .{
+        .payment_id = id,
+        .amount_sat = amount_sat,
+        .note = note,
+        .ref = chat_core.zero_ref,
+        .rail = rail,
+    }) catch return "Offer saved here — couldn't reach them";
+    return "";
+}
+
+/// An S2 lifecycle event on a card (Cancel an offer → `cancelled`, Decline
+/// an offer → `declined`): advance the local card, persist, and signal the
+/// peer with the matching wire byte. A no-op on a terminal card (E4).
+fn payCardSignal(
+    gpa: Allocator,
+    io: std.Io,
+    env: ?*const std.process.Environ.Map,
+    st: ?*chat_e2ee.State,
+    link: ?*chat_relay.ChatRelay,
+    cs: *chat_core.Store,
+    conv: chat_core.ConvIndex,
+    payment_id: u64,
+    to: chat_core.PayStatus,
+    wire_byte: u8,
+) void {
+    const pay = chat_core.findPayment(cs, conv, payment_id) orelse return;
+    const row = chat_core.paymentRow(cs, pay);
+    if (!(chat_core.advancePayment(gpa, cs, pay, to, null) catch false)) return;
+    const state = st orelse return;
+    chatPersistHistory(gpa, io, env, state, cs);
+    if (link) |l| {
+        chat_e2ee.sendPaymentSignal(gpa, io, env, state, l, chat_core.conversationDid(cs, conv), wire_byte, .{
+            .payment_id = payment_id,
+            .amount_sat = row.amount_sat,
+            .note = "",
+            .ref = chat_core.zero_ref,
+            .rail = row.rail,
+        }) catch {};
+    }
+}
+
+/// I just published a receive address — every offer sitting in
+/// `pending_setup` (someone waiting to send me money, on any conversation)
+/// can now proceed: advance it to `ready` locally and signal that payer with
+/// the ready wire byte (21) so their card reads "Ready — Send now?". Scans
+/// all payments; the offers are the counterparty's (`!paymentMine`).
+fn announceReceiveReady(
+    gpa: Allocator,
+    io: std.Io,
+    env: ?*const std.process.Environ.Map,
+    st: ?*chat_e2ee.State,
+    link: ?*chat_relay.ChatRelay,
+    cs: *chat_core.Store,
+) void {
+    const state = st orelse return;
+    var changed = false;
+    const n = chat_core.paymentCount(cs);
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const pay: chat_core.PayIndex = @enumFromInt(i);
+        const row = chat_core.paymentRow(cs, pay);
+        if (row.status != .pending_setup) continue;
+        if (chat_core.paymentMine(cs, pay)) continue; // my OWN offers aren't mine to ready
+        const conv = chat_core.paymentConv(cs, pay);
+        if (!(chat_core.advancePayment(gpa, cs, pay, .ready, null) catch false)) continue;
+        changed = true;
+        if (link) |l| {
+            chat_e2ee.sendPaymentSignal(gpa, io, env, state, l, chat_core.conversationDid(cs, conv), chat_core.kind_pay_ready_wire, .{
+                .payment_id = row.payment_id,
+                .amount_sat = row.amount_sat,
+                .note = "",
+                .ref = chat_core.zero_ref,
+                .rail = row.rail,
+            }) catch {};
+        }
+    }
+    if (changed) chatPersistHistory(gpa, io, env, state, cs);
 }
 
 /// A card's Cancel (own unobserved send) / Mark received (own request —
