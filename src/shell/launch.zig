@@ -24,19 +24,48 @@
 //! scheme is the app that opens — no whitelist, no per-wallet integration
 //! (PART II §2).
 //!
-//! Linux: `xdg-open`. (mac `open` / win `start` are the cross-platform
-//! follow-ups, same posture as the GPU seam.) Failure is ordinary and
-//! surfaced to the caller (headless box, no handler registered): callers
-//! show the URI so the user can act on it themselves (E4).
+//! Linux: `xdg-open`. macOS: `open`. Windows: ShellExecuteW — NOT `cmd /c
+//! start`, which re-parses its command line and mangles the `&`s inside
+//! OAuth/LNURL query strings. Failure is ordinary and surfaced to the
+//! caller (headless box, no handler registered): callers show the URI so
+//! the user can act on it themselves (E4).
 
 const std = @import("std");
+const builtin = @import("builtin");
+
+// The Win32 ABI, declared locally (D3) — same doctrine as shell/win32.zig.
+extern "shell32" fn ShellExecuteW(
+    hwnd: ?*anyopaque,
+    operation: ?[*:0]const u16,
+    file: [*:0]const u16,
+    parameters: ?[*:0]const u16,
+    directory: ?[*:0]const u16,
+    show_cmd: i32,
+) callconv(.winapi) ?*anyopaque;
 
 /// Open `uri` with the OS default handler for its scheme. Blocks only for
-/// the handler dispatch (xdg-open execs and exits), never for the target
-/// application.
+/// the handler dispatch, never for the target application.
 pub fn openUri(io: std.Io, uri: []const u8) !void {
+    if (comptime builtin.os.tag == .windows) {
+        // UTF-16 for the OS ABI. A URI is ASCII by construction; the buffer
+        // still covers the general case, and overflow is an ordinary launch
+        // failure (the caller prints the URI), not a crash.
+        var wbuf: [2048]u16 = undefined;
+        const n = std.unicode.utf8ToUtf16Le(wbuf[0 .. wbuf.len - 1], uri) catch return error.LaunchFailed;
+        if (n >= wbuf.len) return error.LaunchFailed;
+        wbuf[n] = 0;
+        const verb = std.unicode.utf8ToUtf16LeStringLiteral("open");
+        // Per the ABI, the returned pseudo-HINSTANCE is > 32 on success.
+        const r = ShellExecuteW(null, verb, wbuf[0..n :0], null, null, 1);
+        if (@intFromPtr(r) <= 32) return error.LaunchFailed;
+        return;
+    }
+    const argv: []const []const u8 = if (comptime builtin.os.tag.isDarwin())
+        &.{ "open", uri }
+    else
+        &.{ "xdg-open", uri };
     var child = try std.process.spawn(io, .{
-        .argv = &.{ "xdg-open", uri },
+        .argv = argv,
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,

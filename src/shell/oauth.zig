@@ -41,6 +41,14 @@ const oauth_flow = @import("../core/oauth_flow.zig");
 const pkce = @import("../core/pkce.zig");
 const Scheme = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 
+// Windows-only (referenced solely from the comptime .windows branch in
+// awaitCallback, so nothing here reaches a non-Windows link): the receive-
+// timeout socket option standing in for the POSIX poll bound. Declared
+// locally, same doctrine as shell/win32.zig (D3).
+extern "ws2_32" fn setsockopt(s: std.posix.fd_t, level: i32, optname: i32, optval: [*]const u8, optlen: i32) callconv(.winapi) i32;
+const SOL_SOCKET: i32 = 0xffff;
+const SO_RCVTIMEO: i32 = 0x1006;
+
 /// Metadata documents are small flat JSON; 256 KiB is luxurious headroom while
 /// still bounding a hostile server (the transport also enforces its own cap).
 const max_metadata_bytes: usize = 256 * 1024;
@@ -293,6 +301,14 @@ fn awaitCallback(scratch: Allocator, io: std.Io, server: *std.Io.net.Server, can
             var pfds = [_]std.posix.pollfd{.{ .fd = stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
             const ready = std.posix.poll(&pfds, 5_000) catch 0;
             if (ready == 0) continue;
+        } else {
+            // The same 5 s bound in the Windows form: this std snapshot has
+            // no ws2_32 pollfd, so a receive TIMEOUT (SO_RCVTIMEO) makes a
+            // silent preconnect ERROR out of receiveHead below — which the
+            // `catch continue` already treats as "next connection" — instead
+            // of blocking the whole login forever.
+            const timeout_ms: u32 = 5_000;
+            _ = setsockopt(stream.socket.handle, SOL_SOCKET, SO_RCVTIMEO, @ptrCast(&timeout_ms), @sizeOf(u32));
         }
 
         var read_buf: [16 * 1024]u8 = undefined;

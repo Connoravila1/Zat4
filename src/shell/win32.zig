@@ -132,6 +132,12 @@ extern "kernel32" fn GetLastError() callconv(.winapi) u32;
 extern "user32" fn RegisterClassExW(class: *const WNDCLASSEXW) callconv(.winapi) u16;
 extern "user32" fn LoadCursorW(hInstance: HINSTANCE, lpCursorName: usize) callconv(.winapi) HCURSOR;
 extern "user32" fn SetCursor(hCursor: HCURSOR) callconv(.winapi) HCURSOR;
+// DPI: per-monitor-v2 awareness + the system scale for initial sizing.
+// Static imports — the exe needs Windows 10 1703+ (2017), recorded as the
+// support floor rather than dressed up in dynamic lookups.
+extern "user32" fn SetProcessDpiAwarenessContext(value: ?*anyopaque) callconv(.winapi) i32;
+extern "user32" fn GetDpiForSystem() callconv(.winapi) u32;
+extern "kernel32" fn SetConsoleOutputCP(codepage: u32) callconv(.winapi) i32;
 extern "user32" fn AdjustWindowRect(lpRect: *RECT, dwStyle: u32, bMenu: i32) callconv(.winapi) i32;
 extern "user32" fn CreateWindowExW(
     dwExStyle: u32,
@@ -293,6 +299,16 @@ pub fn open(
     rows: u16,
 ) OpenError!*Window {
     _ = environ;
+
+    // Per-monitor-v2 DPI awareness, declared before any window exists:
+    // without it Windows renders the process at 96 DPI and bitmap-stretches
+    // it to the display scale — the classic "blurry app". Best-effort: the
+    // call is absent pre-1703, and failing means blurry, not broken.
+    _ = SetProcessDpiAwarenessContext(@ptrFromInt(@as(usize, @bitCast(@as(isize, -4)))));
+    // Debug builds run with a console attached; its legacy codepage mangles
+    // the UTF-8 diagnostics. Flip it to UTF-8 (65001). Cosmetic, once.
+    _ = SetConsoleOutputCP(65001);
+
     const hinstance = GetModuleHandleW(null);
 
     const class: WNDCLASSEXW = .{
@@ -307,8 +323,13 @@ pub fn open(
         return error.ConnectFailed;
     }
 
-    const width: i32 = @as(i32, cols) * @as(i32, @intCast(text.cell_w));
-    const height: i32 = @as(i32, rows) * @as(i32, @intCast(text.cell_h));
+    // Size by the system scale so the DPI-aware window keeps the physical
+    // footprint the caller asked for (cols/rows are 96-DPI cells). Content
+    // is still laid out in physical pixels — crisp, if smaller type than
+    // the GPU path's scaled layout until roadmap W5 lands.
+    const dpi: i32 = @intCast(@max(96, GetDpiForSystem()));
+    const width: i32 = @divTrunc(@as(i32, cols) * @as(i32, @intCast(text.cell_w)) * dpi, 96);
+    const height: i32 = @divTrunc(@as(i32, rows) * @as(i32, @intCast(text.cell_h)) * dpi, 96);
     var frame: RECT = .{ .left = 0, .top = 0, .right = width, .bottom = height };
     _ = AdjustWindowRect(&frame, ws_overlappedwindow, 0);
 
