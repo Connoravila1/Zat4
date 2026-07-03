@@ -189,7 +189,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -3760,12 +3760,17 @@ fn scaleAlpha(color: u32, a: f32) u32 {
 // frame's values (B2) — the shell owns state, springs, and every side effect.
 // ---------------------------------------------------------------------------
 
+/// How the amount is ENTERED and displayed. The stored/sent value is always
+/// satoshis; BTC is a decimal-entry convenience for larger numbers.
+pub const PayUnit = enum(u8) { sats, btc };
+
 /// The pay sheet's per-frame state — shell values in, pixels out.
 /// A7.2: cold struct, size guard waived — one transient parameter carrier.
 pub const ChatPaySheet = struct {
     open: bool = false,
     rail: chat_msg.Rail = .lightning,
-    /// The amount draft (digits only — the shell filters keystrokes).
+    /// The amount draft — digits in sats mode, a decimal in BTC mode (the
+    /// shell filters keystrokes to the unit).
     amount: []const u8 = "",
     note: []const u8 = "",
     /// 0 = the amount field owns the keyboard, 1 = the note.
@@ -3780,7 +3785,59 @@ pub const ChatPaySheet = struct {
     /// acknowledged this session — the confirm face shows the full warning
     /// (§8.1) the first time, then the short line after.
     first_send: bool = true,
+    /// The entry unit for `amount` (sats or BTC).
+    unit: PayUnit = .sats,
+    /// Live USD-cents per 1 BTC for the ≈$ readout (0 = unknown → hidden). A
+    /// plain price the shell refreshes off-thread; the view only formats it.
+    usd_cents_per_btc: u64 = 0,
 };
+
+/// Parse the amount draft to SATOSHIS for the entry unit — the ONE place
+/// amount-entry becomes a number, so the view's ≈$ and the shell's send can
+/// never disagree. Sats mode: a plain integer. BTC mode: a decimal (e.g.
+/// "0.0001"), truncated at 8 places. Null = empty / malformed / zero / above
+/// the max supply (caught before it can overflow).
+pub fn payAmountToSats(draft: []const u8, unit: PayUnit) ?u64 {
+    const s = std.mem.trim(u8, draft, " ");
+    if (s.len == 0) return null;
+    switch (unit) {
+        .sats => {
+            const v = std.fmt.parseInt(u64, s, 10) catch return null;
+            return if (v == 0) null else v;
+        },
+        .btc => {
+            const dot = std.mem.indexOfScalar(u8, s, '.');
+            const whole_str = if (dot) |d| s[0..d] else s;
+            const frac_str = if (dot) |d| s[d + 1 ..] else "";
+            for (whole_str) |c| if (c < '0' or c > '9') return null;
+            for (frac_str) |c| if (c < '0' or c > '9') return null;
+            const whole = std.fmt.parseInt(u64, if (whole_str.len == 0) "0" else whole_str, 10) catch return null;
+            if (whole > 21_000_000) return null; // above max supply → invalid, and keeps the product in u64
+            var frac: u64 = 0;
+            var scale: u64 = 100_000_000;
+            var i: usize = 0;
+            while (i < frac_str.len and i < 8) : (i += 1) {
+                scale /= 10;
+                frac += @as(u64, frac_str[i] - '0') * scale;
+            }
+            const total = whole * 100_000_000 + frac;
+            return if (total == 0) null else total;
+        },
+    }
+}
+
+/// Format the ≈USD value of `amount_sat` at `cents_per_btc` (0 = unknown →
+/// ""). Integer math widened to u128 for the multiply — a max-supply amount
+/// times a price in cents overflows u64. "$1.23" / "$1,234.50".
+fn formatFiat(buf: []u8, amount_sat: u64, cents_per_btc: u64) []const u8 {
+    if (cents_per_btc == 0 or amount_sat == 0) return "";
+    const cents: u128 = (@as(u128, amount_sat) * cents_per_btc) / 100_000_000;
+    const dollars: u64 = @intCast(cents / 100);
+    const rem: u64 = @intCast(cents % 100);
+    var gb: [27]u8 = undefined;
+    const dg = groupSats(&gb, dollars);
+    return std.fmt.bufPrint(buf, "\u{2248} ${s}.{d:0>2}", .{ dg, rem }) catch "";
+}
 
 /// Which face of the receive-setup flow is showing.
 /// - `onboard`: the first-run empty state — "I have a wallet" vs "I don't yet".
@@ -4586,7 +4643,7 @@ pub fn layoutChat(
     // wallet hand-off. Who + ✓ verified, the amount, and the irreversibility
     // warning — the full first-time disclosure (§8.1) once, the short line after.
     if (pay.open and pay.confirm) {
-        const amt_val = std.fmt.parseInt(u64, pay.amount, 10) catch 0;
+        const amt_val = payAmountToSats(pay.amount, pay.unit) orelse 0;
         const large = amt_val >= pay_large_sat;
         const has_note = pay.note.len > 0;
         var sheet_h: i32 = 16 + 30 + 26 + 34; // pad + title + paying + amount
@@ -4618,7 +4675,13 @@ pub fn layoutChat(
             var gb: [27]u8 = undefined;
             const amt = groupSats(&gb, amt_val);
             const pen = try str(gpa, dl, e, .semibold, detail_x + 18, py + 22, ink, 22, amt);
-            _ = try str(gpa, dl, e, .regular, pen + 6, py + 22, muted, 13, "sats");
+            const pen2 = try str(gpa, dl, e, .regular, pen + 6, py + 22, muted, 13, "sats");
+            // The ≈$ value at the confirm moment too — the amount is fixed now.
+            if (pay.usd_cents_per_btc > 0) {
+                var fbuf: [40]u8 = undefined;
+                const fs = formatFiat(&fbuf, amt_val, pay.usd_cents_per_btc);
+                if (fs.len > 0) _ = try str(gpa, dl, e, .regular, pen2 + 10, py + 22, faint, 12, fs);
+            }
             const rl = if (pay.rail == .lightning) "LIGHTNING" else "ON-CHAIN";
             const rw: i32 = @intCast(text.measure(e, .semibold, rl, 11));
             _ = try str(gpa, dl, e, .semibold, detail_x + detail_w - 18 - rw, py + 18, faint, 11, rl);
@@ -4662,8 +4725,12 @@ pub fn layoutChat(
 
     if (pay.open and !pay.confirm) {
         const status_extra: i32 = if (pay.status.len > 0) 24 else 0;
+        // The ≈$ line shows only when a price is known and the amount parses.
+        const sheet_sats = payAmountToSats(pay.amount, pay.unit);
+        const show_fiat = pay.usd_cents_per_btc > 0 and sheet_sats != null;
+        const fiat_extra: i32 = if (show_fiat) 20 else 0;
         // +30 for the "set up how you get paid" link row at the foot.
-        const sheet_h: i32 = 254 + 30 + status_extra;
+        const sheet_h: i32 = 254 + 30 + status_extra + fiat_extra;
         const sy0 = comp_y - sheet_h - 12;
         try rect(gpa, dl, detail_x, sy0, detail_w, sheet_h, 0xFF201F18, 16);
         const ring_c = (0x90 << 24) | (accent & 0x00FFFFFF);
@@ -4710,8 +4777,10 @@ pub fn layoutChat(
         py += 40;
         // The two inputs: amount (digits) and note. The focused one wears
         // the ring + caret — the composer's focus vocabulary.
+        const unit_label = if (pay.unit == .btc) "BTC" else "sats";
+        const amount_ph = if (pay.unit == .btc) "amount in BTC" else "amount in sats";
         const fields = [2]struct { draft: []const u8, ph: []const u8, act: Action }{
-            .{ .draft = pay.amount, .ph = "amount in sats", .act = .pay_amount },
+            .{ .draft = pay.amount, .ph = amount_ph, .act = .pay_amount },
             .{ .draft = pay.note, .ph = "note (optional)", .act = .pay_note },
         };
         for (fields, 0..) |fld, fi| {
@@ -4727,7 +4796,6 @@ pub fn layoutChat(
             var fpen: i32 = detail_x + 32;
             if (fld.draft.len > 0) {
                 fpen = try str(gpa, dl, e, if (fi == 0) .semibold else .regular, detail_x + 32, py + 25, ink, 14, fld.draft);
-                if (fi == 0) _ = try str(gpa, dl, e, .regular, fpen + 6, py + 25, muted, 12, "sats");
             } else {
                 _ = try str(gpa, dl, e, .regular, detail_x + 32, py + 25, faint, 14, fld.ph);
             }
@@ -4736,7 +4804,26 @@ pub fn layoutChat(
                 try rect(gpa, dl, fpen + 2, py + 10, 2, 18, scaleAlpha((0xE0 << 24) | (accent & 0x00FFFFFF), ca), 0);
             }
             try emitRegion(gpa, regions, detail_x + 18, py, detail_w - 36, 38, 0, fld.act);
+            // The amount row carries a tappable UNIT toggle (sats ⇄ BTC),
+            // right-aligned inside the field.
+            if (fi == 0) {
+                const ulw: i32 = @intCast(text.measure(e, .semibold, unit_label, 12));
+                const upw = ulw + 22;
+                const ux = detail_x + detail_w - 19 - upw - 3;
+                try rect(gpa, dl, ux, py + 4, upw, 30, 0x33EDEAE0, 10);
+                _ = try str(gpa, dl, e, .semibold, ux + 11, py + 25, body_c, 12, unit_label);
+                try emitRegion(gpa, regions, ux, py + 4, upw, 30, 0, .pay_unit);
+            }
             py += 46;
+            // The ≈$ readout under the amount (a price we know, an amount we can read).
+            if (fi == 0 and show_fiat) {
+                var fbuf: [40]u8 = undefined;
+                const fs = formatFiat(&fbuf, sheet_sats.?, pay.usd_cents_per_btc);
+                if (fs.len > 0) {
+                    _ = try str(gpa, dl, e, .regular, detail_x + 20, py + 2, muted, 12, fs);
+                    py += 20;
+                }
+            }
         }
         if (pay.status.len > 0) {
             _ = try str(gpa, dl, e, .regular, detail_x + 20, py + 12, 0xFFE0A868, 13, pay.status);

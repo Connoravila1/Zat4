@@ -50,6 +50,7 @@ const chat_relay = @import("chat_relay.zig");
 const chat_e2ee = @import("chat_e2ee.zig");
 const pay_addr = @import("pay_addr.zig");
 const lnurl = @import("lnurl.zig");
+const http = @import("http.zig");
 const payuri = @import("../core/payuri.zig");
 const launch = @import("launch.zig");
 const chainwatch_core = @import("../core/chainwatch.zig");
@@ -603,6 +604,12 @@ pub fn run(
     // The send-confirm face (§8.2) + the once-per-session first-time disclosure.
     var gpay_confirm: bool = false;
     var gpay_first_send: bool = true;
+    // The amount entry unit (sats/BTC) + the live USD-cents-per-BTC price for
+    // the ≈$ readout (0 = unknown; refreshed off-thread).
+    var gpay_unit: feed_view.PayUnit = .sats;
+    var gprice_cents: u64 = 0;
+    var gprice_last: i64 = 0;
+    var gprice_job: PriceJob = .{};
     // The receive-setup sheet (set up YOUR chat wallet). Addresses can be long
     // (bech32 ~62 chars, lightning addresses too), so give the buffers room.
     var grecv_open: bool = false;
@@ -1138,6 +1145,24 @@ pub fn run(
                 }
                 std.heap.page_allocator.free(greceive_job.did);
                 greceive_job.did = &.{};
+            }
+        }
+
+        // Refresh the BTC/USD price off-thread for the ≈$ readout: once on
+        // arrival, then every ~5 minutes. A dead source just leaves the last
+        // known price (or none — the readout stays hidden).
+        if (dev_chat and gscreen == feed_view.screen_messages) {
+            if (gprice_job.thread == null and (gprice_cents == 0 or now - gprice_last >= 300)) {
+                gprice_last = now;
+                gprice_job.done.store(false, .monotonic);
+                gprice_job.ok = false;
+                gprice_job.thread = std.Thread.spawn(.{}, priceWorker, .{ &gprice_job, io, environ }) catch null;
+            } else if (gprice_job.thread) |t| {
+                if (gprice_job.done.load(.acquire)) {
+                    t.join();
+                    gprice_job.thread = null;
+                    if (gprice_job.ok) gprice_cents = gprice_job.usd_cents;
+                }
             }
         }
 
@@ -1734,7 +1759,7 @@ pub fn run(
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .market = if (gscreen == feed_view.screen_loadout and gloadout_tab == 1) market_cards.items else &.{}, .create = .{ .step = gcreate_step, .answers = gcreate_answers, .config = gcreate_config, .name = gcreate_name_buf[0..gcreate_name_len], .color = gcreate_color, .naming = gcreate_step == .name, .prepare_t = create_prepare_t }, .bench = bench_tray, .inspect_bytes = inspect_bytes orelse "", .inspect_name = inspect_name, .inspect_ref = inspect_ref, .inspect_source = gtransp_source, .inspect_loading = inspect_loading, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .chat_store = if (dev_chat) &gchat_store else null, .chat_sel = gchat_sel, .chat_draft = gchat_draft_buf[0..gchat_draft_len], .chat_input_focus = gchat_input_focus, .chat_composing = gchat_composing, .chat_compose = gchat_peer_buf[0..gchat_peer_len], .chat_compose_status = gchat_compose_status, .chat_typing = gscreen == feed_view.screen_messages and now < gchat_typing_deadline and gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&gchat_store, gchat_sel.?), gchat_typing_peer_buf[0..gchat_typing_peer_len]), .chat_key_ns = gchat_key_ns, .chat_pay = .{ .open = gpay_open, .rail = gpay_rail, .amount = gpay_amount_buf[0..gpay_amount_len], .note = gpay_note_buf[0..gpay_note_len], .focus = gpay_focus, .status = gpay_status, .confirm = gpay_confirm, .first_send = gpay_first_send }, .chat_recv = .{ .open = grecv_open, .mode = grecv_mode, .lightning = grecv_ln_buf[0..grecv_ln_len], .bitcoin = grecv_btc_buf[0..grecv_btc_len], .focus = grecv_focus, .status = grecv_status, .saved = grecv_saved }, .expanded = gexpanded.items, .repost_menu = if (grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
+        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .market = if (gscreen == feed_view.screen_loadout and gloadout_tab == 1) market_cards.items else &.{}, .create = .{ .step = gcreate_step, .answers = gcreate_answers, .config = gcreate_config, .name = gcreate_name_buf[0..gcreate_name_len], .color = gcreate_color, .naming = gcreate_step == .name, .prepare_t = create_prepare_t }, .bench = bench_tray, .inspect_bytes = inspect_bytes orelse "", .inspect_name = inspect_name, .inspect_ref = inspect_ref, .inspect_source = gtransp_source, .inspect_loading = inspect_loading, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .chat_store = if (dev_chat) &gchat_store else null, .chat_sel = gchat_sel, .chat_draft = gchat_draft_buf[0..gchat_draft_len], .chat_input_focus = gchat_input_focus, .chat_composing = gchat_composing, .chat_compose = gchat_peer_buf[0..gchat_peer_len], .chat_compose_status = gchat_compose_status, .chat_typing = gscreen == feed_view.screen_messages and now < gchat_typing_deadline and gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&gchat_store, gchat_sel.?), gchat_typing_peer_buf[0..gchat_typing_peer_len]), .chat_key_ns = gchat_key_ns, .chat_pay = .{ .open = gpay_open, .rail = gpay_rail, .amount = gpay_amount_buf[0..gpay_amount_len], .note = gpay_note_buf[0..gpay_note_len], .focus = gpay_focus, .status = gpay_status, .confirm = gpay_confirm, .first_send = gpay_first_send, .unit = gpay_unit, .usd_cents_per_btc = gprice_cents }, .chat_recv = .{ .open = grecv_open, .mode = grecv_mode, .lightning = grecv_ln_buf[0..grecv_ln_len], .bitcoin = grecv_btc_buf[0..grecv_btc_len], .focus = grecv_focus, .status = grecv_status, .saved = grecv_saved }, .expanded = gexpanded.items, .repost_menu = if (grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
         switch (mode) {
             .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status),
             .compose => {
@@ -2754,6 +2779,7 @@ pub fn run(
                                                     @memcpy(gpay_amount_buf[0..s.len], s);
                                                     gpay_amount_len = s.len;
                                                 }
+                                                gpay_unit = .sats; // the chips are sats amounts
                                                 gpay_focus = 0;
                                             }
                                         },
@@ -2762,6 +2788,15 @@ pub fn run(
                                         },
                                         .pay_note => if (dev_chat) {
                                             gpay_focus = 1;
+                                        },
+                                        // Toggle the entry unit; clear the draft (a
+                                        // sats integer isn't a BTC decimal) so nothing
+                                        // is silently reinterpreted by 1e8.
+                                        .pay_unit => if (dev_chat) {
+                                            gpay_unit = if (gpay_unit == .sats) .btc else .sats;
+                                            gpay_amount_len = 0;
+                                            gpay_focus = 0;
+                                            gpay_status = "";
                                         },
                                         .pay_cancel => if (dev_chat) {
                                             gpay_open = false;
@@ -2857,7 +2892,7 @@ pub fn run(
                                         // (.pay_send). A refusal lands on the sheet.
                                         .pay_arm => if (dev_chat) {
                                             if (gchat_sel) |sc| {
-                                                const amount = std.fmt.parseInt(u64, gpay_amount_buf[0..gpay_amount_len], 10) catch 0;
+                                                const amount = feed_view.payAmountToSats(gpay_amount_buf[0..gpay_amount_len], gpay_unit) orelse 0;
                                                 if (amount == 0 or amount > chat_core.max_amount_sat) {
                                                     gpay_status = "Enter an amount in sats";
                                                 } else {
@@ -2889,7 +2924,7 @@ pub fn run(
                                         },
                                         .pay_request, .pay_send => if (dev_chat) {
                                             if (gchat_sel) |sc| {
-                                                const amount = std.fmt.parseInt(u64, gpay_amount_buf[0..gpay_amount_len], 10) catch 0;
+                                                const amount = feed_view.payAmountToSats(gpay_amount_buf[0..gpay_amount_len], gpay_unit) orelse 0;
                                                 if (amount == 0 or amount > chat_core.max_amount_sat) {
                                                     gpay_status = "Enter an amount in sats";
                                                 } else {
@@ -3397,7 +3432,7 @@ pub fn run(
                         gpay_status = "";
                     },
                     .enter => if (gchat_sel) |sc| {
-                        const amount = std.fmt.parseInt(u64, gpay_amount_buf[0..gpay_amount_len], 10) catch 0;
+                        const amount = feed_view.payAmountToSats(gpay_amount_buf[0..gpay_amount_len], gpay_unit) orelse 0;
                         if (amount == 0 or amount > chat_core.max_amount_sat) {
                             gpay_status = "Enter an amount in sats";
                         } else if (!gpay_confirm) {
@@ -3448,7 +3483,12 @@ pub fn run(
                         } else if (zc == 9) {
                             gpay_focus = 1 - gpay_focus;
                         } else if (gpay_focus == 0) {
-                            if (zc >= '0' and zc <= '9' and gpay_amount_len < gpay_amount_buf.len) {
+                            // BTC mode accepts one decimal point; sats mode is
+                            // digits only.
+                            const is_digit = zc >= '0' and zc <= '9';
+                            const is_dot = zc == '.' and gpay_unit == .btc and
+                                std.mem.indexOfScalar(u8, gpay_amount_buf[0..gpay_amount_len], '.') == null;
+                            if ((is_digit or is_dot) and gpay_amount_len < gpay_amount_buf.len) {
                                 gpay_amount_buf[gpay_amount_len] = @intCast(zc);
                                 gpay_amount_len += 1;
                                 gchat_key_ns = clock_shell.monotonicNanos();
@@ -4633,6 +4673,50 @@ fn receiveWorker(job: *ReceiveJob, io: std.Io, environ: ?*const std.process.Envi
             @memcpy(job.btc[0..own.bitcoin.len], own.bitcoin);
             job.btc_len = own.bitcoin.len;
         }
+    }
+    job.done.store(true, .release);
+}
+
+/// A7.2: cold struct, size guard waived — a singleton, refreshed a few times an
+/// hour. Worker-owned; the price crosses the seam as a plain integer (E1).
+const PriceJob = struct {
+    thread: ?std.Thread = null,
+    done: std.atomic.Value(bool) = .init(false),
+    usd_cents: u64 = 0,
+    ok: bool = false,
+};
+
+/// The one field we read from the mempool.space prices document.
+/// A7.2: cold struct, size guard waived — one per fetch, JSON-parse target only.
+const PriceDoc = struct { USD: f64 = 0 };
+
+/// The BTC/USD price source. mempool.space's `/api/v1/prices` (the same host
+/// family as the chain watcher), overridable to a self-host with ZAT_PRICE_API.
+fn priceSource(environ: ?*const std.process.Environ.Map) []const u8 {
+    if (environ) |env| if (env.get("ZAT_PRICE_API")) |u| if (u.len > 0) return u;
+    return "https://mempool.space/api/v1/prices";
+}
+
+/// Fetch BTC/USD off the render thread so the pay sheet's ≈$ readout never
+/// costs a frame. USD is dollars per BTC in the response; we keep cents.
+fn priceWorker(job: *PriceJob, io: std.Io, environ: ?*const std.process.Environ.Map) void {
+    const a = std.heap.page_allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const resp = http.request(arena_state.allocator(), io, environ, priceSource(environ), .{
+        .guard = .untrusted,
+        .max_response_bytes = 8 * 1024,
+    }) catch {
+        job.done.store(true, .release);
+        return;
+    };
+    if (resp.status == 200) {
+        if (std.json.parseFromSliceLeaky(PriceDoc, arena_state.allocator(), resp.body, .{ .ignore_unknown_fields = true })) |p| {
+            if (p.USD > 0) {
+                job.usd_cents = @intFromFloat(@round(p.USD * 100));
+                job.ok = true;
+            }
+        } else |_| {}
     }
     job.done.store(true, .release);
 }
@@ -6534,6 +6618,11 @@ fn paintFrameGpu(
         chat_sig ^= (@as(u64, g.chat_pay.focus) +% 1) *% 0xD6E8_FEB8_6659_FD93;
         chat_sig ^= @as(u64, @intFromBool(g.chat_pay.confirm)) *% 0x7C3A_1B59_E64D_8811;
         chat_sig ^= @as(u64, @intFromBool(g.chat_pay.first_send)) *% 0x3F9A_2E17_5C08_BD43;
+        // The unit toggle + the live price change what the sheet draws (unit
+        // label, ≈$ line) — they MUST join the signature or the readout won't
+        // repaint on the GPU path (the A5 lesson).
+        chat_sig ^= (@as(u64, @intFromEnum(g.chat_pay.unit)) +% 1) *% 0x2C1B_3C6D_820F_FA8D;
+        chat_sig ^= g.chat_pay.usd_cents_per_btc *% 0xEB44_ACCA_B455_D165;
         chat_sig ^= std.hash.Wyhash.hash(0x1F83_D9AB, g.chat_pay.amount);
         chat_sig ^= std.hash.Wyhash.hash(0x9B05_688C, g.chat_pay.note);
         chat_sig ^= std.hash.Wyhash.hash(0x510E_527F, g.chat_pay.status);

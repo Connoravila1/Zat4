@@ -281,7 +281,7 @@ pub fn main(init: std.process.Init) !void {
         @memset(fb.pixels, clear);
         dl.len = 0;
         try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
-        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread.rows, cthread.cards, 0, "maya.zat4.com", "", false, false, "", "", .{ .open = true, .rail = .lightning, .amount = "5000", .note = "dinner split" }, .{}, &.{}, .{});
+        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread.rows, cthread.cards, 0, "maya.zat4.com", "", false, false, "", "", .{ .open = true, .rail = .lightning, .amount = "5000", .note = "dinner split", .usd_cents_per_btc = 6_500_000 }, .{}, &.{}, .{});
         try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
         try writePpm(io, gpa, &fb, "/tmp/zat_chat_pay.ppm");
         std.debug.print("wrote /tmp/zat_chat_pay.ppm (payment cards + the pay sheet)\n", .{});
