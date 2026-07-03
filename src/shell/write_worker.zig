@@ -137,7 +137,9 @@ fn freeOutcome(gpa: Allocator, o: Result.Outcome) void {
 // ---------------------------------------------------------------------------
 
 /// A7.2: cold struct, size guard waived — two per worker, the cross-thread seam.
-fn Mailbox(comptime T: type) type {
+/// Pub: refresh_worker.zig reuses this same hand-off rather than growing a
+/// third copy of the pattern (stream.zig owns the original reasoning).
+pub fn Mailbox(comptime T: type) type {
     return struct {
         const Self = @This();
         // Spinlock not mutex, deliberately (stream.zig's reasoning): two
@@ -152,7 +154,7 @@ fn Mailbox(comptime T: type) type {
         fn release(b: *Self) void {
             b.locked.store(false, .release);
         }
-        fn push(b: *Self, gpa: Allocator, item: T) bool {
+        pub fn push(b: *Self, gpa: Allocator, item: T) bool {
             b.acquire();
             defer b.release();
             b.items.append(gpa, item) catch return false;

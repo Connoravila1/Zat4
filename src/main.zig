@@ -1004,6 +1004,7 @@ test {
     _ = @import("shell/stream.zig");
     _ = @import("shell/write.zig");
     _ = @import("shell/write_worker.zig");
+    _ = @import("shell/refresh_worker.zig");
     _ = @import("core/pow.zig");
     _ = @import("shell/pow.zig");
     _ = @import("core/credential.zig");

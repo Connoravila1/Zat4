@@ -83,6 +83,7 @@ const effect_core = @import("../core/effect.zig");
 const clock_shell = @import("clock.zig");
 const write = @import("write.zig");
 const write_worker = @import("write_worker.zig");
+const refresh_worker = @import("refresh_worker.zig");
 const auth = @import("auth.zig");
 const lexicon = @import("../core/lexicon.zig");
 const moderation = @import("../core/moderation.zig");
@@ -363,6 +364,24 @@ pub fn run(
     defer if (writer) |w| write_worker.shutdown(w);
     var write_results: std.ArrayList(write_worker.Result) = .empty;
     defer write_results.deinit(gpa);
+    // The refresh worker — the same actor pattern for the timeline FETCH. The
+    // auto-refresh tick and pull-to-refresh used to run getTimeline inline on
+    // this thread, freezing the living field for the round trip every interval
+    // (the periodic split-second hitch). Now they submit here and drain the
+    // page below; only the ingest (pure CPU over the fetched values) runs on
+    // this thread. A failed spawn degrades to manual refresh only (E2: the `r`
+    // key keeps its synchronous path).
+    var refresh_in: refresh_worker.RequestBox = .{};
+    defer refresh_in.deinit(gpa);
+    var refresh_out: refresh_worker.ResultBox = .{};
+    defer refresh_out.deinit(gpa);
+    const refresher: ?*refresh_worker.Worker = refresh_worker.start(gpa, io, environ, session, appview_url, &refresh_in, &refresh_out) catch null;
+    defer if (refresher) |w| refresh_worker.shutdown(w);
+    var refresh_results: std.ArrayList(refresh_worker.Result) = .empty;
+    defer refresh_results.deinit(gpa);
+    // Auto ticks in flight: the interval clock never stacks a second fetch on
+    // an unanswered one (a slow network otherwise queues a burst).
+    var refresh_inflight: u32 = 0;
     // Deferred-undo intents: a post the user UN-engaged before its like/repost
     // create had returned a record uri. Keyed by a hash of the post cid; when
     // the create's result lands (with the uri), the drain fires the delete at
@@ -386,17 +405,14 @@ pub fn run(
     };
     var last_auto_refresh: i64 = 0;
 
-    // The jk-test fix: input must NEVER wait behind a blocking network
-    // call. The auto-refresh below is a synchronous getTimeline round trip
-    // on this thread; if it fires between keypresses, the keys queue in the
-    // socket and the screen freezes, then catches up in a burst — exactly
-    // the "tap j/k, lag, then it unsticks" symptom. So the refresh is gated
-    // on input being IDLE: while the user is actively navigating, it is
-    // suppressed entirely and movement stays instant. Liveness is unharmed
-    // — the firehose thread keeps streaming new posts the whole time; the
-    // poll is only a fallback and can wait the few hundred ms until the
-    // user pauses. (G3/G4: responsiveness is the invariant; the network is
-    // exiled off the input path, never allowed to leak inward.)
+    // Input-idle gate (a historical note): the auto-refresh used to be a
+    // SYNCHRONOUS getTimeline on this thread, and this gate kept it from
+    // freezing active navigation (the old "tap j/k, lag, then it unsticks"
+    // symptom). The fetch now runs on the refresh worker's thread, so nothing
+    // blocks either way — the gate is kept because it is still the right
+    // POLICY: while the user is actively navigating there is no reason to
+    // churn the store under them; the poll waits the few hundred ms until
+    // they pause. (G4: the network stays exiled off the input path.)
     const input_idle_gate_nanos: u64 = 600 * std.time.ns_per_ms;
     var last_input_nanos: u64 = 0;
 
@@ -1171,79 +1187,94 @@ pub fn run(
         }
 
         // Auto-refresh tick: in timeline mode, once the interval has elapsed,
-        // re-run the same getTimeline the `r` key runs. New posts slot in at
-        // the top and the viewport jumps so they are seen — identical to a
-        // manual refresh, just on a timer. This ALSO does the initial load: an
-        // empty store (a cleared cache / first run) would otherwise never fetch
-        // — the window path has no separate startup fetch, so the first tick is
-        // the first load. Failure is contained to the status line (E2); only
-        // OOM is fatal. Never fires mid-compose, so it cannot disturb a draft.
-        if (refresh_interval > 0 and mode == .timeline and
+        // SUBMIT the same getTimeline the `r` key runs to the refresh worker —
+        // the fetch happens off this thread and its page is drained below, so
+        // the living field never hitches on the round trip. This ALSO does the
+        // initial load: an empty store (a cleared cache / first run) would
+        // otherwise never fetch — the window path has no separate startup
+        // fetch, so the first tick is the first load. Failure is contained to
+        // the status line (E2). Never fires mid-compose, so it cannot disturb
+        // a draft.
+        if (refresh_interval > 0 and mode == .timeline and refresh_inflight == 0 and
             now - last_auto_refresh >= refresh_interval and
             clock_shell.monotonicNanos() -| last_input_nanos >= input_idle_gate_nanos)
         {
             last_auto_refresh = now;
-            const was_empty = store.feed.len == 0;
-            const outcome = feed_shell.refreshTimeline(gpa, arena, io, environ, session, appview_url, store, 30) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => blk: {
-                    status = "auto-refresh: network error"; // contained
-                    break :blk null;
-                },
-            };
-            if (outcome) |result| switch (result) {
-                // New posts are STAGED (refreshTimeline doesn't displace the
-                // reader). Reveal them immediately ONLY on the first load (an
-                // empty feed) or when the reader is at the very top of Home;
-                // otherwise leave them behind the "N new posts" pill so the
-                // reader's place is never yanked (the Twitter/Bluesky pattern).
-                .ok => if (feed_core.pendingCount(store) > 0) {
-                    const at_top_home = gscreen == feed_view.screen_home and gscroll_px == 0;
-                    if (was_empty or at_top_home) {
-                        _ = feed_core.revealPending(gpa, store) catch 0;
-                        state.selected = 0;
-                        state.scroll_top = 0;
-                        gview.scroll_rows = 0;
-                        gscroll_px = 0;
-                    }
-                    // else: the pill (feed_core.pendingCount) carries the count.
-                },
-                .failed => {}, // a refused poll is silent; the next tick retries
-            };
-            if (outcome != null and outcome.? == .ok) {
-                _ = cache_shell.saveStore(gpa, environ, store); // E4: a failed save is simply no cache
+            if (refresher) |w| {
+                if (refresh_worker.submit(w, .auto, 30)) refresh_inflight += 1;
             }
+            // No worker (spawn failed at startup): auto-refresh is simply off;
+            // the `r` key's synchronous path still loads the feed (E2).
         }
 
-        // Pull-to-refresh: the overscroll gesture asked for a refresh. Unlike the
-        // passive auto-refresh, an EXPLICIT pull asks to SEE the new — so reveal
-        // the staged posts and jump to the top. Failure stays on the status line
-        // (E2); only OOM is fatal.
+        // Pull-to-refresh: the overscroll gesture asked for a refresh — same
+        // worker, marked .pull so the drain below reveals + jumps (an EXPLICIT
+        // pull asks to SEE the new, unlike the passive auto tick).
         if (pull_refresh_requested) {
             pull_refresh_requested = false;
-            status = "refreshing...";
-            if (feed_shell.refreshTimeline(gpa, arena, io, environ, session, appview_url, store, 30)) |outcome| {
-                switch (outcome) {
-                    .ok => |stats| {
-                        const revealed_n = feed_core.revealPending(gpa, store) catch 0;
-                        if (revealed_n > 0) {
-                            state.selected = 0;
-                            state.scroll_top = 0;
-                            gview.scroll_rows = 0;
-                            gscroll_px = 0;
-                        }
-                        status = if (stats.items_added == 0 and revealed_n == 0)
-                            "no new posts"
-                        else
-                            std.fmt.bufPrint(&status_buf, "+{d} new at top", .{revealed_n}) catch "new posts";
-                        _ = cache_shell.saveStore(gpa, environ, store);
-                    },
-                    .failed => |failure| status = std.fmt.bufPrint(&status_buf, "refused: {d} {s}", .{ failure.status, failure.code }) catch "refused",
-                }
-            } else |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => status = "network error", // contained (E2)
+            if (refresher) |w| {
+                status = "refreshing...";
+                if (refresh_worker.submit(w, .pull, 30)) refresh_inflight += 1;
+            } else status = "refresh unavailable (r refreshes)";
+        }
+
+        // Drain fetched pages. The ingest is the CPU half (pure functions over
+        // the fetched values — the store belongs to this thread); the reveal
+        // choreography is unchanged from the old inline refresh: an auto tick
+        // STAGES new posts behind the "N new posts" pill (revealing only on
+        // first load or at the very top of Home, so the reader's place is
+        // never yanked — the Twitter/Bluesky pattern); a pull reveals + jumps.
+        refresh_results.clearRetainingCapacity();
+        try refresh_out.drain(gpa, &refresh_results);
+        for (refresh_results.items) |res| {
+            refresh_inflight -|= 1;
+            switch (res.outcome) {
+                .ok => |page| {
+                    const was_empty = store.feed.len == 0;
+                    const stats = feed_core.ingestPageRefresh(gpa, store, page) catch |err| {
+                        refresh_worker.freeResult(gpa, res);
+                        return err; // OOM only
+                    };
+                    switch (res.trigger) {
+                        .auto => if (feed_core.pendingCount(store) > 0) {
+                            const at_top_home = gscreen == feed_view.screen_home and gscroll_px == 0;
+                            if (was_empty or at_top_home) {
+                                _ = feed_core.revealPending(gpa, store) catch 0;
+                                state.selected = 0;
+                                state.scroll_top = 0;
+                                gview.scroll_rows = 0;
+                                gscroll_px = 0;
+                            }
+                            // else: the pill (feed_core.pendingCount) carries the count.
+                        },
+                        .pull => {
+                            const revealed_n = feed_core.revealPending(gpa, store) catch 0;
+                            if (revealed_n > 0) {
+                                state.selected = 0;
+                                state.scroll_top = 0;
+                                gview.scroll_rows = 0;
+                                gscroll_px = 0;
+                            }
+                            status = if (stats.items_added == 0 and revealed_n == 0)
+                                "no new posts"
+                            else
+                                std.fmt.bufPrint(&status_buf, "+{d} new at top", .{revealed_n}) catch "new posts";
+                        },
+                    }
+                    _ = cache_shell.saveStore(gpa, environ, store); // E4: a failed save is simply no cache
+                },
+                .refused => |f| switch (res.trigger) {
+                    .auto => {}, // a refused poll is silent; the next tick retries
+                    // bufPrint COPIES f.code into status_buf before freeResult
+                    // destroys the arena that owns it.
+                    .pull => status = std.fmt.bufPrint(&status_buf, "refused: {d} {s}", .{ f.status, f.code }) catch "refused",
+                },
+                .net_error => switch (res.trigger) {
+                    .auto => status = "auto-refresh: network error", // contained
+                    .pull => status = "network error", // contained (E2)
+                },
             }
+            refresh_worker.freeResult(gpa, res);
         }
 
         // Premium Profile screen: on ENTERING it (the rail click flips gscreen),

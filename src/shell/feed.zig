@@ -109,6 +109,28 @@ pub fn refreshTimeline(
     store: *feed_core.Store,
     limit: u32,
 ) !PageOutcome {
+    const outcome = try fetchRefreshPage(gpa, arena, io, environ, session, appview_url, limit);
+    switch (outcome) {
+        .failed => |failure| return .{ .failed = failure },
+        .ok => |page| return .{ .ok = try feed_core.ingestPageRefresh(gpa, store, page) },
+    }
+}
+
+/// The NETWORK half of `refreshTimeline`, alone: fetch the newest page and
+/// return it as a value, touching no store. The refresh worker calls this off
+/// the render thread (the fetch is a blocking round trip — the render loop
+/// must never wait on it) and hands the page back through its mailbox; the
+/// ingest half then runs on the UI thread, which owns the store. Wire/lexicon
+/// knowledge stays in this module (D3) — the worker only moves values.
+pub fn fetchRefreshPage(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    session: *auth.Session,
+    appview_url: []const u8,
+    limit: u32,
+) !xrpc.Outcome(lexicon.TimelinePage) {
     var limit_buf: [12]u8 = undefined;
     const limit_str = std.fmt.bufPrint(&limit_buf, "{d}", .{limit}) catch unreachable;
     // viewer DID: the Cut-1 AppView builds the feed from it (see loadTimelinePage).
@@ -117,7 +139,7 @@ pub fn refreshTimeline(
         .{ .name = "viewer", .value = session.did },
     };
 
-    const outcome = try auth.queryHost(
+    return auth.queryHost(
         gpa,
         arena,
         io,
@@ -128,10 +150,6 @@ pub fn refreshTimeline(
         &params,
         lexicon.TimelinePage,
     );
-    switch (outcome) {
-        .failed => |failure| return .{ .failed = failure },
-        .ok => |page| return .{ .ok = try feed_core.ingestPageRefresh(gpa, store, page) },
-    }
 }
 
 /// Load one author's posts into the SHARED `store` as CONTENT (no Home
