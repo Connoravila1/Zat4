@@ -162,7 +162,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, expand, compose_add, compose_remove, quote_open, quote_new, repost_do };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -3747,6 +3747,58 @@ pub const ChatPaySheet = struct {
     status: []const u8 = "",
 };
 
+/// Which face of the receive-setup flow is showing.
+/// - `onboard`: the first-run empty state — "I have a wallet" vs "I don't yet".
+/// - `paste`:   the two address fields + Save (for users who have an address).
+/// - `wallets`: the "get a wallet" list for users who have none (routes out).
+pub const RecvMode = enum(u8) { onboard, paste, wallets };
+
+/// A recommended wallet for the walletless (the "I don't have one yet" path).
+/// A7.2: cold const table, size guard waived — three entries, never in a loop
+/// beyond the render of this one sheet.
+pub const WalletRec = struct {
+    name: []const u8,
+    tagline: []const u8,
+    /// Opened by the shell's OS-handler seam on tap (the address itself is got
+    /// on the wallet's own site, then pasted back).
+    url: []const u8,
+};
+
+/// The curated shortlist. Simplest-first: a custodial one-tap address, a
+/// self-custodial-but-easy option, then a web wallet. Honest one-liners.
+pub const recv_wallets = [_]WalletRec{
+    .{ .name = "Wallet of Satoshi", .tagline = "Simplest \u{2014} you get an address instantly.", .url = "https://www.walletofsatoshi.com" },
+    .{ .name = "Phoenix", .tagline = "Your own keys, still easy to use.", .url = "https://phoenix.acinq.co" },
+    .{ .name = "Alby", .tagline = "Web wallet with a lightning address.", .url = "https://getalby.com" },
+};
+
+/// The "set up your CHAT receive address" sheet (the private-chat wallet — the
+/// public-facing wallet is a later, separate field). Three modes (`RecvMode`):
+/// the first-run onboarding empty state, the paste form, and the get-a-wallet
+/// list. The shell owns the drafts and the publish; this is the plain view (B5).
+pub const ChatReceiveSheet = struct {
+    open: bool = false,
+    /// Which face is showing (the shell picks `onboard` when you're not set up).
+    mode: RecvMode = .paste,
+    /// The two receive-address drafts. A Lightning address (LUD-16, like
+    /// `you@wallet.com`) is the easy path; the on-chain address is optional.
+    lightning: []const u8 = "",
+    bitcoin: []const u8 = "",
+    /// 0 = the lightning field owns the keyboard, 1 = the bitcoin field.
+    focus: u8 = 0,
+    /// One short line ("" = none): the specific refusal (amber) OR, after a
+    /// successful publish, the green confirmation — `saved` picks the colour.
+    status: []const u8 = "",
+    /// True once a publish succeeded this session: the status reads as the green
+    /// "you can receive" confirmation rather than an amber refusal.
+    saved: bool = false,
+
+    comptime {
+        // Three slices (48) + two bools + a u8, packed into the trailing 8 = 56.
+        assert(@sizeOf(ChatReceiveSheet) == 56);
+    }
+};
+
 /// The sheet's amount chips (sats) — one tap fills the amount field. The
 /// tap region's `post` is the index into this table.
 pub const pay_chips = [4]u64{ 1_000, 5_000, 10_000, 25_000 };
@@ -3783,14 +3835,75 @@ fn payCardAction(mine: bool, kind: chat_msg.Kind, status: chat_msg.PayStatus) ?A
 /// The status line's words ("" = the confirming blocks draw instead).
 /// Every word claims exactly what is known — `pending` means "initiated,
 /// unobserved", never "sent" (§6 honesty).
-fn payStatusWord(status: chat_msg.PayStatus) []const u8 {
+const PayTone = enum { neutral, good, warn };
+
+/// A7.2: cold transient, size guard waived — one per card render, never stored.
+const PayLine = struct { head: []const u8, sub: []const u8, tone: PayTone };
+
+/// The honest per-side status copy (PAYMENT_UX_SPEC §4). Every string is a
+/// static literal — the WHO is already shown by the conversation, so we say
+/// "you"/"them" and never interpolate (no per-frame allocation). The `sub` line
+/// carries the trust load: whether money has moved. `confirming` has no copy
+/// here — the six-block row renders it.
+fn payStatusLine(status: chat_msg.PayStatus, kind: chat_msg.Kind, mine: bool) PayLine {
+    const send = kind == .payment_sent;
+    if (send and mine) {
+        // I am paying them.
+        return switch (status) {
+            .pending_setup => .{ .head = "Waiting to send", .sub = "They need a wallet \u{2014} nothing sent yet", .tone = .warn },
+            .ready => .{ .head = "Ready to send", .sub = "Tap Send to pay from your wallet", .tone = .neutral },
+            .pending => .{ .head = "Approve in your wallet", .sub = "Nothing is sent until you approve", .tone = .neutral },
+            .broadcast => .{ .head = "On its way", .sub = "0 confirmations", .tone = .neutral },
+            .confirming => .{ .head = "Confirming", .sub = "", .tone = .neutral },
+            .settled => .{ .head = "Sent", .sub = "", .tone = .good },
+            .cancelled => .{ .head = "Cancelled", .sub = "No money moved", .tone = .neutral },
+            .declined => .{ .head = "Declined", .sub = "They declined \u{2014} no money moved", .tone = .neutral },
+            .expired => .{ .head = "Expired", .sub = "Offer lapsed \u{2014} no money moved", .tone = .neutral },
+            .failed => .{ .head = "Didn't complete", .sub = "No money moved", .tone = .neutral },
+            .requested => .{ .head = "", .sub = "", .tone = .neutral },
+        };
+    }
+    if (send and !mine) {
+        // They are paying me.
+        return switch (status) {
+            .pending_setup => .{ .head = "They want to pay you", .sub = "Set up a wallet to accept it", .tone = .neutral },
+            .ready => .{ .head = "Ready to receive", .sub = "", .tone = .neutral },
+            .pending => .{ .head = "Incoming", .sub = "They're sending it now", .tone = .neutral },
+            .broadcast => .{ .head = "Incoming", .sub = "0 confirmations", .tone = .neutral },
+            .confirming => .{ .head = "Confirming", .sub = "", .tone = .neutral },
+            .settled => .{ .head = "Received", .sub = "", .tone = .good },
+            .cancelled => .{ .head = "Cancelled", .sub = "They cancelled \u{2014} no money moved", .tone = .neutral },
+            .declined => .{ .head = "Declined", .sub = "You declined", .tone = .neutral },
+            .expired => .{ .head = "Expired", .sub = "This offer lapsed", .tone = .neutral },
+            .failed => .{ .head = "Didn't complete", .sub = "", .tone = .neutral },
+            .requested => .{ .head = "", .sub = "", .tone = .neutral },
+        };
+    }
+    if (!send and mine) {
+        // I requested; I am waiting to be paid.
+        return switch (status) {
+            .requested => .{ .head = "Requested", .sub = "Waiting for them to pay", .tone = .neutral },
+            .pending => .{ .head = "Incoming", .sub = "They're paying now", .tone = .neutral },
+            .broadcast => .{ .head = "Incoming", .sub = "0 confirmations", .tone = .neutral },
+            .confirming => .{ .head = "Confirming", .sub = "", .tone = .neutral },
+            .settled => .{ .head = "Received", .sub = "", .tone = .good },
+            .cancelled => .{ .head = "Request cancelled", .sub = "", .tone = .neutral },
+            .declined => .{ .head = "Declined", .sub = "They declined", .tone = .neutral },
+            .expired => .{ .head = "Request expired", .sub = "", .tone = .neutral },
+            .pending_setup, .ready, .failed => .{ .head = "Didn't complete", .sub = "", .tone = .neutral },
+        };
+    }
+    // They requested; I am the one who can pay.
     return switch (status) {
-        .requested => "requested",
-        .pending => "waiting on the wallet…",
-        .broadcast => "broadcast…",
-        .confirming => "",
-        .settled => "settled",
-        .failed => "didn't complete",
+        .requested => .{ .head = "Payment requested", .sub = "Tap Pay to send from your wallet", .tone = .neutral },
+        .pending => .{ .head = "Approve in your wallet", .sub = "Nothing is sent until you approve", .tone = .neutral },
+        .broadcast => .{ .head = "On its way", .sub = "0 confirmations", .tone = .neutral },
+        .confirming => .{ .head = "Confirming", .sub = "", .tone = .neutral },
+        .settled => .{ .head = "You paid", .sub = "", .tone = .good },
+        .cancelled => .{ .head = "Request cancelled", .sub = "They withdrew it", .tone = .neutral },
+        .declined => .{ .head = "Declined", .sub = "You declined", .tone = .neutral },
+        .expired => .{ .head = "Request expired", .sub = "", .tone = .neutral },
+        .pending_setup, .ready, .failed => .{ .head = "Didn't complete", .sub = "", .tone = .neutral },
     };
 }
 
@@ -3799,7 +3912,7 @@ const pay_card_w_max: i32 = 280;
 /// A card's height for the thread's measure pass — the same arithmetic the
 /// draw pass walks, so the two can never disagree.
 fn payCardHeight(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, b: chat_view.BubbleRow, card: chat_view.PayCard, cw2: i32) !i32 {
-    var h: i32 = 12 + 16 + 30 + 26 + 10; // pads + rail tag + amount + status
+    var h: i32 = 12 + 16 + 30 + 38 + 10; // pads + rail tag + amount + status(head+sub)
     if (b.body.len > 0)
         h += try wrapBody(gpa, dl, e, 0, 0, cw2 - 28, 0, 13, b.body, 18, false, null) + 4;
     if (payCardAction(b.mine, b.kind, card.status) != null) h += 44;
@@ -3860,20 +3973,24 @@ fn drawPayCard(
         const cs = std.fmt.bufPrint(&cb, "{d}/{d}", .{ card.confirmations, chat_msg.settle_depth }) catch "";
         _ = try str(gpa, dl, e, .regular, bx + 14 + 6 * 19 + 6, ty + 16, muted, 12, cs);
     } else {
-        const word = payStatusWord(card.status);
-        const wc: u32 = switch (card.status) {
-            .settled => settled_c,
-            .failed => faint,
-            else => muted,
+        // The honest per-side status: a headline + a trust subline (does money
+        // move?). Tone colours the headline; a settled card gets a green dot.
+        const pl = payStatusLine(card.status, b.kind, b.mine);
+        const hc: u32 = switch (pl.tone) {
+            .good => settled_c,
+            .warn => 0xFFE0A868,
+            .neutral => body_c,
         };
-        if (card.status == .settled) {
+        if (pl.tone == .good) {
             try rect(gpa, dl, bx + 14, ty + 8, 8, 8, settled_c, 4);
-            _ = try str(gpa, dl, e, .semibold, bx + 28, ty + 16, wc, 12, word);
+            _ = try str(gpa, dl, e, .semibold, bx + 28, ty + 16, hc, 13, pl.head);
         } else {
-            _ = try str(gpa, dl, e, .regular, bx + 14, ty + 16, wc, 12, word);
+            _ = try str(gpa, dl, e, .semibold, bx + 14, ty + 16, hc, 13, pl.head);
         }
+        if (pl.sub.len > 0)
+            _ = try str(gpa, dl, e, .regular, bx + 14, ty + 32, muted, 11, pl.sub);
     }
-    ty += 26;
+    ty += 38;
     if (payCardAction(b.mine, b.kind, card.status)) |act| {
         const label: []const u8 = switch (act) {
             .pay_card_pay => "Pay",
@@ -3966,6 +4083,8 @@ pub fn layoutChat(
     /// `i`'s live spring transform. Empty (or shorter than `thread`) = the
     /// missing rows are at rest — the static/software path passes `&.{}`.
     xforms: []const BubbleXform,
+    /// The "set up your receive address" sheet; `.{}` = closed.
+    recv: ChatReceiveSheet,
 ) error{OutOfMemory}!i32 {
     const m: Metrics = if (pane_geom) |g|
         .{ .rail_x = g.rail_x, .col_x = g.col_x, .col_w = g.col_w, .lx = g.lx, .cw = g.cw, .side_x = g.side_x, .wide = g.wide }
@@ -4353,7 +4472,8 @@ pub fn layoutChat(
     // bleed through a surface that talks about money. ──
     if (pay.open) {
         const status_extra: i32 = if (pay.status.len > 0) 24 else 0;
-        const sheet_h: i32 = 254 + status_extra;
+        // +30 for the "set up how you get paid" link row at the foot.
+        const sheet_h: i32 = 254 + 30 + status_extra;
         const sy0 = comp_y - sheet_h - 12;
         try rect(gpa, dl, detail_x, sy0, detail_w, sheet_h, 0xFF201F18, 16);
         const ring_c = (0x90 << 24) | (accent & 0x00FFFFFF);
@@ -4456,6 +4576,148 @@ pub fn layoutChat(
             const slw: i32 = @intCast(text.measure(e, .semibold, "Send", 13));
             _ = try str(gpa, dl, e, .semibold, bx3 + @divTrunc(send_w2 - slw, 2), py + 27, if (armed2) 0xFF20201A else faint, 13, "Send");
             try emitRegion(gpa, regions, bx3, py, send_w2, 42, 0, .pay_send);
+        }
+        // The way IN to setting up how YOU get paid — the answer to "where do
+        // I set my own address?" lives right where money is discussed.
+        py += 50;
+        {
+            const link = "Set up how you get paid \u{203A}";
+            const lw: i32 = @intCast(text.measure(e, .semibold, link, 12));
+            const lx = detail_x + @divTrunc(detail_w - lw, 2);
+            _ = try str(gpa, dl, e, .semibold, lx, py + 6, (0xC0 << 24) | (accent & 0x00FFFFFF), 12, link);
+            try emitRegion(gpa, regions, detail_x + 18, py - 8, detail_w - 36, 28, 0, .recv_open);
+        }
+    }
+
+    // ── The receive-setup sheet: paste YOUR address so people in your chats
+    // can pay you. Same chrome as the pay sheet; mutually exclusive with it. ──
+    if (recv.open) {
+        const status_extra: i32 = if (recv.status.len > 0) 24 else 0;
+        const sheet_h: i32 = switch (recv.mode) {
+            .onboard => 224,
+            .paste => 236 + status_extra,
+            .wallets => 24 + 28 + 30 + @as(i32, @intCast(recv_wallets.len)) * 56 + 54,
+        };
+        const sy0 = comp_y - sheet_h - 12;
+        try rect(gpa, dl, detail_x, sy0, detail_w, sheet_h, 0xFF201F18, 16);
+        const ring_c = (0x90 << 24) | (accent & 0x00FFFFFF);
+        try rect(gpa, dl, detail_x, sy0, detail_w, 1, ring_c, 0);
+        try rect(gpa, dl, detail_x, sy0 + sheet_h - 1, detail_w, 1, ring_c, 0);
+        try rect(gpa, dl, detail_x, sy0, 1, sheet_h, ring_c, 0);
+        try rect(gpa, dl, detail_x + detail_w - 1, sy0, 1, sheet_h, ring_c, 0);
+
+        var py = sy0 + 16;
+        switch (recv.mode) {
+            // First run: the branch. Don't dump a wallet-less user into a form.
+            .onboard => {
+                _ = try str(gpa, dl, e, .semibold, detail_x + 18, py + 16, ink, 16, "Get paid in Zat Chat");
+                py += 34;
+                _ = try strEllipsis(gpa, dl, e, .regular, detail_x + 18, py + 12, muted, 12, "People in your chats can send you bitcoin once you add a wallet address.", detail_w - 36);
+                py += 40;
+                // Primary: I have a wallet -> the paste form.
+                try rect(gpa, dl, detail_x + 18, py, detail_w - 36, 44, accent, 14);
+                const l1 = "I have a wallet \u{2014} paste it";
+                const w1: i32 = @intCast(text.measure(e, .semibold, l1, 13));
+                _ = try str(gpa, dl, e, .semibold, detail_x + @divTrunc(detail_w - w1, 2), py + 28, 0xFF20201A, 13, l1);
+                try emitRegion(gpa, regions, detail_x + 18, py, detail_w - 36, 44, 0, .recv_have);
+                py += 52;
+                // Secondary: I don't have one -> the get-a-wallet list.
+                try rect(gpa, dl, detail_x + 18, py, detail_w - 36, 44, 0x2AEDEAE0, 14);
+                const l2 = "I don't have one yet";
+                const w2: i32 = @intCast(text.measure(e, .semibold, l2, 13));
+                _ = try str(gpa, dl, e, .semibold, detail_x + @divTrunc(detail_w - w2, 2), py + 28, body_c, 13, l2);
+                try emitRegion(gpa, regions, detail_x + 18, py, detail_w - 36, 44, 0, .recv_need);
+                py += 50;
+                const later = "Maybe later";
+                const wl: i32 = @intCast(text.measure(e, .regular, later, 12));
+                _ = try str(gpa, dl, e, .regular, detail_x + @divTrunc(detail_w - wl, 2), py + 6, faint, 12, later);
+                try emitRegion(gpa, regions, detail_x + 18, py - 6, detail_w - 36, 24, 0, .recv_cancel);
+            },
+            // The paste form (for users who have an address).
+            .paste => {
+                _ = try str(gpa, dl, e, .semibold, detail_x + 18, py + 14, ink, 15, "Receive payments in chat");
+                py += 30;
+                _ = try strEllipsis(gpa, dl, e, .regular, detail_x + 18, py + 12, muted, 12, "Paste an address so people can pay you. A Lightning address (you@wallet.com) is easiest.", detail_w - 36);
+                py += 34;
+                const rfields = [2]struct { draft: []const u8, ph: []const u8, act: Action }{
+                    .{ .draft = recv.lightning, .ph = "lightning address  \u{2014}  you@wallet.com", .act = .recv_ln },
+                    .{ .draft = recv.bitcoin, .ph = "bitcoin address (optional)", .act = .recv_btc },
+                };
+                for (rfields, 0..) |fld, fi| {
+                    const focused = recv.focus == fi;
+                    try rect(gpa, dl, detail_x + 18, py, detail_w - 36, 38, 0x22EDEAE0, 12);
+                    if (focused) {
+                        const fr = (0xC0 << 24) | (accent & 0x00FFFFFF);
+                        try rect(gpa, dl, detail_x + 18, py, detail_w - 36, 1, fr, 0);
+                        try rect(gpa, dl, detail_x + 18, py + 37, detail_w - 36, 1, fr, 0);
+                        try rect(gpa, dl, detail_x + 18, py, 1, 38, fr, 0);
+                        try rect(gpa, dl, detail_x + detail_w - 19, py, 1, 38, fr, 0);
+                    }
+                    const fmaxw = detail_w - 64;
+                    var fpen: i32 = detail_x + 32;
+                    if (fld.draft.len > 0) {
+                        try strEllipsis(gpa, dl, e, .regular, detail_x + 32, py + 25, ink, 14, fld.draft, fmaxw);
+                        const tw: i32 = @intCast(text.measure(e, .regular, fld.draft, 14));
+                        fpen = detail_x + 32 + @min(tw, fmaxw);
+                    } else {
+                        try strEllipsis(gpa, dl, e, .regular, detail_x + 32, py + 25, faint, 14, fld.ph, fmaxw);
+                    }
+                    if (focused) {
+                        const ca = caretAlpha(motion.caret_phase);
+                        try rect(gpa, dl, fpen + 2, py + 10, 2, 18, scaleAlpha((0xE0 << 24) | (accent & 0x00FFFFFF), ca), 0);
+                    }
+                    try emitRegion(gpa, regions, detail_x + 18, py, detail_w - 36, 38, 0, fld.act);
+                    py += 46;
+                }
+                if (recv.status.len > 0) {
+                    const sc: u32 = if (recv.saved) 0xFF9BCE9B else 0xFFE0A868;
+                    _ = try str(gpa, dl, e, .regular, detail_x + 20, py + 12, sc, 13, recv.status);
+                    py += 24;
+                }
+                const cancel_w: i32 = 92;
+                var bx3 = detail_x + 18;
+                try rect(gpa, dl, bx3, py, cancel_w, 42, 0x2AEDEAE0, 14);
+                const clw: i32 = @intCast(text.measure(e, .semibold, "Cancel", 13));
+                _ = try str(gpa, dl, e, .semibold, bx3 + @divTrunc(cancel_w - clw, 2), py + 27, body_c, 13, "Cancel");
+                try emitRegion(gpa, regions, bx3, py, cancel_w, 42, 0, .recv_cancel);
+                bx3 += cancel_w + 8;
+                const save_w = detail_x + detail_w - 18 - bx3;
+                const has_addr = recv.lightning.len > 0 or recv.bitcoin.len > 0;
+                try rect(gpa, dl, bx3, py, save_w, 42, if (has_addr) accent else skinPanel(accent), 14);
+                const slw: i32 = @intCast(text.measure(e, .semibold, "Save", 13));
+                _ = try str(gpa, dl, e, .semibold, bx3 + @divTrunc(save_w - slw, 2), py + 27, if (has_addr) 0xFF20201A else faint, 13, "Save");
+                try emitRegion(gpa, regions, bx3, py, save_w, 42, 0, .recv_save);
+            },
+            // The get-a-wallet list (for users who have none). Each row opens the
+            // wallet's site; you grab an address there and come back to paste.
+            .wallets => {
+                _ = try str(gpa, dl, e, .semibold, detail_x + 18, py + 14, ink, 15, "Get a wallet \u{2014} about a minute");
+                py += 28;
+                _ = try strEllipsis(gpa, dl, e, .regular, detail_x + 18, py + 12, muted, 12, "Grab one, then come back and paste your address.", detail_w - 36);
+                py += 30;
+                for (recv_wallets, 0..) |wal, wi| {
+                    try rect(gpa, dl, detail_x + 18, py, detail_w - 36, 48, 0x22EDEAE0, 12);
+                    _ = try str(gpa, dl, e, .semibold, detail_x + 32, py + 20, ink, 13, wal.name);
+                    _ = try strEllipsis(gpa, dl, e, .regular, detail_x + 32, py + 38, muted, 11, wal.tagline, detail_w - 64);
+                    // A subtle arrow to read as "opens out".
+                    _ = try str(gpa, dl, e, .semibold, detail_x + detail_w - 40, py + 29, faint, 15, "\u{203A}");
+                    try emitRegion(gpa, regions, detail_x + 18, py, detail_w - 36, 48, @intCast(wi), .recv_wallet);
+                    py += 56;
+                }
+                const cancel_w: i32 = 92;
+                var bx3 = detail_x + 18;
+                try rect(gpa, dl, bx3, py, cancel_w, 42, 0x2AEDEAE0, 14);
+                const clw: i32 = @intCast(text.measure(e, .semibold, "Cancel", 13));
+                _ = try str(gpa, dl, e, .semibold, bx3 + @divTrunc(cancel_w - clw, 2), py + 27, body_c, 13, "Cancel");
+                try emitRegion(gpa, regions, bx3, py, cancel_w, 42, 0, .recv_cancel);
+                bx3 += cancel_w + 8;
+                const paste_w = detail_x + detail_w - 18 - bx3;
+                try rect(gpa, dl, bx3, py, paste_w, 42, accent, 14);
+                const pl = "I've got one \u{2014} paste";
+                const plw: i32 = @intCast(text.measure(e, .semibold, pl, 13));
+                _ = try str(gpa, dl, e, .semibold, bx3 + @divTrunc(paste_w - plw, 2), py + 27, 0xFF20201A, 13, pl);
+                try emitRegion(gpa, regions, bx3, py, paste_w, 42, 0, .recv_paste);
+            },
         }
     }
 
@@ -4786,7 +5048,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // Narrow width (460): no rail regions, so the counts are exactly the
     // surface's own — one region per conversation row + the composer pair +
     // the "+ New" pill.
-    const h = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", true, false, "", "", .{}, .{}, &.{});
+    const h = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", true, false, "", "", .{}, .{}, &.{}, .{});
     var n_conv: usize = 0;
     var n_input: usize = 0;
     var n_send: usize = 0;
@@ -4812,7 +5074,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // no thread pane and no composer to arm. The "+ New" pill is always there.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h2 = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", false, false, "", "", .{}, .{}, &.{});
+    const h2 = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", false, false, "", "", .{}, .{}, &.{}, .{});
     try std.testing.expectEqual(@as(i32, 940), h2);
     var n2_conv: usize = 0;
     var n2_new: usize = 0;
@@ -4828,7 +5090,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // line draws when the shell hands one over.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", false, true, "chattest.zat4.com", "Couldn't resolve that handle", .{}, .{}, &.{});
+    _ = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", false, true, "chattest.zat4.com", "Couldn't resolve that handle", .{}, .{}, &.{}, .{});
     var n3_compose: usize = 0;
     for (regions.items) |r| {
         if (r.kind == .chat_compose_input) n3_compose += 1;
@@ -4841,12 +5103,12 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // (motion never moves a tap target).
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", true, false, "", "", .{}, .{}, &.{});
+    _ = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", true, false, "", "", .{}, .{}, &.{}, .{});
     const rest_items = dl.len;
     const rest_regions = regions.items.len;
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", true, false, "", "", .{}, .{ .typing_t = 1, .typing_phase = 0.7 }, &.{});
+    _ = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", true, false, "", "", .{}, .{ .typing_t = 1, .typing_phase = 0.7 }, &.{}, .{});
     try std.testing.expect(dl.len > rest_items);
     try std.testing.expectEqual(rest_regions, regions.items.len);
 }
@@ -4880,7 +5142,7 @@ test "messages screen: payment cards and the pay sheet emit their regions (M5 A4
     };
 
     // Sheet closed: the card buttons carry their thread ordinals.
-    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", false, false, "", "", .{}, .{}, &.{});
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", false, false, "", "", .{}, .{}, &.{}, .{});
     var pay_at: u16 = 999;
     var cancel_at: u16 = 999;
     var received_at: u16 = 999;
@@ -4897,7 +5159,7 @@ test "messages screen: payment cards and the pay sheet emit their regions (M5 A4
     // and the amber status line renders without disturbing the regions.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", false, false, "", "", .{ .open = true, .rail = .onchain, .amount = "5000", .note = "dinner", .status = "They haven't set up payments" }, .{}, &.{});
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", false, false, "", "", .{ .open = true, .rail = .onchain, .amount = "5000", .note = "dinner", .status = "They haven't set up payments" }, .{}, &.{}, .{});
     var n_rail: usize = 0;
     var n_chip: usize = 0;
     var n_amount: usize = 0;

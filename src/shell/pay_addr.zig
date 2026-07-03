@@ -73,6 +73,39 @@ pub const Published = struct {
     cid: []const u8,
 };
 
+/// A7.2: cold result, size guard waived. Arena-owned.
+pub const OwnAddresses = struct {
+    lightning: []const u8 = "",
+    bitcoin: []const u8 = "",
+};
+
+/// Read MY OWN receive record, to answer "have I set up payments?" and to
+/// prefill the setup sheet. NO anchor validation: the anchor check exists so a
+/// PAYER can trust a payee's record — reading my own record for my own UI is not
+/// that trust boundary. `null` = no record published (= not set up yet, E4).
+pub fn fetchOwn(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    did: []const u8,
+) !?OwnAddresses {
+    const pds_url = try identity.pdsForDid(gpa, io, environ, .{}, did);
+    defer gpa.free(pds_url);
+    const params = [_]xrpc.Param{
+        .{ .name = "repo", .value = did },
+        .{ .name = "collection", .value = lexicon.collection.pay_address },
+        .{ .name = "rkey", .value = "self" },
+    };
+    const outcome = try net.query(arena, io, environ, pds_url, lexicon.method.get_record, &params, lexicon.GetRecordResponse(PayAddressRecordIn), .{ .guard = .untrusted });
+    const rec = switch (outcome) {
+        .ok => |r| r.value,
+        .failed => return null,
+    };
+    if (rec.lightning.len == 0 and rec.bitcoin.len == 0) return null;
+    return .{ .lightning = rec.lightning, .bitcoin = rec.bitcoin };
+}
+
 pub const PublishError = error{
     NoAddresses,
     BadLightning,

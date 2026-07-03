@@ -599,6 +599,22 @@ pub fn run(
     var gpay_note_len: usize = 0;
     var gpay_focus: u8 = 0;
     var gpay_status: []const u8 = "";
+    // The receive-setup sheet (set up YOUR chat wallet). Addresses can be long
+    // (bech32 ~62 chars, lightning addresses too), so give the buffers room.
+    var grecv_open: bool = false;
+    var grecv_ln_buf: [256]u8 = undefined;
+    var grecv_ln_len: usize = 0;
+    var grecv_btc_buf: [256]u8 = undefined;
+    var grecv_btc_len: usize = 0;
+    var grecv_focus: u8 = 0;
+    var grecv_status: []const u8 = "";
+    var grecv_saved: bool = false;
+    var grecv_mode: feed_view.RecvMode = .paste;
+    // Have we checked (once) whether this account already has a receive address
+    // published, and what it was? Gates the bitcoin icon: set → pay sheet,
+    // unset → the onboarding empty state (never a dead form).
+    var grecv_known: bool = false;
+    var grecv_set: bool = false;
     // The confirmation-watcher's cycle (M5 A5). At exit an in-flight cycle
     // is joined (a few HTTP reads at worst) so the worker never outlives
     // the loop's stack.
@@ -1638,7 +1654,7 @@ pub fn run(
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .market = if (gscreen == feed_view.screen_loadout and gloadout_tab == 1) market_cards.items else &.{}, .create = .{ .step = gcreate_step, .answers = gcreate_answers, .config = gcreate_config, .name = gcreate_name_buf[0..gcreate_name_len], .color = gcreate_color, .naming = gcreate_step == .name, .prepare_t = create_prepare_t }, .bench = bench_tray, .inspect_bytes = inspect_bytes orelse "", .inspect_name = inspect_name, .inspect_ref = inspect_ref, .inspect_source = gtransp_source, .inspect_loading = inspect_loading, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .chat_store = if (dev_chat) &gchat_store else null, .chat_sel = gchat_sel, .chat_draft = gchat_draft_buf[0..gchat_draft_len], .chat_input_focus = gchat_input_focus, .chat_composing = gchat_composing, .chat_compose = gchat_peer_buf[0..gchat_peer_len], .chat_compose_status = gchat_compose_status, .chat_typing = gscreen == feed_view.screen_messages and now < gchat_typing_deadline and gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&gchat_store, gchat_sel.?), gchat_typing_peer_buf[0..gchat_typing_peer_len]), .chat_key_ns = gchat_key_ns, .chat_pay = .{ .open = gpay_open, .rail = gpay_rail, .amount = gpay_amount_buf[0..gpay_amount_len], .note = gpay_note_buf[0..gpay_note_len], .focus = gpay_focus, .status = gpay_status }, .expanded = gexpanded.items, .repost_menu = if (grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
+        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .market = if (gscreen == feed_view.screen_loadout and gloadout_tab == 1) market_cards.items else &.{}, .create = .{ .step = gcreate_step, .answers = gcreate_answers, .config = gcreate_config, .name = gcreate_name_buf[0..gcreate_name_len], .color = gcreate_color, .naming = gcreate_step == .name, .prepare_t = create_prepare_t }, .bench = bench_tray, .inspect_bytes = inspect_bytes orelse "", .inspect_name = inspect_name, .inspect_ref = inspect_ref, .inspect_source = gtransp_source, .inspect_loading = inspect_loading, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .chat_store = if (dev_chat) &gchat_store else null, .chat_sel = gchat_sel, .chat_draft = gchat_draft_buf[0..gchat_draft_len], .chat_input_focus = gchat_input_focus, .chat_composing = gchat_composing, .chat_compose = gchat_peer_buf[0..gchat_peer_len], .chat_compose_status = gchat_compose_status, .chat_typing = gscreen == feed_view.screen_messages and now < gchat_typing_deadline and gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&gchat_store, gchat_sel.?), gchat_typing_peer_buf[0..gchat_typing_peer_len]), .chat_key_ns = gchat_key_ns, .chat_pay = .{ .open = gpay_open, .rail = gpay_rail, .amount = gpay_amount_buf[0..gpay_amount_len], .note = gpay_note_buf[0..gpay_note_len], .focus = gpay_focus, .status = gpay_status }, .chat_recv = .{ .open = grecv_open, .mode = grecv_mode, .lightning = grecv_ln_buf[0..grecv_ln_len], .bitcoin = grecv_btc_buf[0..grecv_btc_len], .focus = grecv_focus, .status = grecv_status, .saved = grecv_saved }, .expanded = gexpanded.items, .repost_menu = if (grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
         switch (mode) {
             .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status),
             .compose => {
@@ -2624,11 +2640,27 @@ pub fn run(
                                         // The pay sheet (M5 A4): the button toggles it;
                                         // it owns the keyboard while open.
                                         .pay_open => if (dev_chat) {
-                                            gpay_open = !gpay_open;
-                                            gpay_status = "";
-                                            gpay_focus = 0;
+                                            // Learn (once) whether payments are set up.
+                                            if (!grecv_known) {
+                                                grecv_known = true;
+                                                _ = gchat_arena_state.reset(.retain_capacity);
+                                                grecv_set = loadOwnReceive(gpa, gchat_arena_state.allocator(), io, environ, session, &grecv_ln_buf, &grecv_ln_len, &grecv_btc_buf, &grecv_btc_len);
+                                            }
                                             gchat_input_focus = false;
                                             gchat_composing = false;
+                                            if (grecv_set) {
+                                                // Set up → the pay sheet (request/send).
+                                                gpay_open = !gpay_open;
+                                                gpay_status = "";
+                                                gpay_focus = 0;
+                                                grecv_open = false;
+                                            } else {
+                                                // Not set up → onboard, never a dead form.
+                                                grecv_open = true;
+                                                grecv_mode = .onboard;
+                                                grecv_status = "";
+                                                gpay_open = false;
+                                            }
                                         },
                                         .pay_rail => if (dev_chat) {
                                             gpay_rail = if (hit.post == 1) .onchain else .lightning;
@@ -2653,6 +2685,58 @@ pub fn run(
                                         .pay_cancel => if (dev_chat) {
                                             gpay_open = false;
                                             gpay_status = "";
+                                        },
+                                        .recv_open => if (dev_chat) {
+                                            if (!grecv_known) {
+                                                grecv_known = true;
+                                                _ = gchat_arena_state.reset(.retain_capacity);
+                                                grecv_set = loadOwnReceive(gpa, gchat_arena_state.allocator(), io, environ, session, &grecv_ln_buf, &grecv_ln_len, &grecv_btc_buf, &grecv_btc_len);
+                                            }
+                                            grecv_open = true;
+                                            gpay_open = false;
+                                            grecv_status = "";
+                                            grecv_saved = false;
+                                            grecv_focus = 0;
+                                            grecv_mode = if (grecv_set) .paste else .onboard;
+                                            gchat_input_focus = false;
+                                            gchat_composing = false;
+                                        },
+                                        .recv_have => if (dev_chat) {
+                                            grecv_mode = .paste;
+                                            grecv_focus = 0;
+                                            grecv_status = "";
+                                        },
+                                        .recv_need => if (dev_chat) {
+                                            grecv_mode = .wallets;
+                                            grecv_status = "";
+                                        },
+                                        .recv_wallet => if (dev_chat) {
+                                            // Open the wallet's own site; you get an address there,
+                                            // then come back and paste it. No return channel needed.
+                                            if (hit.post < feed_view.recv_wallets.len)
+                                                launch.openUri(io, feed_view.recv_wallets[hit.post].url) catch {};
+                                        },
+                                        .recv_paste => if (dev_chat) {
+                                            grecv_mode = .paste;
+                                            grecv_focus = 0;
+                                            grecv_status = "";
+                                        },
+                                        .recv_ln => if (dev_chat) {
+                                            grecv_focus = 0;
+                                        },
+                                        .recv_btc => if (dev_chat) {
+                                            grecv_focus = 1;
+                                        },
+                                        .recv_cancel => if (dev_chat) {
+                                            grecv_open = false;
+                                            grecv_status = "";
+                                        },
+                                        .recv_save => if (dev_chat) {
+                                            const ln = std.mem.trim(u8, grecv_ln_buf[0..grecv_ln_len], " ");
+                                            const btc = std.mem.trim(u8, grecv_btc_buf[0..grecv_btc_len], " ");
+                                            _ = gchat_arena_state.reset(.retain_capacity);
+                                            grecv_status = saveReceiveAddress(gpa, gchat_arena_state.allocator(), io, environ, session, ln, btc, &grecv_saved);
+                                            if (grecv_saved) grecv_set = true;
                                         },
                                         .pay_request, .pay_send => if (dev_chat) {
                                             if (gchat_sel) |sc| {
@@ -3047,6 +3131,54 @@ pub fn run(
             // Send, Escape closes, Tab hops fields; characters route by
             // focus — digits only in the amount, anything printable in the
             // note. Consumes the key.
+            // The receive-setup sheet owns the keyboard while open: Enter saves,
+            // Escape closes, Tab hops the two address fields, any printable
+            // character types into the focused one (addresses are alphanumeric +
+            // punctuation, so no digit filter). Consumes the key.
+            if (engine != null and dev_chat and gscreen == feed_view.screen_messages and grecv_open) {
+                var recv_key = true;
+                switch (decoded.event) {
+                    .escape => {
+                        grecv_open = false;
+                        grecv_status = "";
+                    },
+                    .enter => if (grecv_mode == .paste) {
+                        const ln = std.mem.trim(u8, grecv_ln_buf[0..grecv_ln_len], " ");
+                        const btc = std.mem.trim(u8, grecv_btc_buf[0..grecv_btc_len], " ");
+                        _ = gchat_arena_state.reset(.retain_capacity);
+                        grecv_status = saveReceiveAddress(gpa, gchat_arena_state.allocator(), io, environ, session, ln, btc, &grecv_saved);
+                        if (grecv_saved) grecv_set = true;
+                    },
+                    .char => |zc| if (grecv_mode == .paste) {
+                        if (zc == 8 or zc == 127) {
+                            if (grecv_focus == 0) {
+                                if (grecv_ln_len > 0) grecv_ln_len -= 1;
+                            } else if (grecv_btc_len > 0) grecv_btc_len -= 1;
+                            gchat_key_ns = clock_shell.monotonicNanos();
+                        } else if (zc == 9) {
+                            grecv_focus = 1 - grecv_focus;
+                        } else if (zc >= 0x20 and zc < 0x7f) {
+                            if (grecv_focus == 0) {
+                                if (grecv_ln_len < grecv_ln_buf.len) {
+                                    grecv_ln_buf[grecv_ln_len] = @intCast(zc);
+                                    grecv_ln_len += 1;
+                                    gchat_key_ns = clock_shell.monotonicNanos();
+                                }
+                            } else if (grecv_btc_len < grecv_btc_buf.len) {
+                                grecv_btc_buf[grecv_btc_len] = @intCast(zc);
+                                grecv_btc_len += 1;
+                                gchat_key_ns = clock_shell.monotonicNanos();
+                            }
+                        }
+                    },
+                    else => recv_key = false,
+                }
+                if (recv_key) {
+                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status);
+                    continue;
+                }
+            }
+
             if (engine != null and dev_chat and gscreen == feed_view.screen_messages and gpay_open) {
                 var pay_key = true;
                 switch (decoded.event) {
@@ -3789,6 +3921,64 @@ fn payMintId(io: std.Io) ?u64 {
 /// The sheet's Request verb: a payment_request card in the store + the
 /// encrypted frame to the peer. Returns the sheet's status line ("" =
 /// success; the caller closes the sheet).
+/// Publish YOUR chat receive address (the receive-setup sheet's Save/Enter).
+/// Runs the same validate-first + anchor-sign + put-record path as
+/// `--pay-publish`. Returns the status line to show; sets `saved` so the sheet
+/// colours it green (success) vs amber (refusal). One place, two call sites.
+fn saveReceiveAddress(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    env: ?*const std.process.Environ.Map,
+    session: *auth.Session,
+    ln: []const u8,
+    btc: []const u8,
+    saved: *bool,
+) []const u8 {
+    if (pay_addr.publish(gpa, arena, io, env, session, ln, btc)) |_| {
+        saved.* = true;
+        return "Saved \u{2014} you can now receive payments in chats";
+    } else |err| {
+        saved.* = false;
+        return switch (err) {
+            error.NoAddresses => "Add a Lightning or Bitcoin address first",
+            error.BadLightning => "That Lightning address isn't valid",
+            error.BadBitcoin => "That Bitcoin address isn't valid",
+            error.NoAnchor => "Couldn't sign \u{2014} chat identity missing",
+            error.SignFailed => "Couldn't sign the address record",
+            else => "Couldn't save \u{2014} check your connection",
+        };
+    }
+}
+
+/// Read this account's already-published receive address ONCE, to gate the
+/// bitcoin icon and prefill the sheet. Returns true if set up, copying the
+/// current addresses into the drafts. A network read on the UI thread the first
+/// time payments are opened (the first-contact posture); failure = "not set up"
+/// (E4) — the user just sees onboarding, never an error.
+fn loadOwnReceive(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    env: ?*const std.process.Environ.Map,
+    session: *auth.Session,
+    ln_buf: []u8,
+    ln_len: *usize,
+    btc_buf: []u8,
+    btc_len: *usize,
+) bool {
+    const own = (pay_addr.fetchOwn(gpa, arena, io, env, session.did) catch null) orelse return false;
+    if (own.lightning.len <= ln_buf.len) {
+        @memcpy(ln_buf[0..own.lightning.len], own.lightning);
+        ln_len.* = own.lightning.len;
+    }
+    if (own.bitcoin.len <= btc_buf.len) {
+        @memcpy(btc_buf[0..own.bitcoin.len], own.bitcoin);
+        btc_len.* = own.bitcoin.len;
+    }
+    return true;
+}
+
 fn payRequest(
     gpa: Allocator,
     io: std.Io,
@@ -4705,6 +4895,7 @@ const Grid = struct {
     chat_key_ns: u64 = 0,
     /// The pay sheet's frame state (M5 A4) — closed by default.
     chat_pay: feed_view.ChatPaySheet = .{},
+    chat_recv: feed_view.ChatReceiveSheet = .{},
     /// The reader's expanded posts (main-feed Read-more): CIDs stamped onto
     /// PostView.expanded by fromTimeline so a clamped body lays out in full.
     expanded: []const []const u8 = &.{},
@@ -5525,7 +5716,7 @@ fn paintFrame(
                 // Zat Chat (U3, dev-gated): the Messages surface. -scroll maps the
                 // shared ≤0 scroll state onto layoutChat's positive history offset.
                 const cf = buildChatFrame(arena, g.chat_store.?, g.chat_sel, now);
-                g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{}, &.{}) catch g.content_h.*;
+                g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{}, &.{}, g.chat_recv) catch g.content_h.*;
             } else if (g.screen.* == feed_view.screen_loadout) {
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
                 g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market, g.create, g.bench) catch g.content_h.*; // software: draw line-art nav
@@ -5908,6 +6099,16 @@ fn paintFrameGpu(
         chat_sig ^= std.hash.Wyhash.hash(0x1F83_D9AB, g.chat_pay.amount);
         chat_sig ^= std.hash.Wyhash.hash(0x9B05_688C, g.chat_pay.note);
         chat_sig ^= std.hash.Wyhash.hash(0x510E_527F, g.chat_pay.status);
+        // The receive-setup sheet is render-affecting state too — it MUST join
+        // the signature or its content + tap regions won't rebuild on the GPU
+        // path (the A5 lesson: a stale frame = dead buttons).
+        chat_sig ^= @as(u64, @intFromBool(g.chat_recv.open)) *% 0xA3C5_9AC0_1FEE_D1B7;
+        chat_sig ^= (@as(u64, @intFromEnum(g.chat_recv.mode)) +% 1) *% 0x632B_E5A3_11D9_6F07;
+        chat_sig ^= (@as(u64, g.chat_recv.focus) +% 1) *% 0xC2B2_AE3D_27D4_EB4F;
+        chat_sig ^= @as(u64, @intFromBool(g.chat_recv.saved)) *% 0x1656_67B1_9E37_79F9;
+        chat_sig ^= std.hash.Wyhash.hash(0x2C1B_3C6D, g.chat_recv.lightning);
+        chat_sig ^= std.hash.Wyhash.hash(0x9E37_79B1, g.chat_recv.bitcoin);
+        chat_sig ^= std.hash.Wyhash.hash(0x7F4A_7C15, g.chat_recv.status);
         // Payment CARDS advance without the message count moving (a wire
         // event or the watcher flips status/confirmations on an existing
         // row) — fold every row's live state in so the card repaints the
@@ -5972,7 +6173,7 @@ fn paintFrameGpu(
         // them for the caret's breath; the pay sheet always holds focus, M5 A4).
         chat_animating = gs.chat_anims.items.len > 0 or gs.chat_reflow != null or
             gs.chat_typing_t > 0.01 or g.chat_typing or
-            g.chat_input_focus or g.chat_composing or g.chat_pay.open;
+            g.chat_input_focus or g.chat_composing or g.chat_pay.open or g.chat_recv.open;
     };
     // Read-more expanded set → a set hash (XOR of each CID's FNV, order-free). It
     // rides BOTH the frame signature (so a Read-more tap forces a rebuild — the
@@ -6077,7 +6278,7 @@ fn paintFrameGpu(
                 }
             } else |_| {}
             const reflow_t: f32 = if (gs.chat_reflow) |rh| (gs.chat_world.position(rh) orelse 1.0) else 1.0;
-            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t }, xforms) catch g.content_h.*;
+            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t }, xforms, g.chat_recv) catch g.content_h.*;
         } else if (g.screen.* == feed_view.screen_transparency) {
             // The algorithm transparency page: a plain scrolling document (no rail),
             // rebuilt from the inspected config each entry (what you see = what runs).

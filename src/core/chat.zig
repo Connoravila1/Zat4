@@ -158,27 +158,43 @@ pub const Rail = enum(u8) { lightning = 0, onchain = 1 };
 /// A card's live state. `requested`/`pending` are pre-money, `broadcast`/
 /// `confirming` are in flight, `settled`/`failed` are terminal. Transitions
 /// are monotonic (`advancePayment`) — a card never un-settles.
+/// The card lifecycle (PAYMENT_UX_SPEC §4). Values 0–5 are the original set and
+/// are FROZEN (the history codec persists this byte); 6+ were appended for the
+/// full flow, so old history still reads. `pending` is the "awaiting_wallet"
+/// state (handed to the payer's wallet, not yet on the wire). `pending_setup`,
+/// `ready`, `cancelled`, `declined`, `expired` are reached by the send-to-a-
+/// walletless-recipient and cancel/decline/expire flows (later slices); the
+/// state + its per-side honest copy exist now.
 pub const PayStatus = enum(u8) {
     requested = 0,
-    pending = 1,
+    pending = 1, // == awaiting_wallet: handed to the payer's wallet
     broadcast = 2,
     confirming = 3,
     settled = 4,
     failed = 5,
+    pending_setup = 6, // send offered to someone with no wallet yet
+    ready = 7, // that someone set up; the payer must re-confirm
+    cancelled = 8, // the initiator withdrew it
+    declined = 9, // the other side declined
+    expired = 10, // the offer/request lapsed unanswered
 };
 
 pub fn isTerminalStatus(s: PayStatus) bool {
-    return s == .settled or s == .failed;
+    return switch (s) {
+        .settled, .failed, .cancelled, .declined, .expired => true,
+        else => false,
+    };
 }
 
-/// Forward-only ordering for `advancePayment`; both terminals rank last.
+/// Forward-only ordering for `advancePayment`; every terminal ranks last.
 fn statusRank(s: PayStatus) u8 {
     return switch (s) {
-        .requested => 0,
-        .pending => 1,
-        .broadcast => 2,
-        .confirming => 3,
-        .settled, .failed => 4,
+        .pending_setup, .requested => 0,
+        .ready => 1,
+        .pending => 2,
+        .broadcast => 3,
+        .confirming => 4,
+        .settled, .failed, .cancelled, .declined, .expired => 5,
     };
 }
 
@@ -1004,6 +1020,11 @@ pub fn deserializeStore(gpa: Allocator, bytes: []const u8) DeserializeError!Stor
                 3 => .confirming,
                 4 => .settled,
                 5 => .failed,
+                6 => .pending_setup,
+                7 => .ready,
+                8 => .cancelled,
+                9 => .declined,
+                10 => .expired,
                 else => return error.Malformed,
             };
             row.confirmations = bytes[at + 22];
@@ -1530,7 +1551,7 @@ test "store codec v2: every class of payment-section damage is refused" {
     bad[pay_at + 20] = 2;
     try expectBad(gpa, bad);
     @memcpy(bad, good);
-    bad[pay_at + 21] = 6;
+    bad[pay_at + 21] = 11; // first value past the PayStatus set (0..10)
     try expectBad(gpa, bad);
     @memcpy(bad, good);
     // Ref → out-of-range payment row; all-zero ref.
