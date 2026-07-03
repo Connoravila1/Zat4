@@ -2787,15 +2787,40 @@ pub fn run(
                                                 announceReceiveReady(gpa, io, environ, if (gchat_e2ee) |*p| p else null, gchat_link, &gchat_store);
                                             }
                                         },
-                                        // Compose "Send" ARMS the confirm face (no
-                                        // money yet); the real hand-off is .pay_send.
+                                        // Compose "Send": run the per-action gate
+                                        // (§5). A walletless recipient → an OFFER
+                                        // straight away (no wallet to approve, so no
+                                        // "open wallet" confirm — the old lie). A
+                                        // set-up recipient → ARM the confirm face,
+                                        // whose Confirm is the real hand-off
+                                        // (.pay_send). A refusal lands on the sheet.
                                         .pay_arm => if (dev_chat) {
-                                            const amount = std.fmt.parseInt(u64, gpay_amount_buf[0..gpay_amount_len], 10) catch 0;
-                                            if (amount == 0 or amount > chat_core.max_amount_sat) {
-                                                gpay_status = "Enter an amount in sats";
-                                            } else {
-                                                gpay_confirm = true;
-                                                gpay_status = "";
+                                            if (gchat_sel) |sc| {
+                                                const amount = std.fmt.parseInt(u64, gpay_amount_buf[0..gpay_amount_len], 10) catch 0;
+                                                if (amount == 0 or amount > chat_core.max_amount_sat) {
+                                                    gpay_status = "Enter an amount in sats";
+                                                } else {
+                                                    const note = std.mem.trim(u8, gpay_note_buf[0..gpay_note_len], " ");
+                                                    _ = gchat_arena_state.reset(.retain_capacity);
+                                                    const e2ee = if (gchat_e2ee) |*p| p else null;
+                                                    switch (peerSendGate(gpa, gchat_arena_state.allocator(), io, environ, e2ee, &gchat_store, sc, gpay_rail)) {
+                                                        .walletless => {
+                                                            gpay_status = payOffer(gpa, io, environ, e2ee, gchat_link, &gchat_store, sc, gpay_rail, amount, note, now);
+                                                            if (gpay_status.len == 0) {
+                                                                gpay_open = false;
+                                                                gpay_confirm = false;
+                                                                gpay_amount_len = 0;
+                                                                gpay_note_len = 0;
+                                                                gscroll_px = 0;
+                                                            }
+                                                        },
+                                                        .has_wallet => {
+                                                            gpay_confirm = true;
+                                                            gpay_status = "";
+                                                        },
+                                                        .refuse => |m| gpay_status = m,
+                                                    }
+                                                }
                                             }
                                         },
                                         .pay_confirm_back => if (dev_chat) {
@@ -3299,9 +3324,29 @@ pub fn run(
                         if (amount == 0 or amount > chat_core.max_amount_sat) {
                             gpay_status = "Enter an amount in sats";
                         } else if (!gpay_confirm) {
-                            // Compose → arm the confirm (no money moves on Enter).
-                            gpay_confirm = true;
-                            gpay_status = "";
+                            // Compose → the per-action gate, same as the Send
+                            // button: walletless makes an OFFER, set-up arms the
+                            // confirm. No money moves here either way.
+                            const note = std.mem.trim(u8, gpay_note_buf[0..gpay_note_len], " ");
+                            _ = gchat_arena_state.reset(.retain_capacity);
+                            const e2ee = if (gchat_e2ee) |*p| p else null;
+                            switch (peerSendGate(gpa, gchat_arena_state.allocator(), io, environ, e2ee, &gchat_store, sc, gpay_rail)) {
+                                .walletless => {
+                                    gpay_status = payOffer(gpa, io, environ, e2ee, gchat_link, &gchat_store, sc, gpay_rail, amount, note, now);
+                                    if (gpay_status.len == 0) {
+                                        gpay_open = false;
+                                        gpay_confirm = false;
+                                        gpay_amount_len = 0;
+                                        gpay_note_len = 0;
+                                        gscroll_px = 0;
+                                    }
+                                },
+                                .has_wallet => {
+                                    gpay_confirm = true;
+                                    gpay_status = "";
+                                },
+                                .refuse => |m| gpay_status = m,
+                            }
                         } else {
                             // Confirm face → the real hand-off.
                             const note = std.mem.trim(u8, gpay_note_buf[0..gpay_note_len], " ");
@@ -4200,6 +4245,43 @@ fn paySend(
     return "";
 }
 
+/// The per-action gate (§5): resolve the peer's PUBLISHED receive setup for
+/// the chosen rail BEFORE the send flow commits, so the UI never promises a
+/// wallet hand-off it can't make. `walletless` → the send is an OFFER (no
+/// wallet to approve, so no confirm face); `has_wallet` → the confirm + real
+/// hand-off; `refuse` → a line the sheet shows. This is the same fetch
+/// `paySend` does, hoisted to the tap so a walletless send skips the
+/// misleading "open wallet" beat entirely.
+const SendGate = union(enum) { walletless, has_wallet, refuse: []const u8 };
+
+fn peerSendGate(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    env: ?*const std.process.Environ.Map,
+    st: ?*chat_e2ee.State,
+    cs: *const chat_core.Store,
+    conv: chat_core.ConvIndex,
+    rail: chat_core.Rail,
+) SendGate {
+    const state = st orelse return .{ .refuse = "Chat is offline — no relay configured" };
+    const peer_did = chat_core.conversationDid(cs, conv);
+    const anchor_pub = chat_e2ee.peerAnchor(state, peer_did) orelse
+        return .{ .refuse = "No secure conversation with them yet" };
+    const rails = (pay_addr.fetchPayee(gpa, arena, io, env, peer_did, anchor_pub) catch
+        return .{ .refuse = "Couldn't verify their payment record" }) orelse
+        return .walletless;
+    const addr = switch (rail) {
+        .lightning => rails.lightning,
+        .onchain => rails.bitcoin,
+    };
+    if (addr.len == 0) return .{ .refuse = switch (rail) {
+        .lightning => "They don't take lightning — try on-chain",
+        .onchain => "They don't take on-chain — try lightning",
+    } };
+    return .has_wallet;
+}
+
 /// A FRESH send to a walletless recipient (S2): mint the card at
 /// `pending_setup` (no money moves — "Waiting to send"), persist, and send
 /// the offer wire byte (20) so the peer sees "{P} wants to send you {amt}".
@@ -4209,8 +4291,8 @@ fn payOffer(
     gpa: Allocator,
     io: std.Io,
     env: ?*const std.process.Environ.Map,
-    state: *chat_e2ee.State,
-    l: *chat_relay.ChatRelay,
+    st: ?*chat_e2ee.State,
+    link: ?*chat_relay.ChatRelay,
     cs: *chat_core.Store,
     conv: chat_core.ConvIndex,
     rail: chat_core.Rail,
@@ -4218,6 +4300,8 @@ fn payOffer(
     note: []const u8,
     now: i64,
 ) []const u8 {
+    const state = st orelse return "Chat is offline — no relay configured";
+    const l = link orelse return "Chat is offline — no relay configured";
     const id = payMintId(io) orelse return "No entropy — try again";
     if (chat_core.findPayment(cs, conv, id) != null) return "Try again"; // 2^-64 event
     const pay = chat_core.appendPayment(gpa, cs, conv, .payment_sent, id, rail, amount_sat, note, now, true) catch

@@ -54,6 +54,33 @@ const ink: u32 = 0xFFEDEAE0;
 const body_c: u32 = 0xFFD8D3C8;
 const muted: u32 = 0xFF9A968A;
 const faint: u32 = 0xFF6A655A;
+
+/// Relative luminance of an opaque RGB colour, 0..255 (integer Rec.601-ish
+/// weights). The one input to the contrast rule below.
+inline fn luma(c: u32) u32 {
+    const r = (c >> 16) & 0xFF;
+    const g = (c >> 8) & 0xFF;
+    const b = c & 0xFF;
+    return (r * 77 + g * 150 + b * 29) >> 8;
+}
+
+/// True when a fill is light enough that text on it must go DARK. The bubble
+/// fill shifts with the user's ambient lens (any hue, any lightness), so card
+/// text can never be hardcoded — it is derived from the fill it sits on.
+inline fn fillIsBright(c: u32) bool {
+    return luma(c) > 140;
+}
+
+/// The "colour proof" pair: a legible primary and a muted-companion text
+/// colour for content drawn ON `fill` — dark ink on a bright fill, light ink
+/// on a dark one. Used for every string on a payment card so it stays
+/// readable whatever palette the reader has chosen.
+inline fn onFill(fill: u32) u32 {
+    return if (fillIsBright(fill)) 0xFF1A1712 else 0xFFF4F1EA;
+}
+inline fn onFillMuted(fill: u32) u32 {
+    return if (fillIsBright(fill)) 0xFF4C463C else 0xFFD6D2C7;
+}
 /// The HOUSE accent (amber) — the default and the composer's fixed accent.
 /// On Home the live accent is the SEATED LENS's palette color (§11.5),
 /// threaded into `layout` as `accent` and passed down to the chrome; this
@@ -3986,81 +4013,110 @@ fn drawPayCard(
     ordinal: u16,
 ) !void {
     const settled_c: u32 = 0xFF9BCE9B; // soft success green
+    const warn_c: u32 = 0xFFE0A868; // amber dot
     const fill: u32 = bubbleFill(accent, b.mine);
+    // Every glyph on this card takes its colour FROM the fill (the "colour
+    // proof" rule) — the fill is the user's ambient accent and can be any hue
+    // or lightness, so nothing is hardcoded against it.
+    const bright = fillIsBright(fill);
+    const text_c = onFill(fill);
+    const sub_c = onFillMuted(fill);
     try rect(gpa, dl, bx, by, bw, bh_card, fill, 14);
     if (b.tail) try bubbleTail(gpa, dl, b.mine, bx, by, bw, bh_card, fill);
     if (!chat_msg.isTerminalStatus(card.status)) {
-        // A live card wears a faint accent ring; terminal cards sit quiet.
-        const ring_c = (0x60 << 24) | (accent & 0x00FFFFFF);
+        // A live card wears a faint ring drawn from the ON-fill ink, so it
+        // shows on a bright bubble as well as a dark one.
+        const ring_c = (0x50 << 24) | (text_c & 0x00FFFFFF);
         try rect(gpa, dl, bx, by, bw, 1, ring_c, 0);
         try rect(gpa, dl, bx, by + bh_card - 1, bw, 1, ring_c, 0);
         try rect(gpa, dl, bx, by, 1, bh_card, ring_c, 0);
         try rect(gpa, dl, bx + bw - 1, by, 1, bh_card, ring_c, 0);
     }
     var ty = by + 12;
-    _ = try str(gpa, dl, e, .semibold, bx + 14, ty + 11, faint, 11, if (card.rail == .lightning) "LIGHTNING" else "ON-CHAIN");
+    _ = try str(gpa, dl, e, .semibold, bx + 14, ty + 11, sub_c, 11, if (card.rail == .lightning) "LIGHTNING" else "ON-CHAIN");
     ty += 16;
     var gb: [27]u8 = undefined;
     const amt = groupSats(&gb, card.amount_sat);
-    const pen = try str(gpa, dl, e, .semibold, bx + 14, ty + 22, ink, 22, amt);
-    _ = try str(gpa, dl, e, .regular, pen + 6, ty + 22, muted, 13, "sats");
+    const pen = try str(gpa, dl, e, .semibold, bx + 14, ty + 22, text_c, 22, amt);
+    _ = try str(gpa, dl, e, .regular, pen + 6, ty + 22, sub_c, 13, "sats");
     ty += 30;
     if (b.body.len > 0) {
         const note_h = try wrapBody(gpa, dl, e, 0, 0, bw - 28, 0, 13, b.body, 18, false, null);
-        _ = try wrapBody(gpa, dl, e, bx + 14, ty + 13, bw - 28, muted, 13, b.body, 18, true, null);
+        _ = try wrapBody(gpa, dl, e, bx + 14, ty + 13, bw - 28, sub_c, 13, b.body, 18, true, null);
         ty += note_h + 4;
     }
     if (card.status == .confirming) {
         // The six-block animation: one block fills per confirmation, live
-        // in the conversation — the thread IS the receipt (§4).
+        // in the conversation — the thread IS the receipt (§4). The filled
+        // block is the ON-fill ink; empty blocks a faint wash of it.
         var i: i32 = 0;
         while (i < chat_msg.settle_depth) : (i += 1) {
             const on = i < card.confirmations;
-            try rect(gpa, dl, bx + 14 + i * 19, ty + 5, 14, 14, if (on) accent else 0x2AEDEAE0, 4);
+            try rect(gpa, dl, bx + 14 + i * 19, ty + 5, 14, 14, if (on) text_c else (0x28 << 24) | (text_c & 0x00FFFFFF), 4);
         }
         var cb: [8]u8 = undefined;
         const cs = std.fmt.bufPrint(&cb, "{d}/{d}", .{ card.confirmations, chat_msg.settle_depth }) catch "";
-        _ = try str(gpa, dl, e, .regular, bx + 14 + 6 * 19 + 6, ty + 16, muted, 12, cs);
+        _ = try str(gpa, dl, e, .regular, bx + 14 + 6 * 19 + 6, ty + 16, sub_c, 12, cs);
     } else {
-        // The honest per-side status: a headline + a trust subline (does money
-        // move?). Tone colours the headline; a settled card gets a green dot.
+        // The honest per-side status: a legible headline (ON-fill ink) + a
+        // muted trust subline. The tone survives as a small saturated DOT
+        // (green settled / amber caution) — a coloured dot reads on any fill,
+        // where coloured TEXT would not.
         const pl = payStatusLine(card.status, b.kind, b.mine);
-        const hc: u32 = switch (pl.tone) {
-            .good => settled_c,
-            .warn => 0xFFE0A868,
-            .neutral => body_c,
-        };
-        if (pl.tone == .good) {
-            try rect(gpa, dl, bx + 14, ty + 8, 8, 8, settled_c, 4);
-            _ = try str(gpa, dl, e, .semibold, bx + 28, ty + 16, hc, 13, pl.head);
-        } else {
-            _ = try str(gpa, dl, e, .semibold, bx + 14, ty + 16, hc, 13, pl.head);
+        var hx = bx + 14;
+        if (pl.tone == .good or pl.tone == .warn) {
+            try rect(gpa, dl, bx + 14, ty + 8, 8, 8, if (pl.tone == .good) settled_c else warn_c, 4);
+            hx = bx + 28;
         }
+        _ = try str(gpa, dl, e, .semibold, hx, ty + 16, text_c, 13, pl.head);
         if (pl.sub.len > 0)
-            _ = try str(gpa, dl, e, .regular, bx + 14, ty + 32, muted, 11, pl.sub);
+            _ = try str(gpa, dl, e, .regular, bx + 14, ty + 32, sub_c, 11, pl.sub);
     }
     ty += 38;
     const acts = payCardActions(b.mine, b.kind, card.status);
     if (acts.primary) |act| {
-        // The primary reads as the affirmative move (accent-filled), unless
-        // it is a Cancel — a withdrawal is never the loud button.
-        const filled = act != .pay_card_cancel;
-        const label = payActionLabel(act);
-        const lw: i32 = @intCast(text.measure(e, .semibold, label, 13));
-        const pw = lw + 32;
-        try rect(gpa, dl, bx + 14, ty + 4, pw, 34, if (filled) accent else 0x2AEDEAE0, 12);
-        _ = try str(gpa, dl, e, .semibold, bx + 30, ty + 26, if (filled) 0xFF20201A else body_c, 13, label);
-        try emitRegion(gpa, regions, bx + 14, ty + 4, pw, 34, ordinal, act);
-        if (acts.secondary) |sec| {
-            // A quiet secondary (Cancel/Decline) sits to the right, ghosted.
-            const slabel = payActionLabel(sec);
-            const slw: i32 = @intCast(text.measure(e, .semibold, slabel, 13));
-            const spw = slw + 28;
-            const sx = bx + 14 + pw + 10;
-            _ = try str(gpa, dl, e, .semibold, sx + 14, ty + 26, muted, 13, slabel);
-            try emitRegion(gpa, regions, sx, ty + 4, spw, 34, ordinal, sec);
-        }
+        var ax = bx + 14;
+        ax = try drawCardButton(gpa, dl, e, regions, fill, bright, ax, ty, act, ordinal);
+        if (acts.secondary) |sec|
+            _ = try drawCardButton(gpa, dl, e, regions, fill, bright, ax + 10, ty, sec, ordinal);
     }
+}
+
+/// One card action button, styled to CONTRAST its card fill (never accent-on-
+/// accent, which vanishes on a `mine` card). An affirmative action is a solid
+/// contrasting chip; a withdrawal (Cancel/Decline) is a quiet ghost. Returns
+/// the x just past the button so a second one can follow.
+fn drawCardButton(
+    gpa: Allocator,
+    dl: *raster.DrawList,
+    e: *const text.Engine,
+    regions: ?*Regions,
+    fill: u32,
+    bright: bool,
+    x: i32,
+    ty: i32,
+    act: Action,
+    ordinal: u16,
+) !i32 {
+    const quiet = act == .pay_card_cancel or act == .pay_card_decline;
+    const label = payActionLabel(act);
+    const lw: i32 = @intCast(text.measure(e, .semibold, label, 13));
+    const pw = lw + 32;
+    if (quiet) {
+        // A ghost chip: a faint wash of the ON-fill ink, with muted text.
+        const wash = (0x24 << 24) | (onFill(fill) & 0x00FFFFFF);
+        try rect(gpa, dl, x, ty + 4, pw, 34, wash, 12);
+        _ = try str(gpa, dl, e, .semibold, x + 16, ty + 26, onFillMuted(fill), 13, label);
+    } else {
+        // A solid chip that reads on the card: dark on a bright card, light
+        // on a dark one, with inverted text either way.
+        const chip = if (bright) @as(u32, 0xFF1A1712) else @as(u32, 0xFFF4F1EA);
+        const chip_fg = if (bright) @as(u32, 0xFFF4F1EA) else @as(u32, 0xFF1A1712);
+        try rect(gpa, dl, x, ty + 4, pw, 34, chip, 12);
+        _ = try str(gpa, dl, e, .semibold, x + 16, ty + 26, chip_fg, 13, label);
+    }
+    try emitRegion(gpa, regions, x, ty + 4, pw, 34, ordinal, act);
+    return x + pw;
 }
 
 /// Draw `s` truncated to `maxw`, with a trailing ellipsis when it overflows.
@@ -4811,19 +4867,31 @@ pub fn layoutChat(
                     _ = try str(gpa, dl, e, .regular, detail_x + 20, py + 12, sc, 13, recv.status);
                     py += 24;
                 }
-                const cancel_w: i32 = 92;
-                var bx3 = detail_x + 18;
-                try rect(gpa, dl, bx3, py, cancel_w, 42, 0x2AEDEAE0, 14);
-                const clw: i32 = @intCast(text.measure(e, .semibold, "Cancel", 13));
-                _ = try str(gpa, dl, e, .semibold, bx3 + @divTrunc(cancel_w - clw, 2), py + 27, body_c, 13, "Cancel");
-                try emitRegion(gpa, regions, bx3, py, cancel_w, 42, 0, .recv_cancel);
-                bx3 += cancel_w + 8;
-                const save_w = detail_x + detail_w - 18 - bx3;
-                const has_addr = recv.lightning.len > 0 or recv.bitcoin.len > 0;
-                try rect(gpa, dl, bx3, py, save_w, 42, if (has_addr) accent else skinPanel(accent), 14);
-                const slw: i32 = @intCast(text.measure(e, .semibold, "Save", 13));
-                _ = try str(gpa, dl, e, .semibold, bx3 + @divTrunc(save_w - slw, 2), py + 27, if (has_addr) 0xFF20201A else faint, 13, "Save");
-                try emitRegion(gpa, regions, bx3, py, save_w, 42, 0, .recv_save);
+                if (recv.saved) {
+                    // Once saved there is nothing left to do here — the footer
+                    // collapses to a single Done that closes the sheet (reusing
+                    // recv_cancel, which dismisses). No more lone "Cancel".
+                    const done_w = detail_w - 36;
+                    const dx = detail_x + 18;
+                    try rect(gpa, dl, dx, py, done_w, 42, accent, 14);
+                    const dlw: i32 = @intCast(text.measure(e, .semibold, "Done", 13));
+                    _ = try str(gpa, dl, e, .semibold, dx + @divTrunc(done_w - dlw, 2), py + 27, 0xFF20201A, 13, "Done");
+                    try emitRegion(gpa, regions, dx, py, done_w, 42, 0, .recv_cancel);
+                } else {
+                    const cancel_w: i32 = 92;
+                    var bx3 = detail_x + 18;
+                    try rect(gpa, dl, bx3, py, cancel_w, 42, 0x2AEDEAE0, 14);
+                    const clw: i32 = @intCast(text.measure(e, .semibold, "Cancel", 13));
+                    _ = try str(gpa, dl, e, .semibold, bx3 + @divTrunc(cancel_w - clw, 2), py + 27, body_c, 13, "Cancel");
+                    try emitRegion(gpa, regions, bx3, py, cancel_w, 42, 0, .recv_cancel);
+                    bx3 += cancel_w + 8;
+                    const save_w = detail_x + detail_w - 18 - bx3;
+                    const has_addr = recv.lightning.len > 0 or recv.bitcoin.len > 0;
+                    try rect(gpa, dl, bx3, py, save_w, 42, if (has_addr) accent else skinPanel(accent), 14);
+                    const slw: i32 = @intCast(text.measure(e, .semibold, "Save", 13));
+                    _ = try str(gpa, dl, e, .semibold, bx3 + @divTrunc(save_w - slw, 2), py + 27, if (has_addr) 0xFF20201A else faint, 13, "Save");
+                    try emitRegion(gpa, regions, bx3, py, save_w, 42, 0, .recv_save);
+                }
             },
             // The get-a-wallet list (for users who have none). Each row opens the
             // wallet's site; you grab an address there and come back to paste.
