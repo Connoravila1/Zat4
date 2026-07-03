@@ -170,7 +170,7 @@ pub fn main(init: std.process.Init) !void {
     var engine = try text.initEngine();
     defer text.deinitEngine(gpa, &engine);
 
-    var g_opt: ?gpu.Gpu = gpu.init(win.wid) catch null;
+    var g_opt: ?gpu.Gpu = gpu.init(window_shell.nativeHandle(win)) catch null;
     defer if (g_opt) |*g| gpu.deinit(g);
     var feed_opt: ?gpu.Feed = null;
     defer if (feed_opt) |*fp| gpu.feedDeinit(fp, gpa);

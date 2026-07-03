@@ -40,6 +40,8 @@ const impl = switch (builtin.os.tag) {
 };
 
 pub const Window = impl.Window;
+pub const NativeHandle = impl.NativeHandle;
+pub const nativeHandle = impl.nativeHandle;
 pub const OpenError = impl.OpenError;
 pub const PumpResult = impl.PumpResult;
 pub const open = impl.open;

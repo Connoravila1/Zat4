@@ -116,7 +116,7 @@ pub fn main(init: std.process.Init) !void {
     const home_tray: lens_socket.TrayView = .{ .cards = hc, .text = hb, .seated = lens_catalog.default_feed_seated };
 
     // GPU bring-up (real app path).
-    var g = gpu.init(win.wid) catch {
+    var g = gpu.init(window_shell.nativeHandle(win)) catch {
         std.debug.print("GPU init failed — see [gpu] lines above.\n", .{});
         return;
     };

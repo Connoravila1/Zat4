@@ -310,6 +310,17 @@ fn readSmallFile(gpa: Allocator, path: []const u8, max_bytes: usize) ?[]u8 {
 
 /// Resolve $DISPLAY + cookie and open. `cols`/`rows` set the initial cell
 /// geometry; the window manager may resize us immediately after.
+/// The OS-native window handle the GPU seam consumes. On X11 the EGL
+/// native window IS the X Window XID — a plain value, so handing it out
+/// leaks no protocol detail (D3). Each backend defines its own shape;
+/// shell/native.zig re-exports the selected one and gpu.init takes it,
+/// so no caller ever reaches into a backend's Window fields.
+pub const NativeHandle = u32;
+
+pub fn nativeHandle(win: *const Window) NativeHandle {
+    return win.wid;
+}
+
 pub fn open(
     gpa: Allocator,
     environ: ?*const std.process.Environ.Map,

@@ -166,7 +166,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     var engine = try text.initEngine();
     defer text.deinitEngine(gpa, &engine);
 
-    var g = gpu.init(win.wid) catch |err| {
+    var g = gpu.init(window_shell.nativeHandle(win)) catch |err| {
         std.debug.print("GPU init failed — see [gpu] lines above.\n", .{});
         return err;
     };

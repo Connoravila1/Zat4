@@ -36,6 +36,8 @@
 //! on real hardware (it cannot be run in the build sandbox).
 
 const std = @import("std");
+const builtin = @import("builtin");
+const native = @import("native.zig");
 
 extern fn dlopen(path: [*:0]const u8, mode: c_int) callconv(.c) ?*anyopaque;
 extern fn dlsym(handle: ?*anyopaque, symbol: [*:0]const u8) callconv(.c) ?*anyopaque;
@@ -214,10 +216,28 @@ fn load() Error!void {
     loaded = true;
 }
 
-/// Bring up an EGL/GLES2 context on the existing X11 window `wid`, with a
+/// Bring up an EGL/GLES2 context on the existing native window, with a
 /// running commentary so a real-hardware run reports exactly where (if
 /// anywhere) it stops. Returns a live, current context.
-pub fn init(wid: u32) Error!Gpu {
+///
+/// The handle is whatever the selected window backend supplies
+/// (`native.nativeHandle`) — on X11 the XID, which is also EGL's native
+/// window type, so it feeds eglCreateWindowSurface directly. Windows and
+/// macOS have no GPU backend yet (roadmap W5/M4): there init reports
+/// GpuInit without touching any loader, and the caller's software
+/// fallback takes over (E2). The comptime gate below is also what keeps
+/// dlopen/dlsym out of non-Linux binaries — load() is only analyzed on
+/// the Linux branch, so no dl* symbol is ever referenced at link time.
+pub fn init(handle: native.NativeHandle) Error!Gpu {
+    if (comptime builtin.os.tag != .linux) {
+        elog("no GPU backend for this OS yet — the software renderer takes over", .{});
+        return Error.GpuInit;
+    } else {
+        return initEgl(handle);
+    }
+}
+
+fn initEgl(wid: u32) Error!Gpu {
     try load();
 
     const dpy = eglGetDisplay(null); // EGL_DEFAULT_DISPLAY → EGL opens its own $DISPLAY connection

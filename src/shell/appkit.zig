@@ -227,6 +227,15 @@ pub const Window = struct {
     first_pump: bool,
 };
 
+/// The OS-native window handle the GPU seam consumes: the CAMetalLayer id,
+/// already an opaque objc pointer. The macOS GPU backend (ANGLE/Metal,
+/// roadmap M4) renders into this layer; nothing else reads it (D3).
+pub const NativeHandle = ?*anyopaque;
+
+pub fn nativeHandle(win: *const Window) NativeHandle {
+    return win.layer;
+}
+
 pub fn open(
     gpa: Allocator,
     environ: anytype,
@@ -478,9 +487,31 @@ pub fn setCursor(window: *Window, shape: layout.Cursor) void {
         .pointer => "pointingHandCursor",
         .text => "IBeamCursor",
         .grab => "closedHandCursor",
+        // AppKit has no themed heart cursor; the engagement hover reads as
+        // the hand until a custom cursor lands with the real port (same
+        // posture as the Win32 backend's mapping).
+        .heart => "pointingHandCursor",
     };
     const cursor = send0(o, cls, o.selReg(name)) orelse return;
     _ = send0(o, cursor, o.selReg("set"));
+}
+
+/// Parity stub for the X11 backend's julia mode (the heart cursor). No
+/// custom cursor is built on this backend yet, so the toggle has nothing
+/// to switch — the standard shapes stay. Recorded runtime-port debt
+/// (DISTRIBUTION_ROADMAP M5), not an oversight.
+pub fn setJulia(window: *Window, on: bool) void {
+    _ = window;
+    _ = on;
+}
+
+/// Copy-out is not wired on this backend yet (the real form is
+/// NSPasteboard clearContents + setString:forType:). The X11 path is
+/// already best-effort void; here the debt is named rather than silent
+/// (E3): DISTRIBUTION_ROADMAP M5.
+pub fn setClipboard(window: *Window, data: []const u8) void {
+    _ = window;
+    _ = data;
 }
 
 /// Rasterize and blit: pixels are COPIED into a CFData (the layer may

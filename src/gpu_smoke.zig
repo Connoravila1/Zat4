@@ -44,7 +44,7 @@ pub fn main(init: std.process.Init) !void {
     defer window_shell.close(win);
     std.debug.print("window opened: wid=0x{x} fd={d} depth={d} fb={d}x{d}\n", .{ win.wid, win.fd, win.root_depth, win.fb.width, win.fb.height });
 
-    var g = gpu.init(win.wid) catch {
+    var g = gpu.init(window_shell.nativeHandle(win)) catch {
         std.debug.print("GPU init failed — see [gpu] lines above for the exact step.\n", .{});
         return;
     };

@@ -99,7 +99,7 @@ pub fn main(init: std.process.Init) !void {
     _ = try feed_view.layout(gpa, &engine, @intCast(design_w), @intCast(logicalH(W, H)), posts, 0, &dl, null, null, false, 0, null, 0, feed_view.accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{}, 0, 255, null);
 
     // Bring up GL and the renderer.
-    var g = gpu.init(win.wid) catch {
+    var g = gpu.init(window_shell.nativeHandle(win)) catch {
         std.debug.print("GPU init failed — see [gpu] lines above for the exact step.\n", .{});
         return;
     };

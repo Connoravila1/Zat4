@@ -5756,7 +5756,7 @@ fn liveGeom(gs: *const GpuState, target: feed_view.PaneGeom) feed_view.PaneGeom 
 /// error, OOM) propagates so the caller falls back to software (E2). Each
 /// acquired resource has an errdefer so a mid-init failure frees cleanly (C5).
 fn initGpuState(gpa: Allocator, engine: *text_core.Engine, win: *window_shell.Window) !GpuState {
-    var g = try gpu.init(win.wid);
+    var g = try gpu.init(window_shell.nativeHandle(win));
     errdefer gpu.deinit(&g);
     const w: u32 = win.fb.width;
     const h: u32 = win.fb.height;

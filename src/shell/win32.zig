@@ -276,6 +276,15 @@ const class_name = std.unicode.utf8ToUtf16LeStringLiteral("zatWindow");
 
 /// `environ` is accepted for surface parity with the X11 backend (which
 /// needs DISPLAY/XAUTHORITY); Windows needs nothing from it.
+/// The OS-native window handle the GPU seam consumes: the HWND, erased to
+/// an opaque pointer so the private Win32 ABI types stay private (D3).
+/// The Windows GPU backend (ANGLE, roadmap W5) will cast it back.
+pub const NativeHandle = ?*anyopaque;
+
+pub fn nativeHandle(win: *const Window) NativeHandle {
+    return @ptrCast(win.hwnd);
+}
+
 pub fn open(
     gpa: Allocator,
     environ: anytype,
@@ -553,6 +562,24 @@ fn cursorIdc(shape: layout.Cursor) usize {
 pub fn setCursor(window: *Window, shape: layout.Cursor) void {
     window.want_cursor = shape;
     _ = SetCursor(LoadCursorW(null, cursorIdc(shape)));
+}
+
+/// Parity stub for the X11 backend's julia mode (the heart cursor). No
+/// custom cursor is built on this backend yet, so the toggle has nothing
+/// to switch — the standard shapes stay. Recorded runtime-port debt
+/// (DISTRIBUTION_ROADMAP W6), not an oversight.
+pub fn setJulia(window: *Window, on: bool) void {
+    _ = window;
+    _ = on;
+}
+
+/// Copy-out is not wired on this backend yet (the real form is
+/// OpenClipboard + SetClipboardData(CF_UNICODETEXT)). The X11 path is
+/// already best-effort void; here the debt is named rather than silent
+/// (E3): DISTRIBUTION_ROADMAP W6.
+pub fn setClipboard(window: *Window, data: []const u8) void {
+    _ = window;
+    _ = data;
 }
 
 pub fn present(window: *Window, surface: *const tui.Surface) error{ OutOfMemory, ProtocolError }!void {
