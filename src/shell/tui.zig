@@ -45,6 +45,7 @@ const timeline_ui = @import("../core/timeline_ui.zig");
 const feed_core = @import("../core/feed.zig");
 const chat_core = @import("../core/chat.zig");
 const chat_view_core = @import("../core/chat_view.zig");
+const spring = @import("../core/spring.zig");
 const chat_relay = @import("chat_relay.zig");
 const chat_e2ee = @import("chat_e2ee.zig");
 const pay_addr = @import("pay_addr.zig");
@@ -3745,6 +3746,10 @@ const ChatFrame = struct {
     cards: []const chat_view_core.PayCard = &.{},
     sel: u16 = std.math.maxInt(u16),
     peer: []const u8 = "",
+    /// The open thread's stable message keys, parallel to `thread` (U6b): the
+    /// shell maps its per-bubble springs onto rows by matching these. Empty
+    /// when no conversation is selected.
+    order: []const chat_core.MsgIndex = &.{},
 };
 
 /// Resolve the Messages surface's view-models from the one chat store: the
@@ -4105,6 +4110,9 @@ fn buildChatFrame(arena: Allocator, cs: *const chat_core.Store, sel: ?chat_core.
         const th = chat_view_core.buildThread(arena, cs, sc, now) catch chat_view_core.Thread{};
         out.thread = th.rows;
         out.cards = th.cards;
+        // The same message order `buildThread` iterated, exposed so the shell can
+        // bind its per-bubble springs to rows by key (U6b). 1:1 with `th.rows`.
+        out.order = chat_core.threadSlice(arena, cs, sc) catch &.{};
     }
     return out;
 }
@@ -4923,24 +4931,42 @@ const GpuState = struct {
     algo_v: f32 = 0,
     left_hover_t: f32 = 0,
     left_hover_v: f32 = 0,
-    /// Zat Chat motion (U6a): the newest bubble's send/arrival springs, the
-    /// typing indicator's grow/melt spring + its pulse clock, and the store
-    /// watermark the triggers derive from. ONE trigger site — the observed
-    /// state transition (the store grew), per ANIMATION_SYSTEM_NOTES.
-    chat_send_t: f32 = 1,
-    chat_send_v: f32 = 0,
-    chat_arrive_t: f32 = 1,
-    chat_arrive_v: f32 = 0,
+    /// Zat Chat motion (U6b): PER-BUBBLE springs. Each in-flight bubble owns a
+    /// scale + offset spring in `chat_world` (core/spring.zig), bound by its
+    /// message key in `chat_anims` — so several bubbles animate at once with
+    /// independent momentum (the interruptibility one shared scalar could not
+    /// give). `chat_reflow` is the thread's settle after an append; the typing
+    /// indicator keeps its own small spring. ONE trigger site — the observed
+    /// state transition (the open conversation's newest message advanced).
+    chat_world: spring.World = .empty,
+    chat_anims: std.ArrayListUnmanaged(ChatAnim) = .empty,
+    chat_reflow: ?spring.Handle = null,
     chat_typing_t: f32 = 0,
     chat_typing_v: f32 = 0,
     chat_typing_phase: f32 = 0,
-    chat_seen_msgs: usize = 0,
-    /// False until the Messages screen has been seen once — the history
-    /// restore and any pre-visit arrivals must NOT animate on first paint.
+    /// Watermark: the open conversation and its newest MsgIndex, so only a genuine
+    /// new arrival/send animates (switching convs or restoring history must not).
+    chat_seen_conv: u32 = 0,
+    chat_seen_key: u32 = 0,
+    /// False until a conversation has been observed once — a first paint (history
+    /// restore, pre-visit arrivals) must NOT animate.
     chat_seen_valid: bool = false,
-    /// The chat springs' frame-clock watermark (monotonic ns): motion
-    /// advances by MEASURED time, not a fixed per-frame tick.
+    /// The chat springs' frame-clock watermark (monotonic ns): motion advances by
+    /// MEASURED time, not a fixed per-frame tick.
     chat_clock_ns: u64 = 0,
+};
+
+/// One in-flight bubble's spring binding (U6b). A7.2: cold-ish — a handful live
+/// at once, held in a small list, never scanned in a hot inner loop; guard waived.
+const ChatAnim = struct {
+    /// The bubble's stable message key (`@intFromEnum(MsgIndex)`), matched
+    /// against the thread's order to place the transform on the right row.
+    key: u32,
+    scale: spring.Handle, // grows the bubble into place (0.86/0.92 → 1.0, bouncy)
+    off: spring.Handle, // rises it from below the seat (px → 0)
+    /// Spawn time (monotonic ns) — drives the short, monotonic opacity ramp,
+    /// which is deliberately NOT a spring (an overshooting alpha flickers).
+    born_ns: u64,
 };
 
 /// Spring one geometry boundary toward its target (S.2). Stiff + just over
@@ -5123,7 +5149,64 @@ fn deinitGpuState(gpa: Allocator, gs: *GpuState) void {
     gpu.feedDeinit(&gs.sel, gpa);
     gpu.feedDeinit(&gs.menu, gpa);
     gs.sel_glyphs.deinit(gpa);
+    gs.chat_anims.deinit(gpa);
+    gs.chat_world.deinit(gpa);
     gpu.deinit(&gs.g);
+}
+
+// ── Zat Chat per-bubble motion (U6b) ─────────────────────────────────────────
+// The presets are the roadmap's tuning seeds (duration/bounce, §8 step 7). An
+// OWN send pops a touch harder than a counterparty ARRIVAL (0.28 vs 0.20 bounce)
+// and starts smaller/lower — it springs up out of the composer; an arrival
+// settles more gently. Tune these live (this is the ONE place hand-taste belongs).
+const chat_scale_mine = spring.springConstants(0.28, 0.35);
+const chat_scale_them = spring.springConstants(0.20, 0.35);
+const chat_off_c = spring.springConstants(0.15, 0.40);
+const chat_reflow_c = spring.springConstants(0.0, 0.40); // critical: a reflow must not overshoot
+const chat_fade_ns: f32 = 0.18 * 1_000_000_000.0; // opacity ramp duration
+
+/// Spawn a bubble's scale + offset springs and bind them to its message key.
+/// Idempotent per key; silently no-ops on OOM (a missed animation is cosmetic,
+/// never a crash — E4).
+fn spawnBubbleAnim(gpa: Allocator, gs: *GpuState, key: u32, mine: bool, born_ns: u64) void {
+    for (gs.chat_anims.items) |a| if (a.key == key) return;
+    const c_scale = if (mine) chat_scale_mine else chat_scale_them;
+    const start_scale: f32 = if (mine) 0.86 else 0.92;
+    const start_rise: f32 = if (mine) 26.0 else 20.0;
+    const sh = gs.chat_world.spawn(gpa, start_scale, 1.0, c_scale) catch return;
+    const oh = gs.chat_world.spawn(gpa, start_rise, 0.0, chat_off_c) catch {
+        gs.chat_world.release(sh);
+        return;
+    };
+    gs.chat_anims.append(gpa, .{ .key = key, .scale = sh, .off = oh, .born_ns = born_ns }) catch {
+        gs.chat_world.release(sh);
+        gs.chat_world.release(oh);
+    };
+}
+
+/// Restart the thread-reflow spring (0 → 1) on an append: the older content just
+/// jumped up by the new row's height and now slides back to rest.
+fn startChatReflow(gpa: Allocator, gs: *GpuState) void {
+    if (gs.chat_reflow) |h| gs.chat_world.release(h);
+    gs.chat_reflow = gs.chat_world.spawn(gpa, 0.0, 1.0, chat_reflow_c) catch null;
+}
+
+/// Release the springs of any bubble (and the reflow) that has reached rest, so
+/// the world's active set shrinks back toward empty.
+fn reapChatAnims(gs: *GpuState) void {
+    var i: usize = 0;
+    while (i < gs.chat_anims.items.len) {
+        const a = gs.chat_anims.items[i];
+        if (!gs.chat_world.isActive(a.scale) and !gs.chat_world.isActive(a.off)) {
+            gs.chat_world.release(a.scale);
+            gs.chat_world.release(a.off);
+            _ = gs.chat_anims.swapRemove(i);
+        } else i += 1;
+    }
+    if (gs.chat_reflow) |h| if (!gs.chat_world.isActive(h)) {
+        gs.chat_world.release(h);
+        gs.chat_reflow = null;
+    };
 }
 
 /// Refit the CPU field grid + ambient-bias buffer to a new window size. New
@@ -5442,7 +5525,7 @@ fn paintFrame(
                 // Zat Chat (U3, dev-gated): the Messages surface. -scroll maps the
                 // shared ≤0 scroll state onto layoutChat's positive history offset.
                 const cf = buildChatFrame(arena, g.chat_store.?, g.chat_sel, now);
-                g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{}) catch g.content_h.*;
+                g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{}, &.{}) catch g.content_h.*;
             } else if (g.screen.* == feed_view.screen_loadout) {
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
                 g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market, g.create, g.bench) catch g.content_h.*; // software: draw line-art nav
@@ -5838,44 +5921,56 @@ fn paintFrameGpu(
         chat_sig ^= (@as(u64, cs.payments.len) << 32) ^ (pay_sum *% 0x2545_F491_4F6C_DD1D);
     };
 
-    // Zat Chat motion (U6a). The trigger is DERIVED, in this one place, from
-    // the observed state transition — the store grew — and the newest
-    // message's direction picks the animation (send pop vs arrival settle).
-    // The springs then run in the one loop on the one clock; the surface
-    // just draws whatever the values say (ANIMATION_SYSTEM_NOTES).
+    // Zat Chat motion (U6b). The trigger is DERIVED, in this one place, from the
+    // observed state transition — the OPEN conversation's newest message key
+    // advanced — and the newest message's direction picks the preset (own send
+    // vs counterparty arrival). Each new bubble gets its OWN scale + offset
+    // springs; they then run in the one loop on the one clock, and the surface
+    // draws whatever the springs say (ANIMATION_SYSTEM_NOTES).
     var chat_animating = false;
     if (g.screen.* == feed_view.screen_messages) if (g.chat_store) |cs| {
-        if (gs.chat_seen_valid and cs.msgs.len > gs.chat_seen_msgs) {
-            if (cs.mine.isSet(cs.msgs.len - 1)) {
-                gs.chat_send_t = 0;
-                gs.chat_send_v = 0;
-            } else {
-                gs.chat_arrive_t = 0;
-                gs.chat_arrive_v = 0;
-            }
-        }
-        gs.chat_seen_msgs = cs.msgs.len;
-        gs.chat_seen_valid = true;
-        // MEASURED frame time, sub-stepped for stability: the motion is
-        // identical at 60Hz, 144Hz, or across a dropped frame — smoothness
-        // comes from advancing by real elapsed time, never a fixed tick.
+        // MEASURED frame time (the one clock): motion is identical at 60/144Hz
+        // or across a dropped frame — smoothness comes from real elapsed time.
         const spring_now = clock_shell.monotonicNanos();
         var dt: f32 = if (gs.chat_clock_ns == 0) 1.0 / 60.0 else @as(f32, @floatFromInt(spring_now -| gs.chat_clock_ns)) / 1_000_000_000.0;
         gs.chat_clock_ns = spring_now;
         dt = std.math.clamp(dt, 0.0, 0.05);
+
+        // Detect a new bubble in the SELECTED conversation and spawn its springs.
+        if (g.chat_sel) |conv| {
+            const order = chat_core.threadSlice(arena, cs, conv) catch &[_]chat_core.MsgIndex{};
+            const newest: u32 = if (order.len > 0) @intFromEnum(order[order.len - 1]) else 0;
+            const conv_key: u32 = @intFromEnum(conv);
+            if (!gs.chat_seen_valid or gs.chat_seen_conv != conv_key) {
+                // First sight of this conversation (or a switch): sync the
+                // watermark WITHOUT animating the thread that was already there.
+                gs.chat_seen_conv = conv_key;
+                gs.chat_seen_key = newest;
+                gs.chat_seen_valid = true;
+            } else if (order.len > 0 and newest > gs.chat_seen_key) {
+                const msg = order[order.len - 1];
+                spawnBubbleAnim(gpa, gs, newest, chat_core.isMine(cs, msg), spring_now);
+                startChatReflow(gpa, gs);
+                gs.chat_seen_key = newest;
+            }
+        } else {
+            gs.chat_seen_valid = false; // no conversation open
+        }
+
+        // Advance every bubble spring + the reflow (the world does its own fixed
+        // sub-stepping), and the typing indicator's small spring alongside.
+        gs.chat_world.step(dt);
         var rem = dt;
         while (rem > 1e-6) {
             const step = @min(rem, 1.0 / 240.0);
-            springPop(&gs.chat_send_t, &gs.chat_send_v, 1.0, step);
-            springPop(&gs.chat_arrive_t, &gs.chat_arrive_v, 1.0, step);
             springPop(&gs.chat_typing_t, &gs.chat_typing_v, if (g.chat_typing) 1.0 else 0.0, step);
             rem -= step;
         }
         if (gs.chat_typing_t > 0.01) gs.chat_typing_phase += dt;
-        // A focused input keeps frames coming for the caret's breath — the
-        // pay sheet always holds a focused field while open (M5 A4).
-        chat_animating = @abs(gs.chat_send_t - 1.0) > 0.004 or @abs(gs.chat_send_v) > 0.004 or
-            @abs(gs.chat_arrive_t - 1.0) > 0.004 or @abs(gs.chat_arrive_v) > 0.004 or
+        reapChatAnims(gs);
+        // Keep frames coming while anything is in motion (a focused input keeps
+        // them for the caret's breath; the pay sheet always holds focus, M5 A4).
+        chat_animating = gs.chat_anims.items.len > 0 or gs.chat_reflow != null or
             gs.chat_typing_t > 0.01 or g.chat_typing or
             g.chat_input_focus or g.chat_composing or g.chat_pay.open;
     };
@@ -5958,7 +6053,31 @@ fn paintFrameGpu(
             var caret_ph: f64 = @as(f64, @floatFromInt(caret_raw_ns)) / 1_000_000_000.0;
             if (caret_ph > 0.55) caret_ph = 0.55 + @mod(caret_ph - 0.55, 1.1);
             const caret_phase: f32 = @floatCast(caret_ph);
-            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .send_t = gs.chat_send_t, .arrive_t = gs.chat_arrive_t, .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase }) catch g.content_h.*;
+            // Compose the per-bubble springs into row transforms (U6b): identity
+            // for resting rows, live scale/rise/alpha for the ones still flying.
+            // The shell reads its own spring world here and hands the layout plain
+            // values — no spring index crosses the boundary (A5/B5).
+            var xforms: []feed_view.BubbleXform = &.{};
+            if (arena.alloc(feed_view.BubbleXform, cf.thread.len)) |xs| {
+                xforms = xs;
+                for (xforms) |*x| x.* = .{};
+                for (gs.chat_anims.items) |a| {
+                    for (cf.order, 0..) |m, ri| {
+                        if (@intFromEnum(m) == a.key and ri < xforms.len) {
+                            const grow = gs.chat_world.position(a.scale) orelse 1.0;
+                            const rise = gs.chat_world.position(a.off) orelse 0.0;
+                            // Opacity: a short monotonic ramp off the spawn clock,
+                            // NOT a spring — opaque well before the transform settles.
+                            const age_ns: f32 = @floatFromInt(gs.chat_clock_ns -| a.born_ns);
+                            const alpha = std.math.clamp(age_ns / chat_fade_ns, 0.0, 1.0);
+                            xforms[ri] = .{ .grow = grow, .rise = rise, .alpha = alpha };
+                            break;
+                        }
+                    }
+                }
+            } else |_| {}
+            const reflow_t: f32 = if (gs.chat_reflow) |rh| (gs.chat_world.position(rh) orelse 1.0) else 1.0;
+            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t }, xforms) catch g.content_h.*;
         } else if (g.screen.* == feed_view.screen_transparency) {
             // The algorithm transparency page: a plain scrolling document (no rail),
             // rebuilt from the inspected config each entry (what you see = what runs).

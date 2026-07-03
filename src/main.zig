@@ -990,6 +990,7 @@ test {
     _ = @import("core/xcursor.zig");
     _ = @import("core/atlas.zig");
     _ = @import("core/glyph_field.zig");
+    _ = @import("core/spring.zig");
     _ = @import("core/x11.zig");
     _ = @import("core/win32.zig");
     _ = @import("core/textinput.zig");

@@ -33,6 +33,7 @@ const layout = @import("core/layout.zig");
 const raster = @import("core/raster.zig");
 const text_engine = @import("core/text.zig");
 const x11 = @import("core/x11.zig");
+const spring = @import("core/spring.zig");
 const clock = @import("shell/clock.zig");
 
 const posts_n = 10_000;
@@ -428,5 +429,39 @@ pub fn main() !void {
             }
             p("  like effect peak ({d:.2}s)  worst-frame compute {d} us, peak band {d}/{d} rows ({d} KB blit)\n", .{ life, peak_compute / 1000, peak_band, ph, peak_band * pw * 4 / 1024 });
         }
+    }
+
+    // ── Spring integrator (BUBBLE_SPRING_PHYSICS_ROADMAP §6) ──────────────────
+    // 64 bubbles = 128 channels (scale + offset_y each), ALL active, one frame.
+    // Worst case: every channel is retargeted each frame so none ever rests, so
+    // the full set stays in the active sweep. The retarget is done OUTSIDE the
+    // timing window; only `World.step` is measured (the number the stop-rule
+    // judges).
+    {
+        var world: spring.World = .empty;
+        defer world.deinit(gpa);
+        const c_scale = spring.springConstants(0.25, 0.35);
+        const c_off = spring.springConstants(0.15, 0.40);
+
+        var hs: [128]spring.Handle = undefined;
+        var bidx: usize = 0;
+        while (bidx < 64) : (bidx += 1) {
+            hs[bidx * 2] = try world.spawn(gpa, 0.2, 1.0, c_scale); // scale
+            hs[bidx * 2 + 1] = try world.spawn(gpa, 40.0, 0.0, c_off); // offset_y
+        }
+
+        const dt: f32 = 1.0 / 120.0; // a 120 Hz frame → 2 fixed sub-steps
+        const reps = 2000;
+        var total: u64 = 0;
+        var n: usize = 0;
+        while (n < reps) : (n += 1) {
+            // Keep every channel in motion (flip targets), outside the clock.
+            const a: f32 = if (n % 2 == 0) 1.0 else 0.0;
+            for (hs) |h| world.retarget(h, a);
+            const t0 = clock.monotonicNanos();
+            world.step(dt);
+            total += clock.monotonicNanos() - t0;
+        }
+        p("  spring step 64 bubbles   {d:>6} ns/frame  (128 channels, all active, 2 sub-steps)\n", .{total / reps});
     }
 }

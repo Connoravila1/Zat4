@@ -91,6 +91,17 @@ inline fn skinPanel(accent: u32) u32 {
     return if (accent == lens_socket.julia_pink) panel_julia else panel;
 }
 
+/// A chat bubble's fill — FULLY OPAQUE, so a message reads as a solid bubble,
+/// not a tint you can see the field through. Mine = the accent at full opacity
+/// (the "sent" bubble); theirs = the opaque panel skin (the "received" bubble).
+/// The panel/accent RGB is kept; only the alpha is forced to 0xFF.
+inline fn bubbleFill(accent: u32, mine: bool) u32 {
+    return if (mine)
+        0xFF000000 | (accent & 0x00FFFFFF)
+    else
+        0xFF000000 | (skinPanel(accent) & 0x00FFFFFF);
+}
+
 // Julia mode is a LIGHT theme (white field, bright pink panels), so the text must
 // go DARK to read. Rather than thread a flag through ~120 text-draw sites, the
 // shell calls `juliaRemapText` over the finished draw list: the three text inks
@@ -3644,13 +3655,6 @@ const feed = @import("feed.zig");
 /// ANIMATION_SYSTEM_NOTES). At rest every field is its default and the
 /// layout is byte-identical to the unanimated one.
 pub const ChatMotion = struct {
-    /// The newest OWN bubble springing from the composer into its slot:
-    /// 0 = at the composer, 1 = seated (may overshoot slightly — the spring's
-    /// character). Default 1 = no animation.
-    send_t: f32 = 1,
-    /// The newest COUNTERPARTY bubble's arrival settle: rises ~16px and
-    /// fades in as 0 → 1. Default 1 = at rest.
-    arrive_t: f32 = 1,
     /// The typing indicator: 0 closed, 1 fully grown; intermediate values
     /// are the grow-in / melt-away. The thread lifts to make room as it
     /// grows, so the motion is fluid from inception to end.
@@ -3660,13 +3664,48 @@ pub const ChatMotion = struct {
     /// Seconds since the last keystroke in the focused input — the caret
     /// stays lit while typing and breathes (smooth blink) once idle.
     caret_phase: f32 = 0,
+    /// The thread REFLOW settle (U6b): 0 = a new bubble was just appended (the
+    /// older content, bottom-anchored, has jumped UP by the new row's height),
+    /// 1 = the older content has slid to rest. Older rows are drawn shifted DOWN
+    /// by `slot_last * (1 - reflow_t)`, so they glide up instead of snapping.
+    /// Driven by its own shell spring, independent of any one bubble's morph.
+    /// Default 1 = at rest (static previews, the software path).
+    reflow_t: f32 = 1,
 
     comptime {
-        // Budget 20: five f32 knobs exactly. (A7.1: grew 16 → 20 for the
-        // caret's blink clock — the fifth knob of the motion vocabulary.)
-        assert(@sizeOf(ChatMotion) == 20);
+        // A7.1: four f32 knobs, no padding. The per-bubble send/arrive scalars
+        // moved OUT to `BubbleXform` (U6b); the thread-reflow settle stayed as
+        // its own channel here.
+        assert(@sizeOf(ChatMotion) == 16);
     }
 };
+
+/// PLAIN DATA (A1). One bubble's live transform for the frame — the shell's
+/// per-bubble springs (`core/spring.zig`) composed into values the layout
+/// applies. Handed across the core/shell boundary as a slice parallel to
+/// `thread` (B5); the shell's spring indexes never cross (A5). Identity
+/// (`grow = 1, rise = 0, alpha = 1`) = a seated, resting bubble.
+pub const BubbleXform = struct {
+    /// Scale multiplier on the bubble rect (its scale spring's position). May
+    /// exceed 1 briefly — the overshoot that reads as native.
+    grow: f32 = 1,
+    /// Pixels BELOW the seat the bubble is drawn (its offset spring's position),
+    /// settling to 0 as it rises into place.
+    rise: f32 = 0,
+    /// Opacity 0..1. NOT a spring (an overshooting opacity flickers): a short
+    /// monotonic ramp the shell derives from the scale spring's progress.
+    alpha: f32 = 1,
+
+    comptime {
+        // Three f32, no padding. One per visible in-flight bubble.
+        assert(@sizeOf(BubbleXform) == 12);
+    }
+};
+
+/// True when a transform is the resting identity — the bubble draws normally.
+pub fn xformIsRest(x: BubbleXform) bool {
+    return x.grow == 1 and x.rise == 0 and x.alpha == 1;
+}
 
 /// The caret's alpha at `phase` seconds after the last keystroke: solid
 /// while typing (the first 0.55s), then a smooth ~1.1s breath — the premium
@@ -3785,7 +3824,7 @@ fn drawPayCard(
     ordinal: u16,
 ) !void {
     const settled_c: u32 = 0xFF9BCE9B; // soft success green
-    const fill: u32 = if (b.mine) (0x38 << 24) | (accent & 0x00FFFFFF) else skinPanel(accent);
+    const fill: u32 = bubbleFill(accent, b.mine);
     try rect(gpa, dl, bx, by, bw, bh_card, fill, 14);
     if (b.tail) try bubbleTail(gpa, dl, b.mine, bx, by, bw, bh_card, fill);
     if (!chat_msg.isTerminalStatus(card.status)) {
@@ -3923,6 +3962,10 @@ pub fn layoutChat(
     pay: ChatPaySheet,
     /// The frame's motion values (U6a) — shell springs in, pixels out.
     motion: ChatMotion,
+    /// Per-bubble transforms (U6b), parallel to `thread`: `xforms[i]` is row
+    /// `i`'s live spring transform. Empty (or shorter than `thread`) = the
+    /// missing rows are at rest — the static/software path passes `&.{}`.
+    xforms: []const BubbleXform,
 ) error{OutOfMemory}!i32 {
     const m: Metrics = if (pane_geom) |g|
         .{ .rail_x = g.rail_x, .col_x = g.col_x, .col_w = g.col_w, .lx = g.lx, .cw = g.cw, .side_x = g.side_x, .wide = g.wide }
@@ -4116,20 +4159,27 @@ pub fn layoutChat(
     // out of the composer (unclamped t — the overshoot carries it a breath
     // past its seat, then it settles), growing from 82% and fading in; a
     // counterparty message rises ~20px, growing from 92% and fading in.
-    var fly_t: f32 = 1.0;
-    if (thread.len > 0 and thread[thread.len - 1].kind != .system) {
-        if (thread[thread.len - 1].mine) {
-            if (motion.send_t < 0.999) fly_t = motion.send_t;
-        } else if (motion.arrive_t < 0.999) fly_t = motion.arrive_t;
-    }
-    const flying = fly_t < 0.999;
-    const fly_c = std.math.clamp(fly_t, 0.0, 1.0);
+    // U6b — per-bubble springs. Each row may carry its own live transform
+    // (`xforms[i]`: grow/rise/alpha), so several bubbles can animate at once
+    // with independent momentum — the interruptibility a single scalar could
+    // not express. Separately, the whole thread REFLOWS when a new row is
+    // appended: bottom-anchored, the older content jumps UP by the new row's
+    // height, then slides back down to rest as `reflow_t` 0 → 1. That shift is
+    // applied to every RESTING row (the animating ones ride their own `rise`).
+    const reflow_t = std.math.clamp(motion.reflow_t, 0.0, 1.0);
+    const reflowing = reflow_t < 0.999;
     var shift: i32 = 0;
-    if (flying) {
+    if (reflowing and thread.len > 0) {
         var slot_last = bh[thread.len - 1] + gap;
         if (thread[thread.len - 1].stamp) slot_last += stamp_h;
-        shift = @intFromFloat(@round(@as(f32, @floatFromInt(slot_last)) * (1.0 - fly_c)));
+        shift = @intFromFloat(@round(@as(f32, @floatFromInt(slot_last)) * (1.0 - reflow_t)));
     }
+    // A row is "in flight" when it carries a non-rest transform.
+    const rowXform = struct {
+        fn get(xf: []const BubbleXform, i: usize) BubbleXform {
+            return if (i < xf.len) xf[i] else .{};
+        }
+    }.get;
     // Bottom-anchor ALWAYS. Once history outgrows the pane,
     // `thread_bot - total` goes above thread_top and the oldest rows
     // top-clip — that is correct. The old `@max(thread_top, …)` clamp
@@ -4138,15 +4188,19 @@ pub fn layoutChat(
     // showed in the list preview but not in the thread).
     var y = thread_bot - total + scroll;
     for (thread, bh, 0..) |b, hh, idx| {
-        const is_fly = flying and idx + 1 == thread.len;
-        const row_shift: i32 = if (flying and !is_fly) shift else 0;
-        const clip_bot = if (flying) comp_y else thread_bot;
+        const xf = rowXform(xforms, idx);
+        // A row is "in flight" when it carries a non-rest transform (its own
+        // scale/rise/alpha springs are still running). Resting rows ride the
+        // thread reflow shift; flying rows position by their own `rise`.
+        const is_fly = !xformIsRest(xf);
+        const row_shift: i32 = if (!is_fly) shift else 0;
+        const clip_bot = if (reflowing or is_fly) comp_y else thread_bot;
         if (b.stamp) {
             const sy = y + row_shift;
             if (sy + stamp_h > thread_top and sy < clip_bot) {
                 const aw: i32 = @intCast(text.measure(e, .regular, b.age, 11));
                 // A flying row's divider fades in with its bubble.
-                const sc = if (is_fly) scaleAlpha(faint, fly_c) else faint;
+                const sc = if (is_fly) scaleAlpha(faint, xf.alpha) else faint;
                 _ = try str(gpa, dl, e, .regular, detail_x + @divTrunc(detail_w - aw, 2), sy + 16, sc, 11, b.age);
             }
             y += stamp_h;
@@ -4170,7 +4224,7 @@ pub fn layoutChat(
                 const fits_one = std.mem.indexOfScalar(u8, b.body, '\n') == null and one_w <= bub_max - 2 * pad_x;
                 const bw = if (fits_one) one_w + 2 * pad_x else bub_max;
                 const bx = if (b.mine) detail_x + detail_w - bw else detail_x;
-                const fill: u32 = if (b.mine) (0x38 << 24) | (accent & 0x00FFFFFF) else skinPanel(accent);
+                const fill: u32 = bubbleFill(accent, b.mine);
                 if (!is_fly) {
                     try rect(gpa, dl, bx, by, bw, hh, fill, 14);
                     if (b.tail) try bubbleTail(gpa, dl, b.mine, bx, by, bw, hh, fill);
@@ -4187,12 +4241,12 @@ pub fn layoutChat(
                     // final size and position — the renderer rasterizes
                     // text at integer px, so continuous glyph scaling
                     // STEPS between sizes (the chop). Opacity ramps faster
-                    // than the transform: opaque by 60% of the motion, so
+                    // than the transform: the shell already shaped `alpha` so
                     // the bubble is solid while it is still settling.
-                    const fade = std.math.clamp(fly_c / 0.6, 0.0, 1.0);
-                    const grow = 0.86 + 0.14 * fly_t;
+                    const fade = xf.alpha;
+                    const grow = xf.grow;
                     const seat_bot: f32 = @floatFromInt(y + hh);
-                    const bot_a = seat_bot + 28.0 * (1.0 - fly_t);
+                    const bot_a = seat_bot + xf.rise;
                     const bw_a: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(bw)) * grow));
                     const hh_a: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(hh)) * grow));
                     const bx_a = if (b.mine) bx + (bw - bw_a) else bx;
@@ -4732,7 +4786,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // Narrow width (460): no rail regions, so the counts are exactly the
     // surface's own — one region per conversation row + the composer pair +
     // the "+ New" pill.
-    const h = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", true, false, "", "", .{}, .{});
+    const h = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", true, false, "", "", .{}, .{}, &.{});
     var n_conv: usize = 0;
     var n_input: usize = 0;
     var n_send: usize = 0;
@@ -4758,7 +4812,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // no thread pane and no composer to arm. The "+ New" pill is always there.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h2 = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", false, false, "", "", .{}, .{});
+    const h2 = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", false, false, "", "", .{}, .{}, &.{});
     try std.testing.expectEqual(@as(i32, 940), h2);
     var n2_conv: usize = 0;
     var n2_new: usize = 0;
@@ -4774,7 +4828,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // line draws when the shell hands one over.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", false, true, "chattest.zat4.com", "Couldn't resolve that handle", .{}, .{});
+    _ = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", false, true, "chattest.zat4.com", "Couldn't resolve that handle", .{}, .{}, &.{});
     var n3_compose: usize = 0;
     for (regions.items) |r| {
         if (r.kind == .chat_compose_input) n3_compose += 1;
@@ -4787,12 +4841,12 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // (motion never moves a tap target).
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", true, false, "", "", .{}, .{});
+    _ = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", true, false, "", "", .{}, .{}, &.{});
     const rest_items = dl.len;
     const rest_regions = regions.items.len;
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", true, false, "", "", .{}, .{ .send_t = 0.4, .arrive_t = 1, .typing_t = 1, .typing_phase = 0.7 });
+    _ = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", true, false, "", "", .{}, .{ .typing_t = 1, .typing_phase = 0.7 }, &.{});
     try std.testing.expect(dl.len > rest_items);
     try std.testing.expectEqual(rest_regions, regions.items.len);
 }
@@ -4826,7 +4880,7 @@ test "messages screen: payment cards and the pay sheet emit their regions (M5 A4
     };
 
     // Sheet closed: the card buttons carry their thread ordinals.
-    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", false, false, "", "", .{}, .{});
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", false, false, "", "", .{}, .{}, &.{});
     var pay_at: u16 = 999;
     var cancel_at: u16 = 999;
     var received_at: u16 = 999;
@@ -4843,7 +4897,7 @@ test "messages screen: payment cards and the pay sheet emit their regions (M5 A4
     // and the amber status line renders without disturbing the regions.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", false, false, "", "", .{ .open = true, .rail = .onchain, .amount = "5000", .note = "dinner", .status = "They haven't set up payments" }, .{});
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", false, false, "", "", .{ .open = true, .rail = .onchain, .amount = "5000", .note = "dinner", .status = "They haven't set up payments" }, .{}, &.{});
     var n_rail: usize = 0;
     var n_chip: usize = 0;
     var n_amount: usize = 0;
