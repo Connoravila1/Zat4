@@ -599,6 +599,9 @@ pub fn run(
     var gpay_note_len: usize = 0;
     var gpay_focus: u8 = 0;
     var gpay_status: []const u8 = "";
+    // The send-confirm face (§8.2) + the once-per-session first-time disclosure.
+    var gpay_confirm: bool = false;
+    var gpay_first_send: bool = true;
     // The receive-setup sheet (set up YOUR chat wallet). Addresses can be long
     // (bech32 ~62 chars, lightning addresses too), so give the buffers room.
     var grecv_open: bool = false;
@@ -1654,7 +1657,7 @@ pub fn run(
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .market = if (gscreen == feed_view.screen_loadout and gloadout_tab == 1) market_cards.items else &.{}, .create = .{ .step = gcreate_step, .answers = gcreate_answers, .config = gcreate_config, .name = gcreate_name_buf[0..gcreate_name_len], .color = gcreate_color, .naming = gcreate_step == .name, .prepare_t = create_prepare_t }, .bench = bench_tray, .inspect_bytes = inspect_bytes orelse "", .inspect_name = inspect_name, .inspect_ref = inspect_ref, .inspect_source = gtransp_source, .inspect_loading = inspect_loading, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .chat_store = if (dev_chat) &gchat_store else null, .chat_sel = gchat_sel, .chat_draft = gchat_draft_buf[0..gchat_draft_len], .chat_input_focus = gchat_input_focus, .chat_composing = gchat_composing, .chat_compose = gchat_peer_buf[0..gchat_peer_len], .chat_compose_status = gchat_compose_status, .chat_typing = gscreen == feed_view.screen_messages and now < gchat_typing_deadline and gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&gchat_store, gchat_sel.?), gchat_typing_peer_buf[0..gchat_typing_peer_len]), .chat_key_ns = gchat_key_ns, .chat_pay = .{ .open = gpay_open, .rail = gpay_rail, .amount = gpay_amount_buf[0..gpay_amount_len], .note = gpay_note_buf[0..gpay_note_len], .focus = gpay_focus, .status = gpay_status }, .chat_recv = .{ .open = grecv_open, .mode = grecv_mode, .lightning = grecv_ln_buf[0..grecv_ln_len], .bitcoin = grecv_btc_buf[0..grecv_btc_len], .focus = grecv_focus, .status = grecv_status, .saved = grecv_saved }, .expanded = gexpanded.items, .repost_menu = if (grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
+        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .market = if (gscreen == feed_view.screen_loadout and gloadout_tab == 1) market_cards.items else &.{}, .create = .{ .step = gcreate_step, .answers = gcreate_answers, .config = gcreate_config, .name = gcreate_name_buf[0..gcreate_name_len], .color = gcreate_color, .naming = gcreate_step == .name, .prepare_t = create_prepare_t }, .bench = bench_tray, .inspect_bytes = inspect_bytes orelse "", .inspect_name = inspect_name, .inspect_ref = inspect_ref, .inspect_source = gtransp_source, .inspect_loading = inspect_loading, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .chat_store = if (dev_chat) &gchat_store else null, .chat_sel = gchat_sel, .chat_draft = gchat_draft_buf[0..gchat_draft_len], .chat_input_focus = gchat_input_focus, .chat_composing = gchat_composing, .chat_compose = gchat_peer_buf[0..gchat_peer_len], .chat_compose_status = gchat_compose_status, .chat_typing = gscreen == feed_view.screen_messages and now < gchat_typing_deadline and gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&gchat_store, gchat_sel.?), gchat_typing_peer_buf[0..gchat_typing_peer_len]), .chat_key_ns = gchat_key_ns, .chat_pay = .{ .open = gpay_open, .rail = gpay_rail, .amount = gpay_amount_buf[0..gpay_amount_len], .note = gpay_note_buf[0..gpay_note_len], .focus = gpay_focus, .status = gpay_status, .confirm = gpay_confirm, .first_send = gpay_first_send }, .chat_recv = .{ .open = grecv_open, .mode = grecv_mode, .lightning = grecv_ln_buf[0..grecv_ln_len], .bitcoin = grecv_btc_buf[0..grecv_btc_len], .focus = grecv_focus, .status = grecv_status, .saved = grecv_saved }, .expanded = gexpanded.items, .repost_menu = if (grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
         switch (mode) {
             .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status),
             .compose => {
@@ -2653,6 +2656,7 @@ pub fn run(
                                                 gpay_open = !gpay_open;
                                                 gpay_status = "";
                                                 gpay_focus = 0;
+                                                gpay_confirm = false;
                                                 grecv_open = false;
                                             } else {
                                                 // Not set up → onboard, never a dead form.
@@ -2684,6 +2688,7 @@ pub fn run(
                                         },
                                         .pay_cancel => if (dev_chat) {
                                             gpay_open = false;
+                                            gpay_confirm = false;
                                             gpay_status = "";
                                         },
                                         .recv_open => if (dev_chat) {
@@ -2738,6 +2743,20 @@ pub fn run(
                                             grecv_status = saveReceiveAddress(gpa, gchat_arena_state.allocator(), io, environ, session, ln, btc, &grecv_saved);
                                             if (grecv_saved) grecv_set = true;
                                         },
+                                        // Compose "Send" ARMS the confirm face (no
+                                        // money yet); the real hand-off is .pay_send.
+                                        .pay_arm => if (dev_chat) {
+                                            const amount = std.fmt.parseInt(u64, gpay_amount_buf[0..gpay_amount_len], 10) catch 0;
+                                            if (amount == 0 or amount > chat_core.max_amount_sat) {
+                                                gpay_status = "Enter an amount in sats";
+                                            } else {
+                                                gpay_confirm = true;
+                                                gpay_status = "";
+                                            }
+                                        },
+                                        .pay_confirm_back => if (dev_chat) {
+                                            gpay_confirm = false;
+                                        },
                                         .pay_request, .pay_send => if (dev_chat) {
                                             if (gchat_sel) |sc| {
                                                 const amount = std.fmt.parseInt(u64, gpay_amount_buf[0..gpay_amount_len], 10) catch 0;
@@ -2753,6 +2772,8 @@ pub fn run(
                                                     }
                                                     if (gpay_status.len == 0) {
                                                         gpay_open = false;
+                                                        gpay_confirm = false;
+                                                        gpay_first_send = false; // disclosure acknowledged
                                                         gpay_amount_len = 0;
                                                         gpay_note_len = 0;
                                                         gscroll_px = 0;
@@ -3182,7 +3203,10 @@ pub fn run(
             if (engine != null and dev_chat and gscreen == feed_view.screen_messages and gpay_open) {
                 var pay_key = true;
                 switch (decoded.event) {
-                    .escape => {
+                    // Escape backs out of the confirm face first, then closes.
+                    .escape => if (gpay_confirm) {
+                        gpay_confirm = false;
+                    } else {
                         gpay_open = false;
                         gpay_status = "";
                     },
@@ -3190,12 +3214,19 @@ pub fn run(
                         const amount = std.fmt.parseInt(u64, gpay_amount_buf[0..gpay_amount_len], 10) catch 0;
                         if (amount == 0 or amount > chat_core.max_amount_sat) {
                             gpay_status = "Enter an amount in sats";
+                        } else if (!gpay_confirm) {
+                            // Compose → arm the confirm (no money moves on Enter).
+                            gpay_confirm = true;
+                            gpay_status = "";
                         } else {
+                            // Confirm face → the real hand-off.
                             const note = std.mem.trim(u8, gpay_note_buf[0..gpay_note_len], " ");
                             _ = gchat_arena_state.reset(.retain_capacity);
                             gpay_status = paySend(gpa, gchat_arena_state.allocator(), io, environ, if (gchat_e2ee) |*p| p else null, gchat_link, &gchat_store, sc, gpay_rail, amount, note, null, now);
                             if (gpay_status.len == 0) {
                                 gpay_open = false;
+                                gpay_confirm = false;
+                                gpay_first_send = false;
                                 gpay_amount_len = 0;
                                 gpay_note_len = 0;
                                 gscroll_px = 0;
@@ -6096,6 +6127,8 @@ fn paintFrameGpu(
         chat_sig ^= @as(u64, @intFromBool(g.chat_pay.open)) *% 0xBF58_476D_1CE4_E5B9;
         chat_sig ^= (@as(u64, @intFromEnum(g.chat_pay.rail)) +% 1) *% 0x94D0_49BB_1331_11EB;
         chat_sig ^= (@as(u64, g.chat_pay.focus) +% 1) *% 0xD6E8_FEB8_6659_FD93;
+        chat_sig ^= @as(u64, @intFromBool(g.chat_pay.confirm)) *% 0x7C3A_1B59_E64D_8811;
+        chat_sig ^= @as(u64, @intFromBool(g.chat_pay.first_send)) *% 0x3F9A_2E17_5C08_BD43;
         chat_sig ^= std.hash.Wyhash.hash(0x1F83_D9AB, g.chat_pay.amount);
         chat_sig ^= std.hash.Wyhash.hash(0x9B05_688C, g.chat_pay.note);
         chat_sig ^= std.hash.Wyhash.hash(0x510E_527F, g.chat_pay.status);

@@ -162,7 +162,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, pay_arm, pay_confirm_back };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -3745,6 +3745,14 @@ pub const ChatPaySheet = struct {
     focus: u8 = 0,
     /// One short amber line ("" = none): why the last attempt refused.
     status: []const u8 = "",
+    /// True while the send-confirm face is showing — the last money-hasn't-moved
+    /// moment before the wallet hand-off (PAYMENT_UX_SPEC §8.2). Requests never
+    /// confirm (they move no money); only sends.
+    confirm: bool = false,
+    /// True until the first-time irreversibility disclosure has been
+    /// acknowledged this session — the confirm face shows the full warning
+    /// (§8.1) the first time, then the short line after.
+    first_send: bool = true,
 };
 
 /// Which face of the receive-setup flow is showing.
@@ -3802,6 +3810,9 @@ pub const ChatReceiveSheet = struct {
 /// The sheet's amount chips (sats) — one tap fills the amount field. The
 /// tap region's `post` is the index into this table.
 pub const pay_chips = [4]u64{ 1_000, 5_000, 10_000, 25_000 };
+
+/// Above this, the send-confirm shows a large-amount step-up (§8.3). Tune later.
+pub const pay_large_sat: u64 = 100_000;
 
 /// Digits grouped in thousands ("250,000") — money is read in groups.
 /// 20 digits + 6 separators bounds the buffer.
@@ -4470,7 +4481,85 @@ pub fn layoutChat(
     // composer; drawn (and its regions emitted) LAST, so it shadows anything
     // beneath it (hitTest is last-wins). Near-opaque — the thread must not
     // bleed through a surface that talks about money. ──
-    if (pay.open) {
+    // The send-confirm face (§8.2): the last money-hasn't-moved beat before the
+    // wallet hand-off. Who + ✓ verified, the amount, and the irreversibility
+    // warning — the full first-time disclosure (§8.1) once, the short line after.
+    if (pay.open and pay.confirm) {
+        const amt_val = std.fmt.parseInt(u64, pay.amount, 10) catch 0;
+        const large = amt_val >= pay_large_sat;
+        const has_note = pay.note.len > 0;
+        var sheet_h: i32 = 16 + 30 + 26 + 34; // pad + title + paying + amount
+        if (has_note) sheet_h += 20;
+        sheet_h += if (pay.first_send) 62 else 22; // disclosure
+        if (large) sheet_h += 22;
+        sheet_h += 54; // buttons + pad
+        const sy0 = comp_y - sheet_h - 12;
+        try rect(gpa, dl, detail_x, sy0, detail_w, sheet_h, 0xFF201F18, 16);
+        const ring_c = (0x90 << 24) | (accent & 0x00FFFFFF);
+        try rect(gpa, dl, detail_x, sy0, detail_w, 1, ring_c, 0);
+        try rect(gpa, dl, detail_x, sy0 + sheet_h - 1, detail_w, 1, ring_c, 0);
+        try rect(gpa, dl, detail_x, sy0, 1, sheet_h, ring_c, 0);
+        try rect(gpa, dl, detail_x + detail_w - 1, sy0, 1, sheet_h, ring_c, 0);
+
+        var py = sy0 + 16;
+        _ = try str(gpa, dl, e, .semibold, detail_x + 18, py + 14, ink, 15, "Confirm payment");
+        py += 30;
+        {
+            var hb: [96]u8 = undefined;
+            const s = std.fmt.bufPrint(&hb, "Paying {s}", .{peer}) catch "Payment";
+            try strEllipsis(gpa, dl, e, .semibold, detail_x + 18, py + 14, ink, 13, s, detail_w - 130);
+            const vl = "\u{2713} verified";
+            const vw: i32 = @intCast(text.measure(e, .semibold, vl, 11));
+            _ = try str(gpa, dl, e, .semibold, detail_x + detail_w - 18 - vw, py + 14, 0xFF9BCE9B, 11, vl);
+        }
+        py += 26;
+        {
+            var gb: [27]u8 = undefined;
+            const amt = groupSats(&gb, amt_val);
+            const pen = try str(gpa, dl, e, .semibold, detail_x + 18, py + 22, ink, 22, amt);
+            _ = try str(gpa, dl, e, .regular, pen + 6, py + 22, muted, 13, "sats");
+            const rl = if (pay.rail == .lightning) "LIGHTNING" else "ON-CHAIN";
+            const rw: i32 = @intCast(text.measure(e, .semibold, rl, 11));
+            _ = try str(gpa, dl, e, .semibold, detail_x + detail_w - 18 - rw, py + 18, faint, 11, rl);
+        }
+        py += 34;
+        if (has_note) {
+            try strEllipsis(gpa, dl, e, .regular, detail_x + 18, py + 12, muted, 12, pay.note, detail_w - 36);
+            py += 20;
+        }
+        if (pay.first_send) {
+            _ = try strEllipsis(gpa, dl, e, .regular, detail_x + 18, py + 12, body_c, 11, "Payments are final \u{2014} they can't be reversed or refunded.", detail_w - 36);
+            py += 18;
+            _ = try strEllipsis(gpa, dl, e, .regular, detail_x + 18, py + 12, body_c, 11, "Only send to people you know and trust completely.", detail_w - 36);
+            py += 18;
+            _ = try strEllipsis(gpa, dl, e, .regular, detail_x + 18, py + 12, body_c, 11, "Zat4 never holds your money \u{2014} it goes straight to them.", detail_w - 36);
+            py += 26;
+        } else {
+            _ = try strEllipsis(gpa, dl, e, .regular, detail_x + 18, py + 12, muted, 11, "Payments can't be undone. Only send to people you trust.", detail_w - 36);
+            py += 22;
+        }
+        if (large) {
+            _ = try str(gpa, dl, e, .semibold, detail_x + 18, py + 12, 0xFFE0A868, 12, "This is a large amount \u{2014} double-check it.");
+            py += 22;
+        }
+        {
+            const back_w: i32 = 92;
+            var bx3 = detail_x + 18;
+            try rect(gpa, dl, bx3, py, back_w, 42, 0x2AEDEAE0, 14);
+            const blw: i32 = @intCast(text.measure(e, .semibold, "Back", 13));
+            _ = try str(gpa, dl, e, .semibold, bx3 + @divTrunc(back_w - blw, 2), py + 27, body_c, 13, "Back");
+            try emitRegion(gpa, regions, bx3, py, back_w, 42, 0, .pay_confirm_back);
+            bx3 += back_w + 8;
+            const conf_w = detail_x + detail_w - 18 - bx3;
+            try rect(gpa, dl, bx3, py, conf_w, 42, accent, 14);
+            const cl = "Confirm \u{2014} open wallet";
+            const clw2: i32 = @intCast(text.measure(e, .semibold, cl, 13));
+            _ = try str(gpa, dl, e, .semibold, bx3 + @divTrunc(conf_w - clw2, 2), py + 27, 0xFF20201A, 13, cl);
+            try emitRegion(gpa, regions, bx3, py, conf_w, 42, 0, .pay_send);
+        }
+    }
+
+    if (pay.open and !pay.confirm) {
         const status_extra: i32 = if (pay.status.len > 0) 24 else 0;
         // +30 for the "set up how you get paid" link row at the foot.
         const sheet_h: i32 = 254 + 30 + status_extra;
@@ -4575,7 +4664,10 @@ pub fn layoutChat(
             try rect(gpa, dl, bx3, py, send_w2, 42, if (armed2) accent else skinPanel(accent), 14);
             const slw: i32 = @intCast(text.measure(e, .semibold, "Send", 13));
             _ = try str(gpa, dl, e, .semibold, bx3 + @divTrunc(send_w2 - slw, 2), py + 27, if (armed2) 0xFF20201A else faint, 13, "Send");
-            try emitRegion(gpa, regions, bx3, py, send_w2, 42, 0, .pay_send);
+            // Send ARMS the confirm face (§8.2) — the actual hand-off happens on
+            // the confirm's "Confirm & open wallet". Request moves no money, so it
+            // fires directly with no confirm.
+            try emitRegion(gpa, regions, bx3, py, send_w2, 42, 0, .pay_arm);
         }
         // The way IN to setting up how YOU get paid — the answer to "where do
         // I set my own address?" lives right where money is discussed.
@@ -5174,7 +5266,7 @@ test "messages screen: payment cards and the pay sheet emit their regions (M5 A4
             .pay_amount => n_amount += 1,
             .pay_note => n_note += 1,
             .pay_request => n_req += 1,
-            .pay_send => n_sendv += 1,
+            .pay_arm => n_sendv += 1, // compose "Send" now arms the confirm face
             .pay_cancel => n_cancel += 1,
             else => {},
         }

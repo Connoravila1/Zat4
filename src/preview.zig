@@ -234,6 +234,16 @@ pub fn main(init: std.process.Init) !void {
         try writePpm(io, gpa, &fb, "/tmp/zat_chat_recv_wallets.ppm");
         std.debug.print("wrote /tmp/zat_chat_recv_wallets.ppm (get-a-wallet list)\n", .{});
 
+        // The send-CONFIRM face with the first-time disclosure + large-amount
+        // step-up — the last money-hasn't-moved beat before the wallet hand-off.
+        @memset(fb.pixels, clear);
+        dl.len = 0;
+        try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
+        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread.rows, cthread.cards, 0, "maya.zat4.com", "", false, false, "", "", .{ .open = true, .confirm = true, .rail = .lightning, .amount = "150000", .note = "rent", .first_send = true }, .{}, &.{}, .{});
+        try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+        try writePpm(io, gpa, &fb, "/tmp/zat_chat_pay_confirm.ppm");
+        std.debug.print("wrote /tmp/zat_chat_pay_confirm.ppm (send confirm + disclosure)\n", .{});
+
         // The compose-new-conversation flow: the recipient bar open with a
         // half-typed handle, plus a refusal status line — both states in one
         // frame ("+ New" pill lit, ring, caret, hint replaced by the status).
