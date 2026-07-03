@@ -89,7 +89,7 @@ fn openBackend(
     window_mode: bool,
 ) !struct { backend: shell_tui.Backend, win: ?*window_shell.Window } {
     if (!window_mode) return .{ .backend = .terminal, .win = null };
-    const win = window_shell.open(gpa, env, "zat", 110, 32) catch |err| {
+    const win = window_shell.open(gpa, env, "Zat4", 110, 32) catch |err| {
         try out.print("--window could not open a native window ({s}); on X11, is DISPLAY set?\n", .{@errorName(err)});
         try out.flush();
         return err;
@@ -305,9 +305,17 @@ pub fn main(init: std.process.Init) !void {
                 defer feed_core.deinitStore(gpa, &store);
                 defer _ = cache_shell.saveStore(gpa, env, &store);
                 const eps = config.fromEnv(env);
-                const win = window_shell.open(gpa, env, "zat", 110, 32) catch return;
+                const win = window_shell.open(gpa, env, "Zat4", 110, 32) catch |err| {
+                    // A double-clicked exe has no visible terminal; still say
+                    // WHY we exited for anyone running from one (E3).
+                    std.debug.print("Zat4: could not open a native window ({s})\n", .{@errorName(err)});
+                    return;
+                };
                 defer window_shell.close(win);
-                signed_out = shell_tui.run(gpa, io, env, &session, eps.appview_url, &store, .{ .window = win }) catch false;
+                signed_out = shell_tui.run(gpa, io, env, &session, eps.appview_url, &store, .{ .window = win }) catch |err| blk: {
+                    std.debug.print("Zat4: the session ended on an error ({s})\n", .{@errorName(err)});
+                    break :blk false;
+                };
                 return;
             }
         }
@@ -324,9 +332,17 @@ pub fn main(init: std.process.Init) !void {
             defer feed_core.deinitStore(gpa, &store);
             defer _ = cache_shell.saveStore(gpa, env, &store);
             const eps = config.fromEnv(env);
-            const win = window_shell.open(gpa, env, "zat", 110, 32) catch return;
+            const win = window_shell.open(gpa, env, "Zat4", 110, 32) catch |err| {
+                    // A double-clicked exe has no visible terminal; still say
+                    // WHY we exited for anyone running from one (E3).
+                    std.debug.print("Zat4: could not open a native window ({s})\n", .{@errorName(err)});
+                    return;
+                };
             defer window_shell.close(win);
-            signed_out = shell_tui.run(gpa, io, env, &session, eps.appview_url, &store, .{ .window = win }) catch false;
+            signed_out = shell_tui.run(gpa, io, env, &session, eps.appview_url, &store, .{ .window = win }) catch |err| blk: {
+                    std.debug.print("Zat4: the session ended on an error ({s})\n", .{@errorName(err)});
+                    break :blk false;
+                };
         }
         return;
     }

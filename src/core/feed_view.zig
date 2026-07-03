@@ -1215,7 +1215,7 @@ fn drawRail(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, rx: i32
     const box_w: i32 = @intFromFloat(52.0 + @as(f32, @floatFromInt(rail_w - 24 - 52)) * ex);
     const pill_w: i32 = @intFromFloat(44.0 + @as(f32, @floatFromInt(rail_w - 32 - 44)) * ex);
 
-    const wm = try str(gpa, dl, e, .semibold, x0 + 8, 58, (accent & 0x00FFFFFF) | ea, 26, "zat4");
+    const wm = try str(gpa, dl, e, .semibold, x0 + 8, 58, (accent & 0x00FFFFFF) | ea, 26, "Zat4");
     _ = try str(gpa, dl, e, .semibold, wm, 58, (ink & 0x00FFFFFF) | ea, 26, ".");
 
     // The nav GROUP box (visible always; just narrower when condensed).
@@ -3428,7 +3428,7 @@ fn drawTopBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Me
             try rect(gpa, dl, m.col_x, box_h - 1, m.col_w, 1, divider, 0);
             return;
         }
-        const wm = try str(gpa, dl, e, .semibold, m.lx, 42, accent, 22, "zat4");
+        const wm = try str(gpa, dl, e, .semibold, m.lx, 42, accent, 22, "Zat4");
         _ = try str(gpa, dl, e, .semibold, wm, 42, ink, 22, ".");
         if (is_home) if (socket_tray) |tray| {
             const geom: lens_socket.Geometry = .{ .x = m.lx, .y = socket_y_narrow, .w = m.cw, .scale = 1.0 };

@@ -693,7 +693,7 @@ pub fn buildTimeline(
     try pushRect(gpa, dl, 0, 0, width, g.header_h, theme.bg, 0);
     var hx: i32 = g.col_x;
     const head_base: i32 = @intCast((g.header_h - g.name_line) / 2 + @as(u32, @intCast(g.name_asc)));
-    hx += @intCast(try pushText(gpa, dl, &name, hx, head_base, theme.accent, "zat"));
+    hx += @intCast(try pushText(gpa, dl, &name, hx, head_base, theme.accent, "Zat4"));
     if (account_handle.len > 0) {
         hx += 8; // breath after the wordmark
         hx += @intCast(try pushText(gpa, dl, &small, hx, head_base, theme.ink_dim, "@"));

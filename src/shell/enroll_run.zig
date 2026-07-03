@@ -155,7 +155,7 @@ const craft_dur_ns: f32 = 1_900_000_000;
 /// Run the Join flow. Returns the new account's `Session` when sign-up completes
 /// (the caller drops into the feed), or null when the window is closed / Esc.
 pub fn run(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map) !?auth.Session {
-    const win = window_shell.open(gpa, env, "zat - join", 150, 52) catch |err| {
+    const win = window_shell.open(gpa, env, "Zat4 - join", 150, 52) catch |err| {
         std.debug.print("window.open failed: {s} (on X11, is DISPLAY set?)\n", .{@errorName(err)});
         return err;
     };
@@ -166,17 +166,27 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     var engine = try text.initEngine();
     defer text.deinitEngine(gpa, &engine);
 
-    var g = gpu.init(window_shell.nativeHandle(win)) catch |err| {
-        std.debug.print("GPU init failed — see [gpu] lines above.\n", .{});
-        return err;
-    };
-    defer gpu.deinit(&g);
-    gpu.setViewport(@intCast(W), @intCast(H));
+    // The GPU is the premium path; without it (no driver, or an OS whose GPU
+    // backend isn't built yet — DISTRIBUTION_ROADMAP W5/M4) the Join flow
+    // still runs on the software rasterizer + the backend's blit, the same
+    // fallback doctrine as the feed (E2). Software mode lays out at
+    // window-pixel scale (scale = 1) and skips the living-field background.
+    var g_opt: ?gpu.Gpu = gpu.init(window_shell.nativeHandle(win)) catch null;
+    defer if (g_opt) |*gg| gpu.deinit(gg);
+    const use_gpu = g_opt != null;
 
-    var feed_path = try gpu.initFeed(gpa);
-    defer gpu.feedDeinit(&feed_path, gpa);
-    var field_renderer = try gpu.initFieldRenderer(gpa, &engine, cell_w, cell_h);
-    var field_grid = try gpu.initFieldGrid();
+    var feed_path: gpu.Feed = undefined;
+    var field_renderer: gpu.FieldRenderer = undefined;
+    var field_grid: gpu.FieldGrid = undefined;
+    if (use_gpu) {
+        gpu.setViewport(@intCast(W), @intCast(H));
+        feed_path = try gpu.initFeed(gpa);
+        field_renderer = try gpu.initFieldRenderer(gpa, &engine, cell_w, cell_h);
+        field_grid = try gpu.initFieldGrid();
+    } else {
+        std.debug.print("enrollment: GPU unavailable — using the software renderer.\n", .{});
+    }
+    defer if (use_gpu) gpu.feedDeinit(&feed_path, gpa);
 
     var gcols: u32 = @max(8, W / cell_w);
     var grows: u32 = @max(8, H / cell_h);
@@ -266,7 +276,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         if (win.fb.width != W or win.fb.height != H) {
             W = win.fb.width;
             H = win.fb.height;
-            gpu.setViewport(@intCast(W), @intCast(H));
+            if (use_gpu) gpu.setViewport(@intCast(W), @intCast(H));
             gcols = @max(8, W / cell_w);
             grows = @max(8, H / cell_h);
             var nf: glyph_field.Field = undefined;
@@ -285,7 +295,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         if (had_input) caret_anchor_ns = clock_shell.monotonicNanos(); // keep the caret solid while active
         out.clearRetainingCapacity();
 
-        const scale = uiScale(W);
+        // Software mode renders the draw list 1:1 in window pixels, so its
+        // layout width IS the window width and the pointer needs no rescale.
+        const scale: f32 = if (use_gpu) uiScale(W) else 1.0;
         const frame_ns = clock_shell.monotonicNanos();
 
         // Pointer MOVES first (before layout): update the cursor + field light.
@@ -496,7 +508,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         // Lay out the current state → draw list + hit rects.
         const blink_on = ((frame_ns -| caret_anchor_ns) / 530_000_000) % 2 == 0;
         dl.len = 0;
-        try enroll_view.layout(gpa, &engine, @intCast(design_w), @intCast(logicalH(W, H)), snapshot(&state, blink_on), &dl, &hits);
+        const layout_w: u32 = if (use_gpu) design_w else @max(1, W);
+        const layout_h: u32 = if (use_gpu) logicalH(W, H) else @max(1, H);
+        try enroll_view.layout(gpa, &engine, @intCast(layout_w), @intCast(layout_h), snapshot(&state, blink_on), &dl, &hits);
 
         // Pointer CLICKS (after layout): release-activation — arm on press (with a
         // soft ripple), commit the action on release over the same target.
@@ -556,19 +570,27 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         }
 
         // Render: calm field behind, the card on top.
-        gpu.feedBuild(&feed_path, gpa, &engine, dl.slice(), scale) catch {};
-        gpu.uploadField(&field_grid, field.height, field.dye, field.cols, field.rows);
-        gpu.clear(clear_r, clear_g, clear_b);
-        // The dimmed field "pillar" sits behind the card and is intentionally
-        // WIDER than it (margin each side), so the card rests in a calm band
-        // rather than the band hugging its edges.
-        const card_left: f32 = @floatFromInt((@as(i32, @intCast(design_w)) - 460) / 2);
-        const margin: f32 = 52;
-        const panel_l: f32 = (card_left - margin) * scale;
-        const panel_r: f32 = (card_left + 460.0 + margin) * scale;
-        gpu.drawFieldGrid(&field_grid, &field_renderer, mcx, mcy, t, @intCast(W), @intCast(H), panel_l, panel_r, 0xFFA6ACBA, false); // enroll is pre-auth: default grey-white ink, no hearts
-        gpu.feedDraw(&feed_path, @intCast(W), @intCast(H));
-        gpu.swap(&g);
+        if (g_opt) |*gg| {
+            gpu.feedBuild(&feed_path, gpa, &engine, dl.slice(), scale) catch {};
+            gpu.uploadField(&field_grid, field.height, field.dye, field.cols, field.rows);
+            gpu.clear(clear_r, clear_g, clear_b);
+            // The dimmed field "pillar" sits behind the card and is intentionally
+            // WIDER than it (margin each side), so the card rests in a calm band
+            // rather than the band hugging its edges.
+            const card_left: f32 = @floatFromInt((@as(i32, @intCast(design_w)) - 460) / 2);
+            const margin: f32 = 52;
+            const panel_l: f32 = (card_left - margin) * scale;
+            const panel_r: f32 = (card_left + 460.0 + margin) * scale;
+            gpu.drawFieldGrid(&field_grid, &field_renderer, mcx, mcy, t, @intCast(W), @intCast(H), panel_l, panel_r, 0xFFA6ACBA, false); // enroll is pre-auth: default grey-white ink, no hearts
+            gpu.feedDraw(&feed_path, @intCast(W), @intCast(H));
+            gpu.swap(gg);
+        } else {
+            // Software funnel: rasterize the same draw list into the backend
+            // framebuffer and blit — no field background (its grid render is
+            // GPU-only; the sim still steps so a later GPU attach is seamless).
+            const clear_px: u32 = 0xFF141416; // clear_r/g/b as a packed pixel
+            window_shell.presentDrawList(win, gpa, &engine, dl.slice(), clear_px) catch break;
+        }
     }
     return null; // window closed / Esc without signing up
 }

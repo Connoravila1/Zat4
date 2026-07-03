@@ -292,11 +292,11 @@ pub fn buildBand(
     const text_w: u16 = band.w - margin * 2;
 
     // ---- header (fixed; never scrolls, never moves under physics) ----
-    writeFixed(f, left, 0, col_accent, "zat");
+    writeFixed(f, left, 0, col_accent, "Zat4");
     if (account_handle.len > 0) {
         var hb: [96]u8 = undefined;
         const h = std.fmt.bufPrint(&hb, "@{s}", .{account_handle}) catch "@";
-        writeFixed(f, left + 4, 0, col_dim, h);
+        writeFixed(f, left + 5, 0, col_dim, h);
     }
     var tally_buf: [24]u8 = undefined;
     const tally = std.fmt.bufPrint(&tally_buf, "{d} posts", .{items.len}) catch "";
@@ -579,7 +579,7 @@ fn layoutNavRail(
     const rows = f.rows;
 
     // Wordmark header, aligned with the feed's (fixed chrome).
-    writeFixed(f, left, 0, col_accent, "zat4");
+    writeFixed(f, left, 0, col_accent, "Zat4");
 
     // The destination list. Each row is (glyph label, action). Real verbs
     // (refresh/profile/new_post) work now; nav_* are stubs until Phase D.
@@ -691,13 +691,13 @@ pub fn buildCompose(
     const margin: u16 = 2;
 
     // Header: "zat — new post" or "zat — reply to @handle" (fixed chrome).
-    writeFixed(f, margin, 0, col_accent, "zat");
+    writeFixed(f, margin, 0, col_accent, "Zat4");
     if (reply_to_handle.len > 0) {
         var hb: [128]u8 = undefined;
         const h = std.fmt.bufPrint(&hb, "- reply to @{s}", .{reply_to_handle}) catch "- reply";
-        writeFixed(f, margin + 4, 0, col_dim, h);
+        writeFixed(f, margin + 5, 0, col_dim, h);
     } else {
-        writeFixed(f, margin + 4, 0, col_dim, "- new post");
+        writeFixed(f, margin + 5, 0, col_dim, "- new post");
     }
     fixedDivider(f, 1, col_faint, '=');
 
@@ -781,8 +781,8 @@ pub fn buildProfile(
     if (cols < 16 or rows < 6) return;
     const margin: u16 = 2;
 
-    writeFixed(f, margin, 0, col_accent, "zat");
-    writeFixed(f, margin + 4, 0, col_dim, "- profile");
+    writeFixed(f, margin, 0, col_accent, "Zat4");
+    writeFixed(f, margin + 5, 0, col_dim, "- profile");
     if (status.len > 0 and status.len + margin < cols) {
         writeFixed(f, cols - margin - @as(u16, @intCast(status.len)), 0, col_accent, status);
     }
@@ -914,7 +914,7 @@ test "build: writes a header, cards, and a like zone carrying its effect origin"
     try testing.expect(m.content_rows > 4);
 
     // The header wordmark landed as fixed chrome.
-    try testing.expectEqual(@as(u8, 'z'), f.content[field.index(&f, 2, 0)].glyph);
+    try testing.expectEqual(@as(u8, 'Z'), f.content[field.index(&f, 2, 0)].glyph);
     try testing.expect(f.content[field.index(&f, 2, 0)].flags.fixed);
 
     // There is at least one like zone, and it carries a usable origin.
@@ -1044,7 +1044,7 @@ test "buildCompose: empty draft shows placeholder, cursor at body origin" {
 
     const cur = buildCompose(&f, "", "", 0, "draft");
     // Header wordmark is fixed chrome at the top-left margin.
-    try testing.expectEqual(@as(u8, 'z'), f.content[field.index(&f, 2, 0)].glyph);
+    try testing.expectEqual(@as(u8, 'Z'), f.content[field.index(&f, 2, 0)].glyph);
     try testing.expect(f.content[field.index(&f, 2, 0)].flags.fixed);
     // The placeholder is present on the body row.
     try testing.expectEqual(@as(u8, 's'), f.content[field.index(&f, 2, 3)].glyph);
@@ -1069,7 +1069,7 @@ test "buildCompose: text wraps and the cursor follows the last line's end" {
     // Reply mode changes the header.
     _ = buildCompose(&f, "hi", "alice.test", 2, "");
     // "- reply to @" begins right after "zat " at the margin+4 column.
-    try testing.expectEqual(@as(u8, '-'), f.content[field.index(&f, 6, 0)].glyph);
+    try testing.expectEqual(@as(u8, '-'), f.content[field.index(&f, 7, 0)].glyph);
 }
 
 test "buildCompose: over-limit counter renders in the like/warn colour" {
@@ -1119,7 +1119,7 @@ test "buildProfile: header, handle, following marker, and counts render" {
     }, "live");
 
     // Header wordmark, fixed.
-    try testing.expectEqual(@as(u8, 'z'), f.content[field.index(&f, 2, 0)].glyph);
+    try testing.expectEqual(@as(u8, 'Z'), f.content[field.index(&f, 2, 0)].glyph);
     try testing.expect(f.content[field.index(&f, 2, 0)].flags.fixed);
     // Display name on row 3, handle on row 4 starting with '@' in accent.
     try testing.expectEqual(@as(u8, 'A'), f.content[field.index(&f, 2, 3)].glyph);
@@ -1176,14 +1176,14 @@ test "layoutShell: three bands, fixed seams, inset feed, clickable nav rail" {
     try testing.expect(f.content[field.index(&f, seam_r, 5)].flags.fixed);
 
     // The nav rail wordmark sits at the rail's left inset (col 2), fixed.
-    try testing.expectEqual(@as(u8, 'z'), f.content[field.index(&f, 2, 0)].glyph);
+    try testing.expectEqual(@as(u8, 'Z'), f.content[field.index(&f, 2, 0)].glyph);
     try testing.expect(f.content[field.index(&f, 2, 0)].flags.fixed);
 
     // The centre feed is INSET: column 0 of the feed body is past the
     // left seam, so the feed's first body glyph is not in the nav band.
     // The feed header wordmark now lives at center_x + margin, not col 2.
     const center_x: u16 = cfg.nav_w + 1;
-    try testing.expectEqual(@as(u8, 'z'), f.content[field.index(&f, center_x + 2, 0)].glyph);
+    try testing.expectEqual(@as(u8, 'Z'), f.content[field.index(&f, center_x + 2, 0)].glyph);
 
     // The rail pushed clickable destination zones: at least the real
     // verbs (refresh = home, profile, new_post = compose) are present,
@@ -1251,7 +1251,7 @@ test "layoutShell: collapses to a full-width feed below the threshold (E4)" {
     // No left seam: there is no fixed divider sitting at the nav_w column,
     // because the narrow layout is the full-width feed (an ordinary
     // result, E4). The feed wordmark is at the usual col 2.
-    try testing.expectEqual(@as(u8, 'z'), f.content[field.index(&f, 2, 0)].glyph);
+    try testing.expectEqual(@as(u8, 'Z'), f.content[field.index(&f, 2, 0)].glyph);
     var any_vertical_seam = false;
     var ry: u16 = 3;
     while (ry < 20) : (ry += 1) {
