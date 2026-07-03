@@ -28,6 +28,7 @@
 //! shell modules.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const identity = @import("shell/identity.zig");
 const auth = @import("shell/auth.zig");
 const oauth_shell = @import("shell/oauth.zig");
@@ -111,8 +112,13 @@ pub fn main(init: std.process.Init) !void {
 
     const args = try init.minimal.args.toSlice(arena);
     var handle: []const u8 = "bsky.app";
-    var tui_mode = false;
-    var window_mode = false;
+    // Off-Linux the windowed GUI is the NO-ARGS default: a double-clicked
+    // exe passes no flags, and there is no terminal story there anyway (the
+    // terminal backend is compiled out on Windows). On Linux the terminal
+    // default stays and --window opts in as before. (DISTRIBUTION_ROADMAP W2)
+    const windowed_os = builtin.os.tag == .windows or builtin.os.tag.isDarwin();
+    var tui_mode = windowed_os;
+    var window_mode = windowed_os;
     // Headless write-path test (STANDALONE write leg): `--post "text"` publishes
     // one app.zat4.feed.post and exits, bypassing the GUI composer. The value is
     // the next argument.

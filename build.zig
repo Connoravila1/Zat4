@@ -44,8 +44,15 @@ pub fn build(b: *std.Build) void {
     });
     addFontEngine(b, exe_mod);
 
+    // The product a tester downloads is called Zat4 (the exe name IS the app
+    // name on Windows/macOS); the Linux binary stays `zat` so the dev scripts
+    // and the box deploy keep their paths. (DISTRIBUTION_ROADMAP P phase)
+    const client_name = switch (target.result.os.tag) {
+        .windows, .macos => "Zat4",
+        else => "zat",
+    };
     const exe = b.addExecutable(.{
-        .name = "zat",
+        .name = client_name,
         .root_module = exe_mod,
     });
     b.installArtifact(exe);
