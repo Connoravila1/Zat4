@@ -24,3 +24,4 @@ run-local.sh
 chat-test.sh
 chat-test-b.sh
 transparency-preview.png
+deploy/angle-win64/*.dll

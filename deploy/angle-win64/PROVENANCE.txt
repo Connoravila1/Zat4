@@ -1,0 +1,24 @@
+ANGLE prebuilt for the Windows dist zip (DISTRIBUTION_ROADMAP W5/P-W).
+The DLLs themselves are gitignored (binaries stay out of the repo); this
+file records exactly what to fetch and how to verify it.
+
+Source:   https://github.com/mmozeiko/build-angle (public GitHub-Actions CI
+          building upstream https://github.com/google/angle; BSD-3-Clause)
+Release:  2026-06-27  (angle-x64-2026-06-27.zip)
+ANGLE commit: bb1024656d398bdbf8d0a37715c0436014b15670
+
+sha256 of the release zip:
+  e7562cb98ca61a532989033f936dafcec43293a90344a366e8bbc26b52525905  angle-x64-2026-06-27.zip
+sha256 of the staged DLLs (from its bin/):
+  ad9463177a1a71ca783b9b542762c77467b3c955d7f35cc9e026c5ef55bc5111  libEGL.dll
+  a40009b3c03c5062467f2266c9352650e1b5ab49730c25e1ce66170629615a33  libGLESv2.dll
+  a05f99734f7c4822fefc12b367af21fd0976ed6608752fb1e1e80b6ece7ecbbb  d3dcompiler_47.dll
+
+d3dcompiler_47.dll is ANGLE's pinned HLSL compiler; Windows 10+ carries a
+system copy, but shipping the pinned one removes that variable.
+
+To refresh: download a newer release, verify it is the same public CI
+workflow, update the hashes here, restage the three DLLs.
+F1 record (why a third-party binary at all): src/shell/gpu.zig module head.
+Long-term option: build ANGLE ourselves (Chromium toolchain) — revisit if
+the wave outgrows a pinned prebuilt.

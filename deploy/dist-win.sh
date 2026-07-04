@@ -13,7 +13,7 @@ ZIG="${ZIG:-$HOME/zig-x86_64-linux-0.16.0/zig}"
 : "${ZAT_APPVIEW_TOKEN:?export ZAT_APPVIEW_TOKEN (the wave read token; see run-local.sh)}"
 
 "$ZIG" build client -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe \
-  -Dwindows-gui -Dappview-token="$ZAT_APPVIEW_TOKEN"
+  -Dwindows-gui -Ddist -Dappview-token="$ZAT_APPVIEW_TOKEN"
 
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
@@ -21,6 +21,8 @@ mkdir "$stage/Zat4"
 cp zig-out/bin/Zat4.exe "$stage/Zat4/"
 if [[ -f deploy/angle-win64/libEGL.dll && -f deploy/angle-win64/libGLESv2.dll ]]; then
   cp deploy/angle-win64/libEGL.dll deploy/angle-win64/libGLESv2.dll "$stage/Zat4/"
+  # ANGLE's pinned HLSL compiler; ships when present (see PROVENANCE.txt).
+  [[ -f deploy/angle-win64/d3dcompiler_47.dll ]] && cp deploy/angle-win64/d3dcompiler_47.dll "$stage/Zat4/"
 else
   echo "WARNING: deploy/angle-win64/ DLLs missing — this zip runs on the software renderer only" >&2
 fi

@@ -29,6 +29,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const dist_config = @import("dist_config");
 const identity = @import("shell/identity.zig");
 const auth = @import("shell/auth.zig");
 const oauth_shell = @import("shell/oauth.zig");
@@ -55,6 +56,17 @@ const algorithm_shell = @import("shell/algorithm.zig");
 const builder = @import("core/builder.zig");
 const lens_catalog = @import("core/lens_catalog.zig");
 const clock_shell = @import("shell/clock.zig");
+
+/// The dev app-password, fenced (DISTRIBUTION_ROADMAP T4): a distribution
+/// build never reads the credential env vars — in-app login (enrollment /
+/// browser OAuth) is a tester's only path, so a tester machine's stray
+/// environment can never steer authentication. Dev builds keep the
+/// env-var workflow unchanged.
+fn appPassword(env: ?*const std.process.Environ.Map) ?[]const u8 {
+    if (comptime dist_config.dist) return null;
+    const e = env orelse return null;
+    return e.get("ZAT_APP_PASSWORD");
+}
 
 /// Is there a usable cached session on disk? A cheap pre-auth probe: a new user
 /// (no cache) is sent to enrollment; a returning user (cache present) falls
@@ -284,7 +296,7 @@ pub fn main(init: std.process.Init) !void {
     // password supplied) falls through to the normal login/run paths below.
     // On a completed sign-up, the flow hands back a session: cache it (so the
     // next launch goes straight to the feed) and drop into the feed now.
-    if (window_mode and env.get("ZAT_APP_PASSWORD") == null and !hasCachedSession(gpa, env)) {
+    if (window_mode and appPassword(env) == null and !hasCachedSession(gpa, env)) {
         // Returning OAuth user (6.3): a persisted DPoP session means we skip the
         // Join flow and drop straight into the feed, exactly as a cached app-
         // password session does in the normal path below. Rotated tokens are
@@ -645,7 +657,7 @@ pub fn main(init: std.process.Init) !void {
     if (post_text != null or follow_target != null or publish_algo_name != null or publish_discover or chat_publish or pay_publish) {
         var from_cache = false;
         var session: auth.Session = undefined;
-        if (env.get("ZAT_APP_PASSWORD")) |password| {
+        if (appPassword(env)) |password| {
             const identifier = env.get("ZAT_IDENTIFIER") orelse id.handle;
             switch (try auth.login(gpa, arena, io, env, id.pds_url, identifier, password)) {
                 .refused => |f| {
@@ -830,7 +842,7 @@ pub fn main(init: std.process.Init) !void {
     // tokens) is used forever and every write fails `ExpiredToken`, even though
     // the user supplied fresh credentials. So skip the cache path when a
     // password is present and fall through to the fresh login below.
-    if (tui_mode and env.get("ZAT_APP_PASSWORD") == null) {
+    if (tui_mode and appPassword(env) == null) {
         if (session_path) |sp| {
             if (cache_shell.loadSessionAt(gpa, sp)) |cached| {
                 var session = cached;
@@ -858,7 +870,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    if (env.get("ZAT_APP_PASSWORD")) |password| {
+    if (appPassword(env)) |password| {
         const identifier = env.get("ZAT_IDENTIFIER") orelse id.handle;
         const login_outcome = try auth.login(gpa, arena, io, env, id.pds_url, identifier, password);
         switch (login_outcome) {

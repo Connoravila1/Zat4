@@ -10,7 +10,7 @@ ZIG="${ZIG:-$HOME/zig-x86_64-linux-0.16.0/zig}"
 
 # x86_64-linux baseline CPU: the same SIGILL lesson as the box deploy —
 # a -Dcpu=native build can crash on other machines.
-"$ZIG" build client -Dtarget=x86_64-linux -Doptimize=ReleaseSafe \
+"$ZIG" build client -Dtarget=x86_64-linux -Doptimize=ReleaseSafe -Ddist \
   -Dappview-token="$ZAT_APPVIEW_TOKEN"
 
 stage="$(mktemp -d)"

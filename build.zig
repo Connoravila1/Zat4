@@ -51,8 +51,13 @@ pub fn build(b: *std.Build) void {
     // per-user atproto service auth is the recorded end state
     // (DISTRIBUTION_ROADMAP T2, SECURITY_ROADMAP).
     const appview_token = b.option([]const u8, "appview-token", "Compiled-in AppView bearer token for distributed builds (default: empty = env-only)") orelse "";
+    // Distribution fence (T4): a dist build never reads the dev credential
+    // env vars — in-app login (enrollment / browser OAuth) is a tester's
+    // only path. The dist scripts pass -Ddist.
+    const dist = b.option(bool, "dist", "Distribution build: fence dev credential env vars (in-app login only)") orelse false;
     const dist_opts = b.addOptions();
     dist_opts.addOption([]const u8, "appview_token", appview_token);
+    dist_opts.addOption(bool, "dist", dist);
     exe_mod.addOptions("dist_config", dist_opts);
 
     // The product a tester downloads is called Zat4 (the exe name IS the app
