@@ -19,17 +19,26 @@
 //! B1 classification: SHELL (I/O — talks to the GPU driver). The GPU path.
 //!
 //! Dependency note (F1/F2): NO vendored package and NO link-time graphics
-//! dependency. The system libraries libEGL / libGLESv2 are loaded at RUNTIME
-//! with dlopen (the standard GL-loader pattern), so the app builds with only
-//! libc and runs on any desktop that has a GPU driver — no -dev packages, no
-//! build.zig.zon entry, no @cImport. The justification is the now-real
-//! requirement the software renderer cannot meet: a full-window animated glyph
-//! field at high-DPI, smoothly. The GPU is purpose-built for exactly that.
+//! dependency. The libraries libEGL / libGLESv2 are loaded at RUNTIME
+//! (dlopen on Linux, LoadLibrary on Windows — the standard GL-loader
+//! pattern), so the app builds with only libc and runs on any desktop that
+//! has the libraries. The justification is the now-real requirement the
+//! software renderer cannot meet: a full-window animated glyph field at
+//! high-DPI, smoothly. The GPU is purpose-built for exactly that.
+//!
+//! F1 — ANGLE (Windows; DISTRIBUTION_ROADMAP W5): on Windows the two
+//! libraries are Google's ANGLE (BSD) — libEGL.dll + libGLESv2.dll shipped
+//! NEXT TO the exe, translating our unchanged GLES calls to D3D11. What it
+//! does: an entire conformant GLES driver stack. Why we do not write it:
+//! that is a GPU driver. Cost to remove: delete the DLLs — the software
+//! renderer remains the automatic fallback for any machine without them.
+//! This is the project's first third-party BINARY, runtime-loaded only.
 //!
 //! On X11, EGL's native window IS the X Window XID, which the window backend
 //! already hands us — so we need neither Xlib nor xcb.
 //! eglGetDisplay(EGL_DEFAULT_DISPLAY) lets EGL open its own $DISPLAY
-//! connection; we render to the existing window by its ID.
+//! connection (on ANGLE, its default D3D11 display); we render to the
+//! existing window by its native handle.
 //!
 //! FOUNDATION slice: load the entry points, create a context, clear, swap.
 //! Atlas, shaders, and draw-list translation build on top once this is proven
@@ -41,6 +50,28 @@ const native = @import("native.zig");
 
 extern fn dlopen(path: [*:0]const u8, mode: c_int) callconv(.c) ?*anyopaque;
 extern fn dlsym(handle: ?*anyopaque, symbol: [*:0]const u8) callconv(.c) ?*anyopaque;
+extern "kernel32" fn LoadLibraryW(name: [*:0]const u16) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn GetProcAddress(module: ?*anyopaque, name: [*:0]const u8) callconv(.winapi) ?*anyopaque;
+
+/// Open a runtime graphics library by its per-OS name. Only the taken
+/// comptime branch is analyzed, so dlopen never reaches a Windows link and
+/// LoadLibraryW never reaches a Linux one. Windows searches the exe's own
+/// directory first — exactly where the zip places the ANGLE DLLs.
+fn openLib(comptime linux_name: [:0]const u8, comptime win_name: []const u8) ?*anyopaque {
+    if (comptime builtin.os.tag == .windows) {
+        return LoadLibraryW(std.unicode.utf8ToUtf16LeStringLiteral(win_name));
+    } else {
+        return dlopen(linux_name, RTLD_NOW);
+    }
+}
+
+fn rawSym(lib: ?*anyopaque, name: [*:0]const u8) ?*anyopaque {
+    if (comptime builtin.os.tag == .windows) {
+        return GetProcAddress(lib, name);
+    } else {
+        return dlsym(lib, name);
+    }
+}
 
 // --- EGL / GLES2 handle and scalar types (C ABI) ---
 const EGLDisplay = ?*anyopaque;
@@ -50,7 +81,9 @@ const EGLContext = ?*anyopaque;
 const EGLBoolean = c_uint;
 const EGLint = i32;
 const EGLenum = c_uint;
-const EGLNativeWindowType = c_ulong; // X11: the Window XID
+// The EGL native window is what the OS window backend hands us: the X11
+// XID on Linux, the HWND on Windows (ANGLE).
+const EGLNativeWindowType = if (builtin.os.tag == .windows) ?*anyopaque else c_ulong;
 
 const RTLD_NOW: c_int = 2;
 
@@ -141,8 +174,8 @@ fn fail(comptime step: []const u8) Error {
 }
 
 fn sym(lib: ?*anyopaque, comptime T: type, name: [*:0]const u8) Error!T {
-    const p = dlsym(lib, name) orelse {
-        elog("dlsym '{s}' not found", .{name});
+    const p = rawSym(lib, name) orelse {
+        elog("symbol '{s}' not found", .{name});
         return Error.GpuInit;
     };
     return @ptrCast(p);
@@ -150,12 +183,16 @@ fn sym(lib: ?*anyopaque, comptime T: type, name: [*:0]const u8) Error!T {
 
 fn load() Error!void {
     if (loaded) return;
-    const lib_egl = dlopen("libEGL.so.1", RTLD_NOW) orelse {
-        elog("dlopen libEGL.so.1 failed (is a GPU driver installed?)", .{});
+    const lib_egl = openLib("libEGL.so.1", "libEGL.dll") orelse {
+        if (comptime builtin.os.tag == .windows) {
+            elog("libEGL.dll not found — place ANGLE's libEGL.dll + libGLESv2.dll next to Zat4.exe (software renderer takes over)", .{});
+        } else {
+            elog("dlopen libEGL.so.1 failed (is a GPU driver installed?)", .{});
+        }
         return Error.GpuInit;
     };
-    const lib_gl = dlopen("libGLESv2.so.2", RTLD_NOW) orelse {
-        elog("dlopen libGLESv2.so.2 failed", .{});
+    const lib_gl = openLib("libGLESv2.so.2", "libGLESv2.dll") orelse {
+        elog("libGLESv2 not found next to libEGL", .{});
         return Error.GpuInit;
     };
     eglGetDisplay = try sym(lib_egl, P_GetDisplay, "eglGetDisplay");
@@ -221,26 +258,25 @@ fn load() Error!void {
 /// anywhere) it stops. Returns a live, current context.
 ///
 /// The handle is whatever the selected window backend supplies
-/// (`native.nativeHandle`) — on X11 the XID, which is also EGL's native
-/// window type, so it feeds eglCreateWindowSurface directly. Windows and
-/// macOS have no GPU backend yet (roadmap W5/M4): there init reports
-/// GpuInit without touching any loader, and the caller's software
-/// fallback takes over (E2). The comptime gate below is also what keeps
-/// dlopen/dlsym out of non-Linux binaries — load() is only analyzed on
-/// the Linux branch, so no dl* symbol is ever referenced at link time.
+/// (`native.nativeHandle`) — the X11 XID or the Win32 HWND, both of which
+/// are EGL's native window type on their OS (Windows = ANGLE, roadmap W5).
+/// macOS has no GPU backend yet (M4): there init reports GpuInit without
+/// touching any loader, and the caller's software fallback takes over
+/// (E2). The comptime gates also keep each OS's loader symbols out of the
+/// other OS's link — only the taken branches are analyzed.
 pub fn init(handle: native.NativeHandle) Error!Gpu {
-    if (comptime builtin.os.tag != .linux) {
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .windows) {
+        return initEgl(handle);
+    } else {
         elog("no GPU backend for this OS yet — the software renderer takes over", .{});
         return Error.GpuInit;
-    } else {
-        return initEgl(handle);
     }
 }
 
-fn initEgl(wid: u32) Error!Gpu {
+fn initEgl(handle: native.NativeHandle) Error!Gpu {
     try load();
 
-    const dpy = eglGetDisplay(null); // EGL_DEFAULT_DISPLAY → EGL opens its own $DISPLAY connection
+    const dpy = eglGetDisplay(null); // EGL_DEFAULT_DISPLAY → X11: EGL's own $DISPLAY; ANGLE: the default D3D11 display
     if (dpy == EGL_NO_DISPLAY) return fail("eglGetDisplay");
 
     var maj: EGLint = 0;
@@ -266,11 +302,22 @@ fn initEgl(wid: u32) Error!Gpu {
     _ = eglGetConfigAttrib(dpy, config, EGL_NATIVE_VISUAL_ID, &vis);
     elog("chose config (native visual id = 0x{x}); window must use a matching visual", .{@as(u32, @bitCast(vis))});
 
-    const ctx_attribs = [_]EGLint{ EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
-    const context = eglCreateContext(dpy, config, EGL_NO_CONTEXT, &ctx_attribs);
+    // ES 3 first, ES 2 as the fallback. The shaders are GLSL 100 (valid in
+    // both), but the field grid uploads R32F textures — an ES3 sized format.
+    // Mesa hands back a 3.x-capable context even when 2 is requested, which
+    // is why this worked on Linux; ANGLE (Windows) is strict about the
+    // requested version, so ask for what the renderer actually needs.
+    const ctx3_attribs = [_]EGLint{ EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
+    var context = eglCreateContext(dpy, config, EGL_NO_CONTEXT, &ctx3_attribs);
+    if (context == EGL_NO_CONTEXT) {
+        elog("no ES3 context; retrying ES2 (field textures may be unavailable)", .{});
+        const ctx2_attribs = [_]EGLint{ EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+        context = eglCreateContext(dpy, config, EGL_NO_CONTEXT, &ctx2_attribs);
+    }
     if (context == EGL_NO_CONTEXT) return fail("eglCreateContext");
 
-    const surface = eglCreateWindowSurface(dpy, config, @as(EGLNativeWindowType, wid), null);
+    const nwin: EGLNativeWindowType = if (comptime builtin.os.tag == .windows) handle else @as(EGLNativeWindowType, handle);
+    const surface = eglCreateWindowSurface(dpy, config, nwin, null);
     if (surface == EGL_NO_SURFACE) return fail("eglCreateWindowSurface");
 
     if (eglMakeCurrent(dpy, surface, surface, context) != EGL_TRUE) return fail("eglMakeCurrent");
