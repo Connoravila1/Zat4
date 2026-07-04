@@ -1498,22 +1498,23 @@ pub fn run(
         on_profile_prev = on_profile;
 
         // Thread screen: on ENTERING (a post-body tap flips gscreen) or a target
-        // change, fetch the focused post's thread as CONTENT into the SHARED
-        // store. The view ordering is then a query (buildThreadView). Same E2
-        // containment as the profile fetch.
+        // change, SUBMIT the focused post's thread to the view worker (M-Core.1
+        // unblocking, 4/7); the drain above ingests it as CONTENT into the
+        // SHARED store. The view ordering is then a query (buildThreadView) —
+        // the tapped post is already resident, so the screen shows it at once
+        // and the ancestors/replies fill in when the page lands. Same E2
+        // containment as the profile submit.
         const on_thread = mode == .timeline and gscreen == feed_view.screen_thread;
         if (on_thread and (!on_thread_prev or thread_dirty)) {
-            const to = feed_shell.loadThread(gpa, arena, io, environ, session, appview_url, store, thread_focus_uri, 50) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => blk: {
-                    status = "thread: network error"; // contained
-                    break :blk null;
-                },
-            };
-            if (to) |result| switch (result) {
-                .ok => {},
-                .failed => status = "thread: unavailable",
-            };
+            if (viewloader) |w| {
+                const uri = try gpa.dupe(u8, thread_focus_uri);
+                if (view_worker.submit(w, .thread, uri, 50)) {
+                    status = "loading thread...";
+                } else {
+                    gpa.free(uri);
+                    status = "thread load skipped"; // mailbox OOM; re-entering retries
+                }
+            } else status = "thread: unavailable"; // worker never started (E2)
             thread_dirty = false;
         }
         on_thread_prev = on_thread;
@@ -5061,6 +5062,7 @@ fn revertDisengage(kind: Engagement, gpa: Allocator, store: *feed_core.Store, ci
 fn viewNoun(kind: view_worker.Kind) []const u8 {
     return switch (kind) {
         .profile => "profile",
+        .thread => "thread",
     };
 }
 

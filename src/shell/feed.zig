@@ -235,23 +235,25 @@ pub fn fetchAuthorPage(
     );
 }
 
-/// Fetch a post's thread (`getPostThread?uri=&viewer=`) and ingest its posts —
-/// ancestors, the focused post, and its replies — as CONTENT into the SHARED
-/// store. The thread VIEW is then a pure query (`feed_core.buildThreadView`), so
-/// engagement + identity stay unified with every other view (ZONES inv. 4). The
-/// reply linkage rides on each post's `reply` ref, so the store reconstructs the
-/// chain. `uri` is the focused post's at-uri (as the feed served it).
-pub fn loadThread(
+/// The NETWORK half of the thread screen's load, alone: fetch a post's
+/// thread (`getPostThread?uri=&viewer=`) — ancestors, the focused post, and
+/// its replies, arriving flat — and return it as a value, touching no store
+/// (the view worker calls this off the frame thread; M_CORE_INVERSION MC.3).
+/// The UI ingests the drained posts as CONTENT; the thread VIEW is then a
+/// pure query (`feed_core.buildThreadView`), so engagement + identity stay
+/// unified with every other view (ZONES inv. 4). The reply linkage rides on
+/// each post's `reply` ref, so the store reconstructs the chain. `uri` is
+/// the focused post's at-uri (as the feed served it).
+pub fn fetchThreadPage(
     gpa: Allocator,
     arena: Allocator,
     io: std.Io,
     environ: ?*const std.process.Environ.Map,
     session: *auth.Session,
     appview_url: []const u8,
-    store: *feed_core.Store,
     uri: []const u8,
     limit: u32,
-) !PageOutcome {
+) !xrpc.Outcome(lexicon.ThreadView) {
     var limit_buf: [12]u8 = undefined;
     const limit_str = std.fmt.bufPrint(&limit_buf, "{d}", .{limit}) catch unreachable;
     const params = [_]xrpc.Param{
@@ -260,7 +262,7 @@ pub fn loadThread(
         .{ .name = "limit", .value = limit_str },
     };
 
-    const outcome = try auth.queryHost(
+    return auth.queryHost(
         gpa,
         arena,
         io,
@@ -271,15 +273,6 @@ pub fn loadThread(
         &params,
         lexicon.ThreadView,
     );
-    switch (outcome) {
-        .failed => |failure| return .{ .failed = failure },
-        .ok => |thread| {
-            // The whole thread arrives flat; ingest as content. The nested view
-            // is then a query over the store (feed_core.buildThreadView).
-            const page: lexicon.TimelinePage = .{ .feed = thread.posts };
-            return .{ .ok = try feed_core.ingestPosts(gpa, store, page) };
-        },
-    }
 }
 
 /// Fetch a ZONE's feed (`getPostsForTag?tag=&viewer=`) and ingest its posts as

@@ -55,6 +55,9 @@ const write_worker = @import("write_worker.zig");
 pub const Kind = enum(u8) {
     /// The profile screen's body: one author's posts (getAuthorFeed).
     profile,
+    /// The thread screen's body: the focused post's flat thread
+    /// (getPostThread), reshaped here into a page for the same ingest.
+    thread,
 };
 
 /// A view-load ask. Everything the fetch needs (session, appview_url, io) is
@@ -236,6 +239,25 @@ fn fetchOutcome(worker: *Worker, arena: Allocator, req: Request) Result.Outcome 
             ) catch |err| return .{ .net_error = @errorName(err) };
             return switch (fetched) {
                 .ok => |page| .{ .page = page },
+                .failed => |f| .{ .refused = .{ .status = f.status, .code = f.code } },
+            };
+        },
+        .thread => {
+            const fetched = feed_shell.fetchThreadPage(
+                worker.gpa,
+                arena,
+                worker.io,
+                worker.environ,
+                worker.session,
+                worker.appview_url,
+                target,
+                req.limit,
+            ) catch |err| return .{ .net_error = @errorName(err) };
+            return switch (fetched) {
+                // The thread arrives flat; hand it on as a page (plain
+                // reshaping — the arena owns the posts either way) so the
+                // UI runs the one content ingest for every post screen.
+                .ok => |thread| .{ .page = .{ .feed = thread.posts } },
                 .failed => |f| .{ .refused = .{ .status = f.status, .code = f.code } },
             };
         },
