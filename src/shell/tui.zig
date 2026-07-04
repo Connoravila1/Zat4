@@ -1351,7 +1351,25 @@ pub fn run(
         for (refresh_results.items) |res| {
             refresh_inflight -|= 1;
             switch (res.outcome) {
-                .ok => |page| {
+                .ok => |page| if (res.trigger == .older) {
+                    // Load-more: APPEND (ingestPage walks the cursor down);
+                    // the refresh prepend below would misfile older rows.
+                    const stats = feed_core.ingestPage(gpa, store, page) catch |err| {
+                        refresh_worker.freeResult(gpa, res);
+                        return err; // OOM only
+                    };
+                    status = std.fmt.bufPrint(&status_buf, "+{d} older ({d} seen)", .{
+                        stats.items_added, stats.posts_deduped,
+                    }) catch "loaded";
+                    _ = cache_shell.saveStore(gpa, environ, store); // E4
+                    if (live_stream == null and store.authors.len > 0) {
+                        live_stream = startLiveStream(gpa, io, environ, session.did, store, &mailbox, arena) catch |err| {
+                            refresh_worker.freeResult(gpa, res);
+                            return err; // OOM only — same posture as the ingest arm
+                        };
+                        if (live_stream == null) status = "live stream unavailable" else subscribed_authors = store.authors.len;
+                    }
+                } else {
                     const was_empty = store.feed.len == 0;
                     const stats = feed_core.ingestPageRefresh(gpa, store, page) catch |err| {
                         refresh_worker.freeResult(gpa, res);
@@ -1369,6 +1387,7 @@ pub fn run(
                             }
                             // else: the pill (feed_core.pendingCount) carries the count.
                         },
+                        .older => unreachable, // took the append branch above
                         .pull => {
                             const revealed_n = feed_core.revealPending(gpa, store) catch 0;
                             if (revealed_n > 0) {
@@ -1399,11 +1418,11 @@ pub fn run(
                     .auto => {}, // a refused poll is silent; the next tick retries
                     // bufPrint COPIES f.code into status_buf before freeResult
                     // destroys the arena that owns it.
-                    .pull => status = std.fmt.bufPrint(&status_buf, "refused: {d} {s}", .{ f.status, f.code }) catch "refused",
+                    .pull, .older => status = std.fmt.bufPrint(&status_buf, "refused: {d} {s}", .{ f.status, f.code }) catch "refused",
                 },
                 .net_error => switch (res.trigger) {
                     .auto => status = "auto-refresh: network error", // contained
-                    .pull => status = "network error", // contained (E2)
+                    .pull, .older => status = "network error", // contained (E2)
                 },
             }
             refresh_worker.freeResult(gpa, res);
@@ -3664,32 +3683,21 @@ pub fn run(
                         status = "end of feed";
                         continue;
                     }
-                    // Paint the wait before paying it.
-                    status = "loading...";
-                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status);
-
-                    const outcome = feed_shell.loadTimelinePage(gpa, arena, io, environ, session, appview_url, store, 30) catch |err| switch (err) {
-                        error.OutOfMemory => return err,
-                        else => {
-                            // Contained: the feed fetch failing is a status
-                            // line, not a dead screen (E2).
-                            status = "network error";
-                            continue;
-                        },
-                    };
-                    status = switch (outcome) {
-                        .ok => |stats| std.fmt.bufPrint(&status_buf, "+{d} older ({d} seen)", .{
-                            stats.items_added, stats.posts_deduped,
-                        }) catch "loaded",
-                        .failed => |failure| std.fmt.bufPrint(&status_buf, "refused: {d} {s}", .{
-                            failure.status, failure.code,
-                        }) catch "refused",
-                    };
-                    if (outcome == .ok) _ = cache_shell.saveStore(gpa, environ, store); // E4
-                    if (outcome == .ok and live_stream == null and store.authors.len > 0) {
-                        live_stream = try startLiveStream(gpa, io, environ, session.did, store, &mailbox, arena);
-                        if (live_stream == null) status = "live stream unavailable" else subscribed_authors = store.authors.len;
-                    }
+                    // Off the frame thread (M-Core.1 unblocking, 2/7): copy
+                    // the cursor out of the store — the worker never reads
+                    // the store — and let the drain ingest the older page
+                    // (ingestPage, append) when it lands.
+                    if (refresher) |w| {
+                        if (gpa.dupe(u8, feed_core.nextCursor(store))) |cur| {
+                            if (refresh_worker.submitOlder(w, cur, 30)) {
+                                refresh_inflight += 1;
+                                status = "loading...";
+                            } else {
+                                gpa.free(cur);
+                                status = "load already queued";
+                            }
+                        } else |err| return err; // OOM
+                    } else status = "load unavailable"; // worker never started (E2)
                 },
                 .like => if (view_items.len > 0) {
                     const r = try engageSelected(.like, gpa, arena, session, store, view_items[state.selected], state.selected, gscreen, profile_target_did, thread_focus_cid, zone_tag, thread_rerooted, gcollapsed.items, feed_config, reply_config, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);

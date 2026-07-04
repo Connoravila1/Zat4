@@ -152,6 +152,48 @@ pub fn fetchRefreshPage(
     );
 }
 
+/// The NETWORK half of `loadTimelinePage`, alone: fetch the page after
+/// `cursor` and return it as a value, touching no store — the "walk down"
+/// counterpart of `fetchRefreshPage`, for the same reason (the frame
+/// thread must never wait on the round trip; M_CORE_INVERSION). The caller
+/// copies the cursor out of the store BEFORE submitting — the worker never
+/// reads the store. An empty cursor fetches the newest page (first load).
+pub fn fetchOlderPage(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    session: *auth.Session,
+    appview_url: []const u8,
+    cursor: []const u8,
+    limit: u32,
+) !xrpc.Outcome(lexicon.TimelinePage) {
+    var limit_buf: [12]u8 = undefined;
+    const limit_str = std.fmt.bufPrint(&limit_buf, "{d}", .{limit}) catch unreachable;
+    var params_buf: [3]xrpc.Param = undefined;
+    var params_len: usize = 0;
+    params_buf[params_len] = .{ .name = "limit", .value = limit_str };
+    params_len += 1;
+    // viewer DID: the Cut-1 AppView builds the feed from it (see loadTimelinePage).
+    params_buf[params_len] = .{ .name = "viewer", .value = session.did };
+    params_len += 1;
+    if (cursor.len > 0) {
+        params_buf[params_len] = .{ .name = "cursor", .value = cursor };
+        params_len += 1;
+    }
+    return auth.queryHost(
+        gpa,
+        arena,
+        io,
+        environ,
+        session,
+        appview_url,
+        lexicon.method.get_timeline,
+        params_buf[0..params_len],
+        lexicon.TimelinePage,
+    );
+}
+
 /// Load one author's posts into the SHARED `store` as CONTENT (no Home
 /// feed-ordering rows) — the profile screen's body. The view's ORDERING is
 /// derived by `feed_core.buildAuthorView` as a query over the store, so a post

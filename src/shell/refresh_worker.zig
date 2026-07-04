@@ -54,15 +54,26 @@ const write_worker = @import("write_worker.zig");
 /// treats them differently: an AUTO tick stages new posts behind the pill
 /// (revealing only at top-of-Home or on the first load), while an explicit
 /// PULL reveals and jumps — the reader asked to SEE the new.
-pub const Trigger = enum(u8) { auto, pull };
+pub const Trigger = enum(u8) {
+    auto,
+    pull,
+    /// Load-more: walk DOWN from a cursor (fetchOlderPage) instead of
+    /// fetching the newest. The UI ingests with ingestPage (append), not
+    /// the refresh prepend.
+    older,
+};
 
-/// A refresh ask. No owned bytes — everything the fetch needs (session,
-/// appview_url, io) is captured once in the Worker at start.
+/// A refresh ask. Everything the fetch needs (session, appview_url, io) is
+/// captured once in the Worker at start; an `.older` request additionally
+/// OWNS its cursor copy (gpa bytes — the worker must never read the store,
+/// so the UI copies the cursor out at submit time). Freed by processOne on
+/// every path, or by shutdown's pending-drain.
 /// A7.2: cold struct, size guard waived — one every few seconds at most,
 /// never held in quantity or walked in a hot loop.
 pub const Request = struct {
     trigger: Trigger,
     limit: u32,
+    cursor: ?[]u8 = null,
 };
 
 /// What the worker reports back: the fetched page (or the failure), plus the
@@ -120,6 +131,12 @@ pub fn submit(worker: *Worker, trigger: Trigger, limit: u32) bool {
     return worker.inbox.push(worker.gpa, .{ .trigger = trigger, .limit = limit });
 }
 
+/// Enqueue a load-more walk. On true the worker OWNS `cursor` (a gpa copy
+/// of the store's next cursor); on false the caller keeps it.
+pub fn submitOlder(worker: *Worker, cursor: []u8, limit: u32) bool {
+    return worker.inbox.push(worker.gpa, .{ .trigger = .older, .limit = limit, .cursor = cursor });
+}
+
 pub fn start(
     gpa: Allocator,
     io: std.Io,
@@ -153,7 +170,7 @@ pub fn shutdown(worker: *Worker) void {
     var pending: std.ArrayList(Request) = .empty;
     defer pending.deinit(gpa);
     worker.inbox.drain(gpa, &pending) catch {};
-    // Requests own no bytes; nothing further to free.
+    for (pending.items) |req| if (req.cursor) |c| gpa.free(c);
     var done: std.ArrayList(Result) = .empty;
     defer done.deinit(gpa);
     worker.outbox.drain(gpa, &done) catch {};
@@ -186,6 +203,8 @@ fn threadMain(worker: *Worker) void {
 
 fn processOne(worker: *Worker, req: Request) void {
     const gpa = worker.gpa;
+    // An .older request owns its cursor copy — freed here on every path (C5).
+    defer if (req.cursor) |c| gpa.free(c);
     // The result's arena: it must OUTLIVE this call (the UI ingests from it
     // later), so it is heap-created and travels inside the Result (C5: freed
     // by exactly one owner, freeResult, on every path).
@@ -193,7 +212,16 @@ fn processOne(worker: *Worker, req: Request) void {
     arena_ptr.* = std.heap.ArenaAllocator.init(gpa);
     const arena = arena_ptr.allocator();
 
-    const outcome: Result.Outcome = if (feed_shell.fetchRefreshPage(
+    const fetched_or_err = if (req.trigger == .older) feed_shell.fetchOlderPage(
+        gpa,
+        arena,
+        worker.io,
+        worker.environ,
+        worker.session,
+        worker.appview_url,
+        req.cursor orelse "",
+        req.limit,
+    ) else feed_shell.fetchRefreshPage(
         gpa,
         arena,
         worker.io,
@@ -201,7 +229,8 @@ fn processOne(worker: *Worker, req: Request) void {
         worker.session,
         worker.appview_url,
         req.limit,
-    )) |fetched| switch (fetched) {
+    );
+    const outcome: Result.Outcome = if (fetched_or_err) |fetched| switch (fetched) {
         .ok => |page| .{ .ok = page },
         .failed => |f| .{ .refused = .{ .status = f.status, .code = f.code } },
     } else |err|
