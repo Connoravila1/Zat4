@@ -263,7 +263,18 @@ fn refillMarket(
     });
 }
 
-pub fn run(
+/// Everything run() holds across frames — the state a frame step reads and
+/// mutates, hoisted so the loop body can become a callable step
+/// (M_CORE_INVERSION MC.1). Fields are in original declaration order; the
+/// WHY of each lives with its assignment in initRunState, which is the old
+/// setup code verbatim. Initialized IN PLACE (initRunState takes the
+/// pointer) and never moved or copied afterwards: workers hold addresses of
+/// the mailbox fields, `out` points into `out_writer`, and slice fields
+/// (e.g. profile_target_did) point into sibling buffers at runtime.
+/// A7.2: cold struct, size guard waived — exactly one per run().
+const RunState = struct {
+    // The run() arguments, captured for deinit + the coming stepFrame
+    // (MC.2). Copies of immutable values — no divergence risk.
     gpa: Allocator,
     io: std.Io,
     environ: ?*const std.process.Environ.Map,
@@ -271,10 +282,235 @@ pub fn run(
     appview_url: []const u8,
     store: *feed_core.Store,
     backend: Backend,
-) !bool {
+
+    user_signed_out: bool,
+    stdin_fd: std.Io.File.Handle,
+    original_termios: ?(if (has_termios) posix.termios else void),
+    out_buffer: [32 * 1024]u8,
+    out_writer: std.Io.File.Writer,
+    out: *std.Io.Writer,
+    prev: tui.Surface,
+    next: tui.Surface,
+    state: timeline_ui.UiState,
+    status_buf: [96]u8,
+    status: []const u8,
+    frame_arena: std.heap.ArenaAllocator,
+    mode: Mode,
+    compose_store: [1200]u8,
+    compose: textedit.Field,
+    caret_anchor_ns: u64,
+    compose_drag: bool,
+    last_click_ns: u64,
+    last_click_x: i32,
+    last_click_y: i32,
+    click_count: u8,
+    armed_kind: ?feed_view.Action,
+    armed_post: u16,
+    armed_legacy: bool,
+    armed_cx: u16,
+    armed_cy: u16,
+    armed_compose: ?feed_view.Action,
+    compose_arena_state: std.heap.ArenaAllocator,
+    reply_target: ?write.ReplyTarget,
+    reply_handle: []const u8,
+    quote_target: ?lexicon.RecordRef,
+    quoting_handle: []const u8,
+    grepost_menu: ?u16,
+    compose_kind: ComposeKind,
+    pending_send: ?ChainSend,
+    chain_segments: std.ArrayList([]const u8),
+    pending_profile_save: ?[]const u8,
+    revealed: std.ArrayList([]const u8),
+    profile_arena_state: std.heap.ArenaAllocator,
+    profile_info: ?timeline_ui.ProfileInfo,
+    mailbox: stream_shell.Mailbox,
+    live_stream: ?*stream_shell.Stream,
+    live_mail: std.ArrayList(stream_shell.Mail),
+    subscribed_authors: usize,
+    live_start_attempted: bool,
+    write_in: write_worker.RequestBox,
+    write_out: write_worker.ResultBox,
+    writer: ?*write_worker.Worker,
+    write_results: std.ArrayList(write_worker.Result),
+    refresh_in: refresh_worker.RequestBox,
+    refresh_out: refresh_worker.ResultBox,
+    refresher: ?*refresh_worker.Worker,
+    refresh_results: std.ArrayList(refresh_worker.Result),
+    refresh_inflight: u32,
+    viewload_in: view_worker.RequestBox,
+    viewload_out: view_worker.ResultBox,
+    viewloader: ?*view_worker.Worker,
+    viewload_results: std.ArrayList(view_worker.Result),
+    deferred_unlike: std.AutoHashMapUnmanaged(u64, void),
+    deferred_unrepost: std.AutoHashMapUnmanaged(u64, void),
+    refresh_interval: i64,
+    last_auto_refresh: i64,
+    last_input_nanos: u64,
+    engine: ?text_core.Engine,
+    gfield: field_core.Field,
+    gparticles: field_core.ParticleList,
+    gactive: effect_core.ActiveList,
+    gdraw: raster_core.DrawList,
+    ghr: field_ui.HitList,
+    ghearts: field_ui.HeartList,
+    gview: field_ui.ViewState,
+    gspawn: std.ArrayList(field_core.SpawnEvent),
+    glast_nanos: u64,
+    gzoom: f32,
+    gscroll_px: i32,
+    gcontent_h: i32,
+    overscroll_accum: i32,
+    pull_refresh_requested: bool,
+    gregions: feed_view.Regions,
+    empty_cards: [0]lens_socket.LensCard,
+    socket_cards: []lens_socket.LensCard,
+    socket_blob: []const u8,
+    gseated: u32,
+    reply_cards: []lens_socket.LensCard,
+    reply_blob: []const u8,
+    reply_seated: u32,
+    zone_cards: []lens_socket.LensCard,
+    zone_blob: []const u8,
+    zone_seated: u32,
+    loadout_dirty: bool,
+    socket_was_open: bool,
+    gsocket_ui: lens_socket.SocketUi,
+    gsocket_hits: lens_socket.HitList,
+    reply_ui: lens_socket.SocketUi,
+    reply_hits: lens_socket.HitList,
+    zone_ui: lens_socket.SocketUi,
+    zone_hits: lens_socket.HitList,
+    page_geoms: [3]lens_socket.Geometry,
+    page_drag_surface: ?u8,
+    prev_screen: u8,
+    gloadout_tab: u8,
+    gcreate_step: create_flow.Step,
+    gcreate_answers: builder.Answers,
+    gcreate_config: discover.FeedConfig,
+    gcreate_color: u8,
+    gcreate_name_buf: [64]u8,
+    gcreate_name_len: usize,
+    gchat_store: chat_core.Store,
+    gchat_sel: ?chat_core.ConvIndex,
+    gchat_draft_buf: [512]u8,
+    gchat_draft_len: usize,
+    gchat_input_focus: bool,
+    gchat_composing: bool,
+    gchat_peer_buf: [254]u8,
+    gchat_peer_len: usize,
+    gchat_compose_status: []const u8,
+    gchat_typing_deadline: i64,
+    gchat_typing_peer_buf: [256]u8,
+    gchat_typing_peer_len: usize,
+    gchat_typing_sent_at: i64,
+    gchat_key_ns: u64,
+    gpay_open: bool,
+    gpay_rail: chat_core.Rail,
+    gpay_amount_buf: [16]u8,
+    gpay_amount_len: usize,
+    gpay_note_buf: [256]u8,
+    gpay_note_len: usize,
+    gpay_focus: u8,
+    gpay_status: []const u8,
+    gpay_confirm: bool,
+    gpay_first_send: bool,
+    gpay_unit: feed_view.PayUnit,
+    gprice_cents: u64,
+    gprice_last: i64,
+    gprice_job: PriceJob,
+    grecv_open: bool,
+    grecv_ln_buf: [256]u8,
+    grecv_ln_len: usize,
+    grecv_btc_buf: [256]u8,
+    grecv_btc_len: usize,
+    grecv_focus: u8,
+    grecv_status: []const u8,
+    grecv_saved: bool,
+    grecv_mode: feed_view.RecvMode,
+    grecv_known: bool,
+    grecv_set: bool,
+    gchain_job: ChainJob,
+    gchain_last: i64,
+    gexpire_last: i64,
+    greceive_job: ReceiveJob,
+    gchat_arena_state: std.heap.ArenaAllocator,
+    gchat_box: chat_relay.Mailbox,
+    gchat_link: ?*chat_relay.ChatRelay,
+    gchat_e2ee: ?chat_e2ee.State,
+    gchat_mail: std.ArrayList(chat_relay.Mail),
+    gcreate_prepare_frames: u32,
+    algo_lib: algo_library.Library,
+    algo_uid: u32,
+    gscreen: u8,
+    on_profile_prev: bool,
+    profile_target_buf: [256]u8,
+    profile_target_did: []const u8,
+    profile_dirty: bool,
+    on_thread_prev: bool,
+    thread_focus_cid_buf: [256]u8,
+    thread_focus_uri_buf: [320]u8,
+    thread_focus_cid: []const u8,
+    thread_focus_uri: []const u8,
+    thread_dirty: bool,
+    thread_return_screen: u8,
+    on_zone_prev: bool,
+    zone_tag_buf: [256]u8,
+    zone_tag: []const u8,
+    zone_dirty: bool,
+    zone_return_screen: u8,
+    gsettings_section: u8,
+    toggle_bits: u64,
+    account_handle_buf: [128]u8,
+    choice_sel: [settings_view.choices.len]u8,
+    gsettings_picking: u8,
+    zone_catalog: std.ArrayList(feed_view.ZoneCard),
+    on_browse_prev: bool,
+    market_catalog: std.ArrayList(MarketRow),
+    market_cards: std.ArrayList(feed_view.MarketAlgoCard),
+    on_market_prev: bool,
+    inspect_bytes: ?[]const u8,
+    inspect_name: []const u8,
+    inspect_ref: []const u8,
+    transp_return_screen: u8,
+    gtransp_source: bool,
+    inspect_loading: bool,
+    inspectjob: InspectJob,
+    config_cache: std.StringHashMapUnmanaged([]u8),
+    thread_rerooted: bool,
+    gcollapsed: std.ArrayList([]const u8),
+    gexpanded: std.ArrayList([]const u8),
+    ghover_x: i32,
+    ghover_y: i32,
+    gpu_state: ?GpuState,
+};
+
+/// The old run() setup, verbatim (MC.1: pure mechanics): every hoisted
+/// local is now an in-place field assignment. Errors are possible ONLY in
+/// the early terminal section (isTty/termios/alt-screen); everything after
+/// is total (catch null / orelse), so on success the caller owns exactly
+/// one cleanup: deinitRunState. On error the errdefer restores the
+/// terminal, matching the old defer semantics.
+fn initRunState(
+    rs: *RunState,
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    session: *auth.Session,
+    appview_url: []const u8,
+    store: *feed_core.Store,
+    backend: Backend,
+) !void {
+    rs.* = undefined;
+    rs.gpa = gpa;
+    rs.io = io;
+    rs.environ = environ;
+    rs.session = session;
+    rs.appview_url = appview_url;
+    rs.store = store;
+    rs.backend = backend;
     // Returns whether the user SIGNED OUT (vs a normal window close / quit): the
     // caller then clears the cached session instead of re-saving it on exit.
-    var user_signed_out = false;
+    rs.user_signed_out = false;
     const stdin_file: std.Io.File = .stdin();
     const stdout_file: std.Io.File = .stdout();
     if (backend == .terminal) {
@@ -282,16 +518,16 @@ pub fn run(
             return error.NotATerminal;
         }
     }
-    const stdin_fd = stdin_file.handle;
+    rs.stdin_fd = stdin_file.handle;
 
     // Raw mode (terminal backend only): no line buffering, no echo, no
     // signal keys (ctrl-c arrives as a byte and quits through the same
     // action path as q). The window backend has no tty to configure.
-    var original_termios: ?(if (has_termios) posix.termios else void) = null;
+    rs.original_termios = null;
     if (!has_termios and backend == .terminal) return error.NotATerminal;
     if (comptime has_termios) if (backend == .terminal) {
-        const original = try posix.tcgetattr(stdin_fd);
-        original_termios = original;
+        const original = try posix.tcgetattr(rs.stdin_fd);
+        rs.original_termios = original;
         var raw = original;
         raw.lflag.ICANON = false;
         raw.lflag.ECHO = false;
@@ -305,134 +541,112 @@ pub fn run(
         raw.oflag.OPOST = false;
         raw.cc[@intFromEnum(posix.V.MIN)] = 1;
         raw.cc[@intFromEnum(posix.V.TIME)] = 0;
-        try posix.tcsetattr(stdin_fd, .FLUSH, raw);
+        try posix.tcsetattr(rs.stdin_fd, .FLUSH, raw);
     };
-    defer if (original_termios) |original| {
-        if (comptime has_termios) posix.tcsetattr(stdin_fd, .FLUSH, original) catch {}; // C5: always restored
+    errdefer if (rs.original_termios) |original| {
+        if (comptime has_termios) posix.tcsetattr(rs.stdin_fd, .FLUSH, original) catch {}; // C5: always restored
     };
 
-    var out_buffer: [32 * 1024]u8 = undefined;
-    var out_writer: std.Io.File.Writer = .init(stdout_file, io, &out_buffer);
-    const out = &out_writer.interface;
+    rs.out_buffer = undefined;
+    rs.out_writer = .init(stdout_file, io, &rs.out_buffer);
+    rs.out = &rs.out_writer.interface;
 
     // Alternate screen + hidden cursor; both released on every exit path.
     // (Terminal only — the window has no ANSI to speak.)
     if (backend == .terminal) {
-        try out.writeAll("\x1b[?1049h\x1b[?25l");
-        try out.flush();
+        try rs.out.writeAll("\x1b[?1049h\x1b[?25l");
+        try rs.out.flush();
     }
-    defer if (backend == .terminal) {
-        out.writeAll("\x1b[0m\x1b[?25h\x1b[?1049l") catch {};
-        out.flush() catch {};
-    };
 
-    var prev: tui.Surface = .{};
-    defer tui.deinitSurface(gpa, &prev);
-    var next: tui.Surface = .{};
-    defer tui.deinitSurface(gpa, &next);
+    rs.prev = .{};
+    rs.next = .{};
 
-    var state: timeline_ui.UiState = .{};
-    var status_buf: [96]u8 = undefined;
-    var status: []const u8 = "press r to load your timeline";
+    rs.state = .{};
+    rs.status_buf = undefined;
+    rs.status = "press r to load your timeline";
 
-    var frame_arena = std.heap.ArenaAllocator.init(gpa);
-    defer frame_arena.deinit();
+    rs.frame_arena = std.heap.ArenaAllocator.init(gpa);
 
     // Composer session: the draft buffer is gpa-owned (it outlives frames);
     // the reply target's strings are copied into their own arena, reset at
     // each composer open (C3: one composition, one unit of work).
-    var mode: Mode = .timeline;
+    rs.mode = .timeline;
     // Composer text: a fixed backing buffer (the draft is capped at 300
     // codepoints — ≤1200 UTF-8 bytes) wrapped in the shared editable-text model,
     // so the composer gets caret-aware editing (click-to-place, ←/→, Home/End,
     // mid-text insert/delete) instead of append-only. Caller-owned: no deinit.
-    var compose_store: [1200]u8 = undefined;
-    var compose: textedit.Field = .{ .buf = &compose_store };
+    rs.compose_store = undefined;
+    rs.compose = .{ .buf = &rs.compose_store };
     // The caret blink anchor: reset on every edit/move so the caret stays solid
     // while the user is active, then blinks when idle (B3: the clock is shell).
-    var caret_anchor_ns: u64 = 0;
+    rs.caret_anchor_ns = 0;
     // True between a press and release in the composer text area — a drag extends
     // the selection (textedit anchor stays, caret follows the pointer).
-    var compose_drag: bool = false;
+    rs.compose_drag = false;
     // Multi-click tracking (double = word, triple = line): consecutive presses
     // close in time and position step the count.
-    var last_click_ns: u64 = 0;
-    var last_click_x: i32 = -1000;
-    var last_click_y: i32 = -1000;
-    var click_count: u8 = 0;
+    rs.last_click_ns = 0;
+    rs.last_click_x = -1000;
+    rs.last_click_y = -1000;
+    rs.click_count = 0;
     // Release-activation (the premium standard): a tap is ARMED on press and
     // FIRES on release only if the release lands on the same target (press then
     // slide off = cancel). The press records the target; the release re-hit-tests
     // and fires the feed switch / legacy cell / composer button if it matches.
     // (Caret placement + socket drag stay on press; the lens socket's own taps
     // are unchanged for now — its drag/drop model is separate.)
-    var armed_kind: ?feed_view.Action = null;
-    var armed_post: u16 = 0;
-    var armed_legacy: bool = false;
-    var armed_cx: u16 = 0;
-    var armed_cy: u16 = 0;
-    var armed_compose: ?feed_view.Action = null; // composer Send/Cancel armed on press
-    var compose_arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer compose_arena_state.deinit();
-    var reply_target: ?write.ReplyTarget = null;
-    var reply_handle: []const u8 = "";
+    rs.armed_kind = null;
+    rs.armed_post = 0;
+    rs.armed_legacy = false;
+    rs.armed_cx = 0;
+    rs.armed_cy = 0;
+    rs.armed_compose = null; // composer Send/Cancel armed on press
+    rs.compose_arena_state = std.heap.ArenaAllocator.init(gpa);
+    rs.reply_target = null;
+    rs.reply_handle = "";
     // Quote-post: the quoted post's strong ref (compose-arena-owned, like
     // reply_target) + its @handle for the composer's "Quoting" line. Set when the
     // quote button opens the composer; cleared on send/cancel.
-    var quote_target: ?lexicon.RecordRef = null;
-    var quoting_handle: []const u8 = "";
+    rs.quote_target = null;
+    rs.quoting_handle = "";
     // The VIEW index of the post whose Repost/Quote menu is open, or null. A
     // transient popover: closed by picking a row, tapping elsewhere, or scrolling.
-    var grepost_menu: ?u16 = null;
+    rs.grepost_menu = null;
     // The compose flow is reused for the profile editor: .post writes a feed
     // post on send; .profile upserts the self profile record with the buffer as
     // the display name. Set when the editor / composer is opened.
-    var compose_kind: ComposeKind = .post;
+    rs.compose_kind = .post;
     // A post/reply optimistically shown, its create write queued for the loop to
     // run after the post is on screen (0ms posting). At most one chain in flight;
     // a lone post is a chain of one.
-    var pending_send: ?ChainSend = null;
-    defer if (pending_send) |cs| freeChain(gpa, cs);
+    rs.pending_send = null;
     // Thread composer: the FINALIZED segments above the active box. Tapping "Add"
     // pushes the active draft here and clears the box for the next post; Send
     // publishes these plus the active box as one self-reply chain. gpa-owned
     // texts, freed on send/cancel/exit (C5).
-    var chain_segments: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (chain_segments.items) |s| gpa.free(s);
-        chain_segments.deinit(gpa);
-    }
+    rs.chain_segments = .empty;
     // A queued profile-edit save (the display name to putProfile after it's
     // shown optimistically). gpa-owned; at most one in flight.
-    var pending_profile_save: ?[]const u8 = null;
-    defer if (pending_profile_save) |n| gpa.free(n);
+    rs.pending_profile_save = null;
 
     // Reveal toggles: cids the user has opened past a moderation collapse.
     // Plain values handed to the core each frame (B5); freed here (C4/C5).
-    var revealed: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (revealed.items) |cid| gpa.free(cid);
-        revealed.deinit(gpa);
-    }
+    rs.revealed = .empty;
 
     // The profile screen's strings live in their own arena, reset per
     // fetch (C3); the info struct is a view over it.
-    var profile_arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer profile_arena_state.deinit();
-    var profile_info: ?timeline_ui.ProfileInfo = null;
+    rs.profile_arena_state = std.heap.ArenaAllocator.init(gpa);
+    rs.profile_info = null;
 
     // Live stream: spawned after the first page teaches us whose posts to
     // want; it speaks only through the mailbox (E1) and is joined before
     // the terminal defers above unwind. A dead stream is a status line,
     // never a dead screen (E2).
-    var mailbox: stream_shell.Mailbox = .{};
-    defer mailbox.deinit(gpa);
-    var live_stream: ?*stream_shell.Stream = null;
-    defer if (live_stream) |live| stream_shell.shutdown(live);
-    var live_mail: std.ArrayList(stream_shell.Mail) = .empty;
-    defer live_mail.deinit(gpa);
-    var subscribed_authors: usize = 0;
-    var live_start_attempted = false;
+    rs.mailbox = .{};
+    rs.live_stream = null;
+    rs.live_mail = .empty;
+    rs.subscribed_authors = 0;
+    rs.live_start_attempted = false;
 
     // The WRITE WORKER (mirror of the firehose): like/unlike/repost network
     // calls run on this worker's own thread so the UI loop never blocks on
@@ -441,14 +655,10 @@ pub fn run(
     // and only a server REFUSAL reverts the optimistic state. This is what
     // makes animations smooth — the main loop keeps running every frame
     // while the network call is in flight on another thread.
-    var write_in: write_worker.RequestBox = .{};
-    defer write_in.deinit(gpa);
-    var write_out: write_worker.ResultBox = .{};
-    defer write_out.deinit(gpa);
-    const writer: ?*write_worker.Worker = write_worker.start(gpa, io, environ, session, &write_in, &write_out) catch null;
-    defer if (writer) |w| write_worker.shutdown(w);
-    var write_results: std.ArrayList(write_worker.Result) = .empty;
-    defer write_results.deinit(gpa);
+    rs.write_in = .{};
+    rs.write_out = .{};
+    rs.writer = write_worker.start(gpa, io, environ, session, &rs.write_in, &rs.write_out) catch null;
+    rs.write_results = .empty;
     // The refresh worker — the same actor pattern for the timeline FETCH. The
     // auto-refresh tick and pull-to-refresh used to run getTimeline inline on
     // this thread, freezing the living field for the round trip every interval
@@ -456,17 +666,13 @@ pub fn run(
     // page below; only the ingest (pure CPU over the fetched values) runs on
     // this thread. A failed spawn degrades to manual refresh only (E2: the `r`
     // key keeps its synchronous path).
-    var refresh_in: refresh_worker.RequestBox = .{};
-    defer refresh_in.deinit(gpa);
-    var refresh_out: refresh_worker.ResultBox = .{};
-    defer refresh_out.deinit(gpa);
-    const refresher: ?*refresh_worker.Worker = refresh_worker.start(gpa, io, environ, session, appview_url, &refresh_in, &refresh_out) catch null;
-    defer if (refresher) |w| refresh_worker.shutdown(w);
-    var refresh_results: std.ArrayList(refresh_worker.Result) = .empty;
-    defer refresh_results.deinit(gpa);
+    rs.refresh_in = .{};
+    rs.refresh_out = .{};
+    rs.refresher = refresh_worker.start(gpa, io, environ, session, appview_url, &rs.refresh_in, &rs.refresh_out) catch null;
+    rs.refresh_results = .empty;
     // Auto ticks in flight: the interval clock never stacks a second fetch on
     // an unanswered one (a slow network otherwise queues a burst).
-    var refresh_inflight: u32 = 0;
+    rs.refresh_inflight = 0;
     // The VIEW-LOAD worker — the same actor pattern for the view-ENTRY
     // fetches (profile/thread/zone/…). Entering a view used to run its fetch
     // inline on this thread — a frozen frame per entry, and a guaranteed ANR
@@ -475,22 +681,16 @@ pub fn run(
     // store's resident content until the page lands (every view is a query
     // over the shared store). A failed spawn degrades to a status line per
     // view (E2).
-    var viewload_in: view_worker.RequestBox = .{};
-    defer viewload_in.deinit(gpa);
-    var viewload_out: view_worker.ResultBox = .{};
-    defer viewload_out.deinit(gpa);
-    const viewloader: ?*view_worker.Worker = view_worker.start(gpa, io, environ, session, appview_url, &viewload_in, &viewload_out) catch null;
-    defer if (viewloader) |w| view_worker.shutdown(w);
-    var viewload_results: std.ArrayList(view_worker.Result) = .empty;
-    defer viewload_results.deinit(gpa);
+    rs.viewload_in = .{};
+    rs.viewload_out = .{};
+    rs.viewloader = view_worker.start(gpa, io, environ, session, appview_url, &rs.viewload_in, &rs.viewload_out) catch null;
+    rs.viewload_results = .empty;
     // Deferred-undo intents: a post the user UN-engaged before its like/repost
     // create had returned a record uri. Keyed by a hash of the post cid; when
     // the create's result lands (with the uri), the drain fires the delete at
     // once — so undo is instant instead of waiting on the create round-trip.
-    var deferred_unlike: std.AutoHashMapUnmanaged(u64, void) = .empty;
-    defer deferred_unlike.deinit(gpa);
-    var deferred_unrepost: std.AutoHashMapUnmanaged(u64, void) = .empty;
-    defer deferred_unrepost.deinit(gpa);
+    rs.deferred_unlike = .empty;
+    rs.deferred_unrepost = .empty;
 
     // Auto-refresh: the reliable live path. The Jetstream subsystem stays
     // wired (it proves the firehose engineering), but the VISIBLE feed is
@@ -499,72 +699,63 @@ pub fn run(
     // actually keep the rendered feed fresh; the firehose shines for
     // notifications/counts, a later slice. Interval is overridable via
     // ZAT_REFRESH_SECS (0 disables auto-refresh, falling back to manual r).
-    const refresh_interval: i64 = blk: {
+    rs.refresh_interval = blk: {
         const secs = if (environ) |env| env.get("ZAT_REFRESH_SECS") else null;
         if (secs) |s| break :blk std.fmt.parseInt(i64, s, 10) catch 5;
         break :blk 5;
     };
-    var last_auto_refresh: i64 = 0;
+    rs.last_auto_refresh = 0;
 
     // Last-input clock for the input-idle gate (see input_idle_gate_nanos).
-    var last_input_nanos: u64 = 0;
+    rs.last_input_nanos = 0;
 
     // ---- the modern window path (GUI roadmap 5.2/5.5/5.6, §7 amendment) --
     // The proportional engine and pixel view state exist only for the
     // window backend. A failed font init degrades to the cell renderer
     // (E2: a plainer window, never a dead one) — paintFrame() checks.
-    var engine: ?text_core.Engine = null;
-    defer if (engine) |*e| text_core.deinitEngine(gpa, e);
-    if (backend == .window) engine = text_core.initEngine() catch null;
+    rs.engine = null;
+    if (backend == .window) rs.engine = text_core.initEngine() catch null;
     // The glyph-field cutover (GLYPH_FIELD_SYSTEM_DESIGN G.0): the
     // window renders the feed as a live simulated mono grid. All of
     // this exists only when the font engine came up (E2: otherwise the
     // cell fallback still runs — a plainer window, never a dead one).
-    var gfield: field_core.Field = .{};
-    defer field_core.deinit(gpa, &gfield);
-    var gparticles: field_core.ParticleList = .empty;
-    defer gparticles.deinit(gpa);
-    var gactive: effect_core.ActiveList = .empty;
-    defer gactive.deinit(gpa);
-    var gdraw: raster_core.DrawList = .empty;
-    defer gdraw.deinit(gpa);
-    var ghr: field_ui.HitList = .empty;
-    defer ghr.deinit(gpa);
-    var ghearts: field_ui.HeartList = .empty;
-    defer ghearts.deinit(gpa);
-    var gview: field_ui.ViewState = .{};
-    var gspawn: std.ArrayList(field_core.SpawnEvent) = .empty;
-    defer gspawn.deinit(gpa);
-    var glast_nanos: u64 = 0;
-    var gzoom: f32 = 1.0; // user text-scaling factor (+/- keys)
+    rs.gfield = .{};
+    rs.gparticles = .empty;
+    rs.gactive = .empty;
+    rs.gdraw = .empty;
+    rs.ghr = .empty;
+    rs.ghearts = .empty;
+    rs.gview = .{};
+    rs.gspawn = .empty;
+    rs.glast_nanos = 0;
+    rs.gzoom = 1.0; // user text-scaling factor (+/- keys)
     // cut 5.6 premium feed: pixel scroll offset (≤0 scrolls the stack up),
     // its clamp bound (total content height), and the per-frame button hit
     // regions the pointer handler tests in pixels.
-    var gscroll_px: i32 = 0;
-    var gcontent_h: i32 = 0;
+    rs.gscroll_px = 0;
+    rs.gcontent_h = 0;
     // Pull-to-refresh: an upward wheel while already pinned at the top of Home
     // accumulates "overscroll"; crossing `pull_refresh_threshold` requests a
     // manual refresh (handled at the loop top with the auto-refresh). A
     // downward scroll or a fired refresh resets the accumulator.
-    var overscroll_accum: i32 = 0;
-    var pull_refresh_requested = false;
-    var gregions: feed_view.Regions = .empty;
-    defer gregions.deinit(gpa);
+    rs.overscroll_accum = 0;
+    rs.pull_refresh_requested = false;
+    rs.gregions = .empty;
     // THE LENS SOCKET loadouts — THREE surfaces (feed / reply / zone),
     // SOCKET_LOADOUT §10. The FEED surface is interactive in the home header;
     // reply/zone are held so a save writes the whole record without clobbering
     // them (the loadout PAGE makes them editable). Cards + blob are gpa-owned
     // so the CID slices the socket emits stay valid across frames (B-split).
-    var empty_cards = [_]lens_socket.LensCard{};
-    var socket_cards: []lens_socket.LensCard = &empty_cards;
-    var socket_blob: []const u8 = "";
-    var gseated: u32 = 0;
-    var reply_cards: []lens_socket.LensCard = &empty_cards;
-    var reply_blob: []const u8 = "";
-    var reply_seated: u32 = 0;
-    var zone_cards: []lens_socket.LensCard = &empty_cards;
-    var zone_blob: []const u8 = "";
-    var zone_seated: u32 = 0;
+    rs.empty_cards = [_]lens_socket.LensCard{};
+    rs.socket_cards = &rs.empty_cards;
+    rs.socket_blob = "";
+    rs.gseated = 0;
+    rs.reply_cards = &rs.empty_cards;
+    rs.reply_blob = "";
+    rs.reply_seated = 0;
+    rs.zone_cards = &rs.empty_cards;
+    rs.zone_blob = "";
+    rs.zone_seated = 0;
     // Restore the persisted loadouts from `app.zat4.socket.loadout`; absent
     // (first run) or a failed read falls back to the catalog defaults, which
     // we then write so the record exists going forward.
@@ -573,25 +764,25 @@ pub fn run(
         defer load_arena.deinit();
         const loaded: ?loadout_store.Loaded = loadout_store.load(gpa, load_arena.allocator(), io, environ, session) catch null;
         if (loaded) |ld| {
-            buildSurfaceFromEntries(gpa, ld.feed, &socket_cards, &socket_blob, &gseated);
-            buildSurfaceFromEntries(gpa, ld.reply, &reply_cards, &reply_blob, &reply_seated);
-            buildSurfaceFromEntries(gpa, ld.zone, &zone_cards, &zone_blob, &zone_seated);
+            buildSurfaceFromEntries(gpa, ld.feed, &rs.socket_cards, &rs.socket_blob, &rs.gseated);
+            buildSurfaceFromEntries(gpa, ld.reply, &rs.reply_cards, &rs.reply_blob, &rs.reply_seated);
+            buildSurfaceFromEntries(gpa, ld.zone, &rs.zone_cards, &rs.zone_blob, &rs.zone_seated);
         }
         // Any surface that didn't resolve from the record → its catalog default.
-        if (socket_cards.len == 0) if (lens_catalog.defaultFeedLoadout(gpa)) |t| {
-            socket_cards = t[0];
-            socket_blob = t[1];
-            gseated = lens_catalog.default_feed_seated;
+        if (rs.socket_cards.len == 0) if (lens_catalog.defaultFeedLoadout(gpa)) |t| {
+            rs.socket_cards = t[0];
+            rs.socket_blob = t[1];
+            rs.gseated = lens_catalog.default_feed_seated;
         } else |_| {};
-        if (reply_cards.len == 0) if (lens_catalog.defaultReplyLoadout(gpa)) |t| {
-            reply_cards = t[0];
-            reply_blob = t[1];
-            reply_seated = lens_catalog.default_reply_seated;
+        if (rs.reply_cards.len == 0) if (lens_catalog.defaultReplyLoadout(gpa)) |t| {
+            rs.reply_cards = t[0];
+            rs.reply_blob = t[1];
+            rs.reply_seated = lens_catalog.default_reply_seated;
         } else |_| {};
-        if (zone_cards.len == 0) if (lens_catalog.defaultZoneLoadout(gpa)) |t| {
-            zone_cards = t[0];
-            zone_blob = t[1];
-            zone_seated = lens_catalog.default_zone_seated;
+        if (rs.zone_cards.len == 0) if (lens_catalog.defaultZoneLoadout(gpa)) |t| {
+            rs.zone_cards = t[0];
+            rs.zone_blob = t[1];
+            rs.zone_seated = lens_catalog.default_zone_seated;
         } else |_| {};
         // First run (no record): persist the defaults once (synchronous here is
         // fine — it's startup, before the loop).
@@ -602,131 +793,116 @@ pub fn run(
                 io,
                 environ,
                 session,
-                surfaceDataOf(load_arena.allocator(), socket_cards, socket_blob, gseated),
-                surfaceDataOf(load_arena.allocator(), reply_cards, reply_blob, reply_seated),
-                surfaceDataOf(load_arena.allocator(), zone_cards, zone_blob, zone_seated),
+                surfaceDataOf(load_arena.allocator(), rs.socket_cards, rs.socket_blob, rs.gseated),
+                surfaceDataOf(load_arena.allocator(), rs.reply_cards, rs.reply_blob, rs.reply_seated),
+                surfaceDataOf(load_arena.allocator(), rs.zone_cards, rs.zone_blob, rs.zone_seated),
                 clock_shell.unixSeconds(),
             ) catch {};
         }
     }
-    if (socket_cards.len > 0) gseated = @min(gseated, @as(u32, @intCast(socket_cards.len - 1)));
-    defer if (socket_cards.len > 0) gpa.free(socket_cards);
-    defer if (socket_blob.len > 0) gpa.free(socket_blob);
-    defer if (reply_cards.len > 0) gpa.free(reply_cards);
-    defer if (reply_blob.len > 0) gpa.free(reply_blob);
-    defer if (zone_cards.len > 0) gpa.free(zone_cards);
-    defer if (zone_blob.len > 0) gpa.free(zone_blob);
+    if (rs.socket_cards.len > 0) rs.gseated = @min(rs.gseated, @as(u32, @intCast(rs.socket_cards.len - 1)));
     // Set when the loadout changes (recolor / reorder / seat); flushed to the
     // background worker when the tray closes (so editing never blocks).
-    var loadout_dirty = false;
-    var socket_was_open = false;
-    var gsocket_ui: lens_socket.SocketUi = .{};
-    var gsocket_hits: lens_socket.HitList = .empty;
-    defer gsocket_hits.deinit(gpa);
+    rs.loadout_dirty = false;
+    rs.socket_was_open = false;
+    rs.gsocket_ui = .{};
+    rs.gsocket_hits = .empty;
     // The reply/zone sockets, shown on the loadout PAGE (the feed surface reuses
     // gsocket_ui/gsocket_hits above). Their transient UI + per-frame hit lists.
-    var reply_ui: lens_socket.SocketUi = .{};
-    var reply_hits: lens_socket.HitList = .empty;
-    defer reply_hits.deinit(gpa);
-    var zone_ui: lens_socket.SocketUi = .{};
-    var zone_hits: lens_socket.HitList = .empty;
-    defer zone_hits.deinit(gpa);
+    rs.reply_ui = .{};
+    rs.reply_hits = .empty;
+    rs.zone_ui = .{};
+    rs.zone_hits = .empty;
     // Drag on the loadout PAGE: each socket's on-page geometry (filled by
     // layoutLoadout), and which surface is mid-drag (0 feed / 1 reply / 2 zone).
-    var page_geoms: [3]lens_socket.Geometry = .{ .{ .x = 0, .y = 0, .w = 0 }, .{ .x = 0, .y = 0, .w = 0 }, .{ .x = 0, .y = 0, .w = 0 } };
-    var page_drag_surface: ?u8 = null;
+    rs.page_geoms = .{ .{ .x = 0, .y = 0, .w = 0 }, .{ .x = 0, .y = 0, .w = 0 }, .{ .x = 0, .y = 0, .w = 0 } };
+    rs.page_drag_surface = null;
     // Previous frame's screen — flush the loadout when LEAVING the page (the
     // page's sockets are always open, so there's no tray-close beat there).
-    var prev_screen: u8 = 0;
+    rs.prev_screen = 0;
     // The active sub-tab on the Algorithms page: 0 = Loadout, 1 = Marketplace,
     // 2 = Create (the latter two are placeholders for now).
-    var gloadout_tab: u8 = 0;
+    rs.gloadout_tab = 0;
     // The simple-Create flow's state (loadout tab 2): the current step, the
     // plain-language answers so far, the live config (rebuilt from the answers, then
     // nudged by the recap knobs), the chosen accent, and the name buffer. The user's
     // OWNED algorithms land in `algo_lib`; `algo_uid` mints their local ids.
-    var gcreate_step: create_flow.Step = .landing;
-    var gcreate_answers: builder.Answers = .{};
-    var gcreate_config: discover.FeedConfig = builder.build(.{});
-    var gcreate_color: u8 = 0;
-    var gcreate_name_buf: [64]u8 = undefined;
-    var gcreate_name_len: usize = 0;
+    rs.gcreate_step = .landing;
+    rs.gcreate_answers = .{};
+    rs.gcreate_config = builder.build(.{});
+    rs.gcreate_color = 0;
+    rs.gcreate_name_buf = undefined;
+    rs.gcreate_name_len = 0;
     // Zat Chat (M1): the DM view store — a QUERY model over the real E2EE
     // session below (zat-view-model law). Messages are end-to-end encrypted
     // via MLS; this store holds only the plaintext the local user has typed
     // or the crypto core has decrypted for display.
-    var gchat_store: chat_core.Store = .{};
-    defer chat_core.deinitStore(gpa, &gchat_store);
-    var gchat_sel: ?chat_core.ConvIndex = null;
-    var gchat_draft_buf: [512]u8 = undefined;
-    var gchat_draft_len: usize = 0;
-    var gchat_input_focus: bool = false;
+    rs.gchat_store = .{};
+    rs.gchat_sel = null;
+    rs.gchat_draft_buf = undefined;
+    rs.gchat_draft_len = 0;
+    rs.gchat_input_focus = false;
     // The new-conversation flow: the recipient draft (a handle or DID being
     // typed) and why the last attempt refused (static strings, "" = none).
-    var gchat_composing: bool = false;
-    var gchat_peer_buf: [254]u8 = undefined;
-    var gchat_peer_len: usize = 0;
-    var gchat_compose_status: []const u8 = "";
+    rs.gchat_composing = false;
+    rs.gchat_peer_buf = undefined;
+    rs.gchat_peer_len = 0;
+    rs.gchat_compose_status = "";
     // The peer-is-typing signal (U6a, real): an ENCRYPTED ping on the
     // reserved wire kind (chat.kind_typing_wire) — the relay sees one more
     // fixed-size bucket; only the peer can read it. Receiving one arms a
     // deadline; the indicator shows in the matching open thread until it
     // lapses (or the message itself arrives). The sender throttles to one
     // ping per 4s of active typing.
-    var gchat_typing_deadline: i64 = 0;
-    var gchat_typing_peer_buf: [256]u8 = undefined;
-    var gchat_typing_peer_len: usize = 0;
-    var gchat_typing_sent_at: i64 = 0;
+    rs.gchat_typing_deadline = 0;
+    rs.gchat_typing_peer_buf = undefined;
+    rs.gchat_typing_peer_len = 0;
+    rs.gchat_typing_sent_at = 0;
     // Last chat keystroke (monotonic ns) — the caret's blink clock: lit
     // while typing, breathing when idle.
-    var gchat_key_ns: u64 = 0;
+    rs.gchat_key_ns = 0;
     // The pay sheet (M5 A4): rail + amount/note drafts + which field owns
     // the keyboard + why the last attempt refused (static strings).
-    var gpay_open: bool = false;
-    var gpay_rail: chat_core.Rail = .lightning;
-    var gpay_amount_buf: [16]u8 = undefined;
-    var gpay_amount_len: usize = 0;
-    var gpay_note_buf: [256]u8 = undefined;
-    var gpay_note_len: usize = 0;
-    var gpay_focus: u8 = 0;
-    var gpay_status: []const u8 = "";
+    rs.gpay_open = false;
+    rs.gpay_rail = .lightning;
+    rs.gpay_amount_buf = undefined;
+    rs.gpay_amount_len = 0;
+    rs.gpay_note_buf = undefined;
+    rs.gpay_note_len = 0;
+    rs.gpay_focus = 0;
+    rs.gpay_status = "";
     // The send-confirm face (§8.2) + the once-per-session first-time disclosure.
-    var gpay_confirm: bool = false;
-    var gpay_first_send: bool = true;
+    rs.gpay_confirm = false;
+    rs.gpay_first_send = true;
     // The amount entry unit (sats/BTC) + the live USD-cents-per-BTC price for
     // the ≈$ readout (0 = unknown; refreshed off-thread).
-    var gpay_unit: feed_view.PayUnit = .sats;
-    var gprice_cents: u64 = 0;
-    var gprice_last: i64 = 0;
-    var gprice_job: PriceJob = .{};
+    rs.gpay_unit = .sats;
+    rs.gprice_cents = 0;
+    rs.gprice_last = 0;
+    rs.gprice_job = .{};
     // The receive-setup sheet (set up YOUR chat wallet). Addresses can be long
     // (bech32 ~62 chars, lightning addresses too), so give the buffers room.
-    var grecv_open: bool = false;
-    var grecv_ln_buf: [256]u8 = undefined;
-    var grecv_ln_len: usize = 0;
-    var grecv_btc_buf: [256]u8 = undefined;
-    var grecv_btc_len: usize = 0;
-    var grecv_focus: u8 = 0;
-    var grecv_status: []const u8 = "";
-    var grecv_saved: bool = false;
-    var grecv_mode: feed_view.RecvMode = .paste;
+    rs.grecv_open = false;
+    rs.grecv_ln_buf = undefined;
+    rs.grecv_ln_len = 0;
+    rs.grecv_btc_buf = undefined;
+    rs.grecv_btc_len = 0;
+    rs.grecv_focus = 0;
+    rs.grecv_status = "";
+    rs.grecv_saved = false;
+    rs.grecv_mode = .paste;
     // Have we checked (once) whether this account already has a receive address
     // published, and what it was? Gates the bitcoin icon: set → pay sheet,
     // unset → the onboarding empty state (never a dead form).
-    var grecv_known: bool = false;
-    var grecv_set: bool = false;
+    rs.grecv_known = false;
+    rs.grecv_set = false;
     // The confirmation-watcher's cycle (M5 A5). At exit an in-flight cycle
     // is joined (a few HTTP reads at worst) so the worker never outlives
     // the loop's stack.
-    var gchain_job: ChainJob = .{};
-    var gchain_last: i64 = 0;
-    var gexpire_last: i64 = 0;
-    var greceive_job: ReceiveJob = .{};
-    defer if (gchain_job.thread) |t| {
-        t.join();
-        gchain_job.thread = null;
-        chainJobFree(&gchain_job);
-    };
+    rs.gchain_job = .{};
+    rs.gchain_last = 0;
+    rs.gexpire_last = 0;
+    rs.greceive_job = .{};
 
     // The real E2EE session (M1): the crypto state (anchor, keyPackage,
     // per-conversation MLS groups) + the relay link that carries encrypted
@@ -735,19 +911,11 @@ pub fn run(
     // empty, honest surface (no fake seeds). A dead relay is an empty drain,
     // never a dead screen (E2/E4). A short-lived arena serves the network
     // legs (publish/fetch); the resident state is gpa-owned.
-    var gchat_arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer gchat_arena_state.deinit();
-    var gchat_box: chat_relay.Mailbox = .{};
-    defer gchat_box.deinit(gpa);
-    var gchat_link: ?*chat_relay.ChatRelay = null;
-    defer if (gchat_link) |link| chat_relay.shutdown(link);
-    var gchat_e2ee: ?chat_e2ee.State = null;
-    defer if (gchat_e2ee) |*st| chat_e2ee.deinit(gpa, st);
-    var gchat_mail: std.ArrayList(chat_relay.Mail) = .empty;
-    defer {
-        for (gchat_mail.items) |m| chat_relay.freeMail(gpa, m);
-        gchat_mail.deinit(gpa);
-    }
+    rs.gchat_arena_state = std.heap.ArenaAllocator.init(gpa);
+    rs.gchat_box = .{};
+    rs.gchat_link = null;
+    rs.gchat_e2ee = null;
+    rs.gchat_mail = .empty;
     if (dev_chat) {
         if (environ) |env| {
             if (env.get("ZAT4_RELAY")) |hostport| {
@@ -759,10 +927,10 @@ pub fn run(
                     // Bring up the crypto (publishes our keyPackage, restores
                     // saved conversations), then the relay link subscribed to
                     // our own inbox mailbox.
-                    _ = gchat_arena_state.reset(.retain_capacity);
-                    if (chat_e2ee.init(gpa, gchat_arena_state.allocator(), io, env, session)) |st| {
-                        gchat_e2ee = st;
-                        gchat_link = chat_relay.start(gpa, io, &gchat_box, rhost, rport, token, st.inbox) catch null;
+                    _ = rs.gchat_arena_state.reset(.retain_capacity);
+                    if (chat_e2ee.init(gpa, rs.gchat_arena_state.allocator(), io, env, session)) |st| {
+                        rs.gchat_e2ee = st;
+                        rs.gchat_link = chat_relay.start(gpa, io, &rs.gchat_box, rhost, rport, token, st.inbox) catch null;
                         // Restore the displayed history (M2) first. A missing
                         // or corrupt blob is a cold start, never a half-restore
                         // (the codec is strict) — the mirror below still
@@ -776,8 +944,8 @@ pub fn run(
                                     gpa.free(blob);
                                 }
                                 if (chat_core.deserializeStore(gpa, blob)) |restored| {
-                                    chat_core.deinitStore(gpa, &gchat_store);
-                                    gchat_store = restored;
+                                    chat_core.deinitStore(gpa, &rs.gchat_store);
+                                    rs.gchat_store = restored;
                                 } else |_| {}
                             }
                         }
@@ -786,10 +954,10 @@ pub fn run(
                         // so ones already in the history blob are found, not
                         // doubled), then persist once to heal any divergence.
                         for (st.peer_dids.items) |did| {
-                            _ = chat_core.openConversation(gpa, &gchat_store, did, "") catch {};
+                            _ = chat_core.openConversation(gpa, &rs.gchat_store, did, "") catch {};
                         }
-                        chatPersistHistory(gpa, io, env, &st, &gchat_store);
-                        if (gchat_link != null) {
+                        chatPersistHistory(gpa, io, env, &st, &rs.gchat_store);
+                        if (rs.gchat_link != null) {
                             std.debug.print("[chat] E2EE up -> {s} ({d} conversation(s) restored)\n", .{ hostport, st.peer_dids.items.len });
                         } else {
                             std.debug.print("[chat] keyPackage published but the relay link did NOT start\n", .{});
@@ -807,24 +975,23 @@ pub fn run(
             }
         }
     }
-    var gcreate_prepare_frames: u32 = 0; // the .preparing loading beat's progress (frames)
+    rs.gcreate_prepare_frames = 0; // the .preparing loading beat's progress (frames)
     // Load the user's saved library (created/downloaded feeds); empty on first run
     // or a corrupt file (deserialize is total). Saved after each create/adopt.
-    var algo_lib: algo_library.Library = cache_shell.loadLibrary(gpa, environ) orelse .{};
-    defer algo_lib.deinit(gpa);
-    var algo_uid: u32 = 0;
+    rs.algo_lib = cache_shell.loadLibrary(gpa, environ) orelse .{};
+    rs.algo_uid = 0;
     // Resume id minting past the highest persisted `user:N`, so a new create can't
     // collide with a saved one (add is idempotent by id → a collision drops the new).
-    for (algo_lib.records.items) |rec| {
-        const id = algo_lib.slice(rec.id);
+    for (rs.algo_lib.records.items) |rec| {
+        const id = rs.algo_lib.slice(rec.id);
         if (std.mem.startsWith(u8, id, "user:")) {
             const n = std.fmt.parseInt(u32, id["user:".len..], 10) catch continue;
-            if (n >= algo_uid) algo_uid = n + 1;
+            if (n >= rs.algo_uid) rs.algo_uid = n + 1;
         }
     }
     // The active top-level Screen (index into feed_view.nav_labels); the rail
     // sets it on a click. 0 = Home (the feed). Lives across frames in run().
-    var gscreen: u8 = 0;
+    rs.gscreen = 0;
     // The premium Profile screen is a VIEW over the ONE shared `store`, not a
     // second store (ZONES invariant 4 — the post is the post). Entering it
     // fetches the viewed author's posts as CONTENT into `store`; the view's
@@ -833,10 +1000,10 @@ pub fn run(
     // rail "Profile"; set to a post author's DID when you tap their avatar).
     // `on_profile_prev` catches re-entry; `profile_dirty` catches a target
     // change (tapping a new author while already on the profile).
-    var on_profile_prev = false;
-    var profile_target_buf: [256]u8 = undefined;
-    var profile_target_did: []const u8 = session.did;
-    var profile_dirty = false;
+    rs.on_profile_prev = false;
+    rs.profile_target_buf = undefined;
+    rs.profile_target_did = session.did;
+    rs.profile_dirty = false;
 
     // The Thread screen (C4): tapping a post body opens its thread — also a VIEW
     // over the ONE shared store (the reply linkage rides on each post). Entering
@@ -844,30 +1011,30 @@ pub fn run(
     // query (`feed_core.buildThreadView`) keyed by the focused post's cid. The
     // uri is sent to the AppView's getPostThread; `thread_return_screen` is where
     // Back goes.
-    var on_thread_prev = false;
-    var thread_focus_cid_buf: [256]u8 = undefined;
-    var thread_focus_uri_buf: [320]u8 = undefined;
-    var thread_focus_cid: []const u8 = "";
-    var thread_focus_uri: []const u8 = "";
-    var thread_dirty = false;
-    var thread_return_screen: u8 = 0;
+    rs.on_thread_prev = false;
+    rs.thread_focus_cid_buf = undefined;
+    rs.thread_focus_uri_buf = undefined;
+    rs.thread_focus_cid = "";
+    rs.thread_focus_uri = "";
+    rs.thread_dirty = false;
+    rs.thread_return_screen = 0;
     // ZONE page (a tag-scoped feed): tapping a `#tag` in a post's tray opens it.
     // On entry the shell fetches the zone (`feed_shell.loadZoneFeed`) as CONTENT;
     // the ordering is a query (`feed_core.buildTagView`) keyed by the tag. The
     // tag (display form) is sent to the AppView's getPostsForTag, which normalizes
     // it. `zone_return_screen` is where Back goes.
-    var on_zone_prev = false;
-    var zone_tag_buf: [256]u8 = undefined;
-    var zone_tag: []const u8 = "";
-    var zone_dirty = false;
-    var zone_return_screen: u8 = 0;
+    rs.on_zone_prev = false;
+    rs.zone_tag_buf = undefined;
+    rs.zone_tag = "";
+    rs.zone_dirty = false;
+    rs.zone_return_screen = 0;
     // Settings (`screen_settings`): the selected left-hand section (master–detail
     // state, like the return-screen vars above). A section tap sets it.
-    var gsettings_section: u8 = 0;
+    rs.gsettings_section = 0;
     // Runtime on/off of every Settings toggle — a bitset indexed by GLOBAL row
     // index, seeded from each toggle's `flag_on` default. A toggle tap flips its
     // bit (so all Toy Box switches are live, even before their effects are wired).
-    var toggle_bits: u64 = blk: {
+    rs.toggle_bits = blk: {
         var b: u64 = 0;
         for (settings_view.rows, 0..) |r, i| {
             if (r.kind == .toggle and (r.flags & settings_view.flag_on) != 0) b |= @as(u64, 1) << @intCast(i);
@@ -876,44 +1043,29 @@ pub fn run(
     };
     // Holds the "@handle" form for the Settings → Account info row (formatted
     // each frame from the session; the session handle has no leading @).
-    var account_handle_buf: [128]u8 = undefined;
+    rs.account_handle_buf = undefined;
     // CHOICE selections: the live selected-option index per choice, seeded from
     // each choice's default. `gsettings_picking` = the open choice's action
     // (255 = no picker open). A tap on a choice opens its picker; an option tap
     // sets the index + closes.
-    var choice_sel: [settings_view.choices.len]u8 = blk: {
+    rs.choice_sel = blk: {
         var s: [settings_view.choices.len]u8 = undefined;
         for (settings_view.choices, 0..) |c, i| s[i] = c.default;
         break :blk s;
     };
-    var gsettings_picking: u8 = 255;
+    rs.gsettings_picking = 255;
     // Zones BROWSE catalog (`screen_zones_browse`): gpa-owned zone cards (the
     // display tag duped + post count), (re)fetched from `listTags` on entering
     // the browse screen. Each card taps to its zone feed; freed on exit.
-    var zone_catalog: std.ArrayList(feed_view.ZoneCard) = .empty;
-    var on_browse_prev = false;
-    defer {
-        for (zone_catalog.items) |zc| gpa.free(zc.tag);
-        zone_catalog.deinit(gpa);
-    }
+    rs.zone_catalog = .empty;
+    rs.on_browse_prev = false;
     // MARKETPLACE catalog (Algorithms → Marketplace tab): gpa-owned MarketRow
     // rows from the AppView's `getAlgorithms`, (re)fetched on entering the tab
     // and refilled by the view-load drain via refillMarket; `market_cards` is
     // the display projection handed to the renderer.
-    var market_catalog: std.ArrayList(MarketRow) = .empty;
-    var market_cards: std.ArrayList(feed_view.MarketAlgoCard) = .empty;
-    var on_market_prev = false;
-    defer {
-        for (market_catalog.items) |r| {
-            gpa.free(r.name);
-            gpa.free(r.author_disp);
-            gpa.free(r.author_did);
-            gpa.free(r.rkey);
-            gpa.free(r.cid);
-        }
-        market_catalog.deinit(gpa);
-        market_cards.deinit(gpa);
-    }
+    rs.market_catalog = .empty;
+    rs.market_cards = .empty;
+    rs.on_market_prev = false;
     // The algorithm being inspected on the transparency page (screen_transparency):
     // its fetched config + name + ref (CID), rebuilt into a page each frame. The
     // screen to return to on Back. Config null ⇒ not inspecting.
@@ -923,85 +1075,201 @@ pub fn run(
     // across frames dangles those slices (a use-after-free that crashes validated()
     // on any non-empty program). The render re-parses these bytes into the current
     // frame's arena, and the source view IS these bytes.
-    var inspect_bytes: ?[]const u8 = null;
-    var inspect_name: []const u8 = "";
-    var inspect_ref: []const u8 = "";
-    var transp_return_screen: u8 = feed_view.screen_loadout;
+    rs.inspect_bytes = null;
+    rs.inspect_name = "";
+    rs.inspect_ref = "";
+    rs.transp_return_screen = feed_view.screen_loadout;
     // On the transparency page: false = the summary, true = the byte-exact source
     // (the "View the exact source" tap-through). Reset when a new algorithm opens.
-    var gtransp_source = false;
+    rs.gtransp_source = false;
     // The config fetch runs on a worker (no UI freeze); true while it's in flight.
-    var inspect_loading = false;
-    var inspectjob: InspectJob = .{};
-    defer stopInspect(&inspectjob); // join any in-flight fetch before exit
+    rs.inspect_loading = false;
+    rs.inspectjob = .{};
     // CID-keyed config cache (A8): an algorithm's config is a content-addressed,
     // immutable record — same CID ⇒ same bytes ⇒ fetch ONCE, never again. Keyed by
     // the record CID (duped), value = the serialized config (owned). A re-view is a
     // local map hit (instant), only a never-seen algorithm pays the network fetch.
     // (A size cap / eviction is a later concern; the marketplace is small for now.)
-    var config_cache: std.StringHashMapUnmanaged([]u8) = .empty;
-    defer {
-        var it = config_cache.iterator();
-        while (it.next()) |kv| {
-            gpa.free(kv.key_ptr.*);
-            gpa.free(kv.value_ptr.*);
-        }
-        config_cache.deinit(gpa);
-    }
-    defer {
-        if (inspect_bytes) |b| gpa.free(b);
-        if (inspect_name.len > 0) gpa.free(inspect_name);
-        if (inspect_ref.len > 0) gpa.free(inspect_ref);
-    }
+    rs.config_cache = .empty;
     // RE-ROOT mode: false when a thread is opened from the timeline (show the WHOLE
     // thread, scroll to the focus); true when a reply is tapped INSIDE the thread
     // (re-root on it: condensed ancestors above + the focus + its subtree).
-    var thread_rerooted = false;
+    rs.thread_rerooted = false;
     // Collapsed reply CIDs (Reddit-style) — per-view state (ZONES inv. 4: never
     // on the post). gpa-owned dupes; cleared on exit. Passed to buildThreadView.
-    var gcollapsed: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (gcollapsed.items) |c| gpa.free(c);
-        gcollapsed.deinit(gpa);
-    }
+    rs.gcollapsed = .empty;
     // Expanded post CIDs (main-feed Read-more) — per-view state, same shape as
     // gcollapsed: gpa-owned dupes, cleared on exit. Passed to fromTimeline so a
     // clamped body lays out in full once the reader taps "Read more".
-    var gexpanded: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (gexpanded.items) |c| gpa.free(c);
-        gexpanded.deinit(gpa);
-    }
+    rs.gexpanded = .empty;
 
     // The pointer's last position in LOGICAL coords (for the hover highlight),
     // updated on every motion event; <0 until the first move.
-    var ghover_x: i32 = -1;
-    var ghover_y: i32 = -1;
+    rs.ghover_x = -1;
+    rs.ghover_y = -1;
 
     // Phase 6.4: the GPU render path, brought up additively when the window is
     // open AND the font engine is live AND `gpu.init` succeeds. On any failure
     // it stays null and the SOFTWARE path renders (E2: a plainer window, never
     // a dead one). Created once here; the window is already open by the time
     // run() is called, so its XID is valid.
-    var gpu_state: ?GpuState = null;
-    defer if (gpu_state) |*gs| deinitGpuState(gpa, gs);
-    if (backend == .window) if (engine) |*e| {
-        gpu_state = initGpuState(gpa, e, backend.window) catch |err| blk: {
+    rs.gpu_state = null;
+    if (backend == .window) if (rs.engine) |*e| {
+        rs.gpu_state = initGpuState(gpa, e, backend.window) catch |err| blk: {
             std.debug.print("[gpu] init failed ({s}) — using the software path.\n", .{@errorName(err)});
             break :blk null;
         };
     };
 
+}
+
+/// The old run() defers, in exact reverse-registration (LIFO) order,
+/// evaluated at call time like the defers were (conditions on fields the
+/// frame body mutates — live_stream, gpu_state, socket_cards … — read
+/// their exit-time values).
+fn deinitRunState(rs: *RunState) void {
+    const gpa = rs.gpa;
+    const backend = rs.backend;
+    if (rs.gpu_state) |*gs| deinitGpuState(gpa, gs);
+    {
+        for (rs.gexpanded.items) |c| gpa.free(c);
+        rs.gexpanded.deinit(gpa);
+    }
+    {
+        for (rs.gcollapsed.items) |c| gpa.free(c);
+        rs.gcollapsed.deinit(gpa);
+    }
+    {
+        if (rs.inspect_bytes) |b| gpa.free(b);
+        if (rs.inspect_name.len > 0) gpa.free(rs.inspect_name);
+        if (rs.inspect_ref.len > 0) gpa.free(rs.inspect_ref);
+    }
+    {
+        var it = rs.config_cache.iterator();
+        while (it.next()) |kv| {
+            gpa.free(kv.key_ptr.*);
+            gpa.free(kv.value_ptr.*);
+        }
+        rs.config_cache.deinit(gpa);
+    }
+    stopInspect(&rs.inspectjob); // join any in-flight fetch before exit
+    {
+        for (rs.market_catalog.items) |r| {
+            gpa.free(r.name);
+            gpa.free(r.author_disp);
+            gpa.free(r.author_did);
+            gpa.free(r.rkey);
+            gpa.free(r.cid);
+        }
+        rs.market_catalog.deinit(gpa);
+        rs.market_cards.deinit(gpa);
+    }
+    {
+        for (rs.zone_catalog.items) |zc| gpa.free(zc.tag);
+        rs.zone_catalog.deinit(gpa);
+    }
+    rs.algo_lib.deinit(gpa);
+    {
+        for (rs.gchat_mail.items) |m| chat_relay.freeMail(gpa, m);
+        rs.gchat_mail.deinit(gpa);
+    }
+    if (rs.gchat_e2ee) |*st| chat_e2ee.deinit(gpa, st);
+    if (rs.gchat_link) |link| chat_relay.shutdown(link);
+    rs.gchat_box.deinit(gpa);
+    rs.gchat_arena_state.deinit();
+    if (rs.gchain_job.thread) |t| {
+        t.join();
+        rs.gchain_job.thread = null;
+        chainJobFree(&rs.gchain_job);
+    }
+    chat_core.deinitStore(gpa, &rs.gchat_store);
+    rs.zone_hits.deinit(gpa);
+    rs.reply_hits.deinit(gpa);
+    rs.gsocket_hits.deinit(gpa);
+    if (rs.zone_blob.len > 0) gpa.free(rs.zone_blob);
+    if (rs.zone_cards.len > 0) gpa.free(rs.zone_cards);
+    if (rs.reply_blob.len > 0) gpa.free(rs.reply_blob);
+    if (rs.reply_cards.len > 0) gpa.free(rs.reply_cards);
+    if (rs.socket_blob.len > 0) gpa.free(rs.socket_blob);
+    if (rs.socket_cards.len > 0) gpa.free(rs.socket_cards);
+    rs.gregions.deinit(gpa);
+    rs.gspawn.deinit(gpa);
+    rs.ghearts.deinit(gpa);
+    rs.ghr.deinit(gpa);
+    rs.gdraw.deinit(gpa);
+    rs.gactive.deinit(gpa);
+    rs.gparticles.deinit(gpa);
+    field_core.deinit(gpa, &rs.gfield);
+    if (rs.engine) |*e| text_core.deinitEngine(gpa, e);
+    rs.deferred_unrepost.deinit(gpa);
+    rs.deferred_unlike.deinit(gpa);
+    rs.viewload_results.deinit(gpa);
+    if (rs.viewloader) |w| view_worker.shutdown(w);
+    rs.viewload_out.deinit(gpa);
+    rs.viewload_in.deinit(gpa);
+    rs.refresh_results.deinit(gpa);
+    if (rs.refresher) |w| refresh_worker.shutdown(w);
+    rs.refresh_out.deinit(gpa);
+    rs.refresh_in.deinit(gpa);
+    rs.write_results.deinit(gpa);
+    if (rs.writer) |w| write_worker.shutdown(w);
+    rs.write_out.deinit(gpa);
+    rs.write_in.deinit(gpa);
+    rs.live_mail.deinit(gpa);
+    if (rs.live_stream) |live| stream_shell.shutdown(live);
+    rs.mailbox.deinit(gpa);
+    rs.profile_arena_state.deinit();
+    {
+        for (rs.revealed.items) |cid| gpa.free(cid);
+        rs.revealed.deinit(gpa);
+    }
+    if (rs.pending_profile_save) |n| gpa.free(n);
+    {
+        for (rs.chain_segments.items) |s| gpa.free(s);
+        rs.chain_segments.deinit(gpa);
+    }
+    if (rs.pending_send) |cs| freeChain(gpa, cs);
+    rs.compose_arena_state.deinit();
+    rs.frame_arena.deinit();
+    tui.deinitSurface(gpa, &rs.next);
+    tui.deinitSurface(gpa, &rs.prev);
+    if (backend == .terminal) {
+        rs.out.writeAll("\x1b[0m\x1b[?25h\x1b[?1049l") catch {};
+        rs.out.flush() catch {};
+    }
+    if (rs.original_termios) |original| {
+        if (comptime has_termios) posix.tcsetattr(rs.stdin_fd, .FLUSH, original) catch {}; // C5: always restored
+    }
+}
+
+pub fn run(
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    session: *auth.Session,
+    appview_url: []const u8,
+    store: *feed_core.Store,
+    backend: Backend,
+) !bool {
+    // MC.1 (M_CORE_INVERSION): all cross-frame state lives in RunState,
+    // built in place (workers capture field addresses) and torn down by
+    // deinitRunState — the setup and defers moved there verbatim. The
+    // frame body below is unchanged except for the rs. prefix; MC.2 will
+    // cut it out as stepFrame(&rs).
+    var rs: RunState = undefined;
+    try initRunState(&rs, gpa, io, environ, session, appview_url, store, backend);
+    defer deinitRunState(&rs);
+
     main_loop: while (true) {
-        _ = frame_arena.reset(.retain_capacity); // C3: one arena per frame
-        const arena = frame_arena.allocator();
+        _ = rs.frame_arena.reset(.retain_capacity); // C3: one arena per frame
+        const arena = rs.frame_arena.allocator();
 
         const size: WindowSize = switch (backend) {
-            .terminal => readWindowSize(stdin_fd),
+            .terminal => readWindowSize(rs.stdin_fd),
             .window => |win| .{ .cols = win.cols, .rows = win.rows },
         };
-        if (size.cols != next.width or size.rows != next.height) {
-            try tui.resizeSurface(gpa, &next, size.cols, size.rows);
+        if (size.cols != rs.next.width or size.rows != rs.next.height) {
+            try tui.resizeSurface(gpa, &rs.next, size.cols, size.rows);
             // prev keeps its old dimensions; encodeDiff sees the mismatch
             // and full-repaints — resize handling for free.
         }
@@ -1015,25 +1283,25 @@ pub fn run(
         // Phase 8: a cache-warmed store gets live coverage and an honest
         // status from frame one — no fetch needed to learn whose posts to
         // want. One attempt; the fetch arms below retry on their own.
-        if (!live_start_attempted and live_stream == null and store.authors.len > 0) {
-            live_start_attempted = true;
-            status = std.fmt.bufPrint(&status_buf, "cached: {d} posts (r refreshes)", .{store.feed.len}) catch "cached";
-            live_stream = try startLiveStream(gpa, io, environ, session.did, store, &mailbox, arena);
-            if (live_stream != null) subscribed_authors = store.authors.len;
+        if (!rs.live_start_attempted and rs.live_stream == null and store.authors.len > 0) {
+            rs.live_start_attempted = true;
+            rs.status = std.fmt.bufPrint(&rs.status_buf, "cached: {d} posts (r refreshes)", .{store.feed.len}) catch "cached";
+            rs.live_stream = try startLiveStream(gpa, io, environ, session.did, store, &rs.mailbox, arena);
+            if (rs.live_stream != null) rs.subscribed_authors = store.authors.len;
         }
 
         // Drain the stream's mailbox on the UI thread: plain values in,
         // ingested here, so the store stays single-threaded. Post strings
         // are freed the moment they are ingested — and the unprocessed
         // tail is freed before any error bubbles (C5).
-        live_mail.clearRetainingCapacity();
-        try mailbox.drain(gpa, &live_mail);
+        rs.live_mail.clearRetainingCapacity();
+        try rs.mailbox.drain(gpa, &rs.live_mail);
         var mail_i: usize = 0;
-        while (mail_i < live_mail.items.len) : (mail_i += 1) {
-            switch (live_mail.items[mail_i]) {
-                .status => |msg| status = msg,
-                .failure => |err| status = std.fmt.bufPrint(
-                    &status_buf,
+        while (mail_i < rs.live_mail.items.len) : (mail_i += 1) {
+            switch (rs.live_mail.items[mail_i]) {
+                .status => |msg| rs.status = msg,
+                .failure => |err| rs.status = std.fmt.bufPrint(
+                    &rs.status_buf,
                     "stream: {s}; retrying",
                     .{@errorName(err)},
                 ) catch "stream: retrying",
@@ -1042,8 +1310,8 @@ pub fn run(
                     stream_shell.freePost(gpa, post);
                     const outcome = ingested catch |err| {
                         var rest = mail_i + 1;
-                        while (rest < live_mail.items.len) : (rest += 1) {
-                            switch (live_mail.items[rest]) {
+                        while (rest < rs.live_mail.items.len) : (rest += 1) {
+                            switch (rs.live_mail.items[rest]) {
                                 .post => |tail| stream_shell.freePost(gpa, tail),
                                 .status, .failure => {},
                             }
@@ -1061,10 +1329,10 @@ pub fn run(
                         // nothing appears" bug. For a firehose the right default
                         // is to surface the new post; hold-position can return
                         // later as a configurable behavior.)
-                        state.selected = 0;
-                        state.scroll_top = 0;
-                        gview.scroll_rows = 0;
-                        status = "live: new post";
+                        rs.state.selected = 0;
+                        rs.state.scroll_top = 0;
+                        rs.gview.scroll_rows = 0;
+                        rs.status = "live: new post";
                     }
                 },
             }
@@ -1077,47 +1345,47 @@ pub fn run(
         // Damaged/foreign buckets are skipped values, never a dead screen
         // (E2/E4). The surface repaints via the chat signature exactly as a
         // local append does.
-        if (gchat_link != null) if (gchat_e2ee) |*st| {
-            gchat_mail.clearRetainingCapacity();
-            try gchat_box.drain(gpa, &gchat_mail);
+        if (rs.gchat_link != null) if (rs.gchat_e2ee) |*st| {
+            rs.gchat_mail.clearRetainingCapacity();
+            try rs.gchat_box.drain(gpa, &rs.gchat_mail);
             var chat_mutated = false;
-            for (gchat_mail.items) |m| {
+            for (rs.gchat_mail.items) |m| {
                 switch (m) {
                     .blob => |b| {
-                        _ = gchat_arena_state.reset(.retain_capacity);
-                        const inc = chat_e2ee.onBucket(gpa, gchat_arena_state.allocator(), io, environ, st, b) catch null;
+                        _ = rs.gchat_arena_state.reset(.retain_capacity);
+                        const inc = chat_e2ee.onBucket(gpa, rs.gchat_arena_state.allocator(), io, environ, st, b) catch null;
                         if (inc) |ev| {
                             defer chat_e2ee.freeIncoming(gpa, ev);
                             switch (ev) {
                                 .message => |msg| {
-                                    if (chat_core.openConversation(gpa, &gchat_store, msg.peer_did, "") catch null) |c| {
-                                        _ = chat_core.appendMessage(gpa, &gchat_store, c, msg.kind, msg.text, now, false) catch {};
+                                    if (chat_core.openConversation(gpa, &rs.gchat_store, msg.peer_did, "") catch null) |c| {
+                                        _ = chat_core.appendMessage(gpa, &rs.gchat_store, c, msg.kind, msg.text, now, false) catch {};
                                         chat_mutated = true;
                                     }
                                     // The message supersedes its typing bubble.
-                                    if (std.mem.eql(u8, msg.peer_did, gchat_typing_peer_buf[0..gchat_typing_peer_len]))
-                                        gchat_typing_deadline = 0;
+                                    if (std.mem.eql(u8, msg.peer_did, rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]))
+                                        rs.gchat_typing_deadline = 0;
                                 },
                                 .started => |s| {
-                                    _ = chat_core.openConversation(gpa, &gchat_store, s.peer_did, "") catch null;
+                                    _ = chat_core.openConversation(gpa, &rs.gchat_store, s.peer_did, "") catch null;
                                     chat_mutated = true;
-                                    status = "chat: new conversation";
+                                    rs.status = "chat: new conversation";
                                 },
                                 // Ephemeral: arm the indicator's deadline;
                                 // nothing enters the store (M2 never sees it).
-                                .typing => |t| if (t.peer_did.len <= gchat_typing_peer_buf.len) {
-                                    @memcpy(gchat_typing_peer_buf[0..t.peer_did.len], t.peer_did);
-                                    gchat_typing_peer_len = t.peer_did.len;
-                                    gchat_typing_deadline = now + 6;
+                                .typing => |t| if (t.peer_did.len <= rs.gchat_typing_peer_buf.len) {
+                                    @memcpy(rs.gchat_typing_peer_buf[0..t.peer_did.len], t.peer_did);
+                                    rs.gchat_typing_peer_len = t.peer_did.len;
+                                    rs.gchat_typing_deadline = now + 6;
                                 },
                                 // A payment card (M5 A1): a known id advances
                                 // the existing card (one card per payment,
                                 // morphing in place); a fresh one lands as a
                                 // new card + row.
                                 .payment => |p| {
-                                    if (chat_core.openConversation(gpa, &gchat_store, p.peer_did, "") catch null) |c| blk: {
+                                    if (chat_core.openConversation(gpa, &rs.gchat_store, p.peer_did, "") catch null) |c| blk: {
                                         const ref: ?[32]u8 = if (std.mem.allEqual(u8, &p.ref, 0)) null else p.ref;
-                                        if (chat_core.findPayment(&gchat_store, c, p.id)) |pay| {
+                                        if (chat_core.findPayment(&rs.gchat_store, c, p.id)) |pay| {
                                             // An offer we already hold is a
                                             // duplicate — no-op (E4). Otherwise
                                             // only a `sent` card moves forward.
@@ -1125,43 +1393,43 @@ pub fn run(
                                             // network evidence (broadcast/
                                             // confirming) is A5's.
                                             if (!p.is_offer and p.kind == .payment_sent) {
-                                                if (chat_core.advancePayment(gpa, &gchat_store, pay, .pending, ref) catch false)
+                                                if (chat_core.advancePayment(gpa, &rs.gchat_store, pay, .pending, ref) catch false)
                                                     chat_mutated = true;
                                             }
                                         } else {
-                                            const pay = chat_core.appendPayment(gpa, &gchat_store, c, p.kind, p.id, p.rail, p.amount_sat, p.note, now, false) catch break :blk;
+                                            const pay = chat_core.appendPayment(gpa, &rs.gchat_store, c, p.kind, p.id, p.rail, p.amount_sat, p.note, now, false) catch break :blk;
                                             // S2: an offer to a walletless me lands
                                             // BELOW the kind default — "{P} wants to
                                             // send you {amt}", no money in motion.
                                             if (p.is_offer)
-                                                chat_core.initPaymentStatus(&gchat_store, pay, .pending_setup)
+                                                chat_core.initPaymentStatus(&rs.gchat_store, pay, .pending_setup)
                                             else if (ref) |r|
-                                                chat_core.setSettlementRef(gpa, &gchat_store, pay, r) catch {};
+                                                chat_core.setSettlementRef(gpa, &rs.gchat_store, pay, r) catch {};
                                             chat_mutated = true;
                                         }
                                     }
                                     // A card supersedes its typing bubble too.
-                                    if (std.mem.eql(u8, p.peer_did, gchat_typing_peer_buf[0..gchat_typing_peer_len]))
-                                        gchat_typing_deadline = 0;
+                                    if (std.mem.eql(u8, p.peer_did, rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]))
+                                        rs.gchat_typing_deadline = 0;
                                 },
                                 // A card-flip event (settlement, or S2 ready/
                                 // cancel/decline): advances an existing card to
                                 // the carried status; an unknown id is a
                                 // straggler, dropped (E4).
                                 .payment_update => |u| {
-                                    if (chat_core.openConversation(gpa, &gchat_store, u.peer_did, "") catch null) |c| {
-                                        if (chat_core.findPayment(&gchat_store, c, u.id)) |pay| {
+                                    if (chat_core.openConversation(gpa, &rs.gchat_store, u.peer_did, "") catch null) |c| {
+                                        if (chat_core.findPayment(&rs.gchat_store, c, u.id)) |pay| {
                                             // Trust gate (§0 golden rule): a peer's
                                             // WITHDRAWAL (cancel/decline) may not
                                             // retire a card the chain has already
                                             // witnessed — that would hide a real
                                             // transfer. Settlement/forward events
                                             // are unaffected. Dropped straggler = E4.
-                                            const cur = chat_core.paymentRow(&gchat_store, pay).status;
+                                            const cur = chat_core.paymentRow(&rs.gchat_store, pay).status;
                                             const withdrawal = u.status == .cancelled or u.status == .declined;
                                             if (!(withdrawal and chat_core.hasNetworkEvidence(cur))) {
                                                 const ref: ?[32]u8 = if (std.mem.allEqual(u8, &u.ref, 0)) null else u.ref;
-                                                if (chat_core.advancePayment(gpa, &gchat_store, pay, u.status, ref) catch false)
+                                                if (chat_core.advancePayment(gpa, &rs.gchat_store, pay, u.status, ref) catch false)
                                                     chat_mutated = true;
                                             }
                                         }
@@ -1170,18 +1438,18 @@ pub fn run(
                             }
                         }
                     },
-                    .refused => status = "chat: relay refused the send",
+                    .refused => rs.status = "chat: relay refused the send",
                     .status => {},
                     .failure => {},
                 }
                 chat_relay.freeMail(gpa, m);
             }
-            gchat_mail.clearRetainingCapacity();
+            rs.gchat_mail.clearRetainingCapacity();
             // M2: one history write per drain that changed the store. This
             // matters more than the send-side write — forward secrecy means a
             // decrypted message can NEVER be recovered from the wire again, so
             // it reaches disk before this frame ends.
-            if (chat_mutated) chatPersistHistory(gpa, io, environ, st, &gchat_store);
+            if (chat_mutated) chatPersistHistory(gpa, io, environ, st, &rs.gchat_store);
         };
 
         // Prefetch OUR own receive-setup once, in the background, the first
@@ -1189,58 +1457,58 @@ pub fn run(
         // sheet with no stall (loadOwnReceive is a PDS fetch; on the click it
         // blocked the render thread). If the user taps before this lands,
         // `.pay_open` still falls back to the sync fetch.
-        if (dev_chat and gscreen == feed_view.screen_messages and !grecv_known) {
-            if (greceive_job.thread == null) {
+        if (dev_chat and rs.gscreen == feed_view.screen_messages and !rs.grecv_known) {
+            if (rs.greceive_job.thread == null) {
                 const a = std.heap.page_allocator;
                 if (a.dupe(u8, session.did)) |did_copy| {
-                    greceive_job.did = did_copy;
-                    greceive_job.done.store(false, .monotonic);
-                    greceive_job.found = false;
-                    greceive_job.ln_len = 0;
-                    greceive_job.btc_len = 0;
-                    greceive_job.thread = std.Thread.spawn(.{}, receiveWorker, .{ &greceive_job, io, environ }) catch th: {
+                    rs.greceive_job.did = did_copy;
+                    rs.greceive_job.done.store(false, .monotonic);
+                    rs.greceive_job.found = false;
+                    rs.greceive_job.ln_len = 0;
+                    rs.greceive_job.btc_len = 0;
+                    rs.greceive_job.thread = std.Thread.spawn(.{}, receiveWorker, .{ &rs.greceive_job, io, environ }) catch th: {
                         a.free(did_copy);
                         break :th null;
                     };
                     // Spawn failed → don't retry every frame; the sync fallback covers it.
-                    if (greceive_job.thread == null) grecv_known = true;
-                } else |_| grecv_known = true;
-            } else if (greceive_job.done.load(.acquire)) {
-                greceive_job.thread.?.join();
-                greceive_job.thread = null;
+                    if (rs.greceive_job.thread == null) rs.grecv_known = true;
+                } else |_| rs.grecv_known = true;
+            } else if (rs.greceive_job.done.load(.acquire)) {
+                rs.greceive_job.thread.?.join();
+                rs.greceive_job.thread = null;
                 // Only adopt the result if the sync path hasn't already answered
                 // (it sets grecv_known), so a race can't clobber a fresh save.
-                if (!grecv_known) {
-                    if (greceive_job.found) {
-                        @memcpy(grecv_ln_buf[0..greceive_job.ln_len], greceive_job.ln[0..greceive_job.ln_len]);
-                        grecv_ln_len = greceive_job.ln_len;
-                        @memcpy(grecv_btc_buf[0..greceive_job.btc_len], greceive_job.btc[0..greceive_job.btc_len]);
-                        grecv_btc_len = greceive_job.btc_len;
-                        grecv_set = greceive_job.ln_len > 0 or greceive_job.btc_len > 0;
+                if (!rs.grecv_known) {
+                    if (rs.greceive_job.found) {
+                        @memcpy(rs.grecv_ln_buf[0..rs.greceive_job.ln_len], rs.greceive_job.ln[0..rs.greceive_job.ln_len]);
+                        rs.grecv_ln_len = rs.greceive_job.ln_len;
+                        @memcpy(rs.grecv_btc_buf[0..rs.greceive_job.btc_len], rs.greceive_job.btc[0..rs.greceive_job.btc_len]);
+                        rs.grecv_btc_len = rs.greceive_job.btc_len;
+                        rs.grecv_set = rs.greceive_job.ln_len > 0 or rs.greceive_job.btc_len > 0;
                     } else {
-                        grecv_set = false;
+                        rs.grecv_set = false;
                     }
-                    grecv_known = true;
+                    rs.grecv_known = true;
                 }
-                std.heap.page_allocator.free(greceive_job.did);
-                greceive_job.did = &.{};
+                std.heap.page_allocator.free(rs.greceive_job.did);
+                rs.greceive_job.did = &.{};
             }
         }
 
         // Refresh the BTC/USD price off-thread for the ≈$ readout: once on
         // arrival, then every ~5 minutes. A dead source just leaves the last
         // known price (or none — the readout stays hidden).
-        if (dev_chat and gscreen == feed_view.screen_messages) {
-            if (gprice_job.thread == null and (gprice_cents == 0 or now - gprice_last >= 300)) {
-                gprice_last = now;
-                gprice_job.done.store(false, .monotonic);
-                gprice_job.ok = false;
-                gprice_job.thread = std.Thread.spawn(.{}, priceWorker, .{ &gprice_job, io, environ }) catch null;
-            } else if (gprice_job.thread) |t| {
-                if (gprice_job.done.load(.acquire)) {
+        if (dev_chat and rs.gscreen == feed_view.screen_messages) {
+            if (rs.gprice_job.thread == null and (rs.gprice_cents == 0 or now - rs.gprice_last >= 300)) {
+                rs.gprice_last = now;
+                rs.gprice_job.done.store(false, .monotonic);
+                rs.gprice_job.ok = false;
+                rs.gprice_job.thread = std.Thread.spawn(.{}, priceWorker, .{ &rs.gprice_job, io, environ }) catch null;
+            } else if (rs.gprice_job.thread) |t| {
+                if (rs.gprice_job.done.load(.acquire)) {
                     t.join();
-                    gprice_job.thread = null;
-                    if (gprice_job.ok) gprice_cents = gprice_job.usd_cents;
+                    rs.gprice_job.thread = null;
+                    if (rs.gprice_job.ok) rs.gprice_cents = rs.gprice_job.usd_cents;
                 }
             }
         }
@@ -1250,28 +1518,28 @@ pub fn run(
         // reach the same terminal from the same `created_at`, no wire. Cheap
         // (linear over a handful of payments); riding the 60s chain cadence
         // keeps it off the per-frame path. Persist only on an actual change.
-        if (dev_chat) if (gchat_e2ee) |*st| {
-            if (now - gexpire_last >= chain_poll_seconds) {
-                gexpire_last = now;
-                if (chat_core.sweepExpired(&gchat_store, now, chat_core.payment_offer_ttl_s))
-                    chatPersistHistory(gpa, io, environ, st, &gchat_store);
+        if (dev_chat) if (rs.gchat_e2ee) |*st| {
+            if (now - rs.gexpire_last >= chain_poll_seconds) {
+                rs.gexpire_last = now;
+                if (chat_core.sweepExpired(&rs.gchat_store, now, chat_core.payment_offer_ttl_s))
+                    chatPersistHistory(gpa, io, environ, st, &rs.gchat_store);
             }
         };
 
         // The confirmation-watcher (M5 A5): spawn a poll cycle when one is
         // due and none is in flight; drain a finished one. Needs no relay —
         // only the E2EE state (for the pinned anchors) and the store.
-        if (dev_chat) if (gchat_e2ee) |*st| {
-            if (gchain_job.thread == null and now - gchain_last >= chain_poll_seconds) {
-                gchain_last = now;
-                _ = gchat_arena_state.reset(.retain_capacity);
-                const entries = chat_core.watchList(gchat_arena_state.allocator(), &gchat_store) catch &.{};
+        if (dev_chat) if (rs.gchat_e2ee) |*st| {
+            if (rs.gchain_job.thread == null and now - rs.gchain_last >= chain_poll_seconds) {
+                rs.gchain_last = now;
+                _ = rs.gchat_arena_state.reset(.retain_capacity);
+                const entries = chat_core.watchList(rs.gchat_arena_state.allocator(), &rs.gchat_store) catch &.{};
                 if (entries.len > 0) spawn: {
                     const a = std.heap.page_allocator;
                     const my_pub = anchor_core.publicKey(st.anchor_seed) catch break :spawn;
                     var items: std.ArrayList(ChainItem) = .empty;
                     for (entries) |en| {
-                        const conv_did = chat_core.conversationDid(&gchat_store, en.conv);
+                        const conv_did = chat_core.conversationDid(&rs.gchat_store, en.conv);
                         const anchor_pub = if (en.mine_address)
                             my_pub
                         else
@@ -1305,33 +1573,33 @@ pub fn run(
                         items.deinit(a);
                         break :spawn;
                     };
-                    gchain_job = .{ .items = owned };
-                    gchain_job.thread = std.Thread.spawn(.{}, chainWorker, .{ &gchain_job, io, environ }) catch {
-                        chainJobFree(&gchain_job);
+                    rs.gchain_job = .{ .items = owned };
+                    rs.gchain_job.thread = std.Thread.spawn(.{}, chainWorker, .{ &rs.gchain_job, io, environ }) catch {
+                        chainJobFree(&rs.gchain_job);
                         break :spawn;
                     };
                 }
             }
-            if (gchain_job.thread) |t| {
-                if (gchain_job.done.load(.acquire)) {
+            if (rs.gchain_job.thread) |t| {
+                if (rs.gchain_job.done.load(.acquire)) {
                     t.join();
-                    gchain_job.thread = null;
+                    rs.gchain_job.thread = null;
                     var chain_mutated = false;
-                    for (gchain_job.results) |res| {
+                    for (rs.gchain_job.results) |res| {
                         const depth = res.depth orelse continue;
-                        const c = chat_core.openConversation(gpa, &gchat_store, res.conv_did, "") catch continue;
-                        const pay = chat_core.findPayment(&gchat_store, c, res.payment_id) orelse continue;
+                        const c = chat_core.openConversation(gpa, &rs.gchat_store, res.conv_did, "") catch continue;
+                        const pay = chat_core.findPayment(&rs.gchat_store, c, res.payment_id) orelse continue;
                         if (depth == 0) {
                             // Seen in the mempool: network evidence at last —
                             // the card may say `broadcast` now.
-                            if (chat_core.advancePayment(gpa, &gchat_store, pay, .broadcast, null) catch false)
+                            if (chat_core.advancePayment(gpa, &rs.gchat_store, pay, .broadcast, null) catch false)
                                 chain_mutated = true;
-                        } else if (chat_core.setConfirmations(&gchat_store, pay, depth)) {
+                        } else if (chat_core.setConfirmations(&rs.gchat_store, pay, depth)) {
                             chain_mutated = true;
                         }
                     }
-                    if (chain_mutated) chatPersistHistory(gpa, io, environ, st, &gchat_store);
-                    chainJobFree(&gchain_job);
+                    if (chain_mutated) chatPersistHistory(gpa, io, environ, st, &rs.gchat_store);
+                    chainJobFree(&rs.gchain_job);
                 }
             }
         };
@@ -1342,23 +1610,23 @@ pub fn run(
         // optimism so the count returns to truth. This runs every loop
         // iteration, off the network thread, so the UI never blocked on the
         // write — the whole point of the worker.
-        write_results.clearRetainingCapacity();
-        try write_out.drain(gpa, &write_results);
-        for (write_results.items) |res| {
+        rs.write_results.clearRetainingCapacity();
+        try rs.write_out.drain(gpa, &rs.write_results);
+        for (rs.write_results.items) |res| {
             // Deferred-undo: if the user un-engaged this post WHILE its create
             // was in flight, the create's result is the first moment we can
             // delete the record. Fire the delete now (the optimistic hollow is
             // already shown); on a failed create there's nothing to delete.
             const deferred: ?*std.AutoHashMapUnmanaged(u64, void) = switch (res.kind) {
-                .like => &deferred_unlike,
-                .repost => &deferred_unrepost,
+                .like => &rs.deferred_unlike,
+                .repost => &rs.deferred_unrepost,
                 .unlike, .unrepost => null,
                 .loadout => null, // loadout writes post no result; defensive only
             };
             if (deferred) |set| {
                 if (set.remove(std.hash.Wyhash.hash(0, res.cid))) {
                     if (res.outcome == .ok and res.outcome.ok.len > 0) {
-                        if (writer) |w| _ = write_worker.submit(w, if (res.kind == .like) .unlike else .unrepost, res.cid, "", "", res.outcome.ok, now);
+                        if (rs.writer) |w| _ = write_worker.submit(w, if (res.kind == .like) .unlike else .unrepost, res.cid, "", "", res.outcome.ok, now);
                     }
                     write_worker.freeResult(gpa, res);
                     continue;
@@ -1377,11 +1645,11 @@ pub fn run(
                 },
                 .refused => |f| {
                     revertWrite(res.kind, gpa, store, res.cid, res.revert_uri) catch {};
-                    status = std.fmt.bufPrint(&status_buf, "refused: {d} {s}", .{ f.status, f.code }) catch "refused";
+                    rs.status = std.fmt.bufPrint(&rs.status_buf, "refused: {d} {s}", .{ f.status, f.code }) catch "refused";
                 },
                 .net_error => |name| {
                     revertWrite(res.kind, gpa, store, res.cid, res.revert_uri) catch {};
-                    status = std.fmt.bufPrint(&status_buf, "network error: {s}", .{name}) catch "network error";
+                    rs.status = std.fmt.bufPrint(&rs.status_buf, "network error: {s}", .{name}) catch "network error";
                 },
             }
             write_worker.freeResult(gpa, res);
@@ -1396,13 +1664,13 @@ pub fn run(
         // fetch, so the first tick is the first load. Failure is contained to
         // the status line (E2). Never fires mid-compose, so it cannot disturb
         // a draft.
-        if (refresh_interval > 0 and mode == .timeline and refresh_inflight == 0 and
-            now - last_auto_refresh >= refresh_interval and
-            clock_shell.monotonicNanos() -| last_input_nanos >= input_idle_gate_nanos)
+        if (rs.refresh_interval > 0 and rs.mode == .timeline and rs.refresh_inflight == 0 and
+            now - rs.last_auto_refresh >= rs.refresh_interval and
+            clock_shell.monotonicNanos() -| rs.last_input_nanos >= input_idle_gate_nanos)
         {
-            last_auto_refresh = now;
-            if (refresher) |w| {
-                if (refresh_worker.submit(w, .auto, 30)) refresh_inflight += 1;
+            rs.last_auto_refresh = now;
+            if (rs.refresher) |w| {
+                if (refresh_worker.submit(w, .auto, 30)) rs.refresh_inflight += 1;
             }
             // No worker (spawn failed at startup): auto-refresh is simply off;
             // the `r` key's synchronous path still loads the feed (E2).
@@ -1411,12 +1679,12 @@ pub fn run(
         // Pull-to-refresh: the overscroll gesture asked for a refresh — same
         // worker, marked .pull so the drain below reveals + jumps (an EXPLICIT
         // pull asks to SEE the new, unlike the passive auto tick).
-        if (pull_refresh_requested) {
-            pull_refresh_requested = false;
-            if (refresher) |w| {
-                status = "refreshing...";
-                if (refresh_worker.submit(w, .pull, 30)) refresh_inflight += 1;
-            } else status = "refresh unavailable (r refreshes)";
+        if (rs.pull_refresh_requested) {
+            rs.pull_refresh_requested = false;
+            if (rs.refresher) |w| {
+                rs.status = "refreshing...";
+                if (refresh_worker.submit(w, .pull, 30)) rs.refresh_inflight += 1;
+            } else rs.status = "refresh unavailable (r refreshes)";
         }
 
         // Drain fetched pages. The ingest is the CPU half (pure functions over
@@ -1425,10 +1693,10 @@ pub fn run(
         // STAGES new posts behind the "N new posts" pill (revealing only on
         // first load or at the very top of Home, so the reader's place is
         // never yanked — the Twitter/Bluesky pattern); a pull reveals + jumps.
-        refresh_results.clearRetainingCapacity();
-        try refresh_out.drain(gpa, &refresh_results);
-        for (refresh_results.items) |res| {
-            refresh_inflight -|= 1;
+        rs.refresh_results.clearRetainingCapacity();
+        try rs.refresh_out.drain(gpa, &rs.refresh_results);
+        for (rs.refresh_results.items) |res| {
+            rs.refresh_inflight -|= 1;
             switch (res.outcome) {
                 .ok => |page| if (res.trigger == .older) {
                     // Load-more: APPEND (ingestPage walks the cursor down);
@@ -1437,16 +1705,16 @@ pub fn run(
                         refresh_worker.freeResult(gpa, res);
                         return err; // OOM only
                     };
-                    status = std.fmt.bufPrint(&status_buf, "+{d} older ({d} seen)", .{
+                    rs.status = std.fmt.bufPrint(&rs.status_buf, "+{d} older ({d} seen)", .{
                         stats.items_added, stats.posts_deduped,
                     }) catch "loaded";
                     _ = cache_shell.saveStore(gpa, environ, store); // E4
-                    if (live_stream == null and store.authors.len > 0) {
-                        live_stream = startLiveStream(gpa, io, environ, session.did, store, &mailbox, arena) catch |err| {
+                    if (rs.live_stream == null and store.authors.len > 0) {
+                        rs.live_stream = startLiveStream(gpa, io, environ, session.did, store, &rs.mailbox, arena) catch |err| {
                             refresh_worker.freeResult(gpa, res);
                             return err; // OOM only — same posture as the ingest arm
                         };
-                        if (live_stream == null) status = "live stream unavailable" else subscribed_authors = store.authors.len;
+                        if (rs.live_stream == null) rs.status = "live stream unavailable" else rs.subscribed_authors = store.authors.len;
                     }
                 } else {
                     const was_empty = store.feed.len == 0;
@@ -1456,13 +1724,13 @@ pub fn run(
                     };
                     switch (res.trigger) {
                         .auto => if (feed_core.pendingCount(store) > 0) {
-                            const at_top_home = gscreen == feed_view.screen_home and gscroll_px == 0;
+                            const at_top_home = rs.gscreen == feed_view.screen_home and rs.gscroll_px == 0;
                             if (was_empty or at_top_home) {
                                 _ = feed_core.revealPending(gpa, store) catch 0;
-                                state.selected = 0;
-                                state.scroll_top = 0;
-                                gview.scroll_rows = 0;
-                                gscroll_px = 0;
+                                rs.state.selected = 0;
+                                rs.state.scroll_top = 0;
+                                rs.gview.scroll_rows = 0;
+                                rs.gscroll_px = 0;
                             }
                             // else: the pill (feed_core.pendingCount) carries the count.
                         },
@@ -1470,24 +1738,24 @@ pub fn run(
                         .pull => {
                             const revealed_n = feed_core.revealPending(gpa, store) catch 0;
                             if (revealed_n > 0) {
-                                state.selected = 0;
-                                state.scroll_top = 0;
-                                gview.scroll_rows = 0;
-                                gscroll_px = 0;
+                                rs.state.selected = 0;
+                                rs.state.scroll_top = 0;
+                                rs.gview.scroll_rows = 0;
+                                rs.gscroll_px = 0;
                             }
-                            status = if (stats.items_added == 0 and revealed_n == 0)
+                            rs.status = if (stats.items_added == 0 and revealed_n == 0)
                                 "no new posts"
                             else
-                                std.fmt.bufPrint(&status_buf, "+{d} new at top", .{revealed_n}) catch "new posts";
+                                std.fmt.bufPrint(&rs.status_buf, "+{d} new at top", .{revealed_n}) catch "new posts";
                             // Parity with the old inline `r`: an explicit
                             // refresh that finds a populated store may also
                             // bring the live stream up.
-                            if (live_stream == null and store.authors.len > 0) {
-                                live_stream = startLiveStream(gpa, io, environ, session.did, store, &mailbox, arena) catch |err| {
+                            if (rs.live_stream == null and store.authors.len > 0) {
+                                rs.live_stream = startLiveStream(gpa, io, environ, session.did, store, &rs.mailbox, arena) catch |err| {
                                     refresh_worker.freeResult(gpa, res);
                                     return err; // OOM only — same posture as the ingest arm above
                                 };
-                                if (live_stream == null) status = "live stream unavailable" else subscribed_authors = store.authors.len;
+                                if (rs.live_stream == null) rs.status = "live stream unavailable" else rs.subscribed_authors = store.authors.len;
                             }
                         },
                     }
@@ -1497,11 +1765,11 @@ pub fn run(
                     .auto => {}, // a refused poll is silent; the next tick retries
                     // bufPrint COPIES f.code into status_buf before freeResult
                     // destroys the arena that owns it.
-                    .pull, .older => status = std.fmt.bufPrint(&status_buf, "refused: {d} {s}", .{ f.status, f.code }) catch "refused",
+                    .pull, .older => rs.status = std.fmt.bufPrint(&rs.status_buf, "refused: {d} {s}", .{ f.status, f.code }) catch "refused",
                 },
                 .net_error => switch (res.trigger) {
-                    .auto => status = "auto-refresh: network error", // contained
-                    .pull, .older => status = "network error", // contained (E2)
+                    .auto => rs.status = "auto-refresh: network error", // contained
+                    .pull, .older => rs.status = "network error", // contained (E2)
                 },
             }
             refresh_worker.freeResult(gpa, res);
@@ -1513,16 +1781,16 @@ pub fn run(
         // already left ingests harmlessly: content lands in the SHARED store
         // and every screen is a query over it (ZONES inv. 4), so there is no
         // stale-view hazard to guard.
-        viewload_results.clearRetainingCapacity();
-        try viewload_out.drain(gpa, &viewload_results);
-        for (viewload_results.items) |res| {
+        rs.viewload_results.clearRetainingCapacity();
+        try rs.viewload_out.drain(gpa, &rs.viewload_results);
+        for (rs.viewload_results.items) |res| {
             switch (res.outcome) {
                 .page => |page| {
                     _ = feed_core.ingestPosts(gpa, store, page) catch |err| {
                         view_worker.freeResult(gpa, res);
                         return err; // OOM only
                     };
-                    status = ""; // the submit's "loading..." line is done
+                    rs.status = ""; // the submit's "loading..." line is done
                 },
                 .zones => |tags| {
                     // Merge the AppView's catalog over the locally-derived set
@@ -1532,7 +1800,7 @@ pub fn run(
                     // one row, not the screen (E2).
                     for (tags) |t| {
                         var found = false;
-                        for (zone_catalog.items) |*zc| {
+                        for (rs.zone_catalog.items) |*zc| {
                             if (std.ascii.eqlIgnoreCase(zc.tag, t.tag)) {
                                 zc.count = t.count;
                                 found = true;
@@ -1541,24 +1809,24 @@ pub fn run(
                         }
                         if (!found) {
                             const dup = gpa.dupe(u8, t.tag) catch continue;
-                            zone_catalog.append(gpa, .{ .tag = dup, .count = t.count }) catch gpa.free(dup);
+                            rs.zone_catalog.append(gpa, .{ .tag = dup, .count = t.count }) catch gpa.free(dup);
                         }
                     }
-                    status = "";
+                    rs.status = "";
                 },
                 .algorithms => |algos| {
-                    refillMarket(gpa, algos, &market_catalog, &market_cards) catch |err| {
+                    refillMarket(gpa, algos, &rs.market_catalog, &rs.market_cards) catch |err| {
                         view_worker.freeResult(gpa, res);
                         return err; // OOM only
                     };
-                    status = "";
+                    rs.status = "";
                 },
                 // bufPrint COPIES f.code into status_buf before freeResult
                 // destroys the arena that owns it.
-                .refused => |f| status = std.fmt.bufPrint(&status_buf, "{s}: refused {d} {s}", .{
+                .refused => |f| rs.status = std.fmt.bufPrint(&rs.status_buf, "{s}: refused {d} {s}", .{
                     viewNoun(res.kind), f.status, f.code,
                 }) catch "refused",
-                .net_error => status = std.fmt.bufPrint(&status_buf, "{s}: network error", .{
+                .net_error => rs.status = std.fmt.bufPrint(&rs.status_buf, "{s}: network error", .{
                     viewNoun(res.kind),
                 }) catch "network error", // contained (E2)
             }
@@ -1571,22 +1839,22 @@ pub fn run(
         // drain above ingests the page as CONTENT into the SHARED store when
         // it lands; failure stays a status line (E2). Gated to the timeline
         // mode + window path.
-        const on_profile = mode == .timeline and gscreen == feed_view.screen_profile;
-        if (on_profile and (!on_profile_prev or profile_dirty)) {
-            if (viewloader) |w| {
+        const on_profile = rs.mode == .timeline and rs.gscreen == feed_view.screen_profile;
+        if (on_profile and (!rs.on_profile_prev or rs.profile_dirty)) {
+            if (rs.viewloader) |w| {
                 // The target lives in a mutable UI buffer the next tap
                 // rewrites — the worker owns a gpa copy.
-                const actor = try gpa.dupe(u8, profile_target_did);
+                const actor = try gpa.dupe(u8, rs.profile_target_did);
                 if (view_worker.submit(w, .profile, actor, 30)) {
-                    status = "loading profile...";
+                    rs.status = "loading profile...";
                 } else {
                     gpa.free(actor);
-                    status = "profile load skipped"; // mailbox OOM; re-entering retries
+                    rs.status = "profile load skipped"; // mailbox OOM; re-entering retries
                 }
-            } else status = "profile: unavailable"; // worker never started (E2: a status, not a dead screen)
-            profile_dirty = false;
+            } else rs.status = "profile: unavailable"; // worker never started (E2: a status, not a dead screen)
+            rs.profile_dirty = false;
         }
-        on_profile_prev = on_profile;
+        rs.on_profile_prev = on_profile;
 
         // Thread screen: on ENTERING (a post-body tap flips gscreen) or a target
         // change, SUBMIT the focused post's thread to the view worker (M-Core.1
@@ -1595,20 +1863,20 @@ pub fn run(
         // the tapped post is already resident, so the screen shows it at once
         // and the ancestors/replies fill in when the page lands. Same E2
         // containment as the profile submit.
-        const on_thread = mode == .timeline and gscreen == feed_view.screen_thread;
-        if (on_thread and (!on_thread_prev or thread_dirty)) {
-            if (viewloader) |w| {
-                const uri = try gpa.dupe(u8, thread_focus_uri);
+        const on_thread = rs.mode == .timeline and rs.gscreen == feed_view.screen_thread;
+        if (on_thread and (!rs.on_thread_prev or rs.thread_dirty)) {
+            if (rs.viewloader) |w| {
+                const uri = try gpa.dupe(u8, rs.thread_focus_uri);
                 if (view_worker.submit(w, .thread, uri, 50)) {
-                    status = "loading thread...";
+                    rs.status = "loading thread...";
                 } else {
                     gpa.free(uri);
-                    status = "thread load skipped"; // mailbox OOM; re-entering retries
+                    rs.status = "thread load skipped"; // mailbox OOM; re-entering retries
                 }
-            } else status = "thread: unavailable"; // worker never started (E2)
-            thread_dirty = false;
+            } else rs.status = "thread: unavailable"; // worker never started (E2)
+            rs.thread_dirty = false;
         }
-        on_thread_prev = on_thread;
+        rs.on_thread_prev = on_thread;
 
         // Zone page: on ENTERING (a tag-pill tap flips gscreen) or a tag change,
         // SUBMIT the zone's feed to the view worker (M-Core.1 unblocking, 5/7);
@@ -1616,82 +1884,82 @@ pub fn run(
         // ordering is then a query (buildTagView) — resident posts wearing the
         // tag show at once; the rest fill in when the page lands. Same E2
         // containment as the other view submits.
-        const on_zone = mode == .timeline and gscreen == feed_view.screen_zones;
-        if (on_zone and (!on_zone_prev or zone_dirty)) {
-            if (viewloader) |w| {
-                const tag = try gpa.dupe(u8, zone_tag);
+        const on_zone = rs.mode == .timeline and rs.gscreen == feed_view.screen_zones;
+        if (on_zone and (!rs.on_zone_prev or rs.zone_dirty)) {
+            if (rs.viewloader) |w| {
+                const tag = try gpa.dupe(u8, rs.zone_tag);
                 if (view_worker.submit(w, .zone, tag, 50)) {
-                    status = "loading zone...";
+                    rs.status = "loading zone...";
                 } else {
                     gpa.free(tag);
-                    status = "zone load skipped"; // mailbox OOM; re-entering retries
+                    rs.status = "zone load skipped"; // mailbox OOM; re-entering retries
                 }
-            } else status = "zone: unavailable"; // worker never started (E2)
-            zone_dirty = false;
+            } else rs.status = "zone: unavailable"; // worker never started (E2)
+            rs.zone_dirty = false;
         }
-        on_zone_prev = on_zone;
+        rs.on_zone_prev = on_zone;
 
         // Zones BROWSE: on ENTERING the catalog screen, rebuild the local
         // catalog and submit the server's zone set (`listTags`). Metadata, not
         // posts — it doesn't touch the store. Contained failure (E2): the grid
         // just stays as it was.
-        const on_browse = mode == .timeline and gscreen == feed_view.screen_zones_browse;
-        if (on_browse and !on_browse_prev) {
+        const on_browse = rs.mode == .timeline and rs.gscreen == feed_view.screen_zones_browse;
+        if (on_browse and !rs.on_browse_prev) {
             // The catalog the client can see NOW: derive it from the resident store
             // so a zone whose posts are loaded lists IMMEDIATELY, independent of the
             // AppView's `listTags` (ZONES inv. 4 — a zone catalog is a query, the
             // same as its feed). This is why a zone reachable by tapping its hashtag
             // must also appear here. The server's wider set merges on top.
-            for (zone_catalog.items) |zc| gpa.free(zc.tag);
-            zone_catalog.clearRetainingCapacity();
+            for (rs.zone_catalog.items) |zc| gpa.free(zc.tag);
+            rs.zone_catalog.clearRetainingCapacity();
             if (feed_core.listZonesLocal(arena, store) catch null) |local| {
                 for (local) |t| {
                     const dup = gpa.dupe(u8, t.tag) catch continue;
-                    zone_catalog.append(gpa, .{ .tag = dup, .count = t.count }) catch gpa.free(dup);
+                    rs.zone_catalog.append(gpa, .{ .tag = dup, .count = t.count }) catch gpa.free(dup);
                 }
             }
             // The AppView's wider catalog: SUBMIT to the view worker (M-Core.1
             // unblocking, 6/7); the drain above merges it over this local set
             // when it lands (a server count is authoritative). Failure leaves
             // the local set showing — a status line, never a dead grid (E2).
-            if (viewloader) |w| {
+            if (rs.viewloader) |w| {
                 if (view_worker.submit(w, .zones, null, 0)) {
-                    status = "loading zones...";
-                } else status = "zones load skipped"; // mailbox OOM; re-entering retries
-            } else status = "zones: unavailable"; // worker never started (E2)
+                    rs.status = "loading zones...";
+                } else rs.status = "zones load skipped"; // mailbox OOM; re-entering retries
+            } else rs.status = "zones: unavailable"; // worker never started (E2)
         }
-        on_browse_prev = on_browse;
+        rs.on_browse_prev = on_browse;
 
         // MARKETPLACE: on ENTERING the Algorithms → Marketplace tab, SUBMIT the
         // published-algorithms fetch (`getAlgorithms`) to the view worker
         // (M-Core.1 unblocking, 7/7); the drain above refills the owned catalog
         // when the page lands. Metadata, not posts — it doesn't touch the
         // store. Contained failure (E2).
-        const on_market = mode == .timeline and gscreen == feed_view.screen_loadout and gloadout_tab == 1;
-        if (on_market and !on_market_prev) {
-            if (viewloader) |w| {
+        const on_market = rs.mode == .timeline and rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1;
+        if (on_market and !rs.on_market_prev) {
+            if (rs.viewloader) |w| {
                 if (view_worker.submit(w, .algorithms, null, 50)) {
-                    status = "loading marketplace...";
-                } else status = "marketplace load skipped"; // mailbox OOM; re-entering retries
-            } else status = "marketplace: unavailable"; // worker never started (E2)
+                    rs.status = "loading marketplace...";
+                } else rs.status = "marketplace load skipped"; // mailbox OOM; re-entering retries
+            } else rs.status = "marketplace: unavailable"; // worker never started (E2)
         }
-        on_market_prev = on_market;
+        rs.on_market_prev = on_market;
 
         // Consume a finished background config fetch (View details): after the
         // worker signals done, join it and copy its page_allocator result into the
         // render gpa (no concurrency past the join), then free the worker copy.
-        if (inspectjob.active and inspectjob.done.load(.acquire)) {
-            joinInspect(&inspectjob);
-            if (inspectjob.ok) {
-                if (inspectjob.bytes) |b| {
-                    if (inspect_bytes) |old| gpa.free(old);
-                    inspect_bytes = gpa.dupe(u8, b) catch null;
+        if (rs.inspectjob.active and rs.inspectjob.done.load(.acquire)) {
+            joinInspect(&rs.inspectjob);
+            if (rs.inspectjob.ok) {
+                if (rs.inspectjob.bytes) |b| {
+                    if (rs.inspect_bytes) |old| gpa.free(old);
+                    rs.inspect_bytes = gpa.dupe(u8, b) catch null;
                     // Cache the config by CID (A8) so a re-view never re-fetches.
-                    if (inspect_ref.len > 0 and !config_cache.contains(inspect_ref)) {
-                        const k = gpa.dupe(u8, inspect_ref) catch null;
+                    if (rs.inspect_ref.len > 0 and !rs.config_cache.contains(rs.inspect_ref)) {
+                        const k = gpa.dupe(u8, rs.inspect_ref) catch null;
                         const v = gpa.dupe(u8, b) catch null;
                         if (k != null and v != null) {
-                            config_cache.put(gpa, k.?, v.?) catch {
+                            rs.config_cache.put(gpa, k.?, v.?) catch {
                                 gpa.free(k.?);
                                 gpa.free(v.?);
                             };
@@ -1701,10 +1969,10 @@ pub fn run(
                         }
                     }
                     std.heap.page_allocator.free(b);
-                    inspectjob.bytes = null;
+                    rs.inspectjob.bytes = null;
                 }
-            } else status = "algorithm: unavailable";
-            inspect_loading = false;
+            } else rs.status = "algorithm: unavailable";
+            rs.inspect_loading = false;
         }
 
         // The ACTIVE view: Home (one ordering over the store), the profile screen
@@ -1717,62 +1985,62 @@ pub fn run(
         // siblings order (null on either = the no-scoring path: feed order /
         // chronological threading). Resolved once per frame and reused by the
         // engagement repaints so they rebuild through the same algorithm.
-        const feed_config = seatedLensConfig(socket_cards, socket_blob, gseated);
-        const reply_config = seatedLensConfig(reply_cards, reply_blob, reply_seated);
+        const feed_config = seatedLensConfig(rs.socket_cards, rs.socket_blob, rs.gseated);
+        const reply_config = seatedLensConfig(rs.reply_cards, rs.reply_blob, rs.reply_seated);
         const view_items: []const feed_core.TimelineItem = if (on_thread)
-            try feed_core.buildThreadView(arena, store, thread_focus_cid, thread_rerooted, gcollapsed.items, now, reply_config)
+            try feed_core.buildThreadView(arena, store, rs.thread_focus_cid, rs.thread_rerooted, rs.gcollapsed.items, now, reply_config)
         else if (on_profile)
-            try feed_core.buildAuthorView(arena, store, profile_target_did)
+            try feed_core.buildAuthorView(arena, store, rs.profile_target_did)
         else if (on_zone)
-            try feed_core.buildTagView(arena, store, zone_tag)
+            try feed_core.buildTagView(arena, store, rs.zone_tag)
         else if (feed_config) |cfg|
             try feed_core.buildDiscoverView(arena, store, cfg, now, null)
         else
             try feed_core.buildTimeline(arena, store);
-        const profile_header = try profileHeaderFor(arena, session, gscreen, profile_target_did, view_items);
+        const profile_header = try profileHeaderFor(arena, session, rs.gscreen, rs.profile_target_did, view_items);
         // Advance the seat animation one step per painted frame, resetting at
         // the end of the swap (the field animates continuously, so frames
         // flow). The widget maps swap_phase→geometry purely (B4).
-        if (gsocket_ui.swap_phase > 0) {
-            gsocket_ui.swap_phase +|= 1;
-            if (gsocket_ui.swap_phase > lens_socket.swap_total_frames) gsocket_ui.swap_phase = 0;
+        if (rs.gsocket_ui.swap_phase > 0) {
+            rs.gsocket_ui.swap_phase +|= 1;
+            if (rs.gsocket_ui.swap_phase > lens_socket.swap_total_frames) rs.gsocket_ui.swap_phase = 0;
         }
         // Spring-open: ease each switcher socket's open progress toward its open
         // state. The widget sweeps the tray + reveals cards by this (page sockets
         // force open_t=1 in their render, so this is a no-op there).
         {
             const oe: f32 = 0.34;
-            gsocket_ui.open_t += ((if (gsocket_ui.open) @as(f32, 1) else 0) - gsocket_ui.open_t) * oe;
-            reply_ui.open_t += ((if (reply_ui.open) @as(f32, 1) else 0) - reply_ui.open_t) * oe;
-            zone_ui.open_t += ((if (zone_ui.open) @as(f32, 1) else 0) - zone_ui.open_t) * oe;
+            rs.gsocket_ui.open_t += ((if (rs.gsocket_ui.open) @as(f32, 1) else 0) - rs.gsocket_ui.open_t) * oe;
+            rs.reply_ui.open_t += ((if (rs.reply_ui.open) @as(f32, 1) else 0) - rs.reply_ui.open_t) * oe;
+            rs.zone_ui.open_t += ((if (rs.zone_ui.open) @as(f32, 1) else 0) - rs.zone_ui.open_t) * oe;
         }
-        const home_tray: lens_socket.TrayView = .{ .cards = socket_cards, .text = socket_blob, .seated = gseated };
+        const home_tray: lens_socket.TrayView = .{ .cards = rs.socket_cards, .text = rs.socket_blob, .seated = rs.gseated };
         // Advance the drag's LIVE REFLOW + lift + settle one step per frame (the
         // iOS "pick up and the others fill in" feel). The targets are pure
         // integer slot math; positions are eased here, drawn by the widget.
-        const socket_layout_w: i32 = if (gpu_state != null) @intCast(design_w) else switch (backend) {
+        const socket_layout_w: i32 = if (rs.gpu_state != null) @intCast(design_w) else switch (backend) {
             .window => |w| @intCast(w.fb.width),
             else => @intCast(design_w),
         };
-        if (gscreen == feed_view.screen_loadout) {
+        if (rs.gscreen == feed_view.screen_loadout) {
             // On the page, advance whichever surface is mid-drag, using its
             // on-page geometry (from last frame's layoutLoadout). Clear the
             // drag once its settle finishes (drag_active goes null).
-            if (page_drag_surface) |s| {
+            if (rs.page_drag_surface) |s| {
                 switch (s) {
-                    0 => advanceSocketDrag(&gsocket_ui, home_tray, page_geoms[0]),
-                    1 => advanceSocketDrag(&reply_ui, .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, page_geoms[1]),
-                    else => advanceSocketDrag(&zone_ui, .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, page_geoms[2]),
+                    0 => advanceSocketDrag(&rs.gsocket_ui, home_tray, rs.page_geoms[0]),
+                    1 => advanceSocketDrag(&rs.reply_ui, .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, rs.page_geoms[1]),
+                    else => advanceSocketDrag(&rs.zone_ui, .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, rs.page_geoms[2]),
                 }
                 const ui_done = switch (s) {
-                    1 => reply_ui.drag_active == null,
-                    2 => zone_ui.drag_active == null,
-                    else => gsocket_ui.drag_active == null,
+                    1 => rs.reply_ui.drag_active == null,
+                    2 => rs.zone_ui.drag_active == null,
+                    else => rs.gsocket_ui.drag_active == null,
                 };
-                if (ui_done) page_drag_surface = null;
+                if (ui_done) rs.page_drag_surface = null;
             }
         } else {
-            advanceSocketDrag(&gsocket_ui, home_tray, feed_view.homeSocketGeom(socket_layout_w));
+            advanceSocketDrag(&rs.gsocket_ui, home_tray, feed_view.homeSocketGeom(socket_layout_w));
         }
         // Persist the loadout when the tray CLOSES (the "done editing" beat).
         // Hand it to the BACKGROUND write worker (the same thread that does
@@ -1782,27 +2050,27 @@ pub fn run(
         // are slices into socket_blob; submitLoadout dupes them.
         // Flush on the home tray CLOSING, or on LEAVING the loadout page (whose
         // sockets are always open, so there's no tray-close there).
-        const left_loadout_page = prev_screen == feed_view.screen_loadout and gscreen != feed_view.screen_loadout;
-        const left_thread = prev_screen == feed_view.screen_thread and gscreen != feed_view.screen_thread;
-        const left_zone = prev_screen == feed_view.screen_zones and gscreen != feed_view.screen_zones;
-        const tray_closed = socket_was_open and !gsocket_ui.open;
-        if ((tray_closed or left_loadout_page or left_thread or left_zone) and loadout_dirty) {
-            if (writer) |w| {
+        const left_loadout_page = rs.prev_screen == feed_view.screen_loadout and rs.gscreen != feed_view.screen_loadout;
+        const left_thread = rs.prev_screen == feed_view.screen_thread and rs.gscreen != feed_view.screen_thread;
+        const left_zone = rs.prev_screen == feed_view.screen_zones and rs.gscreen != feed_view.screen_zones;
+        const tray_closed = rs.socket_was_open and !rs.gsocket_ui.open;
+        if ((tray_closed or left_loadout_page or left_thread or left_zone) and rs.loadout_dirty) {
+            if (rs.writer) |w| {
                 // Write the WHOLE record (all three surfaces) so one surface's
                 // edit doesn't clobber the others. ids slice into each surface's
                 // blob; submitLoadout dupes them onto the worker.
                 _ = write_worker.submitLoadout(
                     w,
-                    surfaceDataOf(arena, socket_cards, socket_blob, gseated),
-                    surfaceDataOf(arena, reply_cards, reply_blob, reply_seated),
-                    surfaceDataOf(arena, zone_cards, zone_blob, zone_seated),
+                    surfaceDataOf(arena, rs.socket_cards, rs.socket_blob, rs.gseated),
+                    surfaceDataOf(arena, rs.reply_cards, rs.reply_blob, rs.reply_seated),
+                    surfaceDataOf(arena, rs.zone_cards, rs.zone_blob, rs.zone_seated),
                     now,
                 );
             }
-            loadout_dirty = false;
+            rs.loadout_dirty = false;
         }
-        socket_was_open = gsocket_ui.open;
-        prev_screen = gscreen;
+        rs.socket_was_open = rs.gsocket_ui.open;
+        rs.prev_screen = rs.gscreen;
         // The feed-socket hit list is rebuilt every frame by layout()/
         // layoutLoadout() (both clear it at entry). Zat Chat and the transparency
         // reader are the two dispatch branches that render NEITHER, so without this
@@ -1812,8 +2080,8 @@ pub fn run(
         // (before the event pump) so they present no phantom socket targets. The
         // reply/zone hit lists are already screen-gated to the loadout page, so
         // only this list can leak across the switch.
-        if (gscreen == feed_view.screen_messages or gscreen == feed_view.screen_transparency)
-            gsocket_hits.clearRetainingCapacity();
+        if (rs.gscreen == feed_view.screen_messages or rs.gscreen == feed_view.screen_transparency)
+            rs.gsocket_hits.clearRetainingCapacity();
         // pix exists exactly when a window backend has a live engine; the
         // composer and profile screens stay on the cell path this cut
         // (their pixel port is the recorded next slice).
@@ -1824,57 +2092,57 @@ pub fn run(
         // The socket-of-the-screen: REPLY socket on a thread, the ZONE socket on a
         // zone page, the FEED socket on Home. Each is a switcher over its own
         // surface's loadout (the three the Algorithms page edits).
-        const on_thread_screen = gscreen == feed_view.screen_thread;
-        const on_zone_screen = gscreen == feed_view.screen_zones;
+        const on_thread_screen = rs.gscreen == feed_view.screen_thread;
+        const on_zone_screen = rs.gscreen == feed_view.screen_zones;
         const cur_socket_tray: lens_socket.TrayView = if (on_thread_screen)
-            .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }
+            .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }
         else if (on_zone_screen)
-            .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }
+            .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }
         else
             home_tray;
         // Functional Toy Box / Appearance toggles — each reads its runtime bit
         // (the generalized Julia pattern) and gates its behaviour below.
-        const julia_on = toggleOn(toggle_bits, settings_view.act_julia);
-        const ripples_on = toggleOn(toggle_bits, settings_view.act_ripples);
-        const field_on = toggleOn(toggle_bits, settings_view.act_field);
-        const crt_on = toggleOn(toggle_bits, settings_view.act_crt);
-        const frametiming_on = toggleOn(toggle_bits, settings_view.act_frametiming);
+        const julia_on = toggleOn(rs.toggle_bits, settings_view.act_julia);
+        const ripples_on = toggleOn(rs.toggle_bits, settings_view.act_ripples);
+        const field_on = toggleOn(rs.toggle_bits, settings_view.act_field);
+        const crt_on = toggleOn(rs.toggle_bits, settings_view.act_crt);
+        const frametiming_on = toggleOn(rs.toggle_bits, settings_view.act_frametiming);
         const settings_account: feed_view.SettingsAccount = .{
-            .handle = std.fmt.bufPrint(&account_handle_buf, "@{s}", .{session.handle}) catch session.handle,
+            .handle = std.fmt.bufPrint(&rs.account_handle_buf, "@{s}", .{session.handle}) catch session.handle,
             .did = session.did,
             .pds = session.pds_url,
         };
         // Choice selections → the effects (each frame, declarative like the toggles).
-        const settings_choices_packed = packChoices(&choice_sel);
-        const accent_override: ?u32 = accentChoiceColor(choiceSel(&choice_sel, settings_view.act_accent));
-        const field_gain: f32 = fieldGainFor(choiceSel(&choice_sel, settings_view.act_field_intensity));
+        const settings_choices_packed = packChoices(&rs.choice_sel);
+        const accent_override: ?u32 = accentChoiceColor(choiceSel(&rs.choice_sel, settings_view.act_accent));
+        const field_gain: f32 = fieldGainFor(choiceSel(&rs.choice_sel, settings_view.act_field_intensity));
         switch (backend) { // heart cursor follows the Julia toggle
             .window => |w| window_shell.setJulia(w, julia_on),
             else => {},
         }
-        var cur_socket_ui = if (on_thread_screen) reply_ui else if (on_zone_screen) zone_ui else gsocket_ui;
+        var cur_socket_ui = if (on_thread_screen) rs.reply_ui else if (on_zone_screen) rs.zone_ui else rs.gsocket_ui;
         cur_socket_ui.julia = julia_on;
-        const cur_socket_hits = if (on_thread_screen) &reply_hits else if (on_zone_screen) &zone_hits else &gsocket_hits;
+        const cur_socket_hits = if (on_thread_screen) &rs.reply_hits else if (on_zone_screen) &rs.zone_hits else &rs.gsocket_hits;
         // The Create "preparing" beat: a brief loading pause after the last question,
         // so it reads that the answers calibrated the numbers, then reveal the recap.
         // The living field repaints every frame, so a frame counter advances it.
         const create_prepare_len: u32 = 66; // ~1.1s at 60fps
-        if (gscreen == feed_view.screen_loadout and gloadout_tab == 2 and gcreate_step == .preparing) {
-            gcreate_prepare_frames += 1;
-            if (gcreate_prepare_frames >= create_prepare_len) gcreate_step = .recap;
+        if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 2 and rs.gcreate_step == .preparing) {
+            rs.gcreate_prepare_frames += 1;
+            if (rs.gcreate_prepare_frames >= create_prepare_len) rs.gcreate_step = .recap;
         }
-        const create_prepare_t: f32 = @min(@as(f32, @floatFromInt(gcreate_prepare_frames)) / @as(f32, @floatFromInt(create_prepare_len)), 1.0);
+        const create_prepare_t: f32 = @min(@as(f32, @floatFromInt(rs.gcreate_prepare_frames)) / @as(f32, @floatFromInt(create_prepare_len)), 1.0);
         // The bench: the user's library algorithms as socket cards, built into the
         // frame arena (auto-freed). Only on the Loadout tab; empty otherwise.
         var bench_tray: lens_socket.TrayView = .{ .cards = &.{}, .text = "", .seated = 0 };
-        if (gscreen == feed_view.screen_loadout and gloadout_tab == 0) {
-            if (lens_catalog.benchCards(arena, arena, &algo_lib)) |res| {
+        if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 0) {
+            if (lens_catalog.benchCards(arena, arena, &rs.algo_lib)) |res| {
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        const pix: ?Grid = if (engine) |*e| .{ .engine = e, .field = &gfield, .particles = &gparticles, .active = &gactive, .draw = &gdraw, .hr = &ghr, .hearts = &ghearts, .view = &gview, .spawn_buf = &gspawn, .last_nanos = &glast_nanos, .zoom = &gzoom, .scroll = &gscroll_px, .content_h = &gcontent_h, .regions = &gregions, .screen = &gscreen, .gpu = if (gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = ghover_x, .hover_y = ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = reply_cards, .text = reply_blob, .seated = reply_seated }, .reply_ui = reply_ui, .reply_hits = &reply_hits, .zone_tray = .{ .cards = zone_cards, .text = zone_blob, .seated = zone_seated }, .zone_ui = zone_ui, .zone_hits = &zone_hits, .loadout_tab = gloadout_tab, .market = if (gscreen == feed_view.screen_loadout and gloadout_tab == 1) market_cards.items else &.{}, .create = .{ .step = gcreate_step, .answers = gcreate_answers, .config = gcreate_config, .name = gcreate_name_buf[0..gcreate_name_len], .color = gcreate_color, .naming = gcreate_step == .name, .prepare_t = create_prepare_t }, .bench = bench_tray, .inspect_bytes = inspect_bytes orelse "", .inspect_name = inspect_name, .inspect_ref = inspect_ref, .inspect_source = gtransp_source, .inspect_loading = inspect_loading, .loadout_geoms = &page_geoms, .zone_title = if (on_zone_screen) zone_tag else "", .zones = if (gscreen == feed_view.screen_zones_browse) zone_catalog.items else &.{}, .settings_section = gsettings_section, .settings_toggles = toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = gsettings_picking, .chat_store = if (dev_chat) &gchat_store else null, .chat_sel = gchat_sel, .chat_draft = gchat_draft_buf[0..gchat_draft_len], .chat_input_focus = gchat_input_focus, .chat_composing = gchat_composing, .chat_compose = gchat_peer_buf[0..gchat_peer_len], .chat_compose_status = gchat_compose_status, .chat_typing = gscreen == feed_view.screen_messages and now < gchat_typing_deadline and gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&gchat_store, gchat_sel.?), gchat_typing_peer_buf[0..gchat_typing_peer_len]), .chat_key_ns = gchat_key_ns, .chat_pay = .{ .open = gpay_open, .rail = gpay_rail, .amount = gpay_amount_buf[0..gpay_amount_len], .note = gpay_note_buf[0..gpay_note_len], .focus = gpay_focus, .status = gpay_status, .confirm = gpay_confirm, .first_send = gpay_first_send, .unit = gpay_unit, .usd_cents_per_btc = gprice_cents }, .chat_recv = .{ .open = grecv_open, .mode = grecv_mode, .lightning = grecv_ln_buf[0..grecv_ln_len], .bitcoin = grecv_btc_buf[0..grecv_btc_len], .focus = grecv_focus, .status = grecv_status, .saved = grecv_saved }, .expanded = gexpanded.items, .repost_menu = if (grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
-        switch (mode) {
-            .timeline => try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status),
+        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
+        switch (rs.mode) {
+            .timeline => try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status),
             .compose => {
                 if (pix) |g| switch (backend) {
                     .window => |win| {
@@ -1883,63 +2151,63 @@ pub fn run(
                             // the card). Reply is distinguished by a non-empty
                             // target handle; the profile editor reuses the same
                             // surface with its own context line + "Save" label.
-                            const ctx: feed_view.ComposeContext = if (compose_kind == .profile)
+                            const ctx: feed_view.ComposeContext = if (rs.compose_kind == .profile)
                                 .profile
-                            else if (reply_handle.len > 0) .reply else .post;
-                            paintComposeGpu(gpa, win, g, gs, ctx, reply_handle, quoting_handle, textedit.view(&compose), compose.caret, textedit.selStart(&compose), textedit.selEnd(&compose), composeBlinkOn(caret_anchor_ns), status, chain_segments.items) catch {};
+                            else if (rs.reply_handle.len > 0) .reply else .post;
+                            paintComposeGpu(gpa, win, g, gs, ctx, rs.reply_handle, rs.quoting_handle, textedit.view(&rs.compose), rs.compose.caret, textedit.selStart(&rs.compose), textedit.selEnd(&rs.compose), composeBlinkOn(rs.caret_anchor_ns), rs.status, rs.chain_segments.items) catch {};
                         } else {
                             // Software fallback: the glyph-field cell composer.
-                            const cell = cellSize(win.fb.width, gzoom);
+                            const cell = cellSize(win.fb.width, rs.gzoom);
                             const fgrid = softFieldGrid(win.fb.width, win.fb.height, cell.w, cell.h);
                             const cols = fgrid.cols;
                             const rows = fgrid.rows;
-                            if (gfield.cols != cols or gfield.rows != rows) {
-                                field_core.deinit(gpa, &gfield);
-                                try field_core.init(gpa, &gfield, cols, rows);
+                            if (rs.gfield.cols != cols or rs.gfield.rows != rows) {
+                                field_core.deinit(gpa, &rs.gfield);
+                                try field_core.init(gpa, &rs.gfield, cols, rows);
                             }
-                            const cc = timeline_ui.countCodepoints(textedit.view(&compose));
+                            const cc = timeline_ui.countCodepoints(textedit.view(&rs.compose));
                             // Software fallback keeps an end-of-text cursor (the
                             // GPU path owns the caret-aware bar); the model still
                             // edits at the caret either way.
-                            const cursor = field_ui.buildCompose(&gfield, textedit.view(&compose), reply_handle, cc, status);
-                            try field_core.compose(gpa, &gfield, gparticles.slice(), .{ .x = @floatFromInt(cols / 2), .y = @floatFromInt(rows / 3), .radius = @floatFromInt(cols), .ambient = 0.7 }, cell.w, cell.h, &gdraw);
+                            const cursor = field_ui.buildCompose(&rs.gfield, textedit.view(&rs.compose), rs.reply_handle, cc, rs.status);
+                            try field_core.compose(gpa, &rs.gfield, rs.gparticles.slice(), .{ .x = @floatFromInt(cols / 2), .y = @floatFromInt(rows / 3), .radius = @floatFromInt(cols), .ambient = 0.7 }, cell.w, cell.h, &rs.gdraw);
                             // The cursor: a filled block at the insertion cell,
                             // tinted with the app accent (alpha-blended).
-                            try gdraw.append(gpa, .{ .rect = .{ .x = @intCast(@min(cursor.x * cell.w, 32767)), .y = @intCast(@min(cursor.y * cell.h, 32767)), .w = cell.w, .h = cell.h, .color = 0x88000000 | (field_core.palette[field_ui.col_accent] & 0x00FFFFFF), .radius = 0 } });
-                            window_shell.presentDrawList(win, gpa, g.engine, gdraw.slice(), field_core.background) catch {};
+                            try rs.gdraw.append(gpa, .{ .rect = .{ .x = @intCast(@min(cursor.x * cell.w, 32767)), .y = @intCast(@min(cursor.y * cell.h, 32767)), .w = cell.w, .h = cell.h, .color = 0x88000000 | (field_core.palette[field_ui.col_accent] & 0x00FFFFFF), .radius = 0 } });
+                            window_shell.presentDrawList(win, gpa, g.engine, rs.gdraw.slice(), field_core.background) catch {};
                         }
                     },
                     .terminal => {
-                        timeline_ui.buildComposeFrame(&next, textedit.view(&compose), reply_handle, status);
-                        try present(gpa, out, arena, &prev, &next, backend);
+                        timeline_ui.buildComposeFrame(&rs.next, textedit.view(&rs.compose), rs.reply_handle, rs.status);
+                        try present(gpa, rs.out, arena, &rs.prev, &rs.next, backend);
                     },
                 } else {
-                    timeline_ui.buildComposeFrame(&next, textedit.view(&compose), reply_handle, status);
-                    try present(gpa, out, arena, &prev, &next, backend);
+                    timeline_ui.buildComposeFrame(&rs.next, textedit.view(&rs.compose), rs.reply_handle, rs.status);
+                    try present(gpa, rs.out, arena, &rs.prev, &rs.next, backend);
                 }
             },
             .profile => {
                 if (pix) |g| switch (backend) {
                     .window => |win| {
-                        const cell = cellSize(win.fb.width, gzoom);
+                        const cell = cellSize(win.fb.width, rs.gzoom);
                         const fgrid = softFieldGrid(win.fb.width, win.fb.height, cell.w, cell.h);
                         const cols = fgrid.cols;
                         const rows = fgrid.rows;
-                        if (gfield.cols != cols or gfield.rows != rows) {
-                            field_core.deinit(gpa, &gfield);
-                            try field_core.init(gpa, &gfield, cols, rows);
+                        if (rs.gfield.cols != cols or rs.gfield.rows != rows) {
+                            field_core.deinit(gpa, &rs.gfield);
+                            try field_core.init(gpa, &rs.gfield, cols, rows);
                         }
-                        field_ui.buildProfile(&gfield, profile_info orelse .{}, status);
-                        try field_core.compose(gpa, &gfield, gparticles.slice(), .{ .x = @floatFromInt(cols / 2), .y = @floatFromInt(rows / 3), .radius = @floatFromInt(cols), .ambient = 0.7 }, cell.w, cell.h, &gdraw);
-                        window_shell.presentDrawList(win, gpa, g.engine, gdraw.slice(), field_core.background) catch {};
+                        field_ui.buildProfile(&rs.gfield, rs.profile_info orelse .{}, rs.status);
+                        try field_core.compose(gpa, &rs.gfield, rs.gparticles.slice(), .{ .x = @floatFromInt(cols / 2), .y = @floatFromInt(rows / 3), .radius = @floatFromInt(cols), .ambient = 0.7 }, cell.w, cell.h, &rs.gdraw);
+                        window_shell.presentDrawList(win, gpa, g.engine, rs.gdraw.slice(), field_core.background) catch {};
                     },
                     .terminal => {
-                        timeline_ui.buildProfileFrame(&next, profile_info orelse .{}, status);
-                        try present(gpa, out, arena, &prev, &next, backend);
+                        timeline_ui.buildProfileFrame(&rs.next, rs.profile_info orelse .{}, rs.status);
+                        try present(gpa, rs.out, arena, &rs.prev, &rs.next, backend);
                     },
                 } else {
-                    timeline_ui.buildProfileFrame(&next, profile_info orelse .{}, status);
-                    try present(gpa, out, arena, &prev, &next, backend);
+                    timeline_ui.buildProfileFrame(&rs.next, rs.profile_info orelse .{}, rs.status);
+                    try present(gpa, rs.out, arena, &rs.prev, &rs.next, backend);
                 }
             },
         }
@@ -1949,8 +2217,8 @@ pub fn run(
         // temp cid to the server's (keep the post) or drop it on failure. The
         // write blocks briefly, but the post is already on screen — it FELT
         // instant. Network failure is contained (E2); only OOM is fatal.
-        if (pending_send) |chain| {
-            pending_send = null;
+        if (rs.pending_send) |chain| {
+            rs.pending_send = null;
             defer freeChain(gpa, chain);
             // Publish each segment in order, THREADING it to the one just created:
             // the root is the base reply's root (a reply-chain) or segment 0's own
@@ -1986,7 +2254,7 @@ pub fn run(
                     error.OutOfMemory => return err,
                     else => blk: {
                         feed_core.dropOptimisticPost(store, seg.temp_cid);
-                        status = "send failed";
+                        rs.status = "send failed";
                         stopped = true;
                         break :blk null;
                     },
@@ -2004,7 +2272,7 @@ pub fn run(
                     },
                     .failed => |f| {
                         feed_core.dropOptimisticPost(store, seg.temp_cid);
-                        status = std.fmt.bufPrint(&status_buf, "send refused: {d} {s}", .{ f.status, f.code }) catch "refused";
+                        rs.status = std.fmt.bufPrint(&rs.status_buf, "send refused: {d} {s}", .{ f.status, f.code }) catch "refused";
                         stopped = true;
                     },
                 };
@@ -2015,14 +2283,14 @@ pub fn run(
         // guarded); run the putProfile write now, reverting the guard on failure
         // so the next refresh restores the server name. On success the guard
         // releases when the AppView re-polls + serves the new name.
-        if (pending_profile_save) |name| {
-            pending_profile_save = null;
+        if (rs.pending_profile_save) |name| {
+            rs.pending_profile_save = null;
             defer gpa.free(name);
             const saved = write.putProfile(gpa, arena, io, environ, session, name, now) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => blk: {
                     feed_core.clearPendingDisplay(store);
-                    status = "name save failed";
+                    rs.status = "name save failed";
                     break :blk null;
                 },
             };
@@ -2030,7 +2298,7 @@ pub fn run(
                 .ok => {},
                 .failed => |f| {
                     feed_core.clearPendingDisplay(store);
-                    status = std.fmt.bufPrint(&status_buf, "name refused: {d} {s}", .{ f.status, f.code }) catch "refused";
+                    rs.status = std.fmt.bufPrint(&rs.status_buf, "name refused: {d} {s}", .{ f.status, f.code }) catch "refused";
                 },
             };
         }
@@ -2047,12 +2315,12 @@ pub fn run(
             // this arm comptime-vanishes there — this std snapshot's
             // posix.pollfd does not even resolve on that target.
             .terminal => if (comptime builtin.os.tag == .windows) unreachable else {
-                var fds = [_]posix.pollfd{.{ .fd = stdin_fd, .events = posix.POLL.IN, .revents = 0 }};
+                var fds = [_]posix.pollfd{.{ .fd = rs.stdin_fd, .events = posix.POLL.IN, .revents = 0 }};
                 const ready = posix.poll(&fds, 500) catch 0;
                 if (ready == 0) continue;
-                n = posix.read(stdin_fd, &in_buf) catch 0;
+                n = posix.read(rs.stdin_fd, &in_buf) catch 0;
                 if (n == 0) continue;
-                last_input_nanos = clock_shell.monotonicNanos();
+                rs.last_input_nanos = clock_shell.monotonicNanos();
             },
             .window => |win| {
                 // The pump translates X keys into the same bytes a tty
@@ -2079,21 +2347,21 @@ pub fn run(
                 // keep the simulation ticking; otherwise only when a software
                 // effect/particles are in flight, so a still timeline costs zero
                 // CPU (the no-wasted-cycles ethos).
-                const animating = gpu_state != null or (engine != null and (gactive.len > 0 or gparticles.len > 0));
+                const animating = rs.gpu_state != null or (rs.engine != null and (rs.gactive.len > 0 or rs.gparticles.len > 0));
                 const pump_ms: i32 = if (animating) 16 else 500;
                 const pumped = window_shell.pump(win, pump_ms, gpa, &pumped_bytes, &pointer_events) catch {
-                    status = "window error";
+                    rs.status = "window error";
                     continue;
                 };
                 if (pumped.closed) break :main_loop;
-                if (pumped.dropped > 0) status = "input dropped (low memory)";
+                if (pumped.dropped > 0) rs.status = "input dropped (low memory)";
                 if (pumped.x_error != 0) {
                     // The server refused a request (almost always a blit).
                     // Show the code so a black window names its own cause
                     // instead of staying mute. Codes: 1=Request 2=Value
                     // 3=Window 4=Pixmap 8=Match 9=Drawable 13=GContext
                     // 16=Length. (E3: no silent failure.)
-                    status = std.fmt.bufPrint(&status_buf, "X error code {d}", .{pumped.x_error}) catch "X error";
+                    rs.status = std.fmt.bufPrint(&rs.status_buf, "X error code {d}", .{pumped.x_error}) catch "X error";
                 }
                 // The window's FIRST valid drawable arrives with Expose, not
                 // with map: a PutImage sent before the server has exposed the
@@ -2105,10 +2373,10 @@ pub fn run(
                 // blit the server already threw away. (E2: a repaint request
                 // is folded into the loop's own re-render lap.)
                 if (pumped.exposed or pumped.resized) {
-                    if (mode == .timeline) {
-                        try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status);
+                    if (rs.mode == .timeline) {
+                        try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status);
                     } else {
-                        try present(gpa, out, arena, &prev, &next, backend);
+                        try present(gpa, rs.out, arena, &rs.prev, &rs.next, backend);
                     }
                 }
                 // ---- the mouse becomes the app (5.2): consume the channel.
@@ -2118,7 +2386,7 @@ pub fn run(
                 // the one and only path (timeline_ui.keyFor — round-trip
                 // tested against actionFor). Hit rects are last frame's:
                 // immediate-mode's standard one-frame contract.
-                if (mode == .timeline) if (pix) |g| {
+                if (rs.mode == .timeline) if (pix) |g| {
                     // Pointer coords are PIXELS; the grid thinks in cells.
                     // Use the SAME zoom-derived cell size the renderer
                     // used, so clicks land on the cell under the cursor at
@@ -2138,7 +2406,7 @@ pub fn run(
                         switch (pev.kind) {
                             .wheel => {
                                 if (g.gpu) |gs| gs.menu_open = false; // scrolling dismisses the menu
-                                grepost_menu = null; // …and the Repost/Quote popover
+                                rs.grepost_menu = null; // …and the Repost/Quote popover
                                 const delta: i32 = if (pev.button == 5) 3 else -3;
                                 g.view.scroll_rows += delta;
                                 // The premium feed scrolls in PIXELS. Wheel down
@@ -2168,37 +2436,37 @@ pub fn run(
                                 // builds overscroll; past the threshold it asks for a
                                 // refresh. A wheel-down cancels the pull.
                                 if (g.screen.* == feed_view.screen_home and pev.button != 5 and g.scroll.* == 0) {
-                                    overscroll_accum += 28;
-                                    if (overscroll_accum >= pull_refresh_threshold) {
-                                        pull_refresh_requested = true;
-                                        overscroll_accum = 0;
+                                    rs.overscroll_accum += 28;
+                                    if (rs.overscroll_accum >= pull_refresh_threshold) {
+                                        rs.pull_refresh_requested = true;
+                                        rs.overscroll_accum = 0;
                                     } else {
                                         // Visible proof the pull is registering (the
                                         // animated indicator is the deferred polish).
-                                        status = "↑ keep pulling to refresh";
+                                        rs.status = "↑ keep pulling to refresh";
                                     }
                                 } else if (pev.button == 5) {
-                                    overscroll_accum = 0;
+                                    rs.overscroll_accum = 0;
                                 }
                             },
                             .move => {
                                 // Track the pointer in LOGICAL coords for the hover
                                 // highlight (rx/ry are already mapped through scale).
-                                ghover_x = rx;
-                                ghover_y = ry;
+                                rs.ghover_x = rx;
+                                rs.ghover_y = ry;
                                 // A live drag: the ghost card follows the pointer. On the
                                 // loadout page the dragged surface may be reply/zone.
-                                if (page_drag_surface) |s| {
+                                if (rs.page_drag_surface) |s| {
                                     const ui = switch (s) {
-                                        1 => &reply_ui,
-                                        2 => &zone_ui,
-                                        else => &gsocket_ui,
+                                        1 => &rs.reply_ui,
+                                        2 => &rs.zone_ui,
+                                        else => &rs.gsocket_ui,
                                     };
                                     ui.drag_x = rx;
                                     ui.drag_y = ry;
-                                } else if (gsocket_ui.drag_active != null) {
-                                    gsocket_ui.drag_x = rx;
-                                    gsocket_ui.drag_y = ry;
+                                } else if (rs.gsocket_ui.drag_active != null) {
+                                    rs.gsocket_ui.drag_x = rx;
+                                    rs.gsocket_ui.drag_y = ry;
                                 }
                                 const field_hit = field_ui.hitTest(cx, cy, g.hr.slice());
                                 g.view.hover = if (field_hit) |hit| hit.target else field_ui.no_target;
@@ -2211,9 +2479,9 @@ pub fn run(
                                 const over_clickable =
                                     feed_view.hitTest(g.regions.items, rx, ry) != null or
                                     lens_socket.hitTest(g.socket_hits.items, rx, ry) != null or
-                                    (gscreen == feed_view.screen_loadout and
-                                        (lens_socket.hitTest(reply_hits.items, rx, ry) != null or
-                                            lens_socket.hitTest(zone_hits.items, rx, ry) != null)) or
+                                    (rs.gscreen == feed_view.screen_loadout and
+                                        (lens_socket.hitTest(rs.reply_hits.items, rx, ry) != null or
+                                            lens_socket.hitTest(rs.zone_hits.items, rx, ry) != null)) or
                                     field_hit != null;
                                 // A live text-selection drag over the rooted post:
                                 // extend the selection to the caret under the pointer.
@@ -2224,8 +2492,8 @@ pub fn run(
                                 // card; the I-beam over the rooted post's selectable body
                                 // (or mid text-drag); the hand over anything else
                                 // clickable; the arrow otherwise.
-                                const dragging_card = page_drag_surface != null or gsocket_ui.drag_active != null;
-                                const over_focus_text = gscreen == feed_view.screen_thread and blk: {
+                                const dragging_card = rs.page_drag_surface != null or rs.gsocket_ui.drag_active != null;
+                                const over_focus_text = rs.gscreen == feed_view.screen_thread and blk: {
                                     const h = feed_view.hitTest(g.regions.items, rx, ry) orelse break :blk false;
                                     break :blk h.kind == .post_body and h.post < view_items.len and view_items[h.post].is_focus;
                                 };
@@ -2256,7 +2524,7 @@ pub fn run(
                                 // post body. Left-click while the menu is open hits
                                 // an item or dismisses it (never the feed beneath).
                                 if (pev.button == 3) {
-                                    if (g.gpu) |gs| openContextMenu(gs, gscreen, view_items, g.regions.items, rx, ry);
+                                    if (g.gpu) |gs| openContextMenu(gs, rs.gscreen, view_items, g.regions.items, rx, ry);
                                 } else if (pev.button == 1) {
                                     if (g.gpu) |gs| if (gs.menu_open) {
                                         menuClick(gpa, gs, backend, rx, ry);
@@ -2279,70 +2547,70 @@ pub fn run(
                                 // the swap; re-ranking the feed awaits the discover
                                 // engine (only Following exists today).
                                 var socket_handled = false;
-                                if (gscreen == feed_view.screen_loadout) {
+                                if (rs.gscreen == feed_view.screen_loadout) {
                                     // Loadout page: edit the surface under the cursor (feed /
                                     // reply / zone). A handle press (.reorder) starts a drag for
                                     // that surface; everything else is a click edit.
                                     if (lens_socket.hitTest(g.socket_hits.items, rx, ry)) |sact| {
                                         switch (sact) {
                                             .reorder => |r| {
-                                                page_drag_surface = 0;
-                                                gsocket_ui.drag_active = trayIndexOfCid(socket_cards, socket_blob, r.lens);
-                                                gsocket_ui.drag_x = rx;
-                                                gsocket_ui.drag_y = ry;
+                                                rs.page_drag_surface = 0;
+                                                rs.gsocket_ui.drag_active = trayIndexOfCid(rs.socket_cards, rs.socket_blob, r.lens);
+                                                rs.gsocket_ui.drag_x = rx;
+                                                rs.gsocket_ui.drag_y = ry;
                                             },
-                                            else => applyLoadoutAction(sact, socket_cards, socket_blob, &gseated, &gsocket_ui, &loadout_dirty),
+                                            else => applyLoadoutAction(sact, rs.socket_cards, rs.socket_blob, &rs.gseated, &rs.gsocket_ui, &rs.loadout_dirty),
                                         }
                                         socket_handled = true;
-                                    } else if (lens_socket.hitTest(reply_hits.items, rx, ry)) |sact| {
+                                    } else if (lens_socket.hitTest(rs.reply_hits.items, rx, ry)) |sact| {
                                         switch (sact) {
                                             .reorder => |r| {
-                                                page_drag_surface = 1;
-                                                reply_ui.drag_active = trayIndexOfCid(reply_cards, reply_blob, r.lens);
-                                                reply_ui.drag_x = rx;
-                                                reply_ui.drag_y = ry;
+                                                rs.page_drag_surface = 1;
+                                                rs.reply_ui.drag_active = trayIndexOfCid(rs.reply_cards, rs.reply_blob, r.lens);
+                                                rs.reply_ui.drag_x = rx;
+                                                rs.reply_ui.drag_y = ry;
                                             },
-                                            else => applyLoadoutAction(sact, reply_cards, reply_blob, &reply_seated, &reply_ui, &loadout_dirty),
+                                            else => applyLoadoutAction(sact, rs.reply_cards, rs.reply_blob, &rs.reply_seated, &rs.reply_ui, &rs.loadout_dirty),
                                         }
                                         socket_handled = true;
-                                    } else if (lens_socket.hitTest(zone_hits.items, rx, ry)) |sact| {
+                                    } else if (lens_socket.hitTest(rs.zone_hits.items, rx, ry)) |sact| {
                                         switch (sact) {
                                             .reorder => |r| {
-                                                page_drag_surface = 2;
-                                                zone_ui.drag_active = trayIndexOfCid(zone_cards, zone_blob, r.lens);
-                                                zone_ui.drag_x = rx;
-                                                zone_ui.drag_y = ry;
+                                                rs.page_drag_surface = 2;
+                                                rs.zone_ui.drag_active = trayIndexOfCid(rs.zone_cards, rs.zone_blob, r.lens);
+                                                rs.zone_ui.drag_x = rx;
+                                                rs.zone_ui.drag_y = ry;
                                             },
-                                            else => applyLoadoutAction(sact, zone_cards, zone_blob, &zone_seated, &zone_ui, &loadout_dirty),
+                                            else => applyLoadoutAction(sact, rs.zone_cards, rs.zone_blob, &rs.zone_seated, &rs.zone_ui, &rs.loadout_dirty),
                                         }
                                         socket_handled = true;
                                     }
-                                } else if (gscreen == feed_view.screen_thread) {
+                                } else if (rs.gscreen == feed_view.screen_thread) {
                                     // The inline REPLY socket on a thread: a switcher over the
                                     // reply loadout (shared with the Algorithms page). Order-only,
                                     // no view retint. Reorder lives on the Algorithms page.
                                     if (lens_socket.hitTest(g.socket_hits.items, rx, ry)) |sact| {
                                         socket_handled = true;
                                         switch (sact) {
-                                            .toggle_tray => reply_ui.open = !reply_ui.open,
+                                            .toggle_tray => rs.reply_ui.open = !rs.reply_ui.open,
                                             .seat => |cid| {
-                                                if (trayIndexOfCid(reply_cards, reply_blob, cid)) |idx| {
-                                                    reply_seated = idx;
-                                                    loadout_dirty = true;
+                                                if (trayIndexOfCid(rs.reply_cards, rs.reply_blob, cid)) |idx| {
+                                                    rs.reply_seated = idx;
+                                                    rs.loadout_dirty = true;
                                                 }
-                                                reply_ui.open = false;
-                                                reply_ui.expanded = null;
-                                                reply_ui.picking = null;
+                                                rs.reply_ui.open = false;
+                                                rs.reply_ui.expanded = null;
+                                                rs.reply_ui.picking = null;
                                             },
                                             .get_more => {
-                                                reply_ui.open = false;
-                                                gscreen = feed_view.screen_loadout;
-                                                gscroll_px = 0;
+                                                rs.reply_ui.open = false;
+                                                rs.gscreen = feed_view.screen_loadout;
+                                                rs.gscroll_px = 0;
                                             },
-                                            else => applyLoadoutAction(sact, reply_cards, reply_blob, &reply_seated, &reply_ui, &loadout_dirty),
+                                            else => applyLoadoutAction(sact, rs.reply_cards, rs.reply_blob, &rs.reply_seated, &rs.reply_ui, &rs.loadout_dirty),
                                         }
                                     }
-                                } else if (gscreen == feed_view.screen_zones) {
+                                } else if (rs.gscreen == feed_view.screen_zones) {
                                     // The zone page's socket: a switcher over the ZONE
                                     // loadout (shared with the Algorithms page). Order-only;
                                     // no real ranking power yet (the discover engine is
@@ -2350,22 +2618,22 @@ pub fn run(
                                     if (lens_socket.hitTest(g.socket_hits.items, rx, ry)) |sact| {
                                         socket_handled = true;
                                         switch (sact) {
-                                            .toggle_tray => zone_ui.open = !zone_ui.open,
+                                            .toggle_tray => rs.zone_ui.open = !rs.zone_ui.open,
                                             .seat => |cid| {
-                                                if (trayIndexOfCid(zone_cards, zone_blob, cid)) |idx| {
-                                                    zone_seated = idx;
-                                                    loadout_dirty = true;
+                                                if (trayIndexOfCid(rs.zone_cards, rs.zone_blob, cid)) |idx| {
+                                                    rs.zone_seated = idx;
+                                                    rs.loadout_dirty = true;
                                                 }
-                                                zone_ui.open = false;
-                                                zone_ui.expanded = null;
-                                                zone_ui.picking = null;
+                                                rs.zone_ui.open = false;
+                                                rs.zone_ui.expanded = null;
+                                                rs.zone_ui.picking = null;
                                             },
                                             .get_more => {
-                                                zone_ui.open = false;
-                                                gscreen = feed_view.screen_loadout;
-                                                gscroll_px = 0;
+                                                rs.zone_ui.open = false;
+                                                rs.gscreen = feed_view.screen_loadout;
+                                                rs.gscroll_px = 0;
                                             },
-                                            else => applyLoadoutAction(sact, zone_cards, zone_blob, &zone_seated, &zone_ui, &loadout_dirty),
+                                            else => applyLoadoutAction(sact, rs.zone_cards, rs.zone_blob, &rs.zone_seated, &rs.zone_ui, &rs.loadout_dirty),
                                         }
                                     }
                                 } else if (lens_socket.hitTest(g.socket_hits.items, rx, ry)) |sact| {
@@ -2374,65 +2642,65 @@ pub fn run(
                                     // closes it (the open/set arms re-open or keep as needed).
                                     switch (sact) {
                                         .open_swatch, .set_color => {},
-                                        else => gsocket_ui.picking = null,
+                                        else => rs.gsocket_ui.picking = null,
                                     }
                                     switch (sact) {
-                                        .toggle_tray => gsocket_ui.open = !gsocket_ui.open,
+                                        .toggle_tray => rs.gsocket_ui.open = !rs.gsocket_ui.open,
                                         .seat => |cid| {
-                                            if (trayIndexOfCid(socket_cards, socket_blob, cid)) |ni| {
-                                                if (ni != gseated) {
-                                                    gsocket_ui.swap_from = gseated;
-                                                    gsocket_ui.swap_to = ni;
-                                                    gsocket_ui.swap_phase = 1;
-                                                    gseated = ni;
+                                            if (trayIndexOfCid(rs.socket_cards, rs.socket_blob, cid)) |ni| {
+                                                if (ni != rs.gseated) {
+                                                    rs.gsocket_ui.swap_from = rs.gseated;
+                                                    rs.gsocket_ui.swap_to = ni;
+                                                    rs.gsocket_ui.swap_phase = 1;
+                                                    rs.gseated = ni;
                                                     // Seat = re-rank now, scroll to top (owner decision
                                                     // 2026-06-22). The visible gesture today; the actual
                                                     // lens re-ordering is the discover-engine track —
                                                     // THIS is the seam it plugs into (re-rank the feed by
                                                     // the seated lens here, then reset scroll).
-                                                    gscroll_px = 0;
+                                                    rs.gscroll_px = 0;
                                                 }
                                             }
-                                            gsocket_ui.expanded = null;
-                                            gsocket_ui.open = false; // watch it plug in, then the tray retracts
-                                            loadout_dirty = true;
+                                            rs.gsocket_ui.expanded = null;
+                                            rs.gsocket_ui.open = false; // watch it plug in, then the tray retracts
+                                            rs.loadout_dirty = true;
                                         },
                                         // ⓘ → expand inline detail; tapping the open one collapses it.
                                         .expand => |cid| {
-                                            if (trayIndexOfCid(socket_cards, socket_blob, cid)) |idx| {
-                                                gsocket_ui.expanded = if (gsocket_ui.expanded == idx) null else idx;
+                                            if (trayIndexOfCid(rs.socket_cards, rs.socket_blob, cid)) |idx| {
+                                                rs.gsocket_ui.expanded = if (rs.gsocket_ui.expanded == idx) null else idx;
                                             }
                                         },
-                                        .collapse => gsocket_ui.expanded = null,
+                                        .collapse => rs.gsocket_ui.expanded = null,
                                         // Press on a drag handle → start dragging that lens (the
                                         // seated one has no handle, §7.3). The ghost follows the
                                         // pointer; the drop lands on button_up.
                                         .reorder => |r| {
-                                            gsocket_ui.picking = null;
-                                            gsocket_ui.drag_active = trayIndexOfCid(socket_cards, socket_blob, r.lens);
-                                            gsocket_ui.drag_x = rx;
-                                            gsocket_ui.drag_y = ry;
+                                            rs.gsocket_ui.picking = null;
+                                            rs.gsocket_ui.drag_active = trayIndexOfCid(rs.socket_cards, rs.socket_blob, r.lens);
+                                            rs.gsocket_ui.drag_x = rx;
+                                            rs.gsocket_ui.drag_y = ry;
                                         },
                                         // Tap a card's swatch → open/close its color picker (§11.5).
                                         .open_swatch => |cid| {
-                                            const idx = trayIndexOfCid(socket_cards, socket_blob, cid);
-                                            gsocket_ui.picking = if (gsocket_ui.picking == idx) null else idx;
+                                            const idx = trayIndexOfCid(rs.socket_cards, rs.socket_blob, cid);
+                                            rs.gsocket_ui.picking = if (rs.gsocket_ui.picking == idx) null else idx;
                                         },
                                         // Pick a color → recolor that lens (totally the user's
                                         // call; duplicates allowed). If it's the seated lens, the
                                         // whole-UI accent follows next frame (seatedAccent).
                                         .set_color => |sc2| {
-                                            if (trayIndexOfCid(socket_cards, socket_blob, sc2.lens)) |idx| {
-                                                if (idx < socket_cards.len) socket_cards[idx].color = sc2.color;
-                                                loadout_dirty = true;
+                                            if (trayIndexOfCid(rs.socket_cards, rs.socket_blob, sc2.lens)) |idx| {
+                                                if (idx < rs.socket_cards.len) rs.socket_cards[idx].color = sc2.color;
+                                                rs.loadout_dirty = true;
                                             }
-                                            gsocket_ui.picking = null;
+                                            rs.gsocket_ui.picking = null;
                                         },
                                         // "get more" → the Algorithms (loadout) page.
                                         .get_more => {
-                                            gsocket_ui.picking = null;
-                                            gsocket_ui.open = false;
-                                            gscreen = feed_view.screen_loadout;
+                                            rs.gsocket_ui.picking = null;
+                                            rs.gsocket_ui.open = false;
+                                            rs.gscreen = feed_view.screen_loadout;
                                         },
                                     }
                                 }
@@ -2441,23 +2709,23 @@ pub fn run(
                                     // fires on button_up only if the release lands on
                                     // the same target — press-then-slide-off cancels.
                                     if (feed_view.hitTest(g.regions.items, rx, ry)) |hit| {
-                                        gsocket_ui.picking = null; // a click off the socket closes the picker
+                                        rs.gsocket_ui.picking = null; // a click off the socket closes the picker
                                         // The ROOTED post's body is selectable, not a
                                         // re-root target: a press there places the caret
                                         // and begins a text selection (web-style — a
                                         // release without a drag clears it). Don't arm a tap.
-                                        const is_focus_body = gscreen == feed_view.screen_thread and hit.kind == .post_body and
+                                        const is_focus_body = rs.gscreen == feed_view.screen_thread and hit.kind == .post_body and
                                             hit.post < view_items.len and view_items[hit.post].is_focus;
                                         if (is_focus_body) {
-                                            if (g.gpu) |gs| selectPress(gs, rx, ry, &last_click_ns, &last_click_x, &last_click_y, &click_count, clock_shell.monotonicNanos());
+                                            if (g.gpu) |gs| selectPress(gs, rx, ry, &rs.last_click_ns, &rs.last_click_x, &rs.last_click_y, &rs.click_count, clock_shell.monotonicNanos());
                                         } else {
-                                            armed_kind = hit.kind;
-                                            armed_post = hit.post;
+                                            rs.armed_kind = hit.kind;
+                                            rs.armed_post = hit.post;
                                         }
                                     } else if (field_ui.hitTest(cx, cy, g.hr.slice())) |_| {
-                                        armed_legacy = true;
-                                        armed_cx = cx;
-                                        armed_cy = cy;
+                                        rs.armed_legacy = true;
+                                        rs.armed_cx = cx;
+                                        rs.armed_cy = cy;
                                     }
                                 }
                                 }
@@ -2471,83 +2739,83 @@ pub fn run(
                                 // anchor==focus, i.e. an empty selection = cleared).
                                 if (g.gpu) |gs| gs.sel_dragging = false;
                                 // Finish any drag with a drop first (the press began it).
-                                if (gscreen == feed_view.screen_loadout) {
-                                    if (page_drag_surface) |s| switch (s) {
-                                        0 => pageDragDrop(socket_cards, socket_blob, &gseated, &gsocket_ui, page_geoms[0], &loadout_dirty),
-                                        1 => pageDragDrop(reply_cards, reply_blob, &reply_seated, &reply_ui, page_geoms[1], &loadout_dirty),
-                                        else => pageDragDrop(zone_cards, zone_blob, &zone_seated, &zone_ui, page_geoms[2], &loadout_dirty),
+                                if (rs.gscreen == feed_view.screen_loadout) {
+                                    if (rs.page_drag_surface) |s| switch (s) {
+                                        0 => pageDragDrop(rs.socket_cards, rs.socket_blob, &rs.gseated, &rs.gsocket_ui, rs.page_geoms[0], &rs.loadout_dirty),
+                                        1 => pageDragDrop(rs.reply_cards, rs.reply_blob, &rs.reply_seated, &rs.reply_ui, rs.page_geoms[1], &rs.loadout_dirty),
+                                        else => pageDragDrop(rs.zone_cards, rs.zone_blob, &rs.zone_seated, &rs.zone_ui, rs.page_geoms[2], &rs.loadout_dirty),
                                     };
-                                } else if (gsocket_ui.drag_active) |d| {
-                                    const geom = feed_view.homeSocketGeom(if (gpu_state != null) @as(i32, @intCast(design_w)) else @as(i32, @intCast(win.fb.width)));
-                                    const to: u32 = lens_socket.dropIndex(home_tray, gsocket_ui, geom) orelse d;
-                                    const seated_off = if (gseated < socket_cards.len) socket_cards[gseated].cid.off else 0;
-                                    reorderTray(socket_cards, d, to);
-                                    for (socket_cards, 0..) |c, ix| {
+                                } else if (rs.gsocket_ui.drag_active) |d| {
+                                    const geom = feed_view.homeSocketGeom(if (rs.gpu_state != null) @as(i32, @intCast(design_w)) else @as(i32, @intCast(win.fb.width)));
+                                    const to: u32 = lens_socket.dropIndex(home_tray, rs.gsocket_ui, geom) orelse d;
+                                    const seated_off = if (rs.gseated < rs.socket_cards.len) rs.socket_cards[rs.gseated].cid.off else 0;
+                                    reorderTray(rs.socket_cards, d, to);
+                                    for (rs.socket_cards, 0..) |c, ix| {
                                         if (c.cid.off == seated_off) {
-                                            gseated = @intCast(ix);
+                                            rs.gseated = @intCast(ix);
                                             break;
                                         }
                                     }
-                                    gsocket_ui.drag_active = to; // the card now lives at `to`
-                                    gsocket_ui.settle_phase = 1; // ghost eases from release point into its slot
-                                    loadout_dirty = true;
+                                    rs.gsocket_ui.drag_active = to; // the card now lives at `to`
+                                    rs.gsocket_ui.settle_phase = 1; // ghost eases from release point into its slot
+                                    rs.loadout_dirty = true;
                                 }
                                 // Release-activation: fire the armed feed tap ONLY if the
                                 // release lands on the same target the press armed. A press
                                 // that began a drag never armed a tap, so a drag never also
                                 // fires one.
-                                if (armed_kind) |ak| {
+                                if (rs.armed_kind) |ak| {
                                     if (feed_view.hitTest(g.regions.items, rx, ry)) |hit| {
-                                        if (hit.kind == ak and hit.post == armed_post) {
+                                        if (hit.kind == ak and hit.post == rs.armed_post) {
                                             // An open Repost/Quote menu is dismissed by any tap
                                             // outside its rows (and the repost button that toggles
                                             // it), and the tap is swallowed — the popover norm.
-                                            if (grepost_menu != null and hit.kind != .repost_do and hit.kind != .quote_new and hit.kind != .repost) {
-                                                grepost_menu = null;
+                                            if (rs.grepost_menu != null and hit.kind != .repost_do and hit.kind != .quote_new and hit.kind != .repost) {
+                                                rs.grepost_menu = null;
                                             } else switch (hit.kind) {
                                         // Left-rail destination: switch the active screen
                                         // (post carries the Screen index). Selecting Profile
                                         // targets YOUR own profile; the next frame re-renders.
                                         .nav => {
-                                            gscreen = @intCast(hit.post);
-                                            if (gscreen == feed_view.screen_profile) {
-                                                profile_target_did = session.did;
-                                                profile_dirty = true;
+                                            rs.gscreen = @intCast(hit.post);
+                                            if (rs.gscreen == feed_view.screen_profile) {
+                                                rs.profile_target_did = session.did;
+                                                rs.profile_dirty = true;
                                             }
                                             // Each screen starts at the top (scroll is shared).
-                                            gscroll_px = 0;
+                                            rs.gscroll_px = 0;
                                         },
                                         // Avatar tap → open THAT author's profile (any author;
                                         // the DID comes from the post's at-uri). A query over
                                         // the shared store — same engagement/identity truth.
                                         .author => if (hit.post < view_items.len) {
                                             const did = authorDidFromUri(view_items[hit.post].uri);
-                                            if (did.len > 0 and did.len <= profile_target_buf.len) {
-                                                @memcpy(profile_target_buf[0..did.len], did);
-                                                profile_target_did = profile_target_buf[0..did.len];
-                                                gscreen = feed_view.screen_profile;
-                                                profile_dirty = true;
+                                            if (did.len > 0 and did.len <= rs.profile_target_buf.len) {
+                                                @memcpy(rs.profile_target_buf[0..did.len], did);
+                                                rs.profile_target_did = rs.profile_target_buf[0..did.len];
+                                                rs.gscreen = feed_view.screen_profile;
+                                                rs.profile_dirty = true;
                                             }
                                         },
                                         // New-post button → the composer (cell path for now).
                                         .compose => {
-                                            compose_kind = .post;
-                                            mode = .compose;
+                                            rs.compose_kind = .post;
+                                            rs.mode = .compose;
                                         },
                                         // "Edit profile" → reuse the composer to set your
                                         // display name; prefill the current one (when it's a
                                         // real name, not the handle fallback). Saved via
                                         // putProfile on send (handleComposeInput).
                                         .edit_profile => {
-                                            compose_kind = .profile;
-                                            textedit.clear(&compose);
+                                            rs.compose_kind = .profile;
+                                            textedit.clear(&rs.compose);
                                             if (profile_header) |ph| {
                                                 const bare = if (ph.handle.len > 1) ph.handle[1..] else "";
                                                 if (ph.display_name.len > 0 and !std.mem.eql(u8, ph.display_name, bare))
-                                                    textedit.set(&compose, ph.display_name);
+                                                    textedit.set(&rs.compose, ph.display_name);
                                             }
-                                            mode = .compose;
-                                            status = "edit display name · Enter saves";
+                                            rs.mode = .compose;
+                                            rs.status = "edit display name · Enter saves";
                                         },
                                         // Like / boost: the SAME path the keyboard uses —
                                         // optimistic toggle (heart fills red), persist via
@@ -2556,23 +2824,23 @@ pub fn run(
                                         // the one shared store, so a like from the profile
                                         // updates the same record Home shows (ZONES inv. 4).
                                         .like => if (hit.post < view_items.len) {
-                                            state.selected = hit.post;
-                                            const r = try engageSelected(.like, gpa, arena, session, store, view_items[hit.post], hit.post, gscreen, profile_target_did, thread_focus_cid, zone_tag, thread_rerooted, gcollapsed.items, feed_config, reply_config, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
-                                            if (r.status.len > 0) status = r.status;
+                                            rs.state.selected = hit.post;
+                                            const r = try engageSelected(.like, gpa, arena, session, store, view_items[hit.post], hit.post, rs.gscreen, rs.profile_target_did, rs.thread_focus_cid, rs.zone_tag, rs.thread_rerooted, rs.gcollapsed.items, feed_config, reply_config, &rs.state, rs.revealed.items, now, rs.out, &rs.prev, &rs.next, backend, pix, rs.writer, &rs.deferred_unlike, &rs.deferred_unrepost);
+                                            if (r.status.len > 0) rs.status = r.status;
                                         },
                                         // Repost button → OPEN the Repost/Quote menu for
                                         // this post (a second tap closes it). The middle
                                         // action doubles as repost + quote (the universal
                                         // pattern); the choice is made in the menu below.
                                         .repost => if (hit.post < view_items.len) {
-                                            grepost_menu = if (grepost_menu == @as(u16, @intCast(hit.post))) null else @intCast(hit.post);
+                                            rs.grepost_menu = if (rs.grepost_menu == @as(u16, @intCast(hit.post))) null else @intCast(hit.post);
                                         },
                                         // Menu "Repost" row → the optimistic repost toggle.
                                         .repost_do => if (hit.post < view_items.len) {
-                                            grepost_menu = null;
-                                            state.selected = hit.post;
-                                            const r = try engageSelected(.repost, gpa, arena, session, store, view_items[hit.post], hit.post, gscreen, profile_target_did, thread_focus_cid, zone_tag, thread_rerooted, gcollapsed.items, feed_config, reply_config, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
-                                            if (r.status.len > 0) status = r.status;
+                                            rs.grepost_menu = null;
+                                            rs.state.selected = hit.post;
+                                            const r = try engageSelected(.repost, gpa, arena, session, store, view_items[hit.post], hit.post, rs.gscreen, rs.profile_target_did, rs.thread_focus_cid, rs.zone_tag, rs.thread_rerooted, rs.gcollapsed.items, feed_config, reply_config, &rs.state, rs.revealed.items, now, rs.out, &rs.prev, &rs.next, backend, pix, rs.writer, &rs.deferred_unlike, &rs.deferred_unrepost);
+                                            if (r.status.len > 0) rs.status = r.status;
                                         },
                                         // Reply → open the premium composer in reply
                                         // mode for the TAPPED post (C2). Same sequence
@@ -2583,19 +2851,19 @@ pub fn run(
                                         .reply => if (hit.post < view_items.len) {
                                             const item = view_items[hit.post];
                                             if (feed_core.replyRefsForCid(store, item.cid)) |refs| {
-                                                _ = compose_arena_state.reset(.retain_capacity);
-                                                const compose_arena = compose_arena_state.allocator();
-                                                reply_target = .{
+                                                _ = rs.compose_arena_state.reset(.retain_capacity);
+                                                const compose_arena = rs.compose_arena_state.allocator();
+                                                rs.reply_target = .{
                                                     .root_uri = try compose_arena.dupe(u8, refs.root_uri),
                                                     .root_cid = try compose_arena.dupe(u8, refs.root_cid),
                                                     .parent_uri = try compose_arena.dupe(u8, refs.parent_uri),
                                                     .parent_cid = try compose_arena.dupe(u8, refs.parent_cid),
                                                 };
-                                                reply_handle = try compose_arena.dupe(u8, item.author_handle);
-                                                compose_kind = .post;
-                                                textedit.clear(&compose);
-                                                status = "";
-                                                mode = .compose;
+                                                rs.reply_handle = try compose_arena.dupe(u8, item.author_handle);
+                                                rs.compose_kind = .post;
+                                                textedit.clear(&rs.compose);
+                                                rs.status = "";
+                                                rs.mode = .compose;
                                             }
                                         },
                                         // Quote → open the composer with the tapped post
@@ -2603,22 +2871,22 @@ pub fn run(
                                         // first segment on send). Refs copied into the
                                         // compose arena (they outlive this frame).
                                         .quote_new => if (hit.post < view_items.len) {
-                                            grepost_menu = null;
+                                            rs.grepost_menu = null;
                                             const item = view_items[hit.post];
                                             if (item.uri.len > 0 and item.cid.len > 0) {
-                                                _ = compose_arena_state.reset(.retain_capacity);
-                                                const compose_arena = compose_arena_state.allocator();
-                                                quote_target = .{
+                                                _ = rs.compose_arena_state.reset(.retain_capacity);
+                                                const compose_arena = rs.compose_arena_state.allocator();
+                                                rs.quote_target = .{
                                                     .uri = try compose_arena.dupe(u8, item.uri),
                                                     .cid = try compose_arena.dupe(u8, item.cid),
                                                 };
-                                                quoting_handle = try compose_arena.dupe(u8, item.author_handle);
-                                                reply_target = null;
-                                                reply_handle = "";
-                                                compose_kind = .post;
-                                                textedit.clear(&compose);
-                                                status = "";
-                                                mode = .compose;
+                                                rs.quoting_handle = try compose_arena.dupe(u8, item.author_handle);
+                                                rs.reply_target = null;
+                                                rs.reply_handle = "";
+                                                rs.compose_kind = .post;
+                                                textedit.clear(&rs.compose);
+                                                rs.status = "";
+                                                rs.mode = .compose;
                                             }
                                         },
                                         // Quote card tap → open the QUOTED post's thread
@@ -2626,16 +2894,16 @@ pub fn run(
                                         // the store's quote_of edge). Mirrors .post_body.
                                         .quote_open => if (hit.post < view_items.len) {
                                             const item = view_items[hit.post];
-                                            if (item.quote_cid.len > 0 and item.quote_cid.len <= thread_focus_cid_buf.len and item.quote_uri.len <= thread_focus_uri_buf.len) {
-                                                @memcpy(thread_focus_cid_buf[0..item.quote_cid.len], item.quote_cid);
-                                                thread_focus_cid = thread_focus_cid_buf[0..item.quote_cid.len];
-                                                @memcpy(thread_focus_uri_buf[0..item.quote_uri.len], item.quote_uri);
-                                                thread_focus_uri = thread_focus_uri_buf[0..item.quote_uri.len];
-                                                const was_in_thread = gscreen == feed_view.screen_thread;
-                                                if (!was_in_thread) thread_return_screen = gscreen;
-                                                gscreen = feed_view.screen_thread;
-                                                thread_dirty = true;
-                                                thread_rerooted = was_in_thread;
+                                            if (item.quote_cid.len > 0 and item.quote_cid.len <= rs.thread_focus_cid_buf.len and item.quote_uri.len <= rs.thread_focus_uri_buf.len) {
+                                                @memcpy(rs.thread_focus_cid_buf[0..item.quote_cid.len], item.quote_cid);
+                                                rs.thread_focus_cid = rs.thread_focus_cid_buf[0..item.quote_cid.len];
+                                                @memcpy(rs.thread_focus_uri_buf[0..item.quote_uri.len], item.quote_uri);
+                                                rs.thread_focus_uri = rs.thread_focus_uri_buf[0..item.quote_uri.len];
+                                                const was_in_thread = rs.gscreen == feed_view.screen_thread;
+                                                if (!was_in_thread) rs.thread_return_screen = rs.gscreen;
+                                                rs.gscreen = feed_view.screen_thread;
+                                                rs.thread_dirty = true;
+                                                rs.thread_rerooted = was_in_thread;
                                                 g.scroll.* = 0;
                                                 if (g.gpu) |gs| {
                                                     gs.scroll_to_focus = true;
@@ -2654,22 +2922,22 @@ pub fn run(
                                         // rebuilt next frame.
                                         .post_body => if (hit.post < view_items.len) {
                                             const item = view_items[hit.post];
-                                            if (item.cid.len > 0 and item.cid.len <= thread_focus_cid_buf.len and item.uri.len <= thread_focus_uri_buf.len) {
-                                                @memcpy(thread_focus_cid_buf[0..item.cid.len], item.cid);
-                                                thread_focus_cid = thread_focus_cid_buf[0..item.cid.len];
-                                                @memcpy(thread_focus_uri_buf[0..item.uri.len], item.uri);
-                                                thread_focus_uri = thread_focus_uri_buf[0..item.uri.len];
-                                                const was_in_thread = gscreen == feed_view.screen_thread;
-                                                if (!was_in_thread) thread_return_screen = gscreen;
-                                                gscreen = feed_view.screen_thread;
-                                                thread_dirty = true;
+                                            if (item.cid.len > 0 and item.cid.len <= rs.thread_focus_cid_buf.len and item.uri.len <= rs.thread_focus_uri_buf.len) {
+                                                @memcpy(rs.thread_focus_cid_buf[0..item.cid.len], item.cid);
+                                                rs.thread_focus_cid = rs.thread_focus_cid_buf[0..item.cid.len];
+                                                @memcpy(rs.thread_focus_uri_buf[0..item.uri.len], item.uri);
+                                                rs.thread_focus_uri = rs.thread_focus_uri_buf[0..item.uri.len];
+                                                const was_in_thread = rs.gscreen == feed_view.screen_thread;
+                                                if (!was_in_thread) rs.thread_return_screen = rs.gscreen;
+                                                rs.gscreen = feed_view.screen_thread;
+                                                rs.thread_dirty = true;
                                                 // First tap from the timeline = WHOLE thread; a tap
                                                 // INSIDE the thread = RE-ROOT (condensed ancestors
                                                 // above the focus). EITHER way, land ON the tapped
                                                 // post (it's the new root) — ancestors sit above,
                                                 // scrollable up — so a deep-chain tap doesn't dump
                                                 // you at the top to scroll back down.
-                                                thread_rerooted = was_in_thread;
+                                                rs.thread_rerooted = was_in_thread;
                                                 g.scroll.* = 0;
                                                 if (g.gpu) |gs| {
                                                     gs.scroll_to_focus = true;
@@ -2686,17 +2954,17 @@ pub fn run(
                                         .back => {
                                             // The transparency page, zone page, and thread
                                             // share Back; each returns where it was entered.
-                                            if (gscreen == feed_view.screen_transparency) {
-                                                if (gtransp_source) {
+                                            if (rs.gscreen == feed_view.screen_transparency) {
+                                                if (rs.gtransp_source) {
                                                     // On the source sub-view → back to the summary.
-                                                    gtransp_source = false;
+                                                    rs.gtransp_source = false;
                                                 } else {
-                                                    gscreen = transp_return_screen;
-                                                    if (inspect_bytes) |b| gpa.free(b);
-                                                    inspect_bytes = null;
+                                                    rs.gscreen = rs.transp_return_screen;
+                                                    if (rs.inspect_bytes) |b| gpa.free(b);
+                                                    rs.inspect_bytes = null;
                                                 }
                                             } else {
-                                                gscreen = if (gscreen == feed_view.screen_zones) zone_return_screen else thread_return_screen;
+                                                rs.gscreen = if (rs.gscreen == feed_view.screen_zones) rs.zone_return_screen else rs.thread_return_screen;
                                             }
                                             g.scroll.* = 0;
                                         },
@@ -2706,9 +2974,9 @@ pub fn run(
                                         .reveal_new => {
                                             _ = feed_core.revealPending(gpa, store) catch 0;
                                             g.scroll.* = 0;
-                                            gview.scroll_rows = 0;
-                                            state.selected = 0;
-                                            status = "";
+                                            rs.gview.scroll_rows = 0;
+                                            rs.state.selected = 0;
+                                            rs.status = "";
                                         },
                                         // The composer's footer buttons never appear
                                         // on the timeline; they are handled in compose
@@ -2720,59 +2988,59 @@ pub fn run(
                                         // them. A tap is a no-op for now.
                                         // Algorithms-page sub-tab (Loadout / Marketplace / Create).
                                         .loadout_tab => {
-                                            gloadout_tab = @intCast(hit.post);
-                                            if (hit.post == 2) gcreate_step = .landing; // Create opens on its landing page
-                                            gscroll_px = 0; // top of the newly-selected tab
+                                            rs.gloadout_tab = @intCast(hit.post);
+                                            if (hit.post == 2) rs.gcreate_step = .landing; // Create opens on its landing page
+                                            rs.gscroll_px = 0; // top of the newly-selected tab
                                         },
                                         // ---- The simple-Create flow (loadout tab 2) ----
                                         // Pick a question option → record the answer, rebuild
                                         // the config from the answers, and advance a step
                                         // (privacy → the recap).
                                         .create_pick => {
-                                            create_flow.applyAnswer(&gcreate_answers, gcreate_step, hit.post);
-                                            gcreate_config = builder.build(gcreate_answers);
-                                            gcreate_step = create_flow.nextStep(gcreate_step);
-                                            if (gcreate_step == .preparing) gcreate_prepare_frames = 0; // start the beat
-                                            gscroll_px = 0;
+                                            create_flow.applyAnswer(&rs.gcreate_answers, rs.gcreate_step, hit.post);
+                                            rs.gcreate_config = builder.build(rs.gcreate_answers);
+                                            rs.gcreate_step = create_flow.nextStep(rs.gcreate_step);
+                                            if (rs.gcreate_step == .preparing) rs.gcreate_prepare_frames = 0; // start the beat
+                                            rs.gscroll_px = 0;
                                         },
                                         .create_back => {
-                                            gcreate_step = create_flow.prevStep(gcreate_step);
-                                            if (gcreate_step == .preparing) gcreate_step = .privacy; // skip the beat going back
-                                            gscroll_px = 0;
+                                            rs.gcreate_step = create_flow.prevStep(rs.gcreate_step);
+                                            if (rs.gcreate_step == .preparing) rs.gcreate_step = .privacy; // skip the beat going back
+                                            rs.gscroll_px = 0;
                                         },
                                         .create_next => { // landing → questions, recap → name
-                                            gcreate_step = create_flow.nextStep(gcreate_step);
-                                            gscroll_px = 0;
+                                            rs.gcreate_step = create_flow.nextStep(rs.gcreate_step);
+                                            rs.gscroll_px = 0;
                                         },
-                                        .create_dev => status = "Developer submission is coming soon — write it in Zal and publish.",
+                                        .create_dev => rs.status = "Developer submission is coming soon — write it in Zal and publish.",
                                         .create_knob_dec, .create_knob_inc => {
                                             const k: create_flow.Knob = @enumFromInt(@as(u8, @intCast(hit.post)));
                                             const step = create_flow.knobMeta(k).step;
-                                            const cur = create_flow.knobValue(gcreate_config, k);
-                                            create_flow.knobSet(&gcreate_config, k, if (hit.kind == .create_knob_inc) cur + step else cur - step);
+                                            const cur = create_flow.knobValue(rs.gcreate_config, k);
+                                            create_flow.knobSet(&rs.gcreate_config, k, if (hit.kind == .create_knob_inc) cur + step else cur - step);
                                         },
-                                        .create_color => gcreate_color = @intCast(hit.post),
+                                        .create_color => rs.gcreate_color = @intCast(hit.post),
                                         // Finalize: serialize the config into a PRIVATE library
                                         // record (a minted local id), reset the flow, and drop
                                         // the user back on their loadout with it saved.
                                         .create_save => {
                                             var idbuf: [24]u8 = undefined;
-                                            const id = std.fmt.bufPrint(&idbuf, "user:{d}", .{algo_uid}) catch "user:x";
-                                            const nm = if (gcreate_name_len > 0) gcreate_name_buf[0..gcreate_name_len] else "My feed";
-                                            if (create_flow.finalize(arena, gcreate_config, id, nm, gcreate_color)) |new| {
-                                                if (algo_lib.add(gpa, new)) |_| {
-                                                    algo_uid += 1;
-                                                    _ = cache_shell.saveLibrary(gpa, environ, &algo_lib); // persist across launches
-                                                    status = "Saved to your library.";
-                                                    gcreate_step = .pace;
-                                                    gcreate_answers = .{};
-                                                    gcreate_config = builder.build(.{});
-                                                    gcreate_name_len = 0;
-                                                    gcreate_color = 0;
-                                                    gloadout_tab = 0;
-                                                    gscroll_px = 0;
-                                                } else |_| status = "Couldn't save — out of memory.";
-                                            } else |_| status = "Couldn't build that feed.";
+                                            const id = std.fmt.bufPrint(&idbuf, "user:{d}", .{rs.algo_uid}) catch "user:x";
+                                            const nm = if (rs.gcreate_name_len > 0) rs.gcreate_name_buf[0..rs.gcreate_name_len] else "My feed";
+                                            if (create_flow.finalize(arena, rs.gcreate_config, id, nm, rs.gcreate_color)) |new| {
+                                                if (rs.algo_lib.add(gpa, new)) |_| {
+                                                    rs.algo_uid += 1;
+                                                    _ = cache_shell.saveLibrary(gpa, environ, &rs.algo_lib); // persist across launches
+                                                    rs.status = "Saved to your library.";
+                                                    rs.gcreate_step = .pace;
+                                                    rs.gcreate_answers = .{};
+                                                    rs.gcreate_config = builder.build(.{});
+                                                    rs.gcreate_name_len = 0;
+                                                    rs.gcreate_color = 0;
+                                                    rs.gloadout_tab = 0;
+                                                    rs.gscroll_px = 0;
+                                                } else |_| rs.status = "Couldn't save — out of memory.";
+                                            } else |_| rs.status = "Couldn't build that feed.";
                                         },
                                         // Reddit-style collapse: toggle this reply's CID in the
                                         // per-view collapsed set (no network — buildThreadView
@@ -2780,15 +3048,15 @@ pub fn run(
                                         .collapse => if (hit.post < view_items.len) {
                                             const cid = view_items[hit.post].cid;
                                             var found: ?usize = null;
-                                            for (gcollapsed.items, 0..) |c, ix| if (std.mem.eql(u8, c, cid)) {
+                                            for (rs.gcollapsed.items, 0..) |c, ix| if (std.mem.eql(u8, c, cid)) {
                                                 found = ix;
                                                 break;
                                             };
                                             if (found) |ix| {
-                                                gpa.free(gcollapsed.items[ix]);
-                                                _ = gcollapsed.swapRemove(ix);
+                                                gpa.free(rs.gcollapsed.items[ix]);
+                                                _ = rs.gcollapsed.swapRemove(ix);
                                             } else if (gpa.dupe(u8, cid)) |d| {
-                                                gcollapsed.append(gpa, d) catch gpa.free(d);
+                                                rs.gcollapsed.append(gpa, d) catch gpa.free(d);
                                             } else |_| {}
                                         },
                                         // Main-feed Read-more: toggle this post's CID in the
@@ -2799,15 +3067,15 @@ pub fn run(
                                         .expand => if (hit.post < view_items.len) {
                                             const cid = view_items[hit.post].cid;
                                             var found: ?usize = null;
-                                            for (gexpanded.items, 0..) |c, ix| if (std.mem.eql(u8, c, cid)) {
+                                            for (rs.gexpanded.items, 0..) |c, ix| if (std.mem.eql(u8, c, cid)) {
                                                 found = ix;
                                                 break;
                                             };
                                             if (found) |ix| {
-                                                gpa.free(gexpanded.items[ix]);
-                                                _ = gexpanded.swapRemove(ix);
+                                                gpa.free(rs.gexpanded.items[ix]);
+                                                _ = rs.gexpanded.swapRemove(ix);
                                             } else if (gpa.dupe(u8, cid)) |d| {
-                                                gexpanded.append(gpa, d) catch gpa.free(d);
+                                                rs.gexpanded.append(gpa, d) catch gpa.free(d);
                                             } else |_| {}
                                         },
                                         .bookmark, .share, .more, .profile_tab => {},
@@ -2816,105 +3084,105 @@ pub fn run(
                                         // the same ordering query the list was built from (no
                                         // store index rides a region, A5).
                                         .chat_conv => if (dev_chat) {
-                                            if (chat_core.conversationsByActivity(gpa, &gchat_store) catch null) |order| {
+                                            if (chat_core.conversationsByActivity(gpa, &rs.gchat_store) catch null) |order| {
                                                 defer gpa.free(order);
                                                 if (hit.post < order.len) {
-                                                    gchat_sel = order[hit.post];
-                                                    chat_core.markRead(&gchat_store, order[hit.post]);
+                                                    rs.gchat_sel = order[hit.post];
+                                                    chat_core.markRead(&rs.gchat_store, order[hit.post]);
                                                     // M2: read-state survives a relaunch too.
-                                                    chatPersistHistory(gpa, io, environ, if (gchat_e2ee) |*p| p else null, &gchat_store);
-                                                    gchat_input_focus = true;
-                                                    gchat_composing = false; // a row tap leaves the compose flow
-                                                    gpay_open = false; // the sheet belongs to one conversation
-                                                    gscroll_px = 0; // newest, bottom-anchored
+                                                    chatPersistHistory(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
+                                                    rs.gchat_input_focus = true;
+                                                    rs.gchat_composing = false; // a row tap leaves the compose flow
+                                                    rs.gpay_open = false; // the sheet belongs to one conversation
+                                                    rs.gscroll_px = 0; // newest, bottom-anchored
                                                 }
                                             }
                                         },
                                         .chat_input => if (dev_chat) {
-                                            gchat_input_focus = true;
-                                            gchat_composing = false;
+                                            rs.gchat_input_focus = true;
+                                            rs.gchat_composing = false;
                                         },
                                         // "+ New": open (or close) the recipient bar; it owns
                                         // the keyboard while open. Tapping the bar itself is
                                         // inert — being open IS its focus state.
                                         .chat_new => if (dev_chat) {
-                                            gchat_composing = !gchat_composing;
-                                            gchat_peer_len = 0;
-                                            gchat_compose_status = "";
-                                            gchat_input_focus = false;
+                                            rs.gchat_composing = !rs.gchat_composing;
+                                            rs.gchat_peer_len = 0;
+                                            rs.gchat_compose_status = "";
+                                            rs.gchat_input_focus = false;
                                         },
                                         .chat_compose_input => {},
                                         .chat_send => if (dev_chat) {
-                                            const body = std.mem.trimEnd(u8, gchat_draft_buf[0..gchat_draft_len], " \n");
-                                            if (body.len > 0) if (gchat_sel) |sc| {
-                                                _ = chat_core.appendMessage(gpa, &gchat_store, sc, .text, body, now, true) catch {};
-                                                chatSend(gpa, io, environ, if (gchat_e2ee) |*st| st else null, gchat_link, &gchat_store, sc, body);
-                                                chatPersistHistory(gpa, io, environ, if (gchat_e2ee) |*p| p else null, &gchat_store);
-                                                gchat_draft_len = 0;
-                                                gchat_input_focus = true;
-                                                gscroll_px = 0;
+                                            const body = std.mem.trimEnd(u8, rs.gchat_draft_buf[0..rs.gchat_draft_len], " \n");
+                                            if (body.len > 0) if (rs.gchat_sel) |sc| {
+                                                _ = chat_core.appendMessage(gpa, &rs.gchat_store, sc, .text, body, now, true) catch {};
+                                                chatSend(gpa, io, environ, if (rs.gchat_e2ee) |*st| st else null, rs.gchat_link, &rs.gchat_store, sc, body);
+                                                chatPersistHistory(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
+                                                rs.gchat_draft_len = 0;
+                                                rs.gchat_input_focus = true;
+                                                rs.gscroll_px = 0;
                                             };
                                         },
                                         // The pay sheet (M5 A4): the button toggles it;
                                         // it owns the keyboard while open.
                                         .pay_open => if (dev_chat) {
                                             // Learn (once) whether payments are set up.
-                                            if (!grecv_known) {
-                                                grecv_known = true;
-                                                _ = gchat_arena_state.reset(.retain_capacity);
-                                                grecv_set = loadOwnReceive(gpa, gchat_arena_state.allocator(), io, environ, session, &grecv_ln_buf, &grecv_ln_len, &grecv_btc_buf, &grecv_btc_len);
+                                            if (!rs.grecv_known) {
+                                                rs.grecv_known = true;
+                                                _ = rs.gchat_arena_state.reset(.retain_capacity);
+                                                rs.grecv_set = loadOwnReceive(gpa, rs.gchat_arena_state.allocator(), io, environ, session, &rs.grecv_ln_buf, &rs.grecv_ln_len, &rs.grecv_btc_buf, &rs.grecv_btc_len);
                                             }
-                                            gchat_input_focus = false;
-                                            gchat_composing = false;
-                                            if (grecv_set) {
+                                            rs.gchat_input_focus = false;
+                                            rs.gchat_composing = false;
+                                            if (rs.grecv_set) {
                                                 // Set up → the pay sheet (request/send).
-                                                gpay_open = !gpay_open;
-                                                gpay_status = "";
-                                                gpay_focus = 0;
-                                                gpay_confirm = false;
-                                                grecv_open = false;
+                                                rs.gpay_open = !rs.gpay_open;
+                                                rs.gpay_status = "";
+                                                rs.gpay_focus = 0;
+                                                rs.gpay_confirm = false;
+                                                rs.grecv_open = false;
                                             } else {
                                                 // Not set up → onboard, never a dead form.
-                                                grecv_open = true;
-                                                grecv_mode = .onboard;
-                                                grecv_status = "";
-                                                gpay_open = false;
+                                                rs.grecv_open = true;
+                                                rs.grecv_mode = .onboard;
+                                                rs.grecv_status = "";
+                                                rs.gpay_open = false;
                                             }
                                         },
                                         .pay_rail => if (dev_chat) {
-                                            gpay_rail = if (hit.post == 1) .onchain else .lightning;
+                                            rs.gpay_rail = if (hit.post == 1) .onchain else .lightning;
                                         },
                                         .pay_chip => if (dev_chat) {
                                             if (hit.post < feed_view.pay_chips.len) {
                                                 var ab: [16]u8 = undefined;
                                                 const s = std.fmt.bufPrint(&ab, "{d}", .{feed_view.pay_chips[hit.post]}) catch "";
-                                                if (s.len <= gpay_amount_buf.len) {
-                                                    @memcpy(gpay_amount_buf[0..s.len], s);
-                                                    gpay_amount_len = s.len;
+                                                if (s.len <= rs.gpay_amount_buf.len) {
+                                                    @memcpy(rs.gpay_amount_buf[0..s.len], s);
+                                                    rs.gpay_amount_len = s.len;
                                                 }
-                                                gpay_unit = .sats; // the chips are sats amounts
-                                                gpay_focus = 0;
+                                                rs.gpay_unit = .sats; // the chips are sats amounts
+                                                rs.gpay_focus = 0;
                                             }
                                         },
                                         .pay_amount => if (dev_chat) {
-                                            gpay_focus = 0;
+                                            rs.gpay_focus = 0;
                                         },
                                         .pay_note => if (dev_chat) {
-                                            gpay_focus = 1;
+                                            rs.gpay_focus = 1;
                                         },
                                         // Toggle the entry unit; clear the draft (a
                                         // sats integer isn't a BTC decimal) so nothing
                                         // is silently reinterpreted by 1e8.
                                         .pay_unit => if (dev_chat) {
-                                            gpay_unit = if (gpay_unit == .sats) .btc else .sats;
-                                            gpay_amount_len = 0;
-                                            gpay_focus = 0;
-                                            gpay_status = "";
+                                            rs.gpay_unit = if (rs.gpay_unit == .sats) .btc else .sats;
+                                            rs.gpay_amount_len = 0;
+                                            rs.gpay_focus = 0;
+                                            rs.gpay_status = "";
                                         },
                                         .pay_cancel => if (dev_chat) {
-                                            gpay_open = false;
-                                            gpay_confirm = false;
-                                            gpay_status = "";
+                                            rs.gpay_open = false;
+                                            rs.gpay_confirm = false;
+                                            rs.gpay_status = "";
                                         },
                                         // The pay sheet's "Set up how you get
                                         // paid" link AND an incoming offer card's
@@ -2924,28 +3192,28 @@ pub fn run(
                                         // flips the offer to ready + signals the
                                         // payer — so the tap just opens the sheet.
                                         .recv_open, .pay_card_setup => if (dev_chat) {
-                                            if (!grecv_known) {
-                                                grecv_known = true;
-                                                _ = gchat_arena_state.reset(.retain_capacity);
-                                                grecv_set = loadOwnReceive(gpa, gchat_arena_state.allocator(), io, environ, session, &grecv_ln_buf, &grecv_ln_len, &grecv_btc_buf, &grecv_btc_len);
+                                            if (!rs.grecv_known) {
+                                                rs.grecv_known = true;
+                                                _ = rs.gchat_arena_state.reset(.retain_capacity);
+                                                rs.grecv_set = loadOwnReceive(gpa, rs.gchat_arena_state.allocator(), io, environ, session, &rs.grecv_ln_buf, &rs.grecv_ln_len, &rs.grecv_btc_buf, &rs.grecv_btc_len);
                                             }
-                                            grecv_open = true;
-                                            gpay_open = false;
-                                            grecv_status = "";
-                                            grecv_saved = false;
-                                            grecv_focus = 0;
-                                            grecv_mode = if (grecv_set) .paste else .onboard;
-                                            gchat_input_focus = false;
-                                            gchat_composing = false;
+                                            rs.grecv_open = true;
+                                            rs.gpay_open = false;
+                                            rs.grecv_status = "";
+                                            rs.grecv_saved = false;
+                                            rs.grecv_focus = 0;
+                                            rs.grecv_mode = if (rs.grecv_set) .paste else .onboard;
+                                            rs.gchat_input_focus = false;
+                                            rs.gchat_composing = false;
                                         },
                                         .recv_have => if (dev_chat) {
-                                            grecv_mode = .paste;
-                                            grecv_focus = 0;
-                                            grecv_status = "";
+                                            rs.grecv_mode = .paste;
+                                            rs.grecv_focus = 0;
+                                            rs.grecv_status = "";
                                         },
                                         .recv_need => if (dev_chat) {
-                                            grecv_mode = .wallets;
-                                            grecv_status = "";
+                                            rs.grecv_mode = .wallets;
+                                            rs.grecv_status = "";
                                         },
                                         .recv_wallet => if (dev_chat) {
                                             // Open the wallet's own site; you get an address there,
@@ -2954,46 +3222,46 @@ pub fn run(
                                                 launch.openUri(io, feed_view.recv_wallets[hit.post].url) catch {};
                                         },
                                         .recv_paste => if (dev_chat) {
-                                            grecv_mode = .paste;
-                                            grecv_focus = 0;
-                                            grecv_status = "";
+                                            rs.grecv_mode = .paste;
+                                            rs.grecv_focus = 0;
+                                            rs.grecv_status = "";
                                         },
                                         .recv_ln => if (dev_chat) {
-                                            grecv_focus = 0;
+                                            rs.grecv_focus = 0;
                                         },
                                         .recv_btc => if (dev_chat) {
-                                            grecv_focus = 1;
+                                            rs.grecv_focus = 1;
                                         },
                                         .recv_cancel => if (dev_chat) {
-                                            grecv_open = false;
-                                            grecv_status = "";
+                                            rs.grecv_open = false;
+                                            rs.grecv_status = "";
                                         },
                                         .recv_save => if (dev_chat) {
-                                            const ln = std.mem.trim(u8, grecv_ln_buf[0..grecv_ln_len], " ");
-                                            const btc = std.mem.trim(u8, grecv_btc_buf[0..grecv_btc_len], " ");
-                                            _ = gchat_arena_state.reset(.retain_capacity);
-                                            grecv_status = saveReceiveAddress(gpa, gchat_arena_state.allocator(), io, environ, session, ln, btc, &grecv_saved);
-                                            if (grecv_saved) {
-                                                grecv_set = true;
+                                            const ln = std.mem.trim(u8, rs.grecv_ln_buf[0..rs.grecv_ln_len], " ");
+                                            const btc = std.mem.trim(u8, rs.grecv_btc_buf[0..rs.grecv_btc_len], " ");
+                                            _ = rs.gchat_arena_state.reset(.retain_capacity);
+                                            rs.grecv_status = saveReceiveAddress(gpa, rs.gchat_arena_state.allocator(), io, environ, session, ln, btc, &rs.grecv_saved);
+                                            if (rs.grecv_saved) {
+                                                rs.grecv_set = true;
                                                 // Now that I can receive, every offer
                                                 // waiting on me can proceed (S2).
-                                                announceReceiveReady(gpa, io, environ, if (gchat_e2ee) |*p| p else null, gchat_link, &gchat_store);
+                                                announceReceiveReady(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, rs.gchat_link, &rs.gchat_store);
                                             }
                                         },
                                         // Remove wallet: unpublish the record (walletless
                                         // again) and clear the fields — one tap, not
                                         // delete-every-char-then-Cancel.
                                         .recv_remove => if (dev_chat) {
-                                            _ = gchat_arena_state.reset(.retain_capacity);
-                                            if (pay_addr.unpublish(gpa, gchat_arena_state.allocator(), io, environ, session)) |_| {
-                                                grecv_ln_len = 0;
-                                                grecv_btc_len = 0;
-                                                grecv_set = false;
-                                                grecv_saved = false;
-                                                grecv_focus = 0;
-                                                grecv_status = "Removed \u{2014} you no longer receive payments here";
+                                            _ = rs.gchat_arena_state.reset(.retain_capacity);
+                                            if (pay_addr.unpublish(gpa, rs.gchat_arena_state.allocator(), io, environ, session)) |_| {
+                                                rs.grecv_ln_len = 0;
+                                                rs.grecv_btc_len = 0;
+                                                rs.grecv_set = false;
+                                                rs.grecv_saved = false;
+                                                rs.grecv_focus = 0;
+                                                rs.grecv_status = "Removed \u{2014} you no longer receive payments here";
                                             } else |_| {
-                                                grecv_status = "Couldn't remove it \u{2014} try again";
+                                                rs.grecv_status = "Couldn't remove it \u{2014} try again";
                                             }
                                         },
                                         // Compose "Send": run the per-action gate
@@ -3004,73 +3272,73 @@ pub fn run(
                                         // whose Confirm is the real hand-off
                                         // (.pay_send). A refusal lands on the sheet.
                                         .pay_arm => if (dev_chat) {
-                                            if (gchat_sel) |sc| {
-                                                const amount = feed_view.payAmountToSats(gpay_amount_buf[0..gpay_amount_len], gpay_unit) orelse 0;
+                                            if (rs.gchat_sel) |sc| {
+                                                const amount = feed_view.payAmountToSats(rs.gpay_amount_buf[0..rs.gpay_amount_len], rs.gpay_unit) orelse 0;
                                                 if (amount == 0 or amount > chat_core.max_amount_sat) {
-                                                    gpay_status = "Enter an amount in sats";
+                                                    rs.gpay_status = "Enter an amount in sats";
                                                 } else {
-                                                    const note = std.mem.trim(u8, gpay_note_buf[0..gpay_note_len], " ");
-                                                    _ = gchat_arena_state.reset(.retain_capacity);
-                                                    const e2ee = if (gchat_e2ee) |*p| p else null;
-                                                    switch (peerSendGate(gpa, gchat_arena_state.allocator(), io, environ, e2ee, &gchat_store, sc, gpay_rail)) {
+                                                    const note = std.mem.trim(u8, rs.gpay_note_buf[0..rs.gpay_note_len], " ");
+                                                    _ = rs.gchat_arena_state.reset(.retain_capacity);
+                                                    const e2ee = if (rs.gchat_e2ee) |*p| p else null;
+                                                    switch (peerSendGate(gpa, rs.gchat_arena_state.allocator(), io, environ, e2ee, &rs.gchat_store, sc, rs.gpay_rail)) {
                                                         .walletless => {
-                                                            gpay_status = payOffer(gpa, io, environ, e2ee, gchat_link, &gchat_store, sc, gpay_rail, amount, note, now);
-                                                            if (gpay_status.len == 0) {
-                                                                gpay_open = false;
-                                                                gpay_confirm = false;
-                                                                gpay_amount_len = 0;
-                                                                gpay_note_len = 0;
-                                                                gscroll_px = 0;
+                                                            rs.gpay_status = payOffer(gpa, io, environ, e2ee, rs.gchat_link, &rs.gchat_store, sc, rs.gpay_rail, amount, note, now);
+                                                            if (rs.gpay_status.len == 0) {
+                                                                rs.gpay_open = false;
+                                                                rs.gpay_confirm = false;
+                                                                rs.gpay_amount_len = 0;
+                                                                rs.gpay_note_len = 0;
+                                                                rs.gscroll_px = 0;
                                                             }
                                                         },
                                                         .has_wallet => {
-                                                            gpay_confirm = true;
-                                                            gpay_status = "";
+                                                            rs.gpay_confirm = true;
+                                                            rs.gpay_status = "";
                                                         },
-                                                        .refuse => |m| gpay_status = m,
+                                                        .refuse => |m| rs.gpay_status = m,
                                                     }
                                                 }
                                             }
                                         },
                                         .pay_confirm_back => if (dev_chat) {
-                                            gpay_confirm = false;
+                                            rs.gpay_confirm = false;
                                         },
                                         .pay_request, .pay_send => if (dev_chat) {
-                                            if (gchat_sel) |sc| {
-                                                const amount = feed_view.payAmountToSats(gpay_amount_buf[0..gpay_amount_len], gpay_unit) orelse 0;
+                                            if (rs.gchat_sel) |sc| {
+                                                const amount = feed_view.payAmountToSats(rs.gpay_amount_buf[0..rs.gpay_amount_len], rs.gpay_unit) orelse 0;
                                                 if (amount == 0 or amount > chat_core.max_amount_sat) {
-                                                    gpay_status = "Enter an amount in sats";
+                                                    rs.gpay_status = "Enter an amount in sats";
                                                 } else {
-                                                    const note = std.mem.trim(u8, gpay_note_buf[0..gpay_note_len], " ");
+                                                    const note = std.mem.trim(u8, rs.gpay_note_buf[0..rs.gpay_note_len], " ");
                                                     if (hit.kind == .pay_request) {
                                                         // Request gate (§5): you can only ASK to be
                                                         // paid on a rail you can actually RECEIVE on
                                                         // — otherwise the money would have nowhere to
                                                         // land. Your own published addresses are
                                                         // already loaded (grecv_*).
-                                                        const have_rail = switch (gpay_rail) {
-                                                            .lightning => grecv_ln_len > 0,
-                                                            .onchain => grecv_btc_len > 0,
+                                                        const have_rail = switch (rs.gpay_rail) {
+                                                            .lightning => rs.grecv_ln_len > 0,
+                                                            .onchain => rs.grecv_btc_len > 0,
                                                         };
                                                         if (!have_rail) {
-                                                            gpay_status = switch (gpay_rail) {
+                                                            rs.gpay_status = switch (rs.gpay_rail) {
                                                                 .lightning => "Add your Lightning address first \u{2014} tap \u{201C}Set up how you get paid\u{201D}",
                                                                 .onchain => "Add your Bitcoin address first \u{2014} tap \u{201C}Set up how you get paid\u{201D}",
                                                             };
                                                         } else {
-                                                            gpay_status = payRequest(gpa, io, environ, if (gchat_e2ee) |*p| p else null, gchat_link, &gchat_store, sc, gpay_rail, amount, note, now);
+                                                            rs.gpay_status = payRequest(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, rs.gchat_link, &rs.gchat_store, sc, rs.gpay_rail, amount, note, now);
                                                         }
                                                     } else {
-                                                        _ = gchat_arena_state.reset(.retain_capacity);
-                                                        gpay_status = paySend(gpa, gchat_arena_state.allocator(), io, environ, if (gchat_e2ee) |*p| p else null, gchat_link, &gchat_store, sc, gpay_rail, amount, note, null, now);
+                                                        _ = rs.gchat_arena_state.reset(.retain_capacity);
+                                                        rs.gpay_status = paySend(gpa, rs.gchat_arena_state.allocator(), io, environ, if (rs.gchat_e2ee) |*p| p else null, rs.gchat_link, &rs.gchat_store, sc, rs.gpay_rail, amount, note, null, now);
                                                     }
-                                                    if (gpay_status.len == 0) {
-                                                        gpay_open = false;
-                                                        gpay_confirm = false;
-                                                        gpay_first_send = false; // disclosure acknowledged
-                                                        gpay_amount_len = 0;
-                                                        gpay_note_len = 0;
-                                                        gscroll_px = 0;
+                                                    if (rs.gpay_status.len == 0) {
+                                                        rs.gpay_open = false;
+                                                        rs.gpay_confirm = false;
+                                                        rs.gpay_first_send = false; // disclosure acknowledged
+                                                        rs.gpay_amount_len = 0;
+                                                        rs.gpay_note_len = 0;
+                                                        rs.gscroll_px = 0;
                                                     }
                                                 }
                                             }
@@ -3080,18 +3348,18 @@ pub fn run(
                                         // sheet uses. Refusals land on the app status
                                         // line (the sheet may be closed).
                                         .pay_card_pay => if (dev_chat) {
-                                            if (gchat_sel) |sc| {
-                                                if (payRowByOrdinal(gpa, &gchat_store, sc, hit.post)) |row| {
-                                                    _ = gchat_arena_state.reset(.retain_capacity);
-                                                    const verdict = paySend(gpa, gchat_arena_state.allocator(), io, environ, if (gchat_e2ee) |*p| p else null, gchat_link, &gchat_store, sc, row.rail, row.amount_sat, "", row.payment_id, now);
-                                                    status = if (verdict.len == 0) "pay: handed to your wallet" else verdict;
+                                            if (rs.gchat_sel) |sc| {
+                                                if (payRowByOrdinal(gpa, &rs.gchat_store, sc, hit.post)) |row| {
+                                                    _ = rs.gchat_arena_state.reset(.retain_capacity);
+                                                    const verdict = paySend(gpa, rs.gchat_arena_state.allocator(), io, environ, if (rs.gchat_e2ee) |*p| p else null, rs.gchat_link, &rs.gchat_store, sc, row.rail, row.amount_sat, "", row.payment_id, now);
+                                                    rs.status = if (verdict.len == 0) "pay: handed to your wallet" else verdict;
                                                 }
                                             }
                                         },
                                         .pay_card_received => if (dev_chat) {
-                                            if (gchat_sel) |sc| {
-                                                if (payRowByOrdinal(gpa, &gchat_store, sc, hit.post)) |row| {
-                                                    payCardEvent(gpa, io, environ, if (gchat_e2ee) |*p| p else null, gchat_link, &gchat_store, sc, row.payment_id, true);
+                                            if (rs.gchat_sel) |sc| {
+                                                if (payRowByOrdinal(gpa, &rs.gchat_store, sc, hit.post)) |row| {
+                                                    payCardEvent(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, rs.gchat_link, &rs.gchat_store, sc, row.payment_id, true);
                                                 }
                                             }
                                         },
@@ -3100,16 +3368,16 @@ pub fn run(
                                         // both flip BOTH sides and move no money
                                         // (S2). Each terminal names itself (§8.5).
                                         .pay_card_cancel, .pay_card_decline => if (dev_chat) {
-                                            if (gchat_sel) |sc| {
-                                                if (payRowByOrdinal(gpa, &gchat_store, sc, hit.post)) |row| {
+                                            if (rs.gchat_sel) |sc| {
+                                                if (payRowByOrdinal(gpa, &rs.gchat_store, sc, hit.post)) |row| {
                                                     const decline = hit.kind == .pay_card_decline;
                                                     payCardSignal(
                                                         gpa,
                                                         io,
                                                         environ,
-                                                        if (gchat_e2ee) |*p| p else null,
-                                                        gchat_link,
-                                                        &gchat_store,
+                                                        if (rs.gchat_e2ee) |*p| p else null,
+                                                        rs.gchat_link,
+                                                        &rs.gchat_store,
                                                         sc,
                                                         row.payment_id,
                                                         if (decline) .declined else .cancelled,
@@ -3124,11 +3392,11 @@ pub fn run(
                                         // happened at the card (money-critical, so
                                         // the hand-off is a deliberate tap).
                                         .pay_card_send => if (dev_chat) {
-                                            if (gchat_sel) |sc| {
-                                                if (payRowByOrdinal(gpa, &gchat_store, sc, hit.post)) |row| {
-                                                    _ = gchat_arena_state.reset(.retain_capacity);
-                                                    const verdict = paySend(gpa, gchat_arena_state.allocator(), io, environ, if (gchat_e2ee) |*p| p else null, gchat_link, &gchat_store, sc, row.rail, row.amount_sat, "", row.payment_id, now);
-                                                    status = if (verdict.len == 0) "pay: handed to your wallet" else verdict;
+                                            if (rs.gchat_sel) |sc| {
+                                                if (payRowByOrdinal(gpa, &rs.gchat_store, sc, hit.post)) |row| {
+                                                    _ = rs.gchat_arena_state.reset(.retain_capacity);
+                                                    const verdict = paySend(gpa, rs.gchat_arena_state.allocator(), io, environ, if (rs.gchat_e2ee) |*p| p else null, rs.gchat_link, &rs.gchat_store, sc, row.rail, row.amount_sat, "", row.payment_id, now);
+                                                    rs.status = if (verdict.len == 0) "pay: handed to your wallet" else verdict;
                                                 }
                                             }
                                         },
@@ -3141,18 +3409,18 @@ pub fn run(
                                             const tags = view_items[hit.post].tags;
                                             if (hit._pad < tags.len) {
                                                 const t = tags[hit._pad];
-                                                if (t.len > 0 and t.len <= zone_tag_buf.len) {
+                                                if (t.len > 0 and t.len <= rs.zone_tag_buf.len) {
                                                     // Zones are canonical lowercase (invariant 1):
                                                     // fold the tapped tag so #Foo opens zone "foo".
-                                                    for (t, 0..) |c, i| zone_tag_buf[i] = std.ascii.toLower(c);
+                                                    for (t, 0..) |c, i| rs.zone_tag_buf[i] = std.ascii.toLower(c);
                                                     // Back returns to where we came FROM (don't
                                                     // overwrite it on a zone→zone hop).
-                                                    if (gscreen != feed_view.screen_zones) zone_return_screen = gscreen;
-                                                    zone_tag = zone_tag_buf[0..t.len];
-                                                    gscreen = feed_view.screen_zones;
-                                                    zone_dirty = true;
-                                                    gscroll_px = 0;
-                                                    gsocket_ui.open = false; // tuck the home socket
+                                                    if (rs.gscreen != feed_view.screen_zones) rs.zone_return_screen = rs.gscreen;
+                                                    rs.zone_tag = rs.zone_tag_buf[0..t.len];
+                                                    rs.gscreen = feed_view.screen_zones;
+                                                    rs.zone_dirty = true;
+                                                    rs.gscroll_px = 0;
+                                                    rs.gsocket_ui.open = false; // tuck the home socket
                                                 }
                                             }
                                         },
@@ -3160,17 +3428,17 @@ pub fn run(
                                         // region carries the catalog index in `post`; resolve
                                         // its display tag and open the zone page (the
                                         // fetch-on-enter pulls the feed, like a tag pill).
-                                        .zone_open => if (hit.post < zone_catalog.items.len) {
-                                            const t = zone_catalog.items[hit.post].tag;
-                                            if (t.len > 0 and t.len <= zone_tag_buf.len) {
+                                        .zone_open => if (hit.post < rs.zone_catalog.items.len) {
+                                            const t = rs.zone_catalog.items[hit.post].tag;
+                                            if (t.len > 0 and t.len <= rs.zone_tag_buf.len) {
                                                 // Canonical lowercase zone name (invariant 1).
-                                                for (t, 0..) |c, i| zone_tag_buf[i] = std.ascii.toLower(c);
-                                                if (gscreen != feed_view.screen_zones) zone_return_screen = gscreen;
-                                                zone_tag = zone_tag_buf[0..t.len];
-                                                gscreen = feed_view.screen_zones;
-                                                zone_dirty = true;
-                                                gscroll_px = 0;
-                                                gsocket_ui.open = false;
+                                                for (t, 0..) |c, i| rs.zone_tag_buf[i] = std.ascii.toLower(c);
+                                                if (rs.gscreen != feed_view.screen_zones) rs.zone_return_screen = rs.gscreen;
+                                                rs.zone_tag = rs.zone_tag_buf[0..t.len];
+                                                rs.gscreen = feed_view.screen_zones;
+                                                rs.zone_dirty = true;
+                                                rs.gscroll_px = 0;
+                                                rs.gsocket_ui.open = false;
                                             }
                                         },
                                         // Marketplace "View details": fetch this
@@ -3178,61 +3446,61 @@ pub fn run(
                                         // open its transparency page. The fetched config
                                         // is validated in the shell leg (never trust the
                                         // wire); what the page shows is what would run.
-                                        .algo_view => if (hit.post < market_catalog.items.len) {
-                                            const r = market_catalog.items[hit.post];
+                                        .algo_view => if (hit.post < rs.market_catalog.items.len) {
+                                            const r = rs.market_catalog.items[hit.post];
                                             // Join any still-running fetch (rapid re-tap) before reusing
                                             // the job, so its thread can't outlive the reused fields.
-                                            if (inspectjob.active) {
-                                                joinInspect(&inspectjob);
-                                                if (inspectjob.ok) if (inspectjob.bytes) |b| std.heap.page_allocator.free(b);
+                                            if (rs.inspectjob.active) {
+                                                joinInspect(&rs.inspectjob);
+                                                if (rs.inspectjob.ok) if (rs.inspectjob.bytes) |b| std.heap.page_allocator.free(b);
                                             }
-                                            if (inspect_name.len > 0) gpa.free(inspect_name);
-                                            if (inspect_ref.len > 0) gpa.free(inspect_ref);
-                                            if (inspect_bytes) |b| gpa.free(b);
-                                            inspect_bytes = null;
-                                            inspect_name = try gpa.dupe(u8, r.name);
-                                            inspect_ref = try gpa.dupe(u8, r.cid);
-                                            transp_return_screen = gscreen;
-                                            gscreen = feed_view.screen_transparency;
-                                            gtransp_source = false; // open on the summary
-                                            gscroll_px = 0;
+                                            if (rs.inspect_name.len > 0) gpa.free(rs.inspect_name);
+                                            if (rs.inspect_ref.len > 0) gpa.free(rs.inspect_ref);
+                                            if (rs.inspect_bytes) |b| gpa.free(b);
+                                            rs.inspect_bytes = null;
+                                            rs.inspect_name = try gpa.dupe(u8, r.name);
+                                            rs.inspect_ref = try gpa.dupe(u8, r.cid);
+                                            rs.transp_return_screen = rs.gscreen;
+                                            rs.gscreen = feed_view.screen_transparency;
+                                            rs.gtransp_source = false; // open on the summary
+                                            rs.gscroll_px = 0;
                                             // A8: a config we've already retrieved is immutable (same
                                             // CID) — serve it from the cache, INSTANT, no network.
-                                            if (config_cache.get(r.cid)) |cached| {
-                                                inspect_bytes = gpa.dupe(u8, cached) catch null;
-                                                inspect_loading = false;
+                                            if (rs.config_cache.get(r.cid)) |cached| {
+                                                rs.inspect_bytes = gpa.dupe(u8, cached) catch null;
+                                                rs.inspect_loading = false;
                                             } else {
                                                 // Never seen: fetch on a worker (public read, no shared
                                                 // session), page opens in a loading state meanwhile.
-                                                startInspect(&inspectjob, io, environ, session.pds_url, r.author_did, r.rkey);
-                                                inspect_loading = true;
+                                                startInspect(&rs.inspectjob, io, environ, session.pds_url, r.author_did, r.rkey);
+                                                rs.inspect_loading = true;
                                             }
                                         },
                                         // "View the exact source" on the transparency
                                         // page → the byte-exact serialized artifact.
                                         .algo_source => {
-                                            gtransp_source = true;
-                                            gscroll_px = 0;
+                                            rs.gtransp_source = true;
+                                            rs.gscroll_px = 0;
                                         },
                                         // "Add to loadout" (adopt + score) is the next
                                         // slice — it needs the fetched config wired into
                                         // the scoring resolver. Honest until then.
                                         .algo_add => {
-                                            status = "Add to loadout is coming next — view its details for now.";
+                                            rs.status = "Add to loadout is coming next — view its details for now.";
                                         },
                                         // Settings → Sign out: flag it and leave the
                                         // run loop. The caller (main) clears the cached
                                         // session instead of re-saving it, so the next
                                         // launch shows the Join/login flow.
                                         .sign_out => {
-                                            user_signed_out = true;
+                                            rs.user_signed_out = true;
                                             break :main_loop;
                                         },
                                         // Settings master–detail: pick the section.
                                         .settings_section => {
-                                            gsettings_section = @intCast(hit.post);
-                                            gscroll_px = 0;
-                                            gsettings_picking = 255; // close any open picker
+                                            rs.gsettings_section = @intCast(hit.post);
+                                            rs.gscroll_px = 0;
+                                            rs.gsettings_picking = 255; // close any open picker
                                         },
                                         // A detail-pane row. Toggles flip their
                                         // runtime bit (live — Julia mode reads its
@@ -3240,14 +3508,14 @@ pub fn run(
                                         // until wired). Non-toggle rows: inert.
                                         .settings_row => {
                                             if (hit.post < settings_view.rows.len and settings_view.rows[hit.post].kind == .toggle) {
-                                                toggle_bits ^= @as(u64, 1) << @intCast(hit.post);
+                                                rs.toggle_bits ^= @as(u64, 1) << @intCast(hit.post);
                                                 // Julia mode flipped ON → sparks fly from the
                                                 // SWITCH: a heart-shaped bloom of ripples out of
                                                 // the toggle's spot in the field. Convert the
                                                 // toggle pill (logical px, right end of the row)
                                                 // to a field cell (window px / cell, via scale).
-                                                if (settings_view.rows[hit.post].action == settings_view.act_julia and (toggle_bits >> @intCast(hit.post)) & 1 != 0) {
-                                                    if (gpu_state) |*gs| {
+                                                if (settings_view.rows[hit.post].action == settings_view.act_julia and (rs.toggle_bits >> @intCast(hit.post)) & 1 != 0) {
+                                                    if (rs.gpu_state) |*gs| {
                                                         const tx = (@as(f32, @floatFromInt(hit.x)) + @as(f32, @floatFromInt(hit.w)) - 36.0) * gs.scale;
                                                         const ty = (@as(f32, @floatFromInt(hit.y)) + @as(f32, @floatFromInt(hit.h)) * 0.5) * gs.scale;
                                                         pushJuliaBurst(gpa, gs, @intFromFloat(tx / @as(f32, @floatFromInt(field_cell_w))), @intFromFloat(ty / @as(f32, @floatFromInt(field_cell_h))));
@@ -3258,46 +3526,46 @@ pub fn run(
                                                     }
                                                 }
                                             }
-                                            gsettings_picking = 255; // a row tap closes the picker
+                                            rs.gsettings_picking = 255; // a row tap closes the picker
                                         },
                                         // A wired CHOICE row: open (or re-close) its
                                         // picker popover.
                                         .settings_choice => {
                                             const act = settings_view.rows[hit.post].action;
-                                            gsettings_picking = if (gsettings_picking == act) 255 else act;
+                                            rs.gsettings_picking = if (rs.gsettings_picking == act) 255 else act;
                                         },
                                         // A picker option: post = choiceIndex*8 + optionIndex.
                                         .settings_choice_opt => {
                                             const ci = hit.post / 8;
                                             const oi: u8 = @intCast(hit.post % 8);
-                                            if (ci < choice_sel.len) choice_sel[ci] = oi;
-                                            gsettings_picking = 255; // selection closes the picker
+                                            if (ci < rs.choice_sel.len) rs.choice_sel[ci] = oi;
+                                            rs.gsettings_picking = 255; // selection closes the picker
                                         },
                                             }
                                         }
                                     }
-                                } else if (armed_legacy and cx == armed_cx and cy == armed_cy) {
+                                } else if (rs.armed_legacy and cx == rs.armed_cx and cy == rs.armed_cy) {
                                     // Legacy (software cell) tap: same target on release.
                                     if (field_ui.hitTest(cx, cy, g.hr.slice())) |hit| {
-                                        if (hit.target != field_ui.no_target and hit.target < view_items.len) state.selected = hit.target;
+                                        if (hit.target != field_ui.no_target and hit.target < view_items.len) rs.state.selected = hit.target;
                                         if (hit.action != .none) if (timeline_ui.keyFor(hit.action)) |byte| {
                                             try pumped_bytes.append(gpa, byte);
                                         };
                                     }
                                 }
-                                armed_kind = null;
-                                armed_legacy = false;
+                                rs.armed_kind = null;
+                                rs.armed_legacy = false;
                             },
                             else => {},
                         }
                     }
-                    if (pointer_events.items.len > 0) last_input_nanos = clock_shell.monotonicNanos();
+                    if (pointer_events.items.len > 0) rs.last_input_nanos = clock_shell.monotonicNanos();
                 };
                 // Compose mode: the premium composer's footer buttons. A tap is
                 // turned into the SAME control byte the keyboard sends — Ctrl-D
                 // (send) / Ctrl-C (cancel) — so handleComposeInput stays the one
                 // dispatch path (the timeline does the same trick for its rows).
-                if (mode == .compose) if (pix) |g| {
+                if (rs.mode == .compose) if (pix) |g| {
                     const gpu_scale: f32 = if (g.gpu) |gs| gs.scale else 1.0;
                     for (pointer_events.items) |pev| {
                         const rx: i32 = if (g.gpu != null) @intFromFloat(@as(f32, @floatFromInt(pev.x)) / gpu_scale) else @intCast(pev.x);
@@ -3310,8 +3578,8 @@ pub fn run(
                                     // on button_up if the release is still on it. A
                                     // segment's ✕ carries its index in `post`.
                                     .compose_send, .compose_cancel, .compose_add, .compose_remove => {
-                                        armed_compose = hit.kind;
-                                        armed_post = hit.post;
+                                        rs.armed_compose = hit.kind;
+                                        rs.armed_post = hit.post;
                                     },
                                     else => {},
                                 } else {
@@ -3319,21 +3587,21 @@ pub fn run(
                                     // presses close in time + place: 1 = caret +
                                     // drag, 2 = select word, 3 = select line.
                                     const now_ns = clock_shell.monotonicNanos();
-                                    const near = @abs(rx - last_click_x) <= 3 and @abs(ry - last_click_y) <= 3;
-                                    click_count = if (now_ns -| last_click_ns < 400_000_000 and near) click_count + 1 else 1;
-                                    last_click_ns = now_ns;
-                                    last_click_x = rx;
-                                    last_click_y = ry;
-                                    const off = feed_view.composeCaretAtPoint(g.engine, @intCast(design_w), textedit.view(&compose), rx, ry);
-                                    switch (@min(click_count, @as(u8, 3))) {
+                                    const near = @abs(rx - rs.last_click_x) <= 3 and @abs(ry - rs.last_click_y) <= 3;
+                                    rs.click_count = if (now_ns -| rs.last_click_ns < 400_000_000 and near) rs.click_count + 1 else 1;
+                                    rs.last_click_ns = now_ns;
+                                    rs.last_click_x = rx;
+                                    rs.last_click_y = ry;
+                                    const off = feed_view.composeCaretAtPoint(g.engine, @intCast(design_w), textedit.view(&rs.compose), rx, ry);
+                                    switch (@min(rs.click_count, @as(u8, 3))) {
                                         1 => {
-                                            textedit.setCaret(&compose, off);
-                                            compose_drag = true; // single press → drag-select
+                                            textedit.setCaret(&rs.compose, off);
+                                            rs.compose_drag = true; // single press → drag-select
                                         },
-                                        2 => textedit.selectWord(&compose, off),
-                                        else => textedit.selectLine(&compose, off),
+                                        2 => textedit.selectWord(&rs.compose, off),
+                                        else => textedit.selectLine(&rs.compose, off),
                                     }
-                                    caret_anchor_ns = now_ns;
+                                    rs.caret_anchor_ns = now_ns;
                                 }
                             },
                             .move => {
@@ -3343,18 +3611,18 @@ pub fn run(
                                 // composer doesn't leave the hand from the button that
                                 // opened it, and editable text reads as selectable.
                                 window_shell.setCursor(win, if (feed_view.hitTest(g.regions.items, rx, ry) != null) .pointer else .text);
-                                if (compose_drag) {
+                                if (rs.compose_drag) {
                                     // Drag extends the selection to the pointer.
-                                    const off = feed_view.composeCaretAtPoint(g.engine, @intCast(design_w), textedit.view(&compose), rx, ry);
-                                    textedit.extendTo(&compose, off);
-                                    caret_anchor_ns = clock_shell.monotonicNanos();
+                                    const off = feed_view.composeCaretAtPoint(g.engine, @intCast(design_w), textedit.view(&rs.compose), rx, ry);
+                                    textedit.extendTo(&rs.compose, off);
+                                    rs.caret_anchor_ns = clock_shell.monotonicNanos();
                                 }
                             },
                             .button_up => if (pev.button == 1) {
-                                compose_drag = false;
+                                rs.compose_drag = false;
                                 // Fire the armed footer button only if the release is
                                 // still over the same button (slide-off cancels).
-                                if (armed_compose) |ac| {
+                                if (rs.armed_compose) |ac| {
                                     if (feed_view.hitTest(g.regions.items, rx, ry)) |hit| {
                                         if (hit.kind == ac) switch (ac) {
                                             .compose_send => try pumped_bytes.append(gpa, 4), // ctrl-D
@@ -3362,30 +3630,30 @@ pub fn run(
                                             // "Add": finalize the active draft as a thread
                                             // segment and clear the box for the next post.
                                             .compose_add => {
-                                                const active = textedit.view(&compose);
-                                                if (active.len > 0 and chain_segments.items.len < max_chain_segments - 1) {
+                                                const active = textedit.view(&rs.compose);
+                                                if (active.len > 0 and rs.chain_segments.items.len < max_chain_segments - 1) {
                                                     if (gpa.dupe(u8, active)) |d| {
-                                                        chain_segments.append(gpa, d) catch gpa.free(d);
-                                                        textedit.clear(&compose);
-                                                        caret_anchor_ns = clock_shell.monotonicNanos();
+                                                        rs.chain_segments.append(gpa, d) catch gpa.free(d);
+                                                        textedit.clear(&rs.compose);
+                                                        rs.caret_anchor_ns = clock_shell.monotonicNanos();
                                                     } else |_| {}
                                                 }
                                             },
                                             // A segment's ✕: drop it, preserving order.
-                                            .compose_remove => if (armed_post < chain_segments.items.len) {
-                                                gpa.free(chain_segments.items[armed_post]);
-                                                _ = chain_segments.orderedRemove(armed_post);
+                                            .compose_remove => if (rs.armed_post < rs.chain_segments.items.len) {
+                                                gpa.free(rs.chain_segments.items[rs.armed_post]);
+                                                _ = rs.chain_segments.orderedRemove(rs.armed_post);
                                             },
                                             else => {},
                                         };
                                     }
                                 }
-                                armed_compose = null;
+                                rs.armed_compose = null;
                             },
                             else => {},
                         }
                     }
-                    if (pointer_events.items.len > 0) last_input_nanos = clock_shell.monotonicNanos();
+                    if (pointer_events.items.len > 0) rs.last_input_nanos = clock_shell.monotonicNanos();
                 };
                 n = @min(pumped_bytes.items.len, in_buf.len);
                 @memcpy(in_buf[0..n], pumped_bytes.items[0..n]);
@@ -3398,7 +3666,7 @@ pub fn run(
                 // CPU work of a frame the top-of-loop paint repeats next lap —
                 // pure waste on the render thread. One paint per lap.)
                 if (n == 0) continue;
-                last_input_nanos = clock_shell.monotonicNanos();
+                rs.last_input_nanos = clock_shell.monotonicNanos();
             },
         }
 
@@ -3408,8 +3676,8 @@ pub fn run(
             if (decoded.consumed == 0) break;
             offset += decoded.consumed;
 
-            if (mode == .profile) {
-                try handleProfileInput(gpa, arena, io, environ, session, out, backend, &prev, &next, &status, &status_buf, &mode, &profile_info, decoded.event, now);
+            if (rs.mode == .profile) {
+                try handleProfileInput(gpa, arena, io, environ, session, rs.out, backend, &rs.prev, &rs.next, &rs.status, &rs.status_buf, &rs.mode, &rs.profile_info, decoded.event, now);
                 continue;
             }
 
@@ -3417,7 +3685,7 @@ pub fn run(
             // rooted post's text selection. Both need the shell (menu state /
             // clipboard). Ctrl+C only CONSUMES the key when a selection exists, so
             // with none it still falls through to its normal handling.
-            if (mode == .timeline) if (pix) |g| if (g.gpu) |gs| {
+            if (rs.mode == .timeline) if (pix) |g| if (g.gpu) |gs| {
                 if (decoded.event == .escape and gs.menu_open) {
                     gs.menu_open = false;
                     continue;
@@ -3430,7 +3698,7 @@ pub fn run(
                     const r = text_select.range(gs.sel_glyphs.items.len, gs.sel_anchor, gs.sel_focus);
                     if (r.hi > r.lo) {
                         copySelection(gpa, gs, backend);
-                        status = "Copied";
+                        rs.status = "Copied";
                         continue;
                     }
                 }
@@ -3443,7 +3711,7 @@ pub fn run(
                 }
             };
 
-            if (mode == .compose) {
+            if (rs.mode == .compose) {
                 // Copy (Ctrl+C) / Cut (Ctrl+X) on a selection — handled here
                 // because the clipboard write needs the window. With a selection,
                 // Ctrl+C copies (not cancel); Ctrl+X copies then deletes.
@@ -3451,18 +3719,18 @@ pub fn run(
                     .char => |c| c,
                     else => null,
                 };
-                if (ctrl_char) |c| if ((c == 3 or c == 24) and textedit.hasSelection(&compose)) {
+                if (ctrl_char) |c| if ((c == 3 or c == 24) and textedit.hasSelection(&rs.compose)) {
                     switch (backend) {
-                        .window => |w| window_shell.setClipboard(w, textedit.selView(&compose)),
+                        .window => |w| window_shell.setClipboard(w, textedit.selView(&rs.compose)),
                         .terminal => {},
                     }
-                    if (c == 24) textedit.deleteSelection(&compose);
-                    caret_anchor_ns = clock_shell.monotonicNanos();
+                    if (c == 24) textedit.deleteSelection(&rs.compose);
+                    rs.caret_anchor_ns = clock_shell.monotonicNanos();
                     continue;
                 };
-                try handleComposeInput(gpa, session, &status, &mode, store, &compose, &chain_segments, &reply_target, &reply_handle, &quote_target, compose_kind, pix, &pending_send, &pending_profile_save, decoded.event, now);
-                if (mode != .compose) compose_drag = false; // composer closed → end any drag
-                caret_anchor_ns = clock_shell.monotonicNanos(); // keystroke/move → solid caret
+                try handleComposeInput(gpa, session, &rs.status, &rs.mode, store, &rs.compose, &rs.chain_segments, &rs.reply_target, &rs.reply_handle, &rs.quote_target, rs.compose_kind, pix, &rs.pending_send, &rs.pending_profile_save, decoded.event, now);
+                if (rs.mode != .compose) rs.compose_drag = false; // composer closed → end any drag
+                rs.caret_anchor_ns = clock_shell.monotonicNanos(); // keystroke/move → solid caret
                 continue;
             }
 
@@ -3487,186 +3755,186 @@ pub fn run(
             // Escape closes, Tab hops the two address fields, any printable
             // character types into the focused one (addresses are alphanumeric +
             // punctuation, so no digit filter). Consumes the key.
-            if (engine != null and dev_chat and gscreen == feed_view.screen_messages and grecv_open) {
+            if (rs.engine != null and dev_chat and rs.gscreen == feed_view.screen_messages and rs.grecv_open) {
                 var recv_key = true;
                 switch (decoded.event) {
                     .escape => {
-                        grecv_open = false;
-                        grecv_status = "";
+                        rs.grecv_open = false;
+                        rs.grecv_status = "";
                     },
-                    .enter => if (grecv_mode == .paste) {
-                        const ln = std.mem.trim(u8, grecv_ln_buf[0..grecv_ln_len], " ");
-                        const btc = std.mem.trim(u8, grecv_btc_buf[0..grecv_btc_len], " ");
-                        _ = gchat_arena_state.reset(.retain_capacity);
-                        grecv_status = saveReceiveAddress(gpa, gchat_arena_state.allocator(), io, environ, session, ln, btc, &grecv_saved);
-                        if (grecv_saved) {
-                            grecv_set = true;
-                            announceReceiveReady(gpa, io, environ, if (gchat_e2ee) |*p| p else null, gchat_link, &gchat_store);
+                    .enter => if (rs.grecv_mode == .paste) {
+                        const ln = std.mem.trim(u8, rs.grecv_ln_buf[0..rs.grecv_ln_len], " ");
+                        const btc = std.mem.trim(u8, rs.grecv_btc_buf[0..rs.grecv_btc_len], " ");
+                        _ = rs.gchat_arena_state.reset(.retain_capacity);
+                        rs.grecv_status = saveReceiveAddress(gpa, rs.gchat_arena_state.allocator(), io, environ, session, ln, btc, &rs.grecv_saved);
+                        if (rs.grecv_saved) {
+                            rs.grecv_set = true;
+                            announceReceiveReady(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, rs.gchat_link, &rs.gchat_store);
                         }
                     },
-                    .char => |zc| if (grecv_mode == .paste) {
+                    .char => |zc| if (rs.grecv_mode == .paste) {
                         if (zc == 8 or zc == 127) {
-                            if (grecv_focus == 0) {
-                                if (grecv_ln_len > 0) grecv_ln_len -= 1;
-                            } else if (grecv_btc_len > 0) grecv_btc_len -= 1;
-                            gchat_key_ns = clock_shell.monotonicNanos();
+                            if (rs.grecv_focus == 0) {
+                                if (rs.grecv_ln_len > 0) rs.grecv_ln_len -= 1;
+                            } else if (rs.grecv_btc_len > 0) rs.grecv_btc_len -= 1;
+                            rs.gchat_key_ns = clock_shell.monotonicNanos();
                         } else if (zc == 9) {
-                            grecv_focus = 1 - grecv_focus;
+                            rs.grecv_focus = 1 - rs.grecv_focus;
                         } else if (zc >= 0x20 and zc < 0x7f) {
-                            if (grecv_focus == 0) {
-                                if (grecv_ln_len < grecv_ln_buf.len) {
-                                    grecv_ln_buf[grecv_ln_len] = @intCast(zc);
-                                    grecv_ln_len += 1;
-                                    gchat_key_ns = clock_shell.monotonicNanos();
+                            if (rs.grecv_focus == 0) {
+                                if (rs.grecv_ln_len < rs.grecv_ln_buf.len) {
+                                    rs.grecv_ln_buf[rs.grecv_ln_len] = @intCast(zc);
+                                    rs.grecv_ln_len += 1;
+                                    rs.gchat_key_ns = clock_shell.monotonicNanos();
                                 }
-                            } else if (grecv_btc_len < grecv_btc_buf.len) {
-                                grecv_btc_buf[grecv_btc_len] = @intCast(zc);
-                                grecv_btc_len += 1;
-                                gchat_key_ns = clock_shell.monotonicNanos();
+                            } else if (rs.grecv_btc_len < rs.grecv_btc_buf.len) {
+                                rs.grecv_btc_buf[rs.grecv_btc_len] = @intCast(zc);
+                                rs.grecv_btc_len += 1;
+                                rs.gchat_key_ns = clock_shell.monotonicNanos();
                             }
                         }
                     },
                     else => recv_key = false,
                 }
                 if (recv_key) {
-                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status);
+                    try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status);
                     continue;
                 }
             }
 
-            if (engine != null and dev_chat and gscreen == feed_view.screen_messages and gpay_open) {
+            if (rs.engine != null and dev_chat and rs.gscreen == feed_view.screen_messages and rs.gpay_open) {
                 var pay_key = true;
                 switch (decoded.event) {
                     // Escape backs out of the confirm face first, then closes.
-                    .escape => if (gpay_confirm) {
-                        gpay_confirm = false;
+                    .escape => if (rs.gpay_confirm) {
+                        rs.gpay_confirm = false;
                     } else {
-                        gpay_open = false;
-                        gpay_status = "";
+                        rs.gpay_open = false;
+                        rs.gpay_status = "";
                     },
-                    .enter => if (gchat_sel) |sc| {
-                        const amount = feed_view.payAmountToSats(gpay_amount_buf[0..gpay_amount_len], gpay_unit) orelse 0;
+                    .enter => if (rs.gchat_sel) |sc| {
+                        const amount = feed_view.payAmountToSats(rs.gpay_amount_buf[0..rs.gpay_amount_len], rs.gpay_unit) orelse 0;
                         if (amount == 0 or amount > chat_core.max_amount_sat) {
-                            gpay_status = "Enter an amount in sats";
-                        } else if (!gpay_confirm) {
+                            rs.gpay_status = "Enter an amount in sats";
+                        } else if (!rs.gpay_confirm) {
                             // Compose → the per-action gate, same as the Send
                             // button: walletless makes an OFFER, set-up arms the
                             // confirm. No money moves here either way.
-                            const note = std.mem.trim(u8, gpay_note_buf[0..gpay_note_len], " ");
-                            _ = gchat_arena_state.reset(.retain_capacity);
-                            const e2ee = if (gchat_e2ee) |*p| p else null;
-                            switch (peerSendGate(gpa, gchat_arena_state.allocator(), io, environ, e2ee, &gchat_store, sc, gpay_rail)) {
+                            const note = std.mem.trim(u8, rs.gpay_note_buf[0..rs.gpay_note_len], " ");
+                            _ = rs.gchat_arena_state.reset(.retain_capacity);
+                            const e2ee = if (rs.gchat_e2ee) |*p| p else null;
+                            switch (peerSendGate(gpa, rs.gchat_arena_state.allocator(), io, environ, e2ee, &rs.gchat_store, sc, rs.gpay_rail)) {
                                 .walletless => {
-                                    gpay_status = payOffer(gpa, io, environ, e2ee, gchat_link, &gchat_store, sc, gpay_rail, amount, note, now);
-                                    if (gpay_status.len == 0) {
-                                        gpay_open = false;
-                                        gpay_confirm = false;
-                                        gpay_amount_len = 0;
-                                        gpay_note_len = 0;
-                                        gscroll_px = 0;
+                                    rs.gpay_status = payOffer(gpa, io, environ, e2ee, rs.gchat_link, &rs.gchat_store, sc, rs.gpay_rail, amount, note, now);
+                                    if (rs.gpay_status.len == 0) {
+                                        rs.gpay_open = false;
+                                        rs.gpay_confirm = false;
+                                        rs.gpay_amount_len = 0;
+                                        rs.gpay_note_len = 0;
+                                        rs.gscroll_px = 0;
                                     }
                                 },
                                 .has_wallet => {
-                                    gpay_confirm = true;
-                                    gpay_status = "";
+                                    rs.gpay_confirm = true;
+                                    rs.gpay_status = "";
                                 },
-                                .refuse => |m| gpay_status = m,
+                                .refuse => |m| rs.gpay_status = m,
                             }
                         } else {
                             // Confirm face → the real hand-off.
-                            const note = std.mem.trim(u8, gpay_note_buf[0..gpay_note_len], " ");
-                            _ = gchat_arena_state.reset(.retain_capacity);
-                            gpay_status = paySend(gpa, gchat_arena_state.allocator(), io, environ, if (gchat_e2ee) |*p| p else null, gchat_link, &gchat_store, sc, gpay_rail, amount, note, null, now);
-                            if (gpay_status.len == 0) {
-                                gpay_open = false;
-                                gpay_confirm = false;
-                                gpay_first_send = false;
-                                gpay_amount_len = 0;
-                                gpay_note_len = 0;
-                                gscroll_px = 0;
+                            const note = std.mem.trim(u8, rs.gpay_note_buf[0..rs.gpay_note_len], " ");
+                            _ = rs.gchat_arena_state.reset(.retain_capacity);
+                            rs.gpay_status = paySend(gpa, rs.gchat_arena_state.allocator(), io, environ, if (rs.gchat_e2ee) |*p| p else null, rs.gchat_link, &rs.gchat_store, sc, rs.gpay_rail, amount, note, null, now);
+                            if (rs.gpay_status.len == 0) {
+                                rs.gpay_open = false;
+                                rs.gpay_confirm = false;
+                                rs.gpay_first_send = false;
+                                rs.gpay_amount_len = 0;
+                                rs.gpay_note_len = 0;
+                                rs.gscroll_px = 0;
                             }
                         }
                     },
                     .char => |zc| {
                         if (zc == 8 or zc == 127) {
-                            if (gpay_focus == 0) {
-                                if (gpay_amount_len > 0) gpay_amount_len -= 1;
-                            } else if (gpay_note_len > 0) gpay_note_len -= 1;
-                            gchat_key_ns = clock_shell.monotonicNanos();
+                            if (rs.gpay_focus == 0) {
+                                if (rs.gpay_amount_len > 0) rs.gpay_amount_len -= 1;
+                            } else if (rs.gpay_note_len > 0) rs.gpay_note_len -= 1;
+                            rs.gchat_key_ns = clock_shell.monotonicNanos();
                         } else if (zc == 9) {
-                            gpay_focus = 1 - gpay_focus;
-                        } else if (gpay_focus == 0) {
+                            rs.gpay_focus = 1 - rs.gpay_focus;
+                        } else if (rs.gpay_focus == 0) {
                             // BTC mode accepts one decimal point; sats mode is
                             // digits only.
                             const is_digit = zc >= '0' and zc <= '9';
-                            const is_dot = zc == '.' and gpay_unit == .btc and
-                                std.mem.indexOfScalar(u8, gpay_amount_buf[0..gpay_amount_len], '.') == null;
-                            if ((is_digit or is_dot) and gpay_amount_len < gpay_amount_buf.len) {
-                                gpay_amount_buf[gpay_amount_len] = @intCast(zc);
-                                gpay_amount_len += 1;
-                                gchat_key_ns = clock_shell.monotonicNanos();
+                            const is_dot = zc == '.' and rs.gpay_unit == .btc and
+                                std.mem.indexOfScalar(u8, rs.gpay_amount_buf[0..rs.gpay_amount_len], '.') == null;
+                            if ((is_digit or is_dot) and rs.gpay_amount_len < rs.gpay_amount_buf.len) {
+                                rs.gpay_amount_buf[rs.gpay_amount_len] = @intCast(zc);
+                                rs.gpay_amount_len += 1;
+                                rs.gchat_key_ns = clock_shell.monotonicNanos();
                             }
-                        } else if (zc >= 0x20 and zc < 0x7f and gpay_note_len < gpay_note_buf.len) {
-                            gpay_note_buf[gpay_note_len] = @intCast(zc);
-                            gpay_note_len += 1;
-                            gchat_key_ns = clock_shell.monotonicNanos();
+                        } else if (zc >= 0x20 and zc < 0x7f and rs.gpay_note_len < rs.gpay_note_buf.len) {
+                            rs.gpay_note_buf[rs.gpay_note_len] = @intCast(zc);
+                            rs.gpay_note_len += 1;
+                            rs.gchat_key_ns = clock_shell.monotonicNanos();
                         }
                     },
                     else => pay_key = false,
                 }
                 if (pay_key) {
-                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status);
+                    try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status);
                     continue;
                 }
             }
 
-            if (engine != null and dev_chat and gscreen == feed_view.screen_messages and (gchat_composing or gchat_input_focus)) {
+            if (rs.engine != null and dev_chat and rs.gscreen == feed_view.screen_messages and (rs.gchat_composing or rs.gchat_input_focus)) {
                 var chat_key = true;
                 switch (decoded.event) {
-                    .enter => if (gchat_composing) {
-                        if (gchat_peer_len > 0) {
-                            _ = gchat_arena_state.reset(.retain_capacity);
+                    .enter => if (rs.gchat_composing) {
+                        if (rs.gchat_peer_len > 0) {
+                            _ = rs.gchat_arena_state.reset(.retain_capacity);
                             var new_sel: ?chat_core.ConvIndex = null;
-                            gchat_compose_status = chatStartCompose(gpa, gchat_arena_state.allocator(), io, environ, session, if (gchat_e2ee) |*p| p else null, gchat_link, &gchat_store, gchat_peer_buf[0..gchat_peer_len], &new_sel);
+                            rs.gchat_compose_status = chatStartCompose(gpa, rs.gchat_arena_state.allocator(), io, environ, session, if (rs.gchat_e2ee) |*p| p else null, rs.gchat_link, &rs.gchat_store, rs.gchat_peer_buf[0..rs.gchat_peer_len], &new_sel);
                             if (new_sel) |nc| {
-                                gchat_sel = nc;
-                                gchat_composing = false;
-                                gchat_peer_len = 0;
-                                gchat_compose_status = "";
-                                gchat_input_focus = true; // straight into typing the first message
-                                gscroll_px = 0;
+                                rs.gchat_sel = nc;
+                                rs.gchat_composing = false;
+                                rs.gchat_peer_len = 0;
+                                rs.gchat_compose_status = "";
+                                rs.gchat_input_focus = true; // straight into typing the first message
+                                rs.gscroll_px = 0;
                             }
                         }
                     } else {
-                        const body = std.mem.trimEnd(u8, gchat_draft_buf[0..gchat_draft_len], " \n");
-                        if (body.len > 0) if (gchat_sel) |sc| {
-                            _ = chat_core.appendMessage(gpa, &gchat_store, sc, .text, body, now, true) catch {};
-                            chatSend(gpa, io, environ, if (gchat_e2ee) |*st| st else null, gchat_link, &gchat_store, sc, body);
-                            chatPersistHistory(gpa, io, environ, if (gchat_e2ee) |*p| p else null, &gchat_store);
-                            gchat_draft_len = 0;
-                            gscroll_px = 0; // re-anchor to the newest message
+                        const body = std.mem.trimEnd(u8, rs.gchat_draft_buf[0..rs.gchat_draft_len], " \n");
+                        if (body.len > 0) if (rs.gchat_sel) |sc| {
+                            _ = chat_core.appendMessage(gpa, &rs.gchat_store, sc, .text, body, now, true) catch {};
+                            chatSend(gpa, io, environ, if (rs.gchat_e2ee) |*st| st else null, rs.gchat_link, &rs.gchat_store, sc, body);
+                            chatPersistHistory(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
+                            rs.gchat_draft_len = 0;
+                            rs.gscroll_px = 0; // re-anchor to the newest message
                         };
                     },
-                    .shift_enter => if (!gchat_composing and gchat_draft_len < gchat_draft_buf.len) {
-                        gchat_draft_buf[gchat_draft_len] = '\n';
-                        gchat_draft_len += 1;
-                        gchat_key_ns = clock_shell.monotonicNanos();
+                    .shift_enter => if (!rs.gchat_composing and rs.gchat_draft_len < rs.gchat_draft_buf.len) {
+                        rs.gchat_draft_buf[rs.gchat_draft_len] = '\n';
+                        rs.gchat_draft_len += 1;
+                        rs.gchat_key_ns = clock_shell.monotonicNanos();
                     },
-                    .escape => if (gchat_composing) {
-                        gchat_composing = false;
-                        gchat_compose_status = "";
+                    .escape => if (rs.gchat_composing) {
+                        rs.gchat_composing = false;
+                        rs.gchat_compose_status = "";
                     } else {
-                        gchat_input_focus = false;
+                        rs.gchat_input_focus = false;
                     },
                     else => chat_key = false,
                 }
                 if (chat_key) {
-                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status);
+                    try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status);
                     continue;
                 }
             }
 
-            if (engine != null) if (decoded.event == .char) {
+            if (rs.engine != null) if (decoded.event == .char) {
                 const zc = decoded.event.char;
                 // The Zat Chat composer strip: typing lands in the chat draft
                 // while the field has focus (tap the input to focus). ASCII
@@ -3676,59 +3944,59 @@ pub fn run(
                 // conversation) owns the keyboard while open. Every chat
                 // keystroke stamps `gchat_key_ns` — the caret stays lit
                 // while typing and breathes when idle.
-                if (dev_chat and gscreen == feed_view.screen_messages and gchat_composing) {
+                if (dev_chat and rs.gscreen == feed_view.screen_messages and rs.gchat_composing) {
                     if (zc == 8 or zc == 127) {
-                        if (gchat_peer_len > 0) gchat_peer_len -= 1;
-                        gchat_key_ns = clock_shell.monotonicNanos();
-                    } else if (zc >= 0x20 and zc < 0x7f and gchat_peer_len < gchat_peer_buf.len) {
-                        gchat_peer_buf[gchat_peer_len] = @intCast(zc);
-                        gchat_peer_len += 1;
-                        gchat_key_ns = clock_shell.monotonicNanos();
+                        if (rs.gchat_peer_len > 0) rs.gchat_peer_len -= 1;
+                        rs.gchat_key_ns = clock_shell.monotonicNanos();
+                    } else if (zc >= 0x20 and zc < 0x7f and rs.gchat_peer_len < rs.gchat_peer_buf.len) {
+                        rs.gchat_peer_buf[rs.gchat_peer_len] = @intCast(zc);
+                        rs.gchat_peer_len += 1;
+                        rs.gchat_key_ns = clock_shell.monotonicNanos();
                     }
-                } else if (dev_chat and gscreen == feed_view.screen_messages and gchat_input_focus) {
+                } else if (dev_chat and rs.gscreen == feed_view.screen_messages and rs.gchat_input_focus) {
                     if (zc == 8 or zc == 127) {
-                        if (gchat_draft_len > 0) gchat_draft_len -= 1;
-                        gchat_key_ns = clock_shell.monotonicNanos();
-                    } else if (zc >= 0x20 and zc < 0x7f and gchat_draft_len < gchat_draft_buf.len) {
-                        gchat_draft_buf[gchat_draft_len] = @intCast(zc);
-                        gchat_draft_len += 1;
-                        gchat_key_ns = clock_shell.monotonicNanos();
+                        if (rs.gchat_draft_len > 0) rs.gchat_draft_len -= 1;
+                        rs.gchat_key_ns = clock_shell.monotonicNanos();
+                    } else if (zc >= 0x20 and zc < 0x7f and rs.gchat_draft_len < rs.gchat_draft_buf.len) {
+                        rs.gchat_draft_buf[rs.gchat_draft_len] = @intCast(zc);
+                        rs.gchat_draft_len += 1;
+                        rs.gchat_key_ns = clock_shell.monotonicNanos();
                         // One encrypted typing ping per 4s of active typing.
                         // deposit is worker-queued (never blocks the frame);
                         // the ping's persist is the same nonce rule a send
                         // pays — one keystore write per ping, throttled.
-                        if (now - gchat_typing_sent_at >= 4) if (gchat_sel) |sc| {
-                            if (gchat_e2ee) |*st| if (gchat_link) |l| {
-                                chat_e2ee.sendTyping(gpa, io, environ, st, l, chat_core.conversationDid(&gchat_store, sc)) catch {};
-                                gchat_typing_sent_at = now;
+                        if (now - rs.gchat_typing_sent_at >= 4) if (rs.gchat_sel) |sc| {
+                            if (rs.gchat_e2ee) |*st| if (rs.gchat_link) |l| {
+                                chat_e2ee.sendTyping(gpa, io, environ, st, l, chat_core.conversationDid(&rs.gchat_store, sc)) catch {};
+                                rs.gchat_typing_sent_at = now;
                             };
                         };
                     }
-                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status);
+                    try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status);
                     continue;
                 }
                 // The Create name field: route typing into the feed-name buffer (ASCII
                 // for now — a zone/feed name is short). Backspace via BS/DEL. Consumes
                 // the key so it never falls through to zoom or the feed shortcuts.
-                if (gscreen == feed_view.screen_loadout and gloadout_tab == 2 and gcreate_step == .name) {
+                if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 2 and rs.gcreate_step == .name) {
                     if ((zc == 8 or zc == 127)) {
-                        if (gcreate_name_len > 0) gcreate_name_len -= 1;
-                    } else if (zc >= 0x20 and zc < 0x7f and gcreate_name_len < gcreate_name_buf.len) {
-                        gcreate_name_buf[gcreate_name_len] = @intCast(zc);
-                        gcreate_name_len += 1;
+                        if (rs.gcreate_name_len > 0) rs.gcreate_name_len -= 1;
+                    } else if (zc >= 0x20 and zc < 0x7f and rs.gcreate_name_len < rs.gcreate_name_buf.len) {
+                        rs.gcreate_name_buf[rs.gcreate_name_len] = @intCast(zc);
+                        rs.gcreate_name_len += 1;
                     }
-                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status);
+                    try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status);
                     continue;
                 }
                 if (zc == '+' or zc == '=') {
-                    gzoom = std.math.clamp(gzoom + 0.15, zoom_min, zoom_max);
-                    status = "zoom in";
-                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status);
+                    rs.gzoom = std.math.clamp(rs.gzoom + 0.15, zoom_min, zoom_max);
+                    rs.status = "zoom in";
+                    try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status);
                     continue;
                 } else if (zc == '-' or zc == '_') {
-                    gzoom = std.math.clamp(gzoom - 0.15, zoom_min, zoom_max);
-                    status = "zoom out";
-                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status);
+                    rs.gzoom = std.math.clamp(rs.gzoom - 0.15, zoom_min, zoom_max);
+                    rs.status = "zoom out";
+                    try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status);
                     continue;
                 }
             };
@@ -3755,62 +4023,62 @@ pub fn run(
                     // this was one of its seven synchronous fetches). The
                     // live-stream start the old inline path did now rides
                     // the drain's .pull success arm.
-                    if (refresher) |w| {
+                    if (rs.refresher) |w| {
                         if (refresh_worker.submit(w, .pull, 30)) {
-                            refresh_inflight += 1;
-                            status = "refreshing...";
-                        } else status = "refresh already running";
-                    } else status = "refresh unavailable"; // worker never started (E2: a status, not a dead key)
+                            rs.refresh_inflight += 1;
+                            rs.status = "refreshing...";
+                        } else rs.status = "refresh already running";
+                    } else rs.status = "refresh unavailable"; // worker never started (E2: a status, not a dead key)
                 },
                 .load_more => {
                     if (store.feed.len > 0 and feed_core.nextCursor(store).len == 0) {
-                        status = "end of feed";
+                        rs.status = "end of feed";
                         continue;
                     }
                     // Off the frame thread (M-Core.1 unblocking, 2/7): copy
                     // the cursor out of the store — the worker never reads
                     // the store — and let the drain ingest the older page
                     // (ingestPage, append) when it lands.
-                    if (refresher) |w| {
+                    if (rs.refresher) |w| {
                         if (gpa.dupe(u8, feed_core.nextCursor(store))) |cur| {
                             if (refresh_worker.submitOlder(w, cur, 30)) {
-                                refresh_inflight += 1;
-                                status = "loading...";
+                                rs.refresh_inflight += 1;
+                                rs.status = "loading...";
                             } else {
                                 gpa.free(cur);
-                                status = "load already queued";
+                                rs.status = "load already queued";
                             }
                         } else |err| return err; // OOM
-                    } else status = "load unavailable"; // worker never started (E2)
+                    } else rs.status = "load unavailable"; // worker never started (E2)
                 },
                 .like => if (view_items.len > 0) {
-                    const r = try engageSelected(.like, gpa, arena, session, store, view_items[state.selected], state.selected, gscreen, profile_target_did, thread_focus_cid, zone_tag, thread_rerooted, gcollapsed.items, feed_config, reply_config, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
-                    if (r.status.len > 0) status = r.status;
+                    const r = try engageSelected(.like, gpa, arena, session, store, view_items[rs.state.selected], rs.state.selected, rs.gscreen, rs.profile_target_did, rs.thread_focus_cid, rs.zone_tag, rs.thread_rerooted, rs.gcollapsed.items, feed_config, reply_config, &rs.state, rs.revealed.items, now, rs.out, &rs.prev, &rs.next, backend, pix, rs.writer, &rs.deferred_unlike, &rs.deferred_unrepost);
+                    if (r.status.len > 0) rs.status = r.status;
                     if (r.skip_rest) continue;
                 },
                 .repost => if (view_items.len > 0) {
-                    const r = try engageSelected(.repost, gpa, arena, session, store, view_items[state.selected], state.selected, gscreen, profile_target_did, thread_focus_cid, zone_tag, thread_rerooted, gcollapsed.items, feed_config, reply_config, &state, revealed.items, now, out, &prev, &next, backend, pix, writer, &deferred_unlike, &deferred_unrepost);
-                    if (r.status.len > 0) status = r.status;
+                    const r = try engageSelected(.repost, gpa, arena, session, store, view_items[rs.state.selected], rs.state.selected, rs.gscreen, rs.profile_target_did, rs.thread_focus_cid, rs.zone_tag, rs.thread_rerooted, rs.gcollapsed.items, feed_config, reply_config, &rs.state, rs.revealed.items, now, rs.out, &rs.prev, &rs.next, backend, pix, rs.writer, &rs.deferred_unlike, &rs.deferred_unrepost);
+                    if (r.status.len > 0) rs.status = r.status;
                     if (r.skip_rest) continue;
                 },
                 .profile => if (view_items.len > 0) {
-                    const item = view_items[state.selected];
-                    status = "loading profile...";
-                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status);
+                    const item = view_items[rs.state.selected];
+                    rs.status = "loading profile...";
+                    try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status);
                     const outcome = auth.queryHost(gpa, arena, io, environ, session, appview_url, lexicon.method.get_profile, &.{
                         .{ .name = "actor", .value = item.author_handle },
                     }, lexicon.ProfileViewDetailed) catch |err| switch (err) {
                         error.OutOfMemory => return err,
                         else => {
-                            status = "network error"; // contained (E2)
+                            rs.status = "network error"; // contained (E2)
                             continue;
                         },
                     };
                     switch (outcome) {
                         .ok => |wire| {
-                            _ = profile_arena_state.reset(.retain_capacity);
-                            const parena = profile_arena_state.allocator();
-                            profile_info = .{
+                            _ = rs.profile_arena_state.reset(.retain_capacity);
+                            const parena = rs.profile_arena_state.allocator();
+                            rs.profile_info = .{
                                 .did = try parena.dupe(u8, wire.did),
                                 .handle = try parena.dupe(u8, wire.handle),
                                 .display_name = try parena.dupe(u8, wire.displayName orelse ""),
@@ -3820,94 +4088,94 @@ pub fn run(
                                 .posts = @intCast(@min(wire.postsCount, std.math.maxInt(u32))),
                                 .following = wire.viewer != null and wire.viewer.?.following != null,
                             };
-                            mode = .profile;
-                            status = "";
+                            rs.mode = .profile;
+                            rs.status = "";
                         },
-                        .failed => |failure| status = std.fmt.bufPrint(&status_buf, "refused: {d} {s}", .{
+                        .failed => |failure| rs.status = std.fmt.bufPrint(&rs.status_buf, "refused: {d} {s}", .{
                             failure.status, failure.code,
                         }) catch "refused",
                     }
                 },
                 .toggle_reveal => if (view_items.len > 0) {
-                    const item = view_items[state.selected];
+                    const item = view_items[rs.state.selected];
                     var found: ?usize = null;
-                    for (revealed.items, 0..) |cid, i| {
+                    for (rs.revealed.items, 0..) |cid, i| {
                         if (std.mem.eql(u8, cid, item.cid)) {
                             found = i;
                             break;
                         }
                     }
                     if (found) |i| {
-                        gpa.free(revealed.items[i]);
-                        _ = revealed.swapRemove(i);
-                        status = "hidden again";
+                        gpa.free(rs.revealed.items[i]);
+                        _ = rs.revealed.swapRemove(i);
+                        rs.status = "hidden again";
                     } else if (moderation.verdictFor(item.label_flags) == .hide) {
-                        try revealed.append(gpa, try gpa.dupe(u8, item.cid));
-                        status = "shown (x re-hides)";
+                        try rs.revealed.append(gpa, try gpa.dupe(u8, item.cid));
+                        rs.status = "shown (x re-hides)";
                     }
                 },
                 .follow => if (view_items.len > 0) {
-                    const item = view_items[state.selected];
+                    const item = view_items[rs.state.selected];
                     const did = feed_core.authorDidForCid(store, item.cid);
                     if (did.len > 0) {
-                        status = "following...";
-                        try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status);
+                        rs.status = "following...";
+                        try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status);
                         const outcome = write.followAccount(gpa, arena, io, environ, session, did, now) catch |err| switch (err) {
                             error.OutOfMemory => return err,
                             else => {
-                                status = "network error";
+                                rs.status = "network error";
                                 continue;
                             },
                         };
-                        status = switch (outcome) {
-                            .ok => std.fmt.bufPrint(&status_buf, "followed @{s}", .{item.author_handle}) catch "followed",
-                            .failed => |failure| std.fmt.bufPrint(&status_buf, "refused: {d} {s}", .{
+                        rs.status = switch (outcome) {
+                            .ok => std.fmt.bufPrint(&rs.status_buf, "followed @{s}", .{item.author_handle}) catch "followed",
+                            .failed => |failure| std.fmt.bufPrint(&rs.status_buf, "refused: {d} {s}", .{
                                 failure.status, failure.code,
                             }) catch "refused",
                         };
                     }
                 },
                 .reply => if (view_items.len > 0) {
-                    const item = view_items[state.selected];
+                    const item = view_items[rs.state.selected];
                     if (feed_core.replyRefsForCid(store, item.cid)) |refs| {
                         // Copy the refs out of the store before composing:
                         // the composer outlives this frame and the store may
                         // grow under it (the lifetime contract, honored).
-                        _ = compose_arena_state.reset(.retain_capacity);
-                        const compose_arena = compose_arena_state.allocator();
-                        reply_target = .{
+                        _ = rs.compose_arena_state.reset(.retain_capacity);
+                        const compose_arena = rs.compose_arena_state.allocator();
+                        rs.reply_target = .{
                             .root_uri = try compose_arena.dupe(u8, refs.root_uri),
                             .root_cid = try compose_arena.dupe(u8, refs.root_cid),
                             .parent_uri = try compose_arena.dupe(u8, refs.parent_uri),
                             .parent_cid = try compose_arena.dupe(u8, refs.parent_cid),
                         };
-                        reply_handle = try compose_arena.dupe(u8, item.author_handle);
-                        textedit.clear(&compose);
-                        status = "";
-                        mode = .compose;
+                        rs.reply_handle = try compose_arena.dupe(u8, item.author_handle);
+                        textedit.clear(&rs.compose);
+                        rs.status = "";
+                        rs.mode = .compose;
                     }
                 },
                 .new_post => {
-                    reply_target = null;
-                    reply_handle = "";
-                    textedit.clear(&compose);
-                    status = "";
-                    mode = .compose;
+                    rs.reply_target = null;
+                    rs.reply_handle = "";
+                    textedit.clear(&rs.compose);
+                    rs.status = "";
+                    rs.mode = .compose;
                 },
                 else => |action| {
-                    timeline_ui.applyAction(&state, action, view_items.len);
+                    timeline_ui.applyAction(&rs.state, action, view_items.len);
                     switch (action) {
                         // Key navigation scrolls the pixel viewport to the
                         // cursor; wheel reading never does (one-shot flag,
                         // consumed by buildTimeline).
-                        .move_up, .move_down, .page_up, .page_down, .go_top, .go_bottom => gview.ensure_selected = true,
+                        .move_up, .move_down, .page_up, .page_down, .go_top, .go_bottom => rs.gview.ensure_selected = true,
                         else => {},
                     }
                 },
             }
         }
     }
-    return user_signed_out;
+    return rs.user_signed_out;
 }
 
 /// The caret blink phase: solid for the ~530 ms after the last edit/move
