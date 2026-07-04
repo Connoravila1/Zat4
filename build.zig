@@ -174,14 +174,43 @@ pub fn build(b: *std.Build) void {
         .root_module = libzat_mod,
         .linkage = .dynamic,
     });
-    const libzat_step = b.step("libzat", "Build the Android C-ABI shared library (MOBILE_ROADMAP M-And.0)");
+    // M-And.0b: `-Dandroid-ndk=<path>` links bionic via the NDK sysroot,
+    // which unlocks the font engine (stb) and dlopen — i.e. the GPU attach
+    // (zat_surface → the system libEGL). Without it the library builds pure
+    // (the seam + the sim; zat_surface reports false). The capability rides
+    // an options module so src/mobile.zig comptime-gates its GPU leg.
+    const ndk_path = b.option([]const u8, "android-ndk", "Android NDK path — bionic libc build of libzat: fonts + EGL (M-And.0b)");
+    const libzat_opts = b.addOptions();
+    libzat_opts.addOption(bool, "have_gpu", ndk_path != null);
+    libzat_mod.addOptions("mobile_config", libzat_opts);
+    if (ndk_path) |ndk| {
+        addFontEngine(b, libzat_mod); // also sets link_libc
+        const sysroot = b.fmt("{s}/toolchains/llvm/prebuilt/linux-x86_64/sysroot", .{ndk});
+        const wf = b.addWriteFiles();
+        // API 29 = this Zig's default android target version; present in r27c.
+        const libc_txt = wf.add("android-libc.txt", b.fmt(
+            "include_dir={s}/usr/include\n" ++
+                "sys_include_dir={s}/usr/include/aarch64-linux-android\n" ++
+                "crt_dir={s}/usr/lib/aarch64-linux-android/29\n" ++
+                "msvc_lib_dir=\n" ++
+                "kernel32_lib_dir=\n" ++
+                "gcc_dir=\n", .{ sysroot, sysroot, sysroot }));
+        libzat.setLibCFile(libc_txt);
+        libzat.step.dependOn(&wf.step);
+    }
+    const libzat_step = b.step("libzat", "Build the Android C-ABI shared library (MOBILE_ROADMAP M-And.0/0b)");
     libzat_step.dependOn(&b.addInstallArtifact(libzat, .{}).step);
 
+    // The seam's unit tests run NATIVE (pure build: have_gpu=false — the GPU
+    // leg needs a device; its refusal path is what the tests pin).
     const mobile_test_mod = b.createModule(.{
         .root_source_file = b.path("src/mobile.zig"),
         .target = target,
         .optimize = optimize,
     });
+    const mobile_test_opts = b.addOptions();
+    mobile_test_opts.addOption(bool, "have_gpu", false);
+    mobile_test_mod.addOptions("mobile_config", mobile_test_opts);
     const mobile_tests = b.addTest(.{ .root_module = mobile_test_mod });
     const run_mobile_tests = b.addRunArtifact(mobile_tests);
     test_step.dependOn(&run_mobile_tests.step);

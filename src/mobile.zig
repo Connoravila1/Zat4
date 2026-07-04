@@ -24,20 +24,26 @@
 //! degrades to a skipped frame or an ignored event, never a crash across the
 //! boundary (E1–E3).
 //!
-//! v0 scope (M-And.0): prove the seam + the cross-compile — the living glyph
-//! field, driven by touches, stepped by the shim's frame tick, its height
-//! plane readable back for a debug render. Deliberately NOT here yet:
-//! - the GPU attach (zat_surface with an ANativeWindow*): needs the NDK-libc
-//!   build (dlopen of the system libEGL) — M-And.0b;
-//! - the feed itself: the desktop run loop OWNS its loop (shell/tui.zig);
-//!   mobile inverts control, so the feed arrives with the control-inversion
-//!   slice (M-Core.1 in the roadmap), not as a smuggled rewrite here.
+//! Scope: M-And.0 (the seam + the pure sim, no libc) plus M-And.0b (the GPU
+//! attach — zat_surface takes the ANativeWindow*, dlopens the system libEGL
+//! through the same gpu.init seam as every desktop backend, and renders the
+//! living field; available only in NDK-libc builds, see `mobile_config`).
+//! Deliberately NOT here: the feed. The desktop run loop OWNS its loop
+//! (shell/tui.zig); mobile inverts control, so the feed arrives with the
+//! control-inversion slice (M-Core.1), not as a smuggled rewrite here.
 //!
 //! Threading contract (documented for the shim): all calls on one thread
 //! (the render/choreographer thread), same as every OS window backend.
 
 const std = @import("std");
 const glyph_field = @import("core/glyph_field.zig");
+// Build-time capability switch (build.zig options module): `have_gpu` is
+// true only for the NDK-libc build (-Dandroid-ndk=...), which is what makes
+// bionic, the font engine, and dlopen(libEGL) available. The pure build
+// comptime-gates every use below, so these imports cost it nothing.
+const mobile_config = @import("mobile_config");
+const gpu = @import("shell/gpu.zig");
+const text = @import("core/text.zig");
 
 /// The seam's context handle. The shim holds it as an opaque pointer.
 /// A7.2: cold struct, size guard waived — exactly one per app process.
@@ -56,7 +62,21 @@ const Ctx = struct {
     /// grid exactly like the desktop loops (accumulated, clamped).
     acc_ns: u64,
     t: f32,
+    /// The GPU attachment (EGL context on the shim's surface + the field
+    /// renderer). Null until zat_surface; void in pure builds.
+    gfx: ?Gfx,
 };
+
+/// Everything the render leg owns once a surface is attached (M-And.0b).
+/// A7.2: cold struct, size guard waived — at most one, lives in Ctx.
+const Gfx = if (mobile_config.have_gpu) struct {
+    g: gpu.Gpu,
+    engine: text.Engine,
+    ramp: gpu.FieldRenderer,
+    grid: gpu.FieldGrid,
+    width_px: u32,
+    height_px: u32,
+} else void;
 
 const step_ns: u64 = 16_666_667; // the fixed 60 Hz sim timestep
 const amb_amp: f32 = 0.006;
@@ -89,11 +109,13 @@ fn create(gpa: std.mem.Allocator, width_px: u32, height_px: u32, cell_px: u32) !
         .cell_px = @max(4, cell_px),
         .acc_ns = 0,
         .t = 0,
+        .gfx = null,
     };
     return ctx;
 }
 
 fn destroy(ctx: *Ctx) void {
+    detachSurface(ctx);
     const gpa = ctx.gpa;
     ctx.splashes.deinit(gpa);
     gpa.free(ctx.bias);
@@ -158,10 +180,88 @@ fn stepSim(ctx: *Ctx, dt_ns: u64) void {
     }
 }
 
+fn detachSurface(ctx: *Ctx) void {
+    if (comptime !mobile_config.have_gpu) return;
+    if (ctx.gfx) |*gfx| {
+        // GL objects (textures, buffers, programs) die with the context;
+        // only the context itself and the font engine need explicit ends.
+        gpu.deinit(&gfx.g);
+        text.deinitEngine(ctx.gpa, &gfx.engine);
+        ctx.gfx = null;
+    }
+}
+
+fn attachSurface(ctx: *Ctx, native_window: ?*anyopaque, width_px: u32, height_px: u32) bool {
+    if (comptime !mobile_config.have_gpu) return false;
+    detachSurface(ctx); // Android recreates surfaces freely; re-attach = replace
+    var g = gpu.init(native_window) catch return false;
+    gpu.setViewport(@intCast(width_px), @intCast(height_px));
+    var engine = text.initEngine() catch {
+        gpu.deinit(&g);
+        return false;
+    };
+    const cell: u16 = @intCast(@min(ctx.cell_px, 256)); // renderer takes u16 cells
+    const ramp = gpu.initFieldRenderer(ctx.gpa, &engine, cell, cell) catch {
+        text.deinitEngine(ctx.gpa, &engine);
+        gpu.deinit(&g);
+        return false;
+    };
+    const grid = gpu.initFieldGrid() catch {
+        text.deinitEngine(ctx.gpa, &engine);
+        gpu.deinit(&g);
+        return false;
+    };
+    ctx.gfx = .{
+        .g = g,
+        .engine = engine,
+        .ramp = ramp,
+        .grid = grid,
+        .width_px = width_px,
+        .height_px = height_px,
+    };
+    if (width_px != ctx.width_px or height_px != ctx.height_px) _ = resize(ctx, width_px, height_px);
+    return true;
+}
+
+fn renderFrame(ctx: *Ctx) void {
+    if (comptime !mobile_config.have_gpu) return;
+    if (ctx.gfx) |*gfx| {
+        gpu.uploadField(&gfx.grid, ctx.field.height, ctx.field.dye, ctx.field.cols, ctx.field.rows);
+        gpu.clear(20.0 / 255.0, 20.0 / 255.0, 22.0 / 255.0);
+        // Full-bleed field: no dimmed content pillar yet (that arrives with
+        // the feed, M-Core.1) — the band is zero-width at the left edge.
+        gpu.drawFieldGrid(&gfx.grid, &gfx.ramp, -100, -100, ctx.t, @intCast(gfx.width_px), @intCast(gfx.height_px), 0, 0, 0xFFA6ACBA, false);
+        gpu.swap(&gfx.g);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The exported ABI. Names are the contract (MOBILE_ROADMAP §2); keep them
 // stable — the Kotlin/Swift shims bind these strings.
 // ---------------------------------------------------------------------------
+
+/// Attach the OS surface (Android: the ANativeWindow* from the shim's
+/// surfaceCreated). Brings up EGL/GLES + the field renderer on it. Pure
+/// builds (no NDK libc) report false — the shim falls back to the
+/// height-plane readback below.
+export fn zat_surface(ctx_ptr: ?*anyopaque, native_window: ?*anyopaque, width_px: u32, height_px: u32) bool {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return false));
+    return attachSurface(ctx, native_window, width_px, height_px);
+}
+
+/// The surface is gone (Android surfaceDestroyed / background). Safe to
+/// call without an attach; rendering resumes on the next zat_surface.
+export fn zat_surface_lost(ctx_ptr: ?*anyopaque) void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return));
+    detachSurface(ctx);
+}
+
+/// Render one frame of the field to the attached surface (call after
+/// zat_step on the same thread). No surface → no-op.
+export fn zat_render(ctx_ptr: ?*anyopaque) void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return));
+    renderFrame(ctx);
+}
 
 export fn zat_init(width_px: u32, height_px: u32, cell_px: u32) ?*anyopaque {
     // v0 allocator: the page allocator — pure Zig, no libc requirement, and
@@ -237,5 +337,17 @@ test "seam ABI: null context is a no-op on every export, never a crash" {
     zat_step(null, step_ns);
     try testing.expectEqual(@as(u32, 0), zat_field_cols(null));
     try testing.expectEqual(@as(?[*]const f32, null), zat_field_height(null));
+    try testing.expect(!zat_surface(null, null, 10, 10));
+    zat_surface_lost(null);
+    zat_render(null);
     zat_shutdown(null);
+}
+
+test "seam: a pure build refuses the surface attach honestly" {
+    // The native test build has have_gpu=false — attach must report false
+    // (the shim's cue to use the readback fallback), never pretend.
+    if (comptime mobile_config.have_gpu) return error.SkipZigTest;
+    const ctx = try create(testing.allocator, 320, 240, 16);
+    defer destroy(ctx);
+    try testing.expect(!attachSurface(ctx, null, 320, 240));
 }

@@ -56,10 +56,14 @@ extern "kernel32" fn GetProcAddress(module: ?*anyopaque, name: [*:0]const u8) ca
 /// Open a runtime graphics library by its per-OS name. Only the taken
 /// comptime branch is analyzed, so dlopen never reaches a Windows link and
 /// LoadLibraryW never reaches a Linux one. Windows searches the exe's own
-/// directory first — exactly where the zip places the ANGLE DLLs.
-fn openLib(comptime linux_name: [:0]const u8, comptime win_name: []const u8) ?*anyopaque {
+/// directory first — exactly where the zip places the ANGLE DLLs. Android's
+/// system libraries are UNSUFFIXED (`libEGL.so`, not `.so.1`) and ship on
+/// every device — nothing to bundle there.
+fn openLib(comptime linux_name: [:0]const u8, comptime win_name: []const u8, comptime android_name: [:0]const u8) ?*anyopaque {
     if (comptime builtin.os.tag == .windows) {
         return LoadLibraryW(std.unicode.utf8ToUtf16LeStringLiteral(win_name));
+    } else if (comptime is_android) {
+        return dlopen(android_name, RTLD_NOW);
     } else {
         return dlopen(linux_name, RTLD_NOW);
     }
@@ -81,9 +85,18 @@ const EGLContext = ?*anyopaque;
 const EGLBoolean = c_uint;
 const EGLint = i32;
 const EGLenum = c_uint;
-// The EGL native window is what the OS window backend hands us: the X11
-// XID on Linux, the HWND on Windows (ANGLE).
-const EGLNativeWindowType = if (builtin.os.tag == .windows) ?*anyopaque else c_ulong;
+const is_android = builtin.abi.isAndroid();
+
+// The EGL native window is what the OS hands us: the X11 XID on desktop
+// Linux, the HWND on Windows (ANGLE), the ANativeWindow* on Android.
+const EGLNativeWindowType = if (builtin.os.tag == .windows or is_android) ?*anyopaque else c_ulong;
+
+/// What callers pass to init. On desktop it is the window backend's
+/// NativeHandle (via shell/native.zig); on Android there IS no window
+/// backend — the mobile shim owns the surface and hands its ANativeWindow*
+/// across the C-ABI seam — so the type is declared here (MOBILE_ROADMAP
+/// §2.5).
+pub const SurfaceHandle = if (is_android) ?*anyopaque else native.NativeHandle;
 
 const RTLD_NOW: c_int = 2;
 
@@ -178,12 +191,14 @@ fn sym(lib: ?*anyopaque, comptime T: type, name: [*:0]const u8) Error!T {
         elog("symbol '{s}' not found", .{name});
         return Error.GpuInit;
     };
-    return @ptrCast(p);
+    // anyopaque is align(1); function pointers are wider on some targets
+    // (aarch64) — the loader vouches for the real alignment.
+    return @ptrCast(@alignCast(p));
 }
 
 fn load() Error!void {
     if (loaded) return;
-    const lib_egl = openLib("libEGL.so.1", "libEGL.dll") orelse {
+    const lib_egl = openLib("libEGL.so.1", "libEGL.dll", "libEGL.so") orelse {
         if (comptime builtin.os.tag == .windows) {
             elog("libEGL.dll not found — place ANGLE's libEGL.dll + libGLESv2.dll next to Zat4.exe (software renderer takes over)", .{});
         } else {
@@ -191,7 +206,7 @@ fn load() Error!void {
         }
         return Error.GpuInit;
     };
-    const lib_gl = openLib("libGLESv2.so.2", "libGLESv2.dll") orelse {
+    const lib_gl = openLib("libGLESv2.so.2", "libGLESv2.dll", "libGLESv2.so") orelse {
         elog("libGLESv2 not found next to libEGL", .{});
         return Error.GpuInit;
     };
@@ -264,7 +279,7 @@ fn load() Error!void {
 /// touching any loader, and the caller's software fallback takes over
 /// (E2). The comptime gates also keep each OS's loader symbols out of the
 /// other OS's link — only the taken branches are analyzed.
-pub fn init(handle: native.NativeHandle) Error!Gpu {
+pub fn init(handle: SurfaceHandle) Error!Gpu {
     if (comptime builtin.os.tag == .linux or builtin.os.tag == .windows) {
         return initEgl(handle);
     } else {
@@ -273,7 +288,7 @@ pub fn init(handle: native.NativeHandle) Error!Gpu {
     }
 }
 
-fn initEgl(handle: native.NativeHandle) Error!Gpu {
+fn initEgl(handle: SurfaceHandle) Error!Gpu {
     try load();
 
     const dpy = eglGetDisplay(null); // EGL_DEFAULT_DISPLAY → X11: EGL's own $DISPLAY; ANGLE: the default D3D11 display
@@ -316,7 +331,7 @@ fn initEgl(handle: native.NativeHandle) Error!Gpu {
     }
     if (context == EGL_NO_CONTEXT) return fail("eglCreateContext");
 
-    const nwin: EGLNativeWindowType = if (comptime builtin.os.tag == .windows) handle else @as(EGLNativeWindowType, handle);
+    const nwin: EGLNativeWindowType = if (comptime builtin.os.tag == .windows or is_android) handle else @as(EGLNativeWindowType, handle);
     const surface = eglCreateWindowSurface(dpy, config, nwin, null);
     if (surface == EGL_NO_SURFACE) return fail("eglCreateWindowSurface");
 
