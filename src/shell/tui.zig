@@ -1520,21 +1520,22 @@ pub fn run(
         on_thread_prev = on_thread;
 
         // Zone page: on ENTERING (a tag-pill tap flips gscreen) or a tag change,
-        // fetch the zone's posts as CONTENT into the SHARED store. The view
-        // ordering is then a query (buildTagView). Same E2 containment.
+        // SUBMIT the zone's feed to the view worker (M-Core.1 unblocking, 5/7);
+        // the drain above ingests it as CONTENT into the SHARED store. The view
+        // ordering is then a query (buildTagView) — resident posts wearing the
+        // tag show at once; the rest fill in when the page lands. Same E2
+        // containment as the other view submits.
         const on_zone = mode == .timeline and gscreen == feed_view.screen_zones;
         if (on_zone and (!on_zone_prev or zone_dirty)) {
-            const zo = feed_shell.loadZoneFeed(gpa, arena, io, environ, session, appview_url, store, zone_tag, 50) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => blk: {
-                    status = "zone: network error"; // contained
-                    break :blk null;
-                },
-            };
-            if (zo) |result| switch (result) {
-                .ok => {},
-                .failed => status = "zone: unavailable",
-            };
+            if (viewloader) |w| {
+                const tag = try gpa.dupe(u8, zone_tag);
+                if (view_worker.submit(w, .zone, tag, 50)) {
+                    status = "loading zone...";
+                } else {
+                    gpa.free(tag);
+                    status = "zone load skipped"; // mailbox OOM; re-entering retries
+                }
+            } else status = "zone: unavailable"; // worker never started (E2)
             zone_dirty = false;
         }
         on_zone_prev = on_zone;
@@ -5063,6 +5064,7 @@ fn viewNoun(kind: view_worker.Kind) []const u8 {
     return switch (kind) {
         .profile => "profile",
         .thread => "thread",
+        .zone => "zone",
     };
 }
 

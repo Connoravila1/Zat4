@@ -58,6 +58,8 @@ pub const Kind = enum(u8) {
     /// The thread screen's body: the focused post's flat thread
     /// (getPostThread), reshaped here into a page for the same ingest.
     thread,
+    /// The zone screen's body: one tag's posts (getPostsForTag).
+    zone,
 };
 
 /// A view-load ask. Everything the fetch needs (session, appview_url, io) is
@@ -258,6 +260,22 @@ fn fetchOutcome(worker: *Worker, arena: Allocator, req: Request) Result.Outcome 
                 // reshaping — the arena owns the posts either way) so the
                 // UI runs the one content ingest for every post screen.
                 .ok => |thread| .{ .page = .{ .feed = thread.posts } },
+                .failed => |f| .{ .refused = .{ .status = f.status, .code = f.code } },
+            };
+        },
+        .zone => {
+            const fetched = feed_shell.fetchZonePage(
+                worker.gpa,
+                arena,
+                worker.io,
+                worker.environ,
+                worker.session,
+                worker.appview_url,
+                target,
+                req.limit,
+            ) catch |err| return .{ .net_error = @errorName(err) };
+            return switch (fetched) {
+                .ok => |page| .{ .page = page },
                 .failed => |f| .{ .refused = .{ .status = f.status, .code = f.code } },
             };
         },

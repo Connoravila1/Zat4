@@ -275,22 +275,24 @@ pub fn fetchThreadPage(
     );
 }
 
-/// Fetch a ZONE's feed (`getPostsForTag?tag=&viewer=`) and ingest its posts as
-/// CONTENT into the shared store; the zone VIEW is then a pure query
-/// (`feed_core.buildTagView`), so engagement + identity stay unified with every
-/// other view (ZONES inv. 4). The server normalizes the tag, so the display-form
-/// `tag` the user tapped resolves to the same zone (invariant 1).
-pub fn loadZoneFeed(
+/// The NETWORK half of the zone screen's load, alone: fetch a ZONE's feed
+/// (`getPostsForTag?tag=&viewer=`) and return the page as a value, touching
+/// no store (the view worker calls this off the frame thread;
+/// M_CORE_INVERSION MC.3). The UI ingests the drained posts as CONTENT; the
+/// zone VIEW is then a pure query (`feed_core.buildTagView`), so engagement
+/// + identity stay unified with every other view (ZONES inv. 4). The server
+/// normalizes the tag, so the display-form `tag` the user tapped resolves
+/// to the same zone (invariant 1).
+pub fn fetchZonePage(
     gpa: Allocator,
     arena: Allocator,
     io: std.Io,
     environ: ?*const std.process.Environ.Map,
     session: *auth.Session,
     appview_url: []const u8,
-    store: *feed_core.Store,
     tag: []const u8,
     limit: u32,
-) !PageOutcome {
+) !xrpc.Outcome(lexicon.TimelinePage) {
     var limit_buf: [12]u8 = undefined;
     const limit_str = std.fmt.bufPrint(&limit_buf, "{d}", .{limit}) catch unreachable;
     const params = [_]xrpc.Param{
@@ -299,7 +301,7 @@ pub fn loadZoneFeed(
         .{ .name = "limit", .value = limit_str },
     };
 
-    const outcome = try auth.queryHost(
+    return auth.queryHost(
         gpa,
         arena,
         io,
@@ -310,10 +312,6 @@ pub fn loadZoneFeed(
         &params,
         lexicon.TimelinePage,
     );
-    switch (outcome) {
-        .failed => |failure| return .{ .failed = failure },
-        .ok => |page| return .{ .ok = try feed_core.ingestPosts(gpa, store, page) },
-    }
 }
 
 /// The result of a zone-catalog fetch: the known zones (display tag + post
