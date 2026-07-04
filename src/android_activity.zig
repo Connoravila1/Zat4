@@ -64,9 +64,18 @@ const Lock = struct {
 const ANativeWindow = opaque {};
 const AInputQueue = opaque {};
 const AInputEvent = opaque {};
-const ARect = extern struct { left: i32, top: i32, right: i32, bottom: i32 };
+const ARect = extern struct {
+    // A7.2 (FFI): layout is the OS ABI's, not ours — an exact guard
+    // would assert the foreign ABI, never zat's discipline; waived.
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+};
 
 const Callbacks = extern struct {
+    // A7.2 (FFI): layout is the OS ABI's, not ours — an exact guard
+    // would assert the foreign ABI, never zat's discipline; waived.
     onStart: ?*const fn (*Activity) callconv(.c) void = null,
     onResume: ?*const fn (*Activity) callconv(.c) void = null,
     onSaveInstanceState: ?*const fn (*Activity, *usize) callconv(.c) ?*anyopaque = null,
@@ -86,6 +95,8 @@ const Callbacks = extern struct {
 };
 
 const Activity = extern struct {
+    // A7.2 (FFI): layout is the OS ABI's, not ours — an exact guard
+    // would assert the foreign ABI, never zat's discipline; waived.
     callbacks: *Callbacks,
     vm: *anyopaque,
     env: *anyopaque,
