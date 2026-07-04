@@ -1242,25 +1242,35 @@ fn deinitRunState(rs: *RunState) void {
     }
 }
 
-pub fn run(
-    gpa: Allocator,
-    io: std.Io,
-    environ: ?*const std.process.Environ.Map,
-    session: *auth.Session,
-    appview_url: []const u8,
-    store: *feed_core.Store,
-    backend: Backend,
-) !bool {
-    // MC.1 (M_CORE_INVERSION): all cross-frame state lives in RunState,
-    // built in place (workers capture field addresses) and torn down by
-    // deinitRunState — the setup and defers moved there verbatim. The
-    // frame body below is unchanged except for the rs. prefix; MC.2 will
-    // cut it out as stepFrame(&rs).
-    var rs: RunState = undefined;
-    try initRunState(&rs, gpa, io, environ, session, appview_url, store, backend);
-    defer deinitRunState(&rs);
+/// What one frame step decided: run another frame, or leave the loop.
+/// The driver owns the loop — the desktop run() below, a phone's vsync
+/// callback later (M_CORE_INVERSION MC.2/MC.4).
+const StepOutcome = enum {
+    /// The frame completed; call again.
+    again,
+    /// The user quit (q / window close). The session stays cached.
+    quit,
+    /// The user signed out (Settings): the caller clears the cached
+    /// session instead of re-saving it.
+    signed_out,
+};
 
-    main_loop: while (true) {
+/// ONE frame of the client, cut out of the old main_loop verbatim (MC.2):
+/// drain the workers, pump input, advance the sim, lay out, paint. The
+/// old `continue :main_loop`-equivalent exits are `return .again`; the
+/// old `break :main_loop` sites jump past the frame block and map to the
+/// outcome below. Waits are unchanged for now: the input pump inside
+/// still blocks up to 16ms/500ms (the driver-owned-wait split is the
+/// MC.4 driver's concern, kept out of this mechanical cut).
+fn stepFrame(rs: *RunState) !StepOutcome {
+    const gpa = rs.gpa;
+    const io = rs.io;
+    const environ = rs.environ;
+    const session = rs.session;
+    const appview_url = rs.appview_url;
+    const store = rs.store;
+    const backend = rs.backend;
+    main_loop: {
         _ = rs.frame_arena.reset(.retain_capacity); // C3: one arena per frame
         const arena = rs.frame_arena.allocator();
 
@@ -2317,9 +2327,9 @@ pub fn run(
             .terminal => if (comptime builtin.os.tag == .windows) unreachable else {
                 var fds = [_]posix.pollfd{.{ .fd = rs.stdin_fd, .events = posix.POLL.IN, .revents = 0 }};
                 const ready = posix.poll(&fds, 500) catch 0;
-                if (ready == 0) continue;
+                if (ready == 0) return .again; // poll timeout: frame over (was `continue`)
                 n = posix.read(rs.stdin_fd, &in_buf) catch 0;
-                if (n == 0) continue;
+                if (n == 0) return .again; // nothing read: frame over (was `continue`)
                 rs.last_input_nanos = clock_shell.monotonicNanos();
             },
             .window => |win| {
@@ -2351,7 +2361,7 @@ pub fn run(
                 const pump_ms: i32 = if (animating) 16 else 500;
                 const pumped = window_shell.pump(win, pump_ms, gpa, &pumped_bytes, &pointer_events) catch {
                     rs.status = "window error";
-                    continue;
+                    return .again; // frame over (was `continue`)
                 };
                 if (pumped.closed) break :main_loop;
                 if (pumped.dropped > 0) rs.status = "input dropped (low memory)";
@@ -3665,7 +3675,7 @@ pub fn run(
                 // redundant: it re-ran the whole pipeline with ~0 dt, doing the
                 // CPU work of a frame the top-of-loop paint repeats next lap —
                 // pure waste on the render thread. One paint per lap.)
-                if (n == 0) continue;
+                if (n == 0) return .again; // no input this lap: frame over (was `continue`)
                 rs.last_input_nanos = clock_shell.monotonicNanos();
             },
         }
@@ -4174,7 +4184,36 @@ pub fn run(
                 },
             }
         }
+        return .again;
     }
+    return if (rs.user_signed_out) .signed_out else .quit;
+}
+
+pub fn run(
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    session: *auth.Session,
+    appview_url: []const u8,
+    store: *feed_core.Store,
+    backend: Backend,
+) !bool {
+    // MC.1 (M_CORE_INVERSION): all cross-frame state lives in RunState,
+    // built in place (workers capture field addresses) and torn down by
+    // deinitRunState — the setup and defers moved there verbatim. The
+    // frame body below is unchanged except for the rs. prefix; MC.2 will
+    // cut it out as stepFrame(&rs).
+    var rs: RunState = undefined;
+    try initRunState(&rs, gpa, io, environ, session, appview_url, store, backend);
+    defer deinitRunState(&rs);
+
+    while (true) switch (try stepFrame(&rs)) {
+        .again => {},
+        // Both exits leave the loop; the sign-out distinction rides in
+        // rs.user_signed_out (set before the break), same as before the
+        // cut. The mobile driver (MC.4) is what consumes the enum.
+        .quit, .signed_out => break,
+    };
     return rs.user_signed_out;
 }
 
