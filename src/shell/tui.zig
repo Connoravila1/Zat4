@@ -87,6 +87,7 @@ const clock_shell = @import("clock.zig");
 const write = @import("write.zig");
 const write_worker = @import("write_worker.zig");
 const refresh_worker = @import("refresh_worker.zig");
+const view_worker = @import("view_worker.zig");
 const auth = @import("auth.zig");
 const lexicon = @import("../core/lexicon.zig");
 const moderation = @import("../core/moderation.zig");
@@ -385,6 +386,22 @@ pub fn run(
     // Auto ticks in flight: the interval clock never stacks a second fetch on
     // an unanswered one (a slow network otherwise queues a burst).
     var refresh_inflight: u32 = 0;
+    // The VIEW-LOAD worker — the same actor pattern for the view-ENTRY
+    // fetches (profile/thread/zone/…). Entering a view used to run its fetch
+    // inline on this thread — a frozen frame per entry, and a guaranteed ANR
+    // once an OS owns the loop (M_CORE_INVERSION MC.3). Now entry submits a
+    // request and the drain below ingests the result; the screen shows the
+    // store's resident content until the page lands (every view is a query
+    // over the shared store). A failed spawn degrades to a status line per
+    // view (E2).
+    var viewload_in: view_worker.RequestBox = .{};
+    defer viewload_in.deinit(gpa);
+    var viewload_out: view_worker.ResultBox = .{};
+    defer viewload_out.deinit(gpa);
+    const viewloader: ?*view_worker.Worker = view_worker.start(gpa, io, environ, session, appview_url, &viewload_in, &viewload_out) catch null;
+    defer if (viewloader) |w| view_worker.shutdown(w);
+    var viewload_results: std.ArrayList(view_worker.Result) = .empty;
+    defer viewload_results.deinit(gpa);
     // Deferred-undo intents: a post the user UN-engaged before its like/repost
     // create had returned a record uri. Keyed by a hash of the post cid; when
     // the create's result lands (with the uri), the drain fires the delete at
@@ -1428,23 +1445,54 @@ pub fn run(
             refresh_worker.freeResult(gpa, res);
         }
 
+        // Drain view-entry loads. The network half ran on the view worker;
+        // only the ingest (pure functions over the fetched values — the store
+        // belongs to this thread) runs here. A late page whose view the user
+        // already left ingests harmlessly: content lands in the SHARED store
+        // and every screen is a query over it (ZONES inv. 4), so there is no
+        // stale-view hazard to guard.
+        viewload_results.clearRetainingCapacity();
+        try viewload_out.drain(gpa, &viewload_results);
+        for (viewload_results.items) |res| {
+            switch (res.outcome) {
+                .page => |page| {
+                    _ = feed_core.ingestPosts(gpa, store, page) catch |err| {
+                        view_worker.freeResult(gpa, res);
+                        return err; // OOM only
+                    };
+                    status = ""; // the submit's "loading..." line is done
+                },
+                // bufPrint COPIES f.code into status_buf before freeResult
+                // destroys the arena that owns it.
+                .refused => |f| status = std.fmt.bufPrint(&status_buf, "{s}: refused {d} {s}", .{
+                    viewNoun(res.kind), f.status, f.code,
+                }) catch "refused",
+                .net_error => status = std.fmt.bufPrint(&status_buf, "{s}: network error", .{
+                    viewNoun(res.kind),
+                }) catch "network error", // contained (E2)
+            }
+            view_worker.freeResult(gpa, res);
+        }
+
         // Premium Profile screen: on ENTERING it (the rail click flips gscreen),
-        // fetch the viewed account's posts as CONTENT into the SHARED store — a
-        // fresh fetch each visit. Failure is contained to the status line (E2);
-        // only OOM is fatal. Gated to the timeline mode + window path.
+        // SUBMIT the viewed account's feed to the view worker — a fresh fetch
+        // each visit, off the frame thread (M-Core.1 unblocking, 3/7). The
+        // drain above ingests the page as CONTENT into the SHARED store when
+        // it lands; failure stays a status line (E2). Gated to the timeline
+        // mode + window path.
         const on_profile = mode == .timeline and gscreen == feed_view.screen_profile;
         if (on_profile and (!on_profile_prev or profile_dirty)) {
-            const po = feed_shell.loadAuthorFeed(gpa, arena, io, environ, session, appview_url, store, profile_target_did, 30) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => blk: {
-                    status = "profile: network error"; // contained
-                    break :blk null;
-                },
-            };
-            if (po) |result| switch (result) {
-                .ok => {},
-                .failed => status = "profile: unavailable",
-            };
+            if (viewloader) |w| {
+                // The target lives in a mutable UI buffer the next tap
+                // rewrites — the worker owns a gpa copy.
+                const actor = try gpa.dupe(u8, profile_target_did);
+                if (view_worker.submit(w, .profile, actor, 30)) {
+                    status = "loading profile...";
+                } else {
+                    gpa.free(actor);
+                    status = "profile load skipped"; // mailbox OOM; re-entering retries
+                }
+            } else status = "profile: unavailable"; // worker never started (E2: a status, not a dead screen)
             profile_dirty = false;
         }
         on_profile_prev = on_profile;
@@ -5006,6 +5054,14 @@ fn revertDisengage(kind: Engagement, gpa: Allocator, store: *feed_core.Store, ci
         .like => try feed_core.revertUnlike(gpa, store, cid, uri),
         .repost => try feed_core.revertUnrepost(gpa, store, cid, uri),
     }
+}
+
+/// The status-line noun for a view-load failure — which screen's fetch it
+/// was, so "network error" says whose.
+fn viewNoun(kind: view_worker.Kind) []const u8 {
+    return switch (kind) {
+        .profile => "profile",
+    };
 }
 
 /// Undo the optimistic state for a write the worker reported as refused

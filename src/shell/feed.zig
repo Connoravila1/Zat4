@@ -194,25 +194,26 @@ pub fn fetchOlderPage(
     );
 }
 
-/// Load one author's posts into the SHARED `store` as CONTENT (no Home
-/// feed-ordering rows) — the profile screen's body. The view's ORDERING is
-/// derived by `feed_core.buildAuthorView` as a query over the store, so a post
-/// is one record seen through many lenses (ZONES invariant 4): engagement and
-/// identity stay unified across Home, profile, and future zones. Same thin
-/// shape as `loadTimelinePage`: the only network seam is the authenticated
-/// getAuthorFeed call. `actor` is whose feed; the viewer DID (session) is sent
-/// so the AppView stamps each row's viewer.like.
-pub fn loadAuthorFeed(
+/// The NETWORK half of the profile screen's load, alone: fetch one author's
+/// posts (getAuthorFeed) and return the page as a value, touching no store —
+/// the view worker calls this off the frame thread (the round trip must
+/// never block a frame; M_CORE_INVERSION MC.3) and the UI ingests the
+/// drained page as CONTENT (`feed_core.ingestPosts`, no Home feed-ordering
+/// rows). The view's ORDERING stays a pure query over the shared store
+/// (`feed_core.buildAuthorView`), so a post is one record seen through many
+/// lenses (ZONES invariant 4): engagement and identity stay unified across
+/// Home, profile, and zones. `actor` is whose feed; the viewer DID (session)
+/// is sent so the AppView stamps each row's viewer.like.
+pub fn fetchAuthorPage(
     gpa: Allocator,
     arena: Allocator,
     io: std.Io,
     environ: ?*const std.process.Environ.Map,
     session: *auth.Session,
     appview_url: []const u8,
-    store: *feed_core.Store,
     actor: []const u8,
     limit: u32,
-) !PageOutcome {
+) !xrpc.Outcome(lexicon.TimelinePage) {
     var limit_buf: [12]u8 = undefined;
     const limit_str = std.fmt.bufPrint(&limit_buf, "{d}", .{limit}) catch unreachable;
     const params = [_]xrpc.Param{
@@ -221,7 +222,7 @@ pub fn loadAuthorFeed(
         .{ .name = "limit", .value = limit_str },
     };
 
-    const outcome = try auth.queryHost(
+    return auth.queryHost(
         gpa,
         arena,
         io,
@@ -232,10 +233,6 @@ pub fn loadAuthorFeed(
         &params,
         lexicon.TimelinePage,
     );
-    switch (outcome) {
-        .failed => |failure| return .{ .failed = failure },
-        .ok => |page| return .{ .ok = try feed_core.ingestPosts(gpa, store, page) },
-    }
 }
 
 /// Fetch a post's thread (`getPostThread?uri=&viewer=`) and ingest its posts —
@@ -628,10 +625,15 @@ test "loopback author feed: the actor + viewer ride the wire; posts land in the 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
 
-    const outcome = try loadAuthorFeed(gpa, arena_state.allocator(), io, null, &session, pds, &store, session.did, 30);
+    // Fetch + ingest as the live path runs them: the network half on the
+    // view worker's thread, the ingest half on the store-owning UI thread.
+    const outcome = try fetchAuthorPage(gpa, arena_state.allocator(), io, null, &session, pds, session.did, 30);
     switch (outcome) {
         .failed => return error.TestUnexpectedXrpcFailure,
-        .ok => |stats| try std.testing.expectEqual(@as(u32, 2), stats.posts_added),
+        .ok => |page| {
+            const stats = try feed_core.ingestPosts(gpa, &store, page);
+            try std.testing.expectEqual(@as(u32, 2), stats.posts_added);
+        },
     }
 
     // Content-only ingest: no Home feed-ordering rows; the profile VIEW is a
