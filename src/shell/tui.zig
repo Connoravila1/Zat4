@@ -179,6 +179,90 @@ pub const Backend = union(enum) {
     window: *window_shell.Window,
 };
 
+/// Raw terminal mode exists everywhere but Windows (v1 there is window-only:
+/// the console needs SetConsoleMode, a recorded follow-up).
+const has_termios = builtin.os.tag != .windows;
+
+/// Input-idle gate (a historical note): the auto-refresh used to be a
+/// SYNCHRONOUS getTimeline on the render thread, and this gate kept it from
+/// freezing active navigation (the old "tap j/k, lag, then it unsticks"
+/// symptom). The fetch now runs on the refresh worker's thread, so nothing
+/// blocks either way — the gate is kept because it is still the right
+/// POLICY: while the user is actively navigating there is no reason to
+/// churn the store under them; the poll waits the few hundred ms until
+/// they pause. (G4: the network stays exiled off the input path.)
+const input_idle_gate_nanos: u64 = 600 * std.time.ns_per_ms;
+
+/// Pull-to-refresh: crossing this much accumulated overscroll (~four wheel
+/// notches) while pinned at the top of Home requests a manual refresh.
+const pull_refresh_threshold: i32 = 112;
+
+/// One marketplace catalog row (Algorithms → Marketplace tab): the full
+/// gpa-owned record, incl. the author DID + rkey the "View details" fetch
+/// needs. The display projection handed to the renderer is
+/// `feed_view.MarketAlgoCard`.
+const MarketRow = struct {
+    name: []const u8,
+    author_disp: []const u8, // "@handle" or the DID
+    author_did: []const u8,
+    rkey: []const u8,
+    cid: []const u8,
+    learns: bool,
+    uses_behavioral: bool,
+    state_budget_bytes: u32,
+
+    comptime {
+        // Budget: five slices + the flags + the u32, packed. A small catalog
+        // (one browse page), but it is a collection row — guard it (A7).
+        std.debug.assert(@sizeOf(MarketRow) == 88);
+    }
+};
+
+/// Refill the marketplace catalog + its display projection from a fetched
+/// browse page — factored so the view-load drain handles its OOM (the only
+/// error) in one place. Owned copies of every string; the cards' strings
+/// point into the catalog rows, which are stable until the next refill
+/// clears them.
+fn refillMarket(
+    gpa: Allocator,
+    algos: []const lexicon.AlgorithmView,
+    catalog: *std.ArrayList(MarketRow),
+    cards: *std.ArrayList(feed_view.MarketAlgoCard),
+) error{OutOfMemory}!void {
+    for (catalog.items) |r| {
+        gpa.free(r.name);
+        gpa.free(r.author_disp);
+        gpa.free(r.author_did);
+        gpa.free(r.rkey);
+        gpa.free(r.cid);
+    }
+    catalog.clearRetainingCapacity();
+    for (algos) |a| {
+        const author_disp = if (a.handle.len > 0)
+            try std.fmt.allocPrint(gpa, "@{s}", .{a.handle})
+        else
+            try gpa.dupe(u8, a.author);
+        try catalog.append(gpa, .{
+            .name = try gpa.dupe(u8, a.name),
+            .author_disp = author_disp,
+            .author_did = try gpa.dupe(u8, a.author),
+            .rkey = try gpa.dupe(u8, a.rkey),
+            .cid = try gpa.dupe(u8, a.cid),
+            .learns = a.learns,
+            .uses_behavioral = a.usesBehavioral,
+            .state_budget_bytes = a.stateBudgetBytes,
+        });
+    }
+    cards.clearRetainingCapacity();
+    for (catalog.items) |r| try cards.append(gpa, .{
+        .name = r.name,
+        .author = r.author_disp,
+        .learns = r.learns,
+        .uses_behavioral = r.uses_behavioral,
+        .state_budget_bytes = r.state_budget_bytes,
+    });
+}
+
 pub fn run(
     gpa: Allocator,
     io: std.Io,
@@ -203,9 +287,6 @@ pub fn run(
     // Raw mode (terminal backend only): no line buffering, no echo, no
     // signal keys (ctrl-c arrives as a byte and quits through the same
     // action path as q). The window backend has no tty to configure.
-    // Windows v1 is window-only: the console needs SetConsoleMode, a
-    // recorded follow-up — until then --tui there says so plainly.
-    const has_termios = builtin.os.tag != .windows;
     var original_termios: ?(if (has_termios) posix.termios else void) = null;
     if (!has_termios and backend == .terminal) return error.NotATerminal;
     if (comptime has_termios) if (backend == .terminal) {
@@ -425,15 +506,7 @@ pub fn run(
     };
     var last_auto_refresh: i64 = 0;
 
-    // Input-idle gate (a historical note): the auto-refresh used to be a
-    // SYNCHRONOUS getTimeline on this thread, and this gate kept it from
-    // freezing active navigation (the old "tap j/k, lag, then it unsticks"
-    // symptom). The fetch now runs on the refresh worker's thread, so nothing
-    // blocks either way — the gate is kept because it is still the right
-    // POLICY: while the user is actively navigating there is no reason to
-    // churn the store under them; the poll waits the few hundred ms until
-    // they pause. (G4: the network stays exiled off the input path.)
-    const input_idle_gate_nanos: u64 = 600 * std.time.ns_per_ms;
+    // Last-input clock for the input-idle gate (see input_idle_gate_nanos).
     var last_input_nanos: u64 = 0;
 
     // ---- the modern window path (GUI roadmap 5.2/5.5/5.6, §7 amendment) --
@@ -475,7 +548,6 @@ pub fn run(
     // downward scroll or a fired refresh resets the accumulator.
     var overscroll_accum: i32 = 0;
     var pull_refresh_requested = false;
-    const pull_refresh_threshold: i32 = 112; // ~four wheel notches of pull
     var gregions: feed_view.Regions = .empty;
     defer gregions.deinit(gpa);
     // THE LENS SOCKET loadouts — THREE surfaces (feed / reply / zone),
@@ -824,20 +896,10 @@ pub fn run(
         for (zone_catalog.items) |zc| gpa.free(zc.tag);
         zone_catalog.deinit(gpa);
     }
-    // MARKETPLACE catalog (Algorithms → Marketplace tab): gpa-owned rows from the
-    // AppView's `getAlgorithms`, (re)fetched on entering the tab. `market_catalog`
-    // holds the full row (incl. the author DID + rkey the "View details" fetch
-    // needs); `market_cards` is the display projection handed to the renderer.
-    const MarketRow = struct {
-        name: []const u8,
-        author_disp: []const u8, // "@handle" or the DID
-        author_did: []const u8,
-        rkey: []const u8,
-        cid: []const u8,
-        learns: bool,
-        uses_behavioral: bool,
-        state_budget_bytes: u32,
-    };
+    // MARKETPLACE catalog (Algorithms → Marketplace tab): gpa-owned MarketRow
+    // rows from the AppView's `getAlgorithms`, (re)fetched on entering the tab
+    // and refilled by the view-load drain via refillMarket; `market_cards` is
+    // the display projection handed to the renderer.
     var market_catalog: std.ArrayList(MarketRow) = .empty;
     var market_cards: std.ArrayList(feed_view.MarketAlgoCard) = .empty;
     var on_market_prev = false;
@@ -852,52 +914,6 @@ pub fn run(
         market_catalog.deinit(gpa);
         market_cards.deinit(gpa);
     }
-    // Refill the marketplace catalog + its display projection from a fetched
-    // browse page — factored so the view-load drain handles its OOM (the only
-    // error) in one place. Owned copies of every string; the cards' strings
-    // point into the catalog rows, which are stable until the next refill
-    // clears them.
-    const refillMarket = struct {
-        fn go(
-            gpa_: Allocator,
-            algos: []const lexicon.AlgorithmView,
-            catalog: *std.ArrayList(MarketRow),
-            cards: *std.ArrayList(feed_view.MarketAlgoCard),
-        ) error{OutOfMemory}!void {
-            for (catalog.items) |r| {
-                gpa_.free(r.name);
-                gpa_.free(r.author_disp);
-                gpa_.free(r.author_did);
-                gpa_.free(r.rkey);
-                gpa_.free(r.cid);
-            }
-            catalog.clearRetainingCapacity();
-            for (algos) |a| {
-                const author_disp = if (a.handle.len > 0)
-                    try std.fmt.allocPrint(gpa_, "@{s}", .{a.handle})
-                else
-                    try gpa_.dupe(u8, a.author);
-                try catalog.append(gpa_, .{
-                    .name = try gpa_.dupe(u8, a.name),
-                    .author_disp = author_disp,
-                    .author_did = try gpa_.dupe(u8, a.author),
-                    .rkey = try gpa_.dupe(u8, a.rkey),
-                    .cid = try gpa_.dupe(u8, a.cid),
-                    .learns = a.learns,
-                    .uses_behavioral = a.usesBehavioral,
-                    .state_budget_bytes = a.stateBudgetBytes,
-                });
-            }
-            cards.clearRetainingCapacity();
-            for (catalog.items) |r| try cards.append(gpa_, .{
-                .name = r.name,
-                .author = r.author_disp,
-                .learns = r.learns,
-                .uses_behavioral = r.uses_behavioral,
-                .state_budget_bytes = r.state_budget_bytes,
-            });
-        }
-    }.go;
     // The algorithm being inspected on the transparency page (screen_transparency):
     // its fetched config + name + ref (CID), rebuilt into a page each frame. The
     // screen to return to on Back. Config null ⇒ not inspecting.
