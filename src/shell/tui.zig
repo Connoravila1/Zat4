@@ -61,6 +61,7 @@ const stream_shell = @import("stream.zig");
 const cache_shell = @import("cache.zig");
 const xrpc = @import("xrpc.zig");
 const window_shell = @import("native.zig");
+const mobile_host = @import("mobile_host.zig");
 const gpu = @import("gpu.zig");
 const glyph_field = @import("../core/glyph_field.zig");
 const layout_core = @import("../core/layout.zig");
@@ -177,6 +178,12 @@ fn startLiveStream(
 pub const Backend = union(enum) {
     terminal,
     window: *window_shell.Window,
+    /// An OS-owned surface (a phone): the OS runs the loop and calls
+    /// stepFrame per vsync; input arrives through the C-ABI seam into the
+    /// host's queue (M_CORE_INVERSION MC.4b). GPU-only by design — the
+    /// software cell renderer never runs here (the ARGB-blit fallback is
+    /// the roadmap's simulator story, not this arm's).
+    mobile: *mobile_host.MobileHost,
 };
 
 /// Raw terminal mode exists everywhere but Windows (v1 there is window-only:
@@ -1281,6 +1288,13 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
         const size: WindowSize = switch (backend) {
             .terminal => readWindowSize(rs.stdin_fd),
             .window => |win| .{ .cols = win.cols, .rows = win.rows },
+            // The cell Surface is vestigial on the GPU-only mobile arm (the
+            // GPU paint never reads it); a notional 8x16 cell keeps the
+            // resize accounting total and cheap.
+            .mobile => |m| .{
+                .cols = @intCast(@max(1, @min(m.width_px / 8, std.math.maxInt(u16)))),
+                .rows = @intCast(@max(1, @min(m.height_px / 16, std.math.maxInt(u16)))),
+            },
         };
         if (size.cols != rs.next.width or size.rows != rs.next.height) {
             try tui.resizeSurface(gpa, &rs.next, size.cols, size.rows);
@@ -2191,6 +2205,9 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             window_shell.presentDrawList(win, gpa, g.engine, rs.gdraw.slice(), field_core.background) catch {};
                         }
                     },
+                    // The mobile composer is a later UI pass (M-UX); the mode
+                    // is unreachable there v1 (no keyboard path opens it).
+                    .mobile => {},
                     .terminal => {
                         timeline_ui.buildComposeFrame(&rs.next, textedit.view(&rs.compose), rs.reply_handle, rs.status);
                         try present(gpa, rs.out, arena, &rs.prev, &rs.next, backend);
@@ -2215,6 +2232,9 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         try field_core.compose(gpa, &rs.gfield, rs.gparticles.slice(), .{ .x = @floatFromInt(cols / 2), .y = @floatFromInt(rows / 3), .radius = @floatFromInt(cols), .ambient = 0.7 }, cell.w, cell.h, &rs.gdraw);
                         window_shell.presentDrawList(win, gpa, g.engine, rs.gdraw.slice(), field_core.background) catch {};
                     },
+                    // The legacy cell-profile mode is desktop-only; mobile's
+                    // profile is the premium screen inside .timeline mode.
+                    .mobile => {},
                     .terminal => {
                         timeline_ui.buildProfileFrame(&rs.next, rs.profile_info orelse .{}, rs.status);
                         try present(gpa, rs.out, arena, &rs.prev, &rs.next, backend);
@@ -2334,6 +2354,21 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 n = posix.read(rs.stdin_fd, &in_buf) catch 0;
                 if (n == 0) return .again; // nothing read: frame over (was `continue`)
                 rs.last_input_nanos = clock_shell.monotonicNanos();
+            },
+            .mobile => |m| {
+                // The OS delivered input through the seam between frames;
+                // drain the queue so a motion flood never accumulates. v1
+                // CONSUMES but does not yet dispatch — the pointer dispatch
+                // below is window-coupled today and gets factored for reuse
+                // when touch→scroll gives these events meaning
+                // (M_CORE_INVERSION MC.4d). The wait budget is unused here
+                // by design: a choreographer-driven host passes 0 and the
+                // step never blocks on an OS-owned thread.
+                if (m.closed) break :main_loop;
+                var touch_events: std.ArrayList(layout_core.InputEvent) = .empty;
+                defer touch_events.deinit(gpa);
+                mobile_host.drain(m, gpa, &touch_events) catch {}; // OOM: dropped taps, contained (E2)
+                if (touch_events.items.len > 0) rs.last_input_nanos = clock_shell.monotonicNanos();
             },
             .window => |win| {
                 // The pump translates X keys into the same bytes a tty
@@ -3721,7 +3756,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 if (ctrl_char) |c| if ((c == 3 or c == 24) and textedit.hasSelection(&rs.compose)) {
                     switch (backend) {
                         .window => |w| window_shell.setClipboard(w, textedit.selView(&rs.compose)),
-                        .terminal => {},
+                        .terminal, .mobile => {}, // no clipboard surface (mobile: a later UX pass)
                     }
                     if (c == 24) textedit.deleteSelection(&rs.compose);
                     rs.caret_anchor_ns = clock_shell.monotonicNanos();
@@ -6566,12 +6601,20 @@ fn paintFrame(
     status: []const u8,
 ) !void {
     if (pix) |g| switch (backend) {
+        // The mobile arm is GPU-only by design (Backend doc): no GPU state
+        // → no paint, an honest blank until MC.4c wires the attach. The
+        // software cell path below needs an X11 window to blit to.
+        .mobile => |m| {
+            if (view_items.len > 0 and state.selected >= view_items.len) state.selected = @intCast(view_items.len - 1);
+            if (g.gpu) |gs| try paintFrameGpu(gpa, arena, m.width_px, m.height_px, g, gs, view_items, profile_header, now);
+            return;
+        },
         .window => |win| {
             if (view_items.len > 0 and state.selected >= view_items.len) state.selected = @intCast(view_items.len - 1);
             // Phase 6.4: when the GPU path is live, render the field + feed on
             // the GPU and return; the software path below is the fallback.
             if (g.gpu) |gs| {
-                try paintFrameGpu(gpa, arena, win, g, gs, view_items, profile_header, now);
+                try paintFrameGpu(gpa, arena, win.fb.width, win.fb.height, g, gs, view_items, profile_header, now);
                 return;
             }
             // Cell size scales with the user zoom; the grid reflows to
@@ -6859,7 +6902,10 @@ fn paintComposeGpu(
 fn paintFrameGpu(
     gpa: Allocator,
     arena: Allocator,
-    win: *window_shell.Window,
+    // Surface pixel dims — all this pass ever needed from the window, so
+    // the OS-agnostic value crosses instead (the mobile arm has no Window).
+    w: u32,
+    h: u32,
     g: Grid,
     gs: *GpuState,
     items: []const feed_core.TimelineItem, // the ACTIVE view's posts
@@ -6867,8 +6913,6 @@ fn paintFrameGpu(
     profile_header: ?feed_view.ProfileHeader,
     now: i64,
 ) !void {
-    const w: u32 = win.fb.width;
-    const h: u32 = win.fb.height;
     // Frame-period measurement for the "Show frame timing" overlay — a smoothed
     // ms between successive frames (cheap; the clock read is the only cost).
     {
@@ -7596,7 +7640,7 @@ fn copySelection(gpa: Allocator, gs: *GpuState, backend: Backend) void {
     if (buf.items.len == 0) return;
     switch (backend) {
         .window => |w| window_shell.setClipboard(w, buf.items),
-        .terminal => {},
+        .terminal, .mobile => {}, // no clipboard surface (mobile: a later UX pass)
     }
 }
 
@@ -7992,6 +8036,7 @@ fn present(
 ) !void {
     switch (backend) {
         .window => |win| return window_shell.present(win, next) catch {}, // E2: a lost blit is the next frame's problem
+        .mobile => return, // GPU-only: the GPU pass swapped already; no cell blit exists here
         .terminal => {},
     }
     const bytes = try tui.encodeDiff(arena, prev, next);
