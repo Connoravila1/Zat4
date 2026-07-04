@@ -40,6 +40,9 @@
 //! many of them.
 
 const std = @import("std");
+// Build-time distribution config (build.zig addOptions): the closed-wave
+// AppView token default. An options module, not a dependency (F1 n/a).
+const dist_config = @import("dist_config");
 const Allocator = std.mem.Allocator;
 const xrpc = @import("xrpc.zig");
 const http = @import("http.zig");
@@ -299,20 +302,21 @@ pub fn queryHost(
     comptime Response: type,
 ) !xrpc.Outcome(Response) {
     // The Zat4 AppView gates on a SHARED bearer token (appview_serve.zig), not
-    // the user's PDS session JWT. When ZAT_APPVIEW_TOKEN is configured, send it
-    // for AppView-host calls — a shared token does not expire, so the refresh-
-    // and-retry dance below (a PDS protocol op on the session JWT) does not
-    // apply and is skipped. PDS-host calls (the `query` convenience above passes
-    // `session.pds_url`) MUST keep the session JWT, so the token is scoped to a
-    // host that is NOT the user's PDS.
+    // the user's PDS session JWT. The token comes from ZAT_APPVIEW_TOKEN (dev)
+    // or the build-time `-Dappview-token` default baked into distributed
+    // builds (zero-terminal, DISTRIBUTION_ROADMAP T2) — env wins so a dev can
+    // still repoint a dist binary. A shared token does not expire, so the
+    // refresh-and-retry dance below (a PDS protocol op on the session JWT)
+    // does not apply and is skipped. PDS-host calls (the `query` convenience
+    // above passes `session.pds_url`) MUST keep the session JWT, so the token
+    // is scoped to a host that is NOT the user's PDS.
     if (!std.mem.eql(u8, host, session.pds_url)) {
-        const appview_token: ?[]const u8 = if (environ) |e| e.get("ZAT_APPVIEW_TOKEN") else null;
-        if (appview_token) |tok| {
-            if (tok.len > 0) {
-                return xrpc.query(arena, io, environ, host, nsid, params, Response, .{
-                    .authorization = try bearer(arena, tok),
-                });
-            }
+        const env_token: ?[]const u8 = if (environ) |e| e.get("ZAT_APPVIEW_TOKEN") else null;
+        const tok = env_token orelse dist_config.appview_token;
+        if (tok.len > 0) {
+            return xrpc.query(arena, io, environ, host, nsid, params, Response, .{
+                .authorization = try bearer(arena, tok),
+            });
         }
     }
 

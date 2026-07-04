@@ -44,6 +44,17 @@ pub fn build(b: *std.Build) void {
     });
     addFontEngine(b, exe_mod);
 
+    // Closed-wave AppView token, baked at BUILD time into distributed builds
+    // (`-Dappview-token=...`). Never committed: the default is empty, which
+    // leaves the ZAT_APPVIEW_TOKEN env var as the only source (dev builds).
+    // Wave-scoped by design — rotating it is a box-env edit plus a rebuild;
+    // per-user atproto service auth is the recorded end state
+    // (DISTRIBUTION_ROADMAP T2, SECURITY_ROADMAP).
+    const appview_token = b.option([]const u8, "appview-token", "Compiled-in AppView bearer token for distributed builds (default: empty = env-only)") orelse "";
+    const dist_opts = b.addOptions();
+    dist_opts.addOption([]const u8, "appview_token", appview_token);
+    exe_mod.addOptions("dist_config", dist_opts);
+
     // The product a tester downloads is called Zat4 (the exe name IS the app
     // name on Windows/macOS); the Linux binary stays `zat` so the dev scripts
     // and the box deploy keep their paths. (DISTRIBUTION_ROADMAP P phase)

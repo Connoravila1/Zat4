@@ -32,18 +32,19 @@
 //!    service that assembles feeds across many repos. That host is a single
 //!    deployment value, and it lives here.
 //!
-//! Until the AppView exists (Phase C), the default points at a local stub on
-//! loopback, so the client is exercisable end-to-end now. A real deployment
-//! overrides it via the `ZAT4_APPVIEW` environment variable — so pointing at
-//! a Hetzner box is an env change, never a recompile (the roadmap's
-//! "swap without code change" requirement, met).
+//! The compiled-in default is the PRODUCTION endpoint (DISTRIBUTION_ROADMAP
+//! T3): a double-clicked download must reach the live network with zero
+//! environment setup, so the default is the shipping value and `ZAT4_APPVIEW`
+//! is the dev/staging OVERRIDE (a local stub, the old SSH tunnel, a test
+//! box) — never the other way around.
 
 const std = @import("std");
 
-/// The compiled-in default AppView base URL: a local stub on loopback. The
-/// stub answers `app.zat4.feed.getTimeline` / `app.zat4.actor.getProfile`
-/// for end-to-end testing before the real AppView is deployed.
-pub const default_appview_url = "http://127.0.0.1:2584";
+/// The compiled-in default AppView base URL: the live deployment, served on
+/// the already-trusted PDS host under a path (see DEPLOY_STATE — a separate
+/// subdomain would fail the PDS's on-demand tls-check). The AppView's own
+/// bearer gate does auth; TLS terminates at the edge.
+pub const default_appview_url = "https://pds.zat4.com/appview";
 
 /// The environment variable that overrides the default, so prod/staging
 /// point at a real AppView without a recompile.
@@ -94,9 +95,12 @@ pub fn fromEnv(environ: ?*const std.process.Environ.Map) Endpoints {
 
 const testing = std.testing;
 
-test "endpoints: default points at the loopback stub when env is absent" {
+test "endpoints: default points at the live AppView when env is absent" {
     const cfg = fromEnv(null);
     try testing.expectEqualStrings(default_appview_url, cfg.appview_url);
+    // The shipping default must be TLS and never loopback (T3: a bare
+    // download reaches the network; loopback is the dev override's job).
+    try testing.expect(std.mem.startsWith(u8, cfg.appview_url, "https://"));
 }
 
 test "endpoints: ZAT4_APPVIEW overrides the default; empty is ignored" {
