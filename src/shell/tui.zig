@@ -1259,10 +1259,14 @@ const StepOutcome = enum {
 /// drain the workers, pump input, advance the sim, lay out, paint. The
 /// old `continue :main_loop`-equivalent exits are `return .again`; the
 /// old `break :main_loop` sites jump past the frame block and map to the
-/// outcome below. Waits are unchanged for now: the input pump inside
-/// still blocks up to 16ms/500ms (the driver-owned-wait split is the
-/// MC.4 driver's concern, kept out of this mechanical cut).
-fn stepFrame(rs: *RunState) !StepOutcome {
+/// outcome below.
+///
+/// `wait_budget_ms` is the longest the input pump may block waiting for
+/// events — the wait POLICY belongs to the driver (M_CORE_INVERSION MC.4):
+/// the desktop loop below passes its 16/500ms cadence; a phone's
+/// choreographer does the waiting itself and passes 0, so the step never
+/// sleeps on an OS-owned thread.
+fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
     const gpa = rs.gpa;
     const io = rs.io;
     const environ = rs.environ;
@@ -2313,10 +2317,9 @@ fn stepFrame(rs: *RunState) !StepOutcome {
             };
         }
 
-        // Wait for input; the timeout re-renders so relative ages stay
-        // honest on an idle screen. 500 ms: the mailbox drains and
-        // relative ages tick at human latency; two wakeups a second is
-        // beneath measurement (G3).
+        // Wait for input up to the driver's budget; the timeout re-renders
+        // so relative ages stay honest on an idle screen (the WHY of the
+        // budget's size lives with the driver that chose it).
         var in_buf: [256]u8 = undefined;
         var n: usize = 0;
         switch (backend) {
@@ -2326,7 +2329,7 @@ fn stepFrame(rs: *RunState) !StepOutcome {
             // posix.pollfd does not even resolve on that target.
             .terminal => if (comptime builtin.os.tag == .windows) unreachable else {
                 var fds = [_]posix.pollfd{.{ .fd = rs.stdin_fd, .events = posix.POLL.IN, .revents = 0 }};
-                const ready = posix.poll(&fds, 500) catch 0;
+                const ready = posix.poll(&fds, wait_budget_ms) catch 0;
                 if (ready == 0) return .again; // poll timeout: frame over (was `continue`)
                 n = posix.read(rs.stdin_fd, &in_buf) catch 0;
                 if (n == 0) return .again; // nothing read: frame over (was `continue`)
@@ -2343,23 +2346,9 @@ fn stepFrame(rs: *RunState) !StepOutcome {
                 // Drained per lap so a motion flood never accumulates.
                 var pointer_events: std.ArrayList(layout_core.InputEvent) = .empty;
                 defer pointer_events.deinit(gpa);
-                // The field animates only while it has live work — a
-                // playing effect or particles in flight. When it does,
-                // pump at frame cadence (~16 ms) so the loop ticks the
-                // simulation forward each lap; when the screen is static,
-                // block the full idle interval so a still timeline costs
-                // ZERO CPU (the project's no-wasted-cycles ethos, and the
-                // laptop's battery). The next lap's paintFrame is what
-                // advances the sim — a short pump returning no input still
-                // yields one animation frame.
-                // The GPU field is ALIVE AT REST (ambient forcing drives it), so
-                // when the GPU path is live we always pump at frame cadence to
-                // keep the simulation ticking; otherwise only when a software
-                // effect/particles are in flight, so a still timeline costs zero
-                // CPU (the no-wasted-cycles ethos).
-                const animating = rs.gpu_state != null or (rs.engine != null and (rs.gactive.len > 0 or rs.gparticles.len > 0));
-                const pump_ms: i32 = if (animating) 16 else 500;
-                const pumped = window_shell.pump(win, pump_ms, gpa, &pumped_bytes, &pointer_events) catch {
+                // Block up to the driver's wait budget — the 16ms-vs-500ms
+                // cadence policy lives with the desktop driver now (MC.4).
+                const pumped = window_shell.pump(win, wait_budget_ms, gpa, &pumped_bytes, &pointer_events) catch {
                     rs.status = "window error";
                     return .again; // frame over (was `continue`)
                 };
@@ -4207,13 +4196,30 @@ pub fn run(
     try initRunState(&rs, gpa, io, environ, session, appview_url, store, backend);
     defer deinitRunState(&rs);
 
-    while (true) switch (try stepFrame(&rs)) {
-        .again => {},
-        // Both exits leave the loop; the sign-out distinction rides in
-        // rs.user_signed_out (set before the break), same as before the
-        // cut. The mobile driver (MC.4) is what consumes the enum.
-        .quit, .signed_out => break,
-    };
+    while (true) {
+        // The inter-frame wait is the DRIVER's business (MC.4) — the step
+        // itself never chooses how long to sleep. Desktop policy, verbatim
+        // from the old pump site: the field animates only while it has live
+        // work — the GPU field is ALIVE AT REST (ambient forcing drives
+        // it), so when the GPU path is live we always pump at frame cadence
+        // (~16 ms) to keep the simulation ticking; otherwise only when a
+        // software effect/particles are in flight. A static screen blocks
+        // the full idle interval so a still timeline costs ZERO CPU (the
+        // no-wasted-cycles ethos, and the laptop's battery); 500 ms keeps
+        // relative ages honest at human latency — two wakeups a second is
+        // beneath measurement (G3). The next lap's paintFrame is what
+        // advances the sim — a short pump returning no input still yields
+        // one animation frame.
+        const animating = rs.gpu_state != null or (rs.engine != null and (rs.gactive.len > 0 or rs.gparticles.len > 0));
+        const wait_ms: i32 = if (backend == .window and animating) 16 else 500;
+        switch (try stepFrame(&rs, wait_ms)) {
+            .again => {},
+            // Both exits leave the loop; the sign-out distinction rides in
+            // rs.user_signed_out (set before the break), same as before the
+            // cut. The mobile driver (MC.4) is what consumes the enum.
+            .quit, .signed_out => break,
+        }
+    }
     return rs.user_signed_out;
 }
 
