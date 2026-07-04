@@ -1381,6 +1381,16 @@ pub fn run(
                                 "no new posts"
                             else
                                 std.fmt.bufPrint(&status_buf, "+{d} new at top", .{revealed_n}) catch "new posts";
+                            // Parity with the old inline `r`: an explicit
+                            // refresh that finds a populated store may also
+                            // bring the live stream up.
+                            if (live_stream == null and store.authors.len > 0) {
+                                live_stream = startLiveStream(gpa, io, environ, session.did, store, &mailbox, arena) catch |err| {
+                                    refresh_worker.freeResult(gpa, res);
+                                    return err; // OOM only — same posture as the ingest arm above
+                                };
+                                if (live_stream == null) status = "live stream unavailable" else subscribed_authors = store.authors.len;
+                            }
                         },
                     }
                     _ = cache_shell.saveStore(gpa, environ, store); // E4: a failed save is simply no cache
@@ -3636,42 +3646,18 @@ pub fn run(
             switch (kbd_action) {
                 .quit => break :main_loop,
                 .refresh => {
-                    status = "refreshing...";
-                    try paintFrame(gpa, out, arena, &prev, &next, backend, pix, view_items, profile_header, &state, revealed.items, now, session.handle, status);
-
-                    const outcome = feed_shell.refreshTimeline(gpa, arena, io, environ, session, appview_url, store, 30) catch |err| switch (err) {
-                        error.OutOfMemory => return err,
-                        else => {
-                            status = "network error"; // contained (E2)
-                            continue;
-                        },
-                    };
-                    status = switch (outcome) {
-                        .ok => |stats| blk: {
-                            // An explicit refresh asks to SEE the new — REVEAL
-                            // the staged posts and jump to the top. (The passive
-                            // auto-refresh stages them behind the pill instead.)
-                            const revealed_n = feed_core.revealPending(gpa, store) catch 0;
-                            if (revealed_n > 0) {
-                                state.selected = 0;
-                                state.scroll_top = 0;
-                                gview.scroll_rows = 0;
-                                gscroll_px = 0;
-                            }
-                            break :blk if (stats.items_added == 0 and revealed_n == 0)
-                                "no new posts"
-                            else
-                                std.fmt.bufPrint(&status_buf, "+{d} new at top", .{revealed_n}) catch "new posts";
-                        },
-                        .failed => |failure| std.fmt.bufPrint(&status_buf, "refused: {d} {s}", .{
-                            failure.status, failure.code,
-                        }) catch "refused",
-                    };
-                    if (outcome == .ok) _ = cache_shell.saveStore(gpa, environ, store); // E4
-                    if (outcome == .ok and live_stream == null and store.authors.len > 0) {
-                        live_stream = try startLiveStream(gpa, io, environ, session.did, store, &mailbox, arena);
-                        if (live_stream == null) status = "live stream unavailable" else subscribed_authors = store.authors.len;
-                    }
+                    // Off the frame thread, like the pull gesture: submit
+                    // .pull and let the drain above reveal + jump when the
+                    // page lands (M-Core.1: the frame body must not block —
+                    // this was one of its seven synchronous fetches). The
+                    // live-stream start the old inline path did now rides
+                    // the drain's .pull success arm.
+                    if (refresher) |w| {
+                        if (refresh_worker.submit(w, .pull, 30)) {
+                            refresh_inflight += 1;
+                            status = "refreshing...";
+                        } else status = "refresh already running";
+                    } else status = "refresh unavailable"; // worker never started (E2: a status, not a dead key)
                 },
                 .load_more => {
                     if (store.feed.len > 0 and feed_core.nextCursor(store).len == 0) {
