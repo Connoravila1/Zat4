@@ -154,6 +154,38 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_appview_tests.step);
     test_step.dependOn(&run_relay_tests.step);
 
+    // Mobile (MOBILE_ROADMAP M-And.0): the C-ABI seam as an Android shared
+    // library. v0 is pure Zig — no libc, hence no fonts/EGL yet; the
+    // NDK-libc build (M-And.0b) unlocks those. The seam's unit tests run on
+    // the NATIVE target under the leak-checked allocator and ride the
+    // default test step.
+    const android_target = b.resolveTargetQuery(.{
+        .cpu_arch = .aarch64,
+        .os_tag = .linux,
+        .abi = .android,
+    });
+    const libzat_mod = b.createModule(.{
+        .root_source_file = b.path("src/mobile.zig"),
+        .target = android_target,
+        .optimize = optimize,
+    });
+    const libzat = b.addLibrary(.{
+        .name = "zat",
+        .root_module = libzat_mod,
+        .linkage = .dynamic,
+    });
+    const libzat_step = b.step("libzat", "Build the Android C-ABI shared library (MOBILE_ROADMAP M-And.0)");
+    libzat_step.dependOn(&b.addInstallArtifact(libzat, .{}).step);
+
+    const mobile_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/mobile.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const mobile_tests = b.addTest(.{ .root_module = mobile_test_mod });
+    const run_mobile_tests = b.addRunArtifact(mobile_tests);
+    test_step.dependOn(&run_mobile_tests.step);
+
     const live_mod = b.createModule(.{
         .root_source_file = b.path("src/live_tests.zig"),
         .target = target,
