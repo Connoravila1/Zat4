@@ -195,7 +195,13 @@ fn threadMain(worker: *Worker) void {
             continue;
         }
         for (batch.items) |req| {
-            if (worker.stop.load(.acquire)) return; // requests own no bytes
+            if (worker.stop.load(.acquire)) {
+                // An unprocessed .older request still owns its cursor copy
+                // (C5) — shutdown's pending-drain only sees the inbox, not
+                // this drained batch.
+                if (req.cursor) |c| gpa.free(c);
+                continue;
+            }
             processOne(worker, req);
         }
     }
