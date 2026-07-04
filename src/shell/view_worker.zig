@@ -60,6 +60,9 @@ pub const Kind = enum(u8) {
     thread,
     /// The zone screen's body: one tag's posts (getPostsForTag).
     zone,
+    /// The zones BROWSE catalog (listTags) — metadata, not posts; takes no
+    /// target.
+    zones,
 };
 
 /// A view-load ask. Everything the fetch needs (session, appview_url, io) is
@@ -94,6 +97,9 @@ pub const Result = struct {
         /// them as CONTENT (`feed_core.ingestPosts`, no Home ordering rows);
         /// the view's ordering stays a pure query over the store.
         page: lexicon.TimelinePage,
+        /// The zone catalog (listTags) for the browse screen — the UI merges
+        /// it over the locally-derived set it built at view entry.
+        zones: []const lexicon.TagView,
         /// The server refused. Strings live in `arena` — copy (e.g. into a
         /// status buffer) before freeing the result.
         refused: struct { status: u16, code: []const u8 },
@@ -276,6 +282,20 @@ fn fetchOutcome(worker: *Worker, arena: Allocator, req: Request) Result.Outcome 
             ) catch |err| return .{ .net_error = @errorName(err) };
             return switch (fetched) {
                 .ok => |page| .{ .page = page },
+                .failed => |f| .{ .refused = .{ .status = f.status, .code = f.code } },
+            };
+        },
+        .zones => {
+            const fetched = feed_shell.loadZones(
+                worker.gpa,
+                arena,
+                worker.io,
+                worker.environ,
+                worker.session,
+                worker.appview_url,
+            ) catch |err| return .{ .net_error = @errorName(err) };
+            return switch (fetched) {
+                .ok => |tags| .{ .zones = tags },
                 .failed => |f| .{ .refused = .{ .status = f.status, .code = f.code } },
             };
         },

@@ -1462,6 +1462,28 @@ pub fn run(
                     };
                     status = ""; // the submit's "loading..." line is done
                 },
+                .zones => |tags| {
+                    // Merge the AppView's catalog over the locally-derived set
+                    // the browse entry built: a server count is authoritative
+                    // (it spans posts this client hasn't loaded), and a
+                    // server-only zone is appended. A skipped dup (OOM) drops
+                    // one row, not the screen (E2).
+                    for (tags) |t| {
+                        var found = false;
+                        for (zone_catalog.items) |*zc| {
+                            if (std.ascii.eqlIgnoreCase(zc.tag, t.tag)) {
+                                zc.count = t.count;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) {
+                            const dup = gpa.dupe(u8, t.tag) catch continue;
+                            zone_catalog.append(gpa, .{ .tag = dup, .count = t.count }) catch gpa.free(dup);
+                        }
+                    }
+                    status = "";
+                },
                 // bufPrint COPIES f.code into status_buf before freeResult
                 // destroys the arena that owns it.
                 .refused => |f| status = std.fmt.bufPrint(&status_buf, "{s}: refused {d} {s}", .{
@@ -1540,9 +1562,10 @@ pub fn run(
         }
         on_zone_prev = on_zone;
 
-        // Zones BROWSE: on ENTERING the catalog screen, fetch the zone set
-        // (`listTags`) into the owned catalog. Metadata, not posts — it doesn't
-        // touch the store. Contained failure (E2): the grid just stays as it was.
+        // Zones BROWSE: on ENTERING the catalog screen, rebuild the local
+        // catalog and submit the server's zone set (`listTags`). Metadata, not
+        // posts — it doesn't touch the store. Contained failure (E2): the grid
+        // just stays as it was.
         const on_browse = mode == .timeline and gscreen == feed_view.screen_zones_browse;
         if (on_browse and !on_browse_prev) {
             // The catalog the client can see NOW: derive it from the resident store
@@ -1558,34 +1581,15 @@ pub fn run(
                     zone_catalog.append(gpa, .{ .tag = dup, .count = t.count }) catch gpa.free(dup);
                 }
             }
-            // Merge the AppView's catalog: a server count is authoritative (it spans
-            // posts this client hasn't loaded), and a server-only zone is appended.
-            const zo = feed_shell.loadZones(gpa, arena, io, environ, session, appview_url) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => blk: {
-                    status = "zones: network error"; // contained — the local set still shows
-                    break :blk null;
-                },
-            };
-            if (zo) |result| switch (result) {
-                .ok => |tags| {
-                    for (tags) |t| {
-                        var found = false;
-                        for (zone_catalog.items) |*zc| {
-                            if (std.ascii.eqlIgnoreCase(zc.tag, t.tag)) {
-                                zc.count = t.count;
-                                found = true;
-                                break;
-                            }
-                        }
-                        if (!found) {
-                            const dup = gpa.dupe(u8, t.tag) catch continue;
-                            zone_catalog.append(gpa, .{ .tag = dup, .count = t.count }) catch gpa.free(dup);
-                        }
-                    }
-                },
-                .failed => status = "zones: unavailable", // local set still shows
-            };
+            // The AppView's wider catalog: SUBMIT to the view worker (M-Core.1
+            // unblocking, 6/7); the drain above merges it over this local set
+            // when it lands (a server count is authoritative). Failure leaves
+            // the local set showing — a status line, never a dead grid (E2).
+            if (viewloader) |w| {
+                if (view_worker.submit(w, .zones, null, 0)) {
+                    status = "loading zones...";
+                } else status = "zones load skipped"; // mailbox OOM; re-entering retries
+            } else status = "zones: unavailable"; // worker never started (E2)
         }
         on_browse_prev = on_browse;
 
@@ -5065,6 +5069,7 @@ fn viewNoun(kind: view_worker.Kind) []const u8 {
         .profile => "profile",
         .thread => "thread",
         .zone => "zone",
+        .zones => "zones",
     };
 }
 
