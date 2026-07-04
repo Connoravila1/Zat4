@@ -63,6 +63,9 @@ pub const Kind = enum(u8) {
     /// The zones BROWSE catalog (listTags) — metadata, not posts; takes no
     /// target.
     zones,
+    /// The marketplace browse page (getAlgorithms) — metadata + fetch refs,
+    /// not configs; takes no target.
+    algorithms,
 };
 
 /// A view-load ask. Everything the fetch needs (session, appview_url, io) is
@@ -100,6 +103,9 @@ pub const Result = struct {
         /// The zone catalog (listTags) for the browse screen — the UI merges
         /// it over the locally-derived set it built at view entry.
         zones: []const lexicon.TagView,
+        /// The marketplace browse page (getAlgorithms) — the UI copies the
+        /// rows it keeps into its own catalog.
+        algorithms: []const lexicon.AlgorithmView,
         /// The server refused. Strings live in `arena` — copy (e.g. into a
         /// status buffer) before freeing the result.
         refused: struct { status: u16, code: []const u8 },
@@ -296,6 +302,21 @@ fn fetchOutcome(worker: *Worker, arena: Allocator, req: Request) Result.Outcome 
             ) catch |err| return .{ .net_error = @errorName(err) };
             return switch (fetched) {
                 .ok => |tags| .{ .zones = tags },
+                .failed => |f| .{ .refused = .{ .status = f.status, .code = f.code } },
+            };
+        },
+        .algorithms => {
+            const fetched = feed_shell.loadAlgorithms(
+                worker.gpa,
+                arena,
+                worker.io,
+                worker.environ,
+                worker.session,
+                worker.appview_url,
+                req.limit,
+            ) catch |err| return .{ .net_error = @errorName(err) };
+            return switch (fetched) {
+                .ok => |algos| .{ .algorithms = algos },
                 .failed => |f| .{ .refused = .{ .status = f.status, .code = f.code } },
             };
         },

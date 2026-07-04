@@ -852,6 +852,52 @@ pub fn run(
         market_catalog.deinit(gpa);
         market_cards.deinit(gpa);
     }
+    // Refill the marketplace catalog + its display projection from a fetched
+    // browse page — factored so the view-load drain handles its OOM (the only
+    // error) in one place. Owned copies of every string; the cards' strings
+    // point into the catalog rows, which are stable until the next refill
+    // clears them.
+    const refillMarket = struct {
+        fn go(
+            gpa_: Allocator,
+            algos: []const lexicon.AlgorithmView,
+            catalog: *std.ArrayList(MarketRow),
+            cards: *std.ArrayList(feed_view.MarketAlgoCard),
+        ) error{OutOfMemory}!void {
+            for (catalog.items) |r| {
+                gpa_.free(r.name);
+                gpa_.free(r.author_disp);
+                gpa_.free(r.author_did);
+                gpa_.free(r.rkey);
+                gpa_.free(r.cid);
+            }
+            catalog.clearRetainingCapacity();
+            for (algos) |a| {
+                const author_disp = if (a.handle.len > 0)
+                    try std.fmt.allocPrint(gpa_, "@{s}", .{a.handle})
+                else
+                    try gpa_.dupe(u8, a.author);
+                try catalog.append(gpa_, .{
+                    .name = try gpa_.dupe(u8, a.name),
+                    .author_disp = author_disp,
+                    .author_did = try gpa_.dupe(u8, a.author),
+                    .rkey = try gpa_.dupe(u8, a.rkey),
+                    .cid = try gpa_.dupe(u8, a.cid),
+                    .learns = a.learns,
+                    .uses_behavioral = a.usesBehavioral,
+                    .state_budget_bytes = a.stateBudgetBytes,
+                });
+            }
+            cards.clearRetainingCapacity();
+            for (catalog.items) |r| try cards.append(gpa_, .{
+                .name = r.name,
+                .author = r.author_disp,
+                .learns = r.learns,
+                .uses_behavioral = r.uses_behavioral,
+                .state_budget_bytes = r.state_budget_bytes,
+            });
+        }
+    }.go;
     // The algorithm being inspected on the transparency page (screen_transparency):
     // its fetched config + name + ref (CID), rebuilt into a page each frame. The
     // screen to return to on Back. Config null ⇒ not inspecting.
@@ -1484,6 +1530,13 @@ pub fn run(
                     }
                     status = "";
                 },
+                .algorithms => |algos| {
+                    refillMarket(gpa, algos, &market_catalog, &market_cards) catch |err| {
+                        view_worker.freeResult(gpa, res);
+                        return err; // OOM only
+                    };
+                    status = "";
+                },
                 // bufPrint COPIES f.code into status_buf before freeResult
                 // destroys the arena that owns it.
                 .refused => |f| status = std.fmt.bufPrint(&status_buf, "{s}: refused {d} {s}", .{
@@ -1593,57 +1646,18 @@ pub fn run(
         }
         on_browse_prev = on_browse;
 
-        // MARKETPLACE: on ENTERING the Algorithms → Marketplace tab, fetch the
-        // published algorithms (`getAlgorithms`) into the owned catalog. Metadata,
-        // not posts — it doesn't touch the store. Contained failure (E2).
+        // MARKETPLACE: on ENTERING the Algorithms → Marketplace tab, SUBMIT the
+        // published-algorithms fetch (`getAlgorithms`) to the view worker
+        // (M-Core.1 unblocking, 7/7); the drain above refills the owned catalog
+        // when the page lands. Metadata, not posts — it doesn't touch the
+        // store. Contained failure (E2).
         const on_market = mode == .timeline and gscreen == feed_view.screen_loadout and gloadout_tab == 1;
         if (on_market and !on_market_prev) {
-            const mo = feed_shell.loadAlgorithms(gpa, arena, io, environ, session, appview_url, 50) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => blk: {
-                    status = "marketplace: network error"; // contained
-                    break :blk null;
-                },
-            };
-            if (mo) |result| switch (result) {
-                .ok => |algos| {
-                    for (market_catalog.items) |r| {
-                        gpa.free(r.name);
-                        gpa.free(r.author_disp);
-                        gpa.free(r.author_did);
-                        gpa.free(r.rkey);
-                        gpa.free(r.cid);
-                    }
-                    market_catalog.clearRetainingCapacity();
-                    for (algos) |a| {
-                        const author_disp = if (a.handle.len > 0)
-                            try std.fmt.allocPrint(gpa, "@{s}", .{a.handle})
-                        else
-                            try gpa.dupe(u8, a.author);
-                        try market_catalog.append(gpa, .{
-                            .name = try gpa.dupe(u8, a.name),
-                            .author_disp = author_disp,
-                            .author_did = try gpa.dupe(u8, a.author),
-                            .rkey = try gpa.dupe(u8, a.rkey),
-                            .cid = try gpa.dupe(u8, a.cid),
-                            .learns = a.learns,
-                            .uses_behavioral = a.usesBehavioral,
-                            .state_budget_bytes = a.stateBudgetBytes,
-                        });
-                    }
-                    // Refill the display projection (strings point into the owned
-                    // rows above, which are stable until the next fetch clears them).
-                    market_cards.clearRetainingCapacity();
-                    for (market_catalog.items) |r| try market_cards.append(gpa, .{
-                        .name = r.name,
-                        .author = r.author_disp,
-                        .learns = r.learns,
-                        .uses_behavioral = r.uses_behavioral,
-                        .state_budget_bytes = r.state_budget_bytes,
-                    });
-                },
-                .failed => status = "marketplace: unavailable",
-            };
+            if (viewloader) |w| {
+                if (view_worker.submit(w, .algorithms, null, 50)) {
+                    status = "loading marketplace...";
+                } else status = "marketplace load skipped"; // mailbox OOM; re-entering retries
+            } else status = "marketplace: unavailable"; // worker never started (E2)
         }
         on_market_prev = on_market;
 
@@ -5070,6 +5084,7 @@ fn viewNoun(kind: view_worker.Kind) []const u8 {
         .thread => "thread",
         .zone => "zone",
         .zones => "zones",
+        .algorithms => "marketplace",
     };
 }
 
