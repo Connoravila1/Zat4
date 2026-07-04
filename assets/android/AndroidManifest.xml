@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The whole app is native code: hasCode="false" means no dex at all —
+     the framework's NativeActivity loads libzat.so (android.app.lib_name)
+     and calls its ANativeActivity_onCreate (src/android_activity.zig). -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.zat4.client"
+    android:versionCode="1"
+    android:versionName="0.1.0">
+  <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="34"/>
+  <uses-permission android:name="android.permission.INTERNET"/>
+  <application
+      android:label="Zat4"
+      android:icon="@mipmap/ic_launcher"
+      android:hasCode="false"
+      android:extractNativeLibs="true">
+    <activity
+        android:name="android.app.NativeActivity"
+        android:exported="true"
+        android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+        android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|uiMode">
+      <meta-data android:name="android.app.lib_name" android:value="zat"/>
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN"/>
+        <category android:name="android.intent.category.LAUNCHER"/>
+      </intent-filter>
+    </activity>
+  </application>
+</manifest>

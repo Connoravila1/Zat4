@@ -36,6 +36,7 @@
 //! (the render/choreographer thread), same as every OS window backend.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const glyph_field = @import("core/glyph_field.zig");
 // Build-time capability switch (build.zig options module): `have_gpu` is
 // true only for the NDK-libc build (-Dandroid-ndk=...), which is what makes
@@ -244,26 +245,26 @@ fn renderFrame(ctx: *Ctx) void {
 /// surfaceCreated). Brings up EGL/GLES + the field renderer on it. Pure
 /// builds (no NDK libc) report false — the shim falls back to the
 /// height-plane readback below.
-export fn zat_surface(ctx_ptr: ?*anyopaque, native_window: ?*anyopaque, width_px: u32, height_px: u32) bool {
+pub export fn zat_surface(ctx_ptr: ?*anyopaque, native_window: ?*anyopaque, width_px: u32, height_px: u32) bool {
     const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return false));
     return attachSurface(ctx, native_window, width_px, height_px);
 }
 
 /// The surface is gone (Android surfaceDestroyed / background). Safe to
 /// call without an attach; rendering resumes on the next zat_surface.
-export fn zat_surface_lost(ctx_ptr: ?*anyopaque) void {
+pub export fn zat_surface_lost(ctx_ptr: ?*anyopaque) void {
     const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return));
     detachSurface(ctx);
 }
 
 /// Render one frame of the field to the attached surface (call after
 /// zat_step on the same thread). No surface → no-op.
-export fn zat_render(ctx_ptr: ?*anyopaque) void {
+pub export fn zat_render(ctx_ptr: ?*anyopaque) void {
     const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return));
     renderFrame(ctx);
 }
 
-export fn zat_init(width_px: u32, height_px: u32, cell_px: u32) ?*anyopaque {
+pub export fn zat_init(width_px: u32, height_px: u32, cell_px: u32) ?*anyopaque {
     // v0 allocator: the page allocator — pure Zig, no libc requirement, and
     // the sim's allocations are few and long-lived. The NDK build (fonts,
     // GPU, feed) revisits this deliberately (C1 — the choice is visible).
@@ -271,17 +272,17 @@ export fn zat_init(width_px: u32, height_px: u32, cell_px: u32) ?*anyopaque {
     return @ptrCast(ctx);
 }
 
-export fn zat_resize(ctx_ptr: ?*anyopaque, width_px: u32, height_px: u32) bool {
+pub export fn zat_resize(ctx_ptr: ?*anyopaque, width_px: u32, height_px: u32) bool {
     const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return false));
     return resize(ctx, width_px, height_px);
 }
 
-export fn zat_touch(ctx_ptr: ?*anyopaque, kind: u32, x_px: f32, y_px: f32) void {
+pub export fn zat_touch(ctx_ptr: ?*anyopaque, kind: u32, x_px: f32, y_px: f32) void {
     const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return));
     touch(ctx, kind, x_px, y_px);
 }
 
-export fn zat_step(ctx_ptr: ?*anyopaque, dt_ns: u64) void {
+pub export fn zat_step(ctx_ptr: ?*anyopaque, dt_ns: u64) void {
     const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return));
     stepSim(ctx, dt_ns);
 }
@@ -289,20 +290,20 @@ export fn zat_step(ctx_ptr: ?*anyopaque, dt_ns: u64) void {
 /// Field readback for the shim's debug render (v0 only — the GPU attach
 /// replaces this): the height plane as row-major f32, cols × rows. The
 /// pointer stays valid until the next zat_resize/zat_shutdown.
-export fn zat_field_cols(ctx_ptr: ?*anyopaque) u32 {
+pub export fn zat_field_cols(ctx_ptr: ?*anyopaque) u32 {
     const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return 0));
     return ctx.field.cols;
 }
-export fn zat_field_rows(ctx_ptr: ?*anyopaque) u32 {
+pub export fn zat_field_rows(ctx_ptr: ?*anyopaque) u32 {
     const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return 0));
     return ctx.field.rows;
 }
-export fn zat_field_height(ctx_ptr: ?*anyopaque) ?[*]const f32 {
+pub export fn zat_field_height(ctx_ptr: ?*anyopaque) ?[*]const f32 {
     const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return null));
     return ctx.field.height.ptr;
 }
 
-export fn zat_shutdown(ctx_ptr: ?*anyopaque) void {
+pub export fn zat_shutdown(ctx_ptr: ?*anyopaque) void {
     const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return));
     destroy(ctx);
 }
@@ -311,6 +312,12 @@ export fn zat_shutdown(ctx_ptr: ?*anyopaque) void {
 // Tests (C6) — the seam driven exactly as a shim would drive it, on the
 // native target, under the leak-checking test allocator via the internal fns.
 // ---------------------------------------------------------------------------
+
+// The Android in-process host (the "shim" that needs no Kotlin): reference
+// it so ANativeActivity_onCreate is analyzed + exported on android builds.
+comptime {
+    if (builtin.abi.isAndroid()) _ = @import("android_activity.zig");
+}
 
 const testing = std.testing;
 

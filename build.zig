@@ -186,6 +186,10 @@ pub fn build(b: *std.Build) void {
     if (ndk_path) |ndk| {
         addFontEngine(b, libzat_mod); // also sets link_libc
         const sysroot = b.fmt("{s}/toolchains/llvm/prebuilt/linux-x86_64/sysroot", .{ndk});
+        // libandroid.so: the NativeActivity host's window/input calls. The
+        // NDK stub resolves the link; the device provides the real one.
+        libzat_mod.linkSystemLibrary("android", .{});
+        libzat_mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib/aarch64-linux-android/29", .{sysroot}) });
         const wf = b.addWriteFiles();
         // API 29 = this Zig's default android target version; present in r27c.
         const libc_txt = wf.add("android-libc.txt", b.fmt(
