@@ -267,6 +267,15 @@ fn openLoopback(io: std.Io) !Loopback {
 /// the "Unable to connect" failure. So we ignore empty/non-callback connections
 /// and keep listening until the callback (carrying a query) shows up.
 fn awaitCallback(scratch: Allocator, io: std.Io, server: *std.Io.net.Server, cancel: ?*std.atomic.Value(bool)) ![]u8 {
+    // Windows form of the cancel-aware wait: winsock applies SO_RCVTIMEO to
+    // accept() on the LISTENER, so a 250 ms timeout gives the same tick the
+    // POSIX path gets from poll below — each timed-out accept errors, we
+    // check `cancel`, and wait again. (The accepted stream's own receive
+    // timeout is set explicitly further down, overriding any inheritance.)
+    if (comptime builtin.os.tag == .windows) {
+        const tick_ms: u32 = 250;
+        _ = setsockopt(server.socket.handle, SOL_SOCKET, SO_RCVTIMEO, @ptrCast(&tick_ms), @sizeOf(u32));
+    }
     var seen: u32 = 0;
     while (seen < 64) : (seen += 1) {
         // Wait for an incoming connection by POLLING the listener with a short
@@ -274,7 +283,6 @@ fn awaitCallback(scratch: Allocator, io: std.Io, server: *std.Io.net.Server, can
         // (the GUI closed the window mid-flow) and bail promptly instead of
         // hanging a worker thread on `accept` forever. With no cancel flag this
         // is the same patient wait as a bare accept, just woken every 250 ms.
-        // Windows has no browser flow yet, so it keeps the plain blocking accept.
         if (comptime builtin.os.tag != .windows) {
             while (true) {
                 if (cancel) |c| if (c.load(.acquire)) return error.CallbackFailed;
@@ -283,7 +291,20 @@ fn awaitCallback(scratch: Allocator, io: std.Io, server: *std.Io.net.Server, can
                 if (lready > 0) break;
             }
         }
-        const stream = server.accept(io) catch return error.CallbackFailed;
+        const stream = blk: {
+            if (comptime builtin.os.tag == .windows) {
+                // Timed-out accepts are the wait tick; a real connection
+                // breaks out. Hard listener errors are indistinguishable
+                // from ticks here, so the loop is bounded by `cancel` alone
+                // — the same shape as the POSIX listener-poll above.
+                while (true) {
+                    if (cancel) |c| if (c.load(.acquire)) return error.CallbackFailed;
+                    break :blk server.accept(io) catch continue;
+                }
+            } else {
+                break :blk server.accept(io) catch return error.CallbackFailed;
+            }
+        };
         // One close for every exit of this iteration — continue, return, OR the
         // `try` below failing on OOM (the old per-branch closes leaked the fd on
         // that error path). `accept` blocks patiently between connections, so

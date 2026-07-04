@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Zat4
+Comment=A self-contained social network on the AT Protocol
+Exec=Zat4 --window
+Icon=zat4
+Terminal=false
+Categories=Network;InstantMessaging;
+StartupWMClass=zat

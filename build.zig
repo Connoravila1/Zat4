@@ -66,7 +66,23 @@ pub fn build(b: *std.Build) void {
         .name = client_name,
         .root_module = exe_mod,
     });
+    if (target.result.os.tag == .windows) {
+        // The taskbar/Explorer icon rides a compiled resource (the .ico is
+        // generated from the repo logo — see assets/icon/).
+        exe_mod.addWin32ResourceFile(.{ .file = b.path("assets/icon/zat4.rc") });
+        // Dist builds are GUI-subsystem (no console window). Default stays
+        // console: the [gpu]/[oauth] diagnostics are the W2/W5 bring-up tool.
+        if (b.option(bool, "windows-gui", "Windows client as a GUI-subsystem app (no console; dist builds)") orelse false) {
+            exe.subsystem = .Windows;
+        }
+    }
     b.installArtifact(exe);
+
+    // Client-only build+install: the dist scripts use this because the full
+    // install step also builds the servers, which fail on the Windows target
+    // by design (pollfd; they are Linux-only) and would abort the script.
+    const client_step = b.step("client", "Build + install only the client executable");
+    client_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
