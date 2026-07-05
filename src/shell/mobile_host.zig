@@ -55,6 +55,12 @@ pub const MobileHost = struct {
     down_y: i32 = -1,
     scrolling: bool = false,
     drag_y: i32 = -1,
+    /// The fling: scroll velocity in LOGICAL px/frame, sampled (smoothed)
+    /// while the finger drags and carried when it lifts; friction decays it,
+    /// the scroll clamp kills it, and a new touch stops it instantly
+    /// (interruptibility is the signature — same doctrine as the chat
+    /// bubbles' springs).
+    fling_v: f32 = 0,
 };
 
 pub fn deinit(host: *MobileHost, gpa: Allocator) void {

@@ -2401,12 +2401,21 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 // Momentum/fling is the M-UX pass. Bare moves never forward:
                 // a finger casts no hover.
                 const touch_slop: i32 = 28; // device px, ~a fingertip's wobble
+                const scale: f32 = if (rs.gpu_state) |*gs| gs.scale else 1.0;
+                const view_h: i32 = @intFromFloat(@as(f32, @floatFromInt(m.height_px)) / scale);
+                const min_scroll: i32 = @min(0, view_h - rs.gcontent_h - 24);
+                // This frame's finger travel (logical px) — the fling's
+                // velocity sample. Zero on drag-free frames, which is what
+                // decays the smoothed velocity toward rest during a
+                // press-and-hold before release.
+                var frame_dy: f32 = 0;
                 for (touch_events.items) |tev| switch (tev.kind) {
                     .button_down => {
                         m.down_x = tev.x;
                         m.down_y = tev.y;
                         m.scrolling = false;
                         m.drag_y = tev.y;
+                        m.fling_v = 0; // a touch catches the gliding feed (interruptible)
                     },
                     .move => if (m.down_x >= 0) {
                         if (!m.scrolling and
@@ -2415,10 +2424,9 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         if (m.scrolling) {
                             const dy_phys: i32 = @as(i32, tev.y) - m.drag_y;
                             m.drag_y = tev.y;
-                            const scale: f32 = if (rs.gpu_state) |*gs| gs.scale else 1.0;
-                            rs.gscroll_px += @intFromFloat(@as(f32, @floatFromInt(dy_phys)) / scale);
-                            const view_h: i32 = @intFromFloat(@as(f32, @floatFromInt(m.height_px)) / scale);
-                            const min_scroll: i32 = @min(0, view_h - rs.gcontent_h - 24);
+                            const dy: f32 = @as(f32, @floatFromInt(dy_phys)) / scale;
+                            frame_dy += dy;
+                            rs.gscroll_px += @intFromFloat(dy);
                             rs.gscroll_px = @max(min_scroll, @min(0, rs.gscroll_px));
                         }
                     },
@@ -2428,6 +2436,8 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             pointer_events.append(gpa, .{ .x = @intCast(m.down_x), .y = @intCast(m.down_y), .kind = .button_down, .button = 1, .mods = 0, ._pad = 0 }) catch {};
                             pointer_events.append(gpa, .{ .x = tev.x, .y = tev.y, .kind = .button_up, .button = 1, .mods = 0, ._pad = 0 }) catch {};
                         }
+                        // A scroll release KEEPS m.fling_v — the glide below
+                        // takes over from the sampled velocity.
                         m.down_x = -1;
                         m.down_y = -1;
                         m.scrolling = false;
@@ -2435,6 +2445,26 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     },
                     else => {},
                 };
+                // MOMENTUM (M-UX, first slice): while dragging, smooth the
+                // per-frame travel into a velocity; with the finger up, the
+                // feed glides on it — exponential friction, killed by the
+                // clamp (no bounce yet) or the next touch. Constants are
+                // per-60Hz-frame: friction 0.955 halves the glide roughly
+                // every quarter second; rest below half a pixel.
+                const fling_friction: f32 = 0.955;
+                const fling_rest: f32 = 0.5;
+                if (m.scrolling or m.down_x >= 0) {
+                    m.fling_v = m.fling_v * 0.6 + frame_dy * 0.4;
+                } else if (@abs(m.fling_v) > fling_rest) {
+                    const before = rs.gscroll_px;
+                    rs.gscroll_px += @intFromFloat(m.fling_v);
+                    rs.gscroll_px = @max(min_scroll, @min(0, rs.gscroll_px));
+                    if (rs.gscroll_px == before and @abs(m.fling_v) >= 1.0) {
+                        m.fling_v = 0; // hit an edge: the glide is spent
+                    } else {
+                        m.fling_v *= fling_friction;
+                    }
+                } else m.fling_v = 0;
             },
             .window => |win| {
                 // The pump translates X keys into the same bytes a tty
