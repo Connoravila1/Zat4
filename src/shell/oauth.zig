@@ -36,6 +36,7 @@ const http = @import("http.zig");
 const config = @import("config.zig");
 const auth = @import("auth.zig");
 const launch = @import("launch.zig");
+const clock = @import("clock.zig");
 const oauth = @import("../core/oauth.zig");
 const oauth_flow = @import("../core/oauth_flow.zig");
 const pkce = @import("../core/pkce.zig");
@@ -125,9 +126,67 @@ fn wellKnownUrl(scratch: Allocator, base: []const u8, path: []const u8) Allocato
 
 // ---------------------------------------------------------------------------
 // The authorization-code login flow. Discovery → PKCE/DPoP prep → PAR → browser
-// → loopback callback → token exchange. The result is an `auth.Session` (oauth
-// mode); from there the app uses `auth.query`/`auth.procedure` like any session.
+// → callback → token exchange. The result is an `auth.Session` (oauth mode);
+// from there the app uses `auth.query`/`auth.procedure` like any session.
+// The callback rides one of two transports (RedirectChannel): the desktop
+// loopback listener, or the mobile delivered-redirect mailbox (M-And.5).
 // ---------------------------------------------------------------------------
+
+/// M-And.5: the delivered-redirect channel for OS-owned browser flows. On a
+/// phone the redirect arrives as an OS intent — there is no socket to listen
+/// on — and the app cannot open a browser itself (the activity does, via the
+/// OS). One of these is the meeting point: the flow deposits the authorize
+/// URL for the shim to open, and the shim deposits the redirect URI the
+/// intent delivered; each side polls its slot. Two independent one-shot
+/// mailboxes, plain bytes across the seam (E1).
+/// A7.2: cold struct, size guard waived — one per login flow.
+pub const MobileFlow = struct {
+    /// flow → shim: the authorize URL to open in the OS browser.
+    url_ready: std.atomic.Value(bool) = .init(false),
+    url_len: usize = 0,
+    url_buf: [2048]u8 = undefined,
+    /// shim → flow: the full redirect URI from the intent. `claimed` gates
+    /// writers (first delivery wins); `ready` releases the bytes to the flow.
+    redirect_claimed: std.atomic.Value(bool) = .init(false),
+    redirect_ready: std.atomic.Value(bool) = .init(false),
+    redirect_len: usize = 0,
+    redirect_buf: [2048]u8 = undefined,
+
+    /// Deposit the intent's redirect URI (any thread). An oversize URI is
+    /// truncated — it then fails state validation downstream, an explicit
+    /// refusal rather than a silent hang (E3).
+    pub fn deliverRedirect(self: *MobileFlow, uri: []const u8) void {
+        if (self.redirect_claimed.swap(true, .acquire)) return;
+        const n = @min(uri.len, self.redirect_buf.len);
+        @memcpy(self.redirect_buf[0..n], uri[0..n]);
+        self.redirect_len = n;
+        self.redirect_ready.store(true, .release);
+    }
+
+    /// The authorize URL once the flow has built it; null until then. The
+    /// slice aliases the mailbox — read it before the flow object dies.
+    pub fn authorizeUrl(self: *MobileFlow) ?[]const u8 {
+        if (!self.url_ready.load(.acquire)) return null;
+        return self.url_buf[0..self.url_len];
+    }
+
+    fn depositUrl(self: *MobileFlow, url: []const u8) !void {
+        if (url.len > self.url_buf.len) return error.AuthorizeUrlTooLong;
+        @memcpy(self.url_buf[0..url.len], url);
+        self.url_len = url.len;
+        self.url_ready.store(true, .release);
+    }
+};
+
+/// Where the browser's redirect comes back from — the two login transports.
+/// A7.2: cold struct, size guard waived — one per login flow, never in bulk.
+const RedirectChannel = union(enum) {
+    /// Desktop: bind a loopback listener; the redirect is an HTTP GET.
+    loopback,
+    /// Mobile (M-And.5): the OS delivers the redirect as an intent; the
+    /// shim ferries both directions through the MobileFlow mailboxes.
+    mobile: *MobileFlow,
+};
 
 /// Run the full browser OAuth login for the account at `pds_url` (resolved by
 /// the caller from a handle/DID via `identity`). `handle` seeds the login form.
@@ -148,6 +207,36 @@ pub fn login(
     handle: ?[]const u8,
     cancel: ?*std.atomic.Value(bool),
 ) !auth.Session {
+    return loginFlow(gpa, io, environ, scratch, pds_url, handle, cancel, .loopback);
+}
+
+/// The mobile login (M-And.5): same flow, but the browser is opened BY the
+/// OS shim (it polls `flow.authorizeUrl`) and the redirect arrives as an
+/// intent the shim deposits with `flow.deliverRedirect`. Runs on a worker —
+/// it blocks polling the mailbox until delivery or `cancel`.
+pub fn loginMobile(
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    scratch: Allocator,
+    pds_url: []const u8,
+    handle: ?[]const u8,
+    cancel: ?*std.atomic.Value(bool),
+    flow: *MobileFlow,
+) !auth.Session {
+    return loginFlow(gpa, io, environ, scratch, pds_url, handle, cancel, .{ .mobile = flow });
+}
+
+fn loginFlow(
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    scratch: Allocator,
+    pds_url: []const u8,
+    handle: ?[]const u8,
+    cancel: ?*std.atomic.Value(bool),
+    channel: RedirectChannel,
+) !auth.Session {
     // 1. Discover the issuer's endpoints (scratch-owned for the flow).
     const server = try discover(scratch, io, environ, scratch, pds_url);
 
@@ -161,10 +250,15 @@ pub fn login(
     const challenge = pkce.challengeS256(&verifier);
     const state = try randomToken(io, scratch, 24);
 
-    // 3. The loopback catcher MUST be listening before we send its URL in PAR.
-    var lb = try openLoopback(io);
-    defer lb.server.deinit(io);
-    const redirect_uri = try std.fmt.allocPrint(scratch, "http://127.0.0.1:{d}/callback", .{lb.port});
+    // 3. The redirect transport. Loopback: the catcher MUST be listening
+    // before its URL goes into PAR. Mobile: the fixed custom-scheme URI —
+    // the OS routes it back by the manifest's intent-filter, nothing to bind.
+    var lb: ?Loopback = if (channel == .loopback) try openLoopback(io) else null;
+    defer if (lb) |*l| l.server.deinit(io);
+    const redirect_uri = switch (channel) {
+        .loopback => try std.fmt.allocPrint(scratch, "http://127.0.0.1:{d}/callback", .{lb.?.port}),
+        .mobile => config.oauth_redirect_mobile,
+    };
 
     // 4. Pushed Authorization Request → request_uri (DPoP, with nonce retry).
     const par_body = try oauth_flow.buildParBody(scratch, .{
@@ -178,24 +272,34 @@ pub fn login(
     const par_post = try auth.dpopPost(io, environ, scratch, server.par_endpoint, par_body, secret, null);
     const par = try oauth_flow.parseParResponse(scratch, par_post.body);
 
-    // 5. Open the browser to the authorize endpoint.
+    // 5. Open the browser to the authorize endpoint. Desktop opens it
+    // itself; mobile deposits the URL for the shim (only the OS activity
+    // can start a browser there).
     const authorize_url = try oauth_flow.buildAuthorizeUrl(scratch, server.authorization_endpoint, config.oauth_client_id, par.request_uri);
-    // Dev affordance: echo the URL so a failed auto-open (headless/SSH) is
-    // recoverable by pasting it. Not a secret. Removed when the GUI drives this.
-    std.debug.print("[oauth] authorize URL (opens automatically): {s}\n", .{authorize_url});
-    openBrowser(io, authorize_url) catch |err| {
-        // Auto-open failed (headless / SSH / no xdg-open). NOT fatal: the URL was
-        // printed above for manual paste, so the flow proceeds to await the
-        // callback. Surfacing the reason instead of swallowing it (E3) keeps a
-        // failed launch from looking like a silent hang. NOTE for slice 6.2: in
-        // the GUI this message + the URL print become a proper surfaced state,
-        // and the flow's overall lifetime (cancel if the browser never opens)
-        // is owned by the worker-thread design that wires this in.
-        std.debug.print("[oauth] could not launch a browser ({s}); open the URL above manually.\n", .{@errorName(err)});
-    };
+    switch (channel) {
+        .loopback => {
+            // Dev affordance: echo the URL so a failed auto-open (headless/SSH) is
+            // recoverable by pasting it. Not a secret. Removed when the GUI drives this.
+            std.debug.print("[oauth] authorize URL (opens automatically): {s}\n", .{authorize_url});
+            openBrowser(io, authorize_url) catch |err| {
+                // Auto-open failed (headless / SSH / no xdg-open). NOT fatal: the URL was
+                // printed above for manual paste, so the flow proceeds to await the
+                // callback. Surfacing the reason instead of swallowing it (E3) keeps a
+                // failed launch from looking like a silent hang. NOTE for slice 6.2: in
+                // the GUI this message + the URL print become a proper surfaced state,
+                // and the flow's overall lifetime (cancel if the browser never opens)
+                // is owned by the worker-thread design that wires this in.
+                std.debug.print("[oauth] could not launch a browser ({s}); open the URL above manually.\n", .{@errorName(err)});
+            };
+        },
+        .mobile => |flow| try flow.depositUrl(authorize_url),
+    }
 
     // 6. Block on the callback; validate state + iss.
-    const query = try awaitCallback(scratch, io, &lb.server, cancel);
+    const query = switch (channel) {
+        .loopback => try awaitCallback(scratch, io, &lb.?.server, cancel),
+        .mobile => |flow| try awaitDelivered(scratch, flow, cancel),
+    };
     const cb = try oauth_flow.parseCallback(scratch, query);
     try oauth_flow.validateCallback(cb, state, server.issuer);
 
@@ -356,6 +460,21 @@ fn awaitCallback(scratch: Allocator, io: std.Io, server: *std.Io.net.Server, can
     return error.CallbackFailed;
 }
 
+/// The mobile counterpart of awaitCallback: poll the delivered-redirect
+/// mailbox until the shim deposits the intent's URI (or `cancel`). Returns
+/// the query string (scratch-owned), the exact shape the loopback path
+/// yields, so validation downstream is one code path.
+fn awaitDelivered(scratch: Allocator, flow: *MobileFlow, cancel: ?*std.atomic.Value(bool)) ![]u8 {
+    while (!flow.redirect_ready.load(.acquire)) {
+        if (cancel) |c| if (c.load(.acquire)) return error.CallbackFailed;
+        clock.sleepMillis(100); // human-latency wait on a worker thread (G3)
+    }
+    const uri = flow.redirect_buf[0..flow.redirect_len];
+    // The intent delivers the full "com.zat4.pds:/callback?state=…&code=…".
+    const qpos = std.mem.indexOfScalar(u8, uri, '?') orelse return error.CallbackFailed;
+    return try scratch.dupe(u8, uri[qpos + 1 ..]);
+}
+
 const success_page =
     \\<!doctype html><html lang="en"><head><meta charset="utf-8">
     \\<meta name="viewport" content="width=device-width,initial-scale=1"><title>Zat4</title>
@@ -391,6 +510,25 @@ fn randomToken(io: std.Io, scratch: Allocator, comptime n: usize) ![]u8 {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "oauth shell: MobileFlow mailboxes — deposit, deliver, first-wins, query extraction" {
+    var flow: MobileFlow = .{};
+    try testing.expectEqual(@as(?[]const u8, null), flow.authorizeUrl());
+
+    try flow.depositUrl("https://pds.zat4.com/oauth/authorize?request_uri=abc");
+    try testing.expectEqualStrings("https://pds.zat4.com/oauth/authorize?request_uri=abc", flow.authorizeUrl().?);
+
+    flow.deliverRedirect("com.zat4.pds:/callback?state=s1&code=c1&iss=i1");
+    flow.deliverRedirect("com.zat4.pds:/callback?state=EVIL"); // second delivery loses
+    const q = try awaitDelivered(testing.allocator, &flow, null);
+    defer testing.allocator.free(q);
+    try testing.expectEqualStrings("state=s1&code=c1&iss=i1", q);
+
+    // A queryless delivery is an explicit refusal, not a hang.
+    var bare: MobileFlow = .{};
+    bare.deliverRedirect("com.zat4.pds:/callback");
+    try testing.expectError(error.CallbackFailed, awaitDelivered(testing.allocator, &bare, null));
+}
 
 test "oauth shell: wellKnownUrl appends and de-duplicates the slash" {
     const a = try wellKnownUrl(testing.allocator, "https://pds.zat4.com", protected_resource_path);

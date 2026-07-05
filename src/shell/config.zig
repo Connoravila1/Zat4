@@ -62,6 +62,14 @@ pub const pds_env_var = "ZAT_PDS";
 pub const oauth_client_id = "https://pds.zat4.com/client-metadata.json";
 pub const oauth_scope = "atproto transition:generic";
 
+/// The mobile redirect URI (M-And.5): the OS delivers the browser's redirect
+/// to the app as an intent — no loopback socket can exist on a phone. The
+/// atproto OAuth spec requires a native client's custom scheme to be the
+/// client_id HOSTNAME in reverse-domain order, `scheme:/path` with exactly
+/// one colon and one slash. Must appear verbatim in the hosted metadata's
+/// `redirect_uris` (the server matches exactly).
+pub const oauth_redirect_mobile = "com.zat4.pds:/callback";
+
 /// Endpoint configuration. A7.2: cold config — one per process, constructed
 /// once at startup, never in a hot loop. Holds borrowed slices (either the
 /// comptime default literal or a slice into the environment block); it owns

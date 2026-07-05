@@ -47,6 +47,7 @@ const gpu = @import("shell/gpu.zig");
 const text = @import("core/text.zig");
 const tui = @import("shell/tui.zig");
 const auth = @import("shell/auth.zig");
+const oauth_shell = @import("shell/oauth.zig");
 const cache_shell = @import("shell/cache.zig");
 const config = @import("shell/config.zig");
 const feed_core = @import("core/feed.zig");
@@ -75,6 +76,10 @@ const Ctx = struct {
     gfx: ?Gfx,
     /// The feed leg. Null until zat_feed_start; void in pure builds.
     feed: ?Feed,
+    /// The on-device sign-in leg (M-And.5). Null until a session-less
+    /// zat_feed_start arms it; stays allocated for the process (one flow
+    /// per run — a late redirect lands in a settled mailbox harmlessly).
+    login: ?*LoginJob,
 };
 
 /// Everything the render leg owns once a surface is attached (M-And.0b).
@@ -102,12 +107,39 @@ const Feed = if (mobile_config.have_gpu) struct {
     run: *tui.MobileRun,
 } else void;
 
+/// The on-device sign-in worker (M-And.5): runs oauth.loginMobile off the
+/// render thread, ferrying the browser hop through the MobileFlow mailboxes
+/// (the shim opens the URL, the OS intent delivers the redirect). On success
+/// the session is SAVED to the cache and the shim re-tries zat_feed_start —
+/// the same front door the cached-session path uses (one bring-up, D2).
+/// A7.2: cold struct, size guard waived — at most one per app process.
+const LoginJob = if (mobile_config.have_gpu) struct {
+    gpa: std.mem.Allocator,
+    thread: ?std.Thread,
+    flow: oauth_shell.MobileFlow,
+    io_backend: *std.Io.Threaded,
+    env: *std.process.Environ.Map,
+    cancel: std.atomic.Value(bool),
+    done: std.atomic.Value(bool),
+    ok: std.atomic.Value(bool),
+    /// Shim-side one-shot latches (render thread only).
+    url_handed: bool,
+    consumed: bool,
+    /// The authorize URL, NUL-terminated for the C ABI hand-off.
+    url_z: [2048:0]u8,
+} else void;
+
+/// The active login flow's redirect mailbox. A process global by necessity:
+/// the OS delivers the redirect intent to a FRESH activity instance that
+/// holds no ctx — zat_oauth_redirect is its only line in.
+var g_login_flow: std.atomic.Value(?*oauth_shell.MobileFlow) = .init(null);
+
 // The one Android log line (liblog, linked by the NDK build): stderr goes
 // nowhere in an APK, so the feed leg narrates its decisions here — `adb
 // logcat -s zat4` is the whole debugging story for a phone that shows the
 // field but no feed. No-op off Android.
 extern "log" fn __android_log_write(prio: c_int, tag: [*:0]const u8, text: [*:0]const u8) c_int;
-fn logcat(comptime fmt: []const u8, args: anytype) void {
+pub fn logcat(comptime fmt: []const u8, args: anytype) void {
     if (comptime !(mobile_config.have_gpu and builtin.abi.isAndroid())) return;
     var buf: [512]u8 = undefined;
     const msg = std.fmt.bufPrintZ(&buf, fmt, args) catch return;
@@ -130,6 +162,20 @@ const sig_pipe: c_int = 13;
 const sig_io: c_int = 29;
 
 fn sigNoop(_: c_int) callconv(.c) void {}
+
+/// Threaded interrupts blocked syscalls with SIGIO (its cancel mechanism)
+/// and sockets raise SIGPIPE — both DEFAULT-KILL an Android process, and
+/// std's sigaction never installs there (the bionic layout mismatch below).
+/// Install no-ops through bionic's true layout before ANY network leg runs
+/// (the feed and the login worker both call this; idempotent).
+fn installSignalNoops() void {
+    if (comptime builtin.abi.isAndroid()) {
+        var act: BionicSigaction = .{ .handler = &sigNoop };
+        const rio = bionic_sigaction(sig_io, &act, null);
+        const rpipe = bionic_sigaction(sig_pipe, &act, null);
+        logcat("signals: SIGIO/SIGPIPE no-op handlers installed (rc {d}/{d})", .{ rio, rpipe });
+    }
+}
 
 const step_ns: u64 = 16_666_667; // the fixed 60 Hz sim timestep
 const amb_amp: f32 = 0.006;
@@ -164,11 +210,13 @@ fn create(gpa: std.mem.Allocator, width_px: u32, height_px: u32, cell_px: u32) !
         .t = 0,
         .gfx = null,
         .feed = null,
+        .login = null,
     };
     return ctx;
 }
 
 fn destroy(ctx: *Ctx) void {
+    loginEnd(ctx);
     feedEnd(ctx);
     detachSurface(ctx);
     const gpa = ctx.gpa;
@@ -274,23 +322,9 @@ fn feedStart(ctx: *Ctx, files_dir: []const u8) bool {
 
     const io_backend = gpa.create(std.Io.Threaded) catch return false;
     io_backend.* = std.Io.Threaded.init(gpa, .{});
-    // Threaded interrupts blocked syscalls by sending SIGIO (its cancel
-    // mechanism — the HTTP client's connect race cancels the loser), and an
-    // unhandled SIGIO TERMINATES the process (the first on-device connect
-    // died exactly there: "exited due to signal 29"). Threaded DOES install
-    // a no-op handler — but every sigaction on this target is broken: bionic
-    // LP64 puts sa_flags FIRST in struct sigaction, while std's layout is
-    // the kernel/glibc handler-first order, so the struct arrives scrambled
-    // and nothing installs. Declare bionic's true layout locally (the same
-    // declare-the-ABI doctrine as android_activity's NDK surface) and
-    // install the no-ops through it; SIGPIPE gets the same treatment (same
-    // class of socket-lifetime signal, same default death).
-    if (comptime builtin.abi.isAndroid()) {
-        var act: BionicSigaction = .{ .handler = &sigNoop };
-        const rio = bionic_sigaction(sig_io, &act, null);
-        const rpipe = bionic_sigaction(sig_pipe, &act, null);
-        logcat("feed: SIGIO/SIGPIPE no-op handlers installed (rc {d}/{d})", .{ rio, rpipe });
-    }
+    // The bionic-layout sigaction story lives on installSignalNoops (the
+    // login worker shares the need — any network leg dies without it).
+    installSignalNoops();
     // Android has no /etc/resolv.conf — name lookups go through bionic's
     // getaddrinfo instead (the netLookup vtable slot; everything else stays
     // the Threaded implementation).
@@ -328,7 +362,11 @@ fn feedStart(ctx: *Ctx, files_dir: []const u8) bool {
                 break :blk s;
             }
         }
-        logcat("feed: NO cached session under {s}/.cache/zat — field-only (provision via --export-session)", .{files_dir});
+        // No session on this device: arm the on-device sign-in (M-And.5).
+        // The shim ferries the browser hop; when the flow lands a session
+        // it saves to the cache and the shim re-tries this front door.
+        logcat("feed: NO cached session under {s}/.cache/zat — arming sign-in", .{files_dir});
+        loginStart(ctx, files_dir);
         return false; // no session on this device yet
     };
     var ok_session = false;
@@ -374,6 +412,108 @@ fn feedStart(ctx: *Ctx, files_dir: []const u8) bool {
     ok_session = true;
     ok_store = true;
     return true;
+}
+
+/// The login worker body: the full OAuth flow (discovery → PAR → the shim's
+/// browser hop through the mailboxes → token exchange), then SAVE the
+/// session and hand off — the shim's zat_feed_start retry resumes it via
+/// the one cached-session front door. Every failure is a logcat line and a
+/// settled job, never a dead render thread (E2).
+fn loginWorker(job: *LoginJob) void {
+    if (comptime !mobile_config.have_gpu) return;
+    var arena_state = std.heap.ArenaAllocator.init(job.gpa);
+    defer arena_state.deinit();
+    const scratch = arena_state.allocator();
+    const io = android_dns.wrap(job.io_backend.io());
+    const eps = config.fromEnv(job.env);
+    logcat("login: flow starting against {s}", .{eps.pds_url});
+    var session = oauth_shell.loginMobile(job.gpa, io, job.env, scratch, eps.pds_url, null, &job.cancel, &job.flow) catch |err| {
+        logcat("login: flow FAILED ({s}) — field stays; relaunch to retry", .{@errorName(err)});
+        job.done.store(true, .release);
+        return;
+    };
+    var sp_buf: [512]u8 = undefined;
+    if (cache_shell.oauthSessionPath(&sp_buf, job.env)) |sp| {
+        _ = cache_shell.saveOAuthSessionAt(job.gpa, sp, &session);
+        logcat("login: session saved ({s}) — ready for the feed", .{session.handle});
+        job.ok.store(true, .release);
+    } else {
+        logcat("login: no session path — cannot persist, sign-in dropped", .{});
+    }
+    auth.freeSession(job.gpa, session);
+    job.done.store(true, .release);
+}
+
+/// Arm the on-device sign-in: one flow per process run (v1 — a failed flow
+/// waits for an app relaunch rather than looping the browser). Owns its own
+/// Io + environ (HOME = files_dir), freed by loginEnd at shutdown.
+fn loginStart(ctx: *Ctx, files_dir: []const u8) void {
+    if (comptime !mobile_config.have_gpu) return;
+    if (ctx.login != null) return;
+    const gpa = ctx.gpa;
+    const job = gpa.create(LoginJob) catch return;
+    var ok = false;
+    defer if (!ok) gpa.destroy(job);
+
+    const io_backend = gpa.create(std.Io.Threaded) catch return;
+    io_backend.* = std.Io.Threaded.init(gpa, .{});
+    var ok_io = false;
+    defer if (!ok_io) {
+        io_backend.deinit();
+        gpa.destroy(io_backend);
+    };
+
+    const env = gpa.create(std.process.Environ.Map) catch return;
+    env.* = std.process.Environ.Map.init(gpa);
+    var ok_env = false;
+    defer if (!ok_env) {
+        env.deinit();
+        gpa.destroy(env);
+    };
+    env.put("HOME", files_dir) catch return;
+
+    installSignalNoops(); // the login leg is a network leg
+
+    job.* = .{
+        .gpa = gpa,
+        .thread = null,
+        .flow = .{},
+        .io_backend = io_backend,
+        .env = env,
+        .cancel = .init(false),
+        .done = .init(false),
+        .ok = .init(false),
+        .url_handed = false,
+        .consumed = false,
+        .url_z = undefined,
+    };
+    job.thread = std.Thread.spawn(.{}, loginWorker, .{job}) catch {
+        logcat("login: worker spawn failed — sign-in unavailable this run", .{});
+        return; // the ok flags unwind io/env/job (E2)
+    };
+    ctx.login = job;
+    g_login_flow.store(&job.flow, .release);
+    ok = true;
+    ok_io = true;
+    ok_env = true;
+    logcat("login: OAuth flow armed — the shim opens the browser when the URL lands", .{});
+}
+
+/// Tear the login leg down (app exit): cancel the flow, join, free. The
+/// worker observes cancel at its mailbox poll; a leg blocked in a network
+/// call joins after that call's own timeout.
+fn loginEnd(ctx: *Ctx) void {
+    if (comptime !mobile_config.have_gpu) return;
+    const job = ctx.login orelse return;
+    g_login_flow.store(null, .release);
+    job.cancel.store(true, .release);
+    if (job.thread) |t| t.join();
+    job.env.deinit();
+    job.gpa.destroy(job.env);
+    job.io_backend.deinit();
+    job.gpa.destroy(job.io_backend);
+    job.gpa.destroy(job);
+    ctx.login = null;
 }
 
 /// Persist the store and the rotated session tokens (E4: a failed save is
@@ -605,6 +745,48 @@ pub export fn zat_feed_resize(ctx_ptr: ?*anyopaque, width_px: u32, height_px: u3
     if (ctx.feed) |*f| tui.mobileResize(f.run, width_px, height_px);
 }
 
+/// M-And.5: the authorize URL for the shim to open in the OS browser —
+/// non-null exactly ONCE per armed flow (the shim must not reopen the
+/// browser every frame). NUL-terminated; the bytes live until zat_shutdown.
+pub export fn zat_login_url(ctx_ptr: ?*anyopaque) ?[*:0]const u8 {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return null));
+    if (comptime !mobile_config.have_gpu) return null;
+    const job = ctx.login orelse return null;
+    if (job.url_handed) return null;
+    const url = job.flow.authorizeUrl() orelse return null;
+    @memcpy(job.url_z[0..url.len], url);
+    job.url_z[url.len] = 0;
+    job.url_handed = true;
+    return job.url_z[0..url.len :0].ptr;
+}
+
+/// M-And.5: the OS delivered the OAuth redirect intent. Called from the
+/// TRAMPOLINE activity instance (which holds no ctx — hence the process-
+/// global mailbox). True = a waiting flow took it; false = nothing armed
+/// (a stale redirect after process death — the caller launches normally).
+pub export fn zat_oauth_redirect(uri: ?[*:0]const u8) bool {
+    const u = uri orelse return false;
+    const flow = g_login_flow.load(.acquire) orelse return false;
+    flow.deliverRedirect(std.mem.span(u));
+    return true;
+}
+
+/// M-And.5: true exactly ONCE, when the armed flow has finished and saved a
+/// session — the shim's cue to re-try zat_feed_start. A failed flow reports
+/// nothing (the field stays; an app relaunch retries).
+pub export fn zat_login_ready(ctx_ptr: ?*anyopaque) bool {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return false));
+    if (comptime !mobile_config.have_gpu) return false;
+    const job = ctx.login orelse return false;
+    if (job.consumed or !job.done.load(.acquire)) return false;
+    job.consumed = true;
+    if (job.thread) |t| {
+        t.join(); // settled — reap the worker now rather than at shutdown
+        job.thread = null;
+    }
+    return job.ok.load(.acquire);
+}
+
 /// M-And.4: the surface died under a live feed — park it (persist store +
 /// rotated tokens, release the GL leg; the RunState stays hot). Safe
 /// without a feed; idempotent. zat_feed_resume rebuilds the render.
@@ -680,6 +862,10 @@ test "seam ABI: null context is a no-op on every export, never a crash" {
     zat_feed_resize(null, 10, 10);
     zat_feed_suspend(null);
     try testing.expect(!zat_feed_resume(null, null, 10, 10));
+    try testing.expectEqual(@as(?[*:0]const u8, null), zat_login_url(null));
+    try testing.expect(!zat_oauth_redirect(null));
+    try testing.expect(!zat_oauth_redirect("com.zat4.pds:/callback?x=y")); // nothing armed
+    try testing.expect(!zat_login_ready(null));
     zat_feed_end(null);
     zat_shutdown(null);
 }

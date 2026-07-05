@@ -27,6 +27,17 @@
         <action android:name="android.intent.action.MAIN"/>
         <category android:name="android.intent.category.LAUNCHER"/>
       </intent-filter>
+      <!-- The OAuth redirect (M-And.5): the browser hands
+           com.zat4.pds:/callback?... back to the app as a VIEW intent; a
+           trampoline instance ferries it to the armed login flow
+           (android_activity.zig) and re-fronts the running task. The scheme
+           is the client_id hostname reversed, per the atproto OAuth spec. -->
+      <intent-filter>
+        <action android:name="android.intent.action.VIEW"/>
+        <category android:name="android.intent.category.DEFAULT"/>
+        <category android:name="android.intent.category.BROWSABLE"/>
+        <data android:scheme="com.zat4.pds"/>
+      </intent-filter>
     </activity>
   </application>
 </manifest>

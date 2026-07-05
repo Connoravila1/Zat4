@@ -127,6 +127,180 @@ const action_down: i32 = 0;
 const action_up: i32 = 1;
 const action_move: i32 = 2;
 
+// ---------------------------------------------------------------------------
+// Minimal JNI, declared locally (D3) — the two OAuth hops (M-And.5) are the
+// only Java the app speaks: startActivity(ACTION_VIEW url) to open the
+// browser, and getIntent().getDataString() to read the redirect back. Only
+// the dialed slots are typed; indices were read from the NDK's jni.h
+// (233-slot JNINativeInterface, 8-slot JNIInvokeInterface). The A-variants
+// (jvalue arrays) are used exclusively — no C varargs cross this boundary.
+// A7.2 (FFI): layouts are the JVM ABI's, not ours; waived.
+// ---------------------------------------------------------------------------
+
+const jobject = ?*anyopaque;
+const jclass = jobject;
+const jstring = jobject;
+const jmethodID = ?*anyopaque;
+const jvalue = extern union { l: jobject, z: u8, i: i32, j: i64 };
+
+const JniTable = extern struct { slots: [233]?*const anyopaque };
+const JniEnv = *const *const JniTable;
+const VmTable = extern struct { slots: [8]?*const anyopaque };
+const JavaVm = *const *const VmTable;
+
+const jni_find_class = 6; // FindClass
+const jni_exception_clear = 17; // ExceptionClear
+const jni_new_object_a = 30; // NewObjectA
+const jni_get_object_class = 31; // GetObjectClass
+const jni_get_method_id = 33; // GetMethodID
+const jni_call_object_method_a = 36; // CallObjectMethodA
+const jni_call_void_method_a = 63; // CallVoidMethodA
+const jni_get_static_method_id = 113; // GetStaticMethodID
+const jni_call_static_object_method_a = 116; // CallStaticObjectMethodA
+const jni_new_string_utf = 167; // NewStringUTF
+const jni_get_string_utf_chars = 169; // GetStringUTFChars
+const jni_release_string_utf_chars = 170; // ReleaseStringUTFChars
+const jni_exception_check = 228; // ExceptionCheck
+const vm_attach_current_thread = 4; // AttachCurrentThread
+const vm_detach_current_thread = 5; // DetachCurrentThread
+
+const FindClassFn = *const fn (JniEnv, [*:0]const u8) callconv(.c) jclass;
+const GetMethodIdFn = *const fn (JniEnv, jclass, [*:0]const u8, [*:0]const u8) callconv(.c) jmethodID;
+const NewStringUtfFn = *const fn (JniEnv, [*:0]const u8) callconv(.c) jstring;
+const NewObjectAFn = *const fn (JniEnv, jclass, jmethodID, [*]const jvalue) callconv(.c) jobject;
+const GetObjectClassFn = *const fn (JniEnv, jobject) callconv(.c) jclass;
+const CallObjectMethodAFn = *const fn (JniEnv, jobject, jmethodID, [*]const jvalue) callconv(.c) jobject;
+const CallVoidMethodAFn = *const fn (JniEnv, jobject, jmethodID, [*]const jvalue) callconv(.c) void;
+const CallStaticObjectMethodAFn = *const fn (JniEnv, jclass, jmethodID, [*]const jvalue) callconv(.c) jobject;
+const GetStringUtfCharsFn = *const fn (JniEnv, jstring, ?*u8) callconv(.c) ?[*:0]const u8;
+const ReleaseStringUtfCharsFn = *const fn (JniEnv, jstring, [*:0]const u8) callconv(.c) void;
+const ExceptionCheckFn = *const fn (JniEnv) callconv(.c) u8;
+const ExceptionClearFn = *const fn (JniEnv) callconv(.c) void;
+const AttachFn = *const fn (JavaVm, *JniEnv, ?*anyopaque) callconv(.c) c_int;
+const DetachFn = *const fn (JavaVm) callconv(.c) c_int;
+
+fn jniFn(env: JniEnv, comptime idx: usize, comptime F: type) F {
+    return @ptrCast(@alignCast(env.*.slots[idx].?));
+}
+
+/// True (and clears) if the last JNI call left an exception pending —
+/// calling further JNI with one pending is undefined, so every hop checks.
+fn jniFailed(env: JniEnv) bool {
+    if (jniFn(env, jni_exception_check, ExceptionCheckFn)(env) == 0) return false;
+    jniFn(env, jni_exception_clear, ExceptionClearFn)(env);
+    return true;
+}
+
+/// Look up an instance method on `obj`'s class. Null on any failure.
+fn jniMethod(env: JniEnv, obj: jobject, name: [*:0]const u8, sig: [*:0]const u8) jmethodID {
+    const cls = jniFn(env, jni_get_object_class, GetObjectClassFn)(env, obj);
+    if (jniFailed(env) or cls == null) return null;
+    const mid = jniFn(env, jni_get_method_id, GetMethodIdFn)(env, cls, name, sig);
+    if (jniFailed(env)) return null;
+    return mid;
+}
+
+/// CallObjectMethodA with the exception check folded in (null on failure).
+fn jniCallObj(env: JniEnv, obj: jobject, mid: jmethodID, args: [*]const jvalue) jobject {
+    const r = jniFn(env, jni_call_object_method_a, CallObjectMethodAFn)(env, obj, mid, args);
+    if (jniFailed(env)) return null;
+    return r;
+}
+
+const no_args = [_]jvalue{};
+
+/// Open `url` in the OS browser: startActivity(new Intent(ACTION_VIEW,
+/// Uri.parse(url))). Runs on the render thread — attaches it to the JVM for
+/// the calls and detaches before returning (an attached thread must never
+/// exit attached). Any failure is a logcat line and a no-op: the login flow
+/// keeps waiting and an app relaunch retries (E2/E4).
+fn openUrlViaOs(activity: *Activity, url: [*:0]const u8) void {
+    const vm: JavaVm = @ptrCast(@alignCast(activity.vm));
+    var env: JniEnv = undefined;
+    const attach: AttachFn = @ptrCast(@alignCast(vm.*.slots[vm_attach_current_thread].?));
+    if (attach(vm, &env, null) != 0) {
+        seam.logcat("login: JVM attach failed — cannot open the browser", .{});
+        return;
+    }
+    defer _ = @as(DetachFn, @ptrCast(@alignCast(vm.*.slots[vm_detach_current_thread].?)))(vm);
+
+    const find_class = jniFn(env, jni_find_class, FindClassFn);
+    const new_string = jniFn(env, jni_new_string_utf, NewStringUtfFn);
+
+    const uri_cls = find_class(env, "android/net/Uri");
+    if (jniFailed(env) or uri_cls == null) return seam.logcat("login: Uri class lookup failed", .{});
+    const parse_mid = jniFn(env, jni_get_static_method_id, GetMethodIdFn)(env, uri_cls, "parse", "(Ljava/lang/String;)Landroid/net/Uri;");
+    if (jniFailed(env) or parse_mid == null) return seam.logcat("login: Uri.parse lookup failed", .{});
+    const url_j = new_string(env, url);
+    if (jniFailed(env) or url_j == null) return seam.logcat("login: url string failed", .{});
+    const uri = jniFn(env, jni_call_static_object_method_a, CallStaticObjectMethodAFn)(env, uri_cls, parse_mid, &[_]jvalue{.{ .l = url_j }});
+    if (jniFailed(env) or uri == null) return seam.logcat("login: Uri.parse failed", .{});
+
+    const intent_cls = find_class(env, "android/content/Intent");
+    if (jniFailed(env) or intent_cls == null) return seam.logcat("login: Intent class lookup failed", .{});
+    const ctor = jniFn(env, jni_get_method_id, GetMethodIdFn)(env, intent_cls, "<init>", "(Ljava/lang/String;Landroid/net/Uri;)V");
+    if (jniFailed(env) or ctor == null) return seam.logcat("login: Intent ctor lookup failed", .{});
+    const action_j = new_string(env, "android.intent.action.VIEW");
+    if (jniFailed(env) or action_j == null) return seam.logcat("login: action string failed", .{});
+    const intent = jniFn(env, jni_new_object_a, NewObjectAFn)(env, intent_cls, ctor, &[_]jvalue{ .{ .l = action_j }, .{ .l = uri } });
+    if (jniFailed(env) or intent == null) return seam.logcat("login: Intent construction failed", .{});
+
+    const start_mid = jniMethod(env, activity.clazz, "startActivity", "(Landroid/content/Intent;)V");
+    if (start_mid == null) return seam.logcat("login: startActivity lookup failed", .{});
+    jniFn(env, jni_call_void_method_a, CallVoidMethodAFn)(env, activity.clazz, start_mid, &[_]jvalue{.{ .l = intent }});
+    if (jniFailed(env)) return seam.logcat("login: startActivity threw", .{});
+    seam.logcat("login: browser opened for the authorize URL", .{});
+}
+
+/// The redirect trampoline (M-And.5). The OS launches a FRESH activity
+/// instance for the VIEW intent; when this process already runs a live
+/// instance, this create must not touch `app` — instead: ferry the intent's
+/// data URI to the armed login flow, re-front the app's task (the launcher
+/// intent brings the original activity forward), and finish this instance.
+/// Returns true when this create was such a duplicate (handled here).
+fn redirectTrampoline(activity: *Activity) bool {
+    if (app.thread == null) return false; // no live instance: a normal launch
+    const env: JniEnv = @ptrCast(@alignCast(activity.env));
+
+    // getIntent().getDataString() — null for a plain relaunch.
+    blk: {
+        const get_intent = jniMethod(env, activity.clazz, "getIntent", "()Landroid/content/Intent;") orelse break :blk;
+        const intent = jniCallObj(env, activity.clazz, get_intent, &no_args) orelse break :blk;
+        const get_data = jniMethod(env, intent, "getDataString", "()Ljava/lang/String;") orelse break :blk;
+        const data_j = jniCallObj(env, intent, get_data, &no_args) orelse break :blk;
+        const chars = jniFn(env, jni_get_string_utf_chars, GetStringUtfCharsFn)(env, data_j, null) orelse break :blk;
+        defer jniFn(env, jni_release_string_utf_chars, ReleaseStringUtfCharsFn)(env, data_j, chars);
+        if (seam.zat_oauth_redirect(chars)) {
+            seam.logcat("login: redirect delivered to the waiting flow", .{});
+        } else {
+            seam.logcat("login: redirect arrived with no armed flow — dropped", .{});
+        }
+    }
+
+    // Re-front the original task: startActivity(getPackageManager()
+    // .getLaunchIntentForPackage(getPackageName())) — the launcher intent
+    // brings the running task forward instead of stacking a new instance.
+    blk: {
+        const get_pm = jniMethod(env, activity.clazz, "getPackageManager", "()Landroid/content/pm/PackageManager;") orelse break :blk;
+        const pm = jniCallObj(env, activity.clazz, get_pm, &no_args) orelse break :blk;
+        const get_pkg = jniMethod(env, activity.clazz, "getPackageName", "()Ljava/lang/String;") orelse break :blk;
+        const pkg = jniCallObj(env, activity.clazz, get_pkg, &no_args) orelse break :blk;
+        const get_launch = jniMethod(env, pm, "getLaunchIntentForPackage", "(Ljava/lang/String;)Landroid/content/Intent;") orelse break :blk;
+        const launch_intent = jniCallObj(env, pm, get_launch, &[_]jvalue{.{ .l = pkg }}) orelse break :blk;
+        const start_mid = jniMethod(env, activity.clazz, "startActivity", "(Landroid/content/Intent;)V") orelse break :blk;
+        jniFn(env, jni_call_void_method_a, CallVoidMethodAFn)(env, activity.clazz, start_mid, &[_]jvalue{.{ .l = launch_intent }});
+        _ = jniFailed(env);
+    }
+
+    // Dismiss the duplicate instance. Its callbacks were never wired, so
+    // the teardown that follows touches nothing of ours.
+    if (jniMethod(env, activity.clazz, "finish", "()V")) |fin| {
+        jniFn(env, jni_call_void_method_a, CallVoidMethodAFn)(env, activity.clazz, fin, &no_args);
+        _ = jniFailed(env);
+    }
+    return true;
+}
+
 /// One field cell ≈ 18 device px — the web reference's 9 CSS px at ~2×
 /// density; an eyes-on-device [TUNE] (MOBILE_ROADMAP §8.3).
 const cell_px: u32 = 18;
@@ -153,6 +327,11 @@ const App = struct {
     /// onCreate before the thread spawns) — the cache root zat_feed_start
     /// takes (M_CORE_INVERSION MC.4d).
     files_dir: [512:0]u8 = [_:0]u8{0} ** 512,
+    /// The live activity (M-And.5: the render thread's JNI door for the
+    /// browser launch). Set in onCreate before the thread spawns; onDestroy
+    /// JOINS the render thread before the pointer dies, so no use races
+    /// the teardown.
+    activity: ?*Activity = null,
 };
 
 var app: App = .{};
@@ -226,6 +405,21 @@ fn renderThread() void {
                     feed_live = seam.zat_feed_start(ctx, &app.files_dir);
                     feed_errs = 0;
                 }
+            }
+        }
+
+        // M-And.5: ferry the on-device sign-in. The seam surfaces the
+        // authorize URL exactly once — open it in the OS browser; when the
+        // flow lands a session (the trampoline delivered the redirect and
+        // the token exchange finished), start the feed through the same
+        // front door the cached-session path uses.
+        if (!feed_live and !feed_parked) {
+            if (app.activity) |act| {
+                if (seam.zat_login_url(ctx)) |u| openUrlViaOs(act, u);
+            }
+            if (attached_gen != 0 and seam.zat_login_ready(ctx)) {
+                feed_live = seam.zat_feed_start(ctx, &app.files_dir);
+                feed_errs = 0;
             }
         }
 
@@ -334,6 +528,7 @@ fn onDestroy(_: *Activity) callconv(.c) void {
     app.running.store(false, .release);
     if (app.thread) |t| t.join();
     app.thread = null;
+    app.activity = null; // the pointer dies when this returns
 }
 
 // stderr → logcat: a Zig panic in this fork prints its message + trace to
@@ -380,9 +575,12 @@ fn routeStderrToLogcat() void {
 
 /// The framework's entry point (looked up by name in the library that
 /// android.app.lib_name names). Wire the callbacks, start the one thread.
+/// A second create in a live process is the OAuth redirect trampoline
+/// (M-And.5) — handled and dismissed before any of this state is touched.
 export fn ANativeActivity_onCreate(activity: *Activity, saved: ?*anyopaque, saved_len: usize) void {
     _ = saved;
     _ = saved_len;
+    if (redirectTrampoline(activity)) return;
     routeStderrToLogcat();
     activity.callbacks.onNativeWindowCreated = onNativeWindowCreated;
     activity.callbacks.onNativeWindowDestroyed = onNativeWindowDestroyed;
@@ -390,6 +588,7 @@ export fn ANativeActivity_onCreate(activity: *Activity, saved: ?*anyopaque, save
     activity.callbacks.onInputQueueDestroyed = onInputQueueDestroyed;
     activity.callbacks.onDestroy = onDestroy;
     app = .{};
+    app.activity = activity;
     // The app's private files dir — the cache root the feed leg needs
     // (MC.4d). Copied before the thread spawns; the activity's own string
     // may not outlive us.
