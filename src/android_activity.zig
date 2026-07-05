@@ -168,6 +168,10 @@ fn renderThread() void {
     // zat_feed_step (one frame per vsync; the swap inside paces it) and
     // the field-only step/render pair rests.
     var feed_live = false;
+    // M-And.4: a surface bounce PARKS the feed (store/session/workers/
+    // scroll stay hot; only the GL leg is released) and the next surface
+    // resumes it — lock/unlock and backgrounding no longer reset the feed.
+    var feed_parked = false;
     var feed_errs: u32 = 0;
     var last_ns: u64 = clock.monotonicNanos();
 
@@ -179,16 +183,18 @@ fn renderThread() void {
         const queue = app.queue;
         app.mutex.unlock();
 
-        // Surface choreography: attach on a new generation, detach + ack
-        // when the window went away. A dying surface ENDS the feed first —
-        // zat_feed_end persists the store + rotated tokens and closes the
-        // GL context cleanly; the next attach restarts it from the cache
-        // (v1 lifecycle: feed life = surface life; M-And.4 refines this).
+        // Surface choreography (M-And.4): attach on a new generation,
+        // detach + ack when the window went away. A dying surface PARKS a
+        // live feed — zat_feed_suspend persists (kill insurance) and
+        // releases the GL leg while the RunState stays hot; the next
+        // surface RESUMES it in place (scroll intact), falling back to the
+        // full restart-from-cache path only if the resume refuses.
         if (win == null) {
             if (attached_gen != 0) {
                 if (feed_live) {
-                    seam.zat_feed_end(ctx);
+                    seam.zat_feed_suspend(ctx);
                     feed_live = false;
+                    feed_parked = true;
                 }
                 seam.zat_surface_lost(ctx);
                 attached_gen = 0;
@@ -202,11 +208,24 @@ fn renderThread() void {
         } else if (win != null and attached_gen != gen) {
             const w: u32 = @intCast(@max(1, ANativeWindow_getWidth(win.?)));
             const h: u32 = @intCast(@max(1, ANativeWindow_getHeight(win.?)));
-            if (seam.zat_surface(ctx, @ptrCast(win.?), w, h)) {
-                _ = seam.zat_resize(ctx, w, h);
+            if (feed_parked and seam.zat_feed_resume(ctx, @ptrCast(win.?), w, h)) {
                 attached_gen = gen;
-                feed_live = seam.zat_feed_start(ctx, &app.files_dir);
+                feed_parked = false;
+                feed_live = true;
                 feed_errs = 0;
+            } else {
+                if (feed_parked) {
+                    // The parked feed refused the new surface — tear down
+                    // to the restart path (the suspend already persisted).
+                    seam.zat_feed_end(ctx);
+                    feed_parked = false;
+                }
+                if (seam.zat_surface(ctx, @ptrCast(win.?), w, h)) {
+                    _ = seam.zat_resize(ctx, w, h);
+                    attached_gen = gen;
+                    feed_live = seam.zat_feed_start(ctx, &app.files_dir);
+                    feed_errs = 0;
+                }
             }
         }
 
@@ -255,6 +274,13 @@ fn renderThread() void {
             last_ns = clock.monotonicNanos();
             continue;
         }
+        if (feed_parked) {
+            // Backgrounded with a parked feed: fully idle — no sim, no
+            // render — until a surface arrives or the activity ends.
+            last_ns = clock.monotonicNanos();
+            clock.sleepMillis(50);
+            continue;
+        }
         const now_ns = clock.monotonicNanos();
         seam.zat_step(ctx, now_ns -| last_ns);
         last_ns = now_ns;
@@ -264,7 +290,7 @@ fn renderThread() void {
             clock.sleepMillis(50); // parked: no surface
         }
     }
-    if (feed_live) seam.zat_feed_end(ctx);
+    if (feed_live or feed_parked) seam.zat_feed_end(ctx);
     seam.zat_surface_lost(ctx);
 }
 

@@ -4440,6 +4440,39 @@ pub fn mobileResize(mr: *MobileRun, width_px: u32, height_px: u32) void {
     mr.host.height_px = height_px;
 }
 
+/// M-And.4: the surface is dying but the app lives on — release ONLY the
+/// GPU leg. The GL context dies with the surface anyway, and every GpuState
+/// object dies with the context; the RunState — store, session, workers,
+/// scroll, view state — stays hot for the next surface. Idempotent.
+pub fn mobileSuspend(mr: *MobileRun) void {
+    if (mr.rs.gpu_state) |*gs| {
+        deinitGpuState(mr.rs.gpa, gs);
+        mr.rs.gpu_state = null;
+    }
+}
+
+/// M-And.4: a new surface arrived for a suspended feed — rebuild the GPU
+/// leg against the seam's fresh context (owned from the call, the
+/// mobileStart contract) and adopt the new geometry (rotation lands here as
+/// a recreated surface). False = bring-up failed, context released; the
+/// caller falls back to a full restart.
+pub fn mobileResume(mr: *MobileRun, g_in: gpu.Gpu, width_px: u32, height_px: u32) bool {
+    var g = g_in;
+    if (mr.rs.gpu_state != null) {
+        gpu.deinit(&g); // already rendering — refuse the spare context
+        return true;
+    }
+    const eng = if (mr.rs.engine) |*e| e else {
+        gpu.deinit(&g); // no font engine → mobileStart never succeeded
+        return false;
+    };
+    mr.host.width_px = width_px;
+    mr.host.height_px = height_px;
+    // initGpuState owns g from the call (deinits on its own failure, C5).
+    mr.rs.gpu_state = initGpuState(mr.rs.gpa, eng, g, width_px, height_px) catch return false;
+    return true;
+}
+
 /// Tear the feed down: the RunState's deinit (workers joined, arenas freed —
 /// the GPU state inside it owns the GL context) plus the host queue.
 pub fn mobileEnd(mr: *MobileRun) void {

@@ -376,16 +376,9 @@ fn feedStart(ctx: *Ctx, files_dir: []const u8) bool {
     return true;
 }
 
-/// Tear the feed down (app exit / explicit stop): persist the store and the
-/// rotated session tokens (E4: a failed save is simply no cache), then the
-/// driver (workers joined, GL context ends with the GPU state) and the
-/// process-lifetime plumbing.
-fn feedEnd(ctx: *Ctx) void {
-    if (comptime !mobile_config.have_gpu) return;
-    if (ctx.feed == null) return;
-    logcat("feed: ending (persist store + session)", .{});
-    const gpa = ctx.gpa;
-    const f = &ctx.feed.?;
+/// Persist the store and the rotated session tokens (E4: a failed save is
+/// simply no cache). Shared by the teardown and the M-And.4 suspend.
+fn feedPersist(gpa: std.mem.Allocator, f: *Feed) void {
     _ = cache_shell.saveStore(gpa, f.env, &f.store);
     var sp_buf: [512]u8 = undefined;
     if (f.session.mode == .oauth) {
@@ -393,6 +386,54 @@ fn feedEnd(ctx: *Ctx) void {
     } else if (cache_shell.sessionPath(&sp_buf, f.env)) |sp| {
         _ = cache_shell.saveSessionAt(gpa, sp, &f.session);
     }
+}
+
+/// M-And.4: the surface died under a live feed — PARK it, don't end it.
+/// The GL leg is released (it dies with the surface regardless); the
+/// RunState — store, session, workers, scroll — stays hot for the next
+/// surface. Persists NOW as kill insurance: a backgrounded process can die
+/// without another callback ever firing. Idempotent; safe without a feed.
+fn feedSuspend(ctx: *Ctx) void {
+    if (comptime !mobile_config.have_gpu) return;
+    if (ctx.feed == null) return;
+    const f = &ctx.feed.?;
+    logcat("feed: suspending (surface lost) — persist + release the GL leg", .{});
+    feedPersist(ctx.gpa, f);
+    tui.mobileSuspend(f.run);
+}
+
+/// M-And.4: a new surface for a parked feed — fresh GL context on it, then
+/// the driver rebuilds its GPU state (geometry adopted; rotation arrives
+/// this way). False = no feed to resume or bring-up failed; the shim falls
+/// back to the full restart path (the suspend already persisted).
+fn feedResume(ctx: *Ctx, native_window: ?*anyopaque, width_px: u32, height_px: u32) bool {
+    if (comptime !mobile_config.have_gpu) return false;
+    if (ctx.feed == null) return false;
+    const f = &ctx.feed.?;
+    const g = gpu.init(native_window) catch {
+        logcat("feed: resume FAILED — no GL context on the new surface", .{});
+        return false;
+    };
+    if (!tui.mobileResume(f.run, g, width_px, height_px)) {
+        logcat("feed: resume FAILED — GPU feed state bring-up", .{});
+        return false;
+    }
+    ctx.width_px = width_px;
+    ctx.height_px = height_px;
+    logcat("feed: resumed on the new surface ({d}x{d})", .{ width_px, height_px });
+    return true;
+}
+
+/// Tear the feed down (app exit / explicit stop): persist the store and the
+/// rotated session tokens, then the driver (workers joined, GL context ends
+/// with the GPU state) and the process-lifetime plumbing.
+fn feedEnd(ctx: *Ctx) void {
+    if (comptime !mobile_config.have_gpu) return;
+    if (ctx.feed == null) return;
+    logcat("feed: ending (persist store + session)", .{});
+    const gpa = ctx.gpa;
+    const f = &ctx.feed.?;
+    feedPersist(gpa, f);
     tui.mobileEnd(f.run);
     feed_core.deinitStore(gpa, &f.store);
     auth.freeSession(gpa, f.session);
@@ -564,6 +605,22 @@ pub export fn zat_feed_resize(ctx_ptr: ?*anyopaque, width_px: u32, height_px: u3
     if (ctx.feed) |*f| tui.mobileResize(f.run, width_px, height_px);
 }
 
+/// M-And.4: the surface died under a live feed — park it (persist store +
+/// rotated tokens, release the GL leg; the RunState stays hot). Safe
+/// without a feed; idempotent. zat_feed_resume rebuilds the render.
+pub export fn zat_feed_suspend(ctx_ptr: ?*anyopaque) void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return));
+    feedSuspend(ctx);
+}
+
+/// M-And.4: a new surface for a parked feed (Android: the fresh
+/// ANativeWindow*). False = nothing parked or bring-up failed — the shim
+/// falls back to zat_feed_end + the full zat_surface/zat_feed_start path.
+pub export fn zat_feed_resume(ctx_ptr: ?*anyopaque, native_window: ?*anyopaque, width_px: u32, height_px: u32) bool {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return false));
+    return feedResume(ctx, native_window, width_px, height_px);
+}
+
 /// Stop the feed and persist (store + rotated tokens). Safe without a start.
 pub export fn zat_feed_end(ctx_ptr: ?*anyopaque) void {
     const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return));
@@ -603,6 +660,10 @@ test "seam: init → touch → step moves energy → resize survives → shutdow
     try testing.expect(resize(ctx, 2400, 1080));
     stepSim(ctx, step_ns);
     try testing.expectEqual(gridDims(2400, 1080, 24).cols, ctx.field.cols);
+
+    // M-And.4 without a feed: suspend is a no-op, resume refuses honestly.
+    feedSuspend(ctx);
+    try testing.expect(!feedResume(ctx, null, 1080, 2400));
 }
 
 test "seam ABI: null context is a no-op on every export, never a crash" {
@@ -617,6 +678,8 @@ test "seam ABI: null context is a no-op on every export, never a crash" {
     try testing.expect(!zat_feed_start(null, null));
     try testing.expectEqual(@as(u32, 3), zat_feed_step(null));
     zat_feed_resize(null, 10, 10);
+    zat_feed_suspend(null);
+    try testing.expect(!zat_feed_resume(null, null, 10, 10));
     zat_feed_end(null);
     zat_shutdown(null);
 }
