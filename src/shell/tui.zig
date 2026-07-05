@@ -4122,6 +4122,11 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         rs.gchat_peer_len += 1;
                         rs.gchat_key_ns = clock_shell.monotonicNanos();
                     }
+                    // Consume the key while the bar owns the keyboard — without
+                    // this it falls through to the feed shortcuts, so typing a
+                    // handle with an 'n' in it opened the new-post composer.
+                    try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status);
+                    continue;
                 } else if (dev_chat and rs.gscreen == feed_view.screen_messages and rs.gchat_input_focus) {
                     if (zc == 8 or zc == 127) {
                         if (rs.gchat_draft_len > 0) rs.gchat_draft_len -= 1;
