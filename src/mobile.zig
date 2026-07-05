@@ -51,6 +51,7 @@ const cache_shell = @import("shell/cache.zig");
 const config = @import("shell/config.zig");
 const feed_core = @import("core/feed.zig");
 const layout_core = @import("core/layout.zig");
+const android_dns = @import("shell/android_dns.zig");
 
 /// The seam's context handle. The shim holds it as an opaque pointer.
 /// A7.2: cold struct, size guard waived — exactly one per app process.
@@ -112,6 +113,23 @@ fn logcat(comptime fmt: []const u8, args: anytype) void {
     const msg = std.fmt.bufPrintZ(&buf, fmt, args) catch return;
     _ = __android_log_write(4, "zat4", msg); // 4 = ANDROID_LOG_INFO
 }
+
+// Bionic LP64 struct sigaction — sa_flags FIRST (kernel order is handler
+// first; the two must never be conflated). Declared locally per the FFI
+// doctrine; the extern binds libc's real symbol.
+// A7.2 (FFI): layout is the OS ABI's, not ours; waived.
+const BionicSigaction = extern struct {
+    flags: c_int = 0,
+    handler: ?*const fn (c_int) callconv(.c) void,
+    mask: u64 = 0, // sigset_t: one unsigned long on LP64
+    restorer: ?*const fn () callconv(.c) void = null,
+};
+extern "c" fn sigaction(sig: c_int, act: ?*const BionicSigaction, oact: ?*BionicSigaction) c_int;
+const bionic_sigaction = sigaction;
+const sig_pipe: c_int = 13;
+const sig_io: c_int = 29;
+
+fn sigNoop(_: c_int) callconv(.c) void {}
 
 const step_ns: u64 = 16_666_667; // the fixed 60 Hz sim timestep
 const amb_amp: f32 = 0.006;
@@ -256,7 +274,27 @@ fn feedStart(ctx: *Ctx, files_dir: []const u8) bool {
 
     const io_backend = gpa.create(std.Io.Threaded) catch return false;
     io_backend.* = std.Io.Threaded.init(gpa, .{});
-    const io = io_backend.io();
+    // Threaded interrupts blocked syscalls by sending SIGIO (its cancel
+    // mechanism — the HTTP client's connect race cancels the loser), and an
+    // unhandled SIGIO TERMINATES the process (the first on-device connect
+    // died exactly there: "exited due to signal 29"). Threaded DOES install
+    // a no-op handler — but every sigaction on this target is broken: bionic
+    // LP64 puts sa_flags FIRST in struct sigaction, while std's layout is
+    // the kernel/glibc handler-first order, so the struct arrives scrambled
+    // and nothing installs. Declare bionic's true layout locally (the same
+    // declare-the-ABI doctrine as android_activity's NDK surface) and
+    // install the no-ops through it; SIGPIPE gets the same treatment (same
+    // class of socket-lifetime signal, same default death).
+    if (comptime builtin.abi.isAndroid()) {
+        var act: BionicSigaction = .{ .handler = &sigNoop };
+        const rio = bionic_sigaction(sig_io, &act, null);
+        const rpipe = bionic_sigaction(sig_pipe, &act, null);
+        logcat("feed: SIGIO/SIGPIPE no-op handlers installed (rc {d}/{d})", .{ rio, rpipe });
+    }
+    // Android has no /etc/resolv.conf — name lookups go through bionic's
+    // getaddrinfo instead (the netLookup vtable slot; everything else stays
+    // the Threaded implementation).
+    const io = android_dns.wrap(io_backend.io());
     var ok_io = false;
     defer if (!ok_io) {
         io_backend.deinit();
@@ -296,7 +334,9 @@ fn feedStart(ctx: *Ctx, files_dir: []const u8) bool {
     var ok_session = false;
     defer if (!ok_session) auth.freeSession(gpa, session);
 
+    logcat("feed: session ok — loading store", .{});
     var store = cache_shell.loadStore(gpa, env) orelse feed_core.Store{};
+    logcat("feed: store loaded ({d} posts) — dissolving field gfx", .{store.posts.len});
     var ok_store = false;
     defer if (!ok_store) feed_core.deinitStore(gpa, &store);
 
@@ -312,6 +352,7 @@ fn feedStart(ctx: *Ctx, files_dir: []const u8) bool {
     text.deinitEngine(gpa, &ctx.gfx.?.engine);
     ctx.gfx = null;
 
+    logcat("feed: gfx dissolved — starting the driver", .{});
     ctx.feed = .{
         .io_backend = io_backend,
         .env = env,

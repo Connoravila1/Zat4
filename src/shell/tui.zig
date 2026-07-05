@@ -1708,8 +1708,11 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
         {
             rs.last_auto_refresh = now;
             if (rs.refresher) |w| {
-                if (refresh_worker.submit(w, .auto, 30)) rs.refresh_inflight += 1;
-            }
+                if (refresh_worker.submit(w, .auto, 30)) {
+                    rs.refresh_inflight += 1;
+                    mobile_host.logcat("refresh: auto tick submitted", .{});
+                }
+            } else mobile_host.logcat("refresh: NO worker (spawn failed at startup) — auto-refresh is off", .{});
             // No worker (spawn failed at startup): auto-refresh is simply off;
             // the `r` key's synchronous path still loads the feed (E2).
         }
@@ -1760,6 +1763,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         refresh_worker.freeResult(gpa, res);
                         return err; // OOM only
                     };
+                    mobile_host.logcat("refresh: OK +{d} items ({d} posts in store)", .{ stats.items_added, store.posts.len });
                     switch (res.trigger) {
                         .auto => if (feed_core.pendingCount(store) > 0) {
                             const at_top_home = rs.gscreen == feed_view.screen_home and rs.gscroll_px == 0;
@@ -1800,13 +1804,16 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     _ = cache_shell.saveStore(gpa, environ, store); // E4: a failed save is simply no cache
                 },
                 .refused => |f| switch (res.trigger) {
-                    .auto => {}, // a refused poll is silent; the next tick retries
+                    .auto => mobile_host.logcat("refresh: REFUSED {d} {s}", .{ f.status, f.code }), // silent on desktop; the next tick retries
                     // bufPrint COPIES f.code into status_buf before freeResult
                     // destroys the arena that owns it.
                     .pull, .older => rs.status = std.fmt.bufPrint(&rs.status_buf, "refused: {d} {s}", .{ f.status, f.code }) catch "refused",
                 },
-                .net_error => switch (res.trigger) {
-                    .auto => rs.status = "auto-refresh: network error", // contained
+                .net_error => |errname| switch (res.trigger) {
+                    .auto => {
+                        rs.status = "auto-refresh: network error"; // contained
+                        mobile_host.logcat("refresh: NET ERROR {s}", .{errname});
+                    },
                     .pull, .older => rs.status = "network error", // contained (E2)
                 },
             }
@@ -4368,15 +4375,19 @@ pub fn mobileStart(
     const mr = try gpa.create(MobileRun);
     errdefer gpa.destroy(mr);
     mr.host = .{ .width_px = width_px, .height_px = height_px };
+    mobile_host.logcat("driver: building RunState (workers, arenas)", .{});
     try initRunState(&mr.rs, gpa, io, environ, session, appview_url, store, .{ .mobile = &mr.host });
     errdefer deinitRunState(&mr.rs);
+    mobile_host.logcat("driver: RunState up — font engine next", .{});
     // The engine + feed GPU state the window path builds in initRunState's
     // window-gated tail — built here against the seam's context instead.
     mr.rs.engine = text_core.initEngine() catch null;
     if (mr.rs.engine) |*e| {
+        mobile_host.logcat("driver: font engine up — GPU feed state next", .{});
         const gg = g_owned.?;
         g_owned = null;
         mr.rs.gpu_state = try initGpuState(gpa, e, gg, width_px, height_px);
+        mobile_host.logcat("driver: GPU feed state up", .{});
     } else return error.FontEngineUnavailable; // GPU-only arm: no engine → no renderer → honest failure
     return mr;
 }

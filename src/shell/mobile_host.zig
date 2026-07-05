@@ -29,8 +29,21 @@
 //! a queue in the shape sense only — no lock needed, and none is pretended.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const layout_core = @import("../core/layout.zig");
+
+// Android's log stream (liblog): the run loop's network outcomes narrate
+// here on the phone — the status LINE is the desktop's surface, logcat is
+// the phone's (`adb logcat -s zat4`). Comptime-pruned to a no-op (and the
+// extern never referenced, so nothing links) off Android.
+extern "log" fn __android_log_write(prio: c_int, tag: [*:0]const u8, text: [*:0]const u8) c_int;
+pub fn logcat(comptime fmt: []const u8, args: anytype) void {
+    if (comptime !builtin.abi.isAndroid()) return;
+    var buf: [512]u8 = undefined;
+    const msg = std.fmt.bufPrintZ(&buf, fmt, args) catch return;
+    _ = __android_log_write(4, "zat4", msg); // 4 = ANDROID_LOG_INFO
+}
 
 /// The OS-owned surface as the frame step sees it. One per app process,
 /// owned by the seam's Ctx; the step reads dims and drains events.

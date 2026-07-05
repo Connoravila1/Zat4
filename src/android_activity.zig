@@ -184,13 +184,20 @@ fn renderThread() void {
         // zat_feed_end persists the store + rotated tokens and closes the
         // GL context cleanly; the next attach restarts it from the cache
         // (v1 lifecycle: feed life = surface life; M-And.4 refines this).
-        if (win == null and attached_gen != 0) {
-            if (feed_live) {
-                seam.zat_feed_end(ctx);
-                feed_live = false;
+        if (win == null) {
+            if (attached_gen != 0) {
+                if (feed_live) {
+                    seam.zat_feed_end(ctx);
+                    feed_live = false;
+                }
+                seam.zat_surface_lost(ctx);
+                attached_gen = 0;
             }
-            seam.zat_surface_lost(ctx);
-            attached_gen = 0;
+            // ALWAYS ack a dead window, attached or not — a surface can be
+            // created and destroyed before this thread ever attached (a
+            // launch into a sleeping screen), and a gen-gated ack left the
+            // main thread spinning in onNativeWindowDestroyed forever (the
+            // exact ANR the first doze exposed). The ack is idempotent.
             app.detach_ack.store(gen, .release);
         } else if (win != null and attached_gen != gen) {
             const w: u32 = @intCast(@max(1, ANativeWindow_getWidth(win.?)));
@@ -303,11 +310,54 @@ fn onDestroy(_: *Activity) callconv(.c) void {
     app.thread = null;
 }
 
+// stderr → logcat: a Zig panic in this fork prints its message + trace to
+// stderr and exits — which on Android is a SILENT death (fd 2 goes
+// nowhere). Route fd 2 (and 1) through a pipe into the log so every panic
+// names itself in `adb logcat -s zat4-stderr`.
+extern "log" fn __android_log_write(prio: c_int, tag: [*:0]const u8, text: [*:0]const u8) c_int;
+
+fn stderrPump(read_fd: std.c.fd_t) void {
+    var buf: [512]u8 = undefined;
+    var line: [512]u8 = undefined;
+    var line_len: usize = 0;
+    while (true) {
+        const n = std.c.read(read_fd, &buf, buf.len);
+        if (n <= 0) return;
+        for (buf[0..@intCast(n)]) |c| {
+            if (c == '\n' or line_len == line.len - 1) {
+                line[line_len] = 0;
+                _ = __android_log_write(6, "zat4-stderr", line[0..line_len :0]); // 6 = ERROR
+                line_len = 0;
+                if (c != '\n') {
+                    line[0] = c;
+                    line_len = 1;
+                }
+            } else {
+                line[line_len] = c;
+                line_len += 1;
+            }
+        }
+    }
+}
+
+fn routeStderrToLogcat() void {
+    // libc-only plumbing: the pure (no-libc) build has neither pipe nor
+    // liblog — and nothing prints there anyway (the feed leg is NDK-only).
+    if (comptime !@import("mobile_config").have_gpu) return;
+    var fds: [2]std.c.fd_t = undefined;
+    if (std.c.pipe(&fds) != 0) return;
+    if (std.c.dup2(fds[1], 2) < 0) return;
+    if (std.c.dup2(fds[1], 1) < 0) return;
+    const t = std.Thread.spawn(.{}, stderrPump, .{fds[0]}) catch return;
+    t.detach();
+}
+
 /// The framework's entry point (looked up by name in the library that
 /// android.app.lib_name names). Wire the callbacks, start the one thread.
 export fn ANativeActivity_onCreate(activity: *Activity, saved: ?*anyopaque, saved_len: usize) void {
     _ = saved;
     _ = saved_len;
+    routeStderrToLogcat();
     activity.callbacks.onNativeWindowCreated = onNativeWindowCreated;
     activity.callbacks.onNativeWindowDestroyed = onNativeWindowDestroyed;
     activity.callbacks.onInputQueueCreated = onInputQueueCreated;
