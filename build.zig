@@ -193,6 +193,7 @@ pub fn build(b: *std.Build) void {
         // libandroid.so: the NativeActivity host's window/input calls. The
         // NDK stub resolves the link; the device provides the real one.
         libzat_mod.linkSystemLibrary("android", .{});
+        libzat_mod.linkSystemLibrary("log", .{}); // logcat: the feed leg narrates its bring-up (stderr goes nowhere in an APK)
         libzat_mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib/aarch64-linux-android/29", .{sysroot}) });
         const wf = b.addWriteFiles();
         // API 29 = this Zig's default android target version; present in r27c.

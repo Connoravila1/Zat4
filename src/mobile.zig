@@ -101,6 +101,18 @@ const Feed = if (mobile_config.have_gpu) struct {
     run: *tui.MobileRun,
 } else void;
 
+// The one Android log line (liblog, linked by the NDK build): stderr goes
+// nowhere in an APK, so the feed leg narrates its decisions here — `adb
+// logcat -s zat4` is the whole debugging story for a phone that shows the
+// field but no feed. No-op off Android.
+extern "log" fn __android_log_write(prio: c_int, tag: [*:0]const u8, text: [*:0]const u8) c_int;
+fn logcat(comptime fmt: []const u8, args: anytype) void {
+    if (comptime !(mobile_config.have_gpu and builtin.abi.isAndroid())) return;
+    var buf: [512]u8 = undefined;
+    const msg = std.fmt.bufPrintZ(&buf, fmt, args) catch return;
+    _ = __android_log_write(4, "zat4", msg); // 4 = ANDROID_LOG_INFO
+}
+
 const step_ns: u64 = 16_666_667; // the fixed 60 Hz sim timestep
 const amb_amp: f32 = 0.006;
 const amb_scale: f32 = 0.055;
@@ -235,8 +247,12 @@ fn feedStart(ctx: *Ctx, files_dir: []const u8) bool {
     if (comptime !mobile_config.have_gpu) return false;
     if (ctx.feed != null) return true; // idempotent: already running
     const gpa = ctx.gpa;
+    logcat("feed: start requested (files dir: {s})", .{files_dir});
     // The surface attach must exist — its context becomes the feed's.
-    if (ctx.gfx == null) return false;
+    if (ctx.gfx == null) {
+        logcat("feed: no surface attached yet — field-only", .{});
+        return false;
+    }
 
     const io_backend = gpa.create(std.Io.Threaded) catch return false;
     io_backend.* = std.Io.Threaded.init(gpa, .{});
@@ -263,11 +279,18 @@ fn feedStart(ctx: *Ctx, files_dir: []const u8) bool {
     var sp_buf: [512]u8 = undefined;
     const session: auth.Session = blk: {
         if (cache_shell.oauthSessionPath(&sp_buf, env)) |sp| {
-            if (cache_shell.loadOAuthSessionAt(gpa, sp)) |s| break :blk s;
+            if (cache_shell.loadOAuthSessionAt(gpa, sp)) |s| {
+                logcat("feed: resumed OAuth session ({s})", .{s.handle});
+                break :blk s;
+            }
         }
         if (cache_shell.sessionPath(&sp_buf, env)) |sp| {
-            if (cache_shell.loadSessionAt(gpa, sp)) |s| break :blk s;
+            if (cache_shell.loadSessionAt(gpa, sp)) |s| {
+                logcat("feed: resumed app-password session ({s})", .{s.handle});
+                break :blk s;
+            }
         }
+        logcat("feed: NO cached session under {s}/.cache/zat — field-only (provision via --export-session)", .{files_dir});
         return false; // no session on this device yet
     };
     var ok_session = false;
@@ -297,12 +320,14 @@ fn feedStart(ctx: *Ctx, files_dir: []const u8) bool {
         .run = undefined,
     };
     const f = &ctx.feed.?;
-    f.run = tui.mobileStart(gpa, io, env, &f.session, eps.appview_url, &f.store, stolen, w, h) catch {
+    f.run = tui.mobileStart(gpa, io, env, &f.session, eps.appview_url, &f.store, stolen, w, h) catch |err| {
         // mobileStart owned the context from the call (deinits on its own
         // failure); unwind the rest through the flags above.
+        logcat("feed: driver bring-up FAILED ({s}) — field lost too (context consumed); relaunch to retry", .{@errorName(err)});
         ctx.feed = null;
         return false;
     };
+    logcat("feed: LIVE — appview {s}, {d} cached posts, {d}x{d}", .{ eps.appview_url, f.store.feed.len, w, h });
     ok_io = true;
     ok_env = true;
     ok_session = true;
@@ -317,6 +342,7 @@ fn feedStart(ctx: *Ctx, files_dir: []const u8) bool {
 fn feedEnd(ctx: *Ctx) void {
     if (comptime !mobile_config.have_gpu) return;
     if (ctx.feed == null) return;
+    logcat("feed: ending (persist store + session)", .{});
     const gpa = ctx.gpa;
     const f = &ctx.feed.?;
     _ = cache_shell.saveStore(gpa, f.env, &f.store);
@@ -477,7 +503,10 @@ pub export fn zat_feed_step(ctx_ptr: ?*anyopaque) u32 {
     const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return 3));
     if (comptime !mobile_config.have_gpu) return 3;
     if (ctx.feed) |*f| {
-        const outcome = tui.mobileStep(f.run) catch return 3;
+        const outcome = tui.mobileStep(f.run) catch |err| {
+            logcat("feed: frame error {s}", .{@errorName(err)});
+            return 3;
+        };
         return switch (outcome) {
             .again => 0,
             .quit => 1,
