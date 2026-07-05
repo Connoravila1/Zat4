@@ -9,8 +9,9 @@
 #   platform ~/android-sdk/android-34  (android.jar for aapt2 link)
 #   JRE      ~/jre                     (apksigner/keytool are jars)
 #
-#   Usage:  deploy/dist-android.sh
+#   Usage:  ZAT_APPVIEW_TOKEN=... deploy/dist-android.sh
 set -euo pipefail
+: "${ZAT_APPVIEW_TOKEN:?export ZAT_APPVIEW_TOKEN (the wave read token; see run-local.sh) — a phone has no env vars, the token must be baked}"
 cd "$(dirname "$0")/.."
 ZIG="${ZIG:-$HOME/zig-x86_64-linux-0.16.0/zig}"
 NDK="${ANDROID_NDK:-$HOME/android-ndk-r27c}"
@@ -19,7 +20,7 @@ PLATFORM="${ANDROID_PLATFORM_JAR:-$HOME/android-sdk/android-34/android.jar}"
 JAVA="${JAVA:-$HOME/jre/bin/java}"
 KEYTOOL="${KEYTOOL:-$HOME/jre/bin/keytool}"
 
-"$ZIG" build libzat -Doptimize=ReleaseSafe -Dandroid-ndk="$NDK"
+"$ZIG" build libzat -Doptimize=ReleaseSafe -Dandroid-ndk="$NDK" -Dappview-token="$ZAT_APPVIEW_TOKEN"
 
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT

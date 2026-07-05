@@ -8,10 +8,14 @@
     android:versionName="0.1.0">
   <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="34"/>
   <uses-permission android:name="android.permission.INTERNET"/>
+  <!-- debuggable: test builds only. It is what lets `adb run-as` provision
+       the session file into the app's private files dir before on-device
+       sign-in exists (M-And.5). The store build drops it. -->
   <application
       android:label="Zat4"
       android:icon="@mipmap/ic_launcher"
       android:hasCode="false"
+      android:debuggable="true"
       android:extractNativeLibs="true">
     <activity
         android:name="android.app.NativeActivity"

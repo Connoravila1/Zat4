@@ -428,28 +428,41 @@ pub fn saveLibrary(gpa: Allocator, environ: ?*const std.process.Environ.Map, lib
 const session_magic = [4]u8{ 'Z', 'A', 'T', 'S' };
 const session_version: u16 = 1;
 
+fn serializeSession(arena: Allocator, session: *const auth.Session) ?[]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    out.appendSlice(arena, &session_magic) catch return null;
+    out.appendSlice(arena, std.mem.asBytes(&session_version)) catch return null;
+    inline for (.{ session.did, session.handle, session.pds_url, session.access_jwt, session.refresh_jwt }) |field| {
+        const len: u32 = @intCast(field.len);
+        out.appendSlice(arena, std.mem.asBytes(&len)) catch return null;
+        out.appendSlice(arena, field) catch return null;
+    }
+    return out.items;
+}
+
 pub fn saveSessionAt(gpa: Allocator, path: []const u8, session: *const auth.Session) bool {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var out: std.ArrayList(u8) = .empty;
-    out.appendSlice(arena, &session_magic) catch return false;
-    out.appendSlice(arena, std.mem.asBytes(&session_version)) catch return false;
-    inline for (.{ session.did, session.handle, session.pds_url, session.access_jwt, session.refresh_jwt }) |field| {
-        const len: u32 = @intCast(field.len);
-        out.appendSlice(arena, std.mem.asBytes(&len)) catch return false;
-        out.appendSlice(arena, field) catch return false;
-    }
+    const bytes = serializeSession(arena_state.allocator(), session) orelse return false;
     // Phase 4: prefer the OS keystore (secrets off plaintext). On a VERIFIED
     // store (keystore.put reads back to confirm), drop any 0600 fallback so no
     // plaintext sibling lingers — the "encrypt one file, leave the other" theater
     // the SECURITY NOTE warns about. If the keystore is absent/locked, fall back
     // to the 0600 file unchanged.
-    if (keystore_supported and keystore.put(gpa, session_keystore_key, out.items)) {
+    if (keystore_supported and keystore.put(gpa, session_keystore_key, bytes)) {
         unlink(path);
         return true;
     }
-    return writeFileAtomic(path, out.items, 0o600);
+    return writeFileAtomic(path, bytes, 0o600);
+}
+
+/// The app-password twin of exportOAuthSessionTo (same provisioning leg,
+/// same warning: live tokens on disk — push it, delete it).
+pub fn exportSessionTo(gpa: Allocator, path: []const u8, session: *const auth.Session) bool {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const bytes = serializeSession(arena_state.allocator(), session) orelse return false;
+    return writeFileAtomic(path, bytes, 0o600);
 }
 
 /// Loaded strings are gpa-owned; release with `freeSession`. Reads the keystore
@@ -565,35 +578,52 @@ pub fn sessionPath(buf: []u8, environ: ?*const std.process.Environ.Map) ?[]const
 const oauth_session_magic = [4]u8{ 'Z', 'A', 'T', 'O' };
 const oauth_session_version: u16 = 1;
 
-pub fn saveOAuthSessionAt(gpa: Allocator, path: []const u8, sess: *const auth.Session) bool {
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+fn serializeOAuthSession(arena: Allocator, sess: *const auth.Session) ?[]const u8 {
     var out: std.ArrayList(u8) = .empty;
-    out.appendSlice(arena, &oauth_session_magic) catch return false;
-    out.appendSlice(arena, std.mem.asBytes(&oauth_session_version)) catch return false;
-    out.appendSlice(arena, &sess.dpop_secret) catch return false;
+    out.appendSlice(arena, &oauth_session_magic) catch return null;
+    out.appendSlice(arena, std.mem.asBytes(&oauth_session_version)) catch return null;
+    out.appendSlice(arena, &sess.dpop_secret) catch return null;
     inline for (.{
         sess.did,         sess.handle,      sess.pds_url,
         sess.access_jwt,  sess.refresh_jwt, sess.scope,
         sess.issuer,      sess.token_endpoint,
     }) |field| {
         const len: u32 = @intCast(field.len);
-        out.appendSlice(arena, std.mem.asBytes(&len)) catch return false;
-        out.appendSlice(arena, field) catch return false;
+        out.appendSlice(arena, std.mem.asBytes(&len)) catch return null;
+        out.appendSlice(arena, field) catch return null;
     }
     // The nonce is optional; an empty string on disk means "none".
     const nonce = sess.nonce orelse "";
     const nlen: u32 = @intCast(nonce.len);
-    out.appendSlice(arena, std.mem.asBytes(&nlen)) catch return false;
-    out.appendSlice(arena, nonce) catch return false;
+    out.appendSlice(arena, std.mem.asBytes(&nlen)) catch return null;
+    out.appendSlice(arena, nonce) catch return null;
+    return out.items;
+}
+
+pub fn saveOAuthSessionAt(gpa: Allocator, path: []const u8, sess: *const auth.Session) bool {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const bytes = serializeOAuthSession(arena_state.allocator(), sess) orelse return false;
     // Phase 4: keystore-first (DPoP key + refresh token off plaintext), file
     // fallback. A verified store removes the plaintext sibling. See saveSessionAt.
-    if (keystore_supported and keystore.put(gpa, oauth_keystore_key, out.items)) {
+    if (keystore_supported and keystore.put(gpa, oauth_keystore_key, bytes)) {
         unlink(path);
         return true;
     }
-    return writeFileAtomic(path, out.items, 0o600);
+    return writeFileAtomic(path, bytes, 0o600);
+}
+
+/// Write the oauth session blob to `path` as a plain 0600 FILE, bypassing the
+/// keystore preference — the dev provisioning leg (M_CORE_INVERSION MC.4d):
+/// a phone has no Secret Service, so its loadOAuthSessionAt falls through to
+/// exactly this file once it lands in the app's files dir. The file holds
+/// live tokens + the DPoP key — the caller (the --export-session dev flag)
+/// says so and the walkthrough deletes it after the push.
+pub fn exportOAuthSessionTo(gpa: Allocator, path: []const u8, sess: *const auth.Session) bool {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const bytes = serializeOAuthSession(arena_state.allocator(), sess) orelse return false;
+    return writeFileAtomic(path, bytes, 0o600);
 }
 
 /// Loaded strings are gpa-owned; release with `auth.freeSession`. Keystore first

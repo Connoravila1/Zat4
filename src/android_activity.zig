@@ -149,6 +149,10 @@ const App = struct {
     /// The detach handshake: onNativeWindowDestroyed blocks until the
     /// render thread has stopped touching the dying surface.
     detach_ack: std.atomic.Value(u32) = .init(0),
+    /// The app's private files dir (activity.internalDataPath, copied in
+    /// onCreate before the thread spawns) — the cache root zat_feed_start
+    /// takes (M_CORE_INVERSION MC.4d).
+    files_dir: [512:0]u8 = [_:0]u8{0} ** 512,
 };
 
 var app: App = .{};
@@ -158,6 +162,13 @@ fn renderThread() void {
     defer seam.zat_shutdown(ctx);
 
     var attached_gen: u32 = 0;
+    // The FEED leg (MC.4d): attempted once per surface attach — a false
+    // (no cached session / bring-up failure) leaves the field-only render
+    // for that surface, never a dead screen (E2). While live, the loop is
+    // zat_feed_step (one frame per vsync; the swap inside paces it) and
+    // the field-only step/render pair rests.
+    var feed_live = false;
+    var feed_errs: u32 = 0;
     var last_ns: u64 = clock.monotonicNanos();
 
     while (app.running.load(.acquire)) {
@@ -169,8 +180,15 @@ fn renderThread() void {
         app.mutex.unlock();
 
         // Surface choreography: attach on a new generation, detach + ack
-        // when the window went away.
+        // when the window went away. A dying surface ENDS the feed first —
+        // zat_feed_end persists the store + rotated tokens and closes the
+        // GL context cleanly; the next attach restarts it from the cache
+        // (v1 lifecycle: feed life = surface life; M-And.4 refines this).
         if (win == null and attached_gen != 0) {
+            if (feed_live) {
+                seam.zat_feed_end(ctx);
+                feed_live = false;
+            }
             seam.zat_surface_lost(ctx);
             attached_gen = 0;
             app.detach_ack.store(gen, .release);
@@ -180,6 +198,8 @@ fn renderThread() void {
             if (seam.zat_surface(ctx, @ptrCast(win.?), w, h)) {
                 _ = seam.zat_resize(ctx, w, h);
                 attached_gen = gen;
+                feed_live = seam.zat_feed_start(ctx, &app.files_dir);
+                feed_errs = 0;
             }
         }
 
@@ -209,6 +229,25 @@ fn renderThread() void {
             }
         }
 
+        if (feed_live) {
+            // One feed frame; the swap inside vsync-paces the loop. 1/2
+            // (quit/signed-out) and persistent 3s (frame errors, ~2s worth)
+            // end the feed — the screen parks on its last frame; a surface
+            // bounce (or app relaunch) starts fresh from the cache.
+            const rc = seam.zat_feed_step(ctx);
+            if (rc == 1 or rc == 2) {
+                seam.zat_feed_end(ctx);
+                feed_live = false;
+            } else if (rc == 3) {
+                feed_errs += 1;
+                if (feed_errs > 120) {
+                    seam.zat_feed_end(ctx);
+                    feed_live = false;
+                }
+            } else feed_errs = 0;
+            last_ns = clock.monotonicNanos();
+            continue;
+        }
         const now_ns = clock.monotonicNanos();
         seam.zat_step(ctx, now_ns -| last_ns);
         last_ns = now_ns;
@@ -218,6 +257,7 @@ fn renderThread() void {
             clock.sleepMillis(50); // parked: no surface
         }
     }
+    if (feed_live) seam.zat_feed_end(ctx);
     seam.zat_surface_lost(ctx);
 }
 
@@ -274,5 +314,12 @@ export fn ANativeActivity_onCreate(activity: *Activity, saved: ?*anyopaque, save
     activity.callbacks.onInputQueueDestroyed = onInputQueueDestroyed;
     activity.callbacks.onDestroy = onDestroy;
     app = .{};
+    // The app's private files dir — the cache root the feed leg needs
+    // (MC.4d). Copied before the thread spawns; the activity's own string
+    // may not outlive us.
+    const path = std.mem.span(activity.internalDataPath);
+    const n = @min(path.len, app.files_dir.len);
+    @memcpy(app.files_dir[0..n], path[0..n]);
+    app.files_dir[n] = 0;
     app.thread = std.Thread.spawn(.{}, renderThread, .{}) catch null;
 }

@@ -2367,18 +2367,34 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
             },
             .mobile => |m| {
                 // The OS delivered input through the seam between frames;
-                // drain the queue so a motion flood never accumulates. v1
-                // CONSUMES but does not yet dispatch — the pointer dispatch
-                // below is window-coupled today and gets factored for reuse
-                // when touch→scroll gives these events meaning
-                // (M_CORE_INVERSION MC.4d). The wait budget is unused here
-                // by design: a choreographer-driven host passes 0 and the
-                // step never blocks on an OS-owned thread.
+                // drain the queue so a motion flood never accumulates. The
+                // wait budget is unused here by design: a choreographer-
+                // driven host passes 0 and the step never blocks on an
+                // OS-owned thread.
                 if (m.closed) break :main_loop;
                 var touch_events: std.ArrayList(layout_core.InputEvent) = .empty;
                 defer touch_events.deinit(gpa);
                 mobile_host.drain(m, gpa, &touch_events) catch {}; // OOM: dropped taps, contained (E2)
                 if (touch_events.items.len > 0) rs.last_input_nanos = clock_shell.monotonicNanos();
+                // v1 TOUCH SCROLL (MC.4d): a vertical drag moves the feed
+                // 1:1 — content follows the finger, the same pixel-space
+                // clamp as the desktop wheel (top = 0, bottom exposes the
+                // last post + breathing room). Taps/momentum are the M-UX
+                // pass; the full pointer dispatch is window-coupled today.
+                for (touch_events.items) |tev| switch (tev.kind) {
+                    .button_down => m.drag_y = tev.y,
+                    .move => if (m.drag_y >= 0) {
+                        const dy_phys: i32 = @as(i32, tev.y) - m.drag_y;
+                        m.drag_y = tev.y;
+                        const scale: f32 = if (rs.gpu_state) |*gs| gs.scale else 1.0;
+                        rs.gscroll_px += @intFromFloat(@as(f32, @floatFromInt(dy_phys)) / scale);
+                        const view_h: i32 = @intFromFloat(@as(f32, @floatFromInt(m.height_px)) / scale);
+                        const min_scroll: i32 = @min(0, view_h - rs.gcontent_h - 24);
+                        rs.gscroll_px = @max(min_scroll, @min(0, rs.gscroll_px));
+                    },
+                    .button_up => m.drag_y = -1,
+                    else => {},
+                };
             },
             .window => |win| {
                 // The pump translates X keys into the same bytes a tty

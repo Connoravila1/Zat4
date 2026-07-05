@@ -83,6 +83,18 @@ fn hasCachedSession(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map
     return false;
 }
 
+/// The --export-session success message: where the file went and the exact
+/// adb steps that provision it into the phone's files dir (MC.4d).
+fn printExportRecipe(out: *std.Io.Writer, handle: []const u8, path: []const u8, target_name: []const u8) !void {
+    try out.print(
+        \\[export] {s} -> {s} (plain 0600 file, LIVE tokens — delete after the push)
+        \\[export] provision:  adb push {s} /data/local/tmp/{s}
+        \\[export]             adb shell run-as com.zat4.client sh -c 'mkdir -p files/.cache/zat && cp /data/local/tmp/{s} files/.cache/zat/'
+        \\[export]             adb shell rm /data/local/tmp/{s} && rm {s}
+        \\
+    , .{ handle, path, path, target_name, target_name, target_name, path });
+}
+
 /// Trim display text to `max` bytes without splitting a UTF-8 sequence.
 fn truncate(text: []const u8, max: usize) []const u8 {
     if (text.len <= max) return text;
@@ -163,6 +175,9 @@ pub fn main(init: std.process.Init) !void {
     // session and makes an authenticated call WITHOUT re-login, proving the key
     // and tokens survive across launches.
     var oauth_resume = false;
+    // Dev provisioning target (MC.4d): `--export-session <path>` writes the
+    // cached OAuth session to a plain file for the adb push to a phone.
+    var export_session_path: ?[]const u8 = null;
     // Chat anchor test (Zat Chat slice C6): `--chat-anchor <did>` loads or
     // creates the device-bound anchor key for that DID, prints its public key,
     // and self-verifies the DID binding. Run twice: "created" then "loaded"
@@ -226,6 +241,11 @@ pub fn main(init: std.process.Init) !void {
             }
         } else if (std.mem.eql(u8, arg, "--oauth-resume")) {
             oauth_resume = true;
+        } else if (std.mem.eql(u8, arg, "--export-session")) {
+            if (ai + 1 < args.len) {
+                ai += 1;
+                export_session_path = args[ai];
+            }
         } else if (std.mem.eql(u8, arg, "--chat-anchor")) {
             if (ai + 1 < args.len) {
                 ai += 1;
@@ -450,6 +470,36 @@ pub fn main(init: std.process.Init) !void {
 
     // Slice 5 proof: resume the persisted DPoP session and make an authenticated
     // call without any re-login — the key and tokens came off disk.
+    // Dev provisioning (M_CORE_INVERSION MC.4d): write the cached OAuth
+    // session — keystore-resolved — to a plain file a phone's file-fallback
+    // load can read (`adb push` + `run-as cp` into the app's files dir).
+    // Fenced from dist builds: a shipped binary carries no secrets-export
+    // flag. The file holds LIVE tokens + the DPoP key: push it, delete it.
+    if (comptime !dist_config.dist) if (export_session_path) |xp| {
+        var sp_buf: [512]u8 = undefined;
+        // OAuth first, app-password second — the same precedence the phone's
+        // zat_feed_start resumes with. The provisioned file must keep its
+        // kind's own name (the two loaders read different blobs).
+        var wrote = false;
+        if (cache_shell.oauthSessionPath(&sp_buf, env)) |sp| {
+            if (cache_shell.loadOAuthSessionAt(gpa, sp)) |sess| {
+                defer auth.freeSession(gpa, sess);
+                wrote = cache_shell.exportOAuthSessionTo(gpa, xp, &sess);
+                if (wrote) try printExportRecipe(out, sess.handle, xp, "oauth_session.zat");
+            }
+        }
+        if (!wrote) if (cache_shell.sessionPath(&sp_buf, env)) |sp| {
+            if (cache_shell.loadSessionAt(gpa, sp)) |sess| {
+                defer auth.freeSession(gpa, sess);
+                wrote = cache_shell.exportSessionTo(gpa, xp, &sess);
+                if (wrote) try printExportRecipe(out, sess.handle, xp, "session.zat");
+            }
+        };
+        if (!wrote) try out.print("--export-session: no saved session on this machine (or the write failed)\n", .{});
+        try out.flush();
+        return;
+    };
+
     if (oauth_resume) {
         var sp_buf: [512]u8 = undefined;
         const sp = cache_shell.oauthSessionPath(&sp_buf, env) orelse {

@@ -47,6 +47,10 @@ pub const MobileHost = struct {
     /// The OS asked us to leave (activity finishing). The pump arm maps
     /// it to the same exit as a window close.
     closed: bool = false,
+    /// The live drag's last pointer y in surface pixels, or -1 when no
+    /// finger is down — the v1 touch-scroll anchor (the pump arm turns
+    /// move deltas into pixel scroll; momentum/fling is the M-UX pass).
+    drag_y: i32 = -1,
 };
 
 pub fn deinit(host: *MobileHost, gpa: Allocator) void {
