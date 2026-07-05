@@ -183,6 +183,10 @@ pub fn build(b: *std.Build) void {
     const libzat_opts = b.addOptions();
     libzat_opts.addOption(bool, "have_gpu", ndk_path != null);
     libzat_mod.addOptions("mobile_config", libzat_opts);
+    // The feed leg (M-Core.1 MC.4c) pulls auth/cache/tui into libzat, and
+    // auth reads the same baked dist config (AppView token, credential
+    // fence) as the desktop client.
+    libzat_mod.addOptions("dist_config", dist_opts);
     if (ndk_path) |ndk| {
         addFontEngine(b, libzat_mod); // also sets link_libc
         const sysroot = b.fmt("{s}/toolchains/llvm/prebuilt/linux-x86_64/sysroot", .{ndk});

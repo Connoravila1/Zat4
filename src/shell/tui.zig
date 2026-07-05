@@ -1121,7 +1121,10 @@ fn initRunState(
     // a dead one). Created once here; the window is already open by the time
     // run() is called, so its XID is valid.
     rs.gpu_state = null;
-    if (backend == .window) if (rs.engine) |*e| {
+    // Comptime-gated off Android: the window backend never exists in an APK
+    // (mobileStart brings the GPU up on the seam's surface instead), and the
+    // X11 native handle does not type-check against the Android gpu.init.
+    if (comptime !builtin.abi.isAndroid()) if (backend == .window) if (rs.engine) |*e| {
         rs.gpu_state = blk: {
             const win = backend.window;
             const g = gpu.init(window_shell.nativeHandle(win)) catch |err| {

@@ -45,6 +45,12 @@ const glyph_field = @import("core/glyph_field.zig");
 const mobile_config = @import("mobile_config");
 const gpu = @import("shell/gpu.zig");
 const text = @import("core/text.zig");
+const tui = @import("shell/tui.zig");
+const auth = @import("shell/auth.zig");
+const cache_shell = @import("shell/cache.zig");
+const config = @import("shell/config.zig");
+const feed_core = @import("core/feed.zig");
+const layout_core = @import("core/layout.zig");
 
 /// The seam's context handle. The shim holds it as an opaque pointer.
 /// A7.2: cold struct, size guard waived — exactly one per app process.
@@ -66,6 +72,8 @@ const Ctx = struct {
     /// The GPU attachment (EGL context on the shim's surface + the field
     /// renderer). Null until zat_surface; void in pure builds.
     gfx: ?Gfx,
+    /// The feed leg. Null until zat_feed_start; void in pure builds.
+    feed: ?Feed,
 };
 
 /// Everything the render leg owns once a surface is attached (M-And.0b).
@@ -77,6 +85,20 @@ const Gfx = if (mobile_config.have_gpu) struct {
     grid: gpu.FieldGrid,
     width_px: u32,
     height_px: u32,
+} else void;
+
+/// The FEED leg (M_CORE_INVERSION MC.4c): everything zat_feed_start owns —
+/// the process-lifetime plumbing main.zig gets for free (an Io instance, an
+/// environ map rooted at the app's files dir so every cache path works
+/// unchanged), the resumed session + store, and the driver handle. NDK
+/// builds only, like Gfx.
+/// A7.2: cold struct, size guard waived — at most one per app process.
+const Feed = if (mobile_config.have_gpu) struct {
+    io_backend: *std.Io.Threaded,
+    env: *std.process.Environ.Map,
+    session: auth.Session,
+    store: feed_core.Store,
+    run: *tui.MobileRun,
 } else void;
 
 const step_ns: u64 = 16_666_667; // the fixed 60 Hz sim timestep
@@ -111,11 +133,13 @@ fn create(gpa: std.mem.Allocator, width_px: u32, height_px: u32, cell_px: u32) !
         .acc_ns = 0,
         .t = 0,
         .gfx = null,
+        .feed = null,
     };
     return ctx;
 }
 
 fn destroy(ctx: *Ctx) void {
+    feedEnd(ctx);
     detachSurface(ctx);
     const gpa = ctx.gpa;
     ctx.splashes.deinit(gpa);
@@ -144,8 +168,28 @@ fn resize(ctx: *Ctx, width_px: u32, height_px: u32) bool {
 
 fn touch(ctx: *Ctx, kind: u32, x_px: f32, y_px: f32) void {
     // v0 vocabulary: 0 = down, 1 = move, 2 = up — the same three the desktop
-    // pumps produce. Only `down` splashes for now; move/up join with the
-    // feed's hit-testing (M-Core.1).
+    // pumps produce. With the FEED live, the event joins the frame step's
+    // queue (the same InputEvents the X11 pump makes; dispatch = MC.4d).
+    // Field-only mode keeps the splash.
+    if (comptime mobile_config.have_gpu) {
+        if (ctx.feed) |*f| {
+            const ev: layout_core.InputEvent = .{
+                .x = @intFromFloat(std.math.clamp(x_px, 0, 65535)),
+                .y = @intFromFloat(std.math.clamp(y_px, 0, 65535)),
+                .kind = switch (kind) {
+                    0 => .button_down,
+                    1 => .move,
+                    2 => .button_up,
+                    else => return,
+                },
+                .button = 1,
+                .mods = 0,
+                ._pad = 0,
+            };
+            _ = tui.mobilePush(f.run, ev); // a dropped tap is contained (E4)
+            return;
+        }
+    }
     if (kind != 0) return;
     const fcell: f32 = @floatFromInt(ctx.cell_px);
     const cx: f32 = std.math.clamp(x_px / fcell, 0, @as(f32, @floatFromInt(ctx.field.cols - 1)));
@@ -179,6 +223,117 @@ fn stepSim(ctx: *Ctx, dt_ns: u64) void {
         ctx.splashes.clearRetainingCapacity();
         ctx.t += 1.0 / 60.0;
     }
+}
+
+/// Bring the FEED up on the attached surface (MC.4c): root the cache at the
+/// app's files dir, resume the cached session, load the store, hand the
+/// attach's GL context to the shared mobile driver (tui.mobileStart). False
+/// = no attach yet, no cached session (sign-in on device is M-And.5; until
+/// then MC.4d provisions the session file), or a failed bring-up — the shim
+/// keeps the field-only render, never a dead screen (E2).
+fn feedStart(ctx: *Ctx, files_dir: []const u8) bool {
+    if (comptime !mobile_config.have_gpu) return false;
+    if (ctx.feed != null) return true; // idempotent: already running
+    const gpa = ctx.gpa;
+    // The surface attach must exist — its context becomes the feed's.
+    if (ctx.gfx == null) return false;
+
+    const io_backend = gpa.create(std.Io.Threaded) catch return false;
+    io_backend.* = std.Io.Threaded.init(gpa, .{});
+    const io = io_backend.io();
+    var ok_io = false;
+    defer if (!ok_io) {
+        io_backend.deinit();
+        gpa.destroy(io_backend);
+    };
+
+    // The environ map IS the path root: HOME = the app's private files dir,
+    // so every existing cache path derivation works unchanged.
+    const env = gpa.create(std.process.Environ.Map) catch return false;
+    env.* = std.process.Environ.Map.init(gpa);
+    var ok_env = false;
+    defer if (!ok_env) {
+        env.deinit();
+        gpa.destroy(env);
+    };
+    env.put("HOME", files_dir) catch return false;
+
+    // Resume the cached session: OAuth (DPoP) first, the app-password
+    // cache second — same precedence as main.zig's front door.
+    var sp_buf: [512]u8 = undefined;
+    const session: auth.Session = blk: {
+        if (cache_shell.oauthSessionPath(&sp_buf, env)) |sp| {
+            if (cache_shell.loadOAuthSessionAt(gpa, sp)) |s| break :blk s;
+        }
+        if (cache_shell.sessionPath(&sp_buf, env)) |sp| {
+            if (cache_shell.loadSessionAt(gpa, sp)) |s| break :blk s;
+        }
+        return false; // no session on this device yet
+    };
+    var ok_session = false;
+    defer if (!ok_session) auth.freeSession(gpa, session);
+
+    var store = cache_shell.loadStore(gpa, env) orelse feed_core.Store{};
+    var ok_store = false;
+    defer if (!ok_store) feed_core.deinitStore(gpa, &store);
+
+    const eps = config.fromEnv(env);
+
+    // The feed leg takes over the render: dissolve the field-only Gfx —
+    // steal its context (the driver owns it from here), end its private
+    // font engine (the driver makes its own). The ramp/grid GL names die
+    // with the context at feed end; no process memory is held.
+    const stolen = ctx.gfx.?.g;
+    const w = ctx.gfx.?.width_px;
+    const h = ctx.gfx.?.height_px;
+    text.deinitEngine(gpa, &ctx.gfx.?.engine);
+    ctx.gfx = null;
+
+    ctx.feed = .{
+        .io_backend = io_backend,
+        .env = env,
+        .session = session,
+        .store = store,
+        .run = undefined,
+    };
+    const f = &ctx.feed.?;
+    f.run = tui.mobileStart(gpa, io, env, &f.session, eps.appview_url, &f.store, stolen, w, h) catch {
+        // mobileStart owned the context from the call (deinits on its own
+        // failure); unwind the rest through the flags above.
+        ctx.feed = null;
+        return false;
+    };
+    ok_io = true;
+    ok_env = true;
+    ok_session = true;
+    ok_store = true;
+    return true;
+}
+
+/// Tear the feed down (app exit / explicit stop): persist the store and the
+/// rotated session tokens (E4: a failed save is simply no cache), then the
+/// driver (workers joined, GL context ends with the GPU state) and the
+/// process-lifetime plumbing.
+fn feedEnd(ctx: *Ctx) void {
+    if (comptime !mobile_config.have_gpu) return;
+    if (ctx.feed == null) return;
+    const gpa = ctx.gpa;
+    const f = &ctx.feed.?;
+    _ = cache_shell.saveStore(gpa, f.env, &f.store);
+    var sp_buf: [512]u8 = undefined;
+    if (f.session.mode == .oauth) {
+        if (cache_shell.oauthSessionPath(&sp_buf, f.env)) |sp| _ = cache_shell.saveOAuthSessionAt(gpa, sp, &f.session);
+    } else if (cache_shell.sessionPath(&sp_buf, f.env)) |sp| {
+        _ = cache_shell.saveSessionAt(gpa, sp, &f.session);
+    }
+    tui.mobileEnd(f.run);
+    feed_core.deinitStore(gpa, &f.store);
+    auth.freeSession(gpa, f.session);
+    f.env.deinit();
+    gpa.destroy(f.env);
+    f.io_backend.deinit();
+    gpa.destroy(f.io_backend);
+    ctx.feed = null;
 }
 
 fn detachSurface(ctx: *Ctx) void {
@@ -303,6 +458,48 @@ pub export fn zat_field_height(ctx_ptr: ?*anyopaque) ?[*]const f32 {
     return ctx.field.height.ptr;
 }
 
+/// Bring the FEED up (MC.4c). `files_dir` = the app's private files
+/// directory (NUL-terminated; Android: getFilesDir()), which roots every
+/// cache path. Requires a prior zat_surface attach (the feed takes over its
+/// GL context). False = not attached / no cached session / bring-up failed
+/// — the shim keeps the field-only render (E2). Idempotent when running.
+pub export fn zat_feed_start(ctx_ptr: ?*anyopaque, files_dir: ?[*:0]const u8) bool {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return false));
+    const dir = files_dir orelse return false;
+    return feedStart(ctx, std.mem.span(dir));
+}
+
+/// One FEED frame on the OS's clock (call instead of zat_step+zat_render
+/// while the feed runs; wait budget 0 — the choreographer already waited).
+/// Returns 0 = again, 1 = quit, 2 = signed out, 3 = not running / frame
+/// error (the shim may retry next vsync; persistent 3s mean stop).
+pub export fn zat_feed_step(ctx_ptr: ?*anyopaque) u32 {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return 3));
+    if (comptime !mobile_config.have_gpu) return 3;
+    if (ctx.feed) |*f| {
+        const outcome = tui.mobileStep(f.run) catch return 3;
+        return switch (outcome) {
+            .again => 0,
+            .quit => 1,
+            .signed_out => 2,
+        };
+    }
+    return 3;
+}
+
+/// The surface changed size while the feed runs (rotation/fold).
+pub export fn zat_feed_resize(ctx_ptr: ?*anyopaque, width_px: u32, height_px: u32) void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return));
+    if (comptime !mobile_config.have_gpu) return;
+    if (ctx.feed) |*f| tui.mobileResize(f.run, width_px, height_px);
+}
+
+/// Stop the feed and persist (store + rotated tokens). Safe without a start.
+pub export fn zat_feed_end(ctx_ptr: ?*anyopaque) void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return));
+    feedEnd(ctx);
+}
+
 pub export fn zat_shutdown(ctx_ptr: ?*anyopaque) void {
     const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return));
     destroy(ctx);
@@ -347,6 +544,10 @@ test "seam ABI: null context is a no-op on every export, never a crash" {
     try testing.expect(!zat_surface(null, null, 10, 10));
     zat_surface_lost(null);
     zat_render(null);
+    try testing.expect(!zat_feed_start(null, null));
+    try testing.expectEqual(@as(u32, 3), zat_feed_step(null));
+    zat_feed_resize(null, 10, 10);
+    zat_feed_end(null);
     zat_shutdown(null);
 }
 

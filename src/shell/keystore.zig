@@ -105,13 +105,13 @@ fn load() ?Lib {
     const free = dlsym(lib, "secret_password_free") orelse return null;
     var err_free: ?ErrFreeFn = null;
     if (dlopen("libglib-2.0.so.0", RTLD_NOW)) |glib| {
-        if (dlsym(glib, "g_error_free")) |p| err_free = @ptrCast(p);
+        if (dlsym(glib, "g_error_free")) |p| err_free = @ptrCast(@alignCast(p));
     }
     cached = .{
-        .store = @ptrCast(store),
-        .lookup = @ptrCast(lookup),
-        .clear = @ptrCast(clear),
-        .free = @ptrCast(free),
+        .store = @ptrCast(@alignCast(store)),
+        .lookup = @ptrCast(@alignCast(lookup)),
+        .clear = @ptrCast(@alignCast(clear)),
+        .free = @ptrCast(@alignCast(free)),
         .err_free = err_free,
     };
     return cached;
