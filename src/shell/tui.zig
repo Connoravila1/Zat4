@@ -7251,10 +7251,11 @@ fn paintFrameGpu(
     springGeom(&gs.rail_hover_t, &gs.rail_hover_v, if (over_right_rail) 1.0 else 0.0, 1.0 / 60.0);
     const rail_hover_animating = @abs(gs.rail_hover_t - (if (over_right_rail) @as(f32, 1.0) else 0.0)) > 0.004 or @abs(gs.rail_hover_v) > 0.004;
 
-    // ALGORITHMS: the LEFT rail condenses in place (stays left). algo_t springs
-    // on the loadout screen; hovering the left rail (its current right edge
-    // tracks the expand) re-opens it.
-    const on_algo = g.screen.* == feed_view.screen_loadout;
+    // ALGORITHMS + ZAT CHAT: the LEFT rail condenses in place (stays left).
+    // algo_t springs on the loadout AND messages screens (both master–detail
+    // surfaces that want the width); hovering the left rail (its current
+    // right edge tracks the expand) re-opens it.
+    const on_algo = g.screen.* == feed_view.screen_loadout or g.screen.* == feed_view.screen_messages;
     springGeom(&gs.algo_t, &gs.algo_v, if (on_algo) 1.0 else 0.0, 1.0 / 60.0);
     const home_rail_left: f32 = @floatFromInt(feed_view.paneGeomFor(@intCast(design_w), feed_view.screen_loadout).rail_x);
     // The condensed rail hugs the left edge (shifted left by 60); the hover band
@@ -7446,7 +7447,25 @@ fn paintFrameGpu(
             // Zat Chat (U3, dev-gated): the Messages surface in the GPU's logical
             // design space; the rail is the shell's own tile (rail_external), and
             // -scroll maps the shared ≤0 scroll onto the positive history offset.
-            const lg = feed_view.paneGeomFor(@intCast(design_w), feed_view.screen_messages);
+            // ZAT CHAT: expand the chat glass into the space the condensed
+            // left rail frees — shift LEFT toward the rail + widen RIGHT, by
+            // algo_t (the same reflow the Algorithms page runs; the rail
+            // itself condenses in the rail-tile pass).
+            var lg = feed_view.paneGeomFor(@intCast(design_w), feed_view.screen_messages);
+            if (gs.algo_t > 0.01) {
+                const at = gs.algo_t * gs.algo_t * (3.0 - 2.0 * gs.algo_t);
+                const tcx: f32 = home_rail_left + 92.0;
+                const tcw: f32 = @as(f32, @floatFromInt(design_w)) - tcx - 40.0;
+                const lp2 = struct {
+                    fn f(a: i32, b: f32, t: f32) i32 {
+                        return @intFromFloat(@as(f32, @floatFromInt(a)) + (b - @as(f32, @floatFromInt(a))) * t);
+                    }
+                }.f;
+                lg.col_x = lp2(lg.col_x, tcx, at);
+                lg.col_w = lp2(lg.col_w, tcw, at);
+                lg.lx = lp2(lg.lx, tcx + 22.0, at);
+                lg.cw = lp2(lg.cw, tcw - 44.0, at);
+            }
             gs.content_x = lg.col_x;
             gs.content_w = lg.col_w;
             const cf = buildChatFrame(arena, g.chat_store.?, g.chat_sel, now);

@@ -4204,96 +4204,6 @@ fn strEllipsis(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, weig
 /// can scroll. The thread bottom-anchors at scroll 0 (newest visible above
 /// the composer); scroll > 0 reveals older history. The chrome and the
 /// conversation list do not scroll.
-/// The messages page's top chrome: the title, the "+ New" pill, the E2EE
-/// banner, the recipient bar (new-conversation flow), and the open thread's
-/// peer header. Called by layoutChat AFTER the thread pass — over the
-/// near-opaque header strip — so scrolled bubbles pass beneath the chrome,
-/// never over it (the same order the feed uses for its sticky top bar).
-/// `body_y` is the post-banner (and post-recipient-bar) content top, i.e.
-/// the y the peer header hangs from.
-fn drawChatHeader(
-    gpa: Allocator,
-    dl: *raster.DrawList,
-    e: *const text.Engine,
-    regions: ?*Regions,
-    accent: u32,
-    x0: i32,
-    w: i32,
-    top: i32,
-    composing: bool,
-    compose_draft: []const u8,
-    compose_status: []const u8,
-    caret_phase: f32,
-    peer: []const u8,
-    detail_x: i32,
-    detail_w: i32,
-    body_y: i32,
-) error{OutOfMemory}!void {
-    _ = try str(gpa, dl, e, .semibold, x0, top + 30, ink, 30, "Zat Chat");
-
-    // "+ New" — the new-conversation pill, right-aligned on the title line.
-    // Accent-filled while the recipient bar is open (the toggle reads).
-    {
-        const label = "+ New";
-        const lw: i32 = @intCast(text.measure(e, .semibold, label, 14));
-        const pill_w = lw + 28;
-        const pill_h: i32 = 32;
-        const px0 = x0 + w - pill_w;
-        const py0 = top + 4;
-        try rect(gpa, dl, px0, py0, pill_w, pill_h, if (composing) accent else skinPanel(accent), 16);
-        _ = try str(gpa, dl, e, .semibold, px0 + 14, py0 + 21, if (composing) 0xFF20201A else body_c, 14, label);
-        try emitRegion(gpa, regions, px0, py0, pill_w, @intCast(pill_h), 0, .chat_new);
-    }
-
-    // The honesty line (ZAT_CHAT_ROADMAP M1): the plaintext path is gone —
-    // messages are end-to-end encrypted (MLS over the relay). The claim is
-    // permitted now precisely because M1 is real; it names only what ships
-    // (content secrecy + PQ-hybrid + forward secrecy), never metadata
-    // privacy against a global observer — that stays [OPEN] (vision §8).
-    const ban_y = top + 48;
-    const ban_h: i32 = 30;
-    try rect(gpa, dl, x0, ban_y, w, ban_h, skinPanel(accent), 10);
-    try rect(gpa, dl, x0, ban_y, 3, ban_h, (0xC0 << 24) | (accent & 0x00FFFFFF), 1);
-    const ban_pen = try str(gpa, dl, e, .semibold, x0 + 14, ban_y + 20, ink, 12, "End-to-end encrypted");
-    _ = try str(gpa, dl, e, .regular, ban_pen + 10, ban_y + 20, muted, 12, "— MLS, post-quantum hybrid, forward secrecy");
-
-    // The recipient bar (new-conversation flow): an input for a handle or
-    // DID, the composer strip's focus vocabulary (ring + caret — composing
-    // means it owns the keyboard), a hint line, and the shell's status line
-    // when the last attempt refused.
-    if (composing) {
-        var hy = ban_y + ban_h + 18;
-        const bar_h: i32 = 46;
-        try rect(gpa, dl, x0, hy, w, bar_h, skinPanel(accent), 14);
-        const ring_c = (0xC0 << 24) | (accent & 0x00FFFFFF);
-        try rect(gpa, dl, x0, hy, w, 1, ring_c, 0);
-        try rect(gpa, dl, x0, hy + bar_h - 1, w, 1, ring_c, 0);
-        try rect(gpa, dl, x0, hy, 1, bar_h, ring_c, 0);
-        try rect(gpa, dl, x0 + w - 1, hy, 1, bar_h, ring_c, 0);
-        const lab_pen = try str(gpa, dl, e, .semibold, x0 + 14, hy + 29, muted, 14, "To:");
-        if (compose_draft.len > 0) {
-            try strEllipsis(gpa, dl, e, .regular, lab_pen + 8, hy + 29, ink, 14, compose_draft, x0 + w - 14 - (lab_pen + 8));
-        } else {
-            _ = try str(gpa, dl, e, .regular, lab_pen + 8, hy + 29, faint, 14, "handle or did:…");
-        }
-        const draft_w: i32 = @intCast(text.measure(e, .regular, compose_draft, 14));
-        const bar_caret_x = lab_pen + 8 + @min(draft_w, x0 + w - 14 - (lab_pen + 8)) + 1;
-        try rect(gpa, dl, bar_caret_x, hy + 14, 2, bar_h - 28, scaleAlpha((0xE0 << 24) | (accent & 0x00FFFFFF), caretAlpha(caret_phase)), 0);
-        try emitRegion(gpa, regions, x0, hy, w, @intCast(bar_h), 0, .chat_compose_input);
-        hy += bar_h + 8;
-        if (compose_status.len > 0) {
-            _ = try str(gpa, dl, e, .regular, x0 + 2, hy + 12, 0xFFE0A868, 13, compose_status);
-        } else {
-            _ = try str(gpa, dl, e, .regular, x0 + 2, hy + 12, faint, 12, "Enter to start · Esc to cancel");
-        }
-    }
-
-    // The open thread's peer header (name + divider), atop the header strip.
-    if (peer.len > 0) {
-        _ = try str(gpa, dl, e, .semibold, detail_x, body_y + 24, ink, 18, peer);
-        try rect(gpa, dl, detail_x, body_y + 40, detail_w, 1, divider, 0);
-    }
-}
 
 pub fn layoutChat(
     gpa: Allocator,
@@ -4368,20 +4278,72 @@ pub fn layoutChat(
     const x0 = m.lx;
     const w = m.cw;
     const top: i32 = if (m.wide) 40 else 30;
-
-    // The top chrome — the title, "+ New", the E2EE banner, the recipient
-    // bar, the peer header — is drawn by drawChatHeader AFTER the thread
-    // pass (over a near-opaque header strip, the feed's sticky-bar pattern),
-    // so scrolled bubbles slide BENEATH it. Here only its space is accounted.
-    const ban_y = top + 48;
-    const ban_h: i32 = 30;
-    var body_y = ban_y + ban_h + 18;
-    if (composing) body_y += 46 + 8 + 26; // recipient bar + gap + hint line
     const list_w: i32 = std.math.clamp(@divTrunc(w * 34, 100), 220, 320);
     const split_gap: i32 = 28;
     const detail_x = x0 + list_w + split_gap;
     const detail_w = w - list_w - split_gap;
-    try rect(gpa, dl, detail_x - @divTrunc(split_gap, 2), body_y, 1, height - body_y - 30, divider, 0);
+    // The split divider runs the full pane height: the two columns each own
+    // their chrome now (list header left, peer header right), so the seam is
+    // the page's one structural line.
+    try rect(gpa, dl, detail_x - @divTrunc(split_gap, 2), top - 10, 1, height - top - 20, divider, 0);
+
+    // ── Left column header: the page title, "+ New" under it, and the E2EE
+    // honesty line — all fitted to the LIST column so the thread column keeps
+    // its full height for messages (the owner's reorg: the old full-width
+    // banner block cost the thread ~130px of chrome). ──
+    _ = try str(gpa, dl, e, .semibold, x0, top + 22, ink, 24, "Zat Chat");
+    {
+        const label = "+ New";
+        const lw: i32 = @intCast(text.measure(e, .semibold, label, 14));
+        const pill_w = lw + 28;
+        const pill_h: i32 = 30;
+        const py0 = top + 34;
+        try rect(gpa, dl, x0, py0, pill_w, pill_h, if (composing) accent else skinPanel(accent), 15);
+        _ = try str(gpa, dl, e, .semibold, x0 + 14, py0 + 20, if (composing) 0xFF20201A else body_c, 14, label);
+        try emitRegion(gpa, regions, x0, py0, pill_w, @intCast(pill_h), 0, .chat_new);
+    }
+    // The honesty line (ZAT_CHAT_ROADMAP M1), compact: the claim itself in
+    // full, the mechanism suffix ellipsized to whatever the column spares.
+    // It names only what ships — content secrecy — never metadata privacy
+    // against a global observer (vision §8).
+    const ban_y = top + 74;
+    const ban_h: i32 = 22;
+    try rect(gpa, dl, x0, ban_y, list_w, ban_h, skinPanel(accent), 8);
+    try rect(gpa, dl, x0, ban_y, 3, ban_h, (0xC0 << 24) | (accent & 0x00FFFFFF), 1);
+    const ban_pen = try str(gpa, dl, e, .semibold, x0 + 12, ban_y + 15, ink, 11, "End-to-end encrypted");
+    try strEllipsis(gpa, dl, e, .regular, ban_pen + 8, ban_y + 15, muted, 11, "— MLS, post-quantum hybrid, forward secrecy", x0 + list_w - 10 - (ban_pen + 8));
+    var body_y = ban_y + ban_h + 14;
+
+    // The recipient bar (new-conversation flow), list-width: an input for a
+    // handle or DID with the composer strip's focus vocabulary (ring + caret),
+    // and a hint / refusal line under it. It pushes the list down, never the
+    // thread — the thread column doesn't care.
+    if (composing) {
+        const bar_h: i32 = 40;
+        try rect(gpa, dl, x0, body_y, list_w, bar_h, skinPanel(accent), 12);
+        const ring_c = (0xC0 << 24) | (accent & 0x00FFFFFF);
+        try rect(gpa, dl, x0, body_y, list_w, 1, ring_c, 0);
+        try rect(gpa, dl, x0, body_y + bar_h - 1, list_w, 1, ring_c, 0);
+        try rect(gpa, dl, x0, body_y, 1, bar_h, ring_c, 0);
+        try rect(gpa, dl, x0 + list_w - 1, body_y, 1, bar_h, ring_c, 0);
+        const lab_pen = try str(gpa, dl, e, .semibold, x0 + 12, body_y + 26, muted, 14, "To:");
+        if (compose_draft.len > 0) {
+            try strEllipsis(gpa, dl, e, .regular, lab_pen + 8, body_y + 26, ink, 14, compose_draft, x0 + list_w - 12 - (lab_pen + 8));
+        } else {
+            _ = try str(gpa, dl, e, .regular, lab_pen + 8, body_y + 26, faint, 14, "handle or did:…");
+        }
+        const draft_w: i32 = @intCast(text.measure(e, .regular, compose_draft, 14));
+        const bar_caret_x = lab_pen + 8 + @min(draft_w, x0 + list_w - 12 - (lab_pen + 8)) + 1;
+        try rect(gpa, dl, bar_caret_x, body_y + 11, 2, bar_h - 22, scaleAlpha((0xE0 << 24) | (accent & 0x00FFFFFF), caretAlpha(motion.caret_phase)), 0);
+        try emitRegion(gpa, regions, x0, body_y, list_w, @intCast(bar_h), 0, .chat_compose_input);
+        body_y += bar_h + 8;
+        if (compose_status.len > 0) {
+            try strEllipsis(gpa, dl, e, .regular, x0 + 2, body_y + 10, 0xFFE0A868, 12, compose_status, list_w - 4);
+        } else {
+            _ = try str(gpa, dl, e, .regular, x0 + 2, body_y + 10, faint, 12, "Enter to start · Esc to cancel");
+        }
+        body_y += 24;
+    }
 
     // ── Left: the conversation list (avatar + name + preview / age + unread). ──
     const row_h: i32 = 64;
@@ -4423,13 +4385,14 @@ pub fn layoutChat(
         ly += row_h;
     }
 
-    // ── Right: the open thread + the composer strip. ──
+    // ── Right: the open thread + the composer strip. The peer header sits at
+    // the very TOP of the column and costs ~50px — everything under it is
+    // messages (the owner's reorg: this column is only the conversation). ──
     if (peer.len == 0) {
-        _ = try str(gpa, dl, e, .regular, detail_x + 20, body_y + 40, faint, 15, "Select a conversation");
-        try drawChatHeader(gpa, dl, e, regions, accent, x0, w, top, composing, compose_draft, compose_status, motion.caret_phase, peer, detail_x, detail_w, body_y);
+        _ = try str(gpa, dl, e, .regular, detail_x + 20, top + 26, faint, 15, "Select a conversation");
         return height;
     }
-    const thread_top = body_y + 54;
+    const thread_top = top + 52;
     // The composer GROWS DOWNWARD as the draft wraps (hard word-break
     // included), so a long message builds lines inside the pane instead of
     // running off it; the thread above yields the space. Enter sends,
@@ -4627,13 +4590,14 @@ pub fn layoutChat(
         }
     }
 
-    // The sticky header strip: a near-opaque veil over the detail pane's top
-    // (from the split divider to the column's right edge), drawn AFTER the
-    // thread so a scrolled bubble slides beneath it and ghosts faintly
-    // through — the feed's header_veil pattern — then the chrome on top.
-    const hdr_x = detail_x - @divTrunc(split_gap, 2);
+    // The sticky peer header: a near-opaque strip over the detail column's
+    // top, drawn AFTER the thread so a scrolled bubble slides beneath it and
+    // ghosts faintly through — the feed's header_veil pattern — then the
+    // peer name + divider on top.
+    const hdr_x = detail_x - @divTrunc(split_gap, 2) + 1;
     try rect(gpa, dl, hdr_x, 0, x0 + w - hdr_x, thread_top, skinHeaderVeil(accent), 0);
-    try drawChatHeader(gpa, dl, e, regions, accent, x0, w, top, composing, compose_draft, compose_status, motion.caret_phase, peer, detail_x, detail_w, body_y);
+    _ = try str(gpa, dl, e, .semibold, detail_x, top + 26, ink, 16, peer);
+    try rect(gpa, dl, detail_x, top + 40, detail_w, 1, divider, 0);
 
     // The composer: a growing multi-line input + Send. The draft renders
     // through the same wrap engine as the bubbles (soft wrap + hard
