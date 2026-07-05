@@ -320,21 +320,6 @@ fn feedStart(ctx: *Ctx, files_dir: []const u8) bool {
         return false;
     }
 
-    const io_backend = gpa.create(std.Io.Threaded) catch return false;
-    io_backend.* = std.Io.Threaded.init(gpa, .{});
-    // The bionic-layout sigaction story lives on installSignalNoops (the
-    // login worker shares the need — any network leg dies without it).
-    installSignalNoops();
-    // Android has no /etc/resolv.conf — name lookups go through bionic's
-    // getaddrinfo instead (the netLookup vtable slot; everything else stays
-    // the Threaded implementation).
-    const io = android_dns.wrap(io_backend.io());
-    var ok_io = false;
-    defer if (!ok_io) {
-        io_backend.deinit();
-        gpa.destroy(io_backend);
-    };
-
     // The environ map IS the path root: HOME = the app's private files dir,
     // so every existing cache path derivation works unchanged.
     const env = gpa.create(std.process.Environ.Map) catch return false;
@@ -346,8 +331,15 @@ fn feedStart(ctx: *Ctx, files_dir: []const u8) bool {
     };
     env.put("HOME", files_dir) catch return false;
 
-    // Resume the cached session: OAuth (DPoP) first, the app-password
-    // cache second — same precedence as main.zig's front door.
+    // Resume the cached session — BEFORE any Io.Threaded exists. Ordering
+    // is load-bearing: Threaded.deinit RESTORES the pre-init SIGIO/SIGPIPE
+    // disposition it saved at init (and on Android it saved it through the
+    // broken std sigaction layout — garbage that lands as SIG_DFL). So a
+    // no-session unwind of an already-created Threaded would CLOBBER the
+    // process-wide no-op handlers right as the login worker races its
+    // first connect — the signal-29 death, round two (caught live on the
+    // Pixel, 2026-07-05). No Threaded is created until a session is in
+    // hand; the login leg owns its own for the flow's lifetime.
     var sp_buf: [512]u8 = undefined;
     const session: auth.Session = blk: {
         if (cache_shell.oauthSessionPath(&sp_buf, env)) |sp| {
@@ -371,6 +363,22 @@ fn feedStart(ctx: *Ctx, files_dir: []const u8) bool {
     };
     var ok_session = false;
     defer if (!ok_session) auth.freeSession(gpa, session);
+
+    const io_backend = gpa.create(std.Io.Threaded) catch return false;
+    io_backend.* = std.Io.Threaded.init(gpa, .{});
+    // The bionic-layout sigaction story lives on installSignalNoops — and
+    // it must run AFTER Threaded.init (init's own broken install would
+    // otherwise be the last word; see the ordering note above).
+    installSignalNoops();
+    // Android has no /etc/resolv.conf — name lookups go through bionic's
+    // getaddrinfo instead (the netLookup vtable slot; everything else stays
+    // the Threaded implementation).
+    const io = android_dns.wrap(io_backend.io());
+    var ok_io = false;
+    defer if (!ok_io) {
+        io_backend.deinit();
+        gpa.destroy(io_backend);
+    };
 
     logcat("feed: session ok — loading store", .{});
     var store = cache_shell.loadStore(gpa, env) orelse feed_core.Store{};
@@ -421,6 +429,11 @@ fn feedStart(ctx: *Ctx, files_dir: []const u8) bool {
 /// settled job, never a dead render thread (E2).
 fn loginWorker(job: *LoginJob) void {
     if (comptime !mobile_config.have_gpu) return;
+    // Re-assert the SIGIO/SIGPIPE no-ops from the thread that is about to
+    // do the network (dispositions are process-wide; this is the last word
+    // against any earlier Threaded teardown having restored the default —
+    // see feedStart's ordering note).
+    installSignalNoops();
     var arena_state = std.heap.ArenaAllocator.init(job.gpa);
     defer arena_state.deinit();
     const scratch = arena_state.allocator();
@@ -444,12 +457,18 @@ fn loginWorker(job: *LoginJob) void {
     job.done.store(true, .release);
 }
 
-/// Arm the on-device sign-in: one flow per process run (v1 — a failed flow
-/// waits for an app relaunch rather than looping the browser). Owns its own
-/// Io + environ (HOME = files_dir), freed by loginEnd at shutdown.
+/// Arm the on-device sign-in: one flow AT A TIME. An in-flight flow is
+/// left alone; a SETTLED one (done + consumed — e.g. the user abandoned
+/// the browser and the flow failed) is torn down and replaced, because the
+/// process-owned ctx outlives activity recreations — "relaunch to retry"
+/// must not require process death. Owns its own Io + environ
+/// (HOME = files_dir), freed by loginEnd at replacement or shutdown.
 fn loginStart(ctx: *Ctx, files_dir: []const u8) void {
     if (comptime !mobile_config.have_gpu) return;
-    if (ctx.login != null) return;
+    if (ctx.login) |old| {
+        if (!(old.done.load(.acquire) and old.consumed)) return; // in flight
+        loginEnd(ctx); // settled: clear the way for a fresh attempt
+    }
     const gpa = ctx.gpa;
     const job = gpa.create(LoginJob) catch return;
     var ok = false;
@@ -760,6 +779,18 @@ pub export fn zat_login_url(ctx_ptr: ?*anyopaque) ?[*:0]const u8 {
     return job.url_z[0..url.len :0].ptr;
 }
 
+/// M-And.5: a recreated activity while a flow is ARMED and UNDELIVERED —
+/// re-offer the authorize URL (clear the one-shot latch) so the new
+/// instance opens the browser again; the user gets the sign-in page back
+/// instead of a dead field. No-op for a settled or delivered flow.
+pub export fn zat_login_reoffer(ctx_ptr: ?*anyopaque) void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return));
+    if (comptime !mobile_config.have_gpu) return;
+    const job = ctx.login orelse return;
+    if (job.done.load(.acquire) or job.flow.redirect_ready.load(.acquire)) return;
+    job.url_handed = false;
+}
+
 /// M-And.5: the OS delivered the OAuth redirect intent. Called from the
 /// TRAMPOLINE activity instance (which holds no ctx — hence the process-
 /// global mailbox). True = a waiting flow took it; false = nothing armed
@@ -785,6 +816,17 @@ pub export fn zat_login_ready(ctx_ptr: ?*anyopaque) bool {
         job.thread = null;
     }
     return job.ok.load(.acquire);
+}
+
+/// Is the feed PARKED (suspended, awaiting a surface)? The shim asks on a
+/// render-thread (re)start: a process-lifetime ctx outlives the activity,
+/// so a fresh thread must know whether its first surface resumes a parked
+/// feed or starts from scratch (M-And.4 across activity recreation).
+pub export fn zat_feed_parked(ctx_ptr: ?*anyopaque) bool {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return false));
+    if (comptime !mobile_config.have_gpu) return false;
+    if (ctx.feed == null) return false;
+    return ctx.feed.?.run.rs.gpu_state == null;
 }
 
 /// M-And.4: the surface died under a live feed — park it (persist store +
@@ -866,6 +908,8 @@ test "seam ABI: null context is a no-op on every export, never a crash" {
     try testing.expect(!zat_oauth_redirect(null));
     try testing.expect(!zat_oauth_redirect("com.zat4.pds:/callback?x=y")); // nothing armed
     try testing.expect(!zat_login_ready(null));
+    try testing.expect(!zat_feed_parked(null));
+    zat_login_reoffer(null);
     zat_feed_end(null);
     zat_shutdown(null);
 }

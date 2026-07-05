@@ -252,30 +252,41 @@ fn openUrlViaOs(activity: *Activity, url: [*:0]const u8) void {
     seam.logcat("login: browser opened for the authorize URL", .{});
 }
 
-/// The redirect trampoline (M-And.5). The OS launches a FRESH activity
-/// instance for the VIEW intent; when this process already runs a live
-/// instance, this create must not touch `app` — instead: ferry the intent's
+/// Read the launching intent's data URI and, when it is the OAuth scheme,
+/// hand it to the seam's armed flow (which lives in the PROCESS-owned ctx,
+/// so it survives the activity recreation Android uses to deliver the
+/// intent — observed on-device). Main thread, the activity's own env.
+fn deliverIntentRedirect(activity: *Activity) bool {
+    const env: JniEnv = @ptrCast(@alignCast(activity.env));
+    const get_intent = jniMethod(env, activity.clazz, "getIntent", "()Landroid/content/Intent;") orelse return false;
+    const intent = jniCallObj(env, activity.clazz, get_intent, &no_args) orelse return false;
+    const get_data = jniMethod(env, intent, "getDataString", "()Ljava/lang/String;") orelse return false;
+    const data_j = jniCallObj(env, intent, get_data, &no_args) orelse return false;
+    const chars = jniFn(env, jni_get_string_utf_chars, GetStringUtfCharsFn)(env, data_j, null) orelse return false;
+    defer jniFn(env, jni_release_string_utf_chars, ReleaseStringUtfCharsFn)(env, data_j, chars);
+    if (!std.mem.startsWith(u8, std.mem.span(chars), "com.zat4.pds:")) return false;
+    if (seam.zat_oauth_redirect(chars)) {
+        seam.logcat("login: redirect delivered to the waiting flow", .{});
+        return true;
+    }
+    seam.logcat("login: redirect arrived with no armed flow — dropped", .{});
+    return false;
+}
+
+/// The redirect trampoline (M-And.5). IF the OS ever stacks a fresh
+/// activity instance for the VIEW intent while this process already runs a
+/// live one, this create must not touch `app` — instead: ferry the intent's
 /// data URI to the armed login flow, re-front the app's task (the launcher
 /// intent brings the original activity forward), and finish this instance.
-/// Returns true when this create was such a duplicate (handled here).
+/// (On the test device the redirect arrives as a RECREATE — the normal
+/// launch path below delivers it — but launch behavior varies by launcher/
+/// OEM, so the duplicate-instance case stays handled.) Returns true when
+/// this create was such a duplicate.
 fn redirectTrampoline(activity: *Activity) bool {
     if (app.thread == null) return false; // no live instance: a normal launch
     const env: JniEnv = @ptrCast(@alignCast(activity.env));
 
-    // getIntent().getDataString() — null for a plain relaunch.
-    blk: {
-        const get_intent = jniMethod(env, activity.clazz, "getIntent", "()Landroid/content/Intent;") orelse break :blk;
-        const intent = jniCallObj(env, activity.clazz, get_intent, &no_args) orelse break :blk;
-        const get_data = jniMethod(env, intent, "getDataString", "()Ljava/lang/String;") orelse break :blk;
-        const data_j = jniCallObj(env, intent, get_data, &no_args) orelse break :blk;
-        const chars = jniFn(env, jni_get_string_utf_chars, GetStringUtfCharsFn)(env, data_j, null) orelse break :blk;
-        defer jniFn(env, jni_release_string_utf_chars, ReleaseStringUtfCharsFn)(env, data_j, chars);
-        if (seam.zat_oauth_redirect(chars)) {
-            seam.logcat("login: redirect delivered to the waiting flow", .{});
-        } else {
-            seam.logcat("login: redirect arrived with no armed flow — dropped", .{});
-        }
-    }
+    _ = deliverIntentRedirect(activity);
 
     // Re-front the original task: startActivity(getPackageManager()
     // .getLaunchIntentForPackage(getPackageName())) — the launcher intent
@@ -332,13 +343,30 @@ const App = struct {
     /// JOINS the render thread before the pointer dies, so no use races
     /// the teardown.
     activity: ?*Activity = null,
+    /// M-And.5: this create carried no redirect — if a login flow is still
+    /// waiting, re-offer its authorize URL so this instance reopens the
+    /// browser (set in onCreate; consumed once by the render thread).
+    reoffer_login: bool = false,
 };
 
 var app: App = .{};
 
+/// The seam context is PROCESS-owned, not activity-owned (created by the
+/// first render thread, never shut down): Android freely DESTROYS and
+/// RECREATES the activity — including to deliver the OAuth redirect intent
+/// (observed on-device: the redirect arrives as a recreate, not as a second
+/// instance) — and everything durable (the parked feed's RunState, the
+/// armed login flow) must survive that. The activity is a surface pump; the
+/// ctx is the app. The OS reclaims it at process death (suspend persists
+/// the store + tokens at every surface loss, so nothing is lost).
+var g_ctx: ?*anyopaque = null;
+
 fn renderThread() void {
-    const ctx = seam.zat_init(1080, 2400, cell_px) orelse return;
-    defer seam.zat_shutdown(ctx);
+    const ctx = g_ctx orelse blk: {
+        const c = seam.zat_init(1080, 2400, cell_px) orelse return;
+        g_ctx = c;
+        break :blk c;
+    };
 
     var attached_gen: u32 = 0;
     // The FEED leg (MC.4d): attempted once per surface attach — a false
@@ -350,9 +378,12 @@ fn renderThread() void {
     // M-And.4: a surface bounce PARKS the feed (store/session/workers/
     // scroll stay hot; only the GL leg is released) and the next surface
     // resumes it — lock/unlock and backgrounding no longer reset the feed.
-    var feed_parked = false;
+    // A recreated ACTIVITY hands its ctx to a fresh render thread, so ask
+    // the seam whether the previous thread left a parked feed behind.
+    var feed_parked = seam.zat_feed_parked(ctx);
     var feed_errs: u32 = 0;
     var last_ns: u64 = clock.monotonicNanos();
+    if (app.reoffer_login) seam.zat_login_reoffer(ctx); // fresh instance, waiting flow → browser again
 
     while (app.running.load(.acquire)) {
         // Snapshot the UI-thread-owned state.
@@ -484,7 +515,12 @@ fn renderThread() void {
             clock.sleepMillis(50); // parked: no surface
         }
     }
-    if (feed_live or feed_parked) seam.zat_feed_end(ctx);
+    // Thread exit = the ACTIVITY died, not the app: PARK a live feed
+    // (persist + release the GL leg; RunState and the login flow stay hot
+    // in the process-owned ctx) — a recreated activity's thread resumes it.
+    // Nothing is ended: at process death the OS reclaims, and the suspend
+    // already persisted the store + rotated tokens.
+    if (feed_live) seam.zat_feed_suspend(ctx);
     seam.zat_surface_lost(ctx);
 }
 
@@ -561,10 +597,14 @@ fn stderrPump(read_fd: std.c.fd_t) void {
     }
 }
 
+var stderr_routed = false; // once per PROCESS — a recreated activity reuses the pipe
+
 fn routeStderrToLogcat() void {
     // libc-only plumbing: the pure (no-libc) build has neither pipe nor
     // liblog — and nothing prints there anyway (the feed leg is NDK-only).
     if (comptime !@import("mobile_config").have_gpu) return;
+    if (stderr_routed) return;
+    stderr_routed = true;
     var fds: [2]std.c.fd_t = undefined;
     if (std.c.pipe(&fds) != 0) return;
     if (std.c.dup2(fds[1], 2) < 0) return;
@@ -589,6 +629,13 @@ export fn ANativeActivity_onCreate(activity: *Activity, saved: ?*anyopaque, save
     activity.callbacks.onDestroy = onDestroy;
     app = .{};
     app.activity = activity;
+    // A recreate can BE the redirect delivery (Android tears the activity
+    // down and hands the VIEW intent to the new instance); the armed flow
+    // survived in the process-owned ctx — feed it before the thread spins.
+    // A recreate WITHOUT a redirect while a flow waits re-offers the
+    // browser instead (the user gets the sign-in page back, not a dead
+    // field); the render thread acts on the flag once the ctx exists.
+    app.reoffer_login = !deliverIntentRedirect(activity);
     // The app's private files dir — the cache root the feed leg needs
     // (MC.4d). Copied before the thread spawns; the activity's own string
     // may not outlive us.
