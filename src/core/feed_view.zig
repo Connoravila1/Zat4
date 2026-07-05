@@ -1286,12 +1286,16 @@ pub fn drawTabBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, w
     try rect(gpa, dl, 0, by, width, tab_bar_h, skinHeaderVeil(accent), 0);
     try rect(gpa, dl, 0, by, width, 1, divider, 0);
 
-    const slot_w = @divTrunc(width, 5);
-    const icon_cy = by + 36;
     const Slot = union(enum) { nav: u8, compose, you };
     // zones = the BROWSE page (nav idx 1) — the search surface until real
-    // search exists (the locked design names "search" here).
-    const slots = [_]Slot{ .{ .nav = screen_home }, .{ .nav = screen_zones_browse }, .compose, .{ .nav = 2 }, .you };
+    // search exists (the locked design names "search" here). Seven slots:
+    // the locked five grew Zat Chat + Algorithms (owner's first-port note —
+    // every screen the rail carries must be reachable by thumb; Settings is
+    // the recorded exception, arriving via the "you" page). ~61 logical px
+    // per slot ≈ 150+ physical — comfortably tappable.
+    const slots = [_]Slot{ .{ .nav = screen_home }, .{ .nav = screen_zones_browse }, .{ .nav = 3 }, .compose, .{ .nav = 2 }, .{ .nav = 4 }, .you };
+    const slot_w = @divTrunc(width, @as(i32, @intCast(slots.len)));
+    const icon_cy = by + 36;
     for (slots, 0..) |slot, i| {
         const cx = slot_w * @as(i32, @intCast(i)) + @divTrunc(slot_w, 2);
         switch (slot) {

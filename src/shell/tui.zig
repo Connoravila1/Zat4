@@ -2199,7 +2199,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             const ctx: feed_view.ComposeContext = if (rs.compose_kind == .profile)
                                 .profile
                             else if (rs.reply_handle.len > 0) .reply else .post;
-                            paintComposeGpu(gpa, win, g, gs, ctx, rs.reply_handle, rs.quoting_handle, textedit.view(&rs.compose), rs.compose.caret, textedit.selStart(&rs.compose), textedit.selEnd(&rs.compose), composeBlinkOn(rs.caret_anchor_ns), rs.status, rs.chain_segments.items) catch {};
+                            paintComposeGpu(gpa, win.fb.width, win.fb.height, g, gs, ctx, rs.reply_handle, rs.quoting_handle, textedit.view(&rs.compose), rs.compose.caret, textedit.selStart(&rs.compose), textedit.selEnd(&rs.compose), composeBlinkOn(rs.caret_anchor_ns), rs.status, rs.chain_segments.items) catch {};
                         } else {
                             // Software fallback: the glyph-field cell composer.
                             const cell = cellSize(win.fb.width, rs.gzoom);
@@ -2222,9 +2222,18 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             window_shell.presentDrawList(win, gpa, g.engine, rs.gdraw.slice(), field_core.background) catch {};
                         }
                     },
-                    // The mobile composer is a later UI pass (M-UX); the mode
-                    // is unreachable there v1 (no keyboard path opens it).
-                    .mobile => {},
+                    // The phone composer: the SAME premium GPU surface as the
+                    // desktop (the tab bar's ＋ and every reply button open
+                    // it — the old "unreachable v1" no-op FROZE the app the
+                    // moment they did, caught live on the Pixel 2026-07-05).
+                    // Typing awaits the IME leg (M-And.5 follow-up); until
+                    // then the card renders, Cancel works, nothing freezes.
+                    .mobile => |m| if (g.gpu) |gs| {
+                        const ctx: feed_view.ComposeContext = if (rs.compose_kind == .profile)
+                            .profile
+                        else if (rs.reply_handle.len > 0) .reply else .post;
+                        paintComposeGpu(gpa, m.width_px, m.height_px, g, gs, ctx, rs.reply_handle, rs.quoting_handle, textedit.view(&rs.compose), rs.compose.caret, textedit.selStart(&rs.compose), textedit.selEnd(&rs.compose), composeBlinkOn(rs.caret_anchor_ns), rs.status, rs.chain_segments.items) catch {};
+                    },
                     .terminal => {
                         timeline_ui.buildComposeFrame(&rs.next, textedit.view(&rs.compose), rs.reply_handle, rs.status);
                         try present(gpa, rs.out, arena, &rs.prev, &rs.next, backend);
@@ -7155,7 +7164,10 @@ fn advanceField(gpa: Allocator, gs: *GpuState, active: *effect_core.ActiveList) 
 /// is zeroed so the timeline rebuilds cleanly on return.
 fn paintComposeGpu(
     gpa: Allocator,
-    win: *window_shell.Window,
+    // Surface dims, not the Window — the composer renders on any GPU
+    // surface (the mobile arm passes the host's; MC.4b's same seam).
+    w: u32,
+    h: u32,
     g: Grid,
     gs: *GpuState,
     ctx: feed_view.ComposeContext,
@@ -7170,8 +7182,6 @@ fn paintComposeGpu(
     /// Finalized thread segments above the active box (empty for a lone post).
     segments: []const []const u8,
 ) !void {
-    const w: u32 = win.fb.width;
-    const h: u32 = win.fb.height;
     gpu.setViewport(@intCast(w), @intCast(h));
     const want = gpuFieldGrid(w, h);
     if (want.cols != gs.cols or want.rows != gs.rows) {
@@ -7313,7 +7323,11 @@ fn paintFrameGpu(
     // ZONES TEST: on the Zones tab the nav rail relocates to the RIGHT — a
     // custom per-page tile-move. `zones_t` springs 0→1 when on a zones screen;
     // while it animates the rail (and its regions/icons) follow, so we rebuild.
-    const on_zones = g.screen.* == feed_view.screen_zones_browse or g.screen.* == feed_view.screen_zones;
+    // DESKTOP choreography only: on the phone there is no rail to relocate and
+    // no width to shift into — zones_t pinned 0 keeps the page in the plain
+    // narrow column (its overflow at 430 was the first on-device finding).
+    const on_zones = gs.design_w > feed_view.phone_max and
+        (g.screen.* == feed_view.screen_zones_browse or g.screen.* == feed_view.screen_zones);
     springGeom(&gs.zones_t, &gs.zones_v, if (on_zones) 1.0 else 0.0, 1.0 / 60.0);
     const zones_animating = @abs(gs.zones_t - (if (on_zones) @as(f32, 1.0) else 0.0)) > 0.003 or @abs(gs.zones_v) > 0.003;
 
