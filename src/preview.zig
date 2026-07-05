@@ -150,6 +150,11 @@ pub fn main(init: std.process.Init) !void {
         try feed_view.drawTabBar(gpa, &dl, &engine, @intCast(pw), @intCast(ph), 0, null, lens_socket.seatedAccent(home_tray), false);
         try raster.paint(gpa, &engine, dl.slice(), &pfb, clear);
         try writePpm(io, gpa, &pfb, "/tmp/zat_phone.ppm");
+
+        // ... and with the nav drawer OPEN (the swipe-right surface).
+        try feed_view.drawDrawer(gpa, &dl, &engine, @intCast(pw), @intCast(ph), 1.0, 0, null, lens_socket.seatedAccent(home_tray), "connoravila.zat4.com", false);
+        try raster.paint(gpa, &engine, dl.slice(), &pfb, clear);
+        try writePpm(io, gpa, &pfb, "/tmp/zat_phone_drawer.ppm");
     }
 
     // ALGORITHM TRANSPARENCY page (DISCOVER invariant 5): the real

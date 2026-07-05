@@ -189,7 +189,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back, drawer_close };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -1288,12 +1288,11 @@ pub fn drawTabBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, w
 
     const Slot = union(enum) { nav: u8, compose, you };
     // zones = the BROWSE page (nav idx 1) — the search surface until real
-    // search exists (the locked design names "search" here). Seven slots:
-    // the locked five grew Zat Chat + Algorithms (owner's first-port note —
-    // every screen the rail carries must be reachable by thumb; Settings is
-    // the recorded exception, arriving via the "you" page). ~61 logical px
-    // per slot ≈ 150+ physical — comfortably tappable.
-    const slots = [_]Slot{ .{ .nav = screen_home }, .{ .nav = screen_zones_browse }, .{ .nav = 3 }, .compose, .{ .nav = 2 }, .{ .nav = 4 }, .you };
+    // search exists (the locked design names "search" here). The locked
+    // FIVE, no more: everything else (Zat Chat, Algorithms, Settings)
+    // lives in the swipe-right nav DRAWER (drawDrawer) — seven slots read
+    // as crowded on the first device pass.
+    const slots = [_]Slot{ .{ .nav = screen_home }, .{ .nav = screen_zones_browse }, .compose, .{ .nav = 2 }, .you };
     const slot_w = @divTrunc(width, @as(i32, @intCast(slots.len)));
     const icon_cy = by + 36;
     for (slots, 0..) |slot, i| {
@@ -1320,6 +1319,55 @@ pub fn drawTabBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, w
                 try emitRegion(gpa, regions, cx - 21, icon_cy - 21, 42, 42, screen_profile, .nav);
             },
         }
+    }
+}
+
+/// The PHONE nav DRAWER (the Bluesky-pattern reference, owner-chosen): a
+/// rightward swipe on the content slides it in from the left over a scrim.
+/// It carries the profile card plus EVERY top-level screen — including the
+/// ones the five-slot bar doesn't (Zat Chat, Algorithms, Settings — the
+/// phone's only door to Sign out). Rows speak the same `.nav` vocabulary as
+/// the rail/bar; the scrim emits `.drawer_close`. Regions land only once
+/// the panel is essentially open (honest targets, no mid-flight taps).
+/// `t` is the shell's spring (0 closed -> 1 open); `skip_nav` mirrors
+/// drawRail — nav regions are sized so the GPU SDF pass's (x+21, y+19)
+/// placement lands each icon on the row's icon slot.
+pub const drawer_w: i32 = 300;
+pub fn drawDrawer(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, width: i32, height: i32, t: f32, active: u8, regions: ?*Regions, accent: u32, you_handle: []const u8, skip_nav: bool) error{OutOfMemory}!void {
+    const tt = std.math.clamp(t, 0, 1);
+    if (tt <= 0.01) return;
+    const open = tt > 0.6;
+
+    // The scrim: the content dims as the panel arrives; a tap on it closes.
+    const sa: u32 = @intFromFloat(150.0 * tt);
+    try rect(gpa, dl, 0, 0, width, height, sa << 24, 0);
+    if (open) try emitRegion(gpa, regions, 0, 0, width, @intCast(@min(height, 65535)), 0, .drawer_close);
+
+    // The panel: OPAQUE (navigation must read over anything) with a lit edge.
+    const px = -drawer_w + @as(i32, @intFromFloat(@as(f32, @floatFromInt(drawer_w)) * tt));
+    try rect(gpa, dl, px, 0, drawer_w, height, 0xFF201F18, 0);
+    try rect(gpa, dl, px + drawer_w - 1, 0, 1, height, divider, 0);
+
+    // The profile card: avatar disc + handle -> your profile.
+    try rect(gpa, dl, px + 20, 40, 46, 46, 0xFF3F3B2D, 23);
+    _ = try str(gpa, dl, e, .semibold, px + 34, 70, ink, 16, "y");
+    _ = try str(gpa, dl, e, .semibold, px + 20, 116, ink, 17, "you");
+    const shown = if (you_handle.len > 0) you_handle else "not signed in";
+    _ = try str(gpa, dl, e, .regular, px + 20, 138, faint, 13, shown);
+    if (open) try emitRegion(gpa, regions, px + 12, 32, drawer_w - 24, 114, screen_profile, .nav);
+    try rect(gpa, dl, px + 20, 156, drawer_w - 40, 1, divider, 0);
+
+    // Every top-level screen, the rail's own order (nav_order).
+    const rows = [_]u8{ 0, 1, 4, 3, 2, 5 };
+    var ry: i32 = 182;
+    for (rows) |idx| {
+        const on = idx == active;
+        if (on) try rect(gpa, dl, px + 12, ry - 8, drawer_w - 24, 42, (0x1F << 24) | (accent & 0x00FFFFFF), 12);
+        if (!skip_nav) try navIcon(idx, gpa, dl, px + 24, ry, 22, if (on) accent else muted);
+        _ = try str(gpa, dl, e, if (on) .semibold else .regular, px + 62, ry + 17, if (on) ink else muted, 16, nav_labels[idx]);
+        // Region x sits so the SDF pass's x+21 = the icon centre (px+35).
+        if (open) try emitRegion(gpa, regions, px + 14, ry - 8, drawer_w - 28, 42, idx, .nav);
+        ry += 54;
     }
 }
 

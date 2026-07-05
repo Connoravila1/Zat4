@@ -67,6 +67,10 @@ pub const MobileHost = struct {
     down_x: i32 = -1,
     down_y: i32 = -1,
     scrolling: bool = false,
+    /// This press committed to a HORIZONTAL swipe (the phone nav drawer) —
+    /// mutually exclusive with `scrolling`; the dominant axis at the slop
+    /// threshold decides, the total travel on release resolves it.
+    hswipe: bool = false,
     drag_y: i32 = -1,
     /// The fling: scroll velocity in LOGICAL px/frame, sampled (smoothed)
     /// while the finger drags and carried when it lifts; friction decays it,

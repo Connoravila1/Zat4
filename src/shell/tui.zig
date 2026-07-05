@@ -2185,7 +2185,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
+        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
         switch (rs.mode) {
             .timeline => try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status),
             .compose => {
@@ -2430,13 +2430,25 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         m.down_x = tev.x;
                         m.down_y = tev.y;
                         m.scrolling = false;
+                        m.hswipe = false;
                         m.drag_y = tev.y;
                         m.fling_v = 0; // a touch catches the gliding feed (interruptible)
                     },
                     .move => if (m.down_x >= 0) {
-                        if (!m.scrolling and
-                            (@abs(@as(i32, tev.y) - m.down_y) > touch_slop or
-                                @abs(@as(i32, tev.x) - m.down_x) > touch_slop)) m.scrolling = true;
+                        // The dominant axis at the slop threshold commits the
+                        // gesture: vertical -> scroll (as ever), horizontal ->
+                        // the nav-drawer swipe (resolved on release). One
+                        // commitment per press; a committed swipe never
+                        // scrolls the feed under the moving finger.
+                        if (!m.scrolling and !m.hswipe) {
+                            const adx = @abs(@as(i32, tev.x) - m.down_x);
+                            const ady = @abs(@as(i32, tev.y) - m.down_y);
+                            if (ady > touch_slop and ady >= adx) {
+                                m.scrolling = true;
+                            } else if (adx > touch_slop and adx > ady) {
+                                m.hswipe = true;
+                            }
+                        }
                         if (m.scrolling) {
                             const dy_phys: i32 = @as(i32, tev.y) - m.drag_y;
                             m.drag_y = tev.y;
@@ -2463,7 +2475,19 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         }
                     },
                     .button_up => {
-                        if (m.down_x >= 0 and !m.scrolling) {
+                        if (m.hswipe) {
+                            // The drawer gesture resolves by total travel:
+                            // a decisive rightward swipe opens, leftward
+                            // closes (Bluesky's grammar; the system back
+                            // gesture owns the screen edge, so the swipe
+                            // works from anywhere on the content).
+                            const dx_total = @as(i32, tev.x) - m.down_x;
+                            const commit: i32 = touch_slop * 3;
+                            if (rs.gpu_state) |*gsd| {
+                                if (dx_total > commit) gsd.drawer_want = true;
+                                if (dx_total < -commit) gsd.drawer_want = false;
+                            }
+                        } else if (m.down_x >= 0 and !m.scrolling) {
                             // A clean tap: the press point, then the release.
                             pointer_events.append(gpa, .{ .x = @intCast(m.down_x), .y = @intCast(m.down_y), .kind = .button_down, .button = 1, .mods = 0, ._pad = 0 }) catch {};
                             pointer_events.append(gpa, .{ .x = tev.x, .y = tev.y, .kind = .button_up, .button = 1, .mods = 0, ._pad = 0 }) catch {};
@@ -2948,6 +2972,13 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                     }
                                     // Each screen starts at the top (scroll is shared).
                                     rs.gscroll_px = 0;
+                                    // Navigating dismisses the phone drawer (it is a
+                                    // nav surface; arriving somewhere closes it).
+                                    if (rs.gpu_state) |*gsd| gsd.drawer_want = false;
+                                },
+                                // The phone drawer's scrim: tap-outside closes.
+                                .drawer_close => {
+                                    if (rs.gpu_state) |*gsd| gsd.drawer_want = false;
                                 },
                                 // Avatar tap → open THAT author's profile (any author;
                                 // the DID comes from the post's at-uri). A query over
@@ -6162,6 +6193,8 @@ const Grid = struct {
     field_gain: f32 = 0.9,
     /// Toy Box "Julia mode" active — the field renderer pinks its glyph ink.
     julia: bool = false,
+    /// The signed-in handle for the phone drawer's profile card.
+    you_handle: []const u8 = "",
     /// "Ripples on like" — the like fires the field ripple + red dye.
     ripples_on: bool = true,
     /// "Living glyph field" — the field renders (off ⇒ flat background).
@@ -6375,6 +6408,11 @@ const GpuState = struct {
     /// ZONES test: the nav rail relocates to the right on the Zones tab. Springs
     /// 0 (rail at home/left) → 1 (rail slid to the right). A revertable demo.
     zones_t: f32 = 0,
+    /// The PHONE nav drawer (Bluesky-pattern): 0 closed → 1 open. `want` is
+    /// flipped by the swipe gesture / nav taps; the spring animates t.
+    drawer_t: f32 = 0,
+    drawer_v: f32 = 0,
+    drawer_want: bool = false,
     zones_v: f32 = 0,
     /// Hover-expand of the condensed right rail: 0 = icons-only strip, 1 = full
     /// labelled rail. Springs toward 1 while the cursor is over the right strip.
@@ -7331,6 +7369,11 @@ fn paintFrameGpu(
     springGeom(&gs.zones_t, &gs.zones_v, if (on_zones) 1.0 else 0.0, 1.0 / 60.0);
     const zones_animating = @abs(gs.zones_t - (if (on_zones) @as(f32, 1.0) else 0.0)) > 0.003 or @abs(gs.zones_v) > 0.003;
 
+    // The PHONE drawer springs open/shut; while it moves the chrome tile
+    // (scrim + panel + regions) must rebuild each frame.
+    springGeom(&gs.drawer_t, &gs.drawer_v, if (gs.drawer_want) 1.0 else 0.0, 1.0 / 60.0);
+    const drawer_animating = @abs(gs.drawer_t - (if (gs.drawer_want) @as(f32, 1.0) else 0.0)) > 0.003 or @abs(gs.drawer_v) > 0.003;
+
     // Hover the RIGHT rail → it expands. The hit-band must track the rail's
     // CURRENT (animated) left edge — when expanded it reaches ~188px further
     // left, so a fixed collapsed-strip band would drop the hover as you move
@@ -7345,7 +7388,10 @@ fn paintFrameGpu(
     // algo_t springs on the loadout AND messages screens (both master–detail
     // surfaces that want the width); hovering the left rail (its current
     // right edge tracks the expand) re-opens it.
-    const on_algo = g.screen.* == feed_view.screen_loadout or g.screen.* == feed_view.screen_messages;
+    // DESKTOP choreography only (like zones_t): no rail to condense on phone,
+    // and the shift pushed the loadout off the 430 column (on-device finding).
+    const on_algo = gs.design_w > feed_view.phone_max and
+        (g.screen.* == feed_view.screen_loadout or g.screen.* == feed_view.screen_messages);
     springGeom(&gs.algo_t, &gs.algo_v, if (on_algo) 1.0 else 0.0, 1.0 / 60.0);
     const home_rail_left: f32 = @floatFromInt(feed_view.paneGeomFor(@intCast(gs.design_w), feed_view.screen_loadout).rail_x);
     // The condensed rail hugs the left edge (shifted left by 60); the hover band
@@ -7486,7 +7532,7 @@ fn paintFrameGpu(
     // A drag/settle animates the socket every frame (lift, reflow, ghost), so
     // bypass the feed cache while it runs — a brief interaction, and the field
     // already rebuilds every frame anyway.
-    if (sig != gs.feed_sig or gs.feed.verts.items.len == 0 or g.socket_ui.drag_active != null or search_animating or zones_animating or rail_hover_animating or algo_animating or chat_animating or g.screen.* == feed_view.screen_loadout or g.frametiming_on) {
+    if (sig != gs.feed_sig or gs.feed.verts.items.len == 0 or g.socket_ui.drag_active != null or search_animating or zones_animating or drawer_animating or rail_hover_animating or algo_animating or chat_animating or g.screen.* == feed_view.screen_loadout or g.frametiming_on) {
         gs.feed_sig = sig;
         // An empty timeline renders the chrome with no posts (no placeholders).
         const feed_posts = feed_view.fromTimeline(arena, items, now, g.expanded) catch &[_]feed_view.PostView{};
@@ -7666,6 +7712,9 @@ fn paintFrameGpu(
             // region kinds — the dispatch and the SDF icon pass are unchanged.
             g.draw.len = 0;
             feed_view.drawTabBar(gpa, g.draw, g.engine, @intCast(gs.design_w), @intCast(lh), g.screen.*, g.regions, g.accent, true) catch {};
+            // The nav DRAWER slides over everything (scrim + panel); its
+            // regions land last, so while open it owns the taps.
+            feed_view.drawDrawer(gpa, g.draw, g.engine, @intCast(gs.design_w), @intCast(lh), gs.drawer_t, g.screen.*, g.regions, g.accent, g.you_handle, true) catch {};
             if (g.julia) feed_view.juliaRemapText(g.draw);
             gpu.feedBuild(&gs.rail, gpa, g.engine, g.draw.slice(), scale) catch {};
         } else {
@@ -8135,6 +8184,10 @@ fn drawSocketHoverTop(gpa: Allocator, g: Grid, gs: *GpuState, scale: f32, vw: i3
 /// rollout will have feed_view emit exact placements.
 fn drawSdfIcons(g: Grid, gs: *GpuState, items: []const feed_core.TimelineItem, vw: i32, vh: i32) void {
     const scale = gs.scale;
+    // The phone drawer is OPAQUE chrome, but this pass paints after every
+    // buffer — while it's open, only ITS rows get icons (they're the only
+    // wide .nav regions; everything else would bleed through the panel).
+    const drawer_open = gs.drawer_t > 0.5;
     const header_bottom: i32 = if (g.screen.* == feed_view.screen_home)
         feed_view.homeSocketBottom(g.socket_tray, g.socket_ui)
     else
@@ -8151,6 +8204,7 @@ fn drawSdfIcons(g: Grid, gs: *GpuState, items: []const feed_core.TimelineItem, v
         }
     }.f;
     for (g.regions.items) |r| {
+        if (drawer_open and !(r.kind == .nav and r.w > 100)) continue;
         const cy = (@as(f32, @floatFromInt(r.y)) + @as(f32, @floatFromInt(r.h)) * 0.5) * scale;
         switch (r.kind) {
             // LEFT engagement group — the icon sits at region.x + is/2 (8.5).
@@ -8228,6 +8282,7 @@ fn drawJuliaBurst(gs: *GpuState, vw: i32, vh: i32) void {
 }
 
 fn drawEngagementHearts(g: Grid, gs: *GpuState, items: []const feed_core.TimelineItem, vw: i32, vh: i32) void {
+    if (gs.drawer_t > 0.5) return; // the drawer is opaque chrome; hearts are content
     const scale = gs.scale;
     const s = g.active.slice();
     const recipes = s.items(.recipe);
