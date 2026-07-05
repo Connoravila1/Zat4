@@ -2953,7 +2953,12 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                     }
                                 },
                                 // New-post button → the composer (cell path for now).
+                                // Fresh post: no reply target, no quote attached.
                                 .compose => {
+                                    rs.reply_target = null;
+                                    rs.reply_handle = "";
+                                    rs.quote_target = null;
+                                    rs.quoting_handle = "";
                                     rs.compose_kind = .post;
                                     rs.mode = .compose;
                                 },
@@ -3015,6 +3020,10 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                             .parent_cid = try compose_arena.dupe(u8, refs.parent_cid),
                                         };
                                         rs.reply_handle = try compose_arena.dupe(u8, item.author_handle);
+                                        // The arena reset above freed any prior quote
+                                        // strings — drop the references with them.
+                                        rs.quote_target = null;
+                                        rs.quoting_handle = "";
                                         rs.compose_kind = .post;
                                         textedit.clear(&rs.compose);
                                         rs.status = "";
@@ -3888,7 +3897,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     rs.caret_anchor_ns = clock_shell.monotonicNanos();
                     continue;
                 };
-                try handleComposeInput(gpa, session, &rs.status, &rs.mode, store, &rs.compose, &rs.chain_segments, &rs.reply_target, &rs.reply_handle, &rs.quote_target, rs.compose_kind, pix, &rs.pending_send, &rs.pending_profile_save, decoded.event, now);
+                try handleComposeInput(gpa, session, &rs.status, &rs.mode, store, &rs.compose, &rs.chain_segments, &rs.reply_target, &rs.reply_handle, &rs.quote_target, &rs.quoting_handle, rs.compose_kind, pix, &rs.pending_send, &rs.pending_profile_save, decoded.event, now);
                 if (rs.mode != .compose) rs.compose_drag = false; // composer closed → end any drag
                 rs.caret_anchor_ns = clock_shell.monotonicNanos(); // keystroke/move → solid caret
                 continue;
@@ -4310,6 +4319,10 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             .parent_cid = try compose_arena.dupe(u8, refs.parent_cid),
                         };
                         rs.reply_handle = try compose_arena.dupe(u8, item.author_handle);
+                        // The arena reset above freed any prior quote strings —
+                        // drop the references with them.
+                        rs.quote_target = null;
+                        rs.quoting_handle = "";
                         textedit.clear(&rs.compose);
                         rs.status = "";
                         rs.mode = .compose;
@@ -4318,6 +4331,8 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 .new_post => {
                     rs.reply_target = null;
                     rs.reply_handle = "";
+                    rs.quote_target = null;
+                    rs.quoting_handle = "";
                     textedit.clear(&rs.compose);
                     rs.status = "";
                     rs.mode = .compose;
@@ -4612,6 +4627,10 @@ fn handleComposeInput(
     /// The quoted post's strong ref when composing a quote-post; null otherwise.
     /// Cleared on send/cancel like reply_target. Attaches to the first segment.
     quote_target: *?lexicon.RecordRef,
+    /// The quoted author's handle (the composer's "Quoting @x" line). Lives in
+    /// the compose arena; cleared with quote_target so no reference survives the
+    /// next arena reset.
+    quoting_handle: *[]const u8,
     compose_kind: ComposeKind,
     /// The live render grid (for the post-send scroll-to-top).
     pix: ?Grid,
@@ -4631,6 +4650,7 @@ fn handleComposeInput(
             for (chain_segments.items) |s| gpa.free(s);
             chain_segments.clearRetainingCapacity();
             quote_target.* = null;
+            quoting_handle.* = "";
             mode.* = .timeline;
             status.* = "cancelled";
         },
@@ -4739,6 +4759,7 @@ fn handleComposeInput(
             reply_target.* = null;
             reply_handle.* = "";
             quote_target.* = null;
+            quoting_handle.* = "";
             mode.* = .timeline;
             if (pix) |g| g.scroll.* = 0; // jump to top so you see your posts land
             status.* = "";
