@@ -1122,9 +1122,16 @@ fn initRunState(
     // run() is called, so its XID is valid.
     rs.gpu_state = null;
     if (backend == .window) if (rs.engine) |*e| {
-        rs.gpu_state = initGpuState(gpa, e, backend.window) catch |err| blk: {
-            std.debug.print("[gpu] init failed ({s}) — using the software path.\n", .{@errorName(err)});
-            break :blk null;
+        rs.gpu_state = blk: {
+            const win = backend.window;
+            const g = gpu.init(window_shell.nativeHandle(win)) catch |err| {
+                std.debug.print("[gpu] init failed ({s}) — using the software path.\n", .{@errorName(err)});
+                break :blk null;
+            };
+            break :blk initGpuState(gpa, e, g, win.fb.width, win.fb.height) catch |err| {
+                std.debug.print("[gpu] init failed ({s}) — using the software path.\n", .{@errorName(err)});
+                break :blk null;
+            };
         };
     };
 
@@ -6190,14 +6197,15 @@ fn liveGeom(gs: *const GpuState, target: feed_view.PaneGeom) feed_view.PaneGeom 
     };
 }
 
-/// Bring up the GPU path on the live window. Any failure (no GL, shader/pack
-/// error, OOM) propagates so the caller falls back to software (E2). Each
-/// acquired resource has an errdefer so a mid-init failure frees cleanly (C5).
-fn initGpuState(gpa: Allocator, engine: *text_core.Engine, win: *window_shell.Window) !GpuState {
-    var g = try gpu.init(window_shell.nativeHandle(win));
+/// Bring up the GPU FEED path on an already-current GL context (`g` — the
+/// caller made it against its own surface: the X11 window here, the seam's
+/// ANativeWindow on mobile; this fn OWNS it from the first line, failure
+/// included). Any failure (shader/pack error, OOM) propagates so the caller
+/// falls back to software (E2). Each acquired resource has an errdefer so a
+/// mid-init failure frees cleanly (C5).
+fn initGpuState(gpa: Allocator, engine: *text_core.Engine, g_in: gpu.Gpu, w: u32, h: u32) !GpuState {
+    var g = g_in;
     errdefer gpu.deinit(&g);
-    const w: u32 = win.fb.width;
-    const h: u32 = win.fb.height;
     gpu.setViewport(@intCast(w), @intCast(h));
 
     var feed = try gpu.initFeed(gpa);
