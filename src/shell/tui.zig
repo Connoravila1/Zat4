@@ -4220,6 +4220,83 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
     return if (rs.user_signed_out) .signed_out else .quit;
 }
 
+/// The MOBILE driver's handle (M_CORE_INVERSION MC.4c): the same RunState
+/// the desktop loop drives, plus the host surface the seam writes into —
+/// heap-owned because the OS keeps it alive across vsync callbacks, not a
+/// stack frame. Created by mobileStart, stepped by mobileStep, torn down
+/// by mobileEnd. A7.2: cold struct, size guard waived — one per app process.
+pub const MobileRun = struct {
+    rs: RunState,
+    host: mobile_host.MobileHost,
+};
+
+/// Driver #2 of the one funnel: bring the feed up on an OS-owned surface.
+/// The caller (the C-ABI seam) owns session/store/appview_url and made the
+/// GL context against its own surface; this builds the RunState exactly as
+/// run() does, then hands the context to the same feed renderer the desktop
+/// uses. `g` is owned from the first line (deinit on failure). GPU-only by
+/// design: a failed feed-renderer bring-up fails the start (the mobile arm
+/// has no software fallback), so the seam can report false honestly.
+pub fn mobileStart(
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    session: *auth.Session,
+    appview_url: []const u8,
+    store: *feed_core.Store,
+    g: gpu.Gpu,
+    width_px: u32,
+    height_px: u32,
+) !*MobileRun {
+    // Ownership of the context is TRANSFERRED to initGpuState the moment it
+    // is called (it deinits on its own failure) — the optional disarms this
+    // errdefer at that hand-off so no path deinits twice (C5).
+    var g_owned: ?gpu.Gpu = g;
+    errdefer if (g_owned) |*go| gpu.deinit(go);
+    const mr = try gpa.create(MobileRun);
+    errdefer gpa.destroy(mr);
+    mr.host = .{ .width_px = width_px, .height_px = height_px };
+    try initRunState(&mr.rs, gpa, io, environ, session, appview_url, store, .{ .mobile = &mr.host });
+    errdefer deinitRunState(&mr.rs);
+    // The engine + feed GPU state the window path builds in initRunState's
+    // window-gated tail — built here against the seam's context instead.
+    mr.rs.engine = text_core.initEngine() catch null;
+    if (mr.rs.engine) |*e| {
+        const gg = g_owned.?;
+        g_owned = null;
+        mr.rs.gpu_state = try initGpuState(gpa, e, gg, width_px, height_px);
+    } else return error.FontEngineUnavailable; // GPU-only arm: no engine → no renderer → honest failure
+    return mr;
+}
+
+/// One frame on the OS's clock. Wait budget 0: the choreographer already
+/// waited — the step must never sleep on an OS-owned thread (MC.4a).
+pub fn mobileStep(mr: *MobileRun) !StepOutcome {
+    return stepFrame(&mr.rs, 0);
+}
+
+/// Queue one input event from the seam (same ownership rule as the host:
+/// dropped on OOM, contained). Returns false on the drop.
+pub fn mobilePush(mr: *MobileRun, ev: layout_core.InputEvent) bool {
+    return mobile_host.push(&mr.host, mr.rs.gpa, ev);
+}
+
+/// The surface changed size (rotation / fold): the next frame lays out to
+/// the new dims. The GL viewport is set per frame by the paint.
+pub fn mobileResize(mr: *MobileRun, width_px: u32, height_px: u32) void {
+    mr.host.width_px = width_px;
+    mr.host.height_px = height_px;
+}
+
+/// Tear the feed down: the RunState's deinit (workers joined, arenas freed —
+/// the GPU state inside it owns the GL context) plus the host queue.
+pub fn mobileEnd(mr: *MobileRun) void {
+    const gpa = mr.rs.gpa;
+    deinitRunState(&mr.rs);
+    mobile_host.deinit(&mr.host, gpa);
+    gpa.destroy(mr);
+}
+
 pub fn run(
     gpa: Allocator,
     io: std.Io,
