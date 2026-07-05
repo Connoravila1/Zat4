@@ -2352,6 +2352,19 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
         // budget's size lives with the driver that chose it).
         var in_buf: [256]u8 = undefined;
         var n: usize = 0;
+        // The pointer channel + synthesized key bytes, filled per backend
+        // (the X11 pump; the mobile host's seam queue) and consumed by the
+        // SHARED dispatch below the switch — one input path for every
+        // surface (MC.4d: taps on a phone are the same release-activation
+        // clicks as the desktop mouse). Drained per lap so a motion flood
+        // never accumulates.
+        var pointer_events: std.ArrayList(layout_core.InputEvent) = .empty;
+        defer pointer_events.deinit(gpa);
+        var pumped_bytes: std.ArrayList(u8) = .empty;
+        defer pumped_bytes.deinit(gpa);
+        // The surface's pixel dims, for the dispatch's cell/scale mapping.
+        var fb_w: u32 = 0;
+        var fb_h: u32 = 0;
         switch (backend) {
             // On Windows the terminal backend returns NotATerminal at
             // startup (console raw mode is the recorded follow-up), so
@@ -2372,41 +2385,64 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 // driven host passes 0 and the step never blocks on an
                 // OS-owned thread.
                 if (m.closed) break :main_loop;
+                fb_w = m.width_px;
+                fb_h = m.height_px;
                 var touch_events: std.ArrayList(layout_core.InputEvent) = .empty;
                 defer touch_events.deinit(gpa);
                 mobile_host.drain(m, gpa, &touch_events) catch {}; // OOM: dropped taps, contained (E2)
                 if (touch_events.items.len > 0) rs.last_input_nanos = clock_shell.monotonicNanos();
-                // v1 TOUCH SCROLL (MC.4d): a vertical drag moves the feed
-                // 1:1 — content follows the finger, the same pixel-space
-                // clamp as the desktop wheel (top = 0, bottom exposes the
-                // last post + breathing room). Taps/momentum are the M-UX
-                // pass; the full pointer dispatch is window-coupled today.
+                // TOUCH SLOP (MC.4d): a press that stays within ~a finger's
+                // wobble and releases is a TAP — forwarded to the shared
+                // dispatch below as the same button_down/button_up pair the
+                // mouse sends (release-activation and hit-testing then work
+                // untouched). A press that travels further is a SCROLL: the
+                // feed follows the finger 1:1 with the desktop wheel's pixel
+                // clamp, and nothing is forwarded (a scroll is not a click).
+                // Momentum/fling is the M-UX pass. Bare moves never forward:
+                // a finger casts no hover.
+                const touch_slop: i32 = 28; // device px, ~a fingertip's wobble
                 for (touch_events.items) |tev| switch (tev.kind) {
-                    .button_down => m.drag_y = tev.y,
-                    .move => if (m.drag_y >= 0) {
-                        const dy_phys: i32 = @as(i32, tev.y) - m.drag_y;
+                    .button_down => {
+                        m.down_x = tev.x;
+                        m.down_y = tev.y;
+                        m.scrolling = false;
                         m.drag_y = tev.y;
-                        const scale: f32 = if (rs.gpu_state) |*gs| gs.scale else 1.0;
-                        rs.gscroll_px += @intFromFloat(@as(f32, @floatFromInt(dy_phys)) / scale);
-                        const view_h: i32 = @intFromFloat(@as(f32, @floatFromInt(m.height_px)) / scale);
-                        const min_scroll: i32 = @min(0, view_h - rs.gcontent_h - 24);
-                        rs.gscroll_px = @max(min_scroll, @min(0, rs.gscroll_px));
                     },
-                    .button_up => m.drag_y = -1,
+                    .move => if (m.down_x >= 0) {
+                        if (!m.scrolling and
+                            (@abs(@as(i32, tev.y) - m.down_y) > touch_slop or
+                                @abs(@as(i32, tev.x) - m.down_x) > touch_slop)) m.scrolling = true;
+                        if (m.scrolling) {
+                            const dy_phys: i32 = @as(i32, tev.y) - m.drag_y;
+                            m.drag_y = tev.y;
+                            const scale: f32 = if (rs.gpu_state) |*gs| gs.scale else 1.0;
+                            rs.gscroll_px += @intFromFloat(@as(f32, @floatFromInt(dy_phys)) / scale);
+                            const view_h: i32 = @intFromFloat(@as(f32, @floatFromInt(m.height_px)) / scale);
+                            const min_scroll: i32 = @min(0, view_h - rs.gcontent_h - 24);
+                            rs.gscroll_px = @max(min_scroll, @min(0, rs.gscroll_px));
+                        }
+                    },
+                    .button_up => {
+                        if (m.down_x >= 0 and !m.scrolling) {
+                            // A clean tap: the press point, then the release.
+                            pointer_events.append(gpa, .{ .x = @intCast(m.down_x), .y = @intCast(m.down_y), .kind = .button_down, .button = 1, .mods = 0, ._pad = 0 }) catch {};
+                            pointer_events.append(gpa, .{ .x = tev.x, .y = tev.y, .kind = .button_up, .button = 1, .mods = 0, ._pad = 0 }) catch {};
+                        }
+                        m.down_x = -1;
+                        m.down_y = -1;
+                        m.scrolling = false;
+                        m.drag_y = -1;
+                    },
                     else => {},
                 };
             },
             .window => |win| {
                 // The pump translates X keys into the same bytes a tty
-                // would deliver; close/resize fold into the loop's own
-                // re-render lap (E2: a window hiccup is not a crash).
-                var pumped_bytes: std.ArrayList(u8) = .empty;
-                defer pumped_bytes.deinit(gpa);
-                // Cut 5.1: the pointer channel arrives but is not yet
-                // consumed — hit-testing lands in 5.2 (GUI roadmap §7).
-                // Drained per lap so a motion flood never accumulates.
-                var pointer_events: std.ArrayList(layout_core.InputEvent) = .empty;
-                defer pointer_events.deinit(gpa);
+                // would deliver (into the hoisted lists above); close/resize
+                // fold into the loop's own re-render lap (E2: a window
+                // hiccup is not a crash).
+                fb_w = win.fb.width;
+                fb_h = win.fb.height;
                 // Block up to the driver's wait budget — the 16ms-vs-500ms
                 // cadence policy lives with the desktop driver now (MC.4).
                 const pumped = window_shell.pump(win, wait_budget_ms, gpa, &pumped_bytes, &pointer_events) catch {
@@ -2439,1295 +2475,1306 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         try present(gpa, rs.out, arena, &rs.prev, &rs.next, backend);
                     }
                 }
-                // ---- the mouse becomes the app (5.2): consume the channel.
-                // Wheel scrolls the pixel viewport; motion drives hover;
-                // a click selects its card, and an action zone injects the
-                // SAME byte the bound key sends, so the dispatch below is
-                // the one and only path (timeline_ui.keyFor — round-trip
-                // tested against actionFor). Hit rects are last frame's:
-                // immediate-mode's standard one-frame contract.
-                if (rs.mode == .timeline) if (pix) |g| {
-                    // Pointer coords are PIXELS; the grid thinks in cells.
-                    // Use the SAME zoom-derived cell size the renderer
-                    // used, so clicks land on the cell under the cursor at
-                    // any zoom. Convert once, then everything is cell-space.
-                    const pcell = cellSize(win.fb.width, g.zoom.*);
-                    // The GPU feed lays out in LOGICAL pixels (design_w, scaled
-                    // to fill); the software feed in physical pixels. So the
-                    // region hit-test and the scroll clamp work in whichever
-                    // space the layout used — map the physical pointer back to
-                    // logical for GPU (÷scale), pass it through for software.
-                    const gpu_scale: f32 = if (g.gpu) |gs| gs.scale else 1.0;
-                    for (pointer_events.items) |pev| {
-                        const cx: u16 = pev.x / pcell.w;
-                        const cy: u16 = pev.y / pcell.h;
-                        const rx: i32 = if (g.gpu != null) @intFromFloat(@as(f32, @floatFromInt(pev.x)) / gpu_scale) else @intCast(pev.x);
-                        const ry: i32 = if (g.gpu != null) @intFromFloat(@as(f32, @floatFromInt(pev.y)) / gpu_scale) else @intCast(pev.y);
-                        switch (pev.kind) {
-                            .wheel => {
-                                if (g.gpu) |gs| gs.menu_open = false; // scrolling dismisses the menu
-                                rs.grepost_menu = null; // …and the Repost/Quote popover
-                                const delta: i32 = if (pev.button == 5) 3 else -3;
-                                g.view.scroll_rows += delta;
-                                // The premium feed scrolls in PIXELS. Wheel down
-                                // (button 5) moves content up, so the offset goes
-                                // more negative; clamp so you cannot scroll past
-                                // the ends (top = 0, bottom exposes the last post
-                                // + a little breathing room). content_h is in the
-                                // layout's space, so the viewport height matches.
-                                if (dev_chat and g.screen.* == feed_view.screen_messages) {
-                                    // The chat thread is BOTTOM-anchored: wheel UP walks
-                                    // back into history. The shared clamp keeps scroll in
-                                    // [min_scroll, 0]; the dispatch passes -scroll to
-                                    // layoutChat as its positive history offset.
-                                    g.scroll.* += delta * 28;
-                                } else {
-                                    g.scroll.* -= delta * 28;
+            },
+        }
+        // ---- the mouse becomes the app (5.2): consume the channel.
+        // Wheel scrolls the pixel viewport; motion drives hover;
+        // a click selects its card, and an action zone injects the
+        // SAME byte the bound key sends, so the dispatch below is
+        // the one and only path (timeline_ui.keyFor — round-trip
+        // tested against actionFor). Hit rects are last frame's:
+        // immediate-mode's standard one-frame contract.
+        if (rs.mode == .timeline) if (pix) |g| {
+            // Pointer coords are PIXELS; the grid thinks in cells.
+            // Use the SAME zoom-derived cell size the renderer
+            // used, so clicks land on the cell under the cursor at
+            // any zoom. Convert once, then everything is cell-space.
+            const pcell = cellSize(fb_w, g.zoom.*);
+            // The GPU feed lays out in LOGICAL pixels (design_w, scaled
+            // to fill); the software feed in physical pixels. So the
+            // region hit-test and the scroll clamp work in whichever
+            // space the layout used — map the physical pointer back to
+            // logical for GPU (÷scale), pass it through for software.
+            const gpu_scale: f32 = if (g.gpu) |gs| gs.scale else 1.0;
+            for (pointer_events.items) |pev| {
+                const cx: u16 = pev.x / pcell.w;
+                const cy: u16 = pev.y / pcell.h;
+                const rx: i32 = if (g.gpu != null) @intFromFloat(@as(f32, @floatFromInt(pev.x)) / gpu_scale) else @intCast(pev.x);
+                const ry: i32 = if (g.gpu != null) @intFromFloat(@as(f32, @floatFromInt(pev.y)) / gpu_scale) else @intCast(pev.y);
+                switch (pev.kind) {
+                    .wheel => {
+                        if (g.gpu) |gs| gs.menu_open = false; // scrolling dismisses the menu
+                        rs.grepost_menu = null; // …and the Repost/Quote popover
+                        const delta: i32 = if (pev.button == 5) 3 else -3;
+                        g.view.scroll_rows += delta;
+                        // The premium feed scrolls in PIXELS. Wheel down
+                        // (button 5) moves content up, so the offset goes
+                        // more negative; clamp so you cannot scroll past
+                        // the ends (top = 0, bottom exposes the last post
+                        // + a little breathing room). content_h is in the
+                        // layout's space, so the viewport height matches.
+                        if (dev_chat and g.screen.* == feed_view.screen_messages) {
+                            // The chat thread is BOTTOM-anchored: wheel UP walks
+                            // back into history. The shared clamp keeps scroll in
+                            // [min_scroll, 0]; the dispatch passes -scroll to
+                            // layoutChat as its positive history offset.
+                            g.scroll.* += delta * 28;
+                        } else {
+                            g.scroll.* -= delta * 28;
+                        }
+                        const view_h: i32 = if (g.gpu != null)
+                            @intFromFloat(@as(f32, @floatFromInt(fb_h)) / gpu_scale)
+                        else
+                            @intCast(fb_h);
+                        const min_scroll: i32 = @min(0, view_h - g.content_h.* - 24);
+                        g.scroll.* = @max(min_scroll, @min(0, g.scroll.*));
+                        effect_core.shiftY(g.active, -delta);
+                        // Pull-to-refresh: a wheel-up (button 4 → delta < 0)
+                        // that lands while already pinned at the top of Home
+                        // builds overscroll; past the threshold it asks for a
+                        // refresh. A wheel-down cancels the pull.
+                        if (g.screen.* == feed_view.screen_home and pev.button != 5 and g.scroll.* == 0) {
+                            rs.overscroll_accum += 28;
+                            if (rs.overscroll_accum >= pull_refresh_threshold) {
+                                rs.pull_refresh_requested = true;
+                                rs.overscroll_accum = 0;
+                            } else {
+                                // Visible proof the pull is registering (the
+                                // animated indicator is the deferred polish).
+                                rs.status = "↑ keep pulling to refresh";
+                            }
+                        } else if (pev.button == 5) {
+                            rs.overscroll_accum = 0;
+                        }
+                    },
+                    .move => {
+                        // Track the pointer in LOGICAL coords for the hover
+                        // highlight (rx/ry are already mapped through scale).
+                        rs.ghover_x = rx;
+                        rs.ghover_y = ry;
+                        // A live drag: the ghost card follows the pointer. On the
+                        // loadout page the dragged surface may be reply/zone.
+                        if (rs.page_drag_surface) |s| {
+                            const ui = switch (s) {
+                                1 => &rs.reply_ui,
+                                2 => &rs.zone_ui,
+                                else => &rs.gsocket_ui,
+                            };
+                            ui.drag_x = rx;
+                            ui.drag_y = ry;
+                        } else if (rs.gsocket_ui.drag_active != null) {
+                            rs.gsocket_ui.drag_x = rx;
+                            rs.gsocket_ui.drag_y = ry;
+                        }
+                        const field_hit = field_ui.hitTest(cx, cy, g.hr.slice());
+                        g.view.hover = if (field_hit) |hit| hit.target else field_ui.no_target;
+                        // Pointer affordance: the hand cursor over anything
+                        // clickable, the arrow otherwise. The SAME hit-tests
+                        // the click path below consults — feed regions, the
+                        // lens socket, on the Algorithms page the reply/zone
+                        // sockets too, and the legacy cell rects — so the
+                        // cursor and the click always agree on what is tappable.
+                        const over_clickable =
+                            feed_view.hitTest(g.regions.items, rx, ry) != null or
+                            lens_socket.hitTest(g.socket_hits.items, rx, ry) != null or
+                            (rs.gscreen == feed_view.screen_loadout and
+                                (lens_socket.hitTest(rs.reply_hits.items, rx, ry) != null or
+                                    lens_socket.hitTest(rs.zone_hits.items, rx, ry) != null)) or
+                            field_hit != null;
+                        // A live text-selection drag over the rooted post:
+                        // extend the selection to the caret under the pointer.
+                        if (g.gpu) |gs| if (gs.sel_dragging) {
+                            gs.sel_focus = text_select.caretAtPoint(gs.sel_glyphs.items, rx, ry);
+                        };
+                        // Cursor shape, by priority: grab while dragging a lens
+                        // card; the I-beam over the rooted post's selectable body
+                        // (or mid text-drag); the hand over anything else
+                        // clickable; the arrow otherwise.
+                        const dragging_card = rs.page_drag_surface != null or rs.gsocket_ui.drag_active != null;
+                        const over_focus_text = rs.gscreen == feed_view.screen_thread and blk: {
+                            const h = feed_view.hitTest(g.regions.items, rx, ry) orelse break :blk false;
+                            break :blk h.kind == .post_body and h.post < view_items.len and view_items[h.post].is_focus;
+                        };
+                        const sel_dragging = if (g.gpu) |gs| gs.sel_dragging else false;
+                        const cursor_shape: layout_core.Cursor = if (dragging_card)
+                            .grab
+                        else if (over_focus_text or sel_dragging)
+                            .text
+                        else if (over_clickable)
+                            .pointer
+                        else
+                            .default;
+                        switch (backend) {
+                            .window => |w| window_shell.setCursor(w, cursor_shape),
+                            else => {}, // a finger casts no cursor
+                        }
+                        // GPU: the cursor lights the field (drawFieldGrid
+                        // halo) and leaves a gentle colourless wake.
+                        if (g.gpu) |gs| {
+                            gs.mcx = @as(f32, @floatFromInt(pev.x)) / @as(f32, @floatFromInt(field_cell_w));
+                            gs.mcy = @as(f32, @floatFromInt(pev.y)) / @as(f32, @floatFromInt(field_cell_h));
+                            if (gs.cols > 0 and gs.rows > 0) {
+                                const sx: u32 = @min(@as(u32, @intFromFloat(@max(0.0, gs.mcx))), gs.cols - 1);
+                                const sy: u32 = @min(@as(u32, @intFromFloat(@max(0.0, gs.mcy))), gs.rows - 1);
+                                // hover wake: a gentle, colourless ripple at the pointer.
+                                gs.splashes.append(gpa, .{ .x = sx, .y = sy, .radius = 3, .amp = 0.4 }) catch {};
+                            }
+                        }
+                    },
+                    .button_down => {
+                        // Right-click → the context menu over the rooted
+                        // post body. Left-click while the menu is open hits
+                        // an item or dismisses it (never the feed beneath).
+                        if (pev.button == 3) {
+                            if (g.gpu) |gs| openContextMenu(gs, rs.gscreen, view_items, g.regions.items, rx, ry);
+                        } else if (pev.button == 1) {
+                            if (g.gpu) |gs| if (gs.menu_open) {
+                                menuClick(gpa, gs, backend, rx, ry);
+                                continue;
+                            };
+                        // Premium buttons are hit-tested against the
+                        // regions the feed emitted this frame. A like/
+                        // repost tap blooms the burst right at the icon:
+                        // on the GPU it stamps the living field (a real
+                        // dye splash); on the software path it triggers
+                        // the legacy burst effect. (Persisting a MOUSE
+                        // tap is still the deferred slice; the keyboard
+                        // like persists and bursts via fireEngageEffect.)
+                        // If nothing premium is hit, fall through to the
+                        // legacy cell hit rects.
+                        //
+                        // THE LENS SOCKET is tested FIRST — it sits in the
+                        // sticky header, on top of the feed (its hits live
+                        // in their own space). Seating re-tints + animates
+                        // the swap; re-ranking the feed awaits the discover
+                        // engine (only Following exists today).
+                        var socket_handled = false;
+                        if (rs.gscreen == feed_view.screen_loadout) {
+                            // Loadout page: edit the surface under the cursor (feed /
+                            // reply / zone). A handle press (.reorder) starts a drag for
+                            // that surface; everything else is a click edit.
+                            if (lens_socket.hitTest(g.socket_hits.items, rx, ry)) |sact| {
+                                switch (sact) {
+                                    .reorder => |r| {
+                                        rs.page_drag_surface = 0;
+                                        rs.gsocket_ui.drag_active = trayIndexOfCid(rs.socket_cards, rs.socket_blob, r.lens);
+                                        rs.gsocket_ui.drag_x = rx;
+                                        rs.gsocket_ui.drag_y = ry;
+                                    },
+                                    else => applyLoadoutAction(sact, rs.socket_cards, rs.socket_blob, &rs.gseated, &rs.gsocket_ui, &rs.loadout_dirty),
                                 }
-                                const view_h: i32 = if (g.gpu != null)
-                                    @intFromFloat(@as(f32, @floatFromInt(win.fb.height)) / gpu_scale)
-                                else
-                                    @intCast(win.fb.height);
-                                const min_scroll: i32 = @min(0, view_h - g.content_h.* - 24);
-                                g.scroll.* = @max(min_scroll, @min(0, g.scroll.*));
-                                effect_core.shiftY(g.active, -delta);
-                                // Pull-to-refresh: a wheel-up (button 4 → delta < 0)
-                                // that lands while already pinned at the top of Home
-                                // builds overscroll; past the threshold it asks for a
-                                // refresh. A wheel-down cancels the pull.
-                                if (g.screen.* == feed_view.screen_home and pev.button != 5 and g.scroll.* == 0) {
-                                    rs.overscroll_accum += 28;
-                                    if (rs.overscroll_accum >= pull_refresh_threshold) {
-                                        rs.pull_refresh_requested = true;
-                                        rs.overscroll_accum = 0;
-                                    } else {
-                                        // Visible proof the pull is registering (the
-                                        // animated indicator is the deferred polish).
-                                        rs.status = "↑ keep pulling to refresh";
+                                socket_handled = true;
+                            } else if (lens_socket.hitTest(rs.reply_hits.items, rx, ry)) |sact| {
+                                switch (sact) {
+                                    .reorder => |r| {
+                                        rs.page_drag_surface = 1;
+                                        rs.reply_ui.drag_active = trayIndexOfCid(rs.reply_cards, rs.reply_blob, r.lens);
+                                        rs.reply_ui.drag_x = rx;
+                                        rs.reply_ui.drag_y = ry;
+                                    },
+                                    else => applyLoadoutAction(sact, rs.reply_cards, rs.reply_blob, &rs.reply_seated, &rs.reply_ui, &rs.loadout_dirty),
+                                }
+                                socket_handled = true;
+                            } else if (lens_socket.hitTest(rs.zone_hits.items, rx, ry)) |sact| {
+                                switch (sact) {
+                                    .reorder => |r| {
+                                        rs.page_drag_surface = 2;
+                                        rs.zone_ui.drag_active = trayIndexOfCid(rs.zone_cards, rs.zone_blob, r.lens);
+                                        rs.zone_ui.drag_x = rx;
+                                        rs.zone_ui.drag_y = ry;
+                                    },
+                                    else => applyLoadoutAction(sact, rs.zone_cards, rs.zone_blob, &rs.zone_seated, &rs.zone_ui, &rs.loadout_dirty),
+                                }
+                                socket_handled = true;
+                            }
+                        } else if (rs.gscreen == feed_view.screen_thread) {
+                            // The inline REPLY socket on a thread: a switcher over the
+                            // reply loadout (shared with the Algorithms page). Order-only,
+                            // no view retint. Reorder lives on the Algorithms page.
+                            if (lens_socket.hitTest(g.socket_hits.items, rx, ry)) |sact| {
+                                socket_handled = true;
+                                switch (sact) {
+                                    .toggle_tray => rs.reply_ui.open = !rs.reply_ui.open,
+                                    .seat => |cid| {
+                                        if (trayIndexOfCid(rs.reply_cards, rs.reply_blob, cid)) |idx| {
+                                            rs.reply_seated = idx;
+                                            rs.loadout_dirty = true;
+                                        }
+                                        rs.reply_ui.open = false;
+                                        rs.reply_ui.expanded = null;
+                                        rs.reply_ui.picking = null;
+                                    },
+                                    .get_more => {
+                                        rs.reply_ui.open = false;
+                                        rs.gscreen = feed_view.screen_loadout;
+                                        rs.gscroll_px = 0;
+                                    },
+                                    else => applyLoadoutAction(sact, rs.reply_cards, rs.reply_blob, &rs.reply_seated, &rs.reply_ui, &rs.loadout_dirty),
+                                }
+                            }
+                        } else if (rs.gscreen == feed_view.screen_zones) {
+                            // The zone page's socket: a switcher over the ZONE
+                            // loadout (shared with the Algorithms page). Order-only;
+                            // no real ranking power yet (the discover engine is
+                            // unbuilt). Reorder lives on the Algorithms page.
+                            if (lens_socket.hitTest(g.socket_hits.items, rx, ry)) |sact| {
+                                socket_handled = true;
+                                switch (sact) {
+                                    .toggle_tray => rs.zone_ui.open = !rs.zone_ui.open,
+                                    .seat => |cid| {
+                                        if (trayIndexOfCid(rs.zone_cards, rs.zone_blob, cid)) |idx| {
+                                            rs.zone_seated = idx;
+                                            rs.loadout_dirty = true;
+                                        }
+                                        rs.zone_ui.open = false;
+                                        rs.zone_ui.expanded = null;
+                                        rs.zone_ui.picking = null;
+                                    },
+                                    .get_more => {
+                                        rs.zone_ui.open = false;
+                                        rs.gscreen = feed_view.screen_loadout;
+                                        rs.gscroll_px = 0;
+                                    },
+                                    else => applyLoadoutAction(sact, rs.zone_cards, rs.zone_blob, &rs.zone_seated, &rs.zone_ui, &rs.loadout_dirty),
+                                }
+                            }
+                        } else if (lens_socket.hitTest(g.socket_hits.items, rx, ry)) |sact| {
+                            socket_handled = true;
+                            // Any socket action other than opening/using the picker
+                            // closes it (the open/set arms re-open or keep as needed).
+                            switch (sact) {
+                                .open_swatch, .set_color => {},
+                                else => rs.gsocket_ui.picking = null,
+                            }
+                            switch (sact) {
+                                .toggle_tray => rs.gsocket_ui.open = !rs.gsocket_ui.open,
+                                .seat => |cid| {
+                                    if (trayIndexOfCid(rs.socket_cards, rs.socket_blob, cid)) |ni| {
+                                        if (ni != rs.gseated) {
+                                            rs.gsocket_ui.swap_from = rs.gseated;
+                                            rs.gsocket_ui.swap_to = ni;
+                                            rs.gsocket_ui.swap_phase = 1;
+                                            rs.gseated = ni;
+                                            // Seat = re-rank now, scroll to top (owner decision
+                                            // 2026-06-22). The visible gesture today; the actual
+                                            // lens re-ordering is the discover-engine track —
+                                            // THIS is the seam it plugs into (re-rank the feed by
+                                            // the seated lens here, then reset scroll).
+                                            rs.gscroll_px = 0;
+                                        }
                                     }
-                                } else if (pev.button == 5) {
-                                    rs.overscroll_accum = 0;
-                                }
-                            },
-                            .move => {
-                                // Track the pointer in LOGICAL coords for the hover
-                                // highlight (rx/ry are already mapped through scale).
-                                rs.ghover_x = rx;
-                                rs.ghover_y = ry;
-                                // A live drag: the ghost card follows the pointer. On the
-                                // loadout page the dragged surface may be reply/zone.
-                                if (rs.page_drag_surface) |s| {
-                                    const ui = switch (s) {
-                                        1 => &rs.reply_ui,
-                                        2 => &rs.zone_ui,
-                                        else => &rs.gsocket_ui,
-                                    };
-                                    ui.drag_x = rx;
-                                    ui.drag_y = ry;
-                                } else if (rs.gsocket_ui.drag_active != null) {
+                                    rs.gsocket_ui.expanded = null;
+                                    rs.gsocket_ui.open = false; // watch it plug in, then the tray retracts
+                                    rs.loadout_dirty = true;
+                                },
+                                // ⓘ → expand inline detail; tapping the open one collapses it.
+                                .expand => |cid| {
+                                    if (trayIndexOfCid(rs.socket_cards, rs.socket_blob, cid)) |idx| {
+                                        rs.gsocket_ui.expanded = if (rs.gsocket_ui.expanded == idx) null else idx;
+                                    }
+                                },
+                                .collapse => rs.gsocket_ui.expanded = null,
+                                // Press on a drag handle → start dragging that lens (the
+                                // seated one has no handle, §7.3). The ghost follows the
+                                // pointer; the drop lands on button_up.
+                                .reorder => |r| {
+                                    rs.gsocket_ui.picking = null;
+                                    rs.gsocket_ui.drag_active = trayIndexOfCid(rs.socket_cards, rs.socket_blob, r.lens);
                                     rs.gsocket_ui.drag_x = rx;
                                     rs.gsocket_ui.drag_y = ry;
+                                },
+                                // Tap a card's swatch → open/close its color picker (§11.5).
+                                .open_swatch => |cid| {
+                                    const idx = trayIndexOfCid(rs.socket_cards, rs.socket_blob, cid);
+                                    rs.gsocket_ui.picking = if (rs.gsocket_ui.picking == idx) null else idx;
+                                },
+                                // Pick a color → recolor that lens (totally the user's
+                                // call; duplicates allowed). If it's the seated lens, the
+                                // whole-UI accent follows next frame (seatedAccent).
+                                .set_color => |sc2| {
+                                    if (trayIndexOfCid(rs.socket_cards, rs.socket_blob, sc2.lens)) |idx| {
+                                        if (idx < rs.socket_cards.len) rs.socket_cards[idx].color = sc2.color;
+                                        rs.loadout_dirty = true;
+                                    }
+                                    rs.gsocket_ui.picking = null;
+                                },
+                                // "get more" → the Algorithms (loadout) page.
+                                .get_more => {
+                                    rs.gsocket_ui.picking = null;
+                                    rs.gsocket_ui.open = false;
+                                    rs.gscreen = feed_view.screen_loadout;
+                                },
+                            }
+                        }
+                        if (!socket_handled) {
+                            // Release-activation: ARM the tap (don't fire). It
+                            // fires on button_up only if the release lands on
+                            // the same target — press-then-slide-off cancels.
+                            if (feed_view.hitTest(g.regions.items, rx, ry)) |hit| {
+                                rs.gsocket_ui.picking = null; // a click off the socket closes the picker
+                                // The ROOTED post's body is selectable, not a
+                                // re-root target: a press there places the caret
+                                // and begins a text selection (web-style — a
+                                // release without a drag clears it). Don't arm a tap.
+                                const is_focus_body = rs.gscreen == feed_view.screen_thread and hit.kind == .post_body and
+                                    hit.post < view_items.len and view_items[hit.post].is_focus;
+                                if (is_focus_body) {
+                                    if (g.gpu) |gs| selectPress(gs, rx, ry, &rs.last_click_ns, &rs.last_click_x, &rs.last_click_y, &rs.click_count, clock_shell.monotonicNanos());
+                                } else {
+                                    rs.armed_kind = hit.kind;
+                                    rs.armed_post = hit.post;
                                 }
-                                const field_hit = field_ui.hitTest(cx, cy, g.hr.slice());
-                                g.view.hover = if (field_hit) |hit| hit.target else field_ui.no_target;
-                                // Pointer affordance: the hand cursor over anything
-                                // clickable, the arrow otherwise. The SAME hit-tests
-                                // the click path below consults — feed regions, the
-                                // lens socket, on the Algorithms page the reply/zone
-                                // sockets too, and the legacy cell rects — so the
-                                // cursor and the click always agree on what is tappable.
-                                const over_clickable =
-                                    feed_view.hitTest(g.regions.items, rx, ry) != null or
-                                    lens_socket.hitTest(g.socket_hits.items, rx, ry) != null or
-                                    (rs.gscreen == feed_view.screen_loadout and
-                                        (lens_socket.hitTest(rs.reply_hits.items, rx, ry) != null or
-                                            lens_socket.hitTest(rs.zone_hits.items, rx, ry) != null)) or
-                                    field_hit != null;
-                                // A live text-selection drag over the rooted post:
-                                // extend the selection to the caret under the pointer.
-                                if (g.gpu) |gs| if (gs.sel_dragging) {
-                                    gs.sel_focus = text_select.caretAtPoint(gs.sel_glyphs.items, rx, ry);
-                                };
-                                // Cursor shape, by priority: grab while dragging a lens
-                                // card; the I-beam over the rooted post's selectable body
-                                // (or mid text-drag); the hand over anything else
-                                // clickable; the arrow otherwise.
-                                const dragging_card = rs.page_drag_surface != null or rs.gsocket_ui.drag_active != null;
-                                const over_focus_text = rs.gscreen == feed_view.screen_thread and blk: {
-                                    const h = feed_view.hitTest(g.regions.items, rx, ry) orelse break :blk false;
-                                    break :blk h.kind == .post_body and h.post < view_items.len and view_items[h.post].is_focus;
-                                };
-                                const sel_dragging = if (g.gpu) |gs| gs.sel_dragging else false;
-                                window_shell.setCursor(win, if (dragging_card)
-                                    .grab
-                                else if (over_focus_text or sel_dragging)
-                                    .text
-                                else if (over_clickable)
-                                    .pointer
-                                else
-                                    .default);
-                                // GPU: the cursor lights the field (drawFieldGrid
-                                // halo) and leaves a gentle colourless wake.
-                                if (g.gpu) |gs| {
-                                    gs.mcx = @as(f32, @floatFromInt(pev.x)) / @as(f32, @floatFromInt(field_cell_w));
-                                    gs.mcy = @as(f32, @floatFromInt(pev.y)) / @as(f32, @floatFromInt(field_cell_h));
-                                    if (gs.cols > 0 and gs.rows > 0) {
-                                        const sx: u32 = @min(@as(u32, @intFromFloat(@max(0.0, gs.mcx))), gs.cols - 1);
-                                        const sy: u32 = @min(@as(u32, @intFromFloat(@max(0.0, gs.mcy))), gs.rows - 1);
-                                        // hover wake: a gentle, colourless ripple at the pointer.
-                                        gs.splashes.append(gpa, .{ .x = sx, .y = sy, .radius = 3, .amp = 0.4 }) catch {};
-                                    }
+                            } else if (field_ui.hitTest(cx, cy, g.hr.slice())) |_| {
+                                rs.armed_legacy = true;
+                                rs.armed_cx = cx;
+                                rs.armed_cy = cy;
+                            }
+                        }
+                        }
+                    },
+                    // Release-activation: the armed tap fires here (see the
+                    // button_down arm). Placed after the drag-drop handling so
+                    // a drag never also triggers a tap.
+                    .button_up => if (pev.button == 1) {
+                        // End a text-selection drag (the selection itself
+                        // persists until the next press; a no-drag press left
+                        // anchor==focus, i.e. an empty selection = cleared).
+                        if (g.gpu) |gs| gs.sel_dragging = false;
+                        // Finish any drag with a drop first (the press began it).
+                        if (rs.gscreen == feed_view.screen_loadout) {
+                            if (rs.page_drag_surface) |s| switch (s) {
+                                0 => pageDragDrop(rs.socket_cards, rs.socket_blob, &rs.gseated, &rs.gsocket_ui, rs.page_geoms[0], &rs.loadout_dirty),
+                                1 => pageDragDrop(rs.reply_cards, rs.reply_blob, &rs.reply_seated, &rs.reply_ui, rs.page_geoms[1], &rs.loadout_dirty),
+                                else => pageDragDrop(rs.zone_cards, rs.zone_blob, &rs.zone_seated, &rs.zone_ui, rs.page_geoms[2], &rs.loadout_dirty),
+                            };
+                        } else if (rs.gsocket_ui.drag_active) |d| {
+                            const geom = feed_view.homeSocketGeom(if (rs.gpu_state != null) @as(i32, @intCast(design_w)) else @as(i32, @intCast(fb_w)));
+                            const to: u32 = lens_socket.dropIndex(home_tray, rs.gsocket_ui, geom) orelse d;
+                            const seated_off = if (rs.gseated < rs.socket_cards.len) rs.socket_cards[rs.gseated].cid.off else 0;
+                            reorderTray(rs.socket_cards, d, to);
+                            for (rs.socket_cards, 0..) |c, ix| {
+                                if (c.cid.off == seated_off) {
+                                    rs.gseated = @intCast(ix);
+                                    break;
                                 }
-                            },
-                            .button_down => {
-                                // Right-click → the context menu over the rooted
-                                // post body. Left-click while the menu is open hits
-                                // an item or dismisses it (never the feed beneath).
-                                if (pev.button == 3) {
-                                    if (g.gpu) |gs| openContextMenu(gs, rs.gscreen, view_items, g.regions.items, rx, ry);
-                                } else if (pev.button == 1) {
-                                    if (g.gpu) |gs| if (gs.menu_open) {
-                                        menuClick(gpa, gs, backend, rx, ry);
-                                        continue;
-                                    };
-                                // Premium buttons are hit-tested against the
-                                // regions the feed emitted this frame. A like/
-                                // repost tap blooms the burst right at the icon:
-                                // on the GPU it stamps the living field (a real
-                                // dye splash); on the software path it triggers
-                                // the legacy burst effect. (Persisting a MOUSE
-                                // tap is still the deferred slice; the keyboard
-                                // like persists and bursts via fireEngageEffect.)
-                                // If nothing premium is hit, fall through to the
-                                // legacy cell hit rects.
-                                //
-                                // THE LENS SOCKET is tested FIRST — it sits in the
-                                // sticky header, on top of the feed (its hits live
-                                // in their own space). Seating re-tints + animates
-                                // the swap; re-ranking the feed awaits the discover
-                                // engine (only Following exists today).
-                                var socket_handled = false;
-                                if (rs.gscreen == feed_view.screen_loadout) {
-                                    // Loadout page: edit the surface under the cursor (feed /
-                                    // reply / zone). A handle press (.reorder) starts a drag for
-                                    // that surface; everything else is a click edit.
-                                    if (lens_socket.hitTest(g.socket_hits.items, rx, ry)) |sact| {
-                                        switch (sact) {
-                                            .reorder => |r| {
-                                                rs.page_drag_surface = 0;
-                                                rs.gsocket_ui.drag_active = trayIndexOfCid(rs.socket_cards, rs.socket_blob, r.lens);
-                                                rs.gsocket_ui.drag_x = rx;
-                                                rs.gsocket_ui.drag_y = ry;
-                                            },
-                                            else => applyLoadoutAction(sact, rs.socket_cards, rs.socket_blob, &rs.gseated, &rs.gsocket_ui, &rs.loadout_dirty),
-                                        }
-                                        socket_handled = true;
-                                    } else if (lens_socket.hitTest(rs.reply_hits.items, rx, ry)) |sact| {
-                                        switch (sact) {
-                                            .reorder => |r| {
-                                                rs.page_drag_surface = 1;
-                                                rs.reply_ui.drag_active = trayIndexOfCid(rs.reply_cards, rs.reply_blob, r.lens);
-                                                rs.reply_ui.drag_x = rx;
-                                                rs.reply_ui.drag_y = ry;
-                                            },
-                                            else => applyLoadoutAction(sact, rs.reply_cards, rs.reply_blob, &rs.reply_seated, &rs.reply_ui, &rs.loadout_dirty),
-                                        }
-                                        socket_handled = true;
-                                    } else if (lens_socket.hitTest(rs.zone_hits.items, rx, ry)) |sact| {
-                                        switch (sact) {
-                                            .reorder => |r| {
-                                                rs.page_drag_surface = 2;
-                                                rs.zone_ui.drag_active = trayIndexOfCid(rs.zone_cards, rs.zone_blob, r.lens);
-                                                rs.zone_ui.drag_x = rx;
-                                                rs.zone_ui.drag_y = ry;
-                                            },
-                                            else => applyLoadoutAction(sact, rs.zone_cards, rs.zone_blob, &rs.zone_seated, &rs.zone_ui, &rs.loadout_dirty),
-                                        }
-                                        socket_handled = true;
+                            }
+                            rs.gsocket_ui.drag_active = to; // the card now lives at `to`
+                            rs.gsocket_ui.settle_phase = 1; // ghost eases from release point into its slot
+                            rs.loadout_dirty = true;
+                        }
+                        // Release-activation: fire the armed feed tap ONLY if the
+                        // release lands on the same target the press armed. A press
+                        // that began a drag never armed a tap, so a drag never also
+                        // fires one.
+                        if (rs.armed_kind) |ak| {
+                            if (feed_view.hitTest(g.regions.items, rx, ry)) |hit| {
+                                if (hit.kind == ak and hit.post == rs.armed_post) {
+                                    // An open Repost/Quote menu is dismissed by any tap
+                                    // outside its rows (and the repost button that toggles
+                                    // it), and the tap is swallowed — the popover norm.
+                                    if (rs.grepost_menu != null and hit.kind != .repost_do and hit.kind != .quote_new and hit.kind != .repost) {
+                                        rs.grepost_menu = null;
+                                    } else switch (hit.kind) {
+                                // Left-rail destination: switch the active screen
+                                // (post carries the Screen index). Selecting Profile
+                                // targets YOUR own profile; the next frame re-renders.
+                                .nav => {
+                                    rs.gscreen = @intCast(hit.post);
+                                    if (rs.gscreen == feed_view.screen_profile) {
+                                        rs.profile_target_did = session.did;
+                                        rs.profile_dirty = true;
                                     }
-                                } else if (rs.gscreen == feed_view.screen_thread) {
-                                    // The inline REPLY socket on a thread: a switcher over the
-                                    // reply loadout (shared with the Algorithms page). Order-only,
-                                    // no view retint. Reorder lives on the Algorithms page.
-                                    if (lens_socket.hitTest(g.socket_hits.items, rx, ry)) |sact| {
-                                        socket_handled = true;
-                                        switch (sact) {
-                                            .toggle_tray => rs.reply_ui.open = !rs.reply_ui.open,
-                                            .seat => |cid| {
-                                                if (trayIndexOfCid(rs.reply_cards, rs.reply_blob, cid)) |idx| {
-                                                    rs.reply_seated = idx;
-                                                    rs.loadout_dirty = true;
-                                                }
-                                                rs.reply_ui.open = false;
-                                                rs.reply_ui.expanded = null;
-                                                rs.reply_ui.picking = null;
-                                            },
-                                            .get_more => {
-                                                rs.reply_ui.open = false;
-                                                rs.gscreen = feed_view.screen_loadout;
-                                                rs.gscroll_px = 0;
-                                            },
-                                            else => applyLoadoutAction(sact, rs.reply_cards, rs.reply_blob, &rs.reply_seated, &rs.reply_ui, &rs.loadout_dirty),
+                                    // Each screen starts at the top (scroll is shared).
+                                    rs.gscroll_px = 0;
+                                },
+                                // Avatar tap → open THAT author's profile (any author;
+                                // the DID comes from the post's at-uri). A query over
+                                // the shared store — same engagement/identity truth.
+                                .author => if (hit.post < view_items.len) {
+                                    const did = authorDidFromUri(view_items[hit.post].uri);
+                                    if (did.len > 0 and did.len <= rs.profile_target_buf.len) {
+                                        @memcpy(rs.profile_target_buf[0..did.len], did);
+                                        rs.profile_target_did = rs.profile_target_buf[0..did.len];
+                                        rs.gscreen = feed_view.screen_profile;
+                                        rs.profile_dirty = true;
+                                    }
+                                },
+                                // New-post button → the composer (cell path for now).
+                                .compose => {
+                                    rs.compose_kind = .post;
+                                    rs.mode = .compose;
+                                },
+                                // "Edit profile" → reuse the composer to set your
+                                // display name; prefill the current one (when it's a
+                                // real name, not the handle fallback). Saved via
+                                // putProfile on send (handleComposeInput).
+                                .edit_profile => {
+                                    rs.compose_kind = .profile;
+                                    textedit.clear(&rs.compose);
+                                    if (profile_header) |ph| {
+                                        const bare = if (ph.handle.len > 1) ph.handle[1..] else "";
+                                        if (ph.display_name.len > 0 and !std.mem.eql(u8, ph.display_name, bare))
+                                            textedit.set(&rs.compose, ph.display_name);
+                                    }
+                                    rs.mode = .compose;
+                                    rs.status = "edit display name · Enter saves";
+                                },
+                                // Like / boost: the SAME path the keyboard uses —
+                                // optimistic toggle (heart fills red), persist via
+                                // the worker, and fire the splash + heart-pop.
+                                // Works in ANY view: engageSelected is CID-keyed on
+                                // the one shared store, so a like from the profile
+                                // updates the same record Home shows (ZONES inv. 4).
+                                .like => if (hit.post < view_items.len) {
+                                    rs.state.selected = hit.post;
+                                    const r = try engageSelected(.like, gpa, arena, session, store, view_items[hit.post], hit.post, rs.gscreen, rs.profile_target_did, rs.thread_focus_cid, rs.zone_tag, rs.thread_rerooted, rs.gcollapsed.items, feed_config, reply_config, &rs.state, rs.revealed.items, now, rs.out, &rs.prev, &rs.next, backend, pix, rs.writer, &rs.deferred_unlike, &rs.deferred_unrepost);
+                                    if (r.status.len > 0) rs.status = r.status;
+                                },
+                                // Repost button → OPEN the Repost/Quote menu for
+                                // this post (a second tap closes it). The middle
+                                // action doubles as repost + quote (the universal
+                                // pattern); the choice is made in the menu below.
+                                .repost => if (hit.post < view_items.len) {
+                                    rs.grepost_menu = if (rs.grepost_menu == @as(u16, @intCast(hit.post))) null else @intCast(hit.post);
+                                },
+                                // Menu "Repost" row → the optimistic repost toggle.
+                                .repost_do => if (hit.post < view_items.len) {
+                                    rs.grepost_menu = null;
+                                    rs.state.selected = hit.post;
+                                    const r = try engageSelected(.repost, gpa, arena, session, store, view_items[hit.post], hit.post, rs.gscreen, rs.profile_target_did, rs.thread_focus_cid, rs.zone_tag, rs.thread_rerooted, rs.gcollapsed.items, feed_config, reply_config, &rs.state, rs.revealed.items, now, rs.out, &rs.prev, &rs.next, backend, pix, rs.writer, &rs.deferred_unlike, &rs.deferred_unrepost);
+                                    if (r.status.len > 0) rs.status = r.status;
+                                },
+                                // Reply → open the premium composer in reply
+                                // mode for the TAPPED post (C2). Same sequence
+                                // the cell-path keyboard reply proved: resolve
+                                // the root/parent refs, copy them out of the
+                                // store (the composer outlives this frame), set
+                                // the target + handle, open compose.
+                                .reply => if (hit.post < view_items.len) {
+                                    const item = view_items[hit.post];
+                                    if (feed_core.replyRefsForCid(store, item.cid)) |refs| {
+                                        _ = rs.compose_arena_state.reset(.retain_capacity);
+                                        const compose_arena = rs.compose_arena_state.allocator();
+                                        rs.reply_target = .{
+                                            .root_uri = try compose_arena.dupe(u8, refs.root_uri),
+                                            .root_cid = try compose_arena.dupe(u8, refs.root_cid),
+                                            .parent_uri = try compose_arena.dupe(u8, refs.parent_uri),
+                                            .parent_cid = try compose_arena.dupe(u8, refs.parent_cid),
+                                        };
+                                        rs.reply_handle = try compose_arena.dupe(u8, item.author_handle);
+                                        rs.compose_kind = .post;
+                                        textedit.clear(&rs.compose);
+                                        rs.status = "";
+                                        rs.mode = .compose;
+                                    }
+                                },
+                                // Quote → open the composer with the tapped post
+                                // attached as the quote embed (attaches to the
+                                // first segment on send). Refs copied into the
+                                // compose arena (they outlive this frame).
+                                .quote_new => if (hit.post < view_items.len) {
+                                    rs.grepost_menu = null;
+                                    const item = view_items[hit.post];
+                                    if (item.uri.len > 0 and item.cid.len > 0) {
+                                        _ = rs.compose_arena_state.reset(.retain_capacity);
+                                        const compose_arena = rs.compose_arena_state.allocator();
+                                        rs.quote_target = .{
+                                            .uri = try compose_arena.dupe(u8, item.uri),
+                                            .cid = try compose_arena.dupe(u8, item.cid),
+                                        };
+                                        rs.quoting_handle = try compose_arena.dupe(u8, item.author_handle);
+                                        rs.reply_target = null;
+                                        rs.reply_handle = "";
+                                        rs.compose_kind = .post;
+                                        textedit.clear(&rs.compose);
+                                        rs.status = "";
+                                        rs.mode = .compose;
+                                    }
+                                },
+                                // Quote card tap → open the QUOTED post's thread
+                                // (its uri/cid ride the quoting item, resolved from
+                                // the store's quote_of edge). Mirrors .post_body.
+                                .quote_open => if (hit.post < view_items.len) {
+                                    const item = view_items[hit.post];
+                                    if (item.quote_cid.len > 0 and item.quote_cid.len <= rs.thread_focus_cid_buf.len and item.quote_uri.len <= rs.thread_focus_uri_buf.len) {
+                                        @memcpy(rs.thread_focus_cid_buf[0..item.quote_cid.len], item.quote_cid);
+                                        rs.thread_focus_cid = rs.thread_focus_cid_buf[0..item.quote_cid.len];
+                                        @memcpy(rs.thread_focus_uri_buf[0..item.quote_uri.len], item.quote_uri);
+                                        rs.thread_focus_uri = rs.thread_focus_uri_buf[0..item.quote_uri.len];
+                                        const was_in_thread = rs.gscreen == feed_view.screen_thread;
+                                        if (!was_in_thread) rs.thread_return_screen = rs.gscreen;
+                                        rs.gscreen = feed_view.screen_thread;
+                                        rs.thread_dirty = true;
+                                        rs.thread_rerooted = was_in_thread;
+                                        g.scroll.* = 0;
+                                        if (g.gpu) |gs| {
+                                            gs.scroll_to_focus = true;
+                                            gs.sel_anchor = 0;
+                                            gs.sel_focus = 0;
+                                            gs.sel_dragging = false;
                                         }
                                     }
-                                } else if (rs.gscreen == feed_view.screen_zones) {
-                                    // The zone page's socket: a switcher over the ZONE
-                                    // loadout (shared with the Algorithms page). Order-only;
-                                    // no real ranking power yet (the discover engine is
-                                    // unbuilt). Reorder lives on the Algorithms page.
-                                    if (lens_socket.hitTest(g.socket_hits.items, rx, ry)) |sact| {
-                                        socket_handled = true;
-                                        switch (sact) {
-                                            .toggle_tray => rs.zone_ui.open = !rs.zone_ui.open,
-                                            .seat => |cid| {
-                                                if (trayIndexOfCid(rs.zone_cards, rs.zone_blob, cid)) |idx| {
-                                                    rs.zone_seated = idx;
-                                                    rs.loadout_dirty = true;
-                                                }
-                                                rs.zone_ui.open = false;
-                                                rs.zone_ui.expanded = null;
-                                                rs.zone_ui.picking = null;
-                                            },
-                                            .get_more => {
-                                                rs.zone_ui.open = false;
-                                                rs.gscreen = feed_view.screen_loadout;
-                                                rs.gscroll_px = 0;
-                                            },
-                                            else => applyLoadoutAction(sact, rs.zone_cards, rs.zone_blob, &rs.zone_seated, &rs.zone_ui, &rs.loadout_dirty),
+                                },
+                                // Post body tap → open this post's THREAD
+                                // (whole post minus the avatar/engagement
+                                // carve-outs). Remember the focus cid (for
+                                // the buildThreadView query) + the uri (for
+                                // the getPostThread fetch) and where Back
+                                // returns. Copy them out — the view list is
+                                // rebuilt next frame.
+                                .post_body => if (hit.post < view_items.len) {
+                                    const item = view_items[hit.post];
+                                    if (item.cid.len > 0 and item.cid.len <= rs.thread_focus_cid_buf.len and item.uri.len <= rs.thread_focus_uri_buf.len) {
+                                        @memcpy(rs.thread_focus_cid_buf[0..item.cid.len], item.cid);
+                                        rs.thread_focus_cid = rs.thread_focus_cid_buf[0..item.cid.len];
+                                        @memcpy(rs.thread_focus_uri_buf[0..item.uri.len], item.uri);
+                                        rs.thread_focus_uri = rs.thread_focus_uri_buf[0..item.uri.len];
+                                        const was_in_thread = rs.gscreen == feed_view.screen_thread;
+                                        if (!was_in_thread) rs.thread_return_screen = rs.gscreen;
+                                        rs.gscreen = feed_view.screen_thread;
+                                        rs.thread_dirty = true;
+                                        // First tap from the timeline = WHOLE thread; a tap
+                                        // INSIDE the thread = RE-ROOT (condensed ancestors
+                                        // above the focus). EITHER way, land ON the tapped
+                                        // post (it's the new root) — ancestors sit above,
+                                        // scrollable up — so a deep-chain tap doesn't dump
+                                        // you at the top to scroll back down.
+                                        rs.thread_rerooted = was_in_thread;
+                                        g.scroll.* = 0;
+                                        if (g.gpu) |gs| {
+                                            gs.scroll_to_focus = true;
+                                            // The rooted post (and so the
+                                            // selectable body) changed — drop any
+                                            // stale selection.
+                                            gs.sel_anchor = 0;
+                                            gs.sel_focus = 0;
+                                            gs.sel_dragging = false;
                                         }
                                     }
-                                } else if (lens_socket.hitTest(g.socket_hits.items, rx, ry)) |sact| {
-                                    socket_handled = true;
-                                    // Any socket action other than opening/using the picker
-                                    // closes it (the open/set arms re-open or keep as needed).
-                                    switch (sact) {
-                                        .open_swatch, .set_color => {},
-                                        else => rs.gsocket_ui.picking = null,
-                                    }
-                                    switch (sact) {
-                                        .toggle_tray => rs.gsocket_ui.open = !rs.gsocket_ui.open,
-                                        .seat => |cid| {
-                                            if (trayIndexOfCid(rs.socket_cards, rs.socket_blob, cid)) |ni| {
-                                                if (ni != rs.gseated) {
-                                                    rs.gsocket_ui.swap_from = rs.gseated;
-                                                    rs.gsocket_ui.swap_to = ni;
-                                                    rs.gsocket_ui.swap_phase = 1;
-                                                    rs.gseated = ni;
-                                                    // Seat = re-rank now, scroll to top (owner decision
-                                                    // 2026-06-22). The visible gesture today; the actual
-                                                    // lens re-ordering is the discover-engine track —
-                                                    // THIS is the seam it plugs into (re-rank the feed by
-                                                    // the seated lens here, then reset scroll).
-                                                    rs.gscroll_px = 0;
-                                                }
-                                            }
-                                            rs.gsocket_ui.expanded = null;
-                                            rs.gsocket_ui.open = false; // watch it plug in, then the tray retracts
-                                            rs.loadout_dirty = true;
-                                        },
-                                        // ⓘ → expand inline detail; tapping the open one collapses it.
-                                        .expand => |cid| {
-                                            if (trayIndexOfCid(rs.socket_cards, rs.socket_blob, cid)) |idx| {
-                                                rs.gsocket_ui.expanded = if (rs.gsocket_ui.expanded == idx) null else idx;
-                                            }
-                                        },
-                                        .collapse => rs.gsocket_ui.expanded = null,
-                                        // Press on a drag handle → start dragging that lens (the
-                                        // seated one has no handle, §7.3). The ghost follows the
-                                        // pointer; the drop lands on button_up.
-                                        .reorder => |r| {
-                                            rs.gsocket_ui.picking = null;
-                                            rs.gsocket_ui.drag_active = trayIndexOfCid(rs.socket_cards, rs.socket_blob, r.lens);
-                                            rs.gsocket_ui.drag_x = rx;
-                                            rs.gsocket_ui.drag_y = ry;
-                                        },
-                                        // Tap a card's swatch → open/close its color picker (§11.5).
-                                        .open_swatch => |cid| {
-                                            const idx = trayIndexOfCid(rs.socket_cards, rs.socket_blob, cid);
-                                            rs.gsocket_ui.picking = if (rs.gsocket_ui.picking == idx) null else idx;
-                                        },
-                                        // Pick a color → recolor that lens (totally the user's
-                                        // call; duplicates allowed). If it's the seated lens, the
-                                        // whole-UI accent follows next frame (seatedAccent).
-                                        .set_color => |sc2| {
-                                            if (trayIndexOfCid(rs.socket_cards, rs.socket_blob, sc2.lens)) |idx| {
-                                                if (idx < rs.socket_cards.len) rs.socket_cards[idx].color = sc2.color;
-                                                rs.loadout_dirty = true;
-                                            }
-                                            rs.gsocket_ui.picking = null;
-                                        },
-                                        // "get more" → the Algorithms (loadout) page.
-                                        .get_more => {
-                                            rs.gsocket_ui.picking = null;
-                                            rs.gsocket_ui.open = false;
-                                            rs.gscreen = feed_view.screen_loadout;
-                                        },
-                                    }
-                                }
-                                if (!socket_handled) {
-                                    // Release-activation: ARM the tap (don't fire). It
-                                    // fires on button_up only if the release lands on
-                                    // the same target — press-then-slide-off cancels.
-                                    if (feed_view.hitTest(g.regions.items, rx, ry)) |hit| {
-                                        rs.gsocket_ui.picking = null; // a click off the socket closes the picker
-                                        // The ROOTED post's body is selectable, not a
-                                        // re-root target: a press there places the caret
-                                        // and begins a text selection (web-style — a
-                                        // release without a drag clears it). Don't arm a tap.
-                                        const is_focus_body = rs.gscreen == feed_view.screen_thread and hit.kind == .post_body and
-                                            hit.post < view_items.len and view_items[hit.post].is_focus;
-                                        if (is_focus_body) {
-                                            if (g.gpu) |gs| selectPress(gs, rx, ry, &rs.last_click_ns, &rs.last_click_x, &rs.last_click_y, &rs.click_count, clock_shell.monotonicNanos());
+                                },
+                                // Back (thread top bar) → the prior screen.
+                                .back => {
+                                    // The transparency page, zone page, and thread
+                                    // share Back; each returns where it was entered.
+                                    if (rs.gscreen == feed_view.screen_transparency) {
+                                        if (rs.gtransp_source) {
+                                            // On the source sub-view → back to the summary.
+                                            rs.gtransp_source = false;
                                         } else {
-                                            rs.armed_kind = hit.kind;
-                                            rs.armed_post = hit.post;
+                                            rs.gscreen = rs.transp_return_screen;
+                                            if (rs.inspect_bytes) |b| gpa.free(b);
+                                            rs.inspect_bytes = null;
                                         }
-                                    } else if (field_ui.hitTest(cx, cy, g.hr.slice())) |_| {
-                                        rs.armed_legacy = true;
-                                        rs.armed_cx = cx;
-                                        rs.armed_cy = cy;
+                                    } else {
+                                        rs.gscreen = if (rs.gscreen == feed_view.screen_zones) rs.zone_return_screen else rs.thread_return_screen;
                                     }
-                                }
-                                }
-                            },
-                            // Release-activation: the armed tap fires here (see the
-                            // button_down arm). Placed after the drag-drop handling so
-                            // a drag never also triggers a tap.
-                            .button_up => if (pev.button == 1) {
-                                // End a text-selection drag (the selection itself
-                                // persists until the next press; a no-drag press left
-                                // anchor==focus, i.e. an empty selection = cleared).
-                                if (g.gpu) |gs| gs.sel_dragging = false;
-                                // Finish any drag with a drop first (the press began it).
-                                if (rs.gscreen == feed_view.screen_loadout) {
-                                    if (rs.page_drag_surface) |s| switch (s) {
-                                        0 => pageDragDrop(rs.socket_cards, rs.socket_blob, &rs.gseated, &rs.gsocket_ui, rs.page_geoms[0], &rs.loadout_dirty),
-                                        1 => pageDragDrop(rs.reply_cards, rs.reply_blob, &rs.reply_seated, &rs.reply_ui, rs.page_geoms[1], &rs.loadout_dirty),
-                                        else => pageDragDrop(rs.zone_cards, rs.zone_blob, &rs.zone_seated, &rs.zone_ui, rs.page_geoms[2], &rs.loadout_dirty),
+                                    g.scroll.* = 0;
+                                },
+                                // "N new posts" pill → reveal the staged
+                                // posts + jump to the top (the reader opted
+                                // in, so displacing them now is wanted).
+                                .reveal_new => {
+                                    _ = feed_core.revealPending(gpa, store) catch 0;
+                                    g.scroll.* = 0;
+                                    rs.gview.scroll_rows = 0;
+                                    rs.state.selected = 0;
+                                    rs.status = "";
+                                },
+                                // The composer's footer buttons never appear
+                                // on the timeline; they are handled in compose
+                                // mode below.
+                                .compose_send, .compose_cancel, .compose_add, .compose_remove => {},
+                                // Not wired yet — drawn for the fuller row /
+                                // profile tabs; their regions exist so hover
+                                // can highlight them and a later slice wires
+                                // them. A tap is a no-op for now.
+                                // Algorithms-page sub-tab (Loadout / Marketplace / Create).
+                                .loadout_tab => {
+                                    rs.gloadout_tab = @intCast(hit.post);
+                                    if (hit.post == 2) rs.gcreate_step = .landing; // Create opens on its landing page
+                                    rs.gscroll_px = 0; // top of the newly-selected tab
+                                },
+                                // ---- The simple-Create flow (loadout tab 2) ----
+                                // Pick a question option → record the answer, rebuild
+                                // the config from the answers, and advance a step
+                                // (privacy → the recap).
+                                .create_pick => {
+                                    create_flow.applyAnswer(&rs.gcreate_answers, rs.gcreate_step, hit.post);
+                                    rs.gcreate_config = builder.build(rs.gcreate_answers);
+                                    rs.gcreate_step = create_flow.nextStep(rs.gcreate_step);
+                                    if (rs.gcreate_step == .preparing) rs.gcreate_prepare_frames = 0; // start the beat
+                                    rs.gscroll_px = 0;
+                                },
+                                .create_back => {
+                                    rs.gcreate_step = create_flow.prevStep(rs.gcreate_step);
+                                    if (rs.gcreate_step == .preparing) rs.gcreate_step = .privacy; // skip the beat going back
+                                    rs.gscroll_px = 0;
+                                },
+                                .create_next => { // landing → questions, recap → name
+                                    rs.gcreate_step = create_flow.nextStep(rs.gcreate_step);
+                                    rs.gscroll_px = 0;
+                                },
+                                .create_dev => rs.status = "Developer submission is coming soon — write it in Zal and publish.",
+                                .create_knob_dec, .create_knob_inc => {
+                                    const k: create_flow.Knob = @enumFromInt(@as(u8, @intCast(hit.post)));
+                                    const step = create_flow.knobMeta(k).step;
+                                    const cur = create_flow.knobValue(rs.gcreate_config, k);
+                                    create_flow.knobSet(&rs.gcreate_config, k, if (hit.kind == .create_knob_inc) cur + step else cur - step);
+                                },
+                                .create_color => rs.gcreate_color = @intCast(hit.post),
+                                // Finalize: serialize the config into a PRIVATE library
+                                // record (a minted local id), reset the flow, and drop
+                                // the user back on their loadout with it saved.
+                                .create_save => {
+                                    var idbuf: [24]u8 = undefined;
+                                    const id = std.fmt.bufPrint(&idbuf, "user:{d}", .{rs.algo_uid}) catch "user:x";
+                                    const nm = if (rs.gcreate_name_len > 0) rs.gcreate_name_buf[0..rs.gcreate_name_len] else "My feed";
+                                    if (create_flow.finalize(arena, rs.gcreate_config, id, nm, rs.gcreate_color)) |new| {
+                                        if (rs.algo_lib.add(gpa, new)) |_| {
+                                            rs.algo_uid += 1;
+                                            _ = cache_shell.saveLibrary(gpa, environ, &rs.algo_lib); // persist across launches
+                                            rs.status = "Saved to your library.";
+                                            rs.gcreate_step = .pace;
+                                            rs.gcreate_answers = .{};
+                                            rs.gcreate_config = builder.build(.{});
+                                            rs.gcreate_name_len = 0;
+                                            rs.gcreate_color = 0;
+                                            rs.gloadout_tab = 0;
+                                            rs.gscroll_px = 0;
+                                        } else |_| rs.status = "Couldn't save — out of memory.";
+                                    } else |_| rs.status = "Couldn't build that feed.";
+                                },
+                                // Reddit-style collapse: toggle this reply's CID in the
+                                // per-view collapsed set (no network — buildThreadView
+                                // re-derives the view next frame; ZONES inv. 4).
+                                .collapse => if (hit.post < view_items.len) {
+                                    const cid = view_items[hit.post].cid;
+                                    var found: ?usize = null;
+                                    for (rs.gcollapsed.items, 0..) |c, ix| if (std.mem.eql(u8, c, cid)) {
+                                        found = ix;
+                                        break;
                                     };
-                                } else if (rs.gsocket_ui.drag_active) |d| {
-                                    const geom = feed_view.homeSocketGeom(if (rs.gpu_state != null) @as(i32, @intCast(design_w)) else @as(i32, @intCast(win.fb.width)));
-                                    const to: u32 = lens_socket.dropIndex(home_tray, rs.gsocket_ui, geom) orelse d;
-                                    const seated_off = if (rs.gseated < rs.socket_cards.len) rs.socket_cards[rs.gseated].cid.off else 0;
-                                    reorderTray(rs.socket_cards, d, to);
-                                    for (rs.socket_cards, 0..) |c, ix| {
-                                        if (c.cid.off == seated_off) {
-                                            rs.gseated = @intCast(ix);
-                                            break;
+                                    if (found) |ix| {
+                                        gpa.free(rs.gcollapsed.items[ix]);
+                                        _ = rs.gcollapsed.swapRemove(ix);
+                                    } else if (gpa.dupe(u8, cid)) |d| {
+                                        rs.gcollapsed.append(gpa, d) catch gpa.free(d);
+                                    } else |_| {}
+                                },
+                                // Main-feed Read-more: toggle this post's CID in the
+                                // per-view expanded set (no network — fromTimeline stamps
+                                // PostView.expanded next frame, and the height cache is
+                                // invalidated because the expanded set feeds the content
+                                // signature; ZONES inv. 4).
+                                .expand => if (hit.post < view_items.len) {
+                                    const cid = view_items[hit.post].cid;
+                                    var found: ?usize = null;
+                                    for (rs.gexpanded.items, 0..) |c, ix| if (std.mem.eql(u8, c, cid)) {
+                                        found = ix;
+                                        break;
+                                    };
+                                    if (found) |ix| {
+                                        gpa.free(rs.gexpanded.items[ix]);
+                                        _ = rs.gexpanded.swapRemove(ix);
+                                    } else if (gpa.dupe(u8, cid)) |d| {
+                                        rs.gexpanded.append(gpa, d) catch gpa.free(d);
+                                    } else |_| {}
+                                },
+                                .bookmark, .share, .more, .profile_tab => {},
+                                // Zat Chat (U3): open the tapped conversation. The
+                                // region carries the LIST ORDINAL; map it back through
+                                // the same ordering query the list was built from (no
+                                // store index rides a region, A5).
+                                .chat_conv => if (dev_chat) {
+                                    if (chat_core.conversationsByActivity(gpa, &rs.gchat_store) catch null) |order| {
+                                        defer gpa.free(order);
+                                        if (hit.post < order.len) {
+                                            rs.gchat_sel = order[hit.post];
+                                            chat_core.markRead(&rs.gchat_store, order[hit.post]);
+                                            // M2: read-state survives a relaunch too.
+                                            chatPersistHistory(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
+                                            rs.gchat_input_focus = true;
+                                            rs.gchat_composing = false; // a row tap leaves the compose flow
+                                            rs.gpay_open = false; // the sheet belongs to one conversation
+                                            rs.gscroll_px = 0; // newest, bottom-anchored
                                         }
                                     }
-                                    rs.gsocket_ui.drag_active = to; // the card now lives at `to`
-                                    rs.gsocket_ui.settle_phase = 1; // ghost eases from release point into its slot
-                                    rs.loadout_dirty = true;
-                                }
-                                // Release-activation: fire the armed feed tap ONLY if the
-                                // release lands on the same target the press armed. A press
-                                // that began a drag never armed a tap, so a drag never also
-                                // fires one.
-                                if (rs.armed_kind) |ak| {
-                                    if (feed_view.hitTest(g.regions.items, rx, ry)) |hit| {
-                                        if (hit.kind == ak and hit.post == rs.armed_post) {
-                                            // An open Repost/Quote menu is dismissed by any tap
-                                            // outside its rows (and the repost button that toggles
-                                            // it), and the tap is swallowed — the popover norm.
-                                            if (rs.grepost_menu != null and hit.kind != .repost_do and hit.kind != .quote_new and hit.kind != .repost) {
-                                                rs.grepost_menu = null;
-                                            } else switch (hit.kind) {
-                                        // Left-rail destination: switch the active screen
-                                        // (post carries the Screen index). Selecting Profile
-                                        // targets YOUR own profile; the next frame re-renders.
-                                        .nav => {
-                                            rs.gscreen = @intCast(hit.post);
-                                            if (rs.gscreen == feed_view.screen_profile) {
-                                                rs.profile_target_did = session.did;
-                                                rs.profile_dirty = true;
-                                            }
-                                            // Each screen starts at the top (scroll is shared).
-                                            rs.gscroll_px = 0;
-                                        },
-                                        // Avatar tap → open THAT author's profile (any author;
-                                        // the DID comes from the post's at-uri). A query over
-                                        // the shared store — same engagement/identity truth.
-                                        .author => if (hit.post < view_items.len) {
-                                            const did = authorDidFromUri(view_items[hit.post].uri);
-                                            if (did.len > 0 and did.len <= rs.profile_target_buf.len) {
-                                                @memcpy(rs.profile_target_buf[0..did.len], did);
-                                                rs.profile_target_did = rs.profile_target_buf[0..did.len];
-                                                rs.gscreen = feed_view.screen_profile;
-                                                rs.profile_dirty = true;
-                                            }
-                                        },
-                                        // New-post button → the composer (cell path for now).
-                                        .compose => {
-                                            rs.compose_kind = .post;
-                                            rs.mode = .compose;
-                                        },
-                                        // "Edit profile" → reuse the composer to set your
-                                        // display name; prefill the current one (when it's a
-                                        // real name, not the handle fallback). Saved via
-                                        // putProfile on send (handleComposeInput).
-                                        .edit_profile => {
-                                            rs.compose_kind = .profile;
-                                            textedit.clear(&rs.compose);
-                                            if (profile_header) |ph| {
-                                                const bare = if (ph.handle.len > 1) ph.handle[1..] else "";
-                                                if (ph.display_name.len > 0 and !std.mem.eql(u8, ph.display_name, bare))
-                                                    textedit.set(&rs.compose, ph.display_name);
-                                            }
-                                            rs.mode = .compose;
-                                            rs.status = "edit display name · Enter saves";
-                                        },
-                                        // Like / boost: the SAME path the keyboard uses —
-                                        // optimistic toggle (heart fills red), persist via
-                                        // the worker, and fire the splash + heart-pop.
-                                        // Works in ANY view: engageSelected is CID-keyed on
-                                        // the one shared store, so a like from the profile
-                                        // updates the same record Home shows (ZONES inv. 4).
-                                        .like => if (hit.post < view_items.len) {
-                                            rs.state.selected = hit.post;
-                                            const r = try engageSelected(.like, gpa, arena, session, store, view_items[hit.post], hit.post, rs.gscreen, rs.profile_target_did, rs.thread_focus_cid, rs.zone_tag, rs.thread_rerooted, rs.gcollapsed.items, feed_config, reply_config, &rs.state, rs.revealed.items, now, rs.out, &rs.prev, &rs.next, backend, pix, rs.writer, &rs.deferred_unlike, &rs.deferred_unrepost);
-                                            if (r.status.len > 0) rs.status = r.status;
-                                        },
-                                        // Repost button → OPEN the Repost/Quote menu for
-                                        // this post (a second tap closes it). The middle
-                                        // action doubles as repost + quote (the universal
-                                        // pattern); the choice is made in the menu below.
-                                        .repost => if (hit.post < view_items.len) {
-                                            rs.grepost_menu = if (rs.grepost_menu == @as(u16, @intCast(hit.post))) null else @intCast(hit.post);
-                                        },
-                                        // Menu "Repost" row → the optimistic repost toggle.
-                                        .repost_do => if (hit.post < view_items.len) {
-                                            rs.grepost_menu = null;
-                                            rs.state.selected = hit.post;
-                                            const r = try engageSelected(.repost, gpa, arena, session, store, view_items[hit.post], hit.post, rs.gscreen, rs.profile_target_did, rs.thread_focus_cid, rs.zone_tag, rs.thread_rerooted, rs.gcollapsed.items, feed_config, reply_config, &rs.state, rs.revealed.items, now, rs.out, &rs.prev, &rs.next, backend, pix, rs.writer, &rs.deferred_unlike, &rs.deferred_unrepost);
-                                            if (r.status.len > 0) rs.status = r.status;
-                                        },
-                                        // Reply → open the premium composer in reply
-                                        // mode for the TAPPED post (C2). Same sequence
-                                        // the cell-path keyboard reply proved: resolve
-                                        // the root/parent refs, copy them out of the
-                                        // store (the composer outlives this frame), set
-                                        // the target + handle, open compose.
-                                        .reply => if (hit.post < view_items.len) {
-                                            const item = view_items[hit.post];
-                                            if (feed_core.replyRefsForCid(store, item.cid)) |refs| {
-                                                _ = rs.compose_arena_state.reset(.retain_capacity);
-                                                const compose_arena = rs.compose_arena_state.allocator();
-                                                rs.reply_target = .{
-                                                    .root_uri = try compose_arena.dupe(u8, refs.root_uri),
-                                                    .root_cid = try compose_arena.dupe(u8, refs.root_cid),
-                                                    .parent_uri = try compose_arena.dupe(u8, refs.parent_uri),
-                                                    .parent_cid = try compose_arena.dupe(u8, refs.parent_cid),
-                                                };
-                                                rs.reply_handle = try compose_arena.dupe(u8, item.author_handle);
-                                                rs.compose_kind = .post;
-                                                textedit.clear(&rs.compose);
-                                                rs.status = "";
-                                                rs.mode = .compose;
-                                            }
-                                        },
-                                        // Quote → open the composer with the tapped post
-                                        // attached as the quote embed (attaches to the
-                                        // first segment on send). Refs copied into the
-                                        // compose arena (they outlive this frame).
-                                        .quote_new => if (hit.post < view_items.len) {
-                                            rs.grepost_menu = null;
-                                            const item = view_items[hit.post];
-                                            if (item.uri.len > 0 and item.cid.len > 0) {
-                                                _ = rs.compose_arena_state.reset(.retain_capacity);
-                                                const compose_arena = rs.compose_arena_state.allocator();
-                                                rs.quote_target = .{
-                                                    .uri = try compose_arena.dupe(u8, item.uri),
-                                                    .cid = try compose_arena.dupe(u8, item.cid),
-                                                };
-                                                rs.quoting_handle = try compose_arena.dupe(u8, item.author_handle);
-                                                rs.reply_target = null;
-                                                rs.reply_handle = "";
-                                                rs.compose_kind = .post;
-                                                textedit.clear(&rs.compose);
-                                                rs.status = "";
-                                                rs.mode = .compose;
-                                            }
-                                        },
-                                        // Quote card tap → open the QUOTED post's thread
-                                        // (its uri/cid ride the quoting item, resolved from
-                                        // the store's quote_of edge). Mirrors .post_body.
-                                        .quote_open => if (hit.post < view_items.len) {
-                                            const item = view_items[hit.post];
-                                            if (item.quote_cid.len > 0 and item.quote_cid.len <= rs.thread_focus_cid_buf.len and item.quote_uri.len <= rs.thread_focus_uri_buf.len) {
-                                                @memcpy(rs.thread_focus_cid_buf[0..item.quote_cid.len], item.quote_cid);
-                                                rs.thread_focus_cid = rs.thread_focus_cid_buf[0..item.quote_cid.len];
-                                                @memcpy(rs.thread_focus_uri_buf[0..item.quote_uri.len], item.quote_uri);
-                                                rs.thread_focus_uri = rs.thread_focus_uri_buf[0..item.quote_uri.len];
-                                                const was_in_thread = rs.gscreen == feed_view.screen_thread;
-                                                if (!was_in_thread) rs.thread_return_screen = rs.gscreen;
-                                                rs.gscreen = feed_view.screen_thread;
-                                                rs.thread_dirty = true;
-                                                rs.thread_rerooted = was_in_thread;
-                                                g.scroll.* = 0;
-                                                if (g.gpu) |gs| {
-                                                    gs.scroll_to_focus = true;
-                                                    gs.sel_anchor = 0;
-                                                    gs.sel_focus = 0;
-                                                    gs.sel_dragging = false;
-                                                }
-                                            }
-                                        },
-                                        // Post body tap → open this post's THREAD
-                                        // (whole post minus the avatar/engagement
-                                        // carve-outs). Remember the focus cid (for
-                                        // the buildThreadView query) + the uri (for
-                                        // the getPostThread fetch) and where Back
-                                        // returns. Copy them out — the view list is
-                                        // rebuilt next frame.
-                                        .post_body => if (hit.post < view_items.len) {
-                                            const item = view_items[hit.post];
-                                            if (item.cid.len > 0 and item.cid.len <= rs.thread_focus_cid_buf.len and item.uri.len <= rs.thread_focus_uri_buf.len) {
-                                                @memcpy(rs.thread_focus_cid_buf[0..item.cid.len], item.cid);
-                                                rs.thread_focus_cid = rs.thread_focus_cid_buf[0..item.cid.len];
-                                                @memcpy(rs.thread_focus_uri_buf[0..item.uri.len], item.uri);
-                                                rs.thread_focus_uri = rs.thread_focus_uri_buf[0..item.uri.len];
-                                                const was_in_thread = rs.gscreen == feed_view.screen_thread;
-                                                if (!was_in_thread) rs.thread_return_screen = rs.gscreen;
-                                                rs.gscreen = feed_view.screen_thread;
-                                                rs.thread_dirty = true;
-                                                // First tap from the timeline = WHOLE thread; a tap
-                                                // INSIDE the thread = RE-ROOT (condensed ancestors
-                                                // above the focus). EITHER way, land ON the tapped
-                                                // post (it's the new root) — ancestors sit above,
-                                                // scrollable up — so a deep-chain tap doesn't dump
-                                                // you at the top to scroll back down.
-                                                rs.thread_rerooted = was_in_thread;
-                                                g.scroll.* = 0;
-                                                if (g.gpu) |gs| {
-                                                    gs.scroll_to_focus = true;
-                                                    // The rooted post (and so the
-                                                    // selectable body) changed — drop any
-                                                    // stale selection.
-                                                    gs.sel_anchor = 0;
-                                                    gs.sel_focus = 0;
-                                                    gs.sel_dragging = false;
-                                                }
-                                            }
-                                        },
-                                        // Back (thread top bar) → the prior screen.
-                                        .back => {
-                                            // The transparency page, zone page, and thread
-                                            // share Back; each returns where it was entered.
-                                            if (rs.gscreen == feed_view.screen_transparency) {
-                                                if (rs.gtransp_source) {
-                                                    // On the source sub-view → back to the summary.
-                                                    rs.gtransp_source = false;
-                                                } else {
-                                                    rs.gscreen = rs.transp_return_screen;
-                                                    if (rs.inspect_bytes) |b| gpa.free(b);
-                                                    rs.inspect_bytes = null;
-                                                }
-                                            } else {
-                                                rs.gscreen = if (rs.gscreen == feed_view.screen_zones) rs.zone_return_screen else rs.thread_return_screen;
-                                            }
-                                            g.scroll.* = 0;
-                                        },
-                                        // "N new posts" pill → reveal the staged
-                                        // posts + jump to the top (the reader opted
-                                        // in, so displacing them now is wanted).
-                                        .reveal_new => {
-                                            _ = feed_core.revealPending(gpa, store) catch 0;
-                                            g.scroll.* = 0;
-                                            rs.gview.scroll_rows = 0;
-                                            rs.state.selected = 0;
-                                            rs.status = "";
-                                        },
-                                        // The composer's footer buttons never appear
-                                        // on the timeline; they are handled in compose
-                                        // mode below.
-                                        .compose_send, .compose_cancel, .compose_add, .compose_remove => {},
-                                        // Not wired yet — drawn for the fuller row /
-                                        // profile tabs; their regions exist so hover
-                                        // can highlight them and a later slice wires
-                                        // them. A tap is a no-op for now.
-                                        // Algorithms-page sub-tab (Loadout / Marketplace / Create).
-                                        .loadout_tab => {
-                                            rs.gloadout_tab = @intCast(hit.post);
-                                            if (hit.post == 2) rs.gcreate_step = .landing; // Create opens on its landing page
-                                            rs.gscroll_px = 0; // top of the newly-selected tab
-                                        },
-                                        // ---- The simple-Create flow (loadout tab 2) ----
-                                        // Pick a question option → record the answer, rebuild
-                                        // the config from the answers, and advance a step
-                                        // (privacy → the recap).
-                                        .create_pick => {
-                                            create_flow.applyAnswer(&rs.gcreate_answers, rs.gcreate_step, hit.post);
-                                            rs.gcreate_config = builder.build(rs.gcreate_answers);
-                                            rs.gcreate_step = create_flow.nextStep(rs.gcreate_step);
-                                            if (rs.gcreate_step == .preparing) rs.gcreate_prepare_frames = 0; // start the beat
-                                            rs.gscroll_px = 0;
-                                        },
-                                        .create_back => {
-                                            rs.gcreate_step = create_flow.prevStep(rs.gcreate_step);
-                                            if (rs.gcreate_step == .preparing) rs.gcreate_step = .privacy; // skip the beat going back
-                                            rs.gscroll_px = 0;
-                                        },
-                                        .create_next => { // landing → questions, recap → name
-                                            rs.gcreate_step = create_flow.nextStep(rs.gcreate_step);
-                                            rs.gscroll_px = 0;
-                                        },
-                                        .create_dev => rs.status = "Developer submission is coming soon — write it in Zal and publish.",
-                                        .create_knob_dec, .create_knob_inc => {
-                                            const k: create_flow.Knob = @enumFromInt(@as(u8, @intCast(hit.post)));
-                                            const step = create_flow.knobMeta(k).step;
-                                            const cur = create_flow.knobValue(rs.gcreate_config, k);
-                                            create_flow.knobSet(&rs.gcreate_config, k, if (hit.kind == .create_knob_inc) cur + step else cur - step);
-                                        },
-                                        .create_color => rs.gcreate_color = @intCast(hit.post),
-                                        // Finalize: serialize the config into a PRIVATE library
-                                        // record (a minted local id), reset the flow, and drop
-                                        // the user back on their loadout with it saved.
-                                        .create_save => {
-                                            var idbuf: [24]u8 = undefined;
-                                            const id = std.fmt.bufPrint(&idbuf, "user:{d}", .{rs.algo_uid}) catch "user:x";
-                                            const nm = if (rs.gcreate_name_len > 0) rs.gcreate_name_buf[0..rs.gcreate_name_len] else "My feed";
-                                            if (create_flow.finalize(arena, rs.gcreate_config, id, nm, rs.gcreate_color)) |new| {
-                                                if (rs.algo_lib.add(gpa, new)) |_| {
-                                                    rs.algo_uid += 1;
-                                                    _ = cache_shell.saveLibrary(gpa, environ, &rs.algo_lib); // persist across launches
-                                                    rs.status = "Saved to your library.";
-                                                    rs.gcreate_step = .pace;
-                                                    rs.gcreate_answers = .{};
-                                                    rs.gcreate_config = builder.build(.{});
-                                                    rs.gcreate_name_len = 0;
-                                                    rs.gcreate_color = 0;
-                                                    rs.gloadout_tab = 0;
-                                                    rs.gscroll_px = 0;
-                                                } else |_| rs.status = "Couldn't save — out of memory.";
-                                            } else |_| rs.status = "Couldn't build that feed.";
-                                        },
-                                        // Reddit-style collapse: toggle this reply's CID in the
-                                        // per-view collapsed set (no network — buildThreadView
-                                        // re-derives the view next frame; ZONES inv. 4).
-                                        .collapse => if (hit.post < view_items.len) {
-                                            const cid = view_items[hit.post].cid;
-                                            var found: ?usize = null;
-                                            for (rs.gcollapsed.items, 0..) |c, ix| if (std.mem.eql(u8, c, cid)) {
-                                                found = ix;
-                                                break;
-                                            };
-                                            if (found) |ix| {
-                                                gpa.free(rs.gcollapsed.items[ix]);
-                                                _ = rs.gcollapsed.swapRemove(ix);
-                                            } else if (gpa.dupe(u8, cid)) |d| {
-                                                rs.gcollapsed.append(gpa, d) catch gpa.free(d);
-                                            } else |_| {}
-                                        },
-                                        // Main-feed Read-more: toggle this post's CID in the
-                                        // per-view expanded set (no network — fromTimeline stamps
-                                        // PostView.expanded next frame, and the height cache is
-                                        // invalidated because the expanded set feeds the content
-                                        // signature; ZONES inv. 4).
-                                        .expand => if (hit.post < view_items.len) {
-                                            const cid = view_items[hit.post].cid;
-                                            var found: ?usize = null;
-                                            for (rs.gexpanded.items, 0..) |c, ix| if (std.mem.eql(u8, c, cid)) {
-                                                found = ix;
-                                                break;
-                                            };
-                                            if (found) |ix| {
-                                                gpa.free(rs.gexpanded.items[ix]);
-                                                _ = rs.gexpanded.swapRemove(ix);
-                                            } else if (gpa.dupe(u8, cid)) |d| {
-                                                rs.gexpanded.append(gpa, d) catch gpa.free(d);
-                                            } else |_| {}
-                                        },
-                                        .bookmark, .share, .more, .profile_tab => {},
-                                        // Zat Chat (U3): open the tapped conversation. The
-                                        // region carries the LIST ORDINAL; map it back through
-                                        // the same ordering query the list was built from (no
-                                        // store index rides a region, A5).
-                                        .chat_conv => if (dev_chat) {
-                                            if (chat_core.conversationsByActivity(gpa, &rs.gchat_store) catch null) |order| {
-                                                defer gpa.free(order);
-                                                if (hit.post < order.len) {
-                                                    rs.gchat_sel = order[hit.post];
-                                                    chat_core.markRead(&rs.gchat_store, order[hit.post]);
-                                                    // M2: read-state survives a relaunch too.
-                                                    chatPersistHistory(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
-                                                    rs.gchat_input_focus = true;
-                                                    rs.gchat_composing = false; // a row tap leaves the compose flow
-                                                    rs.gpay_open = false; // the sheet belongs to one conversation
-                                                    rs.gscroll_px = 0; // newest, bottom-anchored
-                                                }
-                                            }
-                                        },
-                                        .chat_input => if (dev_chat) {
-                                            rs.gchat_input_focus = true;
-                                            rs.gchat_composing = false;
-                                        },
-                                        // "+ New": open (or close) the recipient bar; it owns
-                                        // the keyboard while open. Tapping the bar itself is
-                                        // inert — being open IS its focus state.
-                                        .chat_new => if (dev_chat) {
-                                            rs.gchat_composing = !rs.gchat_composing;
-                                            rs.gchat_peer_len = 0;
-                                            rs.gchat_compose_status = "";
-                                            rs.gchat_input_focus = false;
-                                        },
-                                        .chat_compose_input => {},
-                                        .chat_send => if (dev_chat) {
-                                            const body = std.mem.trimEnd(u8, rs.gchat_draft_buf[0..rs.gchat_draft_len], " \n");
-                                            if (body.len > 0) if (rs.gchat_sel) |sc| {
-                                                _ = chat_core.appendMessage(gpa, &rs.gchat_store, sc, .text, body, now, true) catch {};
-                                                chatSend(gpa, io, environ, if (rs.gchat_e2ee) |*st| st else null, rs.gchat_link, &rs.gchat_store, sc, body);
-                                                chatPersistHistory(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
-                                                rs.gchat_draft_len = 0;
-                                                rs.gchat_input_focus = true;
-                                                rs.gscroll_px = 0;
-                                            };
-                                        },
-                                        // The pay sheet (M5 A4): the button toggles it;
-                                        // it owns the keyboard while open.
-                                        .pay_open => if (dev_chat) {
-                                            // Learn (once) whether payments are set up.
-                                            if (!rs.grecv_known) {
-                                                rs.grecv_known = true;
-                                                _ = rs.gchat_arena_state.reset(.retain_capacity);
-                                                rs.grecv_set = loadOwnReceive(gpa, rs.gchat_arena_state.allocator(), io, environ, session, &rs.grecv_ln_buf, &rs.grecv_ln_len, &rs.grecv_btc_buf, &rs.grecv_btc_len);
-                                            }
-                                            rs.gchat_input_focus = false;
-                                            rs.gchat_composing = false;
-                                            if (rs.grecv_set) {
-                                                // Set up → the pay sheet (request/send).
-                                                rs.gpay_open = !rs.gpay_open;
-                                                rs.gpay_status = "";
-                                                rs.gpay_focus = 0;
-                                                rs.gpay_confirm = false;
-                                                rs.grecv_open = false;
-                                            } else {
-                                                // Not set up → onboard, never a dead form.
-                                                rs.grecv_open = true;
-                                                rs.grecv_mode = .onboard;
-                                                rs.grecv_status = "";
-                                                rs.gpay_open = false;
-                                            }
-                                        },
-                                        .pay_rail => if (dev_chat) {
-                                            rs.gpay_rail = if (hit.post == 1) .onchain else .lightning;
-                                        },
-                                        .pay_chip => if (dev_chat) {
-                                            if (hit.post < feed_view.pay_chips.len) {
-                                                var ab: [16]u8 = undefined;
-                                                const s = std.fmt.bufPrint(&ab, "{d}", .{feed_view.pay_chips[hit.post]}) catch "";
-                                                if (s.len <= rs.gpay_amount_buf.len) {
-                                                    @memcpy(rs.gpay_amount_buf[0..s.len], s);
-                                                    rs.gpay_amount_len = s.len;
-                                                }
-                                                rs.gpay_unit = .sats; // the chips are sats amounts
-                                                rs.gpay_focus = 0;
-                                            }
-                                        },
-                                        .pay_amount => if (dev_chat) {
-                                            rs.gpay_focus = 0;
-                                        },
-                                        .pay_note => if (dev_chat) {
-                                            rs.gpay_focus = 1;
-                                        },
-                                        // Toggle the entry unit; clear the draft (a
-                                        // sats integer isn't a BTC decimal) so nothing
-                                        // is silently reinterpreted by 1e8.
-                                        .pay_unit => if (dev_chat) {
-                                            rs.gpay_unit = if (rs.gpay_unit == .sats) .btc else .sats;
-                                            rs.gpay_amount_len = 0;
-                                            rs.gpay_focus = 0;
-                                            rs.gpay_status = "";
-                                        },
-                                        .pay_cancel => if (dev_chat) {
-                                            rs.gpay_open = false;
-                                            rs.gpay_confirm = false;
-                                            rs.gpay_status = "";
-                                        },
-                                        // The pay sheet's "Set up how you get
-                                        // paid" link AND an incoming offer card's
-                                        // "Set up wallet to accept" both open the
-                                        // receive onboarding (S2, PAYMENT_UX_SPEC
-                                        // §4.1). On save, `announceReceiveReady`
-                                        // flips the offer to ready + signals the
-                                        // payer — so the tap just opens the sheet.
-                                        .recv_open, .pay_card_setup => if (dev_chat) {
-                                            if (!rs.grecv_known) {
-                                                rs.grecv_known = true;
-                                                _ = rs.gchat_arena_state.reset(.retain_capacity);
-                                                rs.grecv_set = loadOwnReceive(gpa, rs.gchat_arena_state.allocator(), io, environ, session, &rs.grecv_ln_buf, &rs.grecv_ln_len, &rs.grecv_btc_buf, &rs.grecv_btc_len);
-                                            }
-                                            rs.grecv_open = true;
-                                            rs.gpay_open = false;
-                                            rs.grecv_status = "";
-                                            rs.grecv_saved = false;
-                                            rs.grecv_focus = 0;
-                                            rs.grecv_mode = if (rs.grecv_set) .paste else .onboard;
-                                            rs.gchat_input_focus = false;
-                                            rs.gchat_composing = false;
-                                        },
-                                        .recv_have => if (dev_chat) {
-                                            rs.grecv_mode = .paste;
-                                            rs.grecv_focus = 0;
-                                            rs.grecv_status = "";
-                                        },
-                                        .recv_need => if (dev_chat) {
-                                            rs.grecv_mode = .wallets;
-                                            rs.grecv_status = "";
-                                        },
-                                        .recv_wallet => if (dev_chat) {
-                                            // Open the wallet's own site; you get an address there,
-                                            // then come back and paste it. No return channel needed.
-                                            if (hit.post < feed_view.recv_wallets.len)
-                                                launch.openUri(io, feed_view.recv_wallets[hit.post].url) catch {};
-                                        },
-                                        .recv_paste => if (dev_chat) {
-                                            rs.grecv_mode = .paste;
-                                            rs.grecv_focus = 0;
-                                            rs.grecv_status = "";
-                                        },
-                                        .recv_ln => if (dev_chat) {
-                                            rs.grecv_focus = 0;
-                                        },
-                                        .recv_btc => if (dev_chat) {
-                                            rs.grecv_focus = 1;
-                                        },
-                                        .recv_cancel => if (dev_chat) {
-                                            rs.grecv_open = false;
-                                            rs.grecv_status = "";
-                                        },
-                                        .recv_save => if (dev_chat) {
-                                            const ln = std.mem.trim(u8, rs.grecv_ln_buf[0..rs.grecv_ln_len], " ");
-                                            const btc = std.mem.trim(u8, rs.grecv_btc_buf[0..rs.grecv_btc_len], " ");
+                                },
+                                .chat_input => if (dev_chat) {
+                                    rs.gchat_input_focus = true;
+                                    rs.gchat_composing = false;
+                                },
+                                // "+ New": open (or close) the recipient bar; it owns
+                                // the keyboard while open. Tapping the bar itself is
+                                // inert — being open IS its focus state.
+                                .chat_new => if (dev_chat) {
+                                    rs.gchat_composing = !rs.gchat_composing;
+                                    rs.gchat_peer_len = 0;
+                                    rs.gchat_compose_status = "";
+                                    rs.gchat_input_focus = false;
+                                },
+                                .chat_compose_input => {},
+                                .chat_send => if (dev_chat) {
+                                    const body = std.mem.trimEnd(u8, rs.gchat_draft_buf[0..rs.gchat_draft_len], " \n");
+                                    if (body.len > 0) if (rs.gchat_sel) |sc| {
+                                        _ = chat_core.appendMessage(gpa, &rs.gchat_store, sc, .text, body, now, true) catch {};
+                                        chatSend(gpa, io, environ, if (rs.gchat_e2ee) |*st| st else null, rs.gchat_link, &rs.gchat_store, sc, body);
+                                        chatPersistHistory(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
+                                        rs.gchat_draft_len = 0;
+                                        rs.gchat_input_focus = true;
+                                        rs.gscroll_px = 0;
+                                    };
+                                },
+                                // The pay sheet (M5 A4): the button toggles it;
+                                // it owns the keyboard while open.
+                                .pay_open => if (dev_chat) {
+                                    // Learn (once) whether payments are set up.
+                                    if (!rs.grecv_known) {
+                                        rs.grecv_known = true;
+                                        _ = rs.gchat_arena_state.reset(.retain_capacity);
+                                        rs.grecv_set = loadOwnReceive(gpa, rs.gchat_arena_state.allocator(), io, environ, session, &rs.grecv_ln_buf, &rs.grecv_ln_len, &rs.grecv_btc_buf, &rs.grecv_btc_len);
+                                    }
+                                    rs.gchat_input_focus = false;
+                                    rs.gchat_composing = false;
+                                    if (rs.grecv_set) {
+                                        // Set up → the pay sheet (request/send).
+                                        rs.gpay_open = !rs.gpay_open;
+                                        rs.gpay_status = "";
+                                        rs.gpay_focus = 0;
+                                        rs.gpay_confirm = false;
+                                        rs.grecv_open = false;
+                                    } else {
+                                        // Not set up → onboard, never a dead form.
+                                        rs.grecv_open = true;
+                                        rs.grecv_mode = .onboard;
+                                        rs.grecv_status = "";
+                                        rs.gpay_open = false;
+                                    }
+                                },
+                                .pay_rail => if (dev_chat) {
+                                    rs.gpay_rail = if (hit.post == 1) .onchain else .lightning;
+                                },
+                                .pay_chip => if (dev_chat) {
+                                    if (hit.post < feed_view.pay_chips.len) {
+                                        var ab: [16]u8 = undefined;
+                                        const s = std.fmt.bufPrint(&ab, "{d}", .{feed_view.pay_chips[hit.post]}) catch "";
+                                        if (s.len <= rs.gpay_amount_buf.len) {
+                                            @memcpy(rs.gpay_amount_buf[0..s.len], s);
+                                            rs.gpay_amount_len = s.len;
+                                        }
+                                        rs.gpay_unit = .sats; // the chips are sats amounts
+                                        rs.gpay_focus = 0;
+                                    }
+                                },
+                                .pay_amount => if (dev_chat) {
+                                    rs.gpay_focus = 0;
+                                },
+                                .pay_note => if (dev_chat) {
+                                    rs.gpay_focus = 1;
+                                },
+                                // Toggle the entry unit; clear the draft (a
+                                // sats integer isn't a BTC decimal) so nothing
+                                // is silently reinterpreted by 1e8.
+                                .pay_unit => if (dev_chat) {
+                                    rs.gpay_unit = if (rs.gpay_unit == .sats) .btc else .sats;
+                                    rs.gpay_amount_len = 0;
+                                    rs.gpay_focus = 0;
+                                    rs.gpay_status = "";
+                                },
+                                .pay_cancel => if (dev_chat) {
+                                    rs.gpay_open = false;
+                                    rs.gpay_confirm = false;
+                                    rs.gpay_status = "";
+                                },
+                                // The pay sheet's "Set up how you get
+                                // paid" link AND an incoming offer card's
+                                // "Set up wallet to accept" both open the
+                                // receive onboarding (S2, PAYMENT_UX_SPEC
+                                // §4.1). On save, `announceReceiveReady`
+                                // flips the offer to ready + signals the
+                                // payer — so the tap just opens the sheet.
+                                .recv_open, .pay_card_setup => if (dev_chat) {
+                                    if (!rs.grecv_known) {
+                                        rs.grecv_known = true;
+                                        _ = rs.gchat_arena_state.reset(.retain_capacity);
+                                        rs.grecv_set = loadOwnReceive(gpa, rs.gchat_arena_state.allocator(), io, environ, session, &rs.grecv_ln_buf, &rs.grecv_ln_len, &rs.grecv_btc_buf, &rs.grecv_btc_len);
+                                    }
+                                    rs.grecv_open = true;
+                                    rs.gpay_open = false;
+                                    rs.grecv_status = "";
+                                    rs.grecv_saved = false;
+                                    rs.grecv_focus = 0;
+                                    rs.grecv_mode = if (rs.grecv_set) .paste else .onboard;
+                                    rs.gchat_input_focus = false;
+                                    rs.gchat_composing = false;
+                                },
+                                .recv_have => if (dev_chat) {
+                                    rs.grecv_mode = .paste;
+                                    rs.grecv_focus = 0;
+                                    rs.grecv_status = "";
+                                },
+                                .recv_need => if (dev_chat) {
+                                    rs.grecv_mode = .wallets;
+                                    rs.grecv_status = "";
+                                },
+                                .recv_wallet => if (dev_chat) {
+                                    // Open the wallet's own site; you get an address there,
+                                    // then come back and paste it. No return channel needed.
+                                    if (hit.post < feed_view.recv_wallets.len)
+                                        launch.openUri(io, feed_view.recv_wallets[hit.post].url) catch {};
+                                },
+                                .recv_paste => if (dev_chat) {
+                                    rs.grecv_mode = .paste;
+                                    rs.grecv_focus = 0;
+                                    rs.grecv_status = "";
+                                },
+                                .recv_ln => if (dev_chat) {
+                                    rs.grecv_focus = 0;
+                                },
+                                .recv_btc => if (dev_chat) {
+                                    rs.grecv_focus = 1;
+                                },
+                                .recv_cancel => if (dev_chat) {
+                                    rs.grecv_open = false;
+                                    rs.grecv_status = "";
+                                },
+                                .recv_save => if (dev_chat) {
+                                    const ln = std.mem.trim(u8, rs.grecv_ln_buf[0..rs.grecv_ln_len], " ");
+                                    const btc = std.mem.trim(u8, rs.grecv_btc_buf[0..rs.grecv_btc_len], " ");
+                                    _ = rs.gchat_arena_state.reset(.retain_capacity);
+                                    rs.grecv_status = saveReceiveAddress(gpa, rs.gchat_arena_state.allocator(), io, environ, session, ln, btc, &rs.grecv_saved);
+                                    if (rs.grecv_saved) {
+                                        rs.grecv_set = true;
+                                        // Now that I can receive, every offer
+                                        // waiting on me can proceed (S2).
+                                        announceReceiveReady(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, rs.gchat_link, &rs.gchat_store);
+                                    }
+                                },
+                                // Remove wallet: unpublish the record (walletless
+                                // again) and clear the fields — one tap, not
+                                // delete-every-char-then-Cancel.
+                                .recv_remove => if (dev_chat) {
+                                    _ = rs.gchat_arena_state.reset(.retain_capacity);
+                                    if (pay_addr.unpublish(gpa, rs.gchat_arena_state.allocator(), io, environ, session)) |_| {
+                                        rs.grecv_ln_len = 0;
+                                        rs.grecv_btc_len = 0;
+                                        rs.grecv_set = false;
+                                        rs.grecv_saved = false;
+                                        rs.grecv_focus = 0;
+                                        rs.grecv_status = "Removed \u{2014} you no longer receive payments here";
+                                    } else |_| {
+                                        rs.grecv_status = "Couldn't remove it \u{2014} try again";
+                                    }
+                                },
+                                // Compose "Send": run the per-action gate
+                                // (§5). A walletless recipient → an OFFER
+                                // straight away (no wallet to approve, so no
+                                // "open wallet" confirm — the old lie). A
+                                // set-up recipient → ARM the confirm face,
+                                // whose Confirm is the real hand-off
+                                // (.pay_send). A refusal lands on the sheet.
+                                .pay_arm => if (dev_chat) {
+                                    if (rs.gchat_sel) |sc| {
+                                        const amount = feed_view.payAmountToSats(rs.gpay_amount_buf[0..rs.gpay_amount_len], rs.gpay_unit) orelse 0;
+                                        if (amount == 0 or amount > chat_core.max_amount_sat) {
+                                            rs.gpay_status = "Enter an amount in sats";
+                                        } else {
+                                            const note = std.mem.trim(u8, rs.gpay_note_buf[0..rs.gpay_note_len], " ");
                                             _ = rs.gchat_arena_state.reset(.retain_capacity);
-                                            rs.grecv_status = saveReceiveAddress(gpa, rs.gchat_arena_state.allocator(), io, environ, session, ln, btc, &rs.grecv_saved);
-                                            if (rs.grecv_saved) {
-                                                rs.grecv_set = true;
-                                                // Now that I can receive, every offer
-                                                // waiting on me can proceed (S2).
-                                                announceReceiveReady(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, rs.gchat_link, &rs.gchat_store);
-                                            }
-                                        },
-                                        // Remove wallet: unpublish the record (walletless
-                                        // again) and clear the fields — one tap, not
-                                        // delete-every-char-then-Cancel.
-                                        .recv_remove => if (dev_chat) {
-                                            _ = rs.gchat_arena_state.reset(.retain_capacity);
-                                            if (pay_addr.unpublish(gpa, rs.gchat_arena_state.allocator(), io, environ, session)) |_| {
-                                                rs.grecv_ln_len = 0;
-                                                rs.grecv_btc_len = 0;
-                                                rs.grecv_set = false;
-                                                rs.grecv_saved = false;
-                                                rs.grecv_focus = 0;
-                                                rs.grecv_status = "Removed \u{2014} you no longer receive payments here";
-                                            } else |_| {
-                                                rs.grecv_status = "Couldn't remove it \u{2014} try again";
-                                            }
-                                        },
-                                        // Compose "Send": run the per-action gate
-                                        // (§5). A walletless recipient → an OFFER
-                                        // straight away (no wallet to approve, so no
-                                        // "open wallet" confirm — the old lie). A
-                                        // set-up recipient → ARM the confirm face,
-                                        // whose Confirm is the real hand-off
-                                        // (.pay_send). A refusal lands on the sheet.
-                                        .pay_arm => if (dev_chat) {
-                                            if (rs.gchat_sel) |sc| {
-                                                const amount = feed_view.payAmountToSats(rs.gpay_amount_buf[0..rs.gpay_amount_len], rs.gpay_unit) orelse 0;
-                                                if (amount == 0 or amount > chat_core.max_amount_sat) {
-                                                    rs.gpay_status = "Enter an amount in sats";
-                                                } else {
-                                                    const note = std.mem.trim(u8, rs.gpay_note_buf[0..rs.gpay_note_len], " ");
-                                                    _ = rs.gchat_arena_state.reset(.retain_capacity);
-                                                    const e2ee = if (rs.gchat_e2ee) |*p| p else null;
-                                                    switch (peerSendGate(gpa, rs.gchat_arena_state.allocator(), io, environ, e2ee, &rs.gchat_store, sc, rs.gpay_rail)) {
-                                                        .walletless => {
-                                                            rs.gpay_status = payOffer(gpa, io, environ, e2ee, rs.gchat_link, &rs.gchat_store, sc, rs.gpay_rail, amount, note, now);
-                                                            if (rs.gpay_status.len == 0) {
-                                                                rs.gpay_open = false;
-                                                                rs.gpay_confirm = false;
-                                                                rs.gpay_amount_len = 0;
-                                                                rs.gpay_note_len = 0;
-                                                                rs.gscroll_px = 0;
-                                                            }
-                                                        },
-                                                        .has_wallet => {
-                                                            rs.gpay_confirm = true;
-                                                            rs.gpay_status = "";
-                                                        },
-                                                        .refuse => |m| rs.gpay_status = m,
-                                                    }
-                                                }
-                                            }
-                                        },
-                                        .pay_confirm_back => if (dev_chat) {
-                                            rs.gpay_confirm = false;
-                                        },
-                                        .pay_request, .pay_send => if (dev_chat) {
-                                            if (rs.gchat_sel) |sc| {
-                                                const amount = feed_view.payAmountToSats(rs.gpay_amount_buf[0..rs.gpay_amount_len], rs.gpay_unit) orelse 0;
-                                                if (amount == 0 or amount > chat_core.max_amount_sat) {
-                                                    rs.gpay_status = "Enter an amount in sats";
-                                                } else {
-                                                    const note = std.mem.trim(u8, rs.gpay_note_buf[0..rs.gpay_note_len], " ");
-                                                    if (hit.kind == .pay_request) {
-                                                        // Request gate (§5): you can only ASK to be
-                                                        // paid on a rail you can actually RECEIVE on
-                                                        // — otherwise the money would have nowhere to
-                                                        // land. Your own published addresses are
-                                                        // already loaded (grecv_*).
-                                                        const have_rail = switch (rs.gpay_rail) {
-                                                            .lightning => rs.grecv_ln_len > 0,
-                                                            .onchain => rs.grecv_btc_len > 0,
-                                                        };
-                                                        if (!have_rail) {
-                                                            rs.gpay_status = switch (rs.gpay_rail) {
-                                                                .lightning => "Add your Lightning address first \u{2014} tap \u{201C}Set up how you get paid\u{201D}",
-                                                                .onchain => "Add your Bitcoin address first \u{2014} tap \u{201C}Set up how you get paid\u{201D}",
-                                                            };
-                                                        } else {
-                                                            rs.gpay_status = payRequest(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, rs.gchat_link, &rs.gchat_store, sc, rs.gpay_rail, amount, note, now);
-                                                        }
-                                                    } else {
-                                                        _ = rs.gchat_arena_state.reset(.retain_capacity);
-                                                        rs.gpay_status = paySend(gpa, rs.gchat_arena_state.allocator(), io, environ, if (rs.gchat_e2ee) |*p| p else null, rs.gchat_link, &rs.gchat_store, sc, rs.gpay_rail, amount, note, null, now);
-                                                    }
+                                            const e2ee = if (rs.gchat_e2ee) |*p| p else null;
+                                            switch (peerSendGate(gpa, rs.gchat_arena_state.allocator(), io, environ, e2ee, &rs.gchat_store, sc, rs.gpay_rail)) {
+                                                .walletless => {
+                                                    rs.gpay_status = payOffer(gpa, io, environ, e2ee, rs.gchat_link, &rs.gchat_store, sc, rs.gpay_rail, amount, note, now);
                                                     if (rs.gpay_status.len == 0) {
                                                         rs.gpay_open = false;
                                                         rs.gpay_confirm = false;
-                                                        rs.gpay_first_send = false; // disclosure acknowledged
                                                         rs.gpay_amount_len = 0;
                                                         rs.gpay_note_len = 0;
                                                         rs.gscroll_px = 0;
                                                     }
-                                                }
-                                            }
-                                        },
-                                        // A request card's Pay: the card's own rail,
-                                        // amount, and id drive the same send leg the
-                                        // sheet uses. Refusals land on the app status
-                                        // line (the sheet may be closed).
-                                        .pay_card_pay => if (dev_chat) {
-                                            if (rs.gchat_sel) |sc| {
-                                                if (payRowByOrdinal(gpa, &rs.gchat_store, sc, hit.post)) |row| {
-                                                    _ = rs.gchat_arena_state.reset(.retain_capacity);
-                                                    const verdict = paySend(gpa, rs.gchat_arena_state.allocator(), io, environ, if (rs.gchat_e2ee) |*p| p else null, rs.gchat_link, &rs.gchat_store, sc, row.rail, row.amount_sat, "", row.payment_id, now);
-                                                    rs.status = if (verdict.len == 0) "pay: handed to your wallet" else verdict;
-                                                }
-                                            }
-                                        },
-                                        .pay_card_received => if (dev_chat) {
-                                            if (rs.gchat_sel) |sc| {
-                                                if (payRowByOrdinal(gpa, &rs.gchat_store, sc, hit.post)) |row| {
-                                                    payCardEvent(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, rs.gchat_link, &rs.gchat_store, sc, row.payment_id, true);
-                                                }
-                                            }
-                                        },
-                                        // Withdraw an offer/send (→ cancelled) or
-                                        // turn down an incoming offer (→ declined):
-                                        // both flip BOTH sides and move no money
-                                        // (S2). Each terminal names itself (§8.5).
-                                        .pay_card_cancel, .pay_card_decline => if (dev_chat) {
-                                            if (rs.gchat_sel) |sc| {
-                                                if (payRowByOrdinal(gpa, &rs.gchat_store, sc, hit.post)) |row| {
-                                                    const decline = hit.kind == .pay_card_decline;
-                                                    payCardSignal(
-                                                        gpa,
-                                                        io,
-                                                        environ,
-                                                        if (rs.gchat_e2ee) |*p| p else null,
-                                                        rs.gchat_link,
-                                                        &rs.gchat_store,
-                                                        sc,
-                                                        row.payment_id,
-                                                        if (decline) .declined else .cancelled,
-                                                        if (decline) chat_core.kind_pay_decline_wire else chat_core.kind_pay_cancel_wire,
-                                                    );
-                                                }
-                                            }
-                                        },
-                                        // A `ready` offer card's Send: the peer
-                                        // set up a wallet, so the standard send leg
-                                        // now resolves — re-confirm has already
-                                        // happened at the card (money-critical, so
-                                        // the hand-off is a deliberate tap).
-                                        .pay_card_send => if (dev_chat) {
-                                            if (rs.gchat_sel) |sc| {
-                                                if (payRowByOrdinal(gpa, &rs.gchat_store, sc, hit.post)) |row| {
-                                                    _ = rs.gchat_arena_state.reset(.retain_capacity);
-                                                    const verdict = paySend(gpa, rs.gchat_arena_state.allocator(), io, environ, if (rs.gchat_e2ee) |*p| p else null, rs.gchat_link, &rs.gchat_store, sc, row.rail, row.amount_sat, "", row.payment_id, now);
-                                                    rs.status = if (verdict.len == 0) "pay: handed to your wallet" else verdict;
-                                                }
-                                            }
-                                        },
-                                        // Tag pill (tray) OR an inline `#tag` in the prose →
-                                        // ENTER its zone. Both regions carry the post index in
-                                        // `post` and the tag's index in `_pad`; resolve the
-                                        // display tag, open the zone page, and let the
-                                        // fetch-on-enter pull the zone feed (buildTagView).
-                                        .zone_jump, .tag_inline => if (hit.post < view_items.len) {
-                                            const tags = view_items[hit.post].tags;
-                                            if (hit._pad < tags.len) {
-                                                const t = tags[hit._pad];
-                                                if (t.len > 0 and t.len <= rs.zone_tag_buf.len) {
-                                                    // Zones are canonical lowercase (invariant 1):
-                                                    // fold the tapped tag so #Foo opens zone "foo".
-                                                    for (t, 0..) |c, i| rs.zone_tag_buf[i] = std.ascii.toLower(c);
-                                                    // Back returns to where we came FROM (don't
-                                                    // overwrite it on a zone→zone hop).
-                                                    if (rs.gscreen != feed_view.screen_zones) rs.zone_return_screen = rs.gscreen;
-                                                    rs.zone_tag = rs.zone_tag_buf[0..t.len];
-                                                    rs.gscreen = feed_view.screen_zones;
-                                                    rs.zone_dirty = true;
-                                                    rs.gscroll_px = 0;
-                                                    rs.gsocket_ui.open = false; // tuck the home socket
-                                                }
-                                            }
-                                        },
-                                        // Zone card (browse grid) → ENTER its zone. The
-                                        // region carries the catalog index in `post`; resolve
-                                        // its display tag and open the zone page (the
-                                        // fetch-on-enter pulls the feed, like a tag pill).
-                                        .zone_open => if (hit.post < rs.zone_catalog.items.len) {
-                                            const t = rs.zone_catalog.items[hit.post].tag;
-                                            if (t.len > 0 and t.len <= rs.zone_tag_buf.len) {
-                                                // Canonical lowercase zone name (invariant 1).
-                                                for (t, 0..) |c, i| rs.zone_tag_buf[i] = std.ascii.toLower(c);
-                                                if (rs.gscreen != feed_view.screen_zones) rs.zone_return_screen = rs.gscreen;
-                                                rs.zone_tag = rs.zone_tag_buf[0..t.len];
-                                                rs.gscreen = feed_view.screen_zones;
-                                                rs.zone_dirty = true;
-                                                rs.gscroll_px = 0;
-                                                rs.gsocket_ui.open = false;
-                                            }
-                                        },
-                                        // Marketplace "View details": fetch this
-                                        // algorithm's full config by (author, rkey) and
-                                        // open its transparency page. The fetched config
-                                        // is validated in the shell leg (never trust the
-                                        // wire); what the page shows is what would run.
-                                        .algo_view => if (hit.post < rs.market_catalog.items.len) {
-                                            const r = rs.market_catalog.items[hit.post];
-                                            // Join any still-running fetch (rapid re-tap) before reusing
-                                            // the job, so its thread can't outlive the reused fields.
-                                            if (rs.inspectjob.active) {
-                                                joinInspect(&rs.inspectjob);
-                                                if (rs.inspectjob.ok) if (rs.inspectjob.bytes) |b| std.heap.page_allocator.free(b);
-                                            }
-                                            if (rs.inspect_name.len > 0) gpa.free(rs.inspect_name);
-                                            if (rs.inspect_ref.len > 0) gpa.free(rs.inspect_ref);
-                                            if (rs.inspect_bytes) |b| gpa.free(b);
-                                            rs.inspect_bytes = null;
-                                            rs.inspect_name = try gpa.dupe(u8, r.name);
-                                            rs.inspect_ref = try gpa.dupe(u8, r.cid);
-                                            rs.transp_return_screen = rs.gscreen;
-                                            rs.gscreen = feed_view.screen_transparency;
-                                            rs.gtransp_source = false; // open on the summary
-                                            rs.gscroll_px = 0;
-                                            // A8: a config we've already retrieved is immutable (same
-                                            // CID) — serve it from the cache, INSTANT, no network.
-                                            if (rs.config_cache.get(r.cid)) |cached| {
-                                                rs.inspect_bytes = gpa.dupe(u8, cached) catch null;
-                                                rs.inspect_loading = false;
-                                            } else {
-                                                // Never seen: fetch on a worker (public read, no shared
-                                                // session), page opens in a loading state meanwhile.
-                                                startInspect(&rs.inspectjob, io, environ, session.pds_url, r.author_did, r.rkey);
-                                                rs.inspect_loading = true;
-                                            }
-                                        },
-                                        // "View the exact source" on the transparency
-                                        // page → the byte-exact serialized artifact.
-                                        .algo_source => {
-                                            rs.gtransp_source = true;
-                                            rs.gscroll_px = 0;
-                                        },
-                                        // "Add to loadout" (adopt + score) is the next
-                                        // slice — it needs the fetched config wired into
-                                        // the scoring resolver. Honest until then.
-                                        .algo_add => {
-                                            rs.status = "Add to loadout is coming next — view its details for now.";
-                                        },
-                                        // Settings → Sign out: flag it and leave the
-                                        // run loop. The caller (main) clears the cached
-                                        // session instead of re-saving it, so the next
-                                        // launch shows the Join/login flow.
-                                        .sign_out => {
-                                            rs.user_signed_out = true;
-                                            break :main_loop;
-                                        },
-                                        // Settings master–detail: pick the section.
-                                        .settings_section => {
-                                            rs.gsettings_section = @intCast(hit.post);
-                                            rs.gscroll_px = 0;
-                                            rs.gsettings_picking = 255; // close any open picker
-                                        },
-                                        // A detail-pane row. Toggles flip their
-                                        // runtime bit (live — Julia mode reads its
-                                        // bit; other toggles flip but do nothing
-                                        // until wired). Non-toggle rows: inert.
-                                        .settings_row => {
-                                            if (hit.post < settings_view.rows.len and settings_view.rows[hit.post].kind == .toggle) {
-                                                rs.toggle_bits ^= @as(u64, 1) << @intCast(hit.post);
-                                                // Julia mode flipped ON → sparks fly from the
-                                                // SWITCH: a heart-shaped bloom of ripples out of
-                                                // the toggle's spot in the field. Convert the
-                                                // toggle pill (logical px, right end of the row)
-                                                // to a field cell (window px / cell, via scale).
-                                                if (settings_view.rows[hit.post].action == settings_view.act_julia and (rs.toggle_bits >> @intCast(hit.post)) & 1 != 0) {
-                                                    if (rs.gpu_state) |*gs| {
-                                                        const tx = (@as(f32, @floatFromInt(hit.x)) + @as(f32, @floatFromInt(hit.w)) - 36.0) * gs.scale;
-                                                        const ty = (@as(f32, @floatFromInt(hit.y)) + @as(f32, @floatFromInt(hit.h)) * 0.5) * gs.scale;
-                                                        pushJuliaBurst(gpa, gs, @intFromFloat(tx / @as(f32, @floatFromInt(field_cell_w))), @intFromFloat(ty / @as(f32, @floatFromInt(field_cell_h))));
-                                                        // The visible spark: hearts fly from the switch, on top of everything.
-                                                        gs.julia_burst_x = tx;
-                                                        gs.julia_burst_y = ty;
-                                                        gs.julia_burst_t = 1.0;
-                                                    }
-                                                }
-                                            }
-                                            rs.gsettings_picking = 255; // a row tap closes the picker
-                                        },
-                                        // A wired CHOICE row: open (or re-close) its
-                                        // picker popover.
-                                        .settings_choice => {
-                                            const act = settings_view.rows[hit.post].action;
-                                            rs.gsettings_picking = if (rs.gsettings_picking == act) 255 else act;
-                                        },
-                                        // A picker option: post = choiceIndex*8 + optionIndex.
-                                        .settings_choice_opt => {
-                                            const ci = hit.post / 8;
-                                            const oi: u8 = @intCast(hit.post % 8);
-                                            if (ci < rs.choice_sel.len) rs.choice_sel[ci] = oi;
-                                            rs.gsettings_picking = 255; // selection closes the picker
-                                        },
+                                                },
+                                                .has_wallet => {
+                                                    rs.gpay_confirm = true;
+                                                    rs.gpay_status = "";
+                                                },
+                                                .refuse => |m| rs.gpay_status = m,
                                             }
                                         }
                                     }
-                                } else if (rs.armed_legacy and cx == rs.armed_cx and cy == rs.armed_cy) {
-                                    // Legacy (software cell) tap: same target on release.
-                                    if (field_ui.hitTest(cx, cy, g.hr.slice())) |hit| {
-                                        if (hit.target != field_ui.no_target and hit.target < view_items.len) rs.state.selected = hit.target;
-                                        if (hit.action != .none) if (timeline_ui.keyFor(hit.action)) |byte| {
-                                            try pumped_bytes.append(gpa, byte);
-                                        };
+                                },
+                                .pay_confirm_back => if (dev_chat) {
+                                    rs.gpay_confirm = false;
+                                },
+                                .pay_request, .pay_send => if (dev_chat) {
+                                    if (rs.gchat_sel) |sc| {
+                                        const amount = feed_view.payAmountToSats(rs.gpay_amount_buf[0..rs.gpay_amount_len], rs.gpay_unit) orelse 0;
+                                        if (amount == 0 or amount > chat_core.max_amount_sat) {
+                                            rs.gpay_status = "Enter an amount in sats";
+                                        } else {
+                                            const note = std.mem.trim(u8, rs.gpay_note_buf[0..rs.gpay_note_len], " ");
+                                            if (hit.kind == .pay_request) {
+                                                // Request gate (§5): you can only ASK to be
+                                                // paid on a rail you can actually RECEIVE on
+                                                // — otherwise the money would have nowhere to
+                                                // land. Your own published addresses are
+                                                // already loaded (grecv_*).
+                                                const have_rail = switch (rs.gpay_rail) {
+                                                    .lightning => rs.grecv_ln_len > 0,
+                                                    .onchain => rs.grecv_btc_len > 0,
+                                                };
+                                                if (!have_rail) {
+                                                    rs.gpay_status = switch (rs.gpay_rail) {
+                                                        .lightning => "Add your Lightning address first \u{2014} tap \u{201C}Set up how you get paid\u{201D}",
+                                                        .onchain => "Add your Bitcoin address first \u{2014} tap \u{201C}Set up how you get paid\u{201D}",
+                                                    };
+                                                } else {
+                                                    rs.gpay_status = payRequest(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, rs.gchat_link, &rs.gchat_store, sc, rs.gpay_rail, amount, note, now);
+                                                }
+                                            } else {
+                                                _ = rs.gchat_arena_state.reset(.retain_capacity);
+                                                rs.gpay_status = paySend(gpa, rs.gchat_arena_state.allocator(), io, environ, if (rs.gchat_e2ee) |*p| p else null, rs.gchat_link, &rs.gchat_store, sc, rs.gpay_rail, amount, note, null, now);
+                                            }
+                                            if (rs.gpay_status.len == 0) {
+                                                rs.gpay_open = false;
+                                                rs.gpay_confirm = false;
+                                                rs.gpay_first_send = false; // disclosure acknowledged
+                                                rs.gpay_amount_len = 0;
+                                                rs.gpay_note_len = 0;
+                                                rs.gscroll_px = 0;
+                                            }
+                                        }
+                                    }
+                                },
+                                // A request card's Pay: the card's own rail,
+                                // amount, and id drive the same send leg the
+                                // sheet uses. Refusals land on the app status
+                                // line (the sheet may be closed).
+                                .pay_card_pay => if (dev_chat) {
+                                    if (rs.gchat_sel) |sc| {
+                                        if (payRowByOrdinal(gpa, &rs.gchat_store, sc, hit.post)) |row| {
+                                            _ = rs.gchat_arena_state.reset(.retain_capacity);
+                                            const verdict = paySend(gpa, rs.gchat_arena_state.allocator(), io, environ, if (rs.gchat_e2ee) |*p| p else null, rs.gchat_link, &rs.gchat_store, sc, row.rail, row.amount_sat, "", row.payment_id, now);
+                                            rs.status = if (verdict.len == 0) "pay: handed to your wallet" else verdict;
+                                        }
+                                    }
+                                },
+                                .pay_card_received => if (dev_chat) {
+                                    if (rs.gchat_sel) |sc| {
+                                        if (payRowByOrdinal(gpa, &rs.gchat_store, sc, hit.post)) |row| {
+                                            payCardEvent(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, rs.gchat_link, &rs.gchat_store, sc, row.payment_id, true);
+                                        }
+                                    }
+                                },
+                                // Withdraw an offer/send (→ cancelled) or
+                                // turn down an incoming offer (→ declined):
+                                // both flip BOTH sides and move no money
+                                // (S2). Each terminal names itself (§8.5).
+                                .pay_card_cancel, .pay_card_decline => if (dev_chat) {
+                                    if (rs.gchat_sel) |sc| {
+                                        if (payRowByOrdinal(gpa, &rs.gchat_store, sc, hit.post)) |row| {
+                                            const decline = hit.kind == .pay_card_decline;
+                                            payCardSignal(
+                                                gpa,
+                                                io,
+                                                environ,
+                                                if (rs.gchat_e2ee) |*p| p else null,
+                                                rs.gchat_link,
+                                                &rs.gchat_store,
+                                                sc,
+                                                row.payment_id,
+                                                if (decline) .declined else .cancelled,
+                                                if (decline) chat_core.kind_pay_decline_wire else chat_core.kind_pay_cancel_wire,
+                                            );
+                                        }
+                                    }
+                                },
+                                // A `ready` offer card's Send: the peer
+                                // set up a wallet, so the standard send leg
+                                // now resolves — re-confirm has already
+                                // happened at the card (money-critical, so
+                                // the hand-off is a deliberate tap).
+                                .pay_card_send => if (dev_chat) {
+                                    if (rs.gchat_sel) |sc| {
+                                        if (payRowByOrdinal(gpa, &rs.gchat_store, sc, hit.post)) |row| {
+                                            _ = rs.gchat_arena_state.reset(.retain_capacity);
+                                            const verdict = paySend(gpa, rs.gchat_arena_state.allocator(), io, environ, if (rs.gchat_e2ee) |*p| p else null, rs.gchat_link, &rs.gchat_store, sc, row.rail, row.amount_sat, "", row.payment_id, now);
+                                            rs.status = if (verdict.len == 0) "pay: handed to your wallet" else verdict;
+                                        }
+                                    }
+                                },
+                                // Tag pill (tray) OR an inline `#tag` in the prose →
+                                // ENTER its zone. Both regions carry the post index in
+                                // `post` and the tag's index in `_pad`; resolve the
+                                // display tag, open the zone page, and let the
+                                // fetch-on-enter pull the zone feed (buildTagView).
+                                .zone_jump, .tag_inline => if (hit.post < view_items.len) {
+                                    const tags = view_items[hit.post].tags;
+                                    if (hit._pad < tags.len) {
+                                        const t = tags[hit._pad];
+                                        if (t.len > 0 and t.len <= rs.zone_tag_buf.len) {
+                                            // Zones are canonical lowercase (invariant 1):
+                                            // fold the tapped tag so #Foo opens zone "foo".
+                                            for (t, 0..) |c, i| rs.zone_tag_buf[i] = std.ascii.toLower(c);
+                                            // Back returns to where we came FROM (don't
+                                            // overwrite it on a zone→zone hop).
+                                            if (rs.gscreen != feed_view.screen_zones) rs.zone_return_screen = rs.gscreen;
+                                            rs.zone_tag = rs.zone_tag_buf[0..t.len];
+                                            rs.gscreen = feed_view.screen_zones;
+                                            rs.zone_dirty = true;
+                                            rs.gscroll_px = 0;
+                                            rs.gsocket_ui.open = false; // tuck the home socket
+                                        }
+                                    }
+                                },
+                                // Zone card (browse grid) → ENTER its zone. The
+                                // region carries the catalog index in `post`; resolve
+                                // its display tag and open the zone page (the
+                                // fetch-on-enter pulls the feed, like a tag pill).
+                                .zone_open => if (hit.post < rs.zone_catalog.items.len) {
+                                    const t = rs.zone_catalog.items[hit.post].tag;
+                                    if (t.len > 0 and t.len <= rs.zone_tag_buf.len) {
+                                        // Canonical lowercase zone name (invariant 1).
+                                        for (t, 0..) |c, i| rs.zone_tag_buf[i] = std.ascii.toLower(c);
+                                        if (rs.gscreen != feed_view.screen_zones) rs.zone_return_screen = rs.gscreen;
+                                        rs.zone_tag = rs.zone_tag_buf[0..t.len];
+                                        rs.gscreen = feed_view.screen_zones;
+                                        rs.zone_dirty = true;
+                                        rs.gscroll_px = 0;
+                                        rs.gsocket_ui.open = false;
+                                    }
+                                },
+                                // Marketplace "View details": fetch this
+                                // algorithm's full config by (author, rkey) and
+                                // open its transparency page. The fetched config
+                                // is validated in the shell leg (never trust the
+                                // wire); what the page shows is what would run.
+                                .algo_view => if (hit.post < rs.market_catalog.items.len) {
+                                    const r = rs.market_catalog.items[hit.post];
+                                    // Join any still-running fetch (rapid re-tap) before reusing
+                                    // the job, so its thread can't outlive the reused fields.
+                                    if (rs.inspectjob.active) {
+                                        joinInspect(&rs.inspectjob);
+                                        if (rs.inspectjob.ok) if (rs.inspectjob.bytes) |b| std.heap.page_allocator.free(b);
+                                    }
+                                    if (rs.inspect_name.len > 0) gpa.free(rs.inspect_name);
+                                    if (rs.inspect_ref.len > 0) gpa.free(rs.inspect_ref);
+                                    if (rs.inspect_bytes) |b| gpa.free(b);
+                                    rs.inspect_bytes = null;
+                                    rs.inspect_name = try gpa.dupe(u8, r.name);
+                                    rs.inspect_ref = try gpa.dupe(u8, r.cid);
+                                    rs.transp_return_screen = rs.gscreen;
+                                    rs.gscreen = feed_view.screen_transparency;
+                                    rs.gtransp_source = false; // open on the summary
+                                    rs.gscroll_px = 0;
+                                    // A8: a config we've already retrieved is immutable (same
+                                    // CID) — serve it from the cache, INSTANT, no network.
+                                    if (rs.config_cache.get(r.cid)) |cached| {
+                                        rs.inspect_bytes = gpa.dupe(u8, cached) catch null;
+                                        rs.inspect_loading = false;
+                                    } else {
+                                        // Never seen: fetch on a worker (public read, no shared
+                                        // session), page opens in a loading state meanwhile.
+                                        startInspect(&rs.inspectjob, io, environ, session.pds_url, r.author_did, r.rkey);
+                                        rs.inspect_loading = true;
+                                    }
+                                },
+                                // "View the exact source" on the transparency
+                                // page → the byte-exact serialized artifact.
+                                .algo_source => {
+                                    rs.gtransp_source = true;
+                                    rs.gscroll_px = 0;
+                                },
+                                // "Add to loadout" (adopt + score) is the next
+                                // slice — it needs the fetched config wired into
+                                // the scoring resolver. Honest until then.
+                                .algo_add => {
+                                    rs.status = "Add to loadout is coming next — view its details for now.";
+                                },
+                                // Settings → Sign out: flag it and leave the
+                                // run loop. The caller (main) clears the cached
+                                // session instead of re-saving it, so the next
+                                // launch shows the Join/login flow.
+                                .sign_out => {
+                                    rs.user_signed_out = true;
+                                    break :main_loop;
+                                },
+                                // Settings master–detail: pick the section.
+                                .settings_section => {
+                                    rs.gsettings_section = @intCast(hit.post);
+                                    rs.gscroll_px = 0;
+                                    rs.gsettings_picking = 255; // close any open picker
+                                },
+                                // A detail-pane row. Toggles flip their
+                                // runtime bit (live — Julia mode reads its
+                                // bit; other toggles flip but do nothing
+                                // until wired). Non-toggle rows: inert.
+                                .settings_row => {
+                                    if (hit.post < settings_view.rows.len and settings_view.rows[hit.post].kind == .toggle) {
+                                        rs.toggle_bits ^= @as(u64, 1) << @intCast(hit.post);
+                                        // Julia mode flipped ON → sparks fly from the
+                                        // SWITCH: a heart-shaped bloom of ripples out of
+                                        // the toggle's spot in the field. Convert the
+                                        // toggle pill (logical px, right end of the row)
+                                        // to a field cell (window px / cell, via scale).
+                                        if (settings_view.rows[hit.post].action == settings_view.act_julia and (rs.toggle_bits >> @intCast(hit.post)) & 1 != 0) {
+                                            if (rs.gpu_state) |*gs| {
+                                                const tx = (@as(f32, @floatFromInt(hit.x)) + @as(f32, @floatFromInt(hit.w)) - 36.0) * gs.scale;
+                                                const ty = (@as(f32, @floatFromInt(hit.y)) + @as(f32, @floatFromInt(hit.h)) * 0.5) * gs.scale;
+                                                pushJuliaBurst(gpa, gs, @intFromFloat(tx / @as(f32, @floatFromInt(field_cell_w))), @intFromFloat(ty / @as(f32, @floatFromInt(field_cell_h))));
+                                                // The visible spark: hearts fly from the switch, on top of everything.
+                                                gs.julia_burst_x = tx;
+                                                gs.julia_burst_y = ty;
+                                                gs.julia_burst_t = 1.0;
+                                            }
+                                        }
+                                    }
+                                    rs.gsettings_picking = 255; // a row tap closes the picker
+                                },
+                                // A wired CHOICE row: open (or re-close) its
+                                // picker popover.
+                                .settings_choice => {
+                                    const act = settings_view.rows[hit.post].action;
+                                    rs.gsettings_picking = if (rs.gsettings_picking == act) 255 else act;
+                                },
+                                // A picker option: post = choiceIndex*8 + optionIndex.
+                                .settings_choice_opt => {
+                                    const ci = hit.post / 8;
+                                    const oi: u8 = @intCast(hit.post % 8);
+                                    if (ci < rs.choice_sel.len) rs.choice_sel[ci] = oi;
+                                    rs.gsettings_picking = 255; // selection closes the picker
+                                },
                                     }
                                 }
-                                rs.armed_kind = null;
-                                rs.armed_legacy = false;
+                            }
+                        } else if (rs.armed_legacy and cx == rs.armed_cx and cy == rs.armed_cy) {
+                            // Legacy (software cell) tap: same target on release.
+                            if (field_ui.hitTest(cx, cy, g.hr.slice())) |hit| {
+                                if (hit.target != field_ui.no_target and hit.target < view_items.len) rs.state.selected = hit.target;
+                                if (hit.action != .none) if (timeline_ui.keyFor(hit.action)) |byte| {
+                                    try pumped_bytes.append(gpa, byte);
+                                };
+                            }
+                        }
+                        rs.armed_kind = null;
+                        rs.armed_legacy = false;
+                    },
+                    else => {},
+                }
+            }
+            if (pointer_events.items.len > 0) rs.last_input_nanos = clock_shell.monotonicNanos();
+        };
+        // Compose mode: the premium composer's footer buttons. A tap is
+        // turned into the SAME control byte the keyboard sends — Ctrl-D
+        // (send) / Ctrl-C (cancel) — so handleComposeInput stays the one
+        // dispatch path (the timeline does the same trick for its rows).
+        if (rs.mode == .compose) if (pix) |g| {
+            const gpu_scale: f32 = if (g.gpu) |gs| gs.scale else 1.0;
+            for (pointer_events.items) |pev| {
+                const rx: i32 = if (g.gpu != null) @intFromFloat(@as(f32, @floatFromInt(pev.x)) / gpu_scale) else @intCast(pev.x);
+                const ry: i32 = if (g.gpu != null) @intFromFloat(@as(f32, @floatFromInt(pev.y)) / gpu_scale) else @intCast(pev.y);
+                switch (pev.kind) {
+                    .button_down => {
+                        if (pev.button != 1) continue;
+                        if (feed_view.hitTest(g.regions.items, rx, ry)) |hit| switch (hit.kind) {
+                            // Release-activation: arm the footer button; it fires
+                            // on button_up if the release is still on it. A
+                            // segment's ✕ carries its index in `post`.
+                            .compose_send, .compose_cancel, .compose_add, .compose_remove => {
+                                rs.armed_compose = hit.kind;
+                                rs.armed_post = hit.post;
                             },
                             else => {},
+                        } else {
+                            // Press in the text area. Count consecutive
+                            // presses close in time + place: 1 = caret +
+                            // drag, 2 = select word, 3 = select line.
+                            const now_ns = clock_shell.monotonicNanos();
+                            const near = @abs(rx - rs.last_click_x) <= 3 and @abs(ry - rs.last_click_y) <= 3;
+                            rs.click_count = if (now_ns -| rs.last_click_ns < 400_000_000 and near) rs.click_count + 1 else 1;
+                            rs.last_click_ns = now_ns;
+                            rs.last_click_x = rx;
+                            rs.last_click_y = ry;
+                            const off = feed_view.composeCaretAtPoint(g.engine, @intCast(design_w), textedit.view(&rs.compose), rx, ry);
+                            switch (@min(rs.click_count, @as(u8, 3))) {
+                                1 => {
+                                    textedit.setCaret(&rs.compose, off);
+                                    rs.compose_drag = true; // single press → drag-select
+                                },
+                                2 => textedit.selectWord(&rs.compose, off),
+                                else => textedit.selectLine(&rs.compose, off),
+                            }
+                            rs.caret_anchor_ns = now_ns;
                         }
-                    }
-                    if (pointer_events.items.len > 0) rs.last_input_nanos = clock_shell.monotonicNanos();
-                };
-                // Compose mode: the premium composer's footer buttons. A tap is
-                // turned into the SAME control byte the keyboard sends — Ctrl-D
-                // (send) / Ctrl-C (cancel) — so handleComposeInput stays the one
-                // dispatch path (the timeline does the same trick for its rows).
-                if (rs.mode == .compose) if (pix) |g| {
-                    const gpu_scale: f32 = if (g.gpu) |gs| gs.scale else 1.0;
-                    for (pointer_events.items) |pev| {
-                        const rx: i32 = if (g.gpu != null) @intFromFloat(@as(f32, @floatFromInt(pev.x)) / gpu_scale) else @intCast(pev.x);
-                        const ry: i32 = if (g.gpu != null) @intFromFloat(@as(f32, @floatFromInt(pev.y)) / gpu_scale) else @intCast(pev.y);
-                        switch (pev.kind) {
-                            .button_down => {
-                                if (pev.button != 1) continue;
-                                if (feed_view.hitTest(g.regions.items, rx, ry)) |hit| switch (hit.kind) {
-                                    // Release-activation: arm the footer button; it fires
-                                    // on button_up if the release is still on it. A
-                                    // segment's ✕ carries its index in `post`.
-                                    .compose_send, .compose_cancel, .compose_add, .compose_remove => {
-                                        rs.armed_compose = hit.kind;
-                                        rs.armed_post = hit.post;
+                    },
+                    .move => {
+                        // Affordance: the hand over the composer's footer
+                        // buttons (the only regions it emits), the I-beam over
+                        // the editable text area otherwise — so a tap into the
+                        // composer doesn't leave the hand from the button that
+                        // opened it, and editable text reads as selectable.
+                        switch (backend) {
+                    .window => |w| window_shell.setCursor(w, if (feed_view.hitTest(g.regions.items, rx, ry) != null) .pointer else .text),
+                    else => {}, // a finger casts no cursor
+                }
+                        if (rs.compose_drag) {
+                            // Drag extends the selection to the pointer.
+                            const off = feed_view.composeCaretAtPoint(g.engine, @intCast(design_w), textedit.view(&rs.compose), rx, ry);
+                            textedit.extendTo(&rs.compose, off);
+                            rs.caret_anchor_ns = clock_shell.monotonicNanos();
+                        }
+                    },
+                    .button_up => if (pev.button == 1) {
+                        rs.compose_drag = false;
+                        // Fire the armed footer button only if the release is
+                        // still over the same button (slide-off cancels).
+                        if (rs.armed_compose) |ac| {
+                            if (feed_view.hitTest(g.regions.items, rx, ry)) |hit| {
+                                if (hit.kind == ac) switch (ac) {
+                                    .compose_send => try pumped_bytes.append(gpa, 4), // ctrl-D
+                                    .compose_cancel => try pumped_bytes.append(gpa, 3), // ctrl-C
+                                    // "Add": finalize the active draft as a thread
+                                    // segment and clear the box for the next post.
+                                    .compose_add => {
+                                        const active = textedit.view(&rs.compose);
+                                        if (active.len > 0 and rs.chain_segments.items.len < max_chain_segments - 1) {
+                                            if (gpa.dupe(u8, active)) |d| {
+                                                rs.chain_segments.append(gpa, d) catch gpa.free(d);
+                                                textedit.clear(&rs.compose);
+                                                rs.caret_anchor_ns = clock_shell.monotonicNanos();
+                                            } else |_| {}
+                                        }
+                                    },
+                                    // A segment's ✕: drop it, preserving order.
+                                    .compose_remove => if (rs.armed_post < rs.chain_segments.items.len) {
+                                        gpa.free(rs.chain_segments.items[rs.armed_post]);
+                                        _ = rs.chain_segments.orderedRemove(rs.armed_post);
                                     },
                                     else => {},
-                                } else {
-                                    // Press in the text area. Count consecutive
-                                    // presses close in time + place: 1 = caret +
-                                    // drag, 2 = select word, 3 = select line.
-                                    const now_ns = clock_shell.monotonicNanos();
-                                    const near = @abs(rx - rs.last_click_x) <= 3 and @abs(ry - rs.last_click_y) <= 3;
-                                    rs.click_count = if (now_ns -| rs.last_click_ns < 400_000_000 and near) rs.click_count + 1 else 1;
-                                    rs.last_click_ns = now_ns;
-                                    rs.last_click_x = rx;
-                                    rs.last_click_y = ry;
-                                    const off = feed_view.composeCaretAtPoint(g.engine, @intCast(design_w), textedit.view(&rs.compose), rx, ry);
-                                    switch (@min(rs.click_count, @as(u8, 3))) {
-                                        1 => {
-                                            textedit.setCaret(&rs.compose, off);
-                                            rs.compose_drag = true; // single press → drag-select
-                                        },
-                                        2 => textedit.selectWord(&rs.compose, off),
-                                        else => textedit.selectLine(&rs.compose, off),
-                                    }
-                                    rs.caret_anchor_ns = now_ns;
-                                }
-                            },
-                            .move => {
-                                // Affordance: the hand over the composer's footer
-                                // buttons (the only regions it emits), the I-beam over
-                                // the editable text area otherwise — so a tap into the
-                                // composer doesn't leave the hand from the button that
-                                // opened it, and editable text reads as selectable.
-                                window_shell.setCursor(win, if (feed_view.hitTest(g.regions.items, rx, ry) != null) .pointer else .text);
-                                if (rs.compose_drag) {
-                                    // Drag extends the selection to the pointer.
-                                    const off = feed_view.composeCaretAtPoint(g.engine, @intCast(design_w), textedit.view(&rs.compose), rx, ry);
-                                    textedit.extendTo(&rs.compose, off);
-                                    rs.caret_anchor_ns = clock_shell.monotonicNanos();
-                                }
-                            },
-                            .button_up => if (pev.button == 1) {
-                                rs.compose_drag = false;
-                                // Fire the armed footer button only if the release is
-                                // still over the same button (slide-off cancels).
-                                if (rs.armed_compose) |ac| {
-                                    if (feed_view.hitTest(g.regions.items, rx, ry)) |hit| {
-                                        if (hit.kind == ac) switch (ac) {
-                                            .compose_send => try pumped_bytes.append(gpa, 4), // ctrl-D
-                                            .compose_cancel => try pumped_bytes.append(gpa, 3), // ctrl-C
-                                            // "Add": finalize the active draft as a thread
-                                            // segment and clear the box for the next post.
-                                            .compose_add => {
-                                                const active = textedit.view(&rs.compose);
-                                                if (active.len > 0 and rs.chain_segments.items.len < max_chain_segments - 1) {
-                                                    if (gpa.dupe(u8, active)) |d| {
-                                                        rs.chain_segments.append(gpa, d) catch gpa.free(d);
-                                                        textedit.clear(&rs.compose);
-                                                        rs.caret_anchor_ns = clock_shell.monotonicNanos();
-                                                    } else |_| {}
-                                                }
-                                            },
-                                            // A segment's ✕: drop it, preserving order.
-                                            .compose_remove => if (rs.armed_post < rs.chain_segments.items.len) {
-                                                gpa.free(rs.chain_segments.items[rs.armed_post]);
-                                                _ = rs.chain_segments.orderedRemove(rs.armed_post);
-                                            },
-                                            else => {},
-                                        };
-                                    }
-                                }
-                                rs.armed_compose = null;
-                            },
-                            else => {},
+                                };
+                            }
                         }
-                    }
-                    if (pointer_events.items.len > 0) rs.last_input_nanos = clock_shell.monotonicNanos();
-                };
-                n = @min(pumped_bytes.items.len, in_buf.len);
-                @memcpy(in_buf[0..n], pumped_bytes.items[0..n]);
-                // No input this lap: idle back to the top. The top-of-loop
-                // paintFrame is the ONE place the sim advances — it runs every
-                // lap, and the dynamic pump above already set this lap's length
-                // to the frame cadence while animating, so looping back yields
-                // exactly one animation frame. (A second paint here was
-                // redundant: it re-ran the whole pipeline with ~0 dt, doing the
-                // CPU work of a frame the top-of-loop paint repeats next lap —
-                // pure waste on the render thread. One paint per lap.)
-                if (n == 0) return .again; // no input this lap: frame over (was `continue`)
-                rs.last_input_nanos = clock_shell.monotonicNanos();
-            },
+                        rs.armed_compose = null;
+                    },
+                    else => {},
+                }
+            }
+            if (pointer_events.items.len > 0) rs.last_input_nanos = clock_shell.monotonicNanos();
+        };
+        if (backend != .terminal) {
+            n = @min(pumped_bytes.items.len, in_buf.len);
+            @memcpy(in_buf[0..n], pumped_bytes.items[0..n]);
+        }
+        // No input this lap: idle back to the top. The top-of-loop
+        // paintFrame is the ONE place the sim advances — it runs every
+        // lap, and the dynamic pump above already set this lap's length
+        // to the frame cadence while animating, so looping back yields
+        // exactly one animation frame. (A second paint here was
+        // redundant: it re-ran the whole pipeline with ~0 dt, doing the
+        // CPU work of a frame the top-of-loop paint repeats next lap —
+        // pure waste on the render thread. One paint per lap.)
+        if (backend != .terminal) {
+            if (n == 0) return .again; // no input this lap: frame over (was `continue`)
+            rs.last_input_nanos = clock_shell.monotonicNanos();
         }
 
         var offset: usize = 0;

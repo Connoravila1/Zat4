@@ -47,9 +47,13 @@ pub const MobileHost = struct {
     /// The OS asked us to leave (activity finishing). The pump arm maps
     /// it to the same exit as a window close.
     closed: bool = false,
-    /// The live drag's last pointer y in surface pixels, or -1 when no
-    /// finger is down — the v1 touch-scroll anchor (the pump arm turns
-    /// move deltas into pixel scroll; momentum/fling is the M-UX pass).
+    /// The touch-slop state machine's anchors (the pump arm's tap-vs-scroll
+    /// disambiguation): the press origin in surface pixels (-1 = no finger
+    /// down), whether this press committed to scrolling, and the last
+    /// pointer y a scroll delta was taken from. Momentum/fling = M-UX.
+    down_x: i32 = -1,
+    down_y: i32 = -1,
+    scrolling: bool = false,
     drag_y: i32 = -1,
 };
 
