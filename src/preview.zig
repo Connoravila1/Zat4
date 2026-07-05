@@ -135,6 +135,23 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     try writePpm(io, gpa, &fb, "/tmp/zat_preview.ppm");
 
+    // PHONE proof (the locked mobile shape): the same real feed at the phone
+    // design width — narrow single column, no rail/sidebar, the bottom tab
+    // bar (line-art icons here; the GPU draws SDF icons live). 430×956 is a
+    // Pixel-class viewport in logical px.
+    {
+        const pw: u32 = 430;
+        const ph: u32 = 956;
+        var pfb: raster.Framebuffer = .{};
+        try raster.resize(gpa, &pfb, pw, ph, clear);
+        defer raster.deinit(gpa, &pfb);
+        dl.len = 0;
+        _ = try feed_view.layout(gpa, &engine, @intCast(pw), @intCast(ph), posts, 0, &dl, null, null, false, 0, null, 3, lens_socket.seatedAccent(home_tray), home_tray, .{}, null, null, null, "", &.{}, null, 0, 0, .{}, 0, 255, null);
+        try feed_view.drawTabBar(gpa, &dl, &engine, @intCast(pw), @intCast(ph), 0, null, lens_socket.seatedAccent(home_tray), false);
+        try raster.paint(gpa, &engine, dl.slice(), &pfb, clear);
+        try writePpm(io, gpa, &pfb, "/tmp/zat_phone.ppm");
+    }
+
     // ALGORITHM TRANSPARENCY page (DISCOVER invariant 5): the real
     // transparency.buildPage → feed_view.layoutTransparency path, on the Zat4
     // Discover config (learns + reads attention, so the behavioral markers +

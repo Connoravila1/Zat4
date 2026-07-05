@@ -1131,7 +1131,7 @@ fn initRunState(
                 std.debug.print("[gpu] init failed ({s}) — using the software path.\n", .{@errorName(err)});
                 break :blk null;
             };
-            break :blk initGpuState(gpa, e, g, win.fb.width, win.fb.height) catch |err| {
+            break :blk initGpuState(gpa, e, g, win.fb.width, win.fb.height, design_w) catch |err| {
                 std.debug.print("[gpu] init failed ({s}) — using the software path.\n", .{@errorName(err)});
                 break :blk null;
             };
@@ -2063,7 +2063,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
         // Advance the drag's LIVE REFLOW + lift + settle one step per frame (the
         // iOS "pick up and the others fill in" feel). The targets are pure
         // integer slot math; positions are eased here, drawn by the widget.
-        const socket_layout_w: i32 = if (rs.gpu_state != null) @intCast(design_w) else switch (backend) {
+        const socket_layout_w: i32 = if (rs.gpu_state) |*sgs| @intCast(sgs.design_w) else switch (backend) {
             .window => |w| @intCast(w.fb.width),
             else => @intCast(design_w),
         };
@@ -2901,7 +2901,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                 else => pageDragDrop(rs.zone_cards, rs.zone_blob, &rs.zone_seated, &rs.zone_ui, rs.page_geoms[2], &rs.loadout_dirty),
                             };
                         } else if (rs.gsocket_ui.drag_active) |d| {
-                            const geom = feed_view.homeSocketGeom(if (rs.gpu_state != null) @as(i32, @intCast(design_w)) else @as(i32, @intCast(fb_w)));
+                            const geom = feed_view.homeSocketGeom(if (rs.gpu_state) |*sgs| @as(i32, @intCast(sgs.design_w)) else @as(i32, @intCast(fb_w)));
                             const to: u32 = lens_socket.dropIndex(home_tray, rs.gsocket_ui, geom) orelse d;
                             const seated_off = if (rs.gseated < rs.socket_cards.len) rs.socket_cards[rs.gseated].cid.off else 0;
                             reorderTray(rs.socket_cards, d, to);
@@ -3756,7 +3756,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             rs.last_click_ns = now_ns;
                             rs.last_click_x = rx;
                             rs.last_click_y = ry;
-                            const off = feed_view.composeCaretAtPoint(g.engine, @intCast(design_w), textedit.view(&rs.compose), rx, ry);
+                            const off = feed_view.composeCaretAtPoint(g.engine, @intCast(if (rs.gpu_state) |*sgs| sgs.design_w else design_w), textedit.view(&rs.compose), rx, ry);
                             switch (@min(rs.click_count, @as(u8, 3))) {
                                 1 => {
                                     textedit.setCaret(&rs.compose, off);
@@ -3780,7 +3780,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 }
                         if (rs.compose_drag) {
                             // Drag extends the selection to the pointer.
-                            const off = feed_view.composeCaretAtPoint(g.engine, @intCast(design_w), textedit.view(&rs.compose), rx, ry);
+                            const off = feed_view.composeCaretAtPoint(g.engine, @intCast(if (rs.gpu_state) |*sgs| sgs.design_w else design_w), textedit.view(&rs.compose), rx, ry);
                             textedit.extendTo(&rs.compose, off);
                             rs.caret_anchor_ns = clock_shell.monotonicNanos();
                         }
@@ -4415,7 +4415,7 @@ pub fn mobileStart(
         mobile_host.logcat("driver: font engine up — GPU feed state next", .{});
         const gg = g_owned.?;
         g_owned = null;
-        mr.rs.gpu_state = try initGpuState(gpa, e, gg, width_px, height_px);
+        mr.rs.gpu_state = try initGpuState(gpa, e, gg, width_px, height_px, design_w_phone);
         mobile_host.logcat("driver: GPU feed state up", .{});
     } else return error.FontEngineUnavailable; // GPU-only arm: no engine → no renderer → honest failure
     return mr;
@@ -4469,7 +4469,7 @@ pub fn mobileResume(mr: *MobileRun, g_in: gpu.Gpu, width_px: u32, height_px: u32
     mr.host.width_px = width_px;
     mr.host.height_px = height_px;
     // initGpuState owns g from the call (deinits on its own failure, C5).
-    mr.rs.gpu_state = initGpuState(mr.rs.gpa, eng, g, width_px, height_px) catch return false;
+    mr.rs.gpu_state = initGpuState(mr.rs.gpa, eng, g, width_px, height_px, design_w_phone) catch return false;
     return true;
 }
 
@@ -6180,6 +6180,12 @@ const field_cell_h: u16 = 17;
 /// window (DPI): scale = window_width / design_w. So the three-pane keeps its
 /// cohesion at any window size and the type lands at design size, crisp.
 const design_w: u32 = 1340;
+/// The PHONE logical width (the locked mobile shape: portrait single column).
+/// Small enough that feed_view's narrow path drops the rail + sidebar, and it
+/// makes the scale ~2.5× on a 1080-wide phone — real thumb-sized type and
+/// targets, glyphs still rasterized at physical resolution (crisp). The live
+/// design width rides GpuState.design_w; this is what the mobile driver seeds.
+pub const design_w_phone: u32 = 430;
 /// Ambient-forcing knobs: a slow drifting swell so the still field breathes.
 const amb_amp: f32 = 0.010;
 const amb_scale: f32 = 0.060;
@@ -6194,11 +6200,11 @@ const julia_clear_r: f32 = @as(f32, 0xF7) / 255.0;
 const julia_clear_g: f32 = @as(f32, 0xE9) / 255.0;
 const julia_clear_b: f32 = @as(f32, 0xF1) / 255.0;
 
-fn uiScale(physical_w: u32) f32 {
-    return @as(f32, @floatFromInt(physical_w)) / @as(f32, @floatFromInt(design_w));
+fn uiScaleFor(physical_w: u32, dw: u32) f32 {
+    return @as(f32, @floatFromInt(physical_w)) / @as(f32, @floatFromInt(dw));
 }
-fn logicalH(physical_w: u32, physical_h: u32) u32 {
-    return @max(1, @as(u32, @intFromFloat(@as(f32, @floatFromInt(physical_h)) / uiScale(physical_w))));
+fn logicalHFor(physical_w: u32, physical_h: u32, dw: u32) u32 {
+    return @max(1, @as(u32, @intFromFloat(@as(f32, @floatFromInt(physical_h)) / uiScaleFor(physical_w, dw))));
 }
 
 /// The GPU path's working set, one per run(). A7.2: cold struct, size guard
@@ -6286,6 +6292,12 @@ const GpuState = struct {
     /// back to physical pixels and thence to a field cell. Refreshed each
     /// frame by paintFrameGpu.
     scale: f32,
+    /// The LOGICAL layout width this surface designs to: `design_w` (1340,
+    /// the desktop three-pane) or `design_w_phone` (430 — the single-column
+    /// phone shape; feed_view goes narrow + phone chrome below its
+    /// thresholds). Fixed at initGpuState; `scale` and every layout call
+    /// derive from it, so shape is one number the driver chooses.
+    design_w: u32,
     /// Dirty signature of the last-built feed (scroll + window size + each
     /// post's identity/counts/flags). The field animates every frame, but the
     /// feed — transform + per-post text measurement + vertex build — is rebuilt
@@ -6487,7 +6499,7 @@ fn liveGeom(gs: *const GpuState, target: feed_view.PaneGeom) feed_view.PaneGeom 
 /// included). Any failure (shader/pack error, OOM) propagates so the caller
 /// falls back to software (E2). Each acquired resource has an errdefer so a
 /// mid-init failure frees cleanly (C5).
-fn initGpuState(gpa: Allocator, engine: *text_core.Engine, g_in: gpu.Gpu, w: u32, h: u32) !GpuState {
+fn initGpuState(gpa: Allocator, engine: *text_core.Engine, g_in: gpu.Gpu, w: u32, h: u32, logical_w: u32) !GpuState {
     var g = g_in;
     errdefer gpu.deinit(&g);
     gpu.setViewport(@intCast(w), @intCast(h));
@@ -6540,7 +6552,8 @@ fn initGpuState(gpa: Allocator, engine: *text_core.Engine, g_in: gpu.Gpu, w: u32
         .t = 0,
         .mcx = -1,
         .mcy = -1,
-        .scale = uiScale(w),
+        .scale = uiScaleFor(w, logical_w),
+        .design_w = logical_w,
         .feed_sig = 0,
         .feed_content_sig = 0,
         .heights = &.{},
@@ -7164,14 +7177,14 @@ fn paintComposeGpu(
     if (want.cols != gs.cols or want.rows != gs.rows) {
         resizeGpuField(gpa, gs, w, h) catch {};
     }
-    const scale = uiScale(w);
+    const scale = uiScaleFor(w, gs.design_w);
     gs.scale = scale;
 
     // Build the composer at the LOGICAL design width (scaled to fill), exactly as
     // the feed lays out — so the emitted button regions map back through gs.scale.
-    const lh = logicalH(w, h);
+    const lh = logicalHFor(w, h, gs.design_w);
     g.draw.len = 0;
-    feed_view.layoutCompose(gpa, g.engine, @intCast(design_w), @intCast(lh), g.accent, ctx, reply_handle, quoting, draft, caret, sel_start, sel_end, blink_on, status, segments, g.draw, g.regions) catch {};
+    feed_view.layoutCompose(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.accent, ctx, reply_handle, quoting, draft, caret, sel_start, sel_end, blink_on, status, segments, g.draw, g.regions) catch {};
     if (g.julia) feed_view.juliaRemapText(g.draw); // light theme: dark text
     gpu.feedBuild(&gs.feed, gpa, g.engine, g.draw.slice(), scale) catch {};
     gs.feed_sig = 0; // force a timeline rebuild when the composer closes
@@ -7223,7 +7236,7 @@ fn paintFrameGpu(
         resizeGpuField(gpa, gs, w, h) catch {};
     }
 
-    const scale = uiScale(w);
+    const scale = uiScaleFor(w, gs.design_w);
     gs.scale = scale;
 
     // Auto-scroll a freshly-opened/re-focused THREAD so the focused post lands at
@@ -7241,7 +7254,7 @@ fn paintFrameGpu(
             }
         }
         if (measured) {
-            const lh_view = logicalH(w, h);
+            const lh_view = logicalHFor(w, h, gs.design_w);
             const min_scroll: i32 = @min(0, @as(i32, @intCast(lh_view)) - g.content_h.* - 24);
             g.scroll.* = @max(min_scroll, @min(0, -off));
             gs.scroll_to_focus = false; // applied; wait for heights next frame otherwise
@@ -7308,9 +7321,9 @@ fn paintFrameGpu(
     // CURRENT (animated) left edge — when expanded it reaches ~188px further
     // left, so a fixed collapsed-strip band would drop the hover as you move
     // onto the open panel and snap it shut. Use last frame's rail_hover_t.
-    const dwf: f32 = @floatFromInt(design_w);
+    const dwf: f32 = @floatFromInt(gs.design_w);
     const rail_left_now: f32 = (dwf - 76.0) - gs.rail_hover_t * 188.0;
-    const over_right_rail = gs.zones_t > 0.5 and @as(f32, @floatFromInt(g.hover_x)) >= rail_left_now - 8.0 and g.hover_x < @as(i32, @intCast(design_w)) and g.hover_y >= 0;
+    const over_right_rail = gs.zones_t > 0.5 and @as(f32, @floatFromInt(g.hover_x)) >= rail_left_now - 8.0 and g.hover_x < @as(i32, @intCast(gs.design_w)) and g.hover_y >= 0;
     springGeom(&gs.rail_hover_t, &gs.rail_hover_v, if (over_right_rail) 1.0 else 0.0, 1.0 / 60.0);
     const rail_hover_animating = @abs(gs.rail_hover_t - (if (over_right_rail) @as(f32, 1.0) else 0.0)) > 0.004 or @abs(gs.rail_hover_v) > 0.004;
 
@@ -7320,7 +7333,7 @@ fn paintFrameGpu(
     // right edge tracks the expand) re-opens it.
     const on_algo = g.screen.* == feed_view.screen_loadout or g.screen.* == feed_view.screen_messages;
     springGeom(&gs.algo_t, &gs.algo_v, if (on_algo) 1.0 else 0.0, 1.0 / 60.0);
-    const home_rail_left: f32 = @floatFromInt(feed_view.paneGeomFor(@intCast(design_w), feed_view.screen_loadout).rail_x);
+    const home_rail_left: f32 = @floatFromInt(feed_view.paneGeomFor(@intCast(gs.design_w), feed_view.screen_loadout).rail_x);
     // The condensed rail hugs the left edge (shifted left by 60); the hover band
     // tracks that shifted position + the current expand width.
     const left_rail_right: f32 = (home_rail_left - 60.0) + 64.0 + gs.left_hover_t * 188.0;
@@ -7480,7 +7493,7 @@ fn paintFrameGpu(
             }
             @memset(gs.heights, -1);
         }
-        const lh = logicalH(w, h);
+        const lh = logicalHFor(w, h, gs.design_w);
         g.draw.len = 0;
         var chain_info: feed_view.ChainSticky = .{};
         if (g.screen.* == feed_view.screen_loadout) {
@@ -7489,11 +7502,11 @@ fn paintFrameGpu(
             // ALGORITHMS: expand the loadout content into the space the condensed
             // left rail frees — shift the glass a bit LEFT toward the rail + widen
             // RIGHT, by algo_t. (The rail itself condenses in the rail-tile pass.)
-            var lg = feed_view.paneGeomFor(@intCast(design_w), feed_view.screen_loadout);
+            var lg = feed_view.paneGeomFor(@intCast(gs.design_w), feed_view.screen_loadout);
             if (gs.algo_t > 0.01) {
                 const at = gs.algo_t * gs.algo_t * (3.0 - 2.0 * gs.algo_t);
                 const tcx: f32 = home_rail_left + 92.0;
-                const tcw: f32 = @as(f32, @floatFromInt(design_w)) - tcx - 40.0;
+                const tcw: f32 = @as(f32, @floatFromInt(gs.design_w)) - tcx - 40.0;
                 const lp2 = struct {
                     fn f(a: i32, b: f32, t: f32) i32 {
                         return @intFromFloat(@as(f32, @floatFromInt(a)) + (b - @as(f32, @floatFromInt(a))) * t);
@@ -7514,11 +7527,11 @@ fn paintFrameGpu(
             // left rail frees — shift LEFT toward the rail + widen RIGHT, by
             // algo_t (the same reflow the Algorithms page runs; the rail
             // itself condenses in the rail-tile pass).
-            var lg = feed_view.paneGeomFor(@intCast(design_w), feed_view.screen_messages);
+            var lg = feed_view.paneGeomFor(@intCast(gs.design_w), feed_view.screen_messages);
             if (gs.algo_t > 0.01) {
                 const at = gs.algo_t * gs.algo_t * (3.0 - 2.0 * gs.algo_t);
                 const tcx: f32 = home_rail_left + 92.0;
-                const tcw: f32 = @as(f32, @floatFromInt(design_w)) - tcx - 40.0;
+                const tcw: f32 = @as(f32, @floatFromInt(gs.design_w)) - tcx - 40.0;
                 const lp2 = struct {
                     fn f(a: i32, b: f32, t: f32) i32 {
                         return @intFromFloat(@as(f32, @floatFromInt(a)) + (b - @as(f32, @floatFromInt(a))) * t);
@@ -7563,20 +7576,20 @@ fn paintFrameGpu(
                 }
             } else |_| {}
             const reflow_t: f32 = if (gs.chat_reflow) |rh| (gs.chat_world.position(rh) orelse 1.0) else 1.0;
-            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t }, xforms, g.chat_recv) catch g.content_h.*;
+            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t }, xforms, g.chat_recv) catch g.content_h.*;
         } else if (g.screen.* == feed_view.screen_transparency) {
             // The algorithm transparency page: a plain scrolling document (no rail),
             // rebuilt from the inspected config each entry (what you see = what runs).
             // Summary by default; the byte-exact serialized source on the tap-through.
             if (g.inspect_loading) {
-                g.content_h.* = feed_view.layoutAlgorithmLoading(gpa, g.engine, @intCast(design_w), g.draw, g.regions, g.accent, g.inspect_name) catch g.content_h.*;
+                g.content_h.* = feed_view.layoutAlgorithmLoading(gpa, g.engine, @intCast(gs.design_w), g.draw, g.regions, g.accent, g.inspect_name) catch g.content_h.*;
             } else if (g.inspect_bytes.len > 0) {
                 if (g.inspect_source) {
-                    g.content_h.* = feed_view.layoutAlgorithmSource(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.inspect_name, g.inspect_ref, g.inspect_bytes) catch g.content_h.*;
+                    g.content_h.* = feed_view.layoutAlgorithmSource(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.inspect_name, g.inspect_ref, g.inspect_bytes) catch g.content_h.*;
                 } else {
                     const cfg = algorithm_core.parse(arena, g.inspect_bytes) catch discover.DEFAULT_CONFIG;
                     if (transparency.buildPage(arena, g.inspect_name, g.inspect_ref, cfg) catch null) |pg|
-                        g.content_h.* = feed_view.layoutTransparency(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, pg) catch g.content_h.*;
+                        g.content_h.* = feed_view.layoutTransparency(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, pg) catch g.content_h.*;
                 }
             }
         } else {
@@ -7591,7 +7604,7 @@ fn paintFrameGpu(
             // solved at design_w. Geometry SNAPS to the screen's layout (smooth,
             // no per-frame relayout); a cross-screen MORPH is a separate, cheaper
             // mechanism (see the dormant geom_* spring state) — not a relayout.
-            var gp_geom = feed_view.paneGeomFor(@intCast(design_w), g.screen.*);
+            var gp_geom = feed_view.paneGeomFor(@intCast(gs.design_w), g.screen.*);
             gp_geom.search_open = gs.search_open; // the content-driven sidebar push
             gp_geom.rail_external = true; // the rail is its own tile (decomposition)
             // ZONES: the rail moved to the right, so the content fills the freed
@@ -7600,7 +7613,7 @@ fn paintFrameGpu(
             if (gs.zones_t > 0.01) {
                 const zt2 = gs.zones_t * gs.zones_t * (3.0 - 2.0 * gs.zones_t);
                 const tcx: f32 = 90.0;
-                const tcw: f32 = @as(f32, @floatFromInt(design_w)) - 90.0 - 104.0; // stop before the right rail
+                const tcw: f32 = @as(f32, @floatFromInt(gs.design_w)) - 90.0 - 104.0; // stop before the right rail
                 const lp = struct {
                     fn f(a: i32, b: f32, t: f32) i32 {
                         return @intFromFloat(@as(f32, @floatFromInt(a)) + (b - @as(f32, @floatFromInt(a))) * t);
@@ -7612,7 +7625,7 @@ fn paintFrameGpu(
             }
             gs.content_x = gp_geom.col_x; // for the field panel-softening (tracks the live content)
             gs.content_w = gp_geom.col_w;
-            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, &chain_info, &gs.sel_glyphs, g.zone_title, g.zones, gp_geom, g.settings_section, g.settings_toggles, g.settings_account, g.settings_choices, g.settings_picking, g.repost_menu) catch g.content_h.*;
+            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, &chain_info, &gs.sel_glyphs, g.zone_title, g.zones, gp_geom, g.settings_section, g.settings_toggles, g.settings_account, g.settings_choices, g.settings_picking, g.repost_menu) catch g.content_h.*;
         }
         if (g.julia) feed_view.juliaRemapText(g.draw); // light theme: dark text
         // "Show frame timing": ride the fps/ms badge on the feed buffer. The gate
@@ -7633,9 +7646,17 @@ fn paintFrameGpu(
         // crossfade no longer dissolves it — it stays solid, which is correct.
         // Built for EVERY screen (incl. the loadout/Algorithms page, which now
         // skips its own rail via rail_external) with the active nav = the screen.
-        {
-            const dw: f32 = @floatFromInt(design_w);
-            const home_rail_x: f32 = @floatFromInt(feed_view.paneGeomFor(@intCast(design_w), g.screen.*).rail_x);
+        if (gs.design_w <= feed_view.phone_max) {
+            // PHONE: the nav-chrome tile IS the bottom tab bar (the rail is
+            // desktop furniture). Same buffer, same un-crossfaded draw, same
+            // region kinds — the dispatch and the SDF icon pass are unchanged.
+            g.draw.len = 0;
+            feed_view.drawTabBar(gpa, g.draw, g.engine, @intCast(gs.design_w), @intCast(lh), g.screen.*, g.regions, g.accent, true) catch {};
+            if (g.julia) feed_view.juliaRemapText(g.draw);
+            gpu.feedBuild(&gs.rail, gpa, g.engine, g.draw.slice(), scale) catch {};
+        } else {
+            const dw: f32 = @floatFromInt(gs.design_w);
+            const home_rail_x: f32 = @floatFromInt(feed_view.paneGeomFor(@intCast(gs.design_w), g.screen.*).rail_x);
             const zt = gs.zones_t * gs.zones_t * (3.0 - 2.0 * gs.zones_t); // smoothstep
             g.draw.len = 0;
             // LEFT rail: slides off the left as zt→1 (Zones). On the Algorithms
@@ -7771,7 +7792,7 @@ fn drawChainSticky(gpa: Allocator, g: Grid, gs: *GpuState, scale: f32, vw: i32, 
 
     var hd: raster_core.DrawList = .{};
     defer hd.deinit(gpa);
-    feed_view.buildChainHeaderBar(gpa, &hd, g.engine, @intCast(design_w), draw_y, header_h, pin_y, gs.chain_tint, gs.chain_initial, gs.chain_name[0..gs.chain_name_len], gs.chain_handle[0..gs.chain_handle_len], g.accent, alpha) catch return;
+    feed_view.buildChainHeaderBar(gpa, &hd, g.engine, @intCast(gs.design_w), draw_y, header_h, pin_y, gs.chain_tint, gs.chain_initial, gs.chain_name[0..gs.chain_name_len], gs.chain_handle[0..gs.chain_handle_len], g.accent, alpha) catch return;
     if (hd.len == 0) return;
     gpu.feedBuild(&gs.hover, gpa, g.engine, hd.slice(), scale) catch return;
     gpu.feedDraw(&gs.hover, vw, vh);
@@ -7910,7 +7931,7 @@ fn openContextMenu(gs: *GpuState, screen: u8, view_items: []const feed_core.Time
         gs.sel_focus = w.hi;
     }
     gs.menu_open = true;
-    gs.menu_x = std.math.clamp(rx, 0, @as(i32, @intCast(design_w)) - menu_w);
+    gs.menu_x = std.math.clamp(rx, 0, @as(i32, @intCast(gs.design_w)) - menu_w);
     gs.menu_y = @max(0, ry);
 }
 

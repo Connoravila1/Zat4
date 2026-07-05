@@ -1261,6 +1261,64 @@ fn drawRail(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, rx: i32
     }
 }
 
+/// PHONE layouts (the locked mobile shape) at or below this logical width:
+/// the narrow single column plus the bottom tab bar. The shell picks the
+/// shape by choosing the surface's design width (tui.design_w_phone).
+pub const phone_max: i32 = 500;
+/// The tab bar's height — layout() adds it to content height on phone
+/// widths so the last post scrolls clear of the bar.
+pub const tab_bar_h: i32 = 76;
+
+/// The PHONE tab bar (the locked mobile shape): home · zones · ＋compose ·
+/// activity · you, pinned to the bottom edge over a scrim. Emits the SAME
+/// region kinds as the desktop rail (.nav by screen index, .compose), so
+/// the shell dispatch works unchanged — and each nav region is the 42×42
+/// box whose (x+21, y+19) is the icon centre, the exact placement math the
+/// GPU SDF-icon pass already applies to rail regions. The shell calls this
+/// after ANY screen's layout on a phone-width surface (B5: plain values in,
+/// draw list + regions out). `skip_nav` mirrors drawRail: the GPU draws the
+/// nav icons itself; the software path gets the line-art.
+pub fn drawTabBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, width: i32, height: i32, active: u8, regions: ?*Regions, accent: u32, skip_nav: bool) error{OutOfMemory}!void {
+    const by = height - tab_bar_h;
+    // The feed dies out under the bar ("scrims keep chrome legible"), then
+    // the same frosted veil the sticky top bar wears, and a hairline lid.
+    try rect(gpa, dl, 0, by - 16, width, 16, 0x50181812, 0);
+    try rect(gpa, dl, 0, by, width, tab_bar_h, skinHeaderVeil(accent), 0);
+    try rect(gpa, dl, 0, by, width, 1, divider, 0);
+
+    const slot_w = @divTrunc(width, 5);
+    const icon_cy = by + 36;
+    const Slot = union(enum) { nav: u8, compose, you };
+    // zones = the BROWSE page (nav idx 1) — the search surface until real
+    // search exists (the locked design names "search" here).
+    const slots = [_]Slot{ .{ .nav = screen_home }, .{ .nav = screen_zones_browse }, .compose, .{ .nav = 2 }, .you };
+    for (slots, 0..) |slot, i| {
+        const cx = slot_w * @as(i32, @intCast(i)) + @divTrunc(slot_w, 2);
+        switch (slot) {
+            .nav => |idx| {
+                const on = idx == active;
+                if (on) try rect(gpa, dl, cx - 26, icon_cy - 24, 52, 48, (0x22 << 24) | (accent & 0x00FFFFFF), 14);
+                if (!skip_nav) try navIcon(idx, gpa, dl, cx - 11, icon_cy - 11, 22, if (on) accent else muted);
+                try emitRegion(gpa, regions, cx - 21, icon_cy - 19, 42, 42, idx, .nav);
+            },
+            .compose => {
+                // The raised accent button; the ＋ is two rects, no glyph needed.
+                try rect(gpa, dl, cx - 25, icon_cy - 25, 50, 50, accent, 25);
+                try rect(gpa, dl, cx - 11, icon_cy - 2, 22, 4, bg, 2);
+                try rect(gpa, dl, cx - 2, icon_cy - 11, 4, 22, bg, 2);
+                try emitRegion(gpa, regions, cx - 27, icon_cy - 27, 54, 54, 0, .compose);
+            },
+            .you => {
+                const on = active == screen_profile;
+                if (on) try rect(gpa, dl, cx - 26, icon_cy - 24, 52, 48, (0x22 << 24) | (accent & 0x00FFFFFF), 14);
+                try rect(gpa, dl, cx - 19, icon_cy - 19, 38, 38, 0xFF3F3B2D, 19);
+                _ = try str(gpa, dl, e, .semibold, cx - 5, icon_cy + 6, if (on) accent else ink, 14, "y");
+                try emitRegion(gpa, regions, cx - 21, icon_cy - 21, 42, 42, screen_profile, .nav);
+            },
+        }
+    }
+}
+
 fn drawSidebar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, sx: i32, height: i32, search_open: f32, accent: u32) !void {
     const x0 = sx + 16;
     const w = side_w - 32;
@@ -2016,7 +2074,10 @@ pub fn layout(
         .bottom_off = if (chain_ended) chain_bottom_off else (y - scroll), // all-chain → thread end
         .pin_y = feed_y0,
     };
-    return y - scroll; // total content height (scroll-independent), for clamping
+    // Phone: the tab bar overlays the bottom edge — grow the content height
+    // so the last post scrolls clear of it (the shell's clamp uses this).
+    const phone_inset: i32 = if (width <= phone_max) tab_bar_h else 0;
+    return y - scroll + phone_inset; // total content height (scroll-independent), for clamping
 }
 
 /// Scale a color's alpha by `al` (0..1), keeping its RGB — for fading an overlay.
