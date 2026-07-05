@@ -593,14 +593,18 @@ fn tri(gpa: Allocator, dl: *raster.DrawList, x0: i32, y0: i32, x1: i32, y1: i32,
 /// bottom-right, received bottom-left. It covers the corner's rounding and
 /// pokes just past the edge, so the corner reads as the classic messenger
 /// point. Drawn only where `BubbleRow.tail` says a same-sender run ends.
+/// Draw it BEFORE the bubble rect: the triangle is hard-edged while the rect
+/// is an antialiased SDF, so the rect on top buries the triangle's interior
+/// edges and only the point past the corner shows. The point sits flush with
+/// the bottom edge (collinear — any dip below reads as a ledge).
 fn bubbleTail(gpa: Allocator, dl: *raster.DrawList, mine: bool, bx: i32, by: i32, bw: i32, hh: i32, color: u32) !void {
     const bot = by + hh;
     const nib = @min(14, @max(0, hh - 4)); // stay inside a mid-growth bubble
     if (mine) {
         const cx = bx + bw;
-        try tri(gpa, dl, cx - nib, bot, cx, bot - nib, cx + 6, bot + 1, color);
+        try tri(gpa, dl, cx - nib, bot, cx, bot - nib, cx + 6, bot, color);
     } else {
-        try tri(gpa, dl, bx + nib, bot, bx, bot - nib, bx - 6, bot + 1, color);
+        try tri(gpa, dl, bx + nib, bot, bx, bot - nib, bx - 6, bot, color);
     }
 }
 
@@ -4078,8 +4082,8 @@ fn drawPayCard(
     const bright = fillIsBright(fill);
     const text_c = onFill(fill);
     const sub_c = onFillMuted(fill);
-    try rect(gpa, dl, bx, by, bw, bh_card, fill, 14);
     if (b.tail) try bubbleTail(gpa, dl, b.mine, bx, by, bw, bh_card, fill);
+    try rect(gpa, dl, bx, by, bw, bh_card, fill, 14);
     if (!chat_msg.isTerminalStatus(card.status)) {
         // A live card wears a faint ring drawn from the ON-fill ink, so it
         // shows on a bright bubble as well as a dark one.
@@ -4200,6 +4204,97 @@ fn strEllipsis(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, weig
 /// can scroll. The thread bottom-anchors at scroll 0 (newest visible above
 /// the composer); scroll > 0 reveals older history. The chrome and the
 /// conversation list do not scroll.
+/// The messages page's top chrome: the title, the "+ New" pill, the E2EE
+/// banner, the recipient bar (new-conversation flow), and the open thread's
+/// peer header. Called by layoutChat AFTER the thread pass — over the
+/// near-opaque header strip — so scrolled bubbles pass beneath the chrome,
+/// never over it (the same order the feed uses for its sticky top bar).
+/// `body_y` is the post-banner (and post-recipient-bar) content top, i.e.
+/// the y the peer header hangs from.
+fn drawChatHeader(
+    gpa: Allocator,
+    dl: *raster.DrawList,
+    e: *const text.Engine,
+    regions: ?*Regions,
+    accent: u32,
+    x0: i32,
+    w: i32,
+    top: i32,
+    composing: bool,
+    compose_draft: []const u8,
+    compose_status: []const u8,
+    caret_phase: f32,
+    peer: []const u8,
+    detail_x: i32,
+    detail_w: i32,
+    body_y: i32,
+) error{OutOfMemory}!void {
+    _ = try str(gpa, dl, e, .semibold, x0, top + 30, ink, 30, "Zat Chat");
+
+    // "+ New" — the new-conversation pill, right-aligned on the title line.
+    // Accent-filled while the recipient bar is open (the toggle reads).
+    {
+        const label = "+ New";
+        const lw: i32 = @intCast(text.measure(e, .semibold, label, 14));
+        const pill_w = lw + 28;
+        const pill_h: i32 = 32;
+        const px0 = x0 + w - pill_w;
+        const py0 = top + 4;
+        try rect(gpa, dl, px0, py0, pill_w, pill_h, if (composing) accent else skinPanel(accent), 16);
+        _ = try str(gpa, dl, e, .semibold, px0 + 14, py0 + 21, if (composing) 0xFF20201A else body_c, 14, label);
+        try emitRegion(gpa, regions, px0, py0, pill_w, @intCast(pill_h), 0, .chat_new);
+    }
+
+    // The honesty line (ZAT_CHAT_ROADMAP M1): the plaintext path is gone —
+    // messages are end-to-end encrypted (MLS over the relay). The claim is
+    // permitted now precisely because M1 is real; it names only what ships
+    // (content secrecy + PQ-hybrid + forward secrecy), never metadata
+    // privacy against a global observer — that stays [OPEN] (vision §8).
+    const ban_y = top + 48;
+    const ban_h: i32 = 30;
+    try rect(gpa, dl, x0, ban_y, w, ban_h, skinPanel(accent), 10);
+    try rect(gpa, dl, x0, ban_y, 3, ban_h, (0xC0 << 24) | (accent & 0x00FFFFFF), 1);
+    const ban_pen = try str(gpa, dl, e, .semibold, x0 + 14, ban_y + 20, ink, 12, "End-to-end encrypted");
+    _ = try str(gpa, dl, e, .regular, ban_pen + 10, ban_y + 20, muted, 12, "— MLS, post-quantum hybrid, forward secrecy");
+
+    // The recipient bar (new-conversation flow): an input for a handle or
+    // DID, the composer strip's focus vocabulary (ring + caret — composing
+    // means it owns the keyboard), a hint line, and the shell's status line
+    // when the last attempt refused.
+    if (composing) {
+        var hy = ban_y + ban_h + 18;
+        const bar_h: i32 = 46;
+        try rect(gpa, dl, x0, hy, w, bar_h, skinPanel(accent), 14);
+        const ring_c = (0xC0 << 24) | (accent & 0x00FFFFFF);
+        try rect(gpa, dl, x0, hy, w, 1, ring_c, 0);
+        try rect(gpa, dl, x0, hy + bar_h - 1, w, 1, ring_c, 0);
+        try rect(gpa, dl, x0, hy, 1, bar_h, ring_c, 0);
+        try rect(gpa, dl, x0 + w - 1, hy, 1, bar_h, ring_c, 0);
+        const lab_pen = try str(gpa, dl, e, .semibold, x0 + 14, hy + 29, muted, 14, "To:");
+        if (compose_draft.len > 0) {
+            try strEllipsis(gpa, dl, e, .regular, lab_pen + 8, hy + 29, ink, 14, compose_draft, x0 + w - 14 - (lab_pen + 8));
+        } else {
+            _ = try str(gpa, dl, e, .regular, lab_pen + 8, hy + 29, faint, 14, "handle or did:…");
+        }
+        const draft_w: i32 = @intCast(text.measure(e, .regular, compose_draft, 14));
+        const bar_caret_x = lab_pen + 8 + @min(draft_w, x0 + w - 14 - (lab_pen + 8)) + 1;
+        try rect(gpa, dl, bar_caret_x, hy + 14, 2, bar_h - 28, scaleAlpha((0xE0 << 24) | (accent & 0x00FFFFFF), caretAlpha(caret_phase)), 0);
+        try emitRegion(gpa, regions, x0, hy, w, @intCast(bar_h), 0, .chat_compose_input);
+        hy += bar_h + 8;
+        if (compose_status.len > 0) {
+            _ = try str(gpa, dl, e, .regular, x0 + 2, hy + 12, 0xFFE0A868, 13, compose_status);
+        } else {
+            _ = try str(gpa, dl, e, .regular, x0 + 2, hy + 12, faint, 12, "Enter to start · Esc to cancel");
+        }
+    }
+
+    // The open thread's peer header (name + divider), atop the header strip.
+    if (peer.len > 0) {
+        _ = try str(gpa, dl, e, .semibold, detail_x, body_y + 24, ink, 18, peer);
+        try rect(gpa, dl, detail_x, body_y + 40, detail_w, 1, divider, 0);
+    }
+}
+
 pub fn layoutChat(
     gpa: Allocator,
     e: *const text.Engine,
@@ -4273,65 +4368,15 @@ pub fn layoutChat(
     const x0 = m.lx;
     const w = m.cw;
     const top: i32 = if (m.wide) 40 else 30;
-    _ = try str(gpa, dl, e, .semibold, x0, top + 30, ink, 30, "Zat Chat");
 
-    // "+ New" — the new-conversation pill, right-aligned on the title line.
-    // Accent-filled while the recipient bar is open (the toggle reads).
-    {
-        const label = "+ New";
-        const lw: i32 = @intCast(text.measure(e, .semibold, label, 14));
-        const pill_w = lw + 28;
-        const pill_h: i32 = 32;
-        const px0 = x0 + w - pill_w;
-        const py0 = top + 4;
-        try rect(gpa, dl, px0, py0, pill_w, pill_h, if (composing) accent else skinPanel(accent), 16);
-        _ = try str(gpa, dl, e, .semibold, px0 + 14, py0 + 21, if (composing) 0xFF20201A else body_c, 14, label);
-        try emitRegion(gpa, regions, px0, py0, pill_w, @intCast(pill_h), 0, .chat_new);
-    }
-
-    // The honesty line (ZAT_CHAT_ROADMAP M1): the plaintext path is gone —
-    // messages are end-to-end encrypted (MLS over the relay). The claim is
-    // permitted now precisely because M1 is real; it names only what ships
-    // (content secrecy + PQ-hybrid + forward secrecy), never metadata
-    // privacy against a global observer — that stays [OPEN] (vision §8).
+    // The top chrome — the title, "+ New", the E2EE banner, the recipient
+    // bar, the peer header — is drawn by drawChatHeader AFTER the thread
+    // pass (over a near-opaque header strip, the feed's sticky-bar pattern),
+    // so scrolled bubbles slide BENEATH it. Here only its space is accounted.
     const ban_y = top + 48;
     const ban_h: i32 = 30;
-    try rect(gpa, dl, x0, ban_y, w, ban_h, skinPanel(accent), 10);
-    try rect(gpa, dl, x0, ban_y, 3, ban_h, (0xC0 << 24) | (accent & 0x00FFFFFF), 1);
-    const ban_pen = try str(gpa, dl, e, .semibold, x0 + 14, ban_y + 20, ink, 12, "End-to-end encrypted");
-    _ = try str(gpa, dl, e, .regular, ban_pen + 10, ban_y + 20, muted, 12, "— MLS, post-quantum hybrid, forward secrecy");
-
-    // The recipient bar (new-conversation flow): an input for a handle or
-    // DID, the composer strip's focus vocabulary (ring + caret — composing
-    // means it owns the keyboard), a hint line, and the shell's status line
-    // when the last attempt refused.
     var body_y = ban_y + ban_h + 18;
-    if (composing) {
-        const bar_h: i32 = 46;
-        try rect(gpa, dl, x0, body_y, w, bar_h, skinPanel(accent), 14);
-        const ring_c = (0xC0 << 24) | (accent & 0x00FFFFFF);
-        try rect(gpa, dl, x0, body_y, w, 1, ring_c, 0);
-        try rect(gpa, dl, x0, body_y + bar_h - 1, w, 1, ring_c, 0);
-        try rect(gpa, dl, x0, body_y, 1, bar_h, ring_c, 0);
-        try rect(gpa, dl, x0 + w - 1, body_y, 1, bar_h, ring_c, 0);
-        const lab_pen = try str(gpa, dl, e, .semibold, x0 + 14, body_y + 29, muted, 14, "To:");
-        if (compose_draft.len > 0) {
-            try strEllipsis(gpa, dl, e, .regular, lab_pen + 8, body_y + 29, ink, 14, compose_draft, x0 + w - 14 - (lab_pen + 8));
-        } else {
-            _ = try str(gpa, dl, e, .regular, lab_pen + 8, body_y + 29, faint, 14, "handle or did:…");
-        }
-        const draft_w: i32 = @intCast(text.measure(e, .regular, compose_draft, 14));
-        const bar_caret_x = lab_pen + 8 + @min(draft_w, x0 + w - 14 - (lab_pen + 8)) + 1;
-        try rect(gpa, dl, bar_caret_x, body_y + 14, 2, bar_h - 28, scaleAlpha((0xE0 << 24) | (accent & 0x00FFFFFF), caretAlpha(motion.caret_phase)), 0);
-        try emitRegion(gpa, regions, x0, body_y, w, @intCast(bar_h), 0, .chat_compose_input);
-        body_y += bar_h + 8;
-        if (compose_status.len > 0) {
-            _ = try str(gpa, dl, e, .regular, x0 + 2, body_y + 12, 0xFFE0A868, 13, compose_status);
-        } else {
-            _ = try str(gpa, dl, e, .regular, x0 + 2, body_y + 12, faint, 12, "Enter to start · Esc to cancel");
-        }
-        body_y += 26;
-    }
+    if (composing) body_y += 46 + 8 + 26; // recipient bar + gap + hint line
     const list_w: i32 = std.math.clamp(@divTrunc(w * 34, 100), 220, 320);
     const split_gap: i32 = 28;
     const detail_x = x0 + list_w + split_gap;
@@ -4381,10 +4426,9 @@ pub fn layoutChat(
     // ── Right: the open thread + the composer strip. ──
     if (peer.len == 0) {
         _ = try str(gpa, dl, e, .regular, detail_x + 20, body_y + 40, faint, 15, "Select a conversation");
+        try drawChatHeader(gpa, dl, e, regions, accent, x0, w, top, composing, compose_draft, compose_status, motion.caret_phase, peer, detail_x, detail_w, body_y);
         return height;
     }
-    _ = try str(gpa, dl, e, .semibold, detail_x, body_y + 24, ink, 18, peer);
-    try rect(gpa, dl, detail_x, body_y + 40, detail_w, 1, divider, 0);
     const thread_top = body_y + 54;
     // The composer GROWS DOWNWARD as the draft wraps (hard word-break
     // included), so a long message builds lines inside the pane instead of
@@ -4514,8 +4558,8 @@ pub fn layoutChat(
                 const bx = if (b.mine) detail_x + detail_w - bw else detail_x;
                 const fill: u32 = bubbleFill(accent, b.mine);
                 if (!is_fly) {
-                    try rect(gpa, dl, bx, by, bw, hh, fill, 14);
                     if (b.tail) try bubbleTail(gpa, dl, b.mine, bx, by, bw, hh, fill);
+                    try rect(gpa, dl, bx, by, bw, hh, fill, 14);
                     _ = try wrapBody(gpa, dl, e, bx + pad_x, by + pad_y + 12, bub_max - 2 * pad_x, ink, 14, b.body, line_h, true, null);
                 } else {
                     // THE MORPH. Spring physics, not easing: rise and scale
@@ -4540,8 +4584,8 @@ pub fn layoutChat(
                     const bx_a = if (b.mine) bx + (bw - bw_a) else bx;
                     const by_a = @as(i32, @intFromFloat(@round(bot_a))) - hh_a;
                     const fill_a = scaleAlpha(fill, fade);
-                    try rect(gpa, dl, bx_a, by_a, bw_a, hh_a, fill_a, 14);
                     if (b.tail) try bubbleTail(gpa, dl, b.mine, bx_a, by_a, bw_a, hh_a, fill_a);
+                    try rect(gpa, dl, bx_a, by_a, bw_a, hh_a, fill_a, 14);
                     _ = try wrapBody(gpa, dl, e, bx + pad_x, by_a + pad_y + 12, bub_max - 2 * pad_x, scaleAlpha(ink, fade), 14, b.body, line_h, true, null);
                 }
             }
@@ -4564,11 +4608,11 @@ pub fn layoutChat(
         const th: i32 = @intFromFloat(@round(34.0 * tt));
         const tw: i32 = @intFromFloat(@round(64.0 * (0.55 + 0.45 * tt)));
         const ty = comp_y - 12 - th;
-        try rect(gpa, dl, detail_x, ty, tw, th, scaleAlpha(skinPanel(accent), typing_open), 14);
         // The indicator is a received-side bubble: it wears the tail too —
         // and the arriving message grows out of this same slot, so the
         // handoff reads as the dots becoming the message.
         try bubbleTail(gpa, dl, false, detail_x, ty, tw, th, scaleAlpha(skinPanel(accent), typing_open));
+        try rect(gpa, dl, detail_x, ty, tw, th, scaleAlpha(skinPanel(accent), typing_open), 14);
         if (typing_open > 0.55) {
             const dot_a = (typing_open - 0.55) / 0.45; // dots arrive after the bubble
             var di: i32 = 0;
@@ -4582,6 +4626,14 @@ pub fn layoutChat(
             }
         }
     }
+
+    // The sticky header strip: a near-opaque veil over the detail pane's top
+    // (from the split divider to the column's right edge), drawn AFTER the
+    // thread so a scrolled bubble slides beneath it and ghosts faintly
+    // through — the feed's header_veil pattern — then the chrome on top.
+    const hdr_x = detail_x - @divTrunc(split_gap, 2);
+    try rect(gpa, dl, hdr_x, 0, x0 + w - hdr_x, thread_top, skinHeaderVeil(accent), 0);
+    try drawChatHeader(gpa, dl, e, regions, accent, x0, w, top, composing, compose_draft, compose_status, motion.caret_phase, peer, detail_x, detail_w, body_y);
 
     // The composer: a growing multi-line input + Send. The draft renders
     // through the same wrap engine as the bubbles (soft wrap + hard
