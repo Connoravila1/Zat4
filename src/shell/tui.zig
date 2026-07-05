@@ -3874,7 +3874,8 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 // Tiling foundation: '/' toggles the content-driven SEARCH tile —
                 // it grows + pushes the trending/follow tiles down (a cheap
                 // reposition, no relayout). The shell springs `search_open`.
-                if (ch == '/') {
+                // Dead while a text input owns the keyboard ('/' is text there).
+                if (ch == '/' and !typingOwnsKeyboard(rs)) {
                     gs.search_want = !gs.search_want;
                     continue;
                 }
@@ -4162,6 +4163,14 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status);
                     continue;
                 }
+                // SHORTCUT FENCE — the across-the-board guard over the branch-
+                // level consumes above: while ANY text input owns the keyboard,
+                // a printable key that reaches this point is swallowed — never
+                // zoom, never a feed shortcut (actionFor below). An input is
+                // protected even if its own branch forgets to consume a key —
+                // the bug class where 'n' typed into the chat recipient bar
+                // fell through and opened the new-post composer.
+                if (typingOwnsKeyboard(rs)) continue;
                 if (zc == '+' or zc == '=') {
                     rs.gzoom = std.math.clamp(rs.gzoom + 0.15, zoom_min, zoom_max);
                     rs.status = "zoom in";
@@ -4487,6 +4496,22 @@ pub fn run(
 
 /// The caret blink phase: solid for the ~530 ms after the last edit/move
 /// (anchor), then a 530 ms on/off cycle while idle. B3: the clock is the shell's.
+/// True while any TEXT INPUT owns the keyboard: the premium composer, the
+/// chat recipient bar / message draft, the pay + receive sheets, the Create
+/// name field. Printable keys are TEXT there, never shortcuts. The shortcut
+/// layer checks this ONE predicate (the '/' search toggle + the char fence
+/// in the run loop), so every input — present and future — is shielded even
+/// when its own branch forgets to consume a key. Grow this list with every
+/// new text input; that one line is the whole protection.
+fn typingOwnsKeyboard(rs: *const RunState) bool {
+    if (rs.mode == .compose) return true;
+    if (rs.engine == null) return false; // terminal: none of the GUI inputs exist
+    if (rs.gscreen == feed_view.screen_messages and
+        (rs.gchat_composing or rs.gchat_input_focus or rs.gpay_open or rs.grecv_open)) return true;
+    if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 2 and rs.gcreate_step == .name) return true;
+    return false;
+}
+
 fn composeBlinkOn(anchor_ns: u64) bool {
     return ((clock_shell.monotonicNanos() -| anchor_ns) / 530_000_000) % 2 == 0;
 }
