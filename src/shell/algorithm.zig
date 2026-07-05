@@ -42,6 +42,7 @@ const auth = @import("auth.zig");
 const lexicon = @import("../core/lexicon.zig");
 const discover = @import("../core/discover.zig");
 const algorithm_core = @import("../core/algorithm.zig");
+const algo_gate = @import("../core/algo_gate.zig");
 const feed_core = @import("../core/feed.zig");
 const xrpc = @import("../core/xrpc.zig");
 const net = @import("xrpc.zig"); // the shell XRPC transport (unauthenticated reads)
@@ -81,8 +82,11 @@ pub const Published = struct {
 
 /// Publish a config as an algorithm record in the user's repo at `rkey`
 /// (a user can hold many — `rkey` is the per-algorithm key, not a singleton).
-/// The config is `validated` before publishing, so you cannot publish a NaN.
-/// Returns the uri + CID; a write failure is an explicit error (E3).
+/// FAIL-CLOSED: the config must pass the Phase-5 publish gate (`algo_gate`) —
+/// a config the load path would repair, a wrong-side capability call, or a
+/// guest that can't finish inside its own fuel is `error.PublishRefused`,
+/// never a silently-degraded record. Callers print the named reasons by
+/// running `algo_gate.gate` themselves. Returns the uri + CID (E3).
 pub fn publish(
     gpa: Allocator,
     arena: Allocator,
@@ -94,11 +98,10 @@ pub fn publish(
     rkey: []const u8,
     now_epoch: i64,
 ) !Published {
-    // DEFERRED SECURITY (SECURITY_ROADMAP Phase 12): publish-time validation gate.
-    // `validated` below silently clamps/clips/drops a malformed config so we never
-    // publish unsafe data — but when the authoring UI lands, also REJECT a
-    // malformed program / over-cap rule-list here with a clear error to the author,
-    // rather than letting it degrade to a no-op on every reader's device.
+    // The publish gate (GUEST_TIER_ROADMAP Phase 5; closes the deferred
+    // SECURITY_ROADMAP Phase-12 item recorded here). validated() still runs
+    // below as belt-and-braces, but past the gate it is a proven no-op.
+    if (!algo_gate.gate(config).pass()) return error.PublishRefused;
     var ts_buf: [24]u8 = undefined;
     const record = AlgorithmRecordOut{
         .name = name,

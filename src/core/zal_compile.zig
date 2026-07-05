@@ -120,10 +120,7 @@ fn capabilityTakesTag(cap: guest_abi.Capability) bool {
 /// belong only in `retrieve()`; everything else reads or adapts to a candidate and
 /// belongs in `score()`/`learn()`. Exhaustive so a new capability decides its side.
 fn isSourceCapability(cap: guest_abi.Capability) bool {
-    return switch (cap) {
-        .source_follows, .source_discovery, .source_trending, .source_tag_scope => true,
-        .has_tag, .state_read, .state_write, .attention_dwell, .attention_clicked => false,
-    };
+    return guest_abi.isSource(cap);
 }
 
 /// Which entry point a function name compiles as. `score`/`learn` run PER CANDIDATE
@@ -135,16 +132,12 @@ fn entryKindOf(name: []const u8) guest_abi.EntryPoint {
     return .score; // score() and any other single-entry compile default to per-candidate rules
 }
 
-/// May `entry` call `cap`? A `retrieve()` composes the pool (sources only, no
-/// candidate exists to read); a `score()`/`learn()` reads/adapts to a candidate
-/// (content + state + attention, never a source). This is the compile-time
-/// capability wall — calling the wrong side is a clean author error, not a silent
-/// no-op at runtime (the eBPF posture: the verifier rejects it).
+/// May `entry` call `cap`? Delegates to `guest_abi.entryPermits` — the wall is
+/// stated ONCE in the contract; here it surfaces as a clean author error at
+/// compile time (the eBPF posture: the verifier rejects it), and the publish
+/// gate + `discover.validated` apply the same rule to raw bytecode.
 fn entryPermits(entry: guest_abi.EntryPoint, cap: guest_abi.Capability) bool {
-    return switch (entry) {
-        .retrieve => isSourceCapability(cap),
-        .score, .learn => !isSourceCapability(cap),
-    };
+    return guest_abi.entryPermits(entry, cap);
 }
 
 /// Strip the surrounding quotes from a string token's text (`"zig"` → `zig`). The

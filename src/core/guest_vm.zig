@@ -246,6 +246,17 @@ pub const Host = struct {
     call: *const fn (ctx: *anyopaque, cap: guest_abi.Capability, arg0: f64, arg1: f64) f64,
 };
 
+/// One run's outcome beyond the score: whether the fuel budget was EXHAUSTED (the
+/// program was cut off mid-flight rather than finishing). At run time exhaustion
+/// is safe — the score is whatever the stack held — but the publish gate's battery
+/// (Phase 5, `algo_gate`) treats it as a named refusal: a program that cannot
+/// finish inside its own declared budget doesn't ship.
+/// A7.2: cold struct, size guard waived — one per metered run, never in bulk.
+pub const Metered = struct {
+    score: f64,
+    fuel_exhausted: bool,
+};
+
 /// Run a guest program for one candidate and return its score. TOTAL: defined and
 /// finite for ANY bytecode, at any `fuel_budget` — a looping or hostile program is
 /// STOPPED when its fuel runs out (never a hang), operands are bounded, and every
@@ -253,13 +264,22 @@ pub const Host = struct {
 /// `base_score` fact) and the result if the program leaves the stack empty (an
 /// empty program ⇒ base unchanged, so the VM layer is inert by default). Pure.
 pub fn run(program: []const Instr, view: guest_abi.CandidateView, base_score: f64, fuel_budget: u32, host: ?*const Host) f64 {
+    return runMetered(program, view, base_score, fuel_budget, host).score;
+}
+
+/// `run` with the fuel outcome reported — the publish gate's battery probe.
+pub fn runMetered(program: []const Instr, view: guest_abi.CandidateView, base_score: f64, fuel_budget: u32, host: ?*const Host) Metered {
     @setRuntimeSafety(true); // untrusted bytecode drives `pc` — force checks on regardless of build
     var st: Stack = .{};
     var mem = [_]f64{0} ** mem_words; // per-run scratch, zeroed; discarded at the end
     var pc: usize = 0;
     var fuel: u32 = 0;
+    var exhausted = false;
     while (pc < program.len) {
-        if (fuel >= fuel_budget) break; // out of fuel ⇒ stop (this is what makes loops total)
+        if (fuel >= fuel_budget) {
+            exhausted = true; // out of fuel ⇒ stop (this is what makes loops total)
+            break;
+        }
         fuel += 1;
         const ins = program[pc];
         // EXHAUSTIVE — no `else`. A new opcode must be handled here (and in `arity`)
@@ -384,7 +404,26 @@ pub fn run(program: []const Instr, view: guest_abi.CandidateView, base_score: f6
             },
         }
     }
-    return sanitize(if (st.sp > 0) st.buf[st.sp - 1] else base_score);
+    return .{
+        .score = sanitize(if (st.sp > 0) st.buf[st.sp - 1] else base_score),
+        .fuel_exhausted = exhausted,
+    };
+}
+
+/// The first capability this program calls that its ENTRY POINT does not permit
+/// (null = clean). The compiler enforces this wall at author time (zal_compile);
+/// this applies the SAME rule (`guest_abi.entryPermits`) to the BYTECODE, so a
+/// hand-crafted artifact cannot bypass the compiler: the publish gate refuses it
+/// by name (Phase 5), and `discover.validated` empties it at load — wrong-side
+/// reach is unexpressible, not just unadvised (the eBPF-verifier posture). Pure.
+pub fn entryViolation(program: []const Instr, entry: guest_abi.EntryPoint) ?guest_abi.Capability {
+    const cap_count = @typeInfo(guest_abi.Capability).@"enum".fields.len;
+    for (program) |ins| {
+        if (ins.op != .call_host or ins.arg >= cap_count) continue;
+        const cap: guest_abi.Capability = @enumFromInt(@as(u8, @intCast(ins.arg)));
+        if (!guest_abi.entryPermits(entry, cap)) return cap;
+    }
+    return null;
 }
 
 /// A well-formedness SANITY gate (NOT the safety mechanism — `run` is total on any

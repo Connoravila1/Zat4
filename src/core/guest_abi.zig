@@ -131,6 +131,29 @@ pub fn isBehavioral(cap: Capability) bool {
     };
 }
 
+/// Is this capability a retrieval SOURCE (composes the candidate pool)?
+/// Exhaustive — a new capability must pick a side here on purpose.
+pub fn isSource(cap: Capability) bool {
+    return switch (cap) {
+        .source_follows, .source_discovery, .source_trending, .source_tag_scope => true,
+        .has_tag, .state_read, .state_write, .attention_dwell, .attention_clicked => false,
+    };
+}
+
+/// May `entry` call `cap`? A `retrieve()` composes the pool (sources only — no
+/// candidate exists to read); a `score()`/`learn()` reads/adapts to a candidate
+/// (content + state + attention, never a source). THE entry/capability wall,
+/// stated once in the contract and enforced three times: by the compiler at
+/// author time (`zal_compile`), by the publish gate at publish time
+/// (`algo_gate`, Phase 5), and by `discover.validated` at load — so it holds
+/// for hand-crafted bytecode exactly as for compiled Zal.
+pub fn entryPermits(entry: EntryPoint, cap: Capability) bool {
+    return switch (entry) {
+        .retrieve => isSource(cap),
+        .score, .learn => !isSource(cap),
+    };
+}
+
 /// The PUBLIC features of one candidate, handed to the guest's `score` entry point.
 /// PUBLIC-ONLY BY CONSTRUCTION: there is NO per-identity field here (no author DID,
 /// no handle, no "is this me") — so a guest cannot single out or target a specific

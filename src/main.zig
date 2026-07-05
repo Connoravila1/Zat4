@@ -53,6 +53,8 @@ const launch = @import("shell/launch.zig");
 const chainwatch_core = @import("core/chainwatch.zig");
 const chainwatch_shell = @import("shell/chainwatch.zig");
 const algorithm_shell = @import("shell/algorithm.zig");
+const algo_gate = @import("core/algo_gate.zig");
+const discover = @import("core/discover.zig");
 const builder = @import("core/builder.zig");
 const lens_catalog = @import("core/lens_catalog.zig");
 const clock_shell = @import("shell/clock.zig");
@@ -93,6 +95,16 @@ fn printExportRecipe(out: *std.Io.Writer, handle: []const u8, path: []const u8, 
         \\[export]             adb shell rm /data/local/tmp/{s} && rm {s}
         \\
     , .{ handle, path, path, target_name, target_name, target_name, path });
+}
+
+/// Print the publish gate's named refusals (algo_gate, Phase 5) — the
+/// author-facing half of shell/algorithm.publish's fail-closed error.
+fn printGateRefusals(out: *std.Io.Writer, cfg: discover.FeedConfig) !void {
+    const v = algo_gate.gate(cfg);
+    if (v.pass()) return;
+    try out.print("publish gate refused ({d} reason(s)):\n", .{v.count});
+    for (v.list()) |r| try out.print("  - {s}\n", .{algo_gate.label(r)});
+    try out.flush();
 }
 
 /// Trim display text to `max` bytes without splitting a UTF-8 sequence.
@@ -860,8 +872,11 @@ pub fn main(init: std.process.Init) !void {
         // config) into the user's repo, keyed by a fixed dev rkey so re-running
         // republishes the same slot. From there the AppView's poll indexes it and
         // `getAlgorithms` lists it — the marketplace's content, before the UI.
+        // Both publish legs run the Phase-5 gate first and print its named
+        // refusals — the shell refuses fail-closed either way.
         if (publish_algo_name) |name| {
             const config_out = builder.build(.{});
+            try printGateRefusals(out, config_out); // named reasons before the shell's fail-closed refusal
             const published = algorithm_shell.publish(gpa, arena, io, env, &session, name, config_out, "dev-algo", now) catch |err| {
                 try out.print("publish-algo failed: {s}\n", .{@errorName(err)});
                 try out.flush();
@@ -876,6 +891,7 @@ pub fn main(init: std.process.Init) !void {
         // genuinely complex, behavioral algorithm to render.
         if (publish_discover) {
             const cfg = lens_catalog.scoringConfigForId("zat4:discover") orelse builder.build(.{});
+            try printGateRefusals(out, cfg);
             const published = algorithm_shell.publish(gpa, arena, io, env, &session, "Zat4 Discover", cfg, "zat4-discover", now) catch |err| {
                 try out.print("publish-discover failed: {s}\n", .{@errorName(err)});
                 try out.flush();
@@ -1092,6 +1108,7 @@ test {
     _ = @import("core/zal_parse.zig");
     _ = @import("core/zal_compile.zig");
     _ = @import("core/zal_templates.zig");
+    _ = @import("core/algo_gate.zig");
     _ = @import("shell/algorithm.zig");
     _ = @import("core/feed_view.zig");
     _ = @import("core/settings_view.zig");

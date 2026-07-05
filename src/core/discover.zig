@@ -779,6 +779,14 @@ pub fn validated(c: FeedConfig) FeedConfig {
     // same untrusted-compiler / trusted-validator split as the score program). An
     // empty retrieve() ⇒ the declarative query.sources are used.
     v.guest_retrieve = guest_vm.validatedProgram(v.guest_retrieve);
+    // THE ENTRY/CAPABILITY WALL at load (guest_abi.entryPermits applied to the
+    // bytecode): a score program reaching for a retrieval source, or a retrieve
+    // program reaching for candidate/state/attention, is emptied to the safe
+    // no-op. The compiler refuses this at author time and the publish gate by
+    // name (algo_gate, Phase 5); this is the runtime backstop that holds for
+    // hand-crafted bytecode a compiler never saw.
+    if (guest_vm.entryViolation(v.guest_program, .score) != null) v.guest_program = &.{};
+    if (guest_vm.entryViolation(v.guest_retrieve, .retrieve) != null) v.guest_retrieve = &.{};
     // Clip a hostile/oversized tag-constant pool to its cap (a `has_tag` lookup is
     // `candidates × pool` in the worst case). Truncating the const slice borrows the
     // same memory — no allocation, so `validated` stays pure. An index past the
