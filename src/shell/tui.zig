@@ -2426,6 +2426,22 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             m.drag_y = tev.y;
                             const dy: f32 = @as(f32, @floatFromInt(dy_phys)) / scale;
                             frame_dy += dy;
+                            // Pull-to-refresh (the desktop overscroll gesture,
+                            // by touch): dragging DOWN while already pinned at
+                            // the top of Home builds overscroll; past the
+                            // threshold it asks for a refresh. Any upward drag
+                            // cancels the pull.
+                            if (rs.gscreen == feed_view.screen_home and rs.gscroll_px == 0 and dy > 0) {
+                                rs.overscroll_accum += @intFromFloat(dy);
+                                if (rs.overscroll_accum >= pull_refresh_threshold) {
+                                    rs.pull_refresh_requested = true;
+                                    rs.overscroll_accum = 0;
+                                } else {
+                                    rs.status = "↓ keep pulling to refresh";
+                                }
+                            } else if (dy < 0) {
+                                rs.overscroll_accum = 0;
+                            }
                             rs.gscroll_px += @intFromFloat(dy);
                             rs.gscroll_px = @max(min_scroll, @min(0, rs.gscroll_px));
                         }
