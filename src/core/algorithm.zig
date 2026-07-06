@@ -131,19 +131,27 @@ test "round trip: a guest program's tag-constant pool survives serialize/parse" 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // A guest artifact with BOTH entries: score() reads a tag, retrieve() scopes to
-    // another — a shared two-entry pool, both programs and the pool must round-trip.
+    // A guest artifact with ALL THREE entries: score() reads a tag, retrieve()
+    // scopes to another, arrange() reverses the pool — a shared tag pool and
+    // three programs, all of which must round-trip.
     const src =
         \\fn score() num { if (has_tag("zig")) { return 2.0; } return like_count; }
         \\fn retrieve() num { tag_scope("rust", 1.0); return 0.0; }
+        \\fn arrange() num {
+        \\  var i = pool_len() - 1.0;
+        \\  while (i >= 0.0) { emit(i); i = i - 1.0; }
+        \\  return 0.0;
+        \\}
     ;
     const ast = try zal_parse.parse(arena, src);
     const art = try zal_compile.compileArtifact(arena, &ast);
     try t.expect(art.ok());
+    try t.expect(art.arrange.len > 0);
 
     var cfg = discover.DEFAULT_CONFIG;
     cfg.guest_program = art.score;
     cfg.guest_retrieve = art.retrieve;
+    cfg.guest_arrange = art.arrange;
     cfg.guest_strings = art.strings;
 
     const bytes = try serialize(arena, cfg);
@@ -154,6 +162,7 @@ test "round trip: a guest program's tag-constant pool survives serialize/parse" 
     try t.expectEqualStrings("rust", back.guest_strings[1]);
     try t.expect(back.guest_program.len == art.score.len);
     try t.expect(back.guest_retrieve.len == art.retrieve.len); // retrieve() survives too
+    try t.expect(back.guest_arrange.len == art.arrange.len); // arrange() survives too
     // What you inspect IS what runs: re-serializing reproduces the same bytes (CID).
     const bytes2 = try serialize(arena, back);
     try t.expectEqualSlices(u8, bytes, bytes2);

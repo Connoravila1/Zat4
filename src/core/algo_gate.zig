@@ -63,6 +63,9 @@ pub const Refusal = enum(u8) {
     candidates_over_cap,
     battery_score_exhausted,
     battery_retrieve_exhausted,
+    guest_arrange_malformed,
+    entry_wall_arrange,
+    battery_arrange_exhausted,
     not_load_stable,
 };
 
@@ -84,6 +87,9 @@ pub fn label(r: Refusal) []const u8 {
         .candidates_over_cap => "max_candidates is over the hard cap",
         .battery_score_exhausted => "score() ran out of its own declared fuel on a test candidate — it cannot finish inside its budget",
         .battery_retrieve_exhausted => "retrieve() ran out of its own declared fuel — it cannot finish inside its budget",
+        .guest_arrange_malformed => "the arrange() bytecode is malformed (bad jump target or capability id, or over the length cap)",
+        .entry_wall_arrange => "arrange() calls a capability outside the pool/state set — sources and per-candidate reads don't belong there",
+        .battery_arrange_exhausted => "arrange() ran out of its own declared fuel over a full-size pool — it cannot finish inside its budget",
         .not_load_stable => "a value the engine would repair or clip at load — what you publish must be exactly what runs",
     };
 }
@@ -143,6 +149,22 @@ fn batteryHostCall(_: *anyopaque, cap: guest_abi.Capability, arg0: f64, _: f64) 
 var battery_host_ctx: u8 = 0; // the mock needs an address, not state
 const battery_host: guest_vm.Host = .{ .ctx = @ptrCast(&battery_host_ctx), .call = batteryHostCall };
 
+/// The arrange() battery's mock host: `pool_len` answers a FULL visible pool
+/// (`pool_size_cap`) — the worst case an arrange will ever face — so a program
+/// whose loops scale with the pool is metered against the real ceiling, not a
+/// toy. Reads answer varied finite values; emits acknowledge. Pure (B2).
+fn arrangeBatteryHostCall(_: *anyopaque, cap: guest_abi.Capability, arg0: f64, arg1: f64) f64 {
+    return switch (cap) {
+        .pool_len => @floatFromInt(guest_abi.pool_size_cap),
+        .pool_read => (if (std.math.isFinite(arg0)) arg0 else 0) * 0.5 + (if (std.math.isFinite(arg1)) arg1 else 0),
+        .arrange_emit => 1,
+        else => batteryHostCall(@ptrCast(&battery_host_ctx), cap, arg0, arg1),
+    };
+}
+
+var arrange_battery_ctx: u8 = 0;
+const arrange_battery_host: guest_vm.Host = .{ .ctx = @ptrCast(&arrange_battery_ctx), .call = arrangeBatteryHostCall };
+
 /// Compare a config against its load-repaired self, field by field at
 /// comptime — slices by identity (validated only ever borrows: a clip or an
 /// empty changes ptr/len), scalars by value. A NaN scalar compares unequal
@@ -167,11 +189,13 @@ pub fn gate(c: discover.FeedConfig) Verdict {
     // -- Structural: programs must be well-formed as authored, not repaired.
     if (c.guest_program.len > 0 and !guest_vm.validProgram(c.guest_program)) v.add(.guest_score_malformed);
     if (c.guest_retrieve.len > 0 and !guest_vm.validProgram(c.guest_retrieve)) v.add(.guest_retrieve_malformed);
+    if (c.guest_arrange.len > 0 and !guest_vm.validProgram(c.guest_arrange)) v.add(.guest_arrange_malformed);
     if (c.vm_program.len > 0 and !algo_vm.validProgram(c.vm_program)) v.add(.vm_program_malformed);
 
     // -- The entry/capability wall, on the bytecode (guest_abi.entryPermits).
     if (guest_vm.entryViolation(c.guest_program, .score) != null) v.add(.entry_wall_score);
     if (guest_vm.entryViolation(c.guest_retrieve, .retrieve) != null) v.add(.entry_wall_retrieve);
+    if (guest_vm.entryViolation(c.guest_arrange, .arrange) != null) v.add(.entry_wall_arrange);
 
     // -- Budgets: declared, not clamped. A budget past the ceiling would be
     //    silently cut at load — here it is a named refusal.
@@ -201,6 +225,16 @@ pub fn gate(c: discover.FeedConfig) Verdict {
         // retrieve() runs once per refresh with no candidate — a zeroed view.
         if (guest_vm.runMetered(c.guest_retrieve, battery[1], 0.0, fuel, &battery_host).fuel_exhausted) {
             v.add(.battery_retrieve_exhausted);
+        }
+    }
+    if (c.guest_arrange.len > 0 and !v.has(.guest_arrange_malformed) and !v.has(.entry_wall_arrange) and !v.has(.fuel_over_ceiling)) {
+        // arrange() runs once per refresh with no candidate (zeroed view), over
+        // the pool host that reports a FULL visible window — the worst case its
+        // pool-scaled loops will ever meet. Fuel exhaustion here is a fuel-cut
+        // partial order at runtime (safe), but a named refusal at publish time:
+        // an algorithm that cannot finish its own arrange doesn't ship.
+        if (guest_vm.runMetered(c.guest_arrange, battery[1], 0.0, fuel, &arrange_battery_host).fuel_exhausted) {
+            v.add(.battery_arrange_exhausted);
         }
     }
 
@@ -322,6 +356,48 @@ test "gate: the battery refuses a program that cannot finish inside its declared
     };
     cfg = discover.DEFAULT_CONFIG;
     cfg.guest_program = &counter;
+    try t.expect(gate(cfg).pass());
+}
+
+test "gate: arrange() is walled, batteried against a FULL pool, and a real one passes" {
+    // The wall: an arrange() reaching for a pointwise read is refused by name.
+    const bad_arrange = [_]guest_vm.Instr{
+        .{ .op = .push_const, .value = 0 },
+        .{ .op = .push_const, .value = 0 },
+        .{ .op = .call_host, .arg = @intFromEnum(guest_abi.Capability.has_tag) },
+        .{ .op = .halt },
+    };
+    var cfg = discover.DEFAULT_CONFIG;
+    cfg.guest_arrange = &bad_arrange;
+    try t.expect(gate(cfg).has(.entry_wall_arrange));
+
+    // The battery: a spinner as arrange() can never finish — refused by name.
+    const spinner = [_]guest_vm.Instr{
+        .{ .op = .jump, .arg = 0 },
+    };
+    cfg = discover.DEFAULT_CONFIG;
+    cfg.guest_arrange = &spinner;
+    try t.expect(gate(cfg).has(.battery_arrange_exhausted));
+
+    // A real authored arrange — reverse the pool — finishes against the
+    // battery's FULL visible window (pool_size_cap rows) and passes whole.
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const src =
+        \\fn score() num { return like_count; }
+        \\fn arrange() num {
+        \\  var i = pool_len() - 1.0;
+        \\  while (i >= 0.0) { emit(i); i = i - 1.0; }
+        \\  return 0.0;
+        \\}
+    ;
+    const ast = try zal_parse.parse(arena, src);
+    const art = try zal_compile.compileArtifact(arena, &ast);
+    try t.expect(art.ok());
+    cfg = discover.DEFAULT_CONFIG;
+    cfg.guest_program = art.score;
+    cfg.guest_arrange = art.arrange;
     try t.expect(gate(cfg).pass());
 }
 

@@ -52,15 +52,33 @@ const discover = @import("discover.zig");
 ///   retrieve() -> void         // side effect: calls `source_*` to build the query
 ///   score(CandidateView) -> f64
 ///   learn(AttentionEvent) -> void  // side effect: writes `state_*`
+///   arrange() -> void          // side effect: calls `arrange_emit` to build the order
+///
+/// `arrange` is the POOL-VISIBLE stage (POOL_VISIBILITY_ROADMAP): it runs ONCE
+/// per refresh over the score-sorted pool (no current candidate) and emits the
+/// final order as a permutation of pool indexes. An absent `arrange` means the
+/// score order stands — absence is ordinary, not an error (E4).
 pub const EntryPoint = enum(u8) {
     retrieve,
     score,
     learn,
+    arrange,
 
     comptime {
-        assert(@typeInfo(EntryPoint).@"enum".fields.len == 3);
+        assert(@typeInfo(EntryPoint).@"enum".fields.len == 4);
     }
 };
+
+/// The most candidates the guest may SEE at once — the visible pool window for
+/// `pool_len`/`pool_read`/`arrange_emit`. This is one of the two system-owned
+/// budget numbers (the other is the fuel ceiling, `guest_vm.max_fuel`): it
+/// bounds the worst-case cross-item work (`n²` reads are expressible but
+/// bounded) and the marshaled pool's memory, and it is NOT expressible in a
+/// published algorithm — the environment declares it, period (design §2.2).
+/// G1: 256 is a PROVISIONAL value (a 256-entry permutation + workspace fits the
+/// VM's 1024-word scratch; the pool marshals to ~9 KB); the final number is set
+/// by device measurement (POOL_VISIBILITY_ROADMAP slice 5), not guessed here.
+pub const pool_size_cap: u32 = 256;
 
 /// The capability functions a guest may call — the ONLY reach outward, invoked
 /// through the VM's `call_host` opcode with one of these ids. A guest is GRANTED a
@@ -109,13 +127,29 @@ pub const Capability = enum(u8) {
     attention_dwell, // the viewer's normalized dwell on a candidate, in [0,1]
     attention_clicked, // whether the viewer clicked into a candidate
 
+    // --- Pool (PUBLIC, cross-item): read the candidate pool by index, and emit
+    //     the final order. These widen VISIBILITY, not capability: the facts
+    //     readable through `pool_read` are the SAME public `CandidateView`
+    //     vocabulary a guest already reads one row at a time — all candidates at
+    //     once instead of one (fanning the same photo stack out on the table).
+    //     No identity, no behavioral signal, no exit: `arrange_emit` writes only
+    //     into the host's order buffer, defensively validated. Every call costs
+    //     fuel (the `call_host` meter), so n² programs are expressible but
+    //     BOUNDED. See POOL_VISIBILITY_ROADMAP §0. ---
+    pool_len, // how many candidates are visible (≤ pool_size_cap)
+    pool_read, // arg0 = pool index, arg1 = fact id (guest_vm.Fact) → the fact value
+    arrange_emit, // arg0 = pool index → append it to the final order (arrange only)
+
     comptime {
         // The whole capability surface, in one number (4 retrieval + 1 content + 2
-        // state + 2 behavioral). Bumping it is the deliberate review point for every
-        // new door (targeting / exfiltration / side channel). `source_tag_scope`
-        // composes a zone-scoped pool from a PUBLIC tag constant (no identity), same
-        // door review as `has_tag`: tags only, never handles/text.
-        assert(@typeInfo(Capability).@"enum".fields.len == 9);
+        // state + 2 behavioral + 3 pool). Bumping it is the deliberate review point
+        // for every new door (targeting / exfiltration / side channel).
+        // `source_tag_scope` composes a zone-scoped pool from a PUBLIC tag constant
+        // (no identity), same door review as `has_tag`: tags only, never
+        // handles/text. The pool trio (pool_len/pool_read/arrange_emit) reads
+        // public facts by index + emits an order — reviewed as visibility-only:
+        // no new fact, no reach outward, no per-identity input.
+        assert(@typeInfo(Capability).@"enum".fields.len == 12);
     }
 };
 
@@ -128,6 +162,9 @@ pub fn isBehavioral(cap: Capability) bool {
     return switch (cap) {
         .source_follows, .source_discovery, .source_trending, .source_tag_scope, .has_tag, .state_read, .state_write => false,
         .attention_dwell, .attention_clicked => true,
+        // Pool reads are PUBLIC facts by index; the emit writes an order. Neither
+        // touches the private attention stream (visibility, not capability).
+        .pool_len, .pool_read, .arrange_emit => false,
     };
 }
 
@@ -137,12 +174,26 @@ pub fn isSource(cap: Capability) bool {
     return switch (cap) {
         .source_follows, .source_discovery, .source_trending, .source_tag_scope => true,
         .has_tag, .state_read, .state_write, .attention_dwell, .attention_clicked => false,
+        .pool_len, .pool_read, .arrange_emit => false,
+    };
+}
+
+/// Is this a POOL capability (reads the candidate pool by index / emits the
+/// final order)? Exhaustive — a new capability must pick a side on purpose.
+pub fn isPool(cap: Capability) bool {
+    return switch (cap) {
+        .pool_len, .pool_read, .arrange_emit => true,
+        .source_follows, .source_discovery, .source_trending, .source_tag_scope, .has_tag, .state_read, .state_write, .attention_dwell, .attention_clicked => false,
     };
 }
 
 /// May `entry` call `cap`? A `retrieve()` composes the pool (sources only — no
 /// candidate exists to read); a `score()`/`learn()` reads/adapts to a candidate
-/// (content + state + attention, never a source). THE entry/capability wall,
+/// (content + state + attention + cross-item pool READS, never a source and
+/// never the order-emit — a scorer emits a NUMBER, not an order); an
+/// `arrange()` transforms the pool into an order (pool + state — it has no
+/// current candidate, so the pointwise capabilities `has_tag`/`attention_*`
+/// have nothing to read and are not permitted). THE entry/capability wall,
 /// stated once in the contract and enforced three times: by the compiler at
 /// author time (`zal_compile`), by the publish gate at publish time
 /// (`algo_gate`, Phase 5), and by `discover.validated` at load — so it holds
@@ -150,7 +201,11 @@ pub fn isSource(cap: Capability) bool {
 pub fn entryPermits(entry: EntryPoint, cap: Capability) bool {
     return switch (entry) {
         .retrieve => isSource(cap),
-        .score, .learn => !isSource(cap),
+        .score, .learn => !isSource(cap) and cap != .arrange_emit,
+        .arrange => switch (cap) {
+            .pool_len, .pool_read, .arrange_emit, .state_read, .state_write => true,
+            .source_follows, .source_discovery, .source_trending, .source_tag_scope, .has_tag, .attention_dwell, .attention_clicked => false,
+        },
     };
 }
 
@@ -237,8 +292,44 @@ const t = std.testing;
 test "guards: the ABI types are exactly sized (the no-targeting / feature boundary)" {
     try t.expectEqual(@as(usize, 36), @sizeOf(CandidateView));
     try t.expectEqual(@as(usize, 44), @sizeOf(AttentionEvent));
-    try t.expectEqual(@as(usize, 9), @typeInfo(Capability).@"enum".fields.len);
-    try t.expectEqual(@as(usize, 3), @typeInfo(EntryPoint).@"enum".fields.len);
+    try t.expectEqual(@as(usize, 12), @typeInfo(Capability).@"enum".fields.len);
+    try t.expectEqual(@as(usize, 4), @typeInfo(EntryPoint).@"enum".fields.len);
+}
+
+test "the pool trio is visibility, not capability: public, non-source, non-behavioral" {
+    inline for (.{ Capability.pool_len, Capability.pool_read, Capability.arrange_emit }) |cap| {
+        try t.expect(isPool(cap));
+        try t.expect(!isBehavioral(cap)); // public facts by index — never attention
+        try t.expect(!isSource(cap)); // reads the pool; never composes it
+    }
+    try t.expect(!isPool(.has_tag));
+    try t.expect(!isPool(.source_follows));
+    try t.expect(!isPool(.attention_dwell));
+}
+
+test "the entry wall: arrange gets pool + state, and ONLY arrange emits the order" {
+    // arrange: pool + state, nothing pointwise, no sources.
+    try t.expect(entryPermits(.arrange, .pool_len));
+    try t.expect(entryPermits(.arrange, .pool_read));
+    try t.expect(entryPermits(.arrange, .arrange_emit));
+    try t.expect(entryPermits(.arrange, .state_read));
+    try t.expect(entryPermits(.arrange, .state_write));
+    try t.expect(!entryPermits(.arrange, .has_tag)); // no current candidate to read
+    try t.expect(!entryPermits(.arrange, .attention_dwell));
+    try t.expect(!entryPermits(.arrange, .source_follows));
+
+    // score/learn: cross-item READS yes (that's the visibility widening),
+    // the order-emit no (a scorer emits a number, not an order).
+    try t.expect(entryPermits(.score, .pool_len));
+    try t.expect(entryPermits(.score, .pool_read));
+    try t.expect(!entryPermits(.score, .arrange_emit));
+    try t.expect(entryPermits(.learn, .pool_read));
+    try t.expect(!entryPermits(.learn, .arrange_emit));
+
+    // retrieve: sources only, unchanged.
+    try t.expect(!entryPermits(.retrieve, .pool_read));
+    try t.expect(!entryPermits(.retrieve, .arrange_emit));
+    try t.expect(entryPermits(.retrieve, .source_follows));
 }
 
 test "the behavioral door: exactly the attention capabilities read private data" {

@@ -106,6 +106,27 @@ pub const calm: []const u8 =
     \\}
 ;
 
+/// **Fresh First** — the canonical POOL-VISIBLE starter (arrange(), cross-item):
+/// rank by engagement, then PULL every post younger than an hour to the front.
+/// Two passes over the ranked pool; the second emits everything — an already-
+/// placed post is simply ignored (emit() is once-per-post), so nothing is lost.
+/// This shape (walk the pool, place what matters, then place the rest) is the
+/// skeleton of most arrangement algorithms.
+pub const fresh_first: []const u8 =
+    \\fn score() num { return like_count + repost_count * 2.0; }
+    \\fn arrange() num {
+    \\  var n = pool_len();
+    \\  var i = 0.0;
+    \\  while (i < n) {
+    \\    if (pool_read(i, age_hrs) < 1.0) { emit(i); }
+    \\    i = i + 1.0;
+    \\  }
+    \\  i = 0.0;
+    \\  while (i < n) { emit(i); i = i + 1.0; }
+    \\  return 0.0;
+    \\}
+;
+
 /// One entry in the starter catalogue: a name + its Zal source. A7.2: cold table.
 pub const Template = struct { name: []const u8, source: []const u8 };
 
@@ -117,6 +138,7 @@ pub const all = [_]Template{
     .{ .name = "Most Liked", .source = most_liked },
     .{ .name = "Most Recent", .source = most_recent },
     .{ .name = "Calm", .source = calm },
+    .{ .name = "Fresh First", .source = fresh_first },
 };
 
 // ---------------------------------------------------------------------------
@@ -163,6 +185,19 @@ test "templates: every starter compiles, validates, and runs to a finite score" 
         const s = vm.run(res.program, sample, 0, vm.default_fuel, &host);
         try t.expect(std.math.isFinite(s)); // it runs, totally
     }
+}
+
+test "Fresh First: the whole artifact compiles and its arrange() survives the validator + entry wall" {
+    var a = std.heap.ArenaAllocator.init(t.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const ast = try parse.parse(arena, fresh_first);
+    const art = try compile.compileArtifact(arena, &ast);
+    try t.expect(art.ok());
+    try t.expect(art.arrange.len > 0);
+    try t.expect(vm.validProgram(art.arrange));
+    try t.expect(vm.entryViolation(art.arrange, .arrange) == null); // pool + emit only
+    try t.expect(!compile.usesBehavioral(art.arrange)); // pool reads are public
 }
 
 test "templates: the behavioral claim is PROVABLE from bytecode (invariant 6)" {

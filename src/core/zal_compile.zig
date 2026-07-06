@@ -100,6 +100,12 @@ fn capabilityOf(name: []const u8) ?guest_abi.Capability {
         .{ "state_write", guest_abi.Capability.state_write },
         .{ "attention_dwell", guest_abi.Capability.attention_dwell },
         .{ "attention_clicked", guest_abi.Capability.attention_clicked },
+        // The pool trio (POOL_VISIBILITY_ROADMAP): cross-item reads + the order
+        // emit. `emit` is the creator-facing name for arrange_emit — an arrange()
+        // "emits" its final order one candidate at a time.
+        .{ "pool_len", guest_abi.Capability.pool_len },
+        .{ "pool_read", guest_abi.Capability.pool_read },
+        .{ "emit", guest_abi.Capability.arrange_emit },
     };
     inline for (table) |e| if (std.mem.eql(u8, name, e[0])) return e[1];
     return null;
@@ -112,7 +118,7 @@ fn capabilityOf(name: []const u8) ?guest_abi.Capability {
 fn capabilityTakesTag(cap: guest_abi.Capability) bool {
     return switch (cap) {
         .has_tag, .source_tag_scope => true,
-        .source_follows, .source_discovery, .source_trending, .state_read, .state_write, .attention_dwell, .attention_clicked => false,
+        .source_follows, .source_discovery, .source_trending, .state_read, .state_write, .attention_dwell, .attention_clicked, .pool_len, .pool_read, .arrange_emit => false,
     };
 }
 
@@ -129,6 +135,7 @@ fn isSourceCapability(cap: guest_abi.Capability) bool {
 fn entryKindOf(name: []const u8) guest_abi.EntryPoint {
     if (std.mem.eql(u8, name, "retrieve")) return .retrieve;
     if (std.mem.eql(u8, name, "learn")) return .learn;
+    if (std.mem.eql(u8, name, "arrange")) return .arrange;
     return .score; // score() and any other single-entry compile default to per-candidate rules
 }
 
@@ -319,14 +326,37 @@ const Compiler = struct {
         if (!entryPermits(c.entry, cap)) {
             const msg = if (isSourceCapability(cap))
                 "a retrieval source composes the pool — call it from retrieve(), not here"
+            else if (cap == .arrange_emit)
+                "emit() builds the final order — call it from arrange(), not here"
+            else if (guest_abi.isPool(cap))
+                "this reads the pool — call it from score() or arrange(), not retrieve()"
             else
-                "this reads a candidate — call it from score(), not retrieve()";
+                "this reads the current candidate — call it from score() or learn(), not here";
             try c.err(msg, node.tok_start);
             return;
         }
         const args = c.ast.extra[node.a..node.b];
         if (args.len > 2) {
             try c.err("too many arguments (a capability takes at most 2)", node.tok_start);
+            return;
+        }
+        // pool_read(i, fact): the SECOND argument NAMES the fact to read — a fact
+        // identifier compiled to its id constant (the host resolves it back through
+        // the same `guest_vm.Fact` table). The same special-casing precedent as tag
+        // literals: the identifier is vocabulary, not a value. A local variable or
+        // number in that position is an author error, caught here by name.
+        if (cap == .pool_read) {
+            const fact: ?vm.Fact = if (args.len == 2 and c.ast.nodes[args[1]].tag == .ident)
+                factOf(c.ast.tokenText(args[1]))
+            else
+                null;
+            if (fact == null) {
+                try c.err("pool_read takes (index, fact) — a pool index and a fact name, e.g. pool_read(i, like_count)", node.tok_start);
+                return;
+            }
+            try c.genExpr(args[0]); // arg0 = the pool index (any expression)
+            _ = try c.emit(.{ .op = .push_const, .value = @floatFromInt(@intFromEnum(fact.?)) }); // arg1 = the fact id
+            _ = try c.emit(.{ .op = .call_host, .arg = @intFromEnum(cap) });
             return;
         }
         // A tag-taking capability's FIRST argument is a string literal, compiled to a
@@ -472,11 +502,13 @@ pub fn compile(arena: Allocator, ast: *const Ast, entry_name: []const u8) Alloca
 
 /// A whole guest ARTIFACT: a program's entry points compiled together, sharing ONE
 /// tag-constant pool. `score` is required (a feed IS a scoring function); `retrieve`
-/// is optional (empty when the program has no `retrieve()`). Fail-closed: any error
+/// and `arrange` are optional (empty when the program has no such function —
+/// absence means "engine default for that stage", E4). Fail-closed: any error
 /// yields empty programs. A7.2: cold, waived.
 pub const Artifact = struct {
     score: []const Instr,
     retrieve: []const Instr = &.{},
+    arrange: []const Instr = &.{},
     strings: []const []const u8 = &.{},
     errors: []const Error,
     pub fn ok(self: Artifact) bool {
@@ -503,12 +535,16 @@ pub fn compileArtifact(arena: Allocator, ast: *const Ast) Allocator.Error!Artifa
     };
     // retrieve() is optional; absent ⇒ the declarative query.sources are used.
     const retrieve_prog: []const Instr = (try c.compileEntry("retrieve")) orelse &.{};
+    // arrange() is optional; absent ⇒ the score order stands (the pool-visible
+    // stage, POOL_VISIBILITY_ROADMAP).
+    const arrange_prog: []const Instr = (try c.compileEntry("arrange")) orelse &.{};
     if (c.errors.items.len > 0) {
         return .{ .score = &.{}, .errors = try c.errors.toOwnedSlice(arena) };
     }
     return .{
         .score = score_prog,
         .retrieve = retrieve_prog,
+        .arrange = arrange_prog,
         .strings = try c.strings.toOwnedSlice(arena),
         .errors = &.{},
     };
@@ -686,6 +722,43 @@ test "compile: the entry-capability wall — sources only in retrieve(), candida
     // Right side → compiles.
     try t.expect(!try R.bad(arena, "fn retrieve() num { tag_scope(\"zig\", 1.0); return 0.0; }", "retrieve"));
     try t.expect(!try R.bad(arena, "fn score() num { if (has_tag(\"zig\")) { return 2.0; } return 1.0; }", "score"));
+}
+
+test "compile: the POOL wall — emit only in arrange(), pool reads never in retrieve(), no pointwise in arrange()" {
+    var a = std.heap.ArenaAllocator.init(t.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const R = struct {
+        fn bad(ar: Allocator, src: []const u8, entry: []const u8) !bool {
+            const res = try compile(ar, &(try parse.parse(ar, src)), entry);
+            return !res.ok();
+        }
+    };
+    // Wrong side → clean compile error.
+    try t.expect(try R.bad(arena, "fn score() num { emit(0.0); return like_count; }", "score")); // the order-emit belongs to arrange()
+    try t.expect(try R.bad(arena, "fn retrieve() num { return pool_len(); }", "retrieve")); // pool reads never in retrieve()
+    try t.expect(try R.bad(arena, "fn arrange() num { if (has_tag(\"zig\")) {} return 0.0; }", "arrange")); // no current candidate in arrange()
+    try t.expect(try R.bad(arena, "fn arrange() num { return attention_dwell(); }", "arrange"));
+    try t.expect(try R.bad(arena, "fn arrange() num { follows(1.0); return 0.0; }", "arrange"));
+    // Right side → compiles: cross-item reads in score(), the full pool set in arrange().
+    try t.expect(!try R.bad(arena, "fn score() num { return like_count - pool_read(0.0, like_count); }", "score"));
+    try t.expect(!try R.bad(arena, "fn arrange() num { var i = pool_len() - 1.0; while (i >= 0.0) { emit(i); i = i - 1.0; } return 0.0; }", "arrange"));
+}
+
+test "compile: pool_read demands (index, fact) — a fact NAME, not a value, in the second slot" {
+    var a = std.heap.ArenaAllocator.init(t.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    // A number, a local, or a missing second argument are all clean errors.
+    const r1 = try compile(arena, &(try parse.parse(arena, "fn score() num { return pool_read(0.0, 5.0); }")), "score");
+    try t.expect(!r1.ok());
+    const r2 = try compile(arena, &(try parse.parse(arena, "fn score() num { var x = 1.0; return pool_read(0.0, x); }")), "score");
+    try t.expect(!r2.ok());
+    const r3 = try compile(arena, &(try parse.parse(arena, "fn score() num { return pool_read(0.0); }")), "score");
+    try t.expect(!r3.ok());
+    // The fact identifier compiles to its id CONSTANT (vocabulary, not a value).
+    const r4 = try compile(arena, &(try parse.parse(arena, "fn score() num { return pool_read(1.0, author_rep); }")), "score");
+    try t.expect(r4.ok());
 }
 
 test "compile: a text literal is rejected outside a tag argument (type discipline, fail-closed)" {

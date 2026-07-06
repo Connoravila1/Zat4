@@ -244,7 +244,8 @@ pub fn explain(arena: Allocator, config: discover.FeedConfig) error{OutOfMemory}
         if (comptime std.mem.eql(u8, f.name, "rules") or std.mem.eql(u8, f.name, "vm_program") or
             std.mem.eql(u8, f.name, "guest_program") or std.mem.eql(u8, f.name, "guest_fuel") or
             std.mem.eql(u8, f.name, "guest_strings") or
-            std.mem.eql(u8, f.name, "guest_retrieve"))
+            std.mem.eql(u8, f.name, "guest_retrieve") or
+            std.mem.eql(u8, f.name, "guest_arrange"))
         {
             // The authored LOGIC — the L2 rule-list, the L3 VM program, and the
             // developer-tier guest program (+ its fuel + its tag-constant pool) — are
@@ -340,9 +341,14 @@ pub fn classify(config: discover.FeedConfig) Classification {
     // behavioral_weight at 0. A guest that calls an attention capability uses
     // behavioral data; one that calls state_write keeps a cross-session model. Both
     // entry programs (score + retrieve) are scanned.
-    if (guest_vm.usesBehavioral(config.guest_program) or guest_vm.usesBehavioral(config.guest_retrieve)) uses_behavioral = true;
+    // All THREE entry programs (score + retrieve + arrange) are scanned: the
+    // entry wall forbids attention in arrange(), but the label is derived from
+    // the bytecode as published, never from what a wall would later empty.
+    if (guest_vm.usesBehavioral(config.guest_program) or guest_vm.usesBehavioral(config.guest_retrieve) or
+        guest_vm.usesBehavioral(config.guest_arrange)) uses_behavioral = true;
     if (guest_vm.usedCapabilities(config.guest_program).contains(.state_write) or
-        guest_vm.usedCapabilities(config.guest_retrieve).contains(.state_write)) learns = true;
+        guest_vm.usedCapabilities(config.guest_retrieve).contains(.state_write) or
+        guest_vm.usedCapabilities(config.guest_arrange).contains(.state_write)) learns = true;
     inline for (@typeInfo(discover.FeedConfig).@"struct".fields) |f| {
         if (comptime std.mem.eql(u8, f.name, "rules") or
             std.mem.eql(u8, f.name, "vm_program") or
@@ -350,7 +356,8 @@ pub fn classify(config: discover.FeedConfig) Classification {
             std.mem.eql(u8, f.name, "guest_program") or
             std.mem.eql(u8, f.name, "guest_fuel") or
             std.mem.eql(u8, f.name, "guest_strings") or
-            std.mem.eql(u8, f.name, "guest_retrieve"))
+            std.mem.eql(u8, f.name, "guest_retrieve") or
+            std.mem.eql(u8, f.name, "guest_arrange"))
         {
             // Logic lists, the retrieval sub-record, and the developer-tier guest
             // program carry no behavioral SCALAR weight here: the door wall keeps
@@ -704,7 +711,8 @@ fn leafFieldCount() usize {
         if (comptime std.mem.eql(u8, f.name, "rules") or std.mem.eql(u8, f.name, "vm_program") or
             std.mem.eql(u8, f.name, "guest_program") or std.mem.eql(u8, f.name, "guest_fuel") or
             std.mem.eql(u8, f.name, "guest_strings") or
-            std.mem.eql(u8, f.name, "guest_retrieve"))
+            std.mem.eql(u8, f.name, "guest_retrieve") or
+            std.mem.eql(u8, f.name, "guest_arrange"))
         {
             // not scalar leaves — the authored logic (rules / L3 formula / the
             // developer-tier guest program + its fuel + its tag pool) renders as its own section

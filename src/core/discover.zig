@@ -330,6 +330,18 @@ pub const FeedConfig = struct {
     /// `query.sources` are used, unchanged. Borrows the caller's memory; validated
     /// like `guest_program`.
     guest_retrieve: []const guest_vm.Instr = &.{},
+    /// THE DEVELOPER TIER — the guest's optional `arrange()` program, the
+    /// POOL-VISIBLE stage (POOL_VISIBILITY_ROADMAP): run ONCE per refresh AFTER
+    /// scoring, over the score-sorted visible pool (≤ `guest_abi.pool_size_cap`
+    /// candidates), it reads any candidate's public facts by index (`pool_read`)
+    /// and emits the FINAL ORDER (`arrange_emit`) — cross-item, graph, and
+    /// constrained ranking live here. The emitted permutation is validated
+    /// defensively (dup/out-of-range ignored, missing appended in score order —
+    /// E2/E4), and moderation/diversity (D4) still run after: arrange re-orders
+    /// the pool, it cannot resurface what moderation hides nor add a candidate.
+    /// Empty ⇒ the score order stands, zero new work. Borrows the caller's
+    /// memory; validated like `guest_program`.
+    guest_arrange: []const guest_vm.Instr = &.{},
 };
 
 /// The hard ceiling on a single algorithm's declared on-device state (10 MiB).
@@ -446,9 +458,13 @@ pub fn scoreRow(c: Candidate, config: FeedConfig, now: i64) f64 {
 const ScoreHost = struct {
     strings: []const []const u8, // the artifact's tag-constant pool
     tags: []const []const u8, // this candidate's public tags
+    // The VISIBLE POOL for cross-item reads (POOL_VISIBILITY_ROADMAP): the first
+    // `pool_size_cap` retrieval-passing candidates in feed order, marshaled once
+    // per refresh. Empty slices ⇒ pool_len/pool_read answer 0 (a pool-blind run).
+    pool_views: []const guest_abi.CandidateView = &.{},
+    pool_bases: []const f64 = &.{}, // engine base score per pool row (`base_score` fact)
 
     fn call(ctx: *anyopaque, cap: guest_abi.Capability, arg0: f64, arg1: f64) f64 {
-        _ = arg1;
         const self: *const ScoreHost = @ptrCast(@alignCast(ctx));
         switch (cap) {
             .has_tag => {
@@ -462,7 +478,58 @@ const ScoreHost = struct {
                 for (self.tags) |tg| if (std.ascii.eqlIgnoreCase(tg, want)) return 1;
                 return 0;
             },
+            .pool_len => return @floatFromInt(self.pool_views.len),
+            .pool_read => return poolRead(self.pool_views, self.pool_bases, arg0, arg1),
             else => return 0, // retrieval/state/behavioral are not answered on the score path
+        }
+    }
+};
+
+/// Answer a guest `pool_read(index, fact_id)` over a marshaled visible pool: the
+/// SAME public fact vocabulary the VM reads pointwise (`guest_vm.factValue` — one
+/// table, D4), addressed by pool index. Both operands are validated defensively
+/// (NaN/negative/out-of-range ⇒ 0, never an out-of-bounds access): a bad read is
+/// ordinary bad data (E4). `scores` supplies the row's `base_score` answer — the
+/// engine base during the score stage, the final score during arrange. Pure.
+fn poolRead(views: []const guest_abi.CandidateView, scores: []const f64, arg0: f64, arg1: f64) f64 {
+    if (!(arg0 >= 0 and arg0 < @as(f64, @floatFromInt(views.len)))) return 0;
+    const fact_count = @typeInfo(guest_vm.Fact).@"enum".fields.len;
+    if (!(arg1 >= 0 and arg1 < @as(f64, @floatFromInt(fact_count)))) return 0;
+    const i: usize = @intFromFloat(arg0);
+    const fact: guest_vm.Fact = @enumFromInt(@as(u8, @intFromFloat(arg1)));
+    return guest_vm.factValue(fact, views[i], scores[i]);
+}
+
+/// The host for a guest `arrange()` run — the pool-visible stage's window outward.
+/// It answers pool reads over the SCORE-SORTED visible window (index 0 = top rank;
+/// `base_score` = the final score-stage score) and collects the emitted order.
+/// `arrange_emit(i)` appends pool row `i` to the order exactly once: a duplicate or
+/// out-of-range emit is IGNORED (returns 0; a successful emit returns 1, so a
+/// program can count what it has placed) — the defensive-validation half of the
+/// permutation contract (E2/E4); the caller appends unemitted rows in score order.
+/// PURE (writes only its own arena buffer). A7.2: cold — one per refresh. Waived.
+const ArrangeHost = struct {
+    views: []const guest_abi.CandidateView, // the visible window, score-sorted
+    scores: []const f64, // final score per row
+    order_out: []u32, // emitted pool rows, in emit order (capacity = window len)
+    emitted_len: usize = 0,
+    seen: std.StaticBitSet(guest_abi.pool_size_cap) = std.StaticBitSet(guest_abi.pool_size_cap).initEmpty(),
+
+    fn call(ctx: *anyopaque, cap: guest_abi.Capability, arg0: f64, arg1: f64) f64 {
+        const self: *ArrangeHost = @ptrCast(@alignCast(ctx));
+        switch (cap) {
+            .pool_len => return @floatFromInt(self.views.len),
+            .pool_read => return poolRead(self.views, self.scores, arg0, arg1),
+            .arrange_emit => {
+                if (!(arg0 >= 0 and arg0 < @as(f64, @floatFromInt(self.views.len)))) return 0;
+                const row: u32 = @intFromFloat(arg0);
+                if (self.seen.isSet(row)) return 0; // duplicate ⇒ ignored, not an error
+                self.seen.set(row);
+                self.order_out[self.emitted_len] = row;
+                self.emitted_len += 1;
+                return 1;
+            },
+            else => return 0, // state is shell-wired; sources/pointwise are entry-walled
         }
     }
 };
@@ -548,6 +615,40 @@ pub fn score(arena: Allocator, cands: *const Candidates, config: FeedConfig, now
     else
         config.query.sources;
 
+    // THE VISIBLE POOL for cross-item score reads (POOL_VISIBILITY_ROADMAP): when
+    // a guest score program is present, marshal the first `pool_size_cap`
+    // retrieval-passing candidates (feed order) once, so its `pool_read` answers
+    // any candidate's public facts — the same vocabulary it reads pointwise, all
+    // rows at once instead of one. `base_score` here answers the ENGINE base
+    // (guest scores for the other rows don't exist yet — no ordering paradox).
+    // The retrieval test is recomputed in the main loop below; it is a few
+    // comparisons per source and only paid when a guest runs (G3).
+    var sc_views: []const guest_abi.CandidateView = &.{};
+    var sc_bases: []const f64 = &.{};
+    if (config.guest_program.len > 0) {
+        const cap: usize = @min(n, guest_abi.pool_size_cap);
+        var vlist = try std.ArrayListUnmanaged(guest_abi.CandidateView).initCapacity(arena, cap);
+        var blist = try std.ArrayListUnmanaged(f64).initCapacity(arena, cap);
+        var j: usize = 0;
+        while (j < n and vlist.items.len < cap) : (j += 1) {
+            const cj = cands.list.get(j);
+            const jn = cands.in_network.isSet(j);
+            const jt: []const []const u8 = if (j < cands.cand_tags.items.len) cands.cand_tags.items[j] else &.{};
+            _ = retrieval.poolWeight(eff_sources, .{
+                .in_network = jn,
+                .engagement = cj.like_count + cj.repost_count + cj.reply_count,
+                .tags = jt,
+            }) orelse continue; // not retrieved ⇒ not in the visible pool either
+            const je = j < cands.viewer_engaged.capacity() and cands.viewer_engaged.isSet(j);
+            const jtc: u8 = if (j < cands.tag_count.items.len) cands.tag_count.items[j] else 0;
+            const jq: u32 = if (j < cands.quote_count.items.len) cands.quote_count.items[j] else 0;
+            vlist.appendAssumeCapacity(candidateView(cj, jn, je, jtc, jq, now));
+            blist.appendAssumeCapacity(scoreRow(cj, config, now));
+        }
+        sc_views = vlist.items;
+        sc_bases = blist.items;
+    }
+
     const scores = try arena.alloc(f64, n);
     var kept: std.ArrayListUnmanaged(u32) = .empty;
     try kept.ensureTotalCapacity(arena, n);
@@ -582,7 +683,7 @@ pub fn score(arena: Allocator, cands: *const Candidates, config: FeedConfig, now
             // the artifact's tag pool + the candidate's public tags. PURE (no I/O), so
             // the scorer stays pure; attention/state capabilities are not answered
             // here (they touch I/O + are gated) — they return 0, exactly as a null host.
-            var host_ctx = ScoreHost{ .strings = config.guest_strings, .tags = row_tags };
+            var host_ctx = ScoreHost{ .strings = config.guest_strings, .tags = row_tags, .pool_views = sc_views, .pool_bases = sc_bases };
             const host = guest_vm.Host{ .ctx = &host_ctx, .call = ScoreHost.call };
             scores[i] = guest_vm.run(config.guest_program, view, base, config.guest_fuel, &host) * @as(f64, pool_w);
             kept.appendAssumeCapacity(@intCast(i));
@@ -624,6 +725,52 @@ pub fn score(arena: Allocator, cands: *const Candidates, config: FeedConfig, now
         }
     };
     std.sort.block(u32, order, Ctx{ .scores = scores, .createds = createds, .refs = refs }, Ctx.lessThan);
+
+    // THE ARRANGE STAGE (pool visibility, POOL_VISIBILITY_ROADMAP): a guest
+    // `arrange()` runs ONCE over the score-sorted visible window (≤
+    // `pool_size_cap` rows; index 0 = top rank) and emits the final order as a
+    // permutation. The permutation is applied defensively: emitted rows first in
+    // emit order, unemitted rows appended in score order, ranks past the window
+    // untouched — a malformed or fuel-cut arrange yields a defined order, never
+    // a crash and never a lost candidate (E2/E4). Empty program ⇒ zero work.
+    if (config.guest_arrange.len > 0 and order.len > 0) {
+        const window: usize = @min(order.len, guest_abi.pool_size_cap);
+        const av = try arena.alloc(guest_abi.CandidateView, window);
+        const afinal = try arena.alloc(f64, window);
+        for (av, afinal, order[0..window]) |*vv, *ss, idx| {
+            const c = cands.list.get(idx);
+            const in_net = cands.in_network.isSet(idx);
+            const engaged = idx < cands.viewer_engaged.capacity() and cands.viewer_engaged.isSet(idx);
+            const tags_n: u8 = if (idx < cands.tag_count.items.len) cands.tag_count.items[idx] else 0;
+            const quotes: u32 = if (idx < cands.quote_count.items.len) cands.quote_count.items[idx] else 0;
+            vv.* = candidateView(c, in_net, engaged, tags_n, quotes, now);
+            ss.* = scores[idx];
+        }
+        var ah = ArrangeHost{
+            .views = av,
+            .scores = afinal,
+            .order_out = try arena.alloc(u32, window),
+        };
+        const ahost = guest_vm.Host{ .ctx = &ah, .call = ArrangeHost.call };
+        // No current candidate in arrange — it runs over a zeroed view (like
+        // retrieve); everything it needs comes through the pool capabilities.
+        const zero_view: guest_abi.CandidateView = .{ .like_count = 0, .repost_count = 0, .reply_count = 0, .age_hrs = 0, .author_rep = 0, .in_network = false };
+        _ = guest_vm.run(config.guest_arrange, zero_view, 0, config.guest_fuel, &ahost);
+        const rearranged = try arena.alloc(u32, window);
+        var k: usize = 0;
+        for (ah.order_out[0..ah.emitted_len]) |row| {
+            rearranged[k] = order[row];
+            k += 1;
+        }
+        var row: usize = 0;
+        while (row < window) : (row += 1) {
+            if (!ah.seen.isSet(row)) {
+                rearranged[k] = order[row];
+                k += 1;
+            }
+        }
+        @memcpy(order[0..window], rearranged);
+    }
 
     const out = try arena.alloc(Ref, order.len); // ≤ n when rules excluded some
     for (out, order) |*o, idx| o.* = refs[idx];
@@ -787,6 +934,11 @@ pub fn validated(c: FeedConfig) FeedConfig {
     // hand-crafted bytecode a compiler never saw.
     if (guest_vm.entryViolation(v.guest_program, .score) != null) v.guest_program = &.{};
     if (guest_vm.entryViolation(v.guest_retrieve, .retrieve) != null) v.guest_retrieve = &.{};
+    // The guest's arrange() program: same validator + entry wall (an arrange
+    // reaching for a source or a pointwise capability is emptied to the safe
+    // no-op — the score order stands).
+    v.guest_arrange = guest_vm.validatedProgram(v.guest_arrange);
+    if (guest_vm.entryViolation(v.guest_arrange, .arrange) != null) v.guest_arrange = &.{};
     // Clip a hostile/oversized tag-constant pool to its cap (a `has_tag` lookup is
     // `candidates × pool` in the worst case). Truncating the const slice borrows the
     // same memory — no allocation, so `validated` stays pure. An index past the
@@ -1126,6 +1278,195 @@ test "developer tier: a guest retrieve() composes its own pool via tag_scope" {
     const order = try score(arena, &c, cfg, test_now);
     try t.expectEqual(@as(usize, 1), order.len);
     try t.expectEqual(@as(u32, 2), order[0].raw());
+}
+
+/// A hand-built arrange() that REVERSES the visible pool:
+/// `n = pool_len(); i = n-1; while (i >= 0) { emit(i); i -= 1; }`.
+/// The canonical proof that a guest can return an ORDER it constructed itself
+/// (pool visibility), not just a per-item number.
+const arrange_reverse = [_]guest_vm.Instr{
+    .{ .op = .push_const, .value = 0 }, //  0: pad arg0
+    .{ .op = .push_const, .value = 0 }, //  1: pad arg1
+    .{ .op = .call_host, .arg = @intFromEnum(guest_abi.Capability.pool_len) }, // 2: [n]
+    .{ .op = .push_const, .value = 1 }, //  3
+    .{ .op = .sub }, //  4: i = n-1        [i]
+    .{ .op = .dup }, //  5: loop head      [i,i]
+    .{ .op = .push_const, .value = 0 }, //  6            [i,i,0]
+    .{ .op = .lt }, //  7: i < 0 ?          [i,c]
+    .{ .op = .not }, //  8: i >= 0 ?        [i,c]
+    .{ .op = .jump_if_zero, .arg = 17 }, // 9: exit      [i]
+    .{ .op = .dup }, // 10: arg0 = i        [i,i]
+    .{ .op = .push_const, .value = 0 }, // 11: pad arg1  [i,i,0]
+    .{ .op = .call_host, .arg = @intFromEnum(guest_abi.Capability.arrange_emit) }, // 12: [i,ack]
+    .{ .op = .pop }, // 13                  [i]
+    .{ .op = .push_const, .value = 1 }, // 14            [i,1]
+    .{ .op = .sub }, // 15: i -= 1          [i-1]
+    .{ .op = .jump, .arg = 5 }, // 16: loop
+};
+
+test "pool visibility: an arrange() program REVERSES the score order (permutation return)" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var c: Candidates = .{};
+    defer c.deinit(t.allocator);
+    try c.append(t.allocator, mk(1, 3600, 100), true); // score order: 1, 2, 3
+    try c.append(t.allocator, mk(2, 3600, 50), true);
+    try c.append(t.allocator, mk(3, 3600, 10), true);
+
+    var cfg = DEFAULT_CONFIG;
+    cfg.guest_arrange = &arrange_reverse;
+    cfg = validated(cfg);
+    try t.expect(cfg.guest_arrange.len > 0); // survives the load wall (a legal arrange)
+
+    const order = try score(arena, &c, cfg, test_now);
+    try t.expectEqual(@as(usize, 3), order.len);
+    try t.expectEqual(@as(u32, 3), order[0].raw()); // reversed
+    try t.expectEqual(@as(u32, 2), order[1].raw());
+    try t.expectEqual(@as(u32, 1), order[2].raw());
+}
+
+test "pool visibility: a HOSTILE arrange (dups + out-of-range) resolves to a defined order, nothing lost" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // emit(1); emit(1); emit(500); emit(1) — one legal emit, then garbage.
+    // Expected: row 1 first (the one honored emit), rows 0 and 2 appended in
+    // score order. No crash, no duplicate, no dropped candidate (E2/E4).
+    const hostile = [_]guest_vm.Instr{
+        .{ .op = .push_const, .value = 1 },
+        .{ .op = .push_const, .value = 0 },
+        .{ .op = .call_host, .arg = @intFromEnum(guest_abi.Capability.arrange_emit) },
+        .{ .op = .push_const, .value = 1 }, // duplicate ⇒ ignored
+        .{ .op = .push_const, .value = 0 },
+        .{ .op = .call_host, .arg = @intFromEnum(guest_abi.Capability.arrange_emit) },
+        .{ .op = .push_const, .value = 500 }, // out of range ⇒ ignored
+        .{ .op = .push_const, .value = 0 },
+        .{ .op = .call_host, .arg = @intFromEnum(guest_abi.Capability.arrange_emit) },
+    };
+
+    var c: Candidates = .{};
+    defer c.deinit(t.allocator);
+    try c.append(t.allocator, mk(1, 3600, 100), true); // score order: 1, 2, 3
+    try c.append(t.allocator, mk(2, 3600, 50), true);
+    try c.append(t.allocator, mk(3, 3600, 10), true);
+
+    var cfg = DEFAULT_CONFIG;
+    cfg.guest_arrange = &hostile;
+    cfg = validated(cfg);
+
+    const order = try score(arena, &c, cfg, test_now);
+    try t.expectEqual(@as(usize, 3), order.len);
+    try t.expectEqual(@as(u32, 2), order[0].raw()); // the honored emit (score rank 1)
+    try t.expectEqual(@as(u32, 1), order[1].raw()); // unemitted, appended in score order
+    try t.expectEqual(@as(u32, 3), order[2].raw());
+}
+
+test "pool visibility: score() reads ANOTHER candidate's facts via pool_read (cross-item scoring)" {
+    const t = std.testing;
+    const zal_parse = @import("zal_parse.zig");
+    const zal_compile = @import("zal_compile.zig");
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // "1000 for the candidate whose like_count equals pool row 0's" — only
+    // provable if the guest really reads row 0's facts while scoring OTHERS.
+    const src = "fn score() num { if (like_count == pool_read(0.0, like_count)) { return 1000.0; } return 1.0; }";
+    const ast = try zal_parse.parse(arena, src);
+    const res = try zal_compile.compile(arena, &ast, "score");
+    try t.expect(res.ok());
+    var cfg = DEFAULT_CONFIG;
+    cfg.guest_program = res.program;
+    cfg = validated(cfg);
+
+    var c: Candidates = .{};
+    defer c.deinit(t.allocator);
+    try c.append(t.allocator, mk(1, 3600, 5), true); // pool row 0: 5 likes
+    try c.append(t.allocator, mk(2, 3600, 500), true); // 100× the engagement
+
+    // The unpopular post outranks the popular one BECAUSE the guest compared
+    // each row against row 0 — pointwise scoring cannot express this.
+    const order = try score(arena, &c, cfg, test_now);
+    try t.expectEqual(@as(usize, 2), order.len);
+    try t.expectEqual(@as(u32, 1), order[0].raw());
+    try t.expectEqual(@as(u32, 2), order[1].raw());
+}
+
+test "pool visibility: Zal end-to-end — an authored arrange() reverses the feed" {
+    const t = std.testing;
+    const zal_parse = @import("zal_parse.zig");
+    const zal_compile = @import("zal_compile.zig");
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const src =
+        \\fn score() num { return like_count; }
+        \\fn arrange() num {
+        \\  var i = pool_len() - 1.0;
+        \\  while (i >= 0.0) { emit(i); i = i - 1.0; }
+        \\  return 0.0;
+        \\}
+    ;
+    const ast = try zal_parse.parse(arena, src);
+    const art = try zal_compile.compileArtifact(arena, &ast);
+    try t.expect(art.ok());
+    try t.expect(art.arrange.len > 0);
+    var cfg = DEFAULT_CONFIG;
+    cfg.guest_program = art.score;
+    cfg.guest_arrange = art.arrange;
+    cfg = validated(cfg);
+    try t.expect(cfg.guest_arrange.len > 0);
+
+    var c: Candidates = .{};
+    defer c.deinit(t.allocator);
+    try c.append(t.allocator, mk(1, 3600, 100), true);
+    try c.append(t.allocator, mk(2, 3600, 50), true);
+    try c.append(t.allocator, mk(3, 3600, 10), true);
+
+    const order = try score(arena, &c, cfg, test_now);
+    try t.expectEqual(@as(usize, 3), order.len);
+    try t.expectEqual(@as(u32, 3), order[0].raw());
+    try t.expectEqual(@as(u32, 2), order[1].raw());
+    try t.expectEqual(@as(u32, 1), order[2].raw());
+}
+
+test "pool visibility: the load wall empties an arrange() that reaches for a source or a pointwise read" {
+    const t = std.testing;
+    // arrange calling a retrieval source — wrong side of the entry wall.
+    const bad_source = [_]guest_vm.Instr{
+        .{ .op = .push_const, .value = 0 },
+        .{ .op = .push_const, .value = 0 },
+        .{ .op = .call_host, .arg = @intFromEnum(guest_abi.Capability.source_follows) },
+    };
+    var cfg = DEFAULT_CONFIG;
+    cfg.guest_arrange = &bad_source;
+    try t.expectEqual(@as(usize, 0), validated(cfg).guest_arrange.len);
+
+    // arrange calling has_tag — there is no current candidate to read.
+    const bad_pointwise = [_]guest_vm.Instr{
+        .{ .op = .push_const, .value = 0 },
+        .{ .op = .push_const, .value = 0 },
+        .{ .op = .call_host, .arg = @intFromEnum(guest_abi.Capability.has_tag) },
+    };
+    cfg = DEFAULT_CONFIG;
+    cfg.guest_arrange = &bad_pointwise;
+    try t.expectEqual(@as(usize, 0), validated(cfg).guest_arrange.len);
+
+    // And score() may READ the pool but never EMIT the order.
+    const score_emit = [_]guest_vm.Instr{
+        .{ .op = .push_const, .value = 0 },
+        .{ .op = .push_const, .value = 0 },
+        .{ .op = .call_host, .arg = @intFromEnum(guest_abi.Capability.arrange_emit) },
+    };
+    cfg = DEFAULT_CONFIG;
+    cfg.guest_program = &score_emit;
+    try t.expectEqual(@as(usize, 0), validated(cfg).guest_program.len);
 }
 
 test "score: a source WEIGHT lifts its pool — heavily-weighted follows beats a more-engaged discovery post" {

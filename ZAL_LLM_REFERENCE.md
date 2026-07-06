@@ -38,6 +38,12 @@ fn retrieve() num {          // OPTIONAL — shapes which posts enter the feed
     tag_scope("zig", 1.0);   // add a source; the return value is ignored
     return 0.0;
 }
+
+fn arrange() num {           // OPTIONAL — re-orders the ranked feed (cross-item)
+    var i = pool_len() - 1.0;
+    while (i >= 0.0) { emit(i); i = i - 1.0; }  // this one reverses it
+    return 0.0;
+}
 ```
 
 - The program **must** contain a function named exactly `score`. Return a larger
@@ -47,10 +53,17 @@ fn retrieve() num {          // OPTIONAL — shapes which posts enter the feed
   (`follows`, `discovery`, `trending`, `tag_scope`) to add sources. Each call adds
   a source; a post is kept if it matches at least one. With no `retrieve()`, the
   default pool is used. The returned `num` is ignored.
-- Both take **no parameters** — the current post's data arrives as the *facts* in
-  §4 (for `score`), which you reference by name.
-- You may write other `fn` declarations, but **only `score`/`retrieve` are
-  compiled, and they cannot call your other functions yet** — keep logic inline.
+- It may **optionally** contain a function named exactly `arrange`, which runs
+  once per refresh AFTER scoring, sees the ranked pool as an indexed list
+  (index `0` = the top-scored post), and **emits the final order** with `emit(i)`.
+  Posts you never emit are appended afterward in score order — you cannot lose a
+  post, only re-place it. With no `arrange()`, the score order stands. The
+  returned `num` is ignored.
+- All take **no parameters** — the current post's data arrives as the *facts* in
+  §4 (for `score`), which you reference by name. Inside `arrange()` there is NO
+  current post — read the pool with `pool_read` instead.
+- You may write other `fn` declarations, but **only `score`/`retrieve`/`arrange`
+  are compiled, and they cannot call your other functions yet** — keep logic inline.
 
 ---
 
@@ -124,6 +137,24 @@ survives across runs, indexed by a number. Also never leaves the device.
 |------|---------|
 | `state_read(index)` | the stored value at `index` (0 if unset) |
 | `state_write(index, value)` | writes `value` at `index`; returns 0 |
+
+**The pool (cross-item ranking).** Read the whole candidate pool by index — the
+same public facts as §4, all posts at once instead of one. Available in `score()`
+(compare this post against others) and `arrange()` (build the final order). This
+is public data; it does *not* make your algorithm "use behavioral data."
+
+| Call | Returns |
+|------|---------|
+| `pool_len()` | how many posts are visible in the pool (the system caps this) |
+| `pool_read(i, fact)` | the named fact of pool post `i` — the second argument is a **fact name from §4**, written bare: `pool_read(0.0, like_count)` |
+| `emit(i)` | (**`arrange()` only**) append pool post `i` to the final order; returns `1` if placed, `0` if `i` was already emitted or out of range |
+
+During `score()`, `pool_read(i, base_score)` answers the engine's base score for
+post `i`. During `arrange()`, the pool is sorted by final score (index `0` = top)
+and `pool_read(i, base_score)` answers post `i`'s final score. Every `pool_read`
+costs fuel like any call — an algorithm that compares every post against every
+other post is legal, it just spends its budget faster. Sort-then-compare-neighbors
+style approaches go much further on the same budget.
 
 There are **no other functions.** No `print`, no `random`, no `now`, no `sqrt`,
 no `exp`, no `pow`, no `log`, no math library. If you need a curve, build it from

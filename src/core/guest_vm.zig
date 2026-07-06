@@ -175,8 +175,10 @@ fn sanitize(v: f64) f64 {
 }
 
 /// Resolve a `Fact` to its f64 value for the current candidate. Pure; the clock
-/// never enters (`age_hrs` was precomputed by the host — B4).
-fn factValue(fact: Fact, v: guest_abi.CandidateView, base_score: f64) f64 {
+/// never enters (`age_hrs` was precomputed by the host — B4). PUB because the
+/// pool hosts (`pool_read`, POOL_VISIBILITY_ROADMAP) answer cross-item reads in
+/// this SAME vocabulary — one fact table, never a second copy drifting (D4).
+pub fn factValue(fact: Fact, v: guest_abi.CandidateView, base_score: f64) f64 {
     return switch (fact) {
         .base_score => base_score,
         .like_count => @floatFromInt(v.like_count),
@@ -516,6 +518,9 @@ fn mockHostCall(ctx: *anyopaque, cap: guest_abi.Capability, a0: f64, a1: f64) f6
         .state_write => 0,
         .attention_dwell => 0.5,
         .attention_clicked => if (a0 != 0) @as(f64, 1) else 0,
+        .pool_len => 4, // mock: a four-candidate visible pool
+        .pool_read => a0 + a1, // mock: index + fact id, so both operands are observable
+        .arrange_emit => 0,
     };
 }
 
