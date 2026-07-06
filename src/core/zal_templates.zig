@@ -132,6 +132,65 @@ pub const Template = struct { name: []const u8, source: []const u8 };
 
 /// Every starter, in one table — the seed of the marketplace's "start from a
 /// template" list and the worked examples for the reference doc.
+/// **Search Tiers** — the GOOGLE shape, fundamentally: the pool is an INDEX,
+/// not your social graph (`retrieve()` never calls `follows()` — the whole
+/// break from the timeline architecture), entered by relevance/authority the
+/// way a query enters an index, and arranged in tiers the way a results page
+/// is. The showcase that Zal changes retrieval's FUNDAMENTALS, not weights.
+pub const search_tiers: []const u8 =
+    \\fn retrieve() num {
+    \\  // A search engine's pool is THE INDEX, not your timeline: everything
+    \\  // beyond your follows, plus whatever is provably resonating.
+    \\  discovery(1.0);
+    \\  trending(50.0, 1.0);
+    \\  return 0.0;
+    \\}
+    \\fn score() num {
+    \\  // Relevance, not recency: all-time quality plus a small rate term, so
+    \\  // a durably-good post outranks a briefly-hot one (a result, not news).
+    \\  var quality = like_count + repost_count * 3.0 + reply_count * 9.0;
+    \\  var rate = quality / (age_hrs + 1.0);
+    \\  return quality * 0.7 + rate * 0.3 + author_rep * 50.0;
+    \\}
+    \\fn arrange() num {
+    \\  // The results page: tier 1 = trusted author + real engagement;
+    \\  // tier 2 = conversation-rich; then everything else in score order.
+    \\  var n = pool_len();
+    \\  var i = 0.0;
+    \\  while (i < n) {
+    \\    if (pool_read(i, author_rep) > 0.6 && pool_read(i, like_count) > 5.0) { emit(i); }
+    \\    i = i + 1.0;
+    \\  }
+    \\  i = 0.0;
+    \\  while (i < n) {
+    \\    if (pool_read(i, reply_count) > 3.0) { emit(i); }
+    \\    i = i + 1.0;
+    \\  }
+    \\  i = 0.0;
+    \\  while (i < n) { emit(i); i = i + 1.0; }
+    \\  return 0.0;
+    \\}
+;
+
+/// **Catalog** — the AMAZON shape, fundamentally: the pool is a CATEGORY
+/// INDEX (`retrieve()` scopes to one zone — the department you're browsing),
+/// sorted by all-time quality the way a storefront sorts by rating — a
+/// product's rating doesn't expire the way a post's novelty does. Swap the
+/// tag and it's a different shop; the architecture is the template.
+pub const catalog: []const u8 =
+    \\fn retrieve() num {
+    \\  // A storefront's pool is a department, not a timeline. The tag IS
+    \\  // the department — change it to stand in a different aisle.
+    \\  tag_scope("marketplace", 1.0);
+    \\  return 0.0;
+    \\}
+    \\fn score() num {
+    \\  // All-time quality, like a product rating; age barely matters.
+    \\  var q = like_count * 2.0 + repost_count * 4.0 + reply_count * 3.0;
+    \\  return q * (1.0 + author_rep) / (1.0 + age_hrs * 0.01);
+    \\}
+;
+
 pub const all = [_]Template{
     .{ .name = "Zat4 Discover", .source = zat4_discover },
     .{ .name = "Zat4 Private Discover", .source = zat4_discover_private },
@@ -139,6 +198,8 @@ pub const all = [_]Template{
     .{ .name = "Most Recent", .source = most_recent },
     .{ .name = "Calm", .source = calm },
     .{ .name = "Fresh First", .source = fresh_first },
+    .{ .name = "Search Tiers", .source = search_tiers },
+    .{ .name = "Catalog", .source = catalog },
 };
 
 // ---------------------------------------------------------------------------
@@ -198,6 +259,27 @@ test "Fresh First: the whole artifact compiles and its arrange() survives the va
     try t.expect(vm.validProgram(art.arrange));
     try t.expect(vm.entryViolation(art.arrange, .arrange) == null); // pool + emit only
     try t.expect(!compile.usesBehavioral(art.arrange)); // pool reads are public
+}
+
+test "Search Tiers: the tiered arrange() compiles and survives the validator + entry wall" {
+    var a = std.heap.ArenaAllocator.init(t.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const ast = try parse.parse(arena, search_tiers);
+    const art = try compile.compileArtifact(arena, &ast);
+    try t.expect(art.ok());
+    try t.expect(art.arrange.len > 0);
+    try t.expect(vm.validProgram(art.arrange));
+    try t.expect(vm.entryViolation(art.arrange, .arrange) == null); // pool + emit only
+    try t.expect(!compile.usesBehavioral(art.arrange)); // pool reads are public
+    // The Google-shape point: the pool is composed by retrieve(), and it is
+    // an index (discovery + trending), never the follow graph.
+    try t.expect(art.retrieve.len > 0);
+    try t.expect(vm.entryViolation(art.retrieve, .retrieve) == null);
+    const caps = vm.usedCapabilities(art.retrieve);
+    try t.expect(caps.contains(.source_discovery));
+    try t.expect(caps.contains(.source_trending));
+    try t.expect(!caps.contains(.source_follows));
 }
 
 test "the developer guide's worked examples compile whole (ZAL_DEVELOPER_GUIDE §12 stays honest)" {

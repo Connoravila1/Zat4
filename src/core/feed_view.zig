@@ -3157,13 +3157,23 @@ pub const DevView = struct {
 /// LITERAL lines (no word-wrap — it is code, not prose), with a line-number
 /// gutter. A7.2: cold — one transient per frame/click.
 const DevEditorGeom = struct { panel_x: i32, panel_y: i32, panel_w: i32, tx: i32, ty0: i32, line_h: i32 };
-fn devEditorGeom(m: Metrics, scroll: i32, src_empty: bool) DevEditorGeom {
-    const x0 = m.lx;
+
+/// The editor geometry at a given panel top — the draw derives `panel_y` from
+/// its running y (template chips may wrap to any number of rows); the caret
+/// inverse recomputes the same y for the source-present case (no chips shown).
+fn devEditorGeomAt(m: Metrics, panel_y: i32) DevEditorGeom {
+    // ty0 clears the panel's header strip (34) plus the first line's ascent.
+    return .{ .panel_x = m.lx, .panel_y = panel_y, .panel_w = m.cw, .tx = m.lx + 56, .ty0 = panel_y + 34 + 28, .line_h = 21 };
+}
+
+fn devEditorGeom(m: Metrics, scroll: i32) DevEditorGeom {
     var y: i32 = 140 + scroll;
+    y += 24; // the step label
     y += 52; // title
     y += 34; // the sub line
-    if (src_empty) y += 24 + 44; // "START FROM" + the template chips row
-    return .{ .panel_x = x0, .panel_y = y, .panel_w = m.cw, .tx = x0 + 56, .ty0 = y + 30, .line_h = 21 };
+    // No chips block: with source present the START FROM row is hidden, and
+    // the caret inverse is only ever asked about a non-empty source.
+    return devEditorGeomAt(m, y);
 }
 
 fn devLineCount(src: []const u8) u32 {
@@ -3183,7 +3193,7 @@ fn devLineCount(src: []const u8) u32 {
 pub fn devSrcCaretAtPoint(e: *const text.Engine, width: i32, src: []const u8, scroll: i32, hx: i32, hy: i32) u32 {
     if (src.len == 0) return 0;
     const m = metricsFor(width);
-    const g = devEditorGeom(m, scroll, false);
+    const g = devEditorGeom(m, scroll);
     const nlines: i32 = @intCast(devLineCount(src));
     const li: i32 = std.math.clamp(@divFloor(hy - (g.ty0 - 16), g.line_h), 0, nlines - 1);
     // Walk to the target line's byte range.
@@ -3212,6 +3222,14 @@ pub fn devSrcCaretAtPoint(e: *const text.Engine, width: i32, src: []const u8, sc
         k = @min(k + clen, line_end);
     }
     return best;
+}
+
+/// The dev flow's step marker — the hierarchy anchor above each step title
+/// (the create flow's "STEP n OF 4" convention).
+fn devStepLabel(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32, y: i32, accent: u32, label: []const u8) !i32 {
+    try rect(gpa, dl, x0, y + 4, 22, 3, accent, 1);
+    _ = try str(gpa, dl, e, .semibold, x0 + 32, y + 10, faint, 12, label);
+    return y + 24;
 }
 
 /// One labeled single-line text field of the details form: the box, the current
@@ -3269,6 +3287,7 @@ pub fn layoutDevSubmit(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawLi
 
     switch (view.step) {
         .source => {
+            y = try devStepLabel(gpa, dl, e, x0, y, accent, "STEP 1 OF 3 — THE CODE");
             _ = try str(gpa, dl, e, .semibold, x0, y + 30, ink, 30, "Submit an algorithm");
             y += 52;
             _ = try str(gpa, dl, e, .regular, x0, y + 16, muted, 14, "Real Zal code — write it here or paste with Ctrl+V. Checked by the gate every published algorithm passes.");
@@ -3280,7 +3299,10 @@ pub fn layoutDevSubmit(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawLi
                 for (zal_templates.all, 0..) |tpl, ti| {
                     const tw: i32 = @intCast(text.measure(e, .semibold, tpl.name, 13));
                     const cw2 = tw + 26;
-                    if (cx + cw2 > x0 + w) break; // one row; the catalog is short
+                    if (cx + cw2 > x0 + w and cx > x0) { // wrap: the catalog outgrew one row
+                        cx = x0;
+                        y += 40;
+                    }
                     try rect(gpa, dl, cx, y, cw2, 30, 0x14EDEAE0, 9);
                     _ = try str(gpa, dl, e, .semibold, cx + 13, y + 20, ink, 13, tpl.name);
                     try emitRegion(gpa, regions, cx, y, cw2, 30, @intCast(ti), .dev_template);
@@ -3288,11 +3310,25 @@ pub fn layoutDevSubmit(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawLi
                 }
                 y += 44;
             }
-            // The editor panel: literal lines over a line-number gutter.
-            const g = devEditorGeom(m, scroll, view.src.len == 0);
+            // The editor panel: literal lines over a line-number gutter. Geometry
+            // follows the running y (chips may wrap), matching the caret inverse
+            // for the source-present case where no chips are drawn.
+            const g = devEditorGeomAt(m, y);
             const nlines = devLineCount(view.src);
-            const eh: i32 = @max(340, @as(i32, @intCast(nlines)) * g.line_h + 44);
-            try rect(gpa, dl, g.panel_x, g.panel_y, g.panel_w, eh, 0x0EEDEAE0, 14);
+            const eh: i32 = @max(340, @as(i32, @intCast(nlines)) * g.line_h + 78);
+            // OPAQUE panel (owner call, 2026-07-06): the code sits on solid
+            // ground, not glass — a slightly lifted plate over the page bg,
+            // with a header strip and a darker gutter column giving it a
+            // tool's anatomy instead of a floating rectangle.
+            try rect(gpa, dl, g.panel_x, g.panel_y, g.panel_w, eh, 0xFF201F17, 14);
+            try rect(gpa, dl, g.panel_x, g.panel_y, g.panel_w, 34, 0xFF262419, 14);
+            try rect(gpa, dl, g.panel_x, g.panel_y + 30, g.panel_w, 4, 0xFF262419, 0); // square off the strip's bottom
+            _ = try str(gpa, dl, e, .semibold, g.panel_x + 16, g.panel_y + 22, faint, 11, "ZAL SOURCE");
+            var lcb: [24]u8 = undefined;
+            const lct = std.fmt.bufPrint(&lcb, "{d} lines", .{if (view.src.len == 0) 0 else nlines}) catch "";
+            const lcw: i32 = @intCast(text.measure(e, .regular, lct, 11));
+            _ = try str(gpa, dl, e, .regular, g.panel_x + g.panel_w - lcw - 16, g.panel_y + 22, faint, 11, lct);
+            try rect(gpa, dl, g.panel_x, g.panel_y + 34, 44, eh - 34 - 14, 0xFF1B1A13, 0); // the gutter column
             try emitRegion(gpa, regions, g.panel_x, g.panel_y, g.panel_w, @intCast(@min(eh, 32767)), 0, .dev_src);
             if (view.src.len == 0) {
                 _ = try str(gpa, dl, e, .regular, g.tx, g.ty0, faint, 15, "fn score() {");
@@ -3342,6 +3378,7 @@ pub fn layoutDevSubmit(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawLi
             y = try devNav(gpa, e, dl, x0, y, w, regions, accent, "Check", .dev_check, "Continue", .dev_next, view.check_ok);
         },
         .details => {
+            y = try devStepLabel(gpa, dl, e, x0, y, accent, "STEP 2 OF 3 — YOUR WORDS");
             _ = try str(gpa, dl, e, .semibold, x0, y + 30, ink, 30, "Describe it");
             y += 52;
             _ = try str(gpa, dl, e, .regular, x0, y + 16, muted, 14, "Your words — shown on the public page beside the facts derived from your code.");
@@ -3374,6 +3411,7 @@ pub fn layoutDevSubmit(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawLi
             y = try devNav(gpa, e, dl, x0, y, w, regions, accent, null, .dev_check, "Review", .dev_next, view.name.len > 0);
         },
         .review => {
+            y = try devStepLabel(gpa, dl, e, x0, y, accent, "STEP 3 OF 3 — THE PUBLIC PAGE");
             _ = try str(gpa, dl, e, .semibold, x0, y + 30, ink, 30, "The public page");
             y += 52;
             _ = try str(gpa, dl, e, .regular, x0, y + 16, muted, 14, "Exactly what a user reads before trying it.");

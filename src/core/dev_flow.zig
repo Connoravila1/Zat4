@@ -154,6 +154,20 @@ test "check: a real template compiles, passes the gate, and is publishable" {
     try t.expect(c.config.guest_program.len > 0);
 }
 
+test "check: every template starter passes the WHOLE publish gate (a chip is never a refusing start)" {
+    const templates = @import("zal_templates.zig");
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    for (templates.all) |tpl| {
+        const c = try check(arena, tpl.source);
+        try t.expectEqual(@as(usize, 0), c.errors.len);
+        try t.expect(c.verdict.pass());
+        try t.expect(c.ok());
+    }
+}
+
 test "check: broken source reports compile errors and is not publishable" {
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
