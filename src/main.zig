@@ -1116,6 +1116,7 @@ test {
     _ = @import("core/lens_catalog.zig");
     _ = @import("core/algo_library.zig");
     _ = @import("core/create_flow.zig");
+    _ = @import("core/dev_flow.zig");
     _ = @import("shell/loadout.zig");
     _ = @import("core/appview.zig");
     _ = @import("core/moderation.zig");

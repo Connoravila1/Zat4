@@ -47,6 +47,12 @@ pub const OpenError = error{
     OutOfMemory,
 };
 
+/// Where an inbound cross-app paste stands: Ctrl+V fired a ConvertSelection
+/// (`awaiting_notify`), the owner said the text is ready and we asked for it
+/// (`awaiting_reply`), or nothing is in flight. One paste at a time — a new
+/// Ctrl+V simply restarts the dance.
+const PasteState = enum(u8) { idle, awaiting_notify, awaiting_reply };
+
 /// A7.2: cold struct, size guard waived — one per session.
 pub const Window = struct {
     gpa: Allocator,
@@ -112,6 +118,17 @@ pub const Window = struct {
     targets_atom: u32,
     clip_buf: [1024]u8,
     clip_len: usize,
+    /// Cross-app paste (the inbound half of the selection dance): on Ctrl+V
+    /// when we do NOT own CLIPBOARD, we ConvertSelection onto `paste_prop_atom`
+    /// and walk `paste_state` through notify → reply; `paste_take` is how many
+    /// value bytes of the GetProperty reply body still stream into the typed-
+    /// byte channel (they can span pump reads, like `skip_bytes`). INCR
+    /// (chunked multi-megabyte) transfers are refused — a paste here is source
+    /// code or a password, not a dataset.
+    paste_prop_atom: u32,
+    incr_atom: u32,
+    paste_state: PasteState,
+    paste_take: usize,
     /// The pointer shapes, built once from the server "cursor" glyph font at
     /// open: the hand (over clickable), the I-beam (over selectable text), the
     /// move/grab hand (while dragging). `setCursor` swaps the requested shape
@@ -391,6 +408,12 @@ pub fn openAt(
     const utf8_atom = try awaitAtom(fd);
     try writeAll(fd, x11.internAtom(&req_buf, "TARGETS"));
     const targets_atom = try awaitAtom(fd);
+    // Cross-app paste: the property another app's clipboard owner writes the
+    // converted text onto, and INCR (the chunked-transfer type we refuse).
+    try writeAll(fd, x11.internAtom(&req_buf, "ZAT_PASTE"));
+    const paste_prop_atom = try awaitAtom(fd);
+    try writeAll(fd, x11.internAtom(&req_buf, "INCR"));
+    const incr_atom = try awaitAtom(fd);
 
     try writeAll(fd, x11.createGC(&req_buf, gc, wid));
 
@@ -465,6 +488,10 @@ pub fn openAt(
         .targets_atom = targets_atom,
         .clip_buf = undefined,
         .clip_len = 0,
+        .paste_prop_atom = paste_prop_atom,
+        .incr_atom = incr_atom,
+        .paste_state = .idle,
+        .paste_take = 0,
         // Themed (system theme) cursors when they loaded; the font cursors
         // otherwise — setCursor reads these ids without caring which won.
         .hand_cursor = themed.hand orelse hand_cursor,
@@ -674,7 +701,7 @@ fn cursorSizeFromResources(gpa: Allocator, fd: i32, setup: x11.Setup, req_buf: [
     writeAll(fd, x11.internAtom(req_buf, "RESOURCE_MANAGER")) catch return null;
     const atom = awaitAtom(fd) catch return null;
     if (atom == 0) return null;
-    writeAll(fd, x11.getProperty(req_buf, setup.root_window, atom, 0x4000)) catch return null;
+    writeAll(fd, x11.getProperty(req_buf, setup.root_window, atom, 0x4000, false)) catch return null;
     var reply: [32]u8 = undefined;
     awaitReply(fd, &reply) catch return null;
     const value_len = x11.getPropertyValueLen(&reply);
@@ -821,6 +848,26 @@ pub fn setClipboard(window: *Window, data: []const u8) void {
     writeAll(window.fd, x11.setSelectionOwner(&buf, window.clipboard_atom, window.wid, 0)) catch {};
 }
 
+/// Inbound-paste fetch cap, in the 32-bit units GetProperty counts: 16384
+/// units = 64 KiB — generous for source code or a key, refuses datasets.
+const paste_cap_units: u32 = 16384;
+
+/// Digest the GetProperty reply header of an inbound paste (in `window.carry`):
+/// how many body bytes are pasted text (`paste_take`, streamed to the typed-
+/// byte channel by the pump loop) vs padding to discard (`skip_bytes`).
+/// A missing property, an INCR (chunked) transfer, or a non-byte format
+/// refuses the whole body — the paste just doesn't happen (E4).
+fn consumePasteReply(window: *Window) void {
+    const extra = x11.replyExtraBytes(&window.carry);
+    const type_atom = x11.getPropertyTypeAtom(&window.carry);
+    const format = x11.getPropertyFormat(&window.carry);
+    var take: usize = 0;
+    if (type_atom != 0 and type_atom != window.incr_atom and format == 8)
+        take = @min(@as(usize, x11.getPropertyValueLen(&window.carry)), extra);
+    window.paste_take = take;
+    window.skip_bytes = extra - take;
+}
+
 /// Answer a paste request (a SelectionRequest in `window.carry`): write the
 /// requested representation into the requestor's property, then SelectionNotify
 /// it. We serve TARGETS (the format list), UTF8_STRING, and STRING; anything
@@ -882,6 +929,17 @@ pub fn pump(
 
     var bytes: []const u8 = chunk[0..@intCast(n)];
     while (bytes.len > 0) {
+        // Paste text streaming out of a GetProperty reply body: it rides the
+        // typed-byte channel, not the discard path. '\r' is stripped so CRLF
+        // text lands as plain '\n' line breaks (the decoder's Shift+Enter —
+        // "break the line, don't submit") and never as a form submit.
+        if (window.paste_take > 0) {
+            const eat = @min(window.paste_take, bytes.len);
+            window.paste_take -= eat;
+            for (bytes[0..eat]) |b| if (b != '\r') try out.append(gpa, b);
+            bytes = bytes[eat..];
+            continue;
+        }
         if (window.skip_bytes > 0) {
             const eat = @min(window.skip_bytes, bytes.len);
             window.skip_bytes -= eat;
@@ -897,8 +955,16 @@ pub fn pump(
         window.carry_len = 0;
 
         if (window.carry[0] == 1) {
-            // A stray reply: discard its body and move on.
-            window.skip_bytes = x11.replyExtraBytes(&window.carry);
+            if (window.paste_state == .awaiting_reply) {
+                // The first reply after our GetProperty is our GetProperty —
+                // nothing else we send between ConvertSelection and here
+                // expects a reply. Decide take vs skip from its header.
+                window.paste_state = .idle;
+                consumePasteReply(window);
+            } else {
+                // A stray reply: discard its body and move on.
+                window.skip_bytes = x11.replyExtraBytes(&window.carry);
+            }
             continue;
         }
         // A paste request for our clipboard — serve it here (its six 32-bit
@@ -907,18 +973,48 @@ pub fn pump(
             answerSelection(window);
             continue;
         }
+        // The owner's answer to our ConvertSelection: property set ⇒ the text
+        // is waiting on our window — fetch it (delete: true, per convention);
+        // property 0 ⇒ refused/empty clipboard, the paste quietly ends.
+        if ((window.carry[0] & 0x7F) == x11.event_selection_notify) {
+            if (window.paste_state == .awaiting_notify) {
+                window.paste_state = .idle;
+                if (x11.selectionNotifyProperty(&window.carry) != 0) {
+                    var pbuf: [24]u8 = undefined;
+                    writeAll(window.fd, x11.getProperty(&pbuf, window.wid, window.paste_prop_atom, paste_cap_units, true)) catch continue;
+                    window.paste_state = .awaiting_reply;
+                }
+            }
+            continue;
+        }
+        // Another app claimed CLIPBOARD — our copy is no longer the clipboard.
+        // Drop it so Ctrl+V asks the new owner instead of replaying stale text.
+        if ((window.carry[0] & 0x7F) == x11.event_selection_clear) {
+            window.clip_len = 0;
+            continue;
+        }
         const event = x11.parseEvent(&window.carry, window.wm_protocols, window.wm_delete);
         switch (event.kind) {
             .key_press => {
                 const shifted = event.state & x11.shift_mask != 0;
                 const ctrl = event.state & x11.control_mask != 0;
                 const sym = x11.keysymFor(window.keysyms, window.syms_per_keycode, window.min_keycode, event.detail, shifted);
-                // Ctrl+V → inject the clipboard text WE own as typed bytes (the
-                // copy-here-then-paste-here flow). Real cross-app paste (pasting
-                // from a password manager) needs a ConvertSelection round-trip —
-                // a deferred slice-3 add; this serves the in-app confirm flow.
-                if (ctrl and (sym == 'v' or sym == 'V') and window.clip_len > 0) {
-                    try out.appendSlice(gpa, window.clip_buf[0..window.clip_len]);
+                // Ctrl+V → paste. Text we own (copy-here-paste-here) injects
+                // directly; otherwise ask the current CLIPBOARD owner via the
+                // ConvertSelection round-trip — the text arrives over the next
+                // pumps (SelectionNotify → GetProperty → the reply body).
+                if (ctrl and (sym == 'v' or sym == 'V')) {
+                    if (window.clip_len > 0) {
+                        try out.appendSlice(gpa, window.clip_buf[0..window.clip_len]);
+                    } else {
+                        // The event's own timestamp, per ICCCM (CurrentTime races).
+                        const time = std.mem.readInt(u32, window.carry[4..8], .little);
+                        var cbuf: [24]u8 = undefined;
+                        window.paste_state = .awaiting_notify;
+                        writeAll(window.fd, x11.convertSelection(&cbuf, window.wid, window.clipboard_atom, window.utf8_atom, window.paste_prop_atom, time)) catch {
+                            window.paste_state = .idle;
+                        };
+                    }
                 } else if ((sym == 0xFF0D or sym == 0xFF8D) and shifted and !ctrl) {
                     // Shift+Enter: encoded as '\n' so the decoder can tell it
                     // from plain Enter ('\r') — "break the line, don't submit".
@@ -1153,6 +1249,12 @@ const FakeResult = struct {
     saw_title: bool = false,
     put_width: u16 = 0,
     first_pixel: u32 = 0,
+    /// The inbound-paste dance, observed on the wire: the ConvertSelection
+    /// arrived with a property, it carried the key event's timestamp (not
+    /// CurrentTime), and the GetProperty asked to delete the property.
+    saw_convert: bool = false,
+    convert_time: u32 = 0,
+    saw_get_delete: bool = false,
     finished: bool = false,
 };
 
@@ -1309,28 +1411,77 @@ fn serveFakeX(listen_fd: i32, result: *FakeResult) void {
     event[0] = 5; // ButtonRelease: wheel-up pair — must be DROPPED
     event[1] = 4;
     writeAll(fd, &event) catch return;
+
+    // --- Ctrl+V with no owned clipboard: the client must come asking ---
+    @memset(&event, 0);
+    event[0] = 2; // KeyPress 'v', Control held
+    event[1] = 'v';
+    put32(&event, 4, 777); // the timestamp ConvertSelection must echo
+    put16(&event, 28, 0x0004); // control mask
+    writeAll(fd, &event) catch return;
     result.stage = 3;
 
-    // --- expect at least one PutImage and record its first pixel ---
-    while (true) {
+    // --- expect the paste exchange AND at least one PutImage, any order ---
+    const paste_text = "fn score() {\r\n}\r\n";
+    var paste_stage: u8 = 0; // 0 want ConvertSelection, 1 want GetProperty, 2 done
+    var blit_seen = false;
+    while (!(blit_seen and paste_stage == 2)) {
         var head: [4]u8 = undefined;
         readExact(fd, &head) catch return;
         const units: usize = get16(&head, 2);
         var rest_len = units * 4 - 4;
+        if (head[0] == 24) {
+            // ConvertSelection: requestor@4 selection@8 target@12 property@16 time@20.
+            var rest: [20]u8 = undefined;
+            readExact(fd, &rest) catch return;
+            const property = std.mem.readInt(u32, rest[12..16], .little);
+            result.saw_convert = property != 0;
+            result.convert_time = std.mem.readInt(u32, rest[16..20], .little);
+            // "The text is on your property" — SelectionNotify, property set.
+            @memset(&event, 0);
+            event[0] = 31;
+            put32(&event, 20, property);
+            writeAll(fd, &event) catch return;
+            paste_stage = 1;
+            continue;
+        }
+        if (head[0] == 20 and paste_stage == 1) {
+            // GetProperty: serve the text as UTF8_STRING (atom 103, the 4th
+            // interned), format 8 — CRLF included to prove the '\r' strip.
+            var rest: [20]u8 = undefined;
+            readExact(fd, &rest) catch return;
+            result.saw_get_delete = head[1] == 1;
+            var reply = [_]u8{0} ** 32;
+            reply[0] = 1;
+            reply[1] = 8; // format: bytes
+            put32(&reply, 4, 5); // body: padded4(17) = 20 bytes = 5 units
+            put32(&reply, 8, 103); // type: UTF8_STRING
+            put32(&reply, 16, paste_text.len); // value length
+            writeAll(fd, &reply) catch return;
+            var text_body = [_]u8{0} ** 20;
+            @memcpy(text_body[0..paste_text.len], paste_text);
+            writeAll(fd, &text_body) catch return;
+            paste_stage = 2;
+            continue;
+        }
         if (head[0] == 72) {
             // PutImage: total request = units*4 bytes, header = 24 bytes
             // (6 units), rest is pixel data. 4 header bytes are already in
             // `head`; read the remaining 20 to complete the 24-byte header,
-            // then the first pixel, then drain the rest of the data.
+            // then the first pixel, then drain the rest of the data. Only
+            // the FIRST blit is recorded (a later damage blit may be partial).
             var fixed: [20]u8 = undefined;
             readExact(fd, &fixed) catch return;
-            // width is at absolute request offset 12 -> fixed offset 8.
-            result.put_width = get16(&fixed, 8);
             const data_bytes = units * 4 - 24; // total minus the 24-byte header
             var first: [4]u8 = undefined;
             readExact(fd, &first) catch return;
-            result.first_pixel = std.mem.readInt(u32, &first, .little);
-            result.stage = 4;
+            if (!blit_seen) {
+                // width is at absolute request offset 12 -> fixed offset 8.
+                result.put_width = get16(&fixed, 8);
+                result.first_pixel = std.mem.readInt(u32, &first, .little);
+                result.stage = 4;
+            }
+            blit_seen = true;
             // Drain the remaining pixel data (first 4 already consumed).
             var remaining = data_bytes - 4;
             var sink: [4096]u8 = undefined;
@@ -1339,7 +1490,7 @@ fn serveFakeX(listen_fd: i32, result: *FakeResult) void {
                 readExact(fd, sink[0..take]) catch return;
                 remaining -= take;
             }
-            break;
+            continue;
         }
         var sink: [4096]u8 = undefined;
         while (rest_len > 0) {
@@ -1359,7 +1510,7 @@ fn serveFakeX(listen_fd: i32, result: *FakeResult) void {
     result.finished = true;
 }
 
-test "window loopback: fake X server — open, a key becomes 'q', a blit lands, close button closes" {
+test "window loopback: fake X server — open, a key becomes 'q', a cross-app paste round-trips, a blit lands, close button closes" {
     const gpa = testing.allocator; // C6
     var path_buf: [64]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "/tmp/zat-x11-{d}.sock", .{linux.getpid()}) catch unreachable;
@@ -1435,6 +1586,15 @@ test "window loopback: fake X server — open, a key becomes 'q', a blit lands, 
     try testing.expectEqual(layout.InputEvent.Kind.button_up, ev[2].kind);
     try testing.expectEqual(layout.InputEvent.Kind.wheel, ev[3].kind);
     try testing.expectEqual(@as(u8, 4), ev[3].button);
+
+    // The cross-app paste, end to end: Ctrl+V with no owned clipboard →
+    // ConvertSelection carrying the key event's timestamp (not CurrentTime) →
+    // SelectionNotify → GetProperty (delete: true) → the reply body lands on
+    // the typed-byte channel with '\r' stripped (CRLF → plain line breaks).
+    try testing.expect(result.saw_convert);
+    try testing.expectEqual(@as(u32, 777), result.convert_time);
+    try testing.expect(result.saw_get_delete);
+    try testing.expect(std.mem.indexOf(u8, keys.items, "fn score() {\n}\n") != null);
 
     try testing.expect(result.ok_setup);
     try testing.expect(result.saw_create);

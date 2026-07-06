@@ -56,6 +56,7 @@ const opcode_intern_atom: u8 = 16;
 const opcode_change_property: u8 = 18;
 const opcode_get_property: u8 = 20;
 const opcode_set_selection_owner: u8 = 22;
+const opcode_convert_selection: u8 = 24;
 const opcode_send_event: u8 = 25;
 const opcode_open_font: u8 = 45;
 const opcode_create_pixmap: u8 = 53;
@@ -86,8 +87,9 @@ pub const cursor_xterm: u16 = 152;
 pub const cursor_fleur: u16 = 52;
 
 /// Event codes we send/parse beyond input (clipboard = the selection dance).
+pub const event_selection_clear: u8 = 29;
 pub const event_selection_request: u8 = 30;
-const event_selection_notify: u8 = 31;
+pub const event_selection_notify: u8 = 31;
 
 // ---------------------------------------------------------------------------
 // Little-endian byte plumbing
@@ -370,11 +372,11 @@ pub fn queryExtension(buf: []u8, name: []const u8) []const u8 {
 /// `long_length` bounds the value read, in 4-byte units. The reply's value
 /// length (bytes, for an 8-bit string property) is at `getPropertyValueLen`;
 /// the value bytes follow as the reply's extra data.
-pub fn getProperty(buf: []u8, window: u32, property: u32, long_length: u32) []const u8 {
+pub fn getProperty(buf: []u8, window: u32, property: u32, long_length: u32, delete: bool) []const u8 {
     assert(buf.len >= 24);
     @memset(buf[0..24], 0);
     buf[0] = opcode_get_property;
-    buf[1] = 0; // delete: false
+    buf[1] = @intFromBool(delete);
     put16(buf, 2, 6);
     put32(buf, 4, window);
     put32(buf, 8, property);
@@ -386,6 +388,16 @@ pub fn getProperty(buf: []u8, window: u32, property: u32, long_length: u32) []co
 
 pub fn getPropertyValueLen(reply: *const [32]u8) u32 {
     return get32(reply, 16);
+}
+
+/// The type atom of a GetProperty reply (0 = the property did not exist).
+pub fn getPropertyTypeAtom(reply: *const [32]u8) u32 {
+    return get32(reply, 8);
+}
+
+/// The format (bits per unit: 0, 8, 16, or 32) of a GetProperty reply.
+pub fn getPropertyFormat(reply: *const [32]u8) u8 {
+    return reply[1];
 }
 
 pub const ExtensionInfo = struct { present: bool, major_opcode: u8 };
@@ -536,6 +548,32 @@ pub fn setSelectionOwner(buf: []u8, selection: u32, owner: u32, time: u32) []con
     put32(buf, 8, selection);
     put32(buf, 12, time);
     return buf[0..total];
+}
+
+/// Ask the CURRENT owner of `selection` to write it, converted to `target`,
+/// onto `requestor`'s `property` — the other half of the clipboard dance
+/// (we are the paster this time). The owner (or the server, when there is
+/// no owner) answers with a SelectionNotify event; `property` = 0 in that
+/// event means the conversion was refused or the clipboard is empty.
+pub fn convertSelection(buf: []u8, requestor: u32, selection: u32, target: u32, property: u32, time: u32) []const u8 {
+    const total = 24;
+    assert(buf.len >= total);
+    @memset(buf[0..total], 0);
+    buf[0] = opcode_convert_selection;
+    put16(buf, 2, total / 4);
+    put32(buf, 4, requestor);
+    put32(buf, 8, selection);
+    put32(buf, 12, target);
+    put32(buf, 16, property);
+    put32(buf, 20, time);
+    return buf[0..total];
+}
+
+/// The `property` field of a SelectionNotify event (0 = conversion refused).
+/// Nothing else in the event matters to us — we only ever have one paste in
+/// flight, on one property, so property-set-or-refused is the whole message.
+pub fn selectionNotifyProperty(bytes: *const [32]u8) u32 {
+    return get32(bytes, 20);
 }
 
 /// ChangeProperty in full generality: write `data` (raw bytes) as `count`
