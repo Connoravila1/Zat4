@@ -78,6 +78,9 @@ const lens_socket = @import("../core/lens_socket.zig");
 const lens_catalog = @import("../core/lens_catalog.zig");
 const discover = @import("../core/discover.zig");
 const create_flow = @import("../core/create_flow.zig");
+const dev_flow = @import("../core/dev_flow.zig");
+const zal_templates = @import("../core/zal_templates.zig");
+const algo_gate = @import("../core/algo_gate.zig");
 const builder = @import("../core/builder.zig");
 const algo_library = @import("../core/algo_library.zig");
 const transparency = @import("../core/transparency.zig");
@@ -398,6 +401,31 @@ const RunState = struct {
     gcreate_color: u8,
     gcreate_name_buf: [64]u8,
     gcreate_name_len: usize,
+    // The developer submission flow (ALGO_SUBMISSION slice 1): the Create tab
+    // hosts it while gdev_active. The source rides a textedit.Field over its
+    // fixed store (16 KiB holds any sane Zal program — the gate's caps refuse
+    // far smaller); the detail fields are short append/backspace buffers (the
+    // create-name convention). Check output — diagnostics, disclosures, the
+    // serialized config — is gpa-owned, freed on re-check / reset (C5).
+    gdev_active: bool,
+    gdev_step: dev_flow.Step,
+    gdev_src_store: [16384]u8,
+    gdev_src: textedit.Field,
+    gdev_name_buf: [64]u8,
+    gdev_name_len: usize,
+    gdev_ranks_buf: [96]u8,
+    gdev_ranks_len: usize,
+    gdev_desc_buf: [512]u8,
+    gdev_desc_len: usize,
+    gdev_focus: u8,
+    gdev_color: u8,
+    gdev_checked: bool,
+    gdev_check_ok: bool,
+    gdev_diags: std.ArrayListUnmanaged([]const u8),
+    gdev_discl: std.ArrayListUnmanaged([]const u8),
+    gdev_config: []const u8,
+    gdev_status_buf: [512]u8,
+    gdev_status_len: usize,
     gchat_store: chat_core.Store,
     gchat_sel: ?chat_core.ConvIndex,
     gchat_draft_buf: [512]u8,
@@ -841,6 +869,27 @@ fn initRunState(
     rs.gcreate_color = 0;
     rs.gcreate_name_buf = undefined;
     rs.gcreate_name_len = 0;
+    // The developer submission flow: dormant until the Create landing's
+    // "Submit an algorithm you wrote" button wakes it.
+    rs.gdev_active = false;
+    rs.gdev_step = .source;
+    rs.gdev_src_store = undefined;
+    rs.gdev_src = .{ .buf = &rs.gdev_src_store };
+    rs.gdev_name_buf = undefined;
+    rs.gdev_name_len = 0;
+    rs.gdev_ranks_buf = undefined;
+    rs.gdev_ranks_len = 0;
+    rs.gdev_desc_buf = undefined;
+    rs.gdev_desc_len = 0;
+    rs.gdev_focus = 0;
+    rs.gdev_color = 0;
+    rs.gdev_checked = false;
+    rs.gdev_check_ok = false;
+    rs.gdev_diags = .empty;
+    rs.gdev_discl = .empty;
+    rs.gdev_config = "";
+    rs.gdev_status_buf = undefined;
+    rs.gdev_status_len = 0;
     // Zat Chat (M1): the DM view store — a QUERY model over the real E2EE
     // session below (zat-view-model law). Messages are end-to-end encrypted
     // via MLS; this store holds only the plaintext the local user has typed
@@ -1187,6 +1236,11 @@ fn deinitRunState(rs: *RunState) void {
         rs.zone_catalog.deinit(gpa);
     }
     rs.algo_lib.deinit(gpa);
+    {
+        devClearCheck(rs); // frees the dev flow's diag/disclosure lines + config
+        rs.gdev_diags.deinit(gpa);
+        rs.gdev_discl.deinit(gpa);
+    }
     {
         for (rs.gchat_mail.items) |m| chat_relay.freeMail(gpa, m);
         rs.gchat_mail.deinit(gpa);
@@ -1661,6 +1715,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 .repost => &rs.deferred_unrepost,
                 .unlike, .unrepost => null,
                 .loadout => null, // loadout writes post no result; defensive only
+                .publish_algo => null, // its result drives the dev flow below
             };
             if (deferred) |set| {
                 if (set.remove(std.hash.Wyhash.hash(0, res.cid))) {
@@ -1673,20 +1728,31 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
             }
             switch (res.outcome) {
                 .ok => |uri| {
-                    // Record OUR created like/repost uri so a later unlike/
-                    // unrepost can delete that record — the AppView never sends
-                    // viewer.like, so the optimistic path has no uri otherwise.
-                    if (uri.len > 0) switch (res.kind) {
+                    // A finished algorithm publish: land it on the bench and
+                    // move the dev flow to its done screen (revert_uri carries
+                    // the record CID — the library id / transparency anchor).
+                    if (res.kind == .publish_algo) {
+                        finishDevPublish(rs, environ, uri, res.revert_uri);
+                    } else if (uri.len > 0) switch (res.kind) {
+                        // Record OUR created like/repost uri so a later unlike/
+                        // unrepost can delete that record — the AppView never sends
+                        // viewer.like, so the optimistic path has no uri otherwise.
                         .like => feed_core.setLikeUri(gpa, store, res.cid, uri) catch {},
                         .repost => feed_core.setRepostUri(gpa, store, res.cid, uri) catch {},
-                        .unlike, .unrepost, .loadout => {},
+                        .unlike, .unrepost, .loadout, .publish_algo => {},
                     };
                 },
-                .refused => |f| {
+                .refused => |f| if (res.kind == .publish_algo) {
+                    rs.gdev_step = .review; // nothing was published; the draft stands
+                    rs.gdev_status_len = if (std.fmt.bufPrint(&rs.gdev_status_buf, "The server refused the publish ({d} {s}). Nothing went out — fix and retry.", .{ f.status, f.code })) |m| m.len else |_| 0;
+                } else {
                     revertWrite(res.kind, gpa, store, res.cid, res.revert_uri) catch {};
                     rs.status = std.fmt.bufPrint(&rs.status_buf, "refused: {d} {s}", .{ f.status, f.code }) catch "refused";
                 },
-                .net_error => |name| {
+                .net_error => |name| if (res.kind == .publish_algo) {
+                    rs.gdev_step = .review;
+                    rs.gdev_status_len = if (std.fmt.bufPrint(&rs.gdev_status_buf, "Couldn't reach your repo ({s}). Nothing went out — retry when you're online.", .{name})) |m| m.len else |_| 0;
+                } else {
                     revertWrite(res.kind, gpa, store, res.cid, res.revert_uri) catch {};
                     rs.status = std.fmt.bufPrint(&rs.status_buf, "network error: {s}", .{name}) catch "network error";
                 },
@@ -2186,7 +2252,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
+        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
         switch (rs.mode) {
             .timeline => try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status),
             .compose => {
@@ -3334,7 +3400,96 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                     rs.gcreate_step = create_flow.nextStep(rs.gcreate_step);
                                     rs.gscroll_px = 0;
                                 },
-                                .create_dev => rs.status = "Developer submission is coming soon — write it in Zal and publish.",
+                                .create_dev => { // the landing's second button → the dev flow
+                                    rs.gdev_active = true;
+                                    rs.gdev_step = .source;
+                                    rs.gscroll_px = 0;
+                                },
+                                // ---- The developer submission flow (ALGO_SUBMISSION slice 1) ----
+                                .dev_template => {
+                                    const ti: usize = hit.post;
+                                    if (ti < zal_templates.all.len) {
+                                        textedit.set(&rs.gdev_src, zal_templates.all[ti].source);
+                                        devClearCheck(rs);
+                                    }
+                                },
+                                .dev_src => { // click into the editor → place the caret
+                                    const wdt: i32 = @intCast(if (rs.gpu_state) |*sgs| sgs.design_w else design_w);
+                                    const off = feed_view.devSrcCaretAtPoint(g.engine, wdt, textedit.view(&rs.gdev_src), rs.gscroll_px, rx, ry);
+                                    textedit.setCaret(&rs.gdev_src, off);
+                                },
+                                .dev_check => runDevCheck(rs),
+                                .dev_next => switch (rs.gdev_step) {
+                                    .source => if (rs.gdev_check_ok) {
+                                        rs.gdev_step = .details;
+                                        rs.gscroll_px = 0;
+                                    } else {
+                                        rs.status = "Check must pass first — every refusal is named, fix what it says.";
+                                    },
+                                    .details => if (rs.gdev_name_len > 0) {
+                                        rs.gdev_step = .review;
+                                        rs.gscroll_px = 0;
+                                    } else {
+                                        rs.status = "Give it a name first.";
+                                    },
+                                    .review, .publishing => {},
+                                    .done => { // "Done" → leave the flow, land on the loadout bench
+                                        devReset(rs);
+                                        rs.gloadout_tab = 0;
+                                        rs.gscroll_px = 0;
+                                    },
+                                },
+                                .dev_back => switch (rs.gdev_step) {
+                                    .source => { // back to the Create landing
+                                        devReset(rs);
+                                        rs.gscroll_px = 0;
+                                    },
+                                    .details => {
+                                        rs.gdev_step = .source;
+                                        rs.gscroll_px = 0;
+                                    },
+                                    .review => {
+                                        rs.gdev_step = .details;
+                                        rs.gscroll_px = 0;
+                                    },
+                                    .publishing, .done => {},
+                                },
+                                .dev_field => rs.gdev_focus = @intCast(hit.post),
+                                .dev_color => rs.gdev_color = @intCast(hit.post),
+                                .dev_publish => {
+                                    if (rs.gdev_config.len == 0 or !rs.gdev_check_ok) {
+                                        rs.status = "Run Check first.";
+                                    } else if (rs.writer) |w| {
+                                        // rkey: a name slug + the local uid — readable in the
+                                        // repo, unique per publish (an edited resubmit gets a
+                                        // fresh record, never a silent overwrite).
+                                        var slug: [32]u8 = undefined;
+                                        var sn: usize = 0;
+                                        for (rs.gdev_name_buf[0..rs.gdev_name_len]) |ch| {
+                                            if (sn >= 24) break;
+                                            const lc = std.ascii.toLower(ch);
+                                            if (std.ascii.isAlphanumeric(lc)) {
+                                                slug[sn] = lc;
+                                                sn += 1;
+                                            } else if (sn > 0 and slug[sn - 1] != '-') {
+                                                slug[sn] = '-';
+                                                sn += 1;
+                                            }
+                                        }
+                                        if (sn == 0) {
+                                            slug[0] = 'a';
+                                            sn = 1;
+                                        }
+                                        var rkb: [48]u8 = undefined;
+                                        const rkey = std.fmt.bufPrint(&rkb, "{s}-{d}", .{ slug[0..sn], rs.algo_uid }) catch "algo";
+                                        var idb: [24]u8 = undefined;
+                                        const local_id = std.fmt.bufPrint(&idb, "user:{d}", .{rs.algo_uid}) catch "user:x";
+                                        if (write_worker.submitPublishAlgo(w, local_id, rs.gdev_name_buf[0..rs.gdev_name_len], rs.gdev_config, rkey, now)) {
+                                            rs.gdev_step = .publishing;
+                                            rs.gscroll_px = 0;
+                                        } else rs.status = "Couldn't queue the publish — out of memory.";
+                                    } else rs.status = "Publishing needs the online session.";
+                                },
                                 .create_knob_dec, .create_knob_inc => {
                                     const k: create_flow.Knob = @enumFromInt(@as(u8, @intCast(hit.post)));
                                     const step = create_flow.knobMeta(k).step;
@@ -4308,6 +4463,70 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status);
                     continue;
                 }
+                // The dev submission flow's inputs. SOURCE: the Zal editor — a
+                // textedit.Field, so paste (Ctrl+V arrives as the byte stream),
+                // mid-text edits, and Enter-as-newline behave like a code
+                // editor, not a form. Any edit drops the last check (the gate
+                // verdict binds to exact bytes). DETAILS: name/ranks are short
+                // single-line buffers; Enter or Tab hops fields; the
+                // description takes real newlines. ASCII only (Zal is ASCII).
+                if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 2 and rs.gdev_active and rs.gdev_step == .source) {
+                    if (zc == 8 or zc == 127) {
+                        textedit.backspace(&rs.gdev_src);
+                        devClearCheck(rs);
+                    } else if (zc == '\r' or zc == '\n') {
+                        textedit.insert(&rs.gdev_src, "\n");
+                        devClearCheck(rs);
+                    } else if (zc == 9) {
+                        textedit.insert(&rs.gdev_src, "    ");
+                        devClearCheck(rs);
+                    } else if (zc >= 0x20 and zc < 0x7f) {
+                        const b: [1]u8 = .{@intCast(zc)};
+                        textedit.insert(&rs.gdev_src, &b);
+                        devClearCheck(rs);
+                    }
+                    try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status);
+                    continue;
+                }
+                if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 2 and rs.gdev_active and rs.gdev_step == .details) {
+                    if (zc == 9 or ((zc == '\r' or zc == '\n') and rs.gdev_focus != 2)) {
+                        rs.gdev_focus = (rs.gdev_focus + 1) % 3;
+                    } else if (zc == 8 or zc == 127) {
+                        switch (rs.gdev_focus) {
+                            0 => {
+                                if (rs.gdev_name_len > 0) rs.gdev_name_len -= 1;
+                            },
+                            1 => {
+                                if (rs.gdev_ranks_len > 0) rs.gdev_ranks_len -= 1;
+                            },
+                            else => {
+                                if (rs.gdev_desc_len > 0) rs.gdev_desc_len -= 1;
+                            },
+                        }
+                    } else if ((zc == '\r' or zc == '\n') and rs.gdev_focus == 2) {
+                        if (rs.gdev_desc_len < rs.gdev_desc_buf.len) {
+                            rs.gdev_desc_buf[rs.gdev_desc_len] = '\n';
+                            rs.gdev_desc_len += 1;
+                        }
+                    } else if (zc >= 0x20 and zc < 0x7f) {
+                        switch (rs.gdev_focus) {
+                            0 => if (rs.gdev_name_len < rs.gdev_name_buf.len) {
+                                rs.gdev_name_buf[rs.gdev_name_len] = @intCast(zc);
+                                rs.gdev_name_len += 1;
+                            },
+                            1 => if (rs.gdev_ranks_len < rs.gdev_ranks_buf.len) {
+                                rs.gdev_ranks_buf[rs.gdev_ranks_len] = @intCast(zc);
+                                rs.gdev_ranks_len += 1;
+                            },
+                            else => if (rs.gdev_desc_len < rs.gdev_desc_buf.len) {
+                                rs.gdev_desc_buf[rs.gdev_desc_len] = @intCast(zc);
+                                rs.gdev_desc_len += 1;
+                            },
+                        }
+                    }
+                    try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status);
+                    continue;
+                }
                 // The Create name field: route typing into the feed-name buffer (ASCII
                 // for now — a zone/feed name is short). Backspace via BS/DEL. Consumes
                 // the key so it never falls through to zoom or the feed shortcuts.
@@ -4723,7 +4942,178 @@ fn typingOwnsKeyboard(rs: *const RunState) bool {
     if (rs.gscreen == feed_view.screen_messages and
         (rs.gchat_composing or rs.gchat_input_focus or rs.gpay_open or rs.grecv_open)) return true;
     if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 2 and rs.gcreate_step == .name) return true;
+    // The dev submission flow: the Zal source editor and the details fields.
+    if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 2 and rs.gdev_active and
+        (rs.gdev_step == .source or rs.gdev_step == .details)) return true;
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// The developer submission flow's shell machinery (ALGO_SUBMISSION slice 1):
+// check output ownership, the check runner, and the flow reset. The pure
+// compile/gate/disclosure logic lives in core (dev_flow, algo_gate,
+// transparency); this is only state hygiene + formatting.
+// ---------------------------------------------------------------------------
+
+/// Free the last check's gpa-owned output (diagnostics, disclosures, the
+/// serialized config) and mark the source unchecked. Runs before every
+/// re-check, on any source edit, on reset, and at teardown (C5).
+fn devClearCheck(rs: *RunState) void {
+    const gpa = rs.gpa;
+    for (rs.gdev_diags.items) |s| gpa.free(s);
+    rs.gdev_diags.clearRetainingCapacity();
+    for (rs.gdev_discl.items) |s| gpa.free(s);
+    rs.gdev_discl.clearRetainingCapacity();
+    if (rs.gdev_config.len > 0) gpa.free(rs.gdev_config);
+    rs.gdev_config = "";
+    rs.gdev_checked = false;
+    rs.gdev_check_ok = false;
+}
+
+/// Leave the dev flow entirely: drop the check output and every draft field.
+fn devReset(rs: *RunState) void {
+    devClearCheck(rs);
+    textedit.clear(&rs.gdev_src);
+    rs.gdev_name_len = 0;
+    rs.gdev_ranks_len = 0;
+    rs.gdev_desc_len = 0;
+    rs.gdev_focus = 0;
+    rs.gdev_color = 0;
+    rs.gdev_status_len = 0;
+    rs.gdev_step = .source;
+    rs.gdev_active = false;
+}
+
+/// Append a gpa-owned copy of `s` to a dev line list. OOM drops the line —
+/// a missing sentence, never a crash (E4).
+fn devPush(rs: *RunState, list: *std.ArrayListUnmanaged([]const u8), s: []const u8) void {
+    const gpa = rs.gpa;
+    const copy = gpa.dupe(u8, s) catch return;
+    list.append(gpa, copy) catch gpa.free(copy);
+}
+
+/// Run the compile + publish-gate check over the editor's source and turn the
+/// outcome into display state: named diagnostics on refusal, or the serialized
+/// config (kept byte-exact for the publish) + the code-DERIVED disclosure
+/// sentences the review page shows (invariant 6: facts come from the compiled
+/// code, never the author's claim).
+fn runDevCheck(rs: *RunState) void {
+    const gpa = rs.gpa;
+    devClearCheck(rs);
+    rs.gdev_checked = true;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const src = textedit.view(&rs.gdev_src);
+    const c = dev_flow.check(arena, src) catch {
+        devPush(rs, &rs.gdev_diags, "Out of memory while checking.");
+        return;
+    };
+    if (c.errors.len > 0) {
+        for (c.errors) |err| {
+            var b: [256]u8 = undefined;
+            const line = std.fmt.bufPrint(&b, "line {d}: {s}", .{ dev_flow.lineOf(src, err.start), err.msg }) catch err.msg;
+            devPush(rs, &rs.gdev_diags, line);
+        }
+        return;
+    }
+    if (!c.verdict.pass()) {
+        for (c.verdict.list()) |r| devPush(rs, &rs.gdev_diags, algo_gate.label(r));
+        return;
+    }
+    const bytes = algorithm_core.serialize(arena, discover.validated(c.config)) catch {
+        devPush(rs, &rs.gdev_diags, "Out of memory while checking.");
+        return;
+    };
+    rs.gdev_config = gpa.dupe(u8, bytes) catch "";
+    rs.gdev_check_ok = rs.gdev_config.len > 0;
+    if (transparency.guestSection(c.config)) |gs| {
+        var b: [192]u8 = undefined;
+        devPush(rs, &rs.gdev_discl, if (gs.uses_attention)
+            "Reads your attention signals — on your device only, never sent anywhere."
+        else
+            "Never reads your attention.");
+        devPush(rs, &rs.gdev_discl, if (gs.keeps_state)
+            "Keeps an on-device memory between sessions."
+        else
+            "Keeps nothing between sessions.");
+        devPush(rs, &rs.gdev_discl, if (gs.composes_retrieval)
+            "Composes its own candidate pool (retrieve())."
+        else
+            "Uses the standard candidate pool.");
+        if (gs.reads_tags and gs.zones.len > 0) {
+            var zb: [128]u8 = undefined;
+            var zw: usize = 0;
+            for (gs.zones, 0..) |z, i| {
+                const sep: []const u8 = if (i == 0) "" else ", ";
+                if (zw + sep.len + z.len > zb.len) break;
+                @memcpy(zb[zw..][0..sep.len], sep);
+                zw += sep.len;
+                @memcpy(zb[zw..][0..z.len], z);
+                zw += z.len;
+            }
+            const zl = std.fmt.bufPrint(&b, "Reads zone tags: {s}.", .{zb[0..zw]}) catch "Reads zone tags.";
+            devPush(rs, &rs.gdev_discl, zl);
+        }
+        const fl = std.fmt.bufPrint(&b, "Compute ceiling: {d} instructions per post.", .{gs.fuel}) catch "";
+        if (fl.len > 0) devPush(rs, &rs.gdev_discl, fl);
+        const sl = if (gs.retrieve_len > 0)
+            std.fmt.bufPrint(&b, "Code size: {d} score + {d} retrieve instructions.", .{ gs.score_len, gs.retrieve_len }) catch ""
+        else
+            std.fmt.bufPrint(&b, "Code size: {d} instructions.", .{gs.score_len}) catch "";
+        if (sl.len > 0) devPush(rs, &rs.gdev_discl, sl);
+    }
+}
+
+/// A publish landed OK: put the algorithm on the bench (visibility PUBLIC —
+/// the record shape the marketplace serves), persist the library, and move
+/// the flow to its done screen with the record uri shown. `record_cid` (the
+/// result's revert_uri seat) becomes the library id — the same identity a
+/// DOWNLOADED copy of this record would carry (A5/A8).
+fn finishDevPublish(rs: *RunState, environ: ?*const std.process.Environ.Map, uri: []const u8, record_cid: []const u8) void {
+    const gpa = rs.gpa;
+    var idb: [24]u8 = undefined;
+    const local_id = std.fmt.bufPrint(&idb, "user:{d}", .{rs.algo_uid}) catch "user:x";
+    const id: []const u8 = if (record_cid.len > 0) record_cid else local_id;
+    const nm: []const u8 = if (rs.gdev_name_len > 0) rs.gdev_name_buf[0..rs.gdev_name_len] else "Untitled algorithm";
+    const new: algo_library.NewAlgo = .{
+        .id = id,
+        .name = nm,
+        .ranks = rs.gdev_ranks_buf[0..rs.gdev_ranks_len],
+        .desc = rs.gdev_desc_buf[0..rs.gdev_desc_len],
+        .creator = "you",
+        .config = rs.gdev_config,
+        .color = rs.gdev_color,
+        .visibility = .public,
+    };
+    if (rs.algo_lib.add(gpa, new)) |_| {
+        rs.algo_uid += 1;
+        _ = cache_shell.saveLibrary(gpa, environ, &rs.algo_lib);
+    } else |_| {} // the record is live regardless; the bench copy just missed
+    rs.gdev_step = .done;
+    rs.gdev_status_len = if (std.fmt.bufPrint(&rs.gdev_status_buf, "{s}", .{uri})) |m| m.len else |_| 0;
+    rs.gscroll_px = 0;
+}
+
+/// The dev flow's render view from the run state — one place, so the grid
+/// literal stays a plain field list.
+fn devViewOf(rs: *RunState) feed_view.DevView {
+    return .{
+        .active = rs.gdev_active,
+        .step = rs.gdev_step,
+        .src = textedit.view(&rs.gdev_src),
+        .caret = rs.gdev_src.caret,
+        .checked = rs.gdev_checked,
+        .check_ok = rs.gdev_check_ok,
+        .diags = rs.gdev_diags.items,
+        .disclosures = rs.gdev_discl.items,
+        .name = rs.gdev_name_buf[0..rs.gdev_name_len],
+        .ranks = rs.gdev_ranks_buf[0..rs.gdev_ranks_len],
+        .desc = rs.gdev_desc_buf[0..rs.gdev_desc_len],
+        .focus = rs.gdev_focus,
+        .color = rs.gdev_color,
+        .status = rs.gdev_status_buf[0..rs.gdev_status_len],
+    };
 }
 
 fn composeBlinkOn(anchor_ns: u64) bool {
@@ -5938,6 +6328,7 @@ fn revertWrite(kind: write_worker.Request.Kind, gpa: Allocator, store: *feed_cor
         .unlike => try feed_core.revertUnlike(gpa, store, cid, revert_uri),
         .unrepost => try feed_core.revertUnrepost(gpa, store, cid, revert_uri),
         .loadout => {}, // loadout writes are not optimistic; nothing to revert
+        .publish_algo => {}, // the dev flow reconciles its own state (no store optimism)
     }
 }
 
@@ -6259,6 +6650,7 @@ const Grid = struct {
     market: []const feed_view.MarketAlgoCard = &.{},
     /// The simple-Create flow's state (loadout tab 2). A value set per frame.
     create: feed_view.CreateView = .{ .step = .landing, .answers = .{}, .config = discover.DEFAULT_CONFIG, .name = "", .color = 0 },
+    dev: feed_view.DevView = .{},
     /// The user's bench — library algorithms not in a socket (Loadout tab). A value
     /// set per frame (built from the library into the frame arena).
     bench: lens_socket.TrayView = .{ .cards = &.{}, .text = "", .seated = 0 },
@@ -7191,7 +7583,7 @@ fn paintFrame(
                 g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{}, &.{}, g.chat_recv) catch g.content_h.*;
             } else if (g.screen.* == feed_view.screen_loadout) {
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
-                g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market, g.create, g.bench) catch g.content_h.*; // software: draw line-art nav
+                g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market, g.create, g.dev, g.bench) catch g.content_h.*; // software: draw line-art nav
             } else if (g.screen.* == feed_view.screen_transparency) {
                 if (g.inspect_loading) {
                     g.content_h.* = feed_view.layoutAlgorithmLoading(gpa, g.engine, @intCast(win.fb.width), g.draw, g.regions, g.accent, g.inspect_name) catch g.content_h.*;
@@ -7732,7 +8124,7 @@ fn paintFrameGpu(
             }
             gs.content_x = lg.col_x;
             gs.content_w = lg.col_w;
-            g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, true, true, lg, g.market, g.create, g.bench) catch g.content_h.*; // GPU: SDF pass strikes the nav icons crisp
+            g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, true, true, lg, g.market, g.create, g.dev, g.bench) catch g.content_h.*; // GPU: SDF pass strikes the nav icons crisp
         } else if (g.chat_store != null and g.screen.* == feed_view.screen_messages) {
             // Zat Chat (U3, dev-gated): the Messages surface in the GPU's logical
             // design space; the rail is the shell's own tile (rail_external), and

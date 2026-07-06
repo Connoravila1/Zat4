@@ -42,6 +42,8 @@ const auth = @import("auth.zig");
 const write = @import("write.zig");
 const clock = @import("clock.zig");
 const loadout_store = @import("loadout.zig");
+const algorithm_shell = @import("algorithm.zig");
+const algorithm_core = @import("../core/algorithm.zig");
 
 // ---------------------------------------------------------------------------
 // The messages — plain data, the only thing that crosses the boundary (E1)
@@ -75,7 +77,14 @@ pub const Request = struct {
     /// loop, instead of blocking it on tray-close. Indices: 0=feed,1=reply,2=zone.
     loadout: [3]loadout_store.SurfaceData = .{ .{}, .{}, .{} },
 
-    pub const Kind = enum(u8) { like, unlike, repost, unrepost, loadout };
+    /// For a `.publish_algo` write only: the record's display name and the
+    /// serialized FeedConfig bytes (byte-exact, the form the record carries).
+    /// The rkey rides in `record_uri`; the library's local id in `cid` (so the
+    /// result can be matched back). Owned copies, empty otherwise.
+    algo_name: []const u8 = "",
+    algo_config: []const u8 = "",
+
+    pub const Kind = enum(u8) { like, unlike, repost, unrepost, loadout, publish_algo };
 };
 
 /// What the worker reports back. `cid` matches the request's post so the
@@ -109,6 +118,8 @@ fn freeRequest(gpa: Allocator, r: Request) void {
     gpa.free(r.subject_uri);
     gpa.free(r.subject_cid);
     gpa.free(r.record_uri);
+    gpa.free(r.algo_name);
+    gpa.free(r.algo_config);
     for (r.loadout) |surf| {
         for (surf.ids) |id| gpa.free(id);
         gpa.free(surf.ids);
@@ -306,6 +317,46 @@ pub fn submitLoadout(worker: *Worker, feed: loadout_store.SurfaceData, reply: lo
     return true;
 }
 
+/// Enqueue an algorithm publish (ALGO_SUBMISSION slice 1): the marketplace
+/// record write, off the UI thread like every other write. `local_id` rides
+/// back on the result's `cid` so the UI can finish its flow; `config` is the
+/// serialized FeedConfig the check produced (the worker re-parses and the
+/// publish gate re-verifies, fail-closed). False only on OOM.
+pub fn submitPublishAlgo(worker: *Worker, local_id: []const u8, name: []const u8, config: []const u8, rkey: []const u8, now: i64) bool {
+    const gpa = worker.gpa;
+    const cid_c = gpa.dupe(u8, local_id) catch return false;
+    const name_c = gpa.dupe(u8, name) catch {
+        gpa.free(cid_c);
+        return false;
+    };
+    const cfg_c = gpa.dupe(u8, config) catch {
+        gpa.free(cid_c);
+        gpa.free(name_c);
+        return false;
+    };
+    const rkey_c = gpa.dupe(u8, rkey) catch {
+        gpa.free(cid_c);
+        gpa.free(name_c);
+        gpa.free(cfg_c);
+        return false;
+    };
+    const req: Request = .{
+        .kind = .publish_algo,
+        .cid = cid_c,
+        .subject_uri = "",
+        .subject_cid = "",
+        .record_uri = rkey_c,
+        .now = now,
+        .algo_name = name_c,
+        .algo_config = cfg_c,
+    };
+    if (!worker.inbox.push(gpa, req)) {
+        freeRequest(gpa, req);
+        return false;
+    }
+    return true;
+}
+
 pub fn start(
     gpa: Allocator,
     io: std.Io,
@@ -397,12 +448,38 @@ fn processOne(worker: *Worker, req: Request) void {
         return;
     }
 
+    // Algorithm publish: parse the serialized config back to a FeedConfig and
+    // run the gated record write. The result's `.ok` carries the record uri;
+    // `revert_uri` carries the record CID (the transparency anchor) — reusing
+    // the existing seat rather than growing the Result for one kind.
+    if (req.kind == .publish_algo) {
+        var record_cid: []const u8 = "";
+        const outcome: Result.Outcome = blk: {
+            const cfg = algorithm_core.parse(arena, req.algo_config) catch {
+                break :blk .{ .net_error = gpa.dupe(u8, "BadConfig") catch "error" };
+            };
+            const published = algorithm_shell.publish(gpa, arena, worker.io, worker.environ, worker.session, req.algo_name, cfg, req.record_uri, req.now) catch |err| {
+                break :blk .{ .net_error = gpa.dupe(u8, @errorName(err)) catch "error" };
+            };
+            record_cid = gpa.dupe(u8, published.cid) catch "";
+            break :blk .{ .ok = gpa.dupe(u8, published.uri) catch "" };
+        };
+        const cid_copy = gpa.dupe(u8, req.cid) catch {
+            if (record_cid.len > 0) gpa.free(record_cid);
+            freeOutcome(gpa, outcome);
+            return;
+        };
+        const result: Result = .{ .kind = .publish_algo, .cid = cid_copy, .revert_uri = record_cid, .outcome = outcome };
+        if (!worker.outbox.push(gpa, result)) freeResult(gpa, result);
+        return;
+    }
+
     const call = switch (req.kind) {
         .like => write.likePost(gpa, arena, worker.io, worker.environ, worker.session, req.subject_uri, req.subject_cid, req.now),
         .repost => write.repostPost(gpa, arena, worker.io, worker.environ, worker.session, req.subject_uri, req.subject_cid, req.now),
         .unlike => write.unlikePost(gpa, arena, worker.io, worker.environ, worker.session, req.record_uri),
         .unrepost => write.unrepostPost(gpa, arena, worker.io, worker.environ, worker.session, req.record_uri),
-        .loadout => unreachable, // handled above
+        .loadout, .publish_algo => unreachable, // handled above
     };
 
     const outcome: Result.Outcome = if (call) |wo| switch (wo) {

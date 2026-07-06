@@ -37,6 +37,8 @@ const text = @import("text.zig");
 const raster = @import("raster.zig");
 const lens_socket = @import("lens_socket.zig");
 const create_flow = @import("create_flow.zig");
+const dev_flow = @import("dev_flow.zig");
+const zal_templates = @import("zal_templates.zig");
 const builder = @import("builder.zig");
 const discover = @import("discover.zig");
 const text_select = @import("text_select.zig");
@@ -189,7 +191,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back, drawer_close };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -2788,6 +2790,9 @@ pub fn layoutLoadout(
     market: []const MarketAlgoCard,
     /// The simple-Create flow's state — read only on tab 2 (Create).
     create: CreateView,
+    /// The developer submission flow's state — when `dev.active`, tab 2 hosts
+    /// it instead of the guided builder (the landing's second button).
+    dev: DevView,
     /// The user's BENCH — library algorithms (created/downloaded) not plugged into a
     /// socket. Rendered as a right-hand shelf on the Loadout tab; drag one into a
     /// socket to load it. Empty ⇒ the empty-state prompt.
@@ -2870,6 +2875,8 @@ pub fn layoutLoadout(
         }
     } else if (tab == 1) {
         content_h = try drawMarketplace(gpa, dl, e, m, height, scroll, regions, accent, market);
+    } else if (dev.active) {
+        content_h = try layoutDevSubmit(gpa, e, dl, m, height, scroll, regions, accent, dev);
     } else {
         content_h = try layoutCreate(gpa, e, dl, m, height, scroll, regions, accent, create);
     }
@@ -3121,6 +3128,317 @@ fn createNav(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawList, x0: i3
     _ = try str(gpa, dl, e, .semibold, px + @divTrunc(pw - tw, 2), y + 28, 0xFF0B0B0F, 15, primary);
     try emitRegion(gpa, regions, px, y, @intCast(pw), @intCast(bh), 0, primary_action);
     return y + bh + 20;
+}
+
+/// The developer-submission flow's render state (ALGO_SUBMISSION slice 1) —
+/// the shell owns + drives it; this is what the renderer reads. Diagnostics
+/// and disclosures arrive as pre-formatted sentences (the shell formats once
+/// per check, never per frame). A7.2: cold — one per frame on the Create tab,
+/// never held in quantity. Waived.
+pub const DevView = struct {
+    active: bool = false, // the Create tab is hosting the dev flow
+    step: dev_flow.Step = .source,
+    src: []const u8 = "",
+    caret: u32 = 0,
+    checked: bool = false, // a check has run since the last edit
+    check_ok: bool = false,
+    diags: []const []const u8 = &.{}, // compile errors / gate refusals, one sentence each
+    disclosures: []const []const u8 = &.{}, // code-derived facts (the review step)
+    name: []const u8 = "",
+    ranks: []const u8 = "",
+    desc: []const u8 = "",
+    focus: u8 = 0, // details step: which field owns keys (0 name, 1 ranks, 2 desc)
+    color: u8 = 0, // accent palette index (0..8)
+    status: []const u8 = "", // publish progress / error / the live record uri
+};
+
+/// The source-editor geometry, shared by the draw (`devSource`) and the click →
+/// caret inverse (`devSrcCaretAtPoint`) so the two never drift. Code renders as
+/// LITERAL lines (no word-wrap — it is code, not prose), with a line-number
+/// gutter. A7.2: cold — one transient per frame/click.
+const DevEditorGeom = struct { panel_x: i32, panel_y: i32, panel_w: i32, tx: i32, ty0: i32, line_h: i32 };
+fn devEditorGeom(m: Metrics, scroll: i32, src_empty: bool) DevEditorGeom {
+    const x0 = m.lx;
+    var y: i32 = 140 + scroll;
+    y += 52; // title
+    y += 34; // the sub line
+    if (src_empty) y += 24 + 44; // "START FROM" + the template chips row
+    return .{ .panel_x = x0, .panel_y = y, .panel_w = m.cw, .tx = x0 + 56, .ty0 = y + 30, .line_h = 21 };
+}
+
+fn devLineCount(src: []const u8) u32 {
+    var n: u32 = 1;
+    for (src) |b| {
+        if (b == '\n') n += 1;
+    }
+    return n;
+}
+
+/// Map a click at logical (`hx`,`hy`) to the nearest caret byte offset in the
+/// dev editor's source, replaying `devSource`'s literal-line layout. Pure: the
+/// shell calls it on a `.dev_src` hit, then `textedit.setCaret`. Metrics come
+/// from the page width (`composeCaretAtPoint`'s convention) — under a condensed
+/// rail's pane geometry the x mapping can drift a few px; the nearest-boundary
+/// pick keeps that a one-column miss at worst.
+pub fn devSrcCaretAtPoint(e: *const text.Engine, width: i32, src: []const u8, scroll: i32, hx: i32, hy: i32) u32 {
+    if (src.len == 0) return 0;
+    const m = metricsFor(width);
+    const g = devEditorGeom(m, scroll, false);
+    const nlines: i32 = @intCast(devLineCount(src));
+    const li: i32 = std.math.clamp(@divFloor(hy - (g.ty0 - 16), g.line_h), 0, nlines - 1);
+    // Walk to the target line's byte range.
+    var line_start: usize = 0;
+    var seen: i32 = 0;
+    while (seen < li) {
+        const nl = std.mem.indexOfScalarPos(u8, src, line_start, '\n') orelse break;
+        line_start = nl + 1;
+        seen += 1;
+    }
+    const line_end = std.mem.indexOfScalarPos(u8, src, line_start, '\n') orelse src.len;
+    // Nearest inter-character boundary within the line.
+    var best: u32 = @intCast(line_start);
+    var best_dx: i32 = std.math.maxInt(i32);
+    var x = g.tx;
+    var k = line_start;
+    while (true) {
+        const dx: i32 = @intCast(@abs(@as(i64, x) - hx));
+        if (dx < best_dx) {
+            best_dx = dx;
+            best = @intCast(k);
+        }
+        if (k >= line_end) break;
+        const clen: usize = std.unicode.utf8ByteSequenceLength(src[k]) catch 1;
+        x += @intCast(text.measure(e, .regular, src[k..@min(k + clen, line_end)], 15));
+        k = @min(k + clen, line_end);
+    }
+    return best;
+}
+
+/// One labeled single-line text field of the details form: the box, the current
+/// text (or placeholder), a caret when focused, and its tap region. Returns y
+/// below the field.
+fn devField(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32, y_in: i32, w: i32, regions: ?*Regions, accent: u32, label: []const u8, value: []const u8, placeholder: []const u8, focused: bool, payload: u16) !i32 {
+    var y = y_in;
+    _ = try str(gpa, dl, e, .semibold, x0, y + 12, faint, 12, label);
+    y += 22;
+    const fh: i32 = 46;
+    try rect(gpa, dl, x0, y, w, fh, 0x12EDEAE0, 12);
+    if (focused) try rect(gpa, dl, x0, y, 3, fh, accent, 2);
+    const shown = if (value.len > 0) value else placeholder;
+    const vc: u32 = if (value.len > 0) ink else faint;
+    const pen = try str(gpa, dl, e, .regular, x0 + 16, y + 29, vc, 16, shown);
+    if (focused) try rect(gpa, dl, (if (value.len > 0) pen else x0 + 16) + 2, y + 13, 2, 20, accent, 0);
+    try emitRegion(gpa, regions, x0, y, w, @intCast(fh), payload, .dev_field);
+    return y + fh + 18;
+}
+
+/// The dev flow's bottom nav: "‹ Back" ghost, an optional mid ghost button, and
+/// a primary (drawn dim when `enabled` is false — the region still emits, so
+/// the shell can answer a tap with WHY it is disabled instead of dead pixels).
+fn devNav(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawList, x0: i32, y: i32, w: i32, regions: ?*Regions, accent: u32, mid: ?[]const u8, mid_action: Action, primary: []const u8, primary_action: Action, enabled: bool) !i32 {
+    const bh: i32 = 44;
+    const back_w: i32 = 96;
+    try rect(gpa, dl, x0, y, back_w, bh, 0x12EDEAE0, 11);
+    _ = try str(gpa, dl, e, .semibold, x0 + 24, y + 28, ink, 15, "‹ Back");
+    try emitRegion(gpa, regions, x0, y, back_w, @intCast(bh), 0, .dev_back);
+    const pw: i32 = @max(168, @as(i32, @intCast(text.measure(e, .semibold, primary, 15))) + 48);
+    const px = x0 + w - pw;
+    try rect(gpa, dl, px, y, pw, bh, if (enabled) accent else 0x2AEDEAE0, 11);
+    const tw: i32 = @intCast(text.measure(e, .semibold, primary, 15));
+    _ = try str(gpa, dl, e, .semibold, px + @divTrunc(pw - tw, 2), y + 28, if (enabled) 0xFF0B0B0F else muted, 15, primary);
+    try emitRegion(gpa, regions, px, y, pw, @intCast(bh), 0, primary_action);
+    if (mid) |label| {
+        const mw: i32 = @as(i32, @intCast(text.measure(e, .semibold, label, 15))) + 44;
+        const mx = px - mw - 12;
+        try rect(gpa, dl, mx, y, mw, bh, 0x12EDEAE0, 11);
+        _ = try str(gpa, dl, e, .semibold, mx + 22, y + 28, ink, 15, label);
+        try emitRegion(gpa, regions, mx, y, mw, @intCast(bh), 0, mid_action);
+    }
+    return y + bh + 20;
+}
+
+/// Render the DEVELOPER submission flow (ALGO_SUBMISSION slice 1) into the
+/// Create tab — the real-code path beside `layoutCreate`'s guided one. PURE
+/// draw over `view`; the shell owns the state, the text buffers, and the
+/// check/publish machinery. Returns content height.
+pub fn layoutDevSubmit(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawList, m: Metrics, height: i32, scroll: i32, regions: ?*Regions, accent: u32, view: DevView) error{OutOfMemory}!i32 {
+    _ = height;
+    const x0 = m.lx;
+    const w = m.cw;
+    var y: i32 = 140 + scroll;
+
+    switch (view.step) {
+        .source => {
+            _ = try str(gpa, dl, e, .semibold, x0, y + 30, ink, 30, "Submit an algorithm");
+            y += 52;
+            _ = try str(gpa, dl, e, .regular, x0, y + 16, muted, 14, "Real Zal code — write it here or paste with Ctrl+V. Checked by the gate every published algorithm passes.");
+            y += 34;
+            if (view.src.len == 0) {
+                _ = try str(gpa, dl, e, .semibold, x0, y + 14, faint, 12, "START FROM");
+                y += 24;
+                var cx = x0;
+                for (zal_templates.all, 0..) |tpl, ti| {
+                    const tw: i32 = @intCast(text.measure(e, .semibold, tpl.name, 13));
+                    const cw2 = tw + 26;
+                    if (cx + cw2 > x0 + w) break; // one row; the catalog is short
+                    try rect(gpa, dl, cx, y, cw2, 30, 0x14EDEAE0, 9);
+                    _ = try str(gpa, dl, e, .semibold, cx + 13, y + 20, ink, 13, tpl.name);
+                    try emitRegion(gpa, regions, cx, y, cw2, 30, @intCast(ti), .dev_template);
+                    cx += cw2 + 10;
+                }
+                y += 44;
+            }
+            // The editor panel: literal lines over a line-number gutter.
+            const g = devEditorGeom(m, scroll, view.src.len == 0);
+            const nlines = devLineCount(view.src);
+            const eh: i32 = @max(340, @as(i32, @intCast(nlines)) * g.line_h + 44);
+            try rect(gpa, dl, g.panel_x, g.panel_y, g.panel_w, eh, 0x0EEDEAE0, 14);
+            try emitRegion(gpa, regions, g.panel_x, g.panel_y, g.panel_w, @intCast(@min(eh, 32767)), 0, .dev_src);
+            if (view.src.len == 0) {
+                _ = try str(gpa, dl, e, .regular, g.tx, g.ty0, faint, 15, "fn score() {");
+                _ = try str(gpa, dl, e, .regular, g.tx + 24, g.ty0 + g.line_h, faint, 15, "return like_count + reply_count * 27;");
+                _ = try str(gpa, dl, e, .regular, g.tx, g.ty0 + g.line_h * 2, faint, 15, "}");
+                try rect(gpa, dl, g.tx, g.ty0 - 15, 2, 19, accent, 0); // caret at the start
+            } else {
+                var baseline = g.ty0;
+                var ln: u32 = 1;
+                var it = std.mem.splitScalar(u8, view.src, '\n');
+                var lnbuf: [8]u8 = undefined;
+                var caret_drawn = false;
+                var line_start: usize = 0;
+                while (it.next()) |src_line| {
+                    const lns = std.fmt.bufPrint(&lnbuf, "{d}", .{ln}) catch "";
+                    _ = try str(gpa, dl, e, .regular, g.panel_x + 14, baseline, faint, 11, lns);
+                    _ = try str(gpa, dl, e, .regular, g.tx, baseline, body_c, 15, src_line);
+                    // The caret, when it sits on this line.
+                    const line_end = line_start + src_line.len;
+                    if (!caret_drawn and view.caret >= line_start and view.caret <= line_end) {
+                        const cw3: i32 = @intCast(text.measure(e, .regular, view.src[line_start..view.caret], 15));
+                        try rect(gpa, dl, g.tx + cw3, baseline - 15, 2, 19, accent, 0);
+                        caret_drawn = true;
+                    }
+                    line_start = line_end + 1;
+                    baseline += g.line_h;
+                    ln += 1;
+                }
+            }
+            y = g.panel_y + eh + 18;
+            // Check feedback: named refusals/errors, the pass line, or the hint.
+            if (view.diags.len > 0) {
+                for (view.diags) |d| {
+                    try rect(gpa, dl, x0, y + 4, 8, 8, like_c, 4);
+                    y = try wrapBody(gpa, dl, e, x0 + 18, y + 12, w - 18, body_c, 14, d, 20, true, null);
+                    y += 10;
+                }
+            } else if (view.checked) {
+                try rect(gpa, dl, x0, y + 4, 8, 8, boost_c, 4);
+                _ = try str(gpa, dl, e, .semibold, x0 + 18, y + 12, ink, 15, "Compiles clean — and passes the publish gate.");
+                y += 28;
+            } else {
+                _ = try str(gpa, dl, e, .regular, x0, y + 12, faint, 13, "Check compiles your code and runs the publish gate — every refusal is named, never silent.");
+                y += 28;
+            }
+            y += 10;
+            y = try devNav(gpa, e, dl, x0, y, w, regions, accent, "Check", .dev_check, "Continue", .dev_next, view.check_ok);
+        },
+        .details => {
+            _ = try str(gpa, dl, e, .semibold, x0, y + 30, ink, 30, "Describe it");
+            y += 52;
+            _ = try str(gpa, dl, e, .regular, x0, y + 16, muted, 14, "Your words — shown on the public page beside the facts derived from your code.");
+            y += 36;
+            y = try devField(gpa, dl, e, x0, y, w, regions, accent, "NAME", view.name, "Untitled algorithm", view.focus == 0, 0);
+            y = try devField(gpa, dl, e, x0, y, w, regions, accent, "WHAT IT RANKS FOR — ONE LINE", view.ranks, "e.g. slow-burn threads, no pile-ons", view.focus == 1, 1);
+            _ = try str(gpa, dl, e, .semibold, x0, y + 12, faint, 12, "DESCRIPTION");
+            y += 22;
+            const dh: i32 = 140;
+            try rect(gpa, dl, x0, y, w, dh, 0x12EDEAE0, 12);
+            if (view.focus == 2) try rect(gpa, dl, x0, y, 3, dh, accent, 2);
+            if (view.desc.len > 0) {
+                const end_y = try wrapBody(gpa, dl, e, x0 + 16, y + 26, w - 32, ink, 15, view.desc, 21, true, null);
+                _ = end_y;
+            } else {
+                _ = try str(gpa, dl, e, .regular, x0 + 16, y + 26, faint, 15, "What does it surface, and for whom? Enter breaks the line.");
+            }
+            try emitRegion(gpa, regions, x0, y, w, @intCast(dh), 2, .dev_field);
+            y += dh + 24;
+            _ = try str(gpa, dl, e, .semibold, x0, y + 12, faint, 12, "ACCENT");
+            y += 28;
+            const sw: i32 = 34;
+            for (lens_socket.palette, 0..) |col, ci| {
+                const cx = x0 + @as(i32, @intCast(ci)) * (sw + 12);
+                if (ci == view.color) try rect(gpa, dl, cx - 3, y - 3, sw + 6, sw + 6, 0x40FFFFFF, 11);
+                try rect(gpa, dl, cx, y, sw, sw, col, 9);
+                try emitRegion(gpa, regions, cx, y, sw, @intCast(sw), @intCast(ci), .dev_color);
+            }
+            y += sw + 34;
+            y = try devNav(gpa, e, dl, x0, y, w, regions, accent, null, .dev_check, "Review", .dev_next, view.name.len > 0);
+        },
+        .review => {
+            _ = try str(gpa, dl, e, .semibold, x0, y + 30, ink, 30, "The public page");
+            y += 52;
+            _ = try str(gpa, dl, e, .regular, x0, y + 16, muted, 14, "Exactly what a user reads before trying it.");
+            y += 36;
+            // The card: the author's words, under their chosen accent.
+            const card_top = y;
+            const card_acc = lens_socket.palette[@min(view.color, lens_socket.palette.len - 1)];
+            _ = try str(gpa, dl, e, .semibold, x0 + 24, y + 40, ink, 22, if (view.name.len > 0) view.name else "Untitled algorithm");
+            _ = try str(gpa, dl, e, .regular, x0 + 24, y + 62, muted, 13, "by you");
+            y += 76;
+            if (view.ranks.len > 0) {
+                _ = try str(gpa, dl, e, .regular, x0 + 24, y + 8, body_c, 15, view.ranks);
+                y += 26;
+            }
+            if (view.desc.len > 0) {
+                y = try wrapBody(gpa, dl, e, x0 + 24, y + 12, w - 48, muted, 15, view.desc, 21, true, null);
+            }
+            y += 20;
+            const card_h = y - card_top;
+            // Behind-the-text card chrome drawn as an underlay would need a second
+            // pass; the spine alone carries the accent, over the page glass.
+            try rect(gpa, dl, x0, card_top, 4, card_h, card_acc, 2);
+            y += 8;
+            _ = try str(gpa, dl, e, .semibold, x0, y + 14, faint, 12, "WHAT THE CODE PROVES");
+            y += 30;
+            for (view.disclosures) |fact| {
+                try rect(gpa, dl, x0, y + 4, 8, 8, accent, 4);
+                _ = try str(gpa, dl, e, .semibold, x0 + 18, y + 12, ink, 15, fact);
+                y += 26;
+            }
+            y += 6;
+            y = try wrapBody(gpa, dl, e, x0, y + 12, w, faint, 13, "Derived from the compiled code by the engine — a description never overrides these, here or anywhere an algorithm is shown.", 19, true, null);
+            y += 20;
+            if (view.status.len > 0) {
+                y = try wrapBody(gpa, dl, e, x0, y + 8, w, like_c, 14, view.status, 20, true, null);
+                y += 16;
+            }
+            y = try devNav(gpa, e, dl, x0, y, w, regions, accent, null, .dev_check, "Publish to the marketplace", .dev_publish, true);
+        },
+        .publishing => {
+            y += 120;
+            _ = try str(gpa, dl, e, .semibold, x0, y + 30, ink, 26, "Publishing");
+            y += 52;
+            _ = try str(gpa, dl, e, .regular, x0, y + 16, muted, 15, "Writing the signed record to your repo…");
+            y += 40;
+        },
+        .done => {
+            y += 80;
+            _ = try str(gpa, dl, e, .semibold, x0, y + 30, ink, 30, "It's live");
+            y += 52;
+            y = try wrapBody(gpa, dl, e, x0, y + 16, w, muted, 15, "Your algorithm is published under your handle and lands in the marketplace as the network indexes it. It is also on your bench, ready to socket.", 22, true, null);
+            y += 24;
+            if (view.status.len > 0) {
+                y = try wrapBody(gpa, dl, e, x0, y + 8, w, faint, 13, view.status, 19, true, null);
+                y += 20;
+            }
+            const bh: i32 = 44;
+            const pw: i32 = 128;
+            try rect(gpa, dl, x0, y, pw, bh, accent, 11);
+            _ = try str(gpa, dl, e, .semibold, x0 + 44, y + 28, 0xFF0B0B0F, 15, "Done");
+            try emitRegion(gpa, regions, x0, y, pw, @intCast(bh), 0, .dev_next);
+            y += bh + 20;
+        },
+    }
+    return (y - scroll) + 40;
 }
 
 /// A zone's icon-tile colour, derived deterministically from its tag so a zone
