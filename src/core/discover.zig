@@ -242,7 +242,14 @@ pub const FeedConfig = struct {
     w_bookmark: f32 = 10.0, // high-intent private save (no Twitter equiv; reserved)
     w_profile_click: f32 = 24.0, // BEHAVIORAL — interest in the author (Twitter 12)
     w_link_click: f32 = 22.0, // BEHAVIORAL — followed the content out (Twitter 11)
-    w_negative: f32 = -148.0, // block / mute / report — asymmetric punisher (Twitter −74)
+    /// Block / mute / report — the asymmetric punisher (Twitter −74, doubled).
+    /// Applied as SATURATING DAMPING (`negativeDamping`), never as a term in the
+    /// additive base: the magnitude keeps its "one negative cancels ~148 likes"
+    /// currency in the mild regime, but the score floors at zero instead of going
+    /// negative, and the SIGN is ignored — a published algorithm cannot flip
+    /// victim-generated safety signals into a booster. (H3 amendment 2026-07-05;
+    /// see `negativeDamping` for the two defects the old subtractive form had.)
+    w_negative: f32 = -148.0,
 
     /// A baseline added to the engagement sum for EVERY candidate, so a post with
     /// no engagement yet still has a non-zero score that freshness can lift — the
@@ -406,26 +413,59 @@ pub fn velocityFactor(config: FeedConfig, age_hrs: f64) f64 {
     return 1.0 + (1.0 - age_hrs / velocity_window_hrs);
 }
 
+/// Negative-feedback damping: `d ∈ (0, 1]`, multiplied into the score LAST.
+///
+///   d = base / (base + |w_negative| × negative_count)
+///
+/// Negatives used to be a term in the additive engagement sum, which had two
+/// defects (the H3 amendment this helper records, 2026-07-05): (1) a net-negative
+/// base multiplied by recency decay SHRINKS toward zero with age, so an older,
+/// worse post outranked a fresher equivalent — multiplicative scoring is only
+/// well-behaved over a non-negative base; (2) `w_negative` was only range-clamped,
+/// so a published algorithm could set it POSITIVE and turn blocks/mutes/reports —
+/// victim-generated safety signals — into a booster. As damping, both are
+/// structural: `d` can only pull a score toward zero (never flip its sign), and
+/// `@abs` makes the sign inexpressible rather than merely unadvised.
+///
+/// The shape is ENGAGEMENT-NORMALIZED saturating, chosen over a fixed-per-action
+/// curve on purpose: for |w|·n ≪ base it reproduces the legacy subtractive
+/// behavior exactly to first order (base·d ≈ base − |w|·n — the recorded
+/// "one negative cancels ~148 likes" calibration keeps its meaning), and past it
+/// each ADDITIONAL negative is worth less, so a coordinated mass-block brigade
+/// has diminishing effect instead of burying a post arbitrarily deep (an open
+/// marketplace makes that an attack surface, not a hypothetical). Pure (B2);
+/// a free function beside `scoreRow`, not a method (A1). `base ≤ 0` ⇒ 1 (the
+/// clamped base is already 0; there is nothing to damp).
+pub fn negativeDamping(base: f64, negative_count: u32, w_negative: f32) f64 {
+    if (base <= 0 or negative_count == 0) return 1.0;
+    const penalty = @abs(@as(f64, w_negative)) * @as(f64, @floatFromInt(negative_count));
+    return base / (base + penalty);
+}
+
 /// Score one candidate — the heart, the recorded MULTIPLICATIVE formula:
 ///
-///   score = (Σ count[k] × w[k])          // weighted engagement sum
+///   score = max(0, Σ count[k] × w[k] + floor)   // POSITIVE-only engagement base
 ///         × recency_decay
 ///         × velocity_factor
 ///         × (1 + author_rep × author_rep_weight)
 ///         × (1 + relevance  × relevance_weight)
 ///         × (1 + behavioral × behavioral_weight)   // Tier 2; weight 0 ⇒ inert
+///         × negative_damping                       // d ∈ (0,1] — see negativeDamping
 ///
 /// Multiplicative (not an additive sum of all terms) is the recorded decision:
 /// it produces the authentic Twitter-like behavior where a fresh, fast-climbing
 /// post can outrank an older viral one — at the cost of being more volatile and
 /// more gameable on a single term, which is a CALIBRATION question to settle
-/// with measurement (G2), not a structural one. Note a consequence to calibrate:
+/// with measurement (G2), not a structural one. The base is positive signals
+/// only, clamped non-negative BEFORE the factors multiply it (a negative base
+/// under decay inverts freshness — see `negativeDamping`); negative feedback
+/// enters solely as the final damping factor. Note a consequence to calibrate:
 /// a zero-engagement post scores 0 regardless of recency, so a brand-new post
-/// with no signal does not surface on engagement alone — a base-recency floor is
+/// with no signal does not surface on engagement alone — `engagement_floor` is
 /// the calibration knob if cold posts need a chance. Pure; takes a row by value
 /// (56 bytes, trivial — G3) so a test can score a hand-built candidate directly.
 pub fn scoreRow(c: Candidate, config: FeedConfig, now: i64) f64 {
-    const eng =
+    const eng_sum =
         @as(f64, @floatFromInt(c.like_count)) * @as(f64, config.w_like) +
         @as(f64, @floatFromInt(c.repost_count)) * @as(f64, config.w_repost) +
         @as(f64, @floatFromInt(c.reply_count)) * @as(f64, config.w_reply) +
@@ -433,8 +473,10 @@ pub fn scoreRow(c: Candidate, config: FeedConfig, now: i64) f64 {
         @as(f64, @floatFromInt(c.bookmark_count)) * @as(f64, config.w_bookmark) +
         @as(f64, @floatFromInt(c.profile_click_count)) * @as(f64, config.w_profile_click) +
         @as(f64, @floatFromInt(c.link_click_count)) * @as(f64, config.w_link_click) +
-        @as(f64, @floatFromInt(c.negative_count)) * @as(f64, config.w_negative) +
         @as(f64, config.engagement_floor); // cold-start baseline (default 0)
+    // The guard: authored weights may be negative (that is creator freedom), but
+    // the BASE the factors multiply must not be — clamp before anything scales it.
+    const eng = @max(0.0, eng_sum);
 
     const d = now - c.created_at;
     const age_hrs: f64 = if (d <= 0) 0.0 else @as(f64, @floatFromInt(d)) / 3600.0;
@@ -444,8 +486,9 @@ pub fn scoreRow(c: Candidate, config: FeedConfig, now: i64) f64 {
     const author = 1.0 + @as(f64, c.author_rep) * @as(f64, config.author_rep_weight);
     const rel = 1.0 + @as(f64, c.relevance) * @as(f64, config.relevance_weight);
     const behav = 1.0 + @as(f64, c.behavioral) * @as(f64, config.behavioral_weight);
+    const damp = negativeDamping(eng, c.negative_count, config.w_negative);
 
-    return eng * rec * vel * author * rel * behav;
+    return eng * rec * vel * author * rel * behav * damp;
 }
 
 /// The CONTENT host for a guest score run — the public, non-behavioral capabilities
@@ -1039,23 +1082,82 @@ test "score: calibrated ratios hold — a reply dominates, a repost is only ~2x 
     try t.expectEqual(@as(u32, 3), order[3].raw());
 }
 
-test "score: negative actions are an asymmetric punisher" {
+test "score: negative actions are an asymmetric punisher (damping, never a sign flip)" {
     const t = std.testing;
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     var reported = mk(1, 3600, 100); // 100 likes...
-    reported.negative_count = 2; // ...but two reports: 100×1 + 2×(-74) = -48
+    reported.negative_count = 2; // ...but two reports: damped to 100·(100/396) ≈ 25
 
     var c: Candidates = .{};
     defer c.deinit(t.allocator);
     try c.append(t.allocator, reported, true);
-    try c.append(t.allocator, mk(2, 3600, 1), true); // a quiet positive post
+    try c.append(t.allocator, mk(2, 3600, 30), true); // a modest clean post
 
     const order = try score(arena, &c, DEFAULT_CONFIG, test_now);
     try t.expectEqual(@as(u32, 2), order[0].raw()); // the punished post sinks below it
-    try t.expect(scoreRow(reported, DEFAULT_CONFIG, test_now) < 0);
+    // The punisher damps hard but the score stays NON-NEGATIVE — negatives pull
+    // toward zero, they no longer invert the sign (the decay-inversion guard).
+    const s = scoreRow(reported, DEFAULT_CONFIG, test_now);
+    try t.expect(s >= 0);
+    var clean = reported;
+    clean.negative_count = 0;
+    try t.expect(s < scoreRow(clean, DEFAULT_CONFIG, test_now));
+}
+
+test "score: a downvoted OLD post never outranks a fresher equivalent (the inversion regression)" {
+    const t = std.testing;
+    // Under the old subtractive base, both posts scored NEGATIVE and recency
+    // decay shrank the older one's magnitude — so the older, equally-bad post
+    // ranked HIGHER. With the positive-only clamped base + damping, both stay
+    // ≥ 0 and freshness orders them correctly.
+    var fresh = mk(1, 3600, 100); // 1 hour old
+    fresh.negative_count = 5; // heavily downvoted: |w|·n = 740 ≫ base 100
+    var stale = fresh;
+    stale.created_at = test_now - 48 * 3600; // same post, two days old
+    const s_fresh = scoreRow(fresh, DEFAULT_CONFIG, test_now);
+    const s_stale = scoreRow(stale, DEFAULT_CONFIG, test_now);
+    try t.expect(s_fresh >= 0 and s_stale >= 0);
+    try t.expect(s_fresh > s_stale); // fresher wins — this is what the old formula inverted
+}
+
+test "score: a positive w_negative cannot turn safety signals into a booster (the sign guarantee)" {
+    const t = std.testing;
+    var reported = mk(1, 3600, 100);
+    reported.negative_count = 3;
+
+    var inverted = DEFAULT_CONFIG;
+    inverted.w_negative = 148.0; // an author flips the sign to reward blocks/reports
+    const s_inverted = scoreRow(reported, inverted, test_now);
+    const s_default = scoreRow(reported, DEFAULT_CONFIG, test_now);
+    // The sign is inexpressible: +148 damps exactly as −148 does...
+    try t.expectEqual(s_default, s_inverted);
+    // ...and a damped score never exceeds its undamped self.
+    var clean = reported;
+    clean.negative_count = 0;
+    try t.expect(s_inverted <= scoreRow(clean, inverted, test_now));
+}
+
+test "negativeDamping: d ∈ (0,1] across the range; zero negatives ⇒ no penalty; monotone" {
+    const t = std.testing;
+    // No negatives ⇒ exactly 1 (inert), any base.
+    try t.expectEqual(@as(f64, 1.0), negativeDamping(100.0, 0, -148.0));
+    try t.expectEqual(@as(f64, 1.0), negativeDamping(0.0, 5, -148.0)); // nothing to damp
+    // In range and strictly decreasing as the count grows — but never zero.
+    var prev: f64 = 1.0;
+    var n: u32 = 1;
+    while (n <= 10_000) : (n *= 10) {
+        const dmp = negativeDamping(100.0, n, -148.0);
+        try t.expect(dmp > 0 and dmp <= 1.0);
+        try t.expect(dmp < prev); // monotone: more negatives, more damping
+        prev = dmp;
+    }
+    // The mild regime reproduces the legacy subtractive calibration to first
+    // order: base 10000, one negative ⇒ base·d ≈ base − 148.
+    const soft = 10_000.0 * negativeDamping(10_000.0, 1, -148.0);
+    try t.expect(@abs(soft - (10_000.0 - 148.0)) < 3.0); // within the 2nd-order term
 }
 
 test "score: behavioral signal is inert under the default config (Tier-2 reserved)" {

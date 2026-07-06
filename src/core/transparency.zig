@@ -169,7 +169,7 @@ fn metaFor(comptime name: []const u8) Meta {
         .behavioral = true,
     } else if (comptime std.mem.eql(u8, name, "w_negative")) .{
         .label = "Negative-feedback penalty",
-        .meaning = "The penalty when you block, mute, or report. Negative, so it pushes a post down hard.",
+        .meaning = "How strongly blocks, mutes, and reports pull a post's score toward zero. Only the strength counts — no algorithm can flip this into a boost, and no pile-on can push a score below zero.",
         .category = .engagement,
     } else if (comptime std.mem.eql(u8, name, "engagement_floor")) .{
         .label = "Cold-start floor",
