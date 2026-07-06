@@ -200,6 +200,50 @@ test "Fresh First: the whole artifact compiles and its arrange() survives the va
     try t.expect(!compile.usesBehavioral(art.arrange)); // pool reads are public
 }
 
+test "the developer guide's worked examples compile whole (ZAL_DEVELOPER_GUIDE §12 stays honest)" {
+    var a = std.heap.ArenaAllocator.init(t.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    // The examples that are NOT already templates above: the zone-first feed
+    // (retrieve + has_tag together) and the pool-relative cap (a cross-item
+    // score that aggregates the pool). If an engine change breaks either, the
+    // guide is lying to developers — fix the doc in the same change.
+    const zone_first =
+        \\fn retrieve() num {
+        \\  tag_scope("zig", 1.5);
+        \\  follows(1.0);
+        \\  return 0.0;
+        \\}
+        \\fn score() num {
+        \\  var s = like_count + reply_count * 27.0;
+        \\  if (has_tag("zig")) { s = s * 2.0; }
+        \\  return s * (6.0 / (age_hrs + 6.0));
+        \\}
+    ;
+    const pool_cap =
+        \\fn score() num {
+        \\  var n = pool_len();
+        \\  var sum = 0.0;
+        \\  var i = 0.0;
+        \\  while (i < n) {
+        \\    sum = sum + pool_read(i, base_score);
+        \\    i = i + 1.0;
+        \\  }
+        \\  var avg = 1.0;
+        \\  if (n > 0.0) { avg = sum / n; }
+        \\  var s = like_count + reply_count * 27.0;
+        \\  if (s > avg * 10.0) { s = avg * 10.0; }
+        \\  return s;
+        \\}
+    ;
+    inline for (.{ zone_first, pool_cap }) |src| {
+        const ast = try parse.parse(arena, src);
+        const art = try compile.compileArtifact(arena, &ast);
+        try t.expect(art.ok());
+        try t.expect(vm.validProgram(art.score));
+    }
+}
+
 test "templates: the behavioral claim is PROVABLE from bytecode (invariant 6)" {
     var a = std.heap.ArenaAllocator.init(t.allocator);
     defer a.deinit();
