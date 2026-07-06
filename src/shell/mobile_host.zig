@@ -69,9 +69,16 @@ pub const MobileHost = struct {
     scrolling: bool = false,
     /// This press committed to a HORIZONTAL swipe (the phone nav drawer) —
     /// mutually exclusive with `scrolling`; the dominant axis at the slop
-    /// threshold decides, the total travel on release resolves it.
+    /// threshold decides. The drawer TETHERS to the finger during the drag
+    /// (`hswipe_base` = drawer_t at commit); release settles by the
+    /// halfway rule.
     hswipe: bool = false,
+    hswipe_base: f32 = 0,
     drag_y: i32 = -1,
+    /// Soft-keyboard bytes from the seam (the terminal vocabulary: UTF-8
+    /// text, 0x08 backspace, '\r' enter) — drained into the pump's byte
+    /// stream each frame, exactly like the window backend's key bytes.
+    bytes: std.ArrayList(u8) = .empty,
     /// The fling: scroll velocity in LOGICAL px/frame, sampled (smoothed)
     /// while the finger drags and carried when it lifts; friction decays it,
     /// the scroll clamp kills it, and a new touch stops it instantly
@@ -82,6 +89,19 @@ pub const MobileHost = struct {
 
 pub fn deinit(host: *MobileHost, gpa: Allocator) void {
     host.events.deinit(gpa);
+    host.bytes.deinit(gpa);
+}
+
+/// Queue one soft-keyboard byte. Dropped on OOM (a missed keystroke, E4).
+pub fn pushByte(host: *MobileHost, gpa: Allocator, b: u8) bool {
+    host.bytes.append(gpa, b) catch return false;
+    return true;
+}
+
+/// Move the queued keyboard bytes into the pump's stream.
+pub fn drainBytes(host: *MobileHost, gpa: Allocator, out: *std.ArrayList(u8)) !void {
+    try out.appendSlice(gpa, host.bytes.items);
+    host.bytes.clearRetainingCapacity();
 }
 
 /// Queue one event from the seam. A dropped event on OOM is a missed tap,

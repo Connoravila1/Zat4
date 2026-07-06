@@ -122,10 +122,55 @@ extern "android" fn AMotionEvent_getX(event: *const AInputEvent, pointer_index: 
 extern "android" fn AMotionEvent_getY(event: *const AInputEvent, pointer_index: usize) callconv(.c) f32;
 
 const input_event_type_motion: i32 = 2;
+const input_event_type_key: i32 = 1;
 const action_mask: i32 = 0xff;
 const action_down: i32 = 0;
 const action_up: i32 = 1;
 const action_move: i32 = 2;
+const key_action_down: i32 = 0;
+const meta_shift_on: i32 = 0x1;
+
+extern "android" fn AKeyEvent_getAction(event: *const AInputEvent) callconv(.c) i32;
+extern "android" fn AKeyEvent_getKeyCode(event: *const AInputEvent) callconv(.c) i32;
+extern "android" fn AKeyEvent_getMetaState(event: *const AInputEvent) callconv(.c) i32;
+
+/// Map an Android keycode (+shift) to the codepoint the seam feeds the
+/// composer. The soft keyboard reaches a no-text-widget app through its
+/// KeyEvent FALLBACK (the game-engine path), which covers this basic Latin
+/// set; rich IME text (autocorrect, emoji, CJK) needs an InputConnection —
+/// the recorded follow-up. Unmapped keys return null and stay UNHANDLED so
+/// the system keeps BACK/volume/etc.
+fn keyCodepoint(kc: i32, meta: i32) ?u21 {
+    const shift = (meta & meta_shift_on) != 0;
+    return switch (kc) {
+        7...16 => blk: { // KEYCODE_0..9
+            const d: u21 = @intCast(kc - 7);
+            if (!shift) break :blk '0' + d;
+            const syms = [10]u21{ ')', '!', '@', '#', '$', '%', '^', '&', '*', '(' };
+            break :blk syms[@intCast(kc - 7)];
+        },
+        29...54 => blk: { // KEYCODE_A..Z
+            const c: u21 = 'a' + @as(u21, @intCast(kc - 29));
+            break :blk if (shift) c - 32 else c;
+        },
+        62 => ' ',
+        66 => 13, // enter
+        67 => 8, // del -> backspace
+        55 => if (shift) @as(u21, '<') else ',',
+        56 => if (shift) @as(u21, '>') else '.',
+        68 => if (shift) @as(u21, '~') else '`',
+        69 => if (shift) @as(u21, '_') else '-',
+        70 => if (shift) @as(u21, '+') else '=',
+        71 => if (shift) @as(u21, '{') else '[',
+        72 => if (shift) @as(u21, '}') else ']',
+        73 => if (shift) @as(u21, '|') else '\\',
+        74 => if (shift) @as(u21, ':') else ';',
+        75 => if (shift) @as(u21, '"') else '\'',
+        76 => if (shift) @as(u21, '?') else '/',
+        77 => '@',
+        else => null,
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Minimal JNI, declared locally (D3) — the two OAuth hops (M-And.5) are the
@@ -155,6 +200,7 @@ const jni_get_object_class = 31; // GetObjectClass
 const jni_get_method_id = 33; // GetMethodID
 const jni_call_object_method_a = 36; // CallObjectMethodA
 const jni_call_void_method_a = 63; // CallVoidMethodA
+const jni_call_boolean_method_a = 39; // CallBooleanMethodA
 const jni_get_static_method_id = 113; // GetStaticMethodID
 const jni_call_static_object_method_a = 116; // CallStaticObjectMethodA
 const jni_new_string_utf = 167; // NewStringUTF
@@ -171,6 +217,7 @@ const NewObjectAFn = *const fn (JniEnv, jclass, jmethodID, [*]const jvalue) call
 const GetObjectClassFn = *const fn (JniEnv, jobject) callconv(.c) jclass;
 const CallObjectMethodAFn = *const fn (JniEnv, jobject, jmethodID, [*]const jvalue) callconv(.c) jobject;
 const CallVoidMethodAFn = *const fn (JniEnv, jobject, jmethodID, [*]const jvalue) callconv(.c) void;
+const CallBooleanMethodAFn = *const fn (JniEnv, jobject, jmethodID, [*]const jvalue) callconv(.c) u8;
 const CallStaticObjectMethodAFn = *const fn (JniEnv, jclass, jmethodID, [*]const jvalue) callconv(.c) jobject;
 const GetStringUtfCharsFn = *const fn (JniEnv, jstring, ?*u8) callconv(.c) ?[*:0]const u8;
 const ReleaseStringUtfCharsFn = *const fn (JniEnv, jstring, [*:0]const u8) callconv(.c) void;
@@ -271,6 +318,47 @@ fn deliverIntentRedirect(activity: *Activity) bool {
     }
     seam.logcat("login: redirect arrived with no armed flow — dropped", .{});
     return false;
+}
+
+/// Show or hide the soft keyboard (the M-UX keyboard leg). NativeActivity
+/// has no text widget, so this is the game-engine recipe: ask the
+/// InputMethodManager directly, with the decor view as the anchor
+/// (SHOW_FORCED — the plain flag is a no-op without a focused editor).
+/// Render thread; attach/detach like the browser hop. Failures log and
+/// no-op — typing just needs a relaunch, never a crash (E2/E4).
+fn imeSetVisible(activity: *Activity, show: bool) void {
+    const vm: JavaVm = @ptrCast(@alignCast(activity.vm));
+    var env: JniEnv = undefined;
+    const attach: AttachFn = @ptrCast(@alignCast(vm.*.slots[vm_attach_current_thread].?));
+    if (attach(vm, &env, null) != 0) return;
+    defer _ = @as(DetachFn, @ptrCast(@alignCast(vm.*.slots[vm_detach_current_thread].?)))(vm);
+
+    const new_string = jniFn(env, jni_new_string_utf, NewStringUtfFn);
+    const call_bool = jniFn(env, jni_call_boolean_method_a, CallBooleanMethodAFn);
+
+    const get_svc = jniMethod(env, activity.clazz, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;") orelse return;
+    const svc_name = new_string(env, "input_method");
+    if (jniFailed(env) or svc_name == null) return;
+    const imm = jniCallObj(env, activity.clazz, get_svc, &[_]jvalue{.{ .l = svc_name }}) orelse return seam.logcat("ime: no InputMethodManager", .{});
+
+    const get_window = jniMethod(env, activity.clazz, "getWindow", "()Landroid/view/Window;") orelse return;
+    const window = jniCallObj(env, activity.clazz, get_window, &no_args) orelse return;
+    const get_decor = jniMethod(env, window, "getDecorView", "()Landroid/view/View;") orelse return;
+    const decor = jniCallObj(env, window, get_decor, &no_args) orelse return;
+
+    if (show) {
+        const show_mid = jniMethod(env, imm, "showSoftInput", "(Landroid/view/View;I)Z") orelse return;
+        const shown = call_bool(env, imm, show_mid, &[_]jvalue{ .{ .l = decor }, .{ .i = 2 } }); // 2 = SHOW_FORCED
+        if (jniFailed(env)) return seam.logcat("ime: showSoftInput threw", .{});
+        seam.logcat("ime: show requested (accepted={d})", .{shown});
+    } else {
+        const get_token = jniMethod(env, decor, "getWindowToken", "()Landroid/os/IBinder;") orelse return;
+        const token = jniCallObj(env, decor, get_token, &no_args) orelse return;
+        const hide_mid = jniMethod(env, imm, "hideSoftInputFromWindow", "(Landroid/os/IBinder;I)Z") orelse return;
+        _ = call_bool(env, imm, hide_mid, &[_]jvalue{ .{ .l = token }, .{ .i = 0 } });
+        _ = jniFailed(env);
+        seam.logcat("ime: hidden", .{});
+    }
 }
 
 /// The redirect trampoline (M-And.5). IF the OS ever stacks a fresh
@@ -382,6 +470,7 @@ fn renderThread() void {
     // the seam whether the previous thread left a parked feed behind.
     var feed_parked = seam.zat_feed_parked(ctx);
     var feed_errs: u32 = 0;
+    var ime_shown = false;
     var last_ns: u64 = clock.monotonicNanos();
     if (app.reoffer_login) seam.zat_login_reoffer(ctx); // fresh instance, waiting flow → browser again
 
@@ -475,9 +564,32 @@ fn renderThread() void {
                         seam.zat_touch(ctx, kind, AMotionEvent_getX(e, 0), AMotionEvent_getY(e, 0));
                         handled = 1;
                     }
+                } else if (AInputEvent_getType(e) == input_event_type_key) {
+                    // The soft keyboard's KeyEvent fallback (M-UX keyboard
+                    // leg). Mapped keys feed the composer; unmapped ones
+                    // (BACK, volume) stay the system's.
+                    if (AKeyEvent_getAction(e) == key_action_down) {
+                        if (keyCodepoint(AKeyEvent_getKeyCode(e), AKeyEvent_getMetaState(e))) |cp| {
+                            seam.zat_key(ctx, cp);
+                            handled = 1;
+                        }
+                    }
                 }
                 AInputQueue_finishEvent(q, e, handled);
             }
+        }
+
+        // The M-UX keyboard leg: summon/dismiss the IME on the frame's word
+        // (the composer opening/closing flips it).
+        if (feed_live) {
+            const want_ime = seam.zat_ime_wanted(ctx);
+            if (want_ime != ime_shown) {
+                if (app.activity) |act| imeSetVisible(act, want_ime);
+                ime_shown = want_ime;
+            }
+        } else if (ime_shown) {
+            if (app.activity) |act| imeSetVisible(act, false);
+            ime_shown = false;
         }
 
         if (feed_live) {

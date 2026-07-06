@@ -2910,7 +2910,11 @@ fn drawMarketplace(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, 
     }
 
     var y: i32 = content_top + scroll;
-    const card_h: i32 = 128;
+    // Narrow (phone) cards grow a row: the privacy/meta line and the button
+    // shared a band and collided at 430 (on-device finding) — the button
+    // drops below the meta instead.
+    const narrow = w < 520;
+    const card_h: i32 = if (narrow) 162 else 128;
     const gap: i32 = 16;
     for (market, 0..) |a, i| {
         if (y + card_h > 0 and y < height) {
@@ -2943,7 +2947,7 @@ fn drawMarketplace(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, 
             // loadout" (adopt + score) is the next slice — it needs the fetched
             // config wired into the scoring resolver.
             const btn_h: i32 = 34;
-            const btn_y = y + card_h - btn_h - 18;
+            const btn_y = if (narrow) y + 108 else y + card_h - btn_h - 18;
             const view_w: i32 = 128;
             const view_x = x0 + w - view_w - 20;
             try rect(gpa, dl, view_x, btn_y, view_w, btn_h, 0x14EDEAE0, 10); // ghost
@@ -3171,11 +3175,14 @@ fn drawSettings(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: 
     _ = try str(gpa, dl, e, .semibold, x0, title_y + 30, ink, 30, "Settings");
     const body_y = title_y + 70; // both panes begin below the page title
 
-    // Pane split.
-    const list_w: i32 = std.math.clamp(@divTrunc(w * 36, 100), 180, 260);
+    // Pane split. On PHONE widths the master-detail STACKS instead — the
+    // squeezed side-by-side collided labels with values at 430 (on-device
+    // finding): the section list runs full width, the detail below it.
+    const phone = m.col_w <= phone_max;
+    const list_w: i32 = if (phone) w else std.math.clamp(@divTrunc(w * 36, 100), 180, 260);
     const split_gap: i32 = 28;
-    const detail_x = x0 + list_w + split_gap;
-    const detail_w = w - list_w - split_gap;
+    const detail_x = if (phone) x0 else x0 + list_w + split_gap;
+    const detail_w = if (phone) w else w - list_w - split_gap;
 
     // ── Left: the section list (icon + label + chevron + active pill). ──
     const sec_row_h: i32 = 50;
@@ -3190,10 +3197,11 @@ fn drawSettings(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: 
         ly += sec_row_h;
     }
 
-    // ── Right: the selected section's detail (title + grouped cards). ──
+    // ── Right (phone: BELOW the list): the selected section's detail. ──
     const sec = settings_view.sections[ss];
-    _ = try str(gpa, dl, e, .semibold, detail_x, body_y + 24, ink, 22, sec.label);
-    var dy = body_y + 50;
+    const detail_y0 = if (phone) body_y + @as(i32, @intCast(settings_view.sections.len)) * sec_row_h + 20 else body_y;
+    _ = try str(gpa, dl, e, .semibold, detail_x, detail_y0 + 24, ink, 22, sec.label);
+    var dy = detail_y0 + 50;
 
     // Precompute the contiguous groups of this section, in order, with counts —
     // so each card's background can be drawn at its full height behind its rows.

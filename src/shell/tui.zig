@@ -2406,7 +2406,10 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 var touch_events: std.ArrayList(layout_core.InputEvent) = .empty;
                 defer touch_events.deinit(gpa);
                 mobile_host.drain(m, gpa, &touch_events) catch {}; // OOM: dropped taps, contained (E2)
-                if (touch_events.items.len > 0) rs.last_input_nanos = clock_shell.monotonicNanos();
+                // Soft-keyboard bytes ride the SAME stream the window pump
+                // fills — decodeInput + the compose path work untouched.
+                mobile_host.drainBytes(m, gpa, &pumped_bytes) catch {};
+                if (touch_events.items.len > 0 or pumped_bytes.items.len > 0) rs.last_input_nanos = clock_shell.monotonicNanos();
                 // TOUCH SLOP (MC.4d): a press that stays within ~a finger's
                 // wobble and releases is a TAP — forwarded to the shared
                 // dispatch below as the same button_down/button_up pair the
@@ -2447,6 +2450,21 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                 m.scrolling = true;
                             } else if (adx > touch_slop and adx > ady) {
                                 m.hswipe = true;
+                                if (rs.gpu_state) |*gsd| {
+                                    m.hswipe_base = gsd.drawer_t;
+                                    gsd.drawer_drag = true;
+                                }
+                            }
+                        }
+                        if (m.hswipe) {
+                            // TETHERED: the drawer follows the finger 1:1
+                            // (owner's spec — it comes out WITH the swipe),
+                            // panel-widths of travel mapping to t. The
+                            // spring stands down while the finger owns it.
+                            if (rs.gpu_state) |*gsd| {
+                                const dxl = @as(f32, @floatFromInt(@as(i32, tev.x) - m.down_x)) / scale;
+                                gsd.drawer_t = std.math.clamp(m.hswipe_base + dxl / @as(f32, @floatFromInt(feed_view.drawer_w)), 0.0, 1.0);
+                                gsd.drawer_v = 0;
                             }
                         }
                         if (m.scrolling) {
@@ -2476,16 +2494,12 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     },
                     .button_up => {
                         if (m.hswipe) {
-                            // The drawer gesture resolves by total travel:
-                            // a decisive rightward swipe opens, leftward
-                            // closes (Bluesky's grammar; the system back
-                            // gesture owns the screen edge, so the swipe
-                            // works from anywhere on the content).
-                            const dx_total = @as(i32, tev.x) - m.down_x;
-                            const commit: i32 = touch_slop * 3;
+                            // Release resolves by the HALFWAY rule (owner's
+                            // spec): past half open -> the spring finishes
+                            // the open; short of half -> it goes back in.
                             if (rs.gpu_state) |*gsd| {
-                                if (dx_total > commit) gsd.drawer_want = true;
-                                if (dx_total < -commit) gsd.drawer_want = false;
+                                gsd.drawer_drag = false;
+                                gsd.drawer_want = gsd.drawer_t >= 0.5;
                             }
                         } else if (m.down_x >= 0 and !m.scrolling) {
                             // A clean tap: the press point, then the release.
@@ -4473,6 +4487,19 @@ pub fn mobilePush(mr: *MobileRun, ev: layout_core.InputEvent) bool {
     return mobile_host.push(&mr.host, mr.rs.gpa, ev);
 }
 
+/// Queue one soft-keyboard byte from the seam (the terminal vocabulary the
+/// pump already speaks: UTF-8 text, 0x08 backspace, '\r' enter).
+pub fn mobilePushByte(mr: *MobileRun, b: u8) bool {
+    return mobile_host.pushByte(&mr.host, mr.rs.gpa, b);
+}
+
+/// Does the frame WANT the soft keyboard? The composer is the phone's only
+/// text surface so far (chat input joins when its phone shape lands). The
+/// activity polls this and shows/hides the IME on the transition.
+pub fn mobileImeWanted(mr: *MobileRun) bool {
+    return mr.rs.mode == .compose;
+}
+
 /// The surface changed size (rotation / fold): the next frame lays out to
 /// the new dims. The GL viewport is set per frame by the paint.
 pub fn mobileResize(mr: *MobileRun, width_px: u32, height_px: u32) void {
@@ -6413,6 +6440,9 @@ const GpuState = struct {
     drawer_t: f32 = 0,
     drawer_v: f32 = 0,
     drawer_want: bool = false,
+    /// The finger owns drawer_t right now (tethered drag) — the spring
+    /// stands down and the chrome rebuilds every frame.
+    drawer_drag: bool = false,
     zones_v: f32 = 0,
     /// Hover-expand of the condensed right rail: 0 = icons-only strip, 1 = full
     /// labelled rail. Springs toward 1 while the cursor is over the right strip.
@@ -6474,6 +6504,16 @@ const ChatAnim = struct {
 fn springGeom(cur: *f32, vel: *f32, target: f32, dt: f32) void {
     const k: f32 = 150.0;
     const c: f32 = 25.0;
+    vel.* += (-k * (cur.* - target) - c * vel.*) * dt;
+    cur.* += vel.* * dt;
+}
+
+/// The phone drawer's spring: much stiffer than the pane morphs — a nav
+/// surface should ARRIVE (~0.2 s, critically damped, no overshoot). Tuned
+/// from the owner's first drawer feel pass ("quicker, snappier").
+fn springDrawer(cur: *f32, vel: *f32, target: f32, dt: f32) void {
+    const k: f32 = 600.0;
+    const c: f32 = 49.0;
     vel.* += (-k * (cur.* - target) - c * vel.*) * dt;
     cur.* += vel.* * dt;
 }
@@ -7371,8 +7411,8 @@ fn paintFrameGpu(
 
     // The PHONE drawer springs open/shut; while it moves the chrome tile
     // (scrim + panel + regions) must rebuild each frame.
-    springGeom(&gs.drawer_t, &gs.drawer_v, if (gs.drawer_want) 1.0 else 0.0, 1.0 / 60.0);
-    const drawer_animating = @abs(gs.drawer_t - (if (gs.drawer_want) @as(f32, 1.0) else 0.0)) > 0.003 or @abs(gs.drawer_v) > 0.003;
+    if (!gs.drawer_drag) springDrawer(&gs.drawer_t, &gs.drawer_v, if (gs.drawer_want) 1.0 else 0.0, 1.0 / 60.0);
+    const drawer_animating = gs.drawer_drag or @abs(gs.drawer_t - (if (gs.drawer_want) @as(f32, 1.0) else 0.0)) > 0.003 or @abs(gs.drawer_v) > 0.003;
 
     // Hover the RIGHT rail → it expands. The hit-band must track the rail's
     // CURRENT (animated) left edge — when expanded it reaches ~188px further

@@ -845,6 +845,34 @@ pub export fn zat_feed_resume(ctx_ptr: ?*anyopaque, native_window: ?*anyopaque, 
     return feedResume(ctx, native_window, width_px, height_px);
 }
 
+/// One soft-keyboard codepoint from the OS (M-UX keyboard leg). The seam
+/// encodes it into the terminal byte vocabulary the frame's input decoder
+/// already speaks (UTF-8 text; pass 8 for backspace, 13 for enter). No
+/// feed running -> dropped (nowhere to type).
+pub export fn zat_key(ctx_ptr: ?*anyopaque, codepoint: u32) void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return));
+    if (comptime !mobile_config.have_gpu) return;
+    const f = if (ctx.feed) |*ff| ff else return;
+    if (codepoint == 8 or codepoint == 13 or codepoint == 10) {
+        _ = tui.mobilePushByte(f.run, if (codepoint == 8) 0x08 else '\r');
+        return;
+    }
+    const cp = std.math.cast(u21, codepoint) orelse return;
+    var buf: [4]u8 = undefined;
+    const n = std.unicode.utf8Encode(cp, &buf) catch return; // a bad codepoint is a dropped keystroke (E4)
+    for (buf[0..n]) |b| _ = tui.mobilePushByte(f.run, b);
+}
+
+/// Does the frame want the soft keyboard? The activity polls this each lap
+/// and shows/hides the IME on the transition (the composer is the phone's
+/// only text surface so far).
+pub export fn zat_ime_wanted(ctx_ptr: ?*anyopaque) bool {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return false));
+    if (comptime !mobile_config.have_gpu) return false;
+    const f = if (ctx.feed) |*ff| ff else return false;
+    return tui.mobileImeWanted(f.run);
+}
+
 /// Stop the feed and persist (store + rotated tokens). Safe without a start.
 pub export fn zat_feed_end(ctx_ptr: ?*anyopaque) void {
     const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return));
@@ -910,6 +938,8 @@ test "seam ABI: null context is a no-op on every export, never a crash" {
     try testing.expect(!zat_login_ready(null));
     try testing.expect(!zat_feed_parked(null));
     zat_login_reoffer(null);
+    zat_key(null, 'a');
+    try testing.expect(!zat_ime_wanted(null));
     zat_feed_end(null);
     zat_shutdown(null);
 }
