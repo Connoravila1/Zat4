@@ -464,4 +464,80 @@ pub fn main() !void {
         }
         p("  spring step 64 bubbles   {d:>6} ns/frame  (128 channels, all active, 2 sub-steps)\n", .{total / reps});
     }
+
+    // ── Pool visibility (POOL_VISIBILITY_ROADMAP slice 5, G1) ─────────────────
+    // The user-protection wall is pool_size_cap × the fuel ceiling; the value of
+    // each is a MEASUREMENT question, never a safety one. Two numbers: (1) raw
+    // guest-VM throughput on a pool-reading loop (VM dispatch + call_host seam;
+    // the unit the ceiling-case derives from), and (2) the WORST refresh the
+    // default budget admits — pool_size_cap candidates, every score() burning
+    // its whole default fuel on cross-item reads, plus an arrange() burning the
+    // same — run END-TO-END through discover.score (the real hosts, the real
+    // marshaling). The max_fuel ceiling case is derived from (1), not run: at
+    // 5M fuel × 257 runs it is deliberately absurd, and the derived number is
+    // exactly what shows it must never be the DEFAULT.
+    {
+        const discover_m = @import("core/discover.zig");
+        const gvm = @import("core/guest_vm.zig");
+        const gabi = @import("core/guest_abi.zig");
+
+        // (1) Throughput: an endless pool_read loop, stopped only by fuel.
+        const reader_loop = [_]gvm.Instr{
+            .{ .op = .push_const, .value = 3 }, // arg0: a pool index
+            .{ .op = .push_const, .value = 1 }, // arg1: a fact id
+            .{ .op = .call_host, .arg = @intFromEnum(gabi.Capability.pool_read) },
+            .{ .op = .pop },
+            .{ .op = .jump, .arg = 0 },
+        };
+        const H = struct {
+            fn call(_: *anyopaque, _: gabi.Capability, a0: f64, a1: f64) f64 {
+                return a0 + a1; // flat mock: measures the VM+seam, not the table walk
+            }
+        };
+        var hctx: u8 = 0;
+        const mock = gvm.Host{ .ctx = &hctx, .call = H.call };
+        const spin_fuel: u32 = 1_000_000;
+        const vm_t0 = clock.monotonicNanos();
+        _ = gvm.run(&reader_loop, .{ .like_count = 0, .repost_count = 0, .reply_count = 0, .age_hrs = 0, .author_rep = 0, .in_network = false }, 0, spin_fuel, &mock);
+        const vm_ns = clock.monotonicNanos() - vm_t0;
+        const ns_per_instr = @as(f64, @floatFromInt(vm_ns)) / @as(f64, @floatFromInt(spin_fuel));
+
+        // (2) The worst default-budget refresh, end-to-end. score() spins on
+        // pool reads (burns all default fuel per candidate, produces base_score);
+        // arrange() does the same and never emits (the fallback keeps the order).
+        var pool: discover_m.Candidates = .{};
+        defer pool.deinit(gpa);
+        var ci: u32 = 0;
+        while (ci < gabi.pool_size_cap) : (ci += 1) {
+            try pool.append(gpa, .{
+                .ref = discover_m.Ref.from(ci),
+                .created_at = @intCast(1_700_000_000 - @as(i64, ci) * 60),
+                .like_count = ci * 3,
+                .repost_count = ci % 11,
+                .reply_count = ci % 7,
+                .reply_chain_count = 0,
+                .bookmark_count = 0,
+                .profile_click_count = 0,
+                .link_click_count = 0,
+                .negative_count = 0,
+                .author_rep = 0.5,
+                .relevance = 0,
+                .behavioral = 0,
+            }, ci % 2 == 0);
+        }
+        var wcfg = discover_m.DEFAULT_CONFIG;
+        wcfg.guest_program = &reader_loop;
+        wcfg.guest_arrange = &reader_loop;
+        var pool_arena = std.heap.ArenaAllocator.init(gpa);
+        defer pool_arena.deinit();
+        const wc_t0 = clock.monotonicNanos();
+        const worst_order = try discover_m.score(pool_arena.allocator(), &pool, wcfg, 1_700_000_000);
+        const wc_ns = clock.monotonicNanos() - wc_t0;
+
+        const ceiling_runs: f64 = @floatFromInt(gabi.pool_size_cap + 1);
+        const ceiling_ms = ceiling_runs * @as(f64, @floatFromInt(gvm.max_fuel)) * ns_per_instr / 1_000_000.0;
+        p("  guest VM pool_read loop  {d:.1} ns/instr  ({d} instr in {d} us, call_host-heavy)\n", .{ ns_per_instr, spin_fuel, vm_ns / 1_000 });
+        p("  pool worst refresh       {d:>6} ms  ({d} candidates x {d} default fuel, score+arrange all-burn, end-to-end)\n", .{ wc_ns / 1_000_000, worst_order.len, gvm.default_fuel });
+        p("  pool ceiling (derived)   {d:>6} ms  IF every run burned max_fuel={d} — why max is a wall, not a default\n", .{ @as(u64, @intFromFloat(ceiling_ms)), gvm.max_fuel });
+    }
 }

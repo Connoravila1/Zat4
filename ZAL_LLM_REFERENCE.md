@@ -302,6 +302,29 @@ fn score() num {
 }
 ```
 
+### Fresh First (cross-item: the arrange skeleton)
+
+Rank by engagement, then pull every post younger than an hour to the front.
+The two-pass shape — walk the pool and place what matters, then place the
+rest (already-placed posts are simply skipped by `emit`) — is the skeleton
+of most arrangement algorithms.
+
+```
+fn score() num { return like_count + repost_count * 2.0; }
+
+fn arrange() num {
+  var n = pool_len();
+  var i = 0.0;
+  while (i < n) {
+    if (pool_read(i, age_hrs) < 1.0) { emit(i); }
+    i = i + 1.0;
+  }
+  i = 0.0;
+  while (i < n) { emit(i); i = i + 1.0; }
+  return 0.0;
+}
+```
+
 ---
 
 ## 10. Checklist for generating valid Zal
@@ -318,6 +341,10 @@ Before returning Zal, verify:
 - [ ] Every variable is `var`-declared before assignment.
 - [ ] Comments are `//` only.
 - [ ] `retrieve`/user-defined helper calls are **not** used inside `score()`.
+- [ ] `emit(i)` appears only inside `arrange()`; `pool_read`'s second argument
+      is a **bare fact name from §4** (never a number or a variable); the §4
+      facts are **not** referenced bare inside `arrange()` (there is no current
+      post there — read the pool instead).
 
 If a request needs something Zal doesn't have, say so plainly rather than inventing
 syntax — an algorithm that doesn't compile helps no one.
