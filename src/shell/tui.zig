@@ -46,6 +46,7 @@ const feed_core = @import("../core/feed.zig");
 const chat_core = @import("../core/chat.zig");
 const chat_view_core = @import("../core/chat_view.zig");
 const spring = @import("../core/spring.zig");
+const gesture = @import("../core/gesture.zig");
 const chat_relay = @import("chat_relay.zig");
 const chat_e2ee = @import("chat_e2ee.zig");
 const pay_addr = @import("pay_addr.zig");
@@ -2422,7 +2423,14 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 const touch_slop: i32 = 28; // device px, ~a fingertip's wobble
                 const scale: f32 = if (rs.gpu_state) |*gs| gs.scale else 1.0;
                 const view_h: i32 = @intFromFloat(@as(f32, @floatFromInt(m.height_px)) / scale);
+                const view_h_f: f32 = @floatFromInt(view_h);
                 const min_scroll: i32 = @min(0, view_h - rs.gcontent_h - 24);
+                const min_scroll_f: f32 = @floatFromInt(min_scroll);
+                // The gesture core's sample clock: one shell stamp per drained
+                // batch (B4 — the core only subtracts these). Same-frame
+                // events share a stamp; the velocity window spans frames, so
+                // the estimate's denominator is real time.
+                const now_ms: u32 = @truncate(clock_shell.monotonicNanos() / 1_000_000);
                 // This frame's finger travel (logical px) — the fling's
                 // velocity sample. Zero on drag-free frames, which is what
                 // decays the smoothed velocity toward rest during a
@@ -2436,8 +2444,24 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         m.hswipe = false;
                         m.drag_y = tev.y;
                         m.fling_v = 0; // a touch catches the gliding feed (interruptible)
+                        gesture.clear(&m.ring);
+                        gesture.push(&m.ring, .{ .x = @as(f32, @floatFromInt(tev.x)) / scale, .y = @as(f32, @floatFromInt(tev.y)) / scale, .t_ms = now_ms });
+                        // A touch catches a mid-flight edge bounce too, and
+                        // hands the displayed give back to the finger as raw
+                        // travel (roadmap §2.4): the drag resumes the same
+                        // stretch, no snap. Catching a bounce COMMITS the
+                        // press as a scroll (no slop, no tap on release) —
+                        // the finger owns moving content the instant it
+                        // lands, exactly like catching a glide.
+                        if (m.bounce_px != 0) {
+                            m.over_px = gesture.rubberBandInv(std.math.clamp(m.bounce_px, -(view_h_f - 1), view_h_f - 1), view_h_f);
+                            m.bounce_px = 0;
+                            m.bounce_v = 0;
+                            m.scrolling = true;
+                        }
                     },
                     .move => if (m.down_x >= 0) {
+                        gesture.push(&m.ring, .{ .x = @as(f32, @floatFromInt(tev.x)) / scale, .y = @as(f32, @floatFromInt(tev.y)) / scale, .t_ms = now_ms });
                         // The dominant axis at the slop threshold commits the
                         // gesture: vertical -> scroll (as ever), horizontal ->
                         // the nav-drawer swipe (resolved on release). One
@@ -2451,6 +2475,10 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             } else if (adx > touch_slop and adx > ady) {
                                 m.hswipe = true;
                                 if (rs.gpu_state) |*gsd| {
+                                    // Re-grab (§2.4): a settling drawer hands its
+                                    // CURRENT position back to the finger — there
+                                    // is no locked-while-animating state; the 1:1
+                                    // tether below owns motion from here.
                                     m.hswipe_base = gsd.drawer_t;
                                     gsd.drawer_drag = true;
                                 }
@@ -2463,8 +2491,13 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             // spring stands down while the finger owns it.
                             if (rs.gpu_state) |*gsd| {
                                 const dxl = @as(f32, @floatFromInt(@as(i32, tev.x) - m.down_x)) / scale;
+                                const t_old = gsd.drawer_t;
                                 gsd.drawer_t = std.math.clamp(m.hswipe_base + dxl / @as(f32, @floatFromInt(feed_view.drawer_w)), 0.0, 1.0);
                                 gsd.drawer_v = 0;
+                                // Haptic latch edge (§3): a tick the instant
+                                // the tethered drawer crosses its commit
+                                // point, either direction, mid-drag.
+                                if ((t_old < 0.5) != (gsd.drawer_t < 0.5)) m.haptic_pending = 2;
                             }
                         }
                         if (m.scrolling) {
@@ -2477,34 +2510,81 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             // the top of Home builds overscroll; past the
                             // threshold it asks for a refresh. Any upward drag
                             // cancels the pull.
-                            if (rs.gscreen == feed_view.screen_home and rs.gscroll_px == 0 and dy > 0) {
+                            if (rs.gscreen == feed_view.screen_home and rs.gscroll_px >= 0 and dy > 0) {
                                 rs.overscroll_accum += @intFromFloat(dy);
                                 if (rs.overscroll_accum >= pull_refresh_threshold) {
                                     rs.pull_refresh_requested = true;
                                     rs.overscroll_accum = 0;
+                                    m.haptic_pending = 1; // the arming ticks under the finger (§3)
                                 } else {
                                     rs.status = "↓ keep pulling to refresh";
                                 }
                             } else if (dy < 0) {
                                 rs.overscroll_accum = 0;
                             }
-                            rs.gscroll_px += @intFromFloat(dy);
-                            rs.gscroll_px = @max(min_scroll, @min(0, rs.gscroll_px));
+                            // RUBBER-BAND (roadmap §3): travel past an edge
+                            // accumulates RAW overscroll instead of dying in a
+                            // clamp; the curve maps it to displayed give at
+                            // the frame's end. While banded, the LOGICAL
+                            // scroll is pinned exactly at the edge, so the
+                            // accounting below never reads the banded value.
+                            var d = dy;
+                            if (m.over_px != 0) {
+                                const was_top = m.over_px > 0;
+                                m.over_px += d;
+                                if (m.over_px == 0 or (m.over_px > 0) != was_top) {
+                                    // The finger came back through the edge:
+                                    // the remainder re-enters real scrolling.
+                                    d = m.over_px;
+                                    m.over_px = 0;
+                                    rs.gscroll_px = if (was_top) 0 else min_scroll;
+                                } else {
+                                    d = 0;
+                                }
+                            }
+                            if (d != 0) {
+                                const tent = @as(f32, @floatFromInt(rs.gscroll_px)) + d;
+                                if (tent > 0) {
+                                    rs.gscroll_px = 0;
+                                    m.over_px = tent;
+                                } else if (tent < min_scroll_f) {
+                                    rs.gscroll_px = min_scroll;
+                                    m.over_px = tent - min_scroll_f;
+                                } else {
+                                    rs.gscroll_px = @intFromFloat(tent);
+                                }
+                            }
                         }
                     },
                     .button_up => {
                         if (m.hswipe) {
-                            // Release resolves by the HALFWAY rule (owner's
-                            // spec): past half open -> the spring finishes
-                            // the open; short of half -> it goes back in.
+                            // Release: the settle DECISION comes from where
+                            // momentum would land (projection, roadmap §2.2),
+                            // not from where the finger stopped — a small
+                            // flick still sends the drawer all the way. The
+                            // settle spring STARTS with the finger's release
+                            // velocity (§2.3), so the motion picks up exactly
+                            // where the gesture ended.
                             if (rs.gpu_state) |*gsd| {
                                 gsd.drawer_drag = false;
-                                gsd.drawer_want = gsd.drawer_t >= 0.5;
+                                const v_t = gesture.velocity(&m.ring).x / @as(f32, @floatFromInt(feed_view.drawer_w));
+                                gsd.drawer_want = gesture.settleOpen(gsd.drawer_t, v_t);
+                                gsd.drawer_v = v_t;
                             }
                         } else if (m.down_x >= 0 and !m.scrolling) {
                             // A clean tap: the press point, then the release.
                             pointer_events.append(gpa, .{ .x = @intCast(m.down_x), .y = @intCast(m.down_y), .kind = .button_down, .button = 1, .mods = 0, ._pad = 0 }) catch {};
                             pointer_events.append(gpa, .{ .x = tev.x, .y = tev.y, .kind = .button_up, .button = 1, .mods = 0, ._pad = 0 }) catch {};
+                        }
+                        if (m.over_px != 0) {
+                            // A banded release hands the stretch to the bounce
+                            // spring at the speed the give was visibly moving:
+                            // finger velocity through the band's local slope
+                            // (§2.3 velocity handoff, in displayed units).
+                            m.bounce_px = gesture.rubberBand(m.over_px, view_h_f);
+                            m.bounce_v = gesture.velocity(&m.ring).y * gesture.rubberBandSlope(m.over_px, view_h_f);
+                            m.over_px = 0;
+                            m.fling_v = 0; // the spring owns the return; no glide underneath
                         }
                         // A scroll release KEEPS m.fling_v — the glide below
                         // takes over from the sampled velocity.
@@ -2517,24 +2597,48 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 };
                 // MOMENTUM (M-UX, first slice): while dragging, smooth the
                 // per-frame travel into a velocity; with the finger up, the
-                // feed glides on it — exponential friction, killed by the
-                // clamp (no bounce yet) or the next touch. Constants are
+                // feed glides on it — exponential friction. Constants are
                 // per-60Hz-frame: friction 0.955 halves the glide roughly
-                // every quarter second; rest below half a pixel.
+                // every quarter second; rest below half a pixel. A glide that
+                // reaches an edge no longer dies there — it hands its speed
+                // to the bounce spring (roadmap §2.3/§3: no hard walls).
                 const fling_friction: f32 = 0.955;
                 const fling_rest: f32 = 0.5;
                 if (m.scrolling or m.down_x >= 0) {
                     m.fling_v = m.fling_v * 0.6 + frame_dy * 0.4;
                 } else if (@abs(m.fling_v) > fling_rest) {
-                    const before = rs.gscroll_px;
-                    rs.gscroll_px += @intFromFloat(m.fling_v);
-                    rs.gscroll_px = @max(min_scroll, @min(0, rs.gscroll_px));
-                    if (rs.gscroll_px == before and @abs(m.fling_v) >= 1.0) {
-                        m.fling_v = 0; // hit an edge: the glide is spent
+                    const pos = @as(f32, @floatFromInt(rs.gscroll_px)) + m.fling_v;
+                    if (pos > 0 or pos < min_scroll_f) {
+                        const edge: f32 = if (pos > 0) 0 else min_scroll_f;
+                        rs.gscroll_px = @intFromFloat(edge);
+                        m.bounce_px = pos - edge; // the overshoot step, displayed px
+                        m.bounce_v = m.fling_v * 60.0; // px/frame -> px/s
+                        m.fling_v = 0;
                     } else {
+                        rs.gscroll_px = @intFromFloat(pos);
                         m.fling_v *= fling_friction;
                     }
                 } else m.fling_v = 0;
+                // THE EDGE EPISODE writes the frame's scroll: while the finger
+                // holds a stretch, edge + band(raw); while the spring returns
+                // it, edge + bounce. Both offsets are in displayed logical px
+                // and their SIGN names the edge (positive = top). drawDrawer-
+                // style consumers see an ordinary scroll value throughout.
+                if (m.over_px != 0) {
+                    const edge_i: i32 = if (m.over_px > 0) 0 else min_scroll;
+                    rs.gscroll_px = edge_i + @as(i32, @intFromFloat(gesture.rubberBand(m.over_px, view_h_f)));
+                } else if (m.bounce_px != 0 or @abs(m.bounce_v) > 1.0) {
+                    const scroll_bounce = comptime spring.springConstants(0.0, 0.35);
+                    spring.stepScalar(&m.bounce_px, &m.bounce_v, 0.0, scroll_bounce, 1.0 / 60.0);
+                    const edge_i: i32 = if (m.bounce_px > 0 or (m.bounce_px == 0 and m.bounce_v > 0)) 0 else min_scroll;
+                    if (@abs(m.bounce_px) < 0.5 and @abs(m.bounce_v) < 5.0) {
+                        m.bounce_px = 0;
+                        m.bounce_v = 0;
+                        rs.gscroll_px = edge_i;
+                    } else {
+                        rs.gscroll_px = edge_i + @as(i32, @intFromFloat(m.bounce_px));
+                    }
+                }
             },
             .window => |win| {
                 // The pump translates X keys into the same bytes a tty
@@ -4491,6 +4595,16 @@ pub fn mobilePush(mr: *MobileRun, ev: layout_core.InputEvent) bool {
 /// pump already speaks: UTF-8 text, 0x08 backspace, '\r' enter).
 pub fn mobilePushByte(mr: *MobileRun, b: u8) bool {
     return mobile_host.pushByte(&mr.host, mr.rs.gpa, b);
+}
+
+/// One pending haptic tick, taken (read-and-clear). 0 = none; 1 = the
+/// pull-to-refresh arm; 2 = the drawer latch crossing. The pump detects the
+/// edge the frame it happens; the activity performs the actual taptic
+/// (GESTURE_SYSTEM_ROADMAP §3 — the shell fires, the detection is data).
+pub fn mobileHapticTake(mr: *MobileRun) u8 {
+    const tag = mr.host.haptic_pending;
+    mr.host.haptic_pending = 0;
+    return tag;
 }
 
 /// Does the frame WANT the soft keyboard? The composer is the phone's only

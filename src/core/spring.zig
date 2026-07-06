@@ -203,6 +203,26 @@ pub fn stepSprings(s: Slice, active: []bool, dt: f32, acc: *f32) void {
     }
 }
 
+/// Advance ONE scalar spring channel by real frame time `dt`. The single-channel
+/// convenience over the same semi-implicit integrator `stepSprings` uses, for
+/// callers animating a lone value (a nav drawer's open fraction, a scroll
+/// bounce) where a pooled World is ceremony. Sub-steps are derived from `dt`
+/// each call (h <= sub_step), so the motion is frame-rate independent without a
+/// caller-owned accumulator; the max_accum clamp still guards the stall spiral.
+/// Pure (B2): `dt` is a parameter, never a clock read.
+pub fn stepScalar(pos: *f32, vel: *f32, target: f32, c: Constants, dt: f32) void {
+    const d = std.math.clamp(dt, 0.0, max_accum);
+    const n: u32 = @intFromFloat(@ceil(d / sub_step));
+    if (n == 0) return;
+    const h = d / @as(f32, @floatFromInt(n));
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const accel = -c.stiffness * (pos.* - target) - c.damping * vel.*; // mass = 1
+        vel.* += accel * h;
+        pos.* += vel.* * h;
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // THE MODULE (D2 deep, D3 hiding its internals). `World` owns the spring set and
 // is the ONLY way callers touch springs: they hold opaque `Handle`s, never bare
@@ -592,4 +612,24 @@ test "a settled spring goes inactive and stays put" {
     h.step(1.0 / 60.0);
     h.step(1.0 / 60.0);
     try testing.expect(h.pos() == settled);
+}
+
+// Scalar helper — convergence and velocity carry, matching the pooled step's
+// behaviour on the same constants. Guards the drift risk of a second entry
+// point: stepScalar must be the same physics, not a near-copy that decays.
+test "stepScalar converges and carries velocity through a retarget" {
+    const c = springConstants(0.0, 0.35);
+    var pos: f32 = 0.0;
+    var vel: f32 = 0.0;
+    var i: usize = 0;
+    while (i < 180) : (i += 1) stepScalar(&pos, &vel, 1.0, c, 1.0 / 60.0);
+    try testing.expect(@abs(pos - 1.0) < rest_eps);
+    try testing.expect(@abs(vel) < rest_vel_eps);
+
+    // A retarget is just a new target argument: position and velocity flow on
+    // uninterrupted (the momentum carry that makes interruption seamless).
+    var seeded_v: f32 = 5.0; // as if a finger released at speed
+    var p2: f32 = 0.0;
+    stepScalar(&p2, &seeded_v, 1.0, c, 1.0 / 60.0);
+    try testing.expect(p2 > 0.0); // the seeded velocity moved it immediately
 }

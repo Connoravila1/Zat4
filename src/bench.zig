@@ -34,6 +34,7 @@ const raster = @import("core/raster.zig");
 const text_engine = @import("core/text.zig");
 const x11 = @import("core/x11.zig");
 const spring = @import("core/spring.zig");
+const gesture = @import("core/gesture.zig");
 const clock = @import("shell/clock.zig");
 
 const posts_n = 10_000;
@@ -463,6 +464,39 @@ pub fn main() !void {
             total += clock.monotonicNanos() - t0;
         }
         p("  spring step 64 bubbles   {d:>6} ns/frame  (128 channels, all active, 2 sub-steps)\n", .{total / reps});
+    }
+
+    // ── Gesture step (GESTURE_SYSTEM_ROADMAP §7, G1) ──────────────────────────
+    // One frame of the touch pump's pure gesture work, at a realistic worst
+    // case: a 3-sample batched move burst into the ring, a velocity estimate,
+    // the projection settle decision, the rubber-band map, and one scalar
+    // bounce-spring step. The 120 Hz budget is ~8.3 ms; the stop-rule (G3)
+    // halts tuning once this is trivial against it.
+    {
+        var ring: gesture.SampleRing = .empty;
+        var bounce_px: f32 = 40.0;
+        var bounce_v: f32 = -300.0;
+        const c_bounce = spring.springConstants(0.0, 0.35);
+        const reps = 10_000;
+        var total: u64 = 0;
+        var sink: f32 = 0; // keeps the work observable
+        var n: usize = 0;
+        while (n < reps) : (n += 1) {
+            const t_ms: u32 = @intCast(n * 8);
+            const fx: f32 = @floatFromInt(n % 430);
+            const t0 = clock.monotonicNanos();
+            gesture.push(&ring, .{ .x = fx, .y = fx * 0.5, .t_ms = t_ms });
+            gesture.push(&ring, .{ .x = fx + 2, .y = fx * 0.5 + 3, .t_ms = t_ms });
+            gesture.push(&ring, .{ .x = fx + 5, .y = fx * 0.5 + 7, .t_ms = t_ms });
+            const v = gesture.velocity(&ring);
+            const open = gesture.settleOpen(fx / 430.0, v.x / 300.0);
+            const band = gesture.rubberBand(fx, 800.0);
+            spring.stepScalar(&bounce_px, &bounce_v, 0.0, c_bounce, 1.0 / 120.0);
+            total += clock.monotonicNanos() - t0;
+            sink += band + v.y + (if (open) @as(f32, 1) else 0) + bounce_px;
+        }
+        std.mem.doNotOptimizeAway(&sink);
+        p("  gesture step (1 surface) {d:>6} ns/frame  (3-sample burst + velocity + projection + band + bounce)\n", .{total / reps});
     }
 
     // ── Pool visibility (POOL_VISIBILITY_ROADMAP slice 5, G1) ─────────────────

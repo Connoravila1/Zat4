@@ -32,6 +32,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const layout_core = @import("../core/layout.zig");
+const gesture = @import("../core/gesture.zig");
 
 // Android's log stream (liblog): the run loop's network outcomes narrate
 // here on the phone — the status LINE is the desktop's surface, logcat is
@@ -85,6 +86,27 @@ pub const MobileHost = struct {
     /// (interruptibility is the signature — same doctrine as the chat
     /// bubbles' springs).
     fling_v: f32 = 0,
+    /// The active finger's recent samples (logical px, shell-stamped ms) —
+    /// the gesture core's velocity estimate reads these at release, so the
+    /// drawer settle and the edge bounce start from the finger's REAL speed
+    /// (GESTURE_SYSTEM_ROADMAP §2.2/§2.3), not a single-frame delta.
+    ring: gesture.SampleRing = .empty,
+    /// Feed overscroll past the top/bottom edge, in RAW logical px of finger
+    /// travel (the rubber-band curve maps it to displayed give). Nonzero only
+    /// while a drag holds the feed past an edge; release hands it to the
+    /// bounce spring.
+    over_px: f32 = 0,
+    /// The edge-bounce spring channel: displayed overscroll offset + velocity
+    /// (logical px, px/s). Active whenever the offset or velocity is nonzero;
+    /// integrates toward zero (the edge) via spring.stepScalar.
+    bounce_px: f32 = 0,
+    bounce_v: f32 = 0,
+    /// One pending haptic tick, set by the pump the frame a threshold is
+    /// CROSSED during a drag (GESTURE_SYSTEM_ROADMAP §3 — the tick lands
+    /// under the finger, never on release) and taken (read-and-clear) by the
+    /// activity's per-lap poll. 0 none; 1 pull-to-refresh armed; 2 drawer
+    /// latch crossed.
+    haptic_pending: u8 = 0,
 };
 
 pub fn deinit(host: *MobileHost, gpa: Allocator) void {

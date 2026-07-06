@@ -863,6 +863,16 @@ pub export fn zat_key(ctx_ptr: ?*anyopaque, codepoint: u32) void {
     for (buf[0..n]) |b| _ = tui.mobilePushByte(f.run, b);
 }
 
+/// One pending haptic tick, taken (read-and-clear): 0 none, else a tag the
+/// activity maps to a taptic pattern (all current tags = one crisp tick).
+/// Polled each lap beside the IME word.
+pub export fn zat_haptic(ctx_ptr: ?*anyopaque) u32 {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return 0));
+    if (comptime !mobile_config.have_gpu) return 0;
+    const f = if (ctx.feed) |*ff| ff else return 0;
+    return tui.mobileHapticTake(f.run);
+}
+
 /// Does the frame want the soft keyboard? The activity polls this each lap
 /// and shows/hides the IME on the transition (the composer is the phone's
 /// only text surface so far).

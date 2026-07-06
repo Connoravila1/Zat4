@@ -361,6 +361,29 @@ fn imeSetVisible(activity: *Activity, show: bool) void {
     }
 }
 
+/// One crisp taptic on the decor view — the gesture system's threshold
+/// ticks (pull-to-refresh arming, the drawer latch). performHapticFeedback
+/// respects the user's system haptic setting, which is the polite default;
+/// failures log and no-op (E2/E4 — a missed tick, never a crash). Render
+/// thread; attach/detach like the IME hop.
+fn hapticTick(activity: *Activity) void {
+    const vm: JavaVm = @ptrCast(@alignCast(activity.vm));
+    var env: JniEnv = undefined;
+    const attach: AttachFn = @ptrCast(@alignCast(vm.*.slots[vm_attach_current_thread].?));
+    if (attach(vm, &env, null) != 0) return;
+    defer _ = @as(DetachFn, @ptrCast(@alignCast(vm.*.slots[vm_detach_current_thread].?)))(vm);
+
+    const call_bool = jniFn(env, jni_call_boolean_method_a, CallBooleanMethodAFn);
+    const get_window = jniMethod(env, activity.clazz, "getWindow", "()Landroid/view/Window;") orelse return;
+    const window = jniCallObj(env, activity.clazz, get_window, &no_args) orelse return;
+    const get_decor = jniMethod(env, window, "getDecorView", "()Landroid/view/View;") orelse return;
+    const decor = jniCallObj(env, window, get_decor, &no_args) orelse return;
+    const perform = jniMethod(env, decor, "performHapticFeedback", "(I)Z") orelse return;
+    // 6 = HapticFeedbackConstants.CONTEXT_CLICK (the short, crisp tick).
+    _ = call_bool(env, decor, perform, &[_]jvalue{.{ .i = 6 }});
+    if (jniFailed(env)) return seam.logcat("haptic: performHapticFeedback threw", .{});
+}
+
 /// The redirect trampoline (M-And.5). IF the OS ever stacks a fresh
 /// activity instance for the VIEW intent while this process already runs a
 /// live one, this create must not touch `app` — instead: ferry the intent's
@@ -586,6 +609,11 @@ fn renderThread() void {
             if (want_ime != ime_shown) {
                 if (app.activity) |act| imeSetVisible(act, want_ime);
                 ime_shown = want_ime;
+            }
+            // The gesture system's threshold ticks (drawer latch,
+            // pull-to-refresh arm) land as one taptic each.
+            if (seam.zat_haptic(ctx) != 0) {
+                if (app.activity) |act| hapticTick(act);
             }
         } else if (ime_shown) {
             if (app.activity) |act| imeSetVisible(act, false);
