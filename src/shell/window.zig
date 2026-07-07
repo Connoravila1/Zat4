@@ -1027,9 +1027,10 @@ pub fn pump(
             },
             // Pointer events become the OS-agnostic InputEvent and ride
             // their own channel; key bytes keep the terminal channel.
-            // Wheel arrives as X buttons 4/5 (press only — the paired
-            // release carries nothing and is dropped, as are horizontal
-            // wheel buttons 6/7 until a screen wants them).
+            // Wheel arrives as X buttons 4/5 (vertical, press only — the paired
+            // release carries nothing and is dropped). Horizontal wheel /
+            // trackpad swipe arrives as buttons 6/7; forwarded the same way so a
+            // screen (e.g. the Tectonic filmstrip) can pan sideways.
             .button_press, .button_release => {
                 const mods: u8 = @truncate(event.state);
                 switch (event.detail) {
@@ -1041,7 +1042,7 @@ pub fn pump(
                         .mods = mods,
                         ._pad = 0,
                     }),
-                    4, 5 => if (event.kind == .button_press) try events.append(gpa, .{
+                    4, 5, 6, 7 => if (event.kind == .button_press) try events.append(gpa, .{
                         .x = event.w,
                         .y = event.h,
                         .kind = .wheel,

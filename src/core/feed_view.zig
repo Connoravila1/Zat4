@@ -658,6 +658,21 @@ pub const PaneGeom = struct {
     rail_external: bool = false,
 };
 
+/// Toy Box — which LAYOUT-OWNING toy is active this frame. They are mutually
+/// exclusive by construction (each resolves a post's on-screen position), so a
+/// single selection, not one bit per toy. Only `.depth` is wired today; the rest
+/// are reserved (stable enum values) per TOY_BOX_ROADMAP.md §8 so later slices
+/// slot in without renumbering. An enum, not a struct → no A7 guard.
+pub const ToyKind = enum(u8) { none, gravity, zero_g, liquid, tectonic, depth, lava, magnify };
+
+/// The Toy Box selection handed into `layout()` as one plain value — the same
+/// idiom as the `zones`/`geom` bundles (call sites pass `.{}` for "no toy").
+/// A7.2: cold struct — exactly one per frame, never held in a collection. Guard
+/// waived. (It carries only cold selection/tuning fields as more toys land.)
+pub const ToyView = struct {
+    feed_toy: ToyKind = .none,
+};
+
 /// The geometry `layout()` would compute for a given window width + screen,
 /// exposed so the shell can hold it as ANIMATED state (spring one frame's geom
 /// toward the next screen's target and pass it back via `geom`) — the tiling
@@ -1085,6 +1100,115 @@ fn captureBody(out: *SelGlyphs, gpa: Allocator, e: *const text.Engine, dl: *cons
             else => {},
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Toy Box: Depth feed — the draw-range affine transform (re-layout family)
+//
+// A layout-owning cosmetic toy decorates a post by SCALING the draw items it
+// already emitted, in place — not by re-measuring. The natural monotonic stack
+// runs first (so `y`, the scroll cursor, and the `heights` cache stay exact);
+// then, per visible post, we scale its emitted `[start, dl.len)` slice about a
+// pivot. Because both the software `raster.paint` and the GPU `buildVertices`
+// consume the SAME DrawList, one pure transform decorates BOTH renderers. This
+// primitive is the shared mechanism the re-layout family (depth, tectonic) uses;
+// extract to a `core/toy.zig` at the real cut point, when tectonic needs it (F4).
+
+fn clampI16(v: f32) i16 {
+    return @intFromFloat(std.math.clamp(@round(v), -32768, 32767));
+}
+fn clampU16(v: f32) u16 {
+    return @intFromFloat(std.math.clamp(@round(v), 0, 65535));
+}
+fn clampU8(v: f32) u8 {
+    return @intFromFloat(std.math.clamp(@round(v), 0, 255));
+}
+
+/// Scale every draw item in `dl[start..end)` by `s` about pivot (cx, cy), then
+/// translate by (dx, dy) — mutating coordinates in place. Positions move with the
+/// pivot; sizes/font-px/stroke/radius scale by magnitude only (they don't
+/// translate). Affine ⇒ each endpoint transforms independently under the one
+/// shared pivot. The clamps make a pathological scale degrade to a clipped edge
+/// rather than a wrapped i16. `.cell` never appears in a feed post's range (the
+/// feed emits text/rect/line/tri), but it is handled so the primitive is
+/// reusable by any surface. PURE (B2) — plain data in, plain data out.
+pub fn transformDlRange(dl: *raster.DrawList, start: usize, end: usize, s: f32, cx: f32, cy: f32, dx: f32, dy: f32) void {
+    var sl = dl.slice();
+    const tags = sl.items(.tags);
+    const data = sl.items(.data);
+    var i: usize = start;
+    while (i < end) : (i += 1) {
+        switch (tags[i]) {
+            .text => {
+                const t = &data[i].text;
+                t.x = clampI16(cx + (@as(f32, @floatFromInt(t.x)) - cx) * s + dx);
+                t.baseline = clampI16(cy + (@as(f32, @floatFromInt(t.baseline)) - cy) * s + dy);
+                t.px = @intFromFloat(std.math.clamp(@round(@as(f32, @floatFromInt(t.px)) * s), 4, 200));
+            },
+            .rect => {
+                const r = &data[i].rect;
+                r.x = clampI16(cx + (@as(f32, @floatFromInt(r.x)) - cx) * s + dx);
+                r.y = clampI16(cy + (@as(f32, @floatFromInt(r.y)) - cy) * s + dy);
+                r.w = clampU16(@as(f32, @floatFromInt(r.w)) * s);
+                r.h = clampU16(@as(f32, @floatFromInt(r.h)) * s);
+                r.radius = clampU8(@as(f32, @floatFromInt(r.radius)) * s);
+            },
+            .line => {
+                const l = &data[i].line;
+                l.x0 = clampI16(cx + (@as(f32, @floatFromInt(l.x0)) - cx) * s + dx);
+                l.x1 = clampI16(cx + (@as(f32, @floatFromInt(l.x1)) - cx) * s + dx);
+                l.y0 = clampI16(cy + (@as(f32, @floatFromInt(l.y0)) - cy) * s + dy);
+                l.y1 = clampI16(cy + (@as(f32, @floatFromInt(l.y1)) - cy) * s + dy);
+                l.thickness = clampU8(@as(f32, @floatFromInt(l.thickness)) * s);
+            },
+            .tri => {
+                const t = &data[i].tri;
+                t.x0 = clampI16(cx + (@as(f32, @floatFromInt(t.x0)) - cx) * s + dx);
+                t.x1 = clampI16(cx + (@as(f32, @floatFromInt(t.x1)) - cx) * s + dx);
+                t.x2 = clampI16(cx + (@as(f32, @floatFromInt(t.x2)) - cx) * s + dx);
+                t.y0 = clampI16(cy + (@as(f32, @floatFromInt(t.y0)) - cy) * s + dy);
+                t.y1 = clampI16(cy + (@as(f32, @floatFromInt(t.y1)) - cy) * s + dy);
+                t.y2 = clampI16(cy + (@as(f32, @floatFromInt(t.y2)) - cy) * s + dy);
+            },
+            .cell => {
+                const c = &data[i].cell;
+                c.x = clampU16(cx + (@as(f32, @floatFromInt(c.x)) - cx) * s + dx);
+                c.y = clampU16(cy + (@as(f32, @floatFromInt(c.y)) - cy) * s + dy);
+            },
+        }
+    }
+}
+
+/// The same affine on the per-post hit `Region`s emitted in `[start, end)`, so a
+/// scaled post is TAPPABLE where it is drawn (and — on the live GPU path — the SDF
+/// engagement icons, which position off `regions` rects, follow the loom for
+/// free). Icon SIZE is a global uniform on the GPU pass, so icons track position
+/// but keep natural size in v1 (Region has no spare byte to carry a scale; A7).
+pub fn transformRegionsRange(regions: *Regions, start: usize, end: usize, s: f32, cx: f32, cy: f32, dx: f32, dy: f32) void {
+    var i: usize = start;
+    while (i < end) : (i += 1) {
+        const r = &regions.items[i];
+        r.x = clampI16(cx + (@as(f32, @floatFromInt(r.x)) - cx) * s + dx);
+        r.y = clampI16(cy + (@as(f32, @floatFromInt(r.y)) - cy) * s + dy);
+        r.w = clampU16(@as(f32, @floatFromInt(r.w)) * s);
+        r.h = clampU16(@as(f32, @floatFromInt(r.h)) * s);
+    }
+}
+
+/// A post's engagement, widened so like+reply+boost cannot overflow. PURE.
+fn engagementOf(p: PostView) u64 {
+    return @as(u64, p.like) + @as(u64, p.reply) + @as(u64, p.boost);
+}
+
+/// Depth-feed "loom" scale for one post, given the visible slice's engagement
+/// range: quiet posts recede (~0.80), the loudest looms (~1.12). Neutral 1.0-ish
+/// at the midpoint; a flat slice (all equal) maps to 0.5 → no div-by-zero. PURE.
+fn loomScale(p: PostView, eng_min: u64, eng_max: u64) f32 {
+    const norm: f32 = if (eng_max == eng_min)
+        0.5
+    else
+        @as(f32, @floatFromInt(engagementOf(p) - eng_min)) / @as(f32, @floatFromInt(eng_max - eng_min));
+    return 0.8 + norm * 0.32;
 }
 
 fn fxi(v: f32) i32 {
@@ -1758,6 +1882,10 @@ pub fn layout(
     /// The VIEW index of the post whose repost/quote menu is OPEN, or null. The
     /// menu (Repost · Quote post) is drawn AFTER the post loop so it floats on top.
     repost_menu: ?usize,
+    /// Toy Box: the active layout-owning toy (`.none` = natural layout). On Home,
+    /// `.depth` scales each emitted post by engagement (the "loom"); every other
+    /// screen and toy value lays out unchanged.
+    toys: ToyView,
 ) error{OutOfMemory}!i32 {
     var m: Metrics = if (geom) |g|
         .{ .rail_x = g.rail_x, .col_x = g.col_x, .col_w = g.col_w, .lx = g.lx, .cw = g.cw, .side_x = g.side_x, .wide = g.wide }
@@ -1784,6 +1912,16 @@ pub fn layout(
             m.cw = zone_read_w;
         }
     }
+    // Toy Box: Tectonic — the feed becomes a horizontal FILMSTRIP of postcards
+    // that float over the living glyph field. FULL COMMIT: the glass column and
+    // the floating sidebar are suppressed so the strip owns the whole width; the
+    // nav rail stays as the app's spine. Each post is a fixed-height postcard laid
+    // at its natural column position, then TRANSLATED into its horizontal slot
+    // (with a gentle zigzag stagger). Vertical OR horizontal wheel pans it.
+    const tect = toys.feed_toy == .tectonic and active_screen == screen_home;
+    const tcard_h: i32 = 392; // uniform postcard height (logical)
+    const tect_pitch: i32 = m.col_w + 40; // one card + a gutter
+
     if (regions) |rg| rg.clearRetainingCapacity();
     if (socket_hits) |sh| sh.clearRetainingCapacity();
     // No focused post laid out this frame ⇒ no selectable body. Cleared up front;
@@ -1795,7 +1933,9 @@ pub fn layout(
     //    raised plane (the figure/ground fix), then the glass fill, then a 1px lit
     //    inner edge — the universal "raised surface" cue. (The GPU backdrop blur
     //    of the field UNDER the glass is the finishing layer on the GPU path.)
-    if (m.wide) {
+    // Tectonic suppresses the glass column entirely — the postcards float over the
+    // raw field across the full width (its signature "toy" look).
+    if (m.wide and !tect) {
         const sw: i32 = 20;
         const steps: i32 = 5;
         const step = @divTrunc(sw, steps);
@@ -1807,8 +1947,8 @@ pub fn layout(
             try rect(gpa, dl, m.col_x + m.col_w + k * step, 0, step, height, shade, 0); // right gutter
         }
     }
-    try rect(gpa, dl, m.col_x, 0, m.col_w, height, skinVeil(accent), 0); // glass fill
-    if (m.wide) {
+    if (!tect) try rect(gpa, dl, m.col_x, 0, m.col_w, height, skinVeil(accent), 0); // glass fill
+    if (m.wide and !tect) {
         try rect(gpa, dl, m.col_x, 0, 1, height, 0x24EDEAE0, 0); // left lit edge
         try rect(gpa, dl, m.col_x + m.col_w - 1, 0, 1, height, 0x24EDEAE0, 0); // right lit edge
     }
@@ -1829,7 +1969,8 @@ pub fn layout(
         if (!(geom != null and geom.?.rail_external))
             try drawRail(gpa, dl, e, m.rail_x, height, active_screen, regions, accent, skip_heart, 1.0);
         if (!isWidePage(active_screen)) {
-            try drawSidebar(gpa, dl, e, m.side_x, height, if (geom) |gg| gg.search_open else 0, accent); // home/thread: floating 3-pane sidebar
+            // Tectonic reclaims the sidebar's space for the filmstrip.
+            if (!tect) try drawSidebar(gpa, dl, e, m.side_x, height, if (geom) |gg| gg.search_open else 0, accent); // home/thread: floating 3-pane sidebar
         } else if (active_screen == screen_profile) {
             try drawExtension(gpa, dl, e, m, height, regions); // profile: customisable widgets
         } else {
@@ -1924,6 +2065,29 @@ pub fn layout(
     // The repost/quote menu's anchor (the repost button of the open-menu post),
     // captured during the loop and drawn AFTER it so the menu floats on top.
     var menu_anchor: ?struct { x: i32, y: i32, boosted: bool } = null;
+
+    // Toy Box: Depth feed. Home-gated — a Home cosmetic, and gating here keeps it
+    // off the thread screen, so the depth transform never touches a post whose
+    // body glyphs were captured for text selection (`sel_out`, thread-only). One
+    // O(n) scan resolves the visible slice's engagement range for the loom mapping.
+    const depth_active = toys.feed_toy == .depth and active_screen == screen_home;
+    var eng_min: u64 = std.math.maxInt(u64);
+    var eng_max: u64 = 0;
+    if (depth_active) {
+        for (posts) |p| {
+            const eng = engagementOf(p);
+            eng_min = @min(eng_min, eng);
+            eng_max = @max(eng_max, eng);
+        }
+    }
+
+    // Tectonic: a faint horizontal "timeline track" behind the cards (drawn before
+    // the loop, so the postcards land on top) — the platformer ground line.
+    if (tect) {
+        const track_y = feed_y0 + @divTrunc(tcard_h, 2);
+        try rect(gpa, dl, m.rail_x + rail_w, track_y, width - (m.rail_x + rail_w), 2, 0x1CEDEAE0, 0);
+    }
+
     var y: i32 = feed_y0 + scroll;
     for (posts, 0..) |p, pi| {
         // The reply socket precedes this post (its seam in the thread).
@@ -1934,7 +2098,16 @@ pub fn layout(
             y += sh + 18;
         };
         var nb: [12]u8 = undefined;
-        const post_top = y;
+        // Tectonic emits every card at the SAME fixed top (then translates it into
+        // its strip slot), so no natural vertical stacking — `post_top` is constant.
+        const post_top = if (tect) feed_y0 else y;
+        // Tectonic horizontal cull: skip off-strip cards BEFORE the costly text
+        // measure (the vertical cull's role, moved to the X axis). The strip spans
+        // the whole width now (sidebar gone), from the rail edge to the window edge.
+        if (tect) {
+            const sx = m.col_x + @as(i32, @intCast(pi)) * tect_pitch + scroll;
+            if (sx + m.col_w <= m.rail_x + rail_w or sx >= width) continue;
+        }
 
         // Re-root ANCESTOR (condensed context above the re-rooted post): a smaller
         // avatar + dimmed name/body, tappable to re-root on it, linked by a thin
@@ -2061,9 +2234,33 @@ pub fn layout(
         const tray_extra: i32 = if (tray_h > 0) tray_h + 12 else 0;
         const bottom = erow + 22 + tray_extra;
         const next_y = body_end + quote_extra + 60 + tray_extra;
-        const visible = next_y > 0 and post_top < height;
+        // Tectonic cards that survived the horizontal cull are always drawn.
+        const visible = if (tect) true else (next_y > 0 and post_top < height);
+
+        // Toy Box: Depth feed captures this post's draw + region ranges so the
+        // whole card (wash, avatar, name, body, engagement row/icons, tags,
+        // divider) can be scaled as one unit after it is emitted.
+        const dl_start = dl.len;
+        const rg_start: usize = if (regions) |rg| rg.items.len else 0;
 
         if (visible) {
+            // Tectonic: a proper POSTCARD tile behind the whole post — a solid
+            // rounded panel over the field, an author-tint spine along the top, and
+            // a lit edge. Emitted first (behind the content) and inside the captured
+            // range, so it travels with the card when it is translated into its slot.
+            if (tect) {
+                try rect(gpa, dl, m.col_x, post_top - 16, m.col_w, tcard_h, 0xF01F1D17, 22); // card body
+                try rect(gpa, dl, m.col_x, post_top - 16, m.col_w, 5, p.tint, 22); // author-tint spine
+                try rect(gpa, dl, m.col_x, post_top - 16, m.col_w, 1, 0x22EDEAE0, 22); // lit top edge
+                // A big, faint FRAME NUMBER anchors the card as a filmstrip frame
+                // and fills the postcard's lower body. The tinted rule above it ties
+                // the number to the author's colour.
+                var frbuf: [8]u8 = undefined;
+                const frn = std.fmt.bufPrint(&frbuf, "{d:0>2}", .{pi + 1}) catch "";
+                try rect(gpa, dl, m.col_x + 24, post_top + tcard_h - 96, 40, 3, p.tint, 2);
+                _ = try str(gpa, dl, e, .semibold, m.col_x + 22, post_top + tcard_h - 44, 0x1EEDEAE0, 52, frn);
+            }
+
             // The focused post (thread screen): a neutral light-grey wash behind
             // it (NOT the accent — that clashed with the socket colour and muddied
             // the accent selection drawn on top). A touch stronger than the hover
@@ -2242,10 +2439,40 @@ pub fn layout(
             // divider — the vertical stem + elbow are their separation instead.
             if (is_thread) {
                 if (!in_chain) try rect(gpa, dl, ax, bottom, m.col_x + m.col_w - ax - 4, 1, divider, 0);
-            } else {
+            } else if (!tect) { // tectonic cards are separated by the tile, not a line
                 try rect(gpa, dl, m.col_x, bottom, m.col_w, 1, divider, 0);
             }
         }
+
+        // Toy Box: Depth feed. Scale the post's emitted range about its own centre
+        // — nearer (louder) looms, quieter recedes. v1 is scale-only (dx=dy=0); the
+        // pivot at the column centre + post mid keeps the scaled box within ~6% of
+        // the natural edges, so the untransformed cull above stays safe. `y`/`next_y`
+        // (scroll + height accounting) are left untouched, so the `heights` cache and
+        // all scroll math remain exact. Regions transform too, so taps land on the
+        // loomed card and the GPU SDF icons (positioned off regions) follow it.
+        if (visible and active_screen == screen_home) switch (toys.feed_toy) {
+            .depth => {
+                const s = loomScale(p, eng_min, eng_max);
+                const pcx = @as(f32, @floatFromInt(m.col_x)) + @as(f32, @floatFromInt(m.col_w)) * 0.5;
+                const pcy = (@as(f32, @floatFromInt(post_top)) + @as(f32, @floatFromInt(next_y))) * 0.5;
+                transformDlRange(dl, dl_start, dl.len, s, pcx, pcy, 0, 0);
+                if (regions) |rg| transformRegionsRange(rg, rg_start, rg.items.len, s, pcx, pcy, 0, 0);
+            },
+            .tectonic => {
+                // Translate the full-size postcard (no scaling — text stays crisp)
+                // to its horizontal slot. The X offset carries `scroll`, so a
+                // vertical OR horizontal wheel pans the strip; odd cards drop by a
+                // stagger for a playful platformer zigzag.
+                const screen_x = m.col_x + @as(i32, @intCast(pi)) * tect_pitch + scroll;
+                const stagger: i32 = if (pi % 2 == 1) 54 else 0;
+                const dx = @as(f32, @floatFromInt(screen_x - m.col_x));
+                const dy = @as(f32, @floatFromInt(stagger));
+                transformDlRange(dl, dl_start, dl.len, 1.0, 0, 0, dx, dy);
+                if (regions) |rg| transformRegionsRange(rg, rg_start, rg.items.len, 1.0, 0, 0, dx, dy);
+            },
+            else => {},
+        };
         y = next_y;
     }
     // All-same-author thread: the reply socket lands at the very end.
@@ -2315,6 +2542,9 @@ pub fn layout(
     // Phone: the tab bar overlays the bottom edge — grow the content height
     // so the last post scrolls clear of it (the shell's clamp uses this).
     const phone_inset: i32 = if (width <= phone_max) tab_bar_h else 0;
+    // Tectonic maps vertical scroll → horizontal pan, so the "content extent" the
+    // shell clamps scroll against is the STRIP WIDTH (the total run of cards).
+    if (tect) return m.col_x + @as(i32, @intCast(posts.len)) * tect_pitch + 60;
     return y - scroll + phone_inset; // total content height (scroll-independent), for clamping
 }
 
@@ -4274,6 +4504,35 @@ fn drawSettings(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: 
     };
 
     return @max(ly, dy) - scroll + 40;
+}
+
+/// A floating hover TOOLTIP: a rounded panel with wrapped help text, anchored
+/// below-right of the pointer and clamped into `[view_x0, view_x0+view_w]`. The
+/// caller decides WHEN to show it (pointer over a row that opted into a help
+/// string) and appends it LAST so it overlays everything. PURE — appends to `dl`.
+pub fn drawTooltip(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, px: i32, py: i32, view_x0: i32, view_w: i32, help: []const u8) error{OutOfMemory}!void {
+    if (help.len == 0) return;
+    const pad: i32 = 12;
+    const line_h: i32 = 19;
+    const font_px: u16 = 13;
+    const pw: i32 = 300;
+    const inner: i32 = pw - pad * 2;
+    // Anchor a touch below-right of the pointer, then clamp horizontally so the
+    // panel never runs off the viewport edge.
+    var tx = px + 16;
+    if (tx + pw > view_x0 + view_w - 8) tx = view_x0 + view_w - 8 - pw;
+    if (tx < view_x0 + 8) tx = view_x0 + 8;
+    const ty = py + 20;
+    const first_baseline = ty + pad + 13;
+    // Measure the wrapped height (draw_it = false appends nothing to dl).
+    var ovf = false;
+    const y_after = try wrapBodyLimited(gpa, dl, e, tx + pad, first_baseline, inner, 0, font_px, help, line_h, false, null, null, &ovf);
+    const panel_h = (y_after - ty) + pad;
+    // Shadow, panel fill, and a lit top edge — the app's standard raised surface.
+    try rect(gpa, dl, tx, ty + 3, pw, panel_h, 0x66000000, 12);
+    try rect(gpa, dl, tx, ty, pw, panel_h, 0xF61E1C16, 12);
+    try rect(gpa, dl, tx, ty, pw, 1, 0x24EDEAE0, 12);
+    _ = try wrapBodyLimited(gpa, dl, e, tx + pad, first_baseline, inner, 0xFFD8D4CA, font_px, help, line_h, true, null, null, &ovf);
 }
 
 /// The dropdown popover for an open CHOICE: a panel below the row listing the
@@ -6649,7 +6908,7 @@ test "layout emits 4 tap regions per post (avatar + 3 engagement); hitTest resol
     const posts = [_]PostView{
         .{ .name = "A", .handle = "@a.zat", .age = "1m", .body = "hello there field", .tint = 0xFFAAAAAA, .reply = 1, .boost = 2, .like = 3, .initial = 'A', .liked = true, .boosted = false },
     };
-    const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null);
+    const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{});
     try std.testing.expect(h > 112); // content extends below the top bar
     // 8 regions per post: body tap + avatar + reply/repost/like + bookmark/share/more.
     try std.testing.expectEqual(@as(usize, 8), regions.items.len);
@@ -6679,6 +6938,122 @@ test "layout emits 4 tap regions per post (avatar + 3 engagement); hitTest resol
     try std.testing.expect(hitTest(regions.items, 5, 5) == null);
 }
 
+test "Toy Box depth: transformDlRange scales every variant about the pivot" {
+    const gpa = std.testing.allocator;
+    var dl: raster.DrawList = .{};
+    defer dl.deinit(gpa);
+    // One of each variant, positioned away from the origin so a 2x scale about
+    // (0,0) with no translate simply doubles every coordinate/size.
+    try dl.append(gpa, .{ .rect = .{ .x = 10, .y = 20, .w = 30, .h = 40, .color = 0xFF112233, .radius = 4 } });
+    try dl.append(gpa, .{ .text = .{ .x = 5, .baseline = 15, .codepoint = 'Z', .color = 0xFFFFFFFF, .px = 16, .weight = 0 } });
+    try dl.append(gpa, .{ .line = .{ .x0 = 2, .y0 = 3, .x1 = 6, .y1 = 9, .color = 0xFF000000, .thickness = 2 } });
+    try dl.append(gpa, .{ .tri = .{ .x0 = 1, .y0 = 2, .x1 = 3, .y1 = 4, .x2 = 5, .y2 = 6, .color = 0xFF00FF00 } });
+    transformDlRange(&dl, 0, dl.len, 2.0, 0, 0, 0, 0);
+    const r = dl.get(0).rect;
+    try std.testing.expectEqual(@as(i16, 20), r.x);
+    try std.testing.expectEqual(@as(i16, 40), r.y);
+    try std.testing.expectEqual(@as(u16, 60), r.w);
+    try std.testing.expectEqual(@as(u16, 80), r.h);
+    try std.testing.expectEqual(@as(u8, 8), r.radius);
+    try std.testing.expectEqual(@as(u32, 0xFF112233), r.color); // colour untouched
+    const t = dl.get(1).text;
+    try std.testing.expectEqual(@as(i16, 10), t.x);
+    try std.testing.expectEqual(@as(i16, 30), t.baseline);
+    try std.testing.expectEqual(@as(u16, 32), t.px); // font size scales
+    const l = dl.get(2).line;
+    try std.testing.expectEqual(@as(i16, 4), l.x0);
+    try std.testing.expectEqual(@as(i16, 18), l.y1);
+    try std.testing.expectEqual(@as(u8, 4), l.thickness);
+    const tr = dl.get(3).tri;
+    try std.testing.expectEqual(@as(i16, 10), tr.x2);
+    try std.testing.expectEqual(@as(i16, 12), tr.y2);
+
+    // A pathological scale saturates at the i16/u16 bounds rather than wrapping.
+    var big: raster.DrawList = .{};
+    defer big.deinit(gpa);
+    try big.append(gpa, .{ .rect = .{ .x = 30000, .y = -30000, .w = 60000, .h = 5, .color = 0, .radius = 200 } });
+    transformDlRange(&big, 0, big.len, 100.0, 0, 0, 0, 0);
+    const b = big.get(0).rect;
+    try std.testing.expectEqual(@as(i16, 32767), b.x);
+    try std.testing.expectEqual(@as(i16, -32768), b.y);
+    try std.testing.expectEqual(@as(u16, 65535), b.w);
+    try std.testing.expectEqual(@as(u8, 255), b.radius);
+}
+
+test "Toy Box depth: loomScale is monotonic in engagement with a safe flat case" {
+    const quiet: PostView = .{ .name = "q", .handle = "@q", .age = "1m", .body = "", .tint = 0, .reply = 0, .boost = 0, .like = 0, .initial = 'q', .liked = false, .boosted = false };
+    const loud: PostView = .{ .name = "l", .handle = "@l", .age = "1m", .body = "", .tint = 0, .reply = 10, .boost = 10, .like = 80, .initial = 'l', .liked = false, .boosted = false };
+    // Full range: quiet hits the floor, loud hits the ceiling, monotonic between.
+    try std.testing.expectApproxEqAbs(@as(f32, 0.80), loomScale(quiet, 0, 100), 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.12), loomScale(loud, 0, 100), 0.001);
+    try std.testing.expect(loomScale(loud, 0, 100) > loomScale(quiet, 0, 100));
+    // Flat slice (every post equal): no divide-by-zero, neutral midpoint.
+    try std.testing.expectApproxEqAbs(@as(f32, 0.96), loomScale(quiet, 0, 0), 0.001); // 0.8 + 0.5*0.32
+}
+
+test "Toy Box depth: the toy decorates pixels but never moves the scroll accounting" {
+    const gpa = std.testing.allocator;
+    var engine = try text.initEngine();
+    defer text.deinitEngine(gpa, &engine);
+    var dl: raster.DrawList = .{};
+    defer dl.deinit(gpa);
+    var regions: Regions = .empty;
+    defer regions.deinit(gpa);
+
+    const posts = [_]PostView{
+        .{ .name = "Loud", .handle = "@l.zat", .age = "1m", .body = "a lively post that people engaged with heavily", .tint = 0xFFAAAAAA, .reply = 40, .boost = 30, .like = 200, .initial = 'L', .liked = false, .boosted = false },
+        .{ .name = "Quiet", .handle = "@q.zat", .age = "2m", .body = "a quiet post barely anyone noticed at all", .tint = 0xFF888888, .reply = 0, .boost = 0, .like = 0, .initial = 'Q', .liked = false, .boosted = false },
+    };
+
+    // Baseline: natural layout. Record the content height and a checksum of every
+    // text item's geometry (x + baseline + px) so we can prove pixels changed.
+    const h_none = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{});
+    var sum_none: i64 = 0;
+    for (0..dl.len) |i| if (dl.get(i) == .text) {
+        const t = dl.get(i).text;
+        sum_none += @as(i64, t.x) + t.baseline + t.px;
+    };
+
+    // Depth on: same posts, same width/scroll. Height MUST be identical (the toy
+    // never touches the measure pass or the y cursor), but the emitted geometry
+    // MUST differ (posts are scaled by engagement).
+    dl.clearRetainingCapacity();
+    regions.clearRetainingCapacity();
+    const h_depth = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{ .feed_toy = .depth });
+    var sum_depth: i64 = 0;
+    for (0..dl.len) |i| if (dl.get(i) == .text) {
+        const t = dl.get(i).text;
+        sum_depth += @as(i64, t.x) + t.baseline + t.px;
+    };
+
+    try std.testing.expectEqual(h_none, h_depth); // scroll/height accounting untouched
+    try std.testing.expect(sum_none != sum_depth); // but the pixels moved (the loom)
+}
+
+test "Toy Box tectonic: horizontal filmstrip returns strip width and stays tappable" {
+    const gpa = std.testing.allocator;
+    var engine = try text.initEngine();
+    defer text.deinitEngine(gpa, &engine);
+    var dl: raster.DrawList = .{};
+    defer dl.deinit(gpa);
+    var regions: Regions = .empty;
+    defer regions.deinit(gpa);
+
+    const posts = [_]PostView{
+        .{ .name = "A", .handle = "@a.zat", .age = "1m", .body = "first card in the strip", .tint = 0xFFAAAAAA, .reply = 1, .boost = 0, .like = 2, .initial = 'A', .liked = false, .boosted = false },
+        .{ .name = "B", .handle = "@b.zat", .age = "2m", .body = "second card in the strip", .tint = 0xFF999999, .reply = 0, .boost = 1, .like = 3, .initial = 'B', .liked = false, .boosted = false },
+        .{ .name = "C", .handle = "@c.zat", .age = "3m", .body = "third card in the strip", .tint = 0xFF888888, .reply = 2, .boost = 0, .like = 4, .initial = 'C', .liked = false, .boosted = false },
+    };
+
+    // A vertical layout of three short posts is only a few hundred px tall; the
+    // tectonic strip lays them left-to-right, so the returned extent (the width the
+    // shell pans across) is much larger — proof the horizontal model is in effect.
+    const extent = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{ .feed_toy = .tectonic });
+    try std.testing.expect(extent > 900);
+    // On-strip cards still emit tap regions (taps + GPU icons track the moved card).
+    try std.testing.expect(regions.items.len > 0);
+}
+
 test "layout captures the rooted post's body glyphs for selection (thread screen)" {
     const gpa = std.testing.allocator;
     var engine = try text.initEngine();
@@ -6694,14 +7069,14 @@ test "layout captures the rooted post's body glyphs for selection (thread screen
         .{ .name = "A", .handle = "@a.zat", .age = "1m", .body = "hello there field", .tint = 0xFFAAAAAA, .reply = 0, .boost = 0, .like = 0, .initial = 'A', .liked = false, .boosted = false, .is_focus = true },
     };
     // A WIDE layout so the focus post is on-screen and the body is drawn.
-    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_thread, null, 0, accent_house, null, .{}, null, null, &sel, "", .{}, null, 0, 0, .{}, 0, 255, null);
+    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_thread, null, 0, accent_house, null, .{}, null, null, &sel, "", .{}, null, 0, 0, .{}, 0, 255, null, .{});
     // "hello there field" = 15 visible glyphs (spaces are emitted too): the body
     // captured into the selection map, in reading order.
     try std.testing.expect(sel.items.len > 0);
     try std.testing.expectEqual(@as(u32, 'h'), sel.items[0].cp);
 
     // A non-thread screen captures nothing (only the rooted post is selectable).
-    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_home, null, 0, accent_house, null, .{}, null, null, &sel, "", .{}, null, 0, 0, .{}, 0, 255, null);
+    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_home, null, 0, accent_house, null, .{}, null, null, &sel, "", .{}, null, 0, 0, .{}, 0, 255, null, .{});
     try std.testing.expectEqual(@as(usize, 0), sel.items.len);
 }
 
@@ -6783,7 +7158,7 @@ test "long timeline does not overflow draw coordinates (off-screen posts skipped
     const posts = try arena.alloc(PostView, n);
     for (posts) |*pv| pv.* = .{ .name = "x", .handle = "@x.zat", .age = "1m", .body = "a body line that wraps a little across the feed column width here", .tint = 0xFF888888, .reply = 1, .boost = 2, .like = 3, .initial = 'x', .liked = false, .boosted = false };
 
-    const h = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null); // must not panic
+    const h = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{}); // must not panic
     try std.testing.expect(h > 940 * 10); // height accounts for the whole list
     try std.testing.expect(regions.items.len < 4 * 24); // only on-screen posts are tappable
 
@@ -6797,11 +7172,11 @@ test "long timeline does not overflow draw coordinates (off-screen posts skipped
     @memset(heights, -1);
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h_fill = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null);
+    const h_fill = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{});
     const fill_regions = regions.items.len;
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h_cached = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null);
+    const h_cached = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{});
     try std.testing.expectEqual(h, h_fill);
     try std.testing.expectEqual(h, h_cached);
     try std.testing.expectEqual(fill_regions, regions.items.len);
@@ -6824,7 +7199,7 @@ test "profile screen renders the author's posts under a header; other screens st
     // Profile screen: 8 post tap regions (body + avatar + reply/repost/like +
     // bookmark/share/more) + 4 profile-nav tab regions in the sticky header
     // (the header here isn't editable, so no edit-profile region).
-    const hp = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_profile, header, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null);
+    const hp = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_profile, header, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{});
     try std.testing.expect(hp > 112);
     try std.testing.expectEqual(@as(usize, 12), regions.items.len);
 
@@ -6832,7 +7207,7 @@ test "profile screen renders the author's posts under a header; other screens st
     // so no tap regions, and the height clamps to the viewport (no post stack).
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const he = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, 2, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null); // Activity (a still-bare placeholder)
+    const he = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, 2, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{}); // Activity (a still-bare placeholder)
     try std.testing.expectEqual(@as(i32, 940), he);
     try std.testing.expectEqual(@as(usize, 0), regions.items.len);
 
@@ -6845,7 +7220,7 @@ test "profile screen renders the author's posts under a header; other screens st
     regions.clearRetainingCapacity();
     // Narrow width (460): `m.wide` is false so the rail emits no regions — the
     // only regions are the settings surface's own, keeping the count exact.
-    _ = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_settings, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, settings_view.sec_account, 0, .{}, 0, 255, null);
+    _ = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_settings, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, settings_view.sec_account, 0, .{}, 0, 255, null, .{});
     // Rows that emit a tap region: not info, and not WIP-greyed (those are inert).
     var account_interactive: usize = 0;
     for (settings_view.rows) |r| {
@@ -7041,7 +7416,7 @@ test "zones browse: each catalog entry emits one .zone_open card region carrying
         .{ .tag = "zig", .count = 913 },
         .{ .tag = "small-net", .count = 1 },
     };
-    const h = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_zones_browse, null, 0, accent_house, null, .{}, null, null, null, "", .{ .cards = &zones }, null, 0, 0, .{}, 0, 255, null);
+    const h = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_zones_browse, null, 0, accent_house, null, .{}, null, null, null, "", .{ .cards = &zones }, null, 0, 0, .{}, 0, 255, null, .{});
     try std.testing.expect(h > 0);
     // Each card emits `.zone_open` (whole card) AND `.zone_pin` (its bookmark)
     // carrying the same catalog index; the pin is emitted after so it wins the
@@ -7087,7 +7462,7 @@ test "zones hub: search filters the browse grid; the pinned tab shows only pins;
     };
 
     // Search "water" on Browse: only the two matching cards emit regions.
-    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_zones_browse, null, 0, accent_house, null, .{}, null, null, null, "", .{ .cards = &zones, .query = "water" }, null, 0, 0, .{}, 0, 255, null);
+    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_zones_browse, null, 0, accent_house, null, .{}, null, null, null, "", .{ .cards = &zones, .query = "water" }, null, 0, 0, .{}, 0, 255, null, .{});
     var opens: usize = 0;
     for (regions.items) |r| {
         if (r.kind != .zone_open) continue;
@@ -7097,7 +7472,7 @@ test "zones hub: search filters the browse grid; the pinned tab shows only pins;
     try std.testing.expectEqual(@as(usize, 2), opens);
 
     // The Pinned tab: only the pinned card.
-    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_zones_browse, null, 0, accent_house, null, .{}, null, null, null, "", .{ .cards = &zones, .tab = 1, .tab_t = 1 }, null, 0, 0, .{}, 0, 255, null);
+    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_zones_browse, null, 0, accent_house, null, .{}, null, null, null, "", .{ .cards = &zones, .tab = 1, .tab_t = 1 }, null, 0, 0, .{}, 0, 255, null, .{});
     opens = 0;
     for (regions.items) |r| {
         if (r.kind != .zone_open) continue;
@@ -7107,7 +7482,7 @@ test "zones hub: search filters the browse grid; the pinned tab shows only pins;
     try std.testing.expectEqual(@as(usize, 1), opens);
 
     // Trending: only zones that moved in the window (recent > 0) list.
-    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_zones_browse, null, 0, accent_house, null, .{}, null, null, null, "", .{ .cards = &zones, .tab = 2, .tab_t = 2 }, null, 0, 0, .{}, 0, 255, null);
+    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_zones_browse, null, 0, accent_house, null, .{}, null, null, null, "", .{ .cards = &zones, .tab = 2, .tab_t = 2 }, null, 0, 0, .{}, 0, 255, null, .{});
     opens = 0;
     for (regions.items) |r| {
         if (r.kind != .zone_open) continue;
