@@ -40,6 +40,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const auth = @import("auth.zig");
 const write = @import("write.zig");
+const lexicon = @import("../core/lexicon.zig");
 const clock = @import("clock.zig");
 const loadout_store = @import("loadout.zig");
 const algorithm_shell = @import("algorithm.zig");
@@ -93,7 +94,30 @@ pub const Request = struct {
     algo_tags_csv: []const u8 = "",
     algo_designed: u8 = 0,
 
-    pub const Kind = enum(u8) { like, unlike, repost, unrepost, loadout, publish_algo, delete_algo };
+    /// For a `.chain` write only: the queued post segments (each already
+    /// seated optimistically under its temp cid) and the record-level tags
+    /// riding every segment. The base reply target's four refs ride the
+    /// chain_* fields; the quote ref (segment 0 only) reuses the
+    /// subject_uri/subject_cid seats. All owned; empty = absent. This is the
+    /// posting freeze's fix: each segment pays the volume tax and does its
+    /// createRecord HERE, off the UI loop — a several-segment chain used to
+    /// block the render thread for seconds.
+    chain_segments: []ChainSegment = &.{},
+    chain_tags: [][]const u8 = &.{},
+    chain_root_uri: []const u8 = "",
+    chain_root_cid: []const u8 = "",
+    chain_parent_uri: []const u8 = "",
+    chain_parent_cid: []const u8 = "",
+
+    pub const Kind = enum(u8) { like, unlike, repost, unrepost, loadout, publish_algo, delete_algo, chain };
+};
+
+/// One queued post of a `.chain` send: its optimistic temp cid (the UI's
+/// reconcile key) and the text to publish. Owned by the request.
+/// A7.2: cold struct, size guard waived — human-rate, slice-carrying.
+pub const ChainSegment = struct {
+    temp_cid: []const u8,
+    text: []const u8,
 };
 
 /// What the worker reports back. `cid` matches the request's post so the
@@ -138,6 +162,17 @@ fn freeRequest(gpa: Allocator, r: Request) void {
         gpa.free(surf.ids);
         gpa.free(surf.colors);
     }
+    for (r.chain_segments) |cs| {
+        gpa.free(cs.temp_cid);
+        gpa.free(cs.text);
+    }
+    if (r.chain_segments.len > 0) gpa.free(r.chain_segments);
+    for (r.chain_tags) |t| gpa.free(t);
+    if (r.chain_tags.len > 0) gpa.free(r.chain_tags);
+    gpa.free(r.chain_root_uri);
+    gpa.free(r.chain_root_cid);
+    gpa.free(r.chain_parent_uri);
+    gpa.free(r.chain_parent_cid);
 }
 
 pub fn freeResult(gpa: Allocator, r: Result) void {
@@ -381,6 +416,40 @@ pub fn submitPublishAlgo(worker: *Worker, args: PublishAlgoArgs, now: i64) bool 
     return true;
 }
 
+/// Queue a whole post CHAIN (a lone post is a chain of one). OWNERSHIP MOVES
+/// on success: the segments, tags, target refs, and quote refs are the
+/// caller's gpa-owned strings, handed over as-is (no dupes) — the worker
+/// frees them with the request. On a refused push (mailbox OOM) NOTHING is
+/// freed and false returns; the caller still owns everything. Empty
+/// root/parent = no base reply; empty quote_uri = no quote.
+pub fn submitChain(
+    worker: *Worker,
+    segments: []ChainSegment,
+    tags: [][]const u8,
+    root_uri: []const u8,
+    root_cid: []const u8,
+    parent_uri: []const u8,
+    parent_cid: []const u8,
+    quote_uri: []const u8,
+    quote_cid: []const u8,
+    now: i64,
+) bool {
+    return worker.inbox.push(worker.gpa, .{
+        .kind = .chain,
+        .cid = "",
+        .subject_uri = quote_uri,
+        .subject_cid = quote_cid,
+        .record_uri = "",
+        .now = now,
+        .chain_segments = segments,
+        .chain_tags = tags,
+        .chain_root_uri = root_uri,
+        .chain_root_cid = root_cid,
+        .chain_parent_uri = parent_uri,
+        .chain_parent_cid = parent_cid,
+    });
+}
+
 pub fn start(
     gpa: Allocator,
     io: std.Io,
@@ -485,9 +554,18 @@ fn processOne(worker: *Worker, req: Request) void {
             // The declared surfaces + tags, as the record's string lists.
             var surf: [3][]const u8 = undefined;
             var ns: usize = 0;
-            if (req.algo_designed & 1 != 0) { surf[ns] = "feed"; ns += 1; }
-            if (req.algo_designed & 2 != 0) { surf[ns] = "replies"; ns += 1; }
-            if (req.algo_designed & 4 != 0) { surf[ns] = "zones"; ns += 1; }
+            if (req.algo_designed & 1 != 0) {
+                surf[ns] = "feed";
+                ns += 1;
+            }
+            if (req.algo_designed & 2 != 0) {
+                surf[ns] = "replies";
+                ns += 1;
+            }
+            if (req.algo_designed & 4 != 0) {
+                surf[ns] = "zones";
+                ns += 1;
+            }
             var tags: std.ArrayList([]const u8) = .empty;
             var it = std.mem.splitScalar(u8, req.algo_tags_csv, ',');
             while (it.next()) |raw| {
@@ -517,6 +595,78 @@ fn processOne(worker: *Worker, req: Request) void {
         return;
     }
 
+    // A post CHAIN: publish each segment in order, THREADING it to the one
+    // just created (root = the base reply's root, else segment 0's own ref;
+    // parent = the previous segment). Each segment pays the volume tax and
+    // blocks on its createRecord HERE — off the UI loop, which already shows
+    // the optimistic posts. One Result per segment: `.cid` is the temp cid
+    // (the UI's reconcile key), `revert_uri` carries the REAL record cid
+    // (the publish_algo seat-reuse precedent), `.ok` the real uri. A
+    // failure stops the chain; the remaining segments each get a net_error
+    // result so the UI drops their optimistic posts (E2 — contained).
+    if (req.kind == .chain) {
+        var chain_root: ?lexicon.RecordRef = null;
+        var prev_ref: ?lexicon.RecordRef = null;
+        var stopped = false;
+        for (req.chain_segments) |seg| {
+            var outcome: Result.Outcome = undefined;
+            var real_cid: []const u8 = "";
+            if (stopped) {
+                outcome = .{ .net_error = gpa.dupe(u8, "ChainStopped") catch "error" };
+            } else {
+                const facets = write.resolveFacets(arena, worker.io, worker.environ, worker.session, seg.text) catch &[_]lexicon.Facet{};
+                const seg_target: ?write.ReplyTarget = if (prev_ref == null)
+                    (if (req.chain_root_cid.len > 0) .{
+                        .root_uri = req.chain_root_uri,
+                        .root_cid = req.chain_root_cid,
+                        .parent_uri = req.chain_parent_uri,
+                        .parent_cid = req.chain_parent_cid,
+                    } else null)
+                else
+                    .{
+                        .root_uri = chain_root.?.uri,
+                        .root_cid = chain_root.?.cid,
+                        .parent_uri = prev_ref.?.uri,
+                        .parent_cid = prev_ref.?.cid,
+                    };
+                const seg_quote: ?lexicon.RecordRef = if (prev_ref == null and req.subject_uri.len > 0)
+                    .{ .uri = req.subject_uri, .cid = req.subject_cid }
+                else
+                    null;
+                const posted = write.createPost(gpa, arena, worker.io, worker.environ, worker.session, seg.text, facets, seg_target, seg_quote, req.chain_tags, req.now) catch |err| blk: {
+                    stopped = true;
+                    outcome = .{ .net_error = gpa.dupe(u8, @errorName(err)) catch "error" };
+                    break :blk null;
+                };
+                if (posted) |result| switch (result) {
+                    .ok => |ref| {
+                        real_cid = gpa.dupe(u8, ref.cid) catch "";
+                        outcome = .{ .ok = gpa.dupe(u8, ref.uri) catch "" };
+                        // The refs live in this request's arena — valid for
+                        // the rest of the walk.
+                        if (chain_root == null) chain_root = if (req.chain_root_cid.len > 0)
+                            .{ .uri = req.chain_root_uri, .cid = req.chain_root_cid }
+                        else
+                            ref;
+                        prev_ref = ref;
+                    },
+                    .failed => |f| {
+                        stopped = true;
+                        outcome = .{ .refused = .{ .status = f.status, .code = gpa.dupe(u8, f.code) catch "" } };
+                    },
+                };
+            }
+            const temp_copy = gpa.dupe(u8, seg.temp_cid) catch {
+                if (real_cid.len > 0) gpa.free(real_cid);
+                freeOutcome(gpa, outcome);
+                continue;
+            };
+            const res: Result = .{ .kind = .chain, .cid = temp_copy, .revert_uri = real_cid, .outcome = outcome };
+            if (!worker.outbox.push(gpa, res)) freeResult(gpa, res);
+        }
+        return;
+    }
+
     const call = switch (req.kind) {
         .like => write.likePost(gpa, arena, worker.io, worker.environ, worker.session, req.subject_uri, req.subject_cid, req.now),
         .repost => write.repostPost(gpa, arena, worker.io, worker.environ, worker.session, req.subject_uri, req.subject_cid, req.now),
@@ -525,7 +675,7 @@ fn processOne(worker: *Worker, req: Request) void {
         // The marketplace retraction: delete the algorithm record by uri.
         // `cid` carries the record cid back so the UI drops its local rows.
         .delete_algo => write.deleteAlgorithm(gpa, arena, worker.io, worker.environ, worker.session, req.record_uri),
-        .loadout, .publish_algo => unreachable, // handled above
+        .loadout, .publish_algo, .chain => unreachable, // handled above
     };
 
     const outcome: Result.Outcome = if (call) |wo| switch (wo) {

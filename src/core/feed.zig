@@ -1569,6 +1569,14 @@ pub fn reconcileOptimisticPost(
     real_uri: []const u8,
 ) error{OutOfMemory}!void {
     const index = lookupCid(store, temp_cid) orelse return;
+    // A refresh may have landed the REAL post while the create was in flight
+    // (the send runs off-thread now, so the window is seconds wide): the
+    // server copy wins — the temp seat comes down instead of double-keying
+    // the cid onto two rows (a duplicate in the feed).
+    if (lookupCid(store, real_cid) != null) {
+        dropOptimisticPost(store, temp_cid);
+        return;
+    }
     const adapter = std.hash_map.StringIndexAdapter{ .bytes = &store.string_bytes };
     const ctx = std.hash_map.StringIndexContext{ .bytes = &store.string_bytes };
     _ = store.post_by_cid.removeAdapted(temp_cid, adapter); // drop the temp key
@@ -2374,6 +2382,61 @@ test "timestamps: format is the exact inverse of parse" {
         @as(i64, 1_718_438_400),
         try parseTimestamp(formatTimestamp(&buf, 1_718_438_400)),
     );
+}
+
+test "reconcile: a refresh that already landed the real post wins — the temp seat drops, no duplicate" {
+    const gpa = testing.allocator; // C6
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+
+    // The optimistic seat (the composer's 0ms post) under a temp cid…
+    _ = try ingestLivePost(gpa, &store, .{
+        .did = "did:plc:me",
+        .handle = "me.zat4.com",
+        .uri = "",
+        .cid = "pending:0",
+        .text = "hello field",
+        .reply_parent_cid = "",
+        .reply_root_cid = "",
+        .created_at = 100,
+    });
+    // …then a refresh lands the REAL post (the off-thread send window) BEFORE
+    // the worker's result reconciles the temp cid.
+    const page: lexicon.TimelinePage = .{ .feed = &.{.{ .post = .{
+        .uri = "at://did:plc:me/app.zat4.feed.post/r1",
+        .cid = "bafyreal1",
+        .author = .{ .did = "did:plc:me", .handle = "me.zat4.com" },
+        .record = .{ .text = "hello field", .createdAt = "2026-06-28T00:00:00Z" },
+    } }} };
+    _ = try ingestPage(gpa, &store, page);
+
+    try reconcileOptimisticPost(gpa, &store, "pending:0", "bafyreal1", "at://did:plc:me/app.zat4.feed.post/r1");
+
+    // One visible copy: the server row keeps the cid; the temp row is gone
+    // from the feed (dropOptimisticPost detached it).
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const items = try buildTimeline(arena_state.allocator(), &store);
+    var seen: usize = 0;
+    for (items) |it| {
+        if (std.mem.eql(u8, it.cid, "bafyreal1")) seen += 1;
+        try testing.expect(!std.mem.eql(u8, it.cid, "pending:0"));
+    }
+    try testing.expectEqual(@as(usize, 1), seen);
+    // And the normal (no-race) path still swaps temp → real in place.
+    _ = try ingestLivePost(gpa, &store, .{
+        .did = "did:plc:me",
+        .handle = "me.zat4.com",
+        .uri = "",
+        .cid = "pending:1",
+        .text = "second",
+        .reply_parent_cid = "",
+        .reply_root_cid = "",
+        .created_at = 200,
+    });
+    try reconcileOptimisticPost(gpa, &store, "pending:1", "bafyreal2", "at://did:plc:me/app.zat4.feed.post/r2");
+    try testing.expect(lookupCid(&store, "bafyreal2") != null);
+    try testing.expect(lookupCid(&store, "pending:1") == null);
 }
 
 test "optimistic: like applies once, reverts cleanly, unknown cid is a value" {

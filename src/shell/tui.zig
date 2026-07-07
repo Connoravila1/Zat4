@@ -1900,6 +1900,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 .loadout => null, // loadout writes post no result; defensive only
                 .publish_algo => null, // its result drives the dev flow below
                 .delete_algo => null, // its result drives the dashboard below
+                .chain => null, // per-segment post results, reconciled below
             };
             if (deferred) |set| {
                 if (set.remove(std.hash.Wyhash.hash(0, res.cid))) {
@@ -1940,16 +1941,27 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         }
                         refilterMarket(rs);
                         rs.status = "Deleted — retracted from the marketplace.";
+                    } else if (res.kind == .chain) {
+                        // A chain segment landed: swap its optimistic temp cid
+                        // for the server's real ref (`cid` = the temp key,
+                        // `revert_uri` = the REAL record cid — the seat-reuse
+                        // precedent, `uri` = the real record uri).
+                        feed_core.reconcileOptimisticPost(gpa, store, res.cid, res.revert_uri, uri) catch {};
                     } else if (uri.len > 0) switch (res.kind) {
                         // Record OUR created like/repost uri so a later unlike/
                         // unrepost can delete that record — the AppView never sends
                         // viewer.like, so the optimistic path has no uri otherwise.
                         .like => feed_core.setLikeUri(gpa, store, res.cid, uri) catch {},
                         .repost => feed_core.setRepostUri(gpa, store, res.cid, uri) catch {},
-                        .unlike, .unrepost, .loadout, .publish_algo, .delete_algo => {},
+                        .unlike, .unrepost, .loadout, .publish_algo, .delete_algo, .chain => {},
                     };
                 },
-                .refused => |f| if (res.kind == .delete_algo) {
+                .refused => |f| if (res.kind == .chain) {
+                    // A refused segment: its optimistic post comes down (the
+                    // worker already stopped the rest of the chain).
+                    feed_core.dropOptimisticPost(store, res.cid);
+                    rs.status = std.fmt.bufPrint(&rs.status_buf, "send refused: {d} {s}", .{ f.status, f.code }) catch "send refused";
+                } else if (res.kind == .delete_algo) {
                     rs.status = std.fmt.bufPrint(&rs.status_buf, "delete refused: {d} {s}", .{ f.status, f.code }) catch "delete refused";
                 } else if (res.kind == .publish_algo) {
                     rs.gdev_step = .review; // nothing was published; the draft stands
@@ -1958,7 +1970,13 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     revertWrite(res.kind, gpa, store, res.cid, res.revert_uri) catch {};
                     rs.status = std.fmt.bufPrint(&rs.status_buf, "refused: {d} {s}", .{ f.status, f.code }) catch "refused";
                 },
-                .net_error => |name| if (res.kind == .delete_algo) {
+                .net_error => |name| if (res.kind == .chain) {
+                    feed_core.dropOptimisticPost(store, res.cid);
+                    rs.status = if (std.mem.eql(u8, name, "ChainStopped"))
+                        rs.status // keep the first failure's message
+                    else
+                        std.fmt.bufPrint(&rs.status_buf, "send failed: {s}", .{name}) catch "send failed";
+                } else if (res.kind == .delete_algo) {
                     rs.status = std.fmt.bufPrint(&rs.status_buf, "delete failed: {s} — retry", .{name}) catch "delete failed";
                 } else if (res.kind == .publish_algo) {
                     rs.gdev_step = .review;
@@ -2654,70 +2672,35 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
         }
 
         // 0ms posting: a queued send was shown optimistically and PAINTED above
-        // this frame; perform the actual create write now, then reconcile the
-        // temp cid to the server's (keep the post) or drop it on failure. The
-        // write blocks briefly, but the post is already on screen — it FELT
-        // instant. Network failure is contained (E2); only OOM is fatal.
+        // this frame; hand the actual create writes to the WRITE WORKER. Each
+        // segment pays the volume tax and blocks on its createRecord — done
+        // inline this froze the render thread for seconds on a several-segment
+        // chain (the owner's live finding), so the whole walk runs off-thread
+        // and its per-segment results reconcile in the write drain above
+        // (temp cid → the server's real ref, or drop on failure). Ownership
+        // MOVES into the request on a successful submit; a refused push (no
+        // worker / mailbox OOM) drops the optimistic posts and frees here (E2).
         if (rs.pending_send) |chain| {
             rs.pending_send = null;
-            defer freeChain(gpa, chain);
-            // Publish each segment in order, THREADING it to the one just created:
-            // the root is the base reply's root (a reply-chain) or segment 0's own
-            // created ref (a fresh thread); the parent is the previous segment. A
-            // segment's refusal/failure stops the chain and drops the remaining
-            // optimistic posts (E2 — contained; only OOM is fatal).
-            var chain_root: ?lexicon.RecordRef = null; // resolved after segment 0
-            var prev_ref: ?lexicon.RecordRef = null; // the previous segment's ref
-            var stopped = false;
-            for (chain.segments) |seg| {
-                if (stopped) {
-                    feed_core.dropOptimisticPost(store, seg.temp_cid);
-                    continue;
-                }
-                const facets = write.resolveFacets(arena, io, environ, session, seg.text) catch |err| switch (err) {
-                    error.OutOfMemory => return err,
-                    else => &[_]lexicon.Facet{}, // post without facets rather than fail
-                };
-                // This segment's reply target: segment 0 uses the external base;
-                // later segments reply to the previous segment under the resolved
-                // thread root.
-                const seg_target: ?write.ReplyTarget = if (prev_ref == null)
-                    chain.base_target
-                else
-                    .{
-                        .root_uri = chain_root.?.uri,
-                        .root_cid = chain_root.?.cid,
-                        .parent_uri = prev_ref.?.uri,
-                        .parent_cid = prev_ref.?.cid,
-                    };
-                // The quote embed attaches to segment 0 only (prev_ref == null).
-                const seg_quote: ?lexicon.RecordRef = if (prev_ref == null) chain.base_quote else null;
-                const posted = write.createPost(gpa, arena, io, environ, session, seg.text, facets, seg_target, seg_quote, chain.tags, now) catch |err| switch (err) {
-                    error.OutOfMemory => return err,
-                    else => blk: {
-                        feed_core.dropOptimisticPost(store, seg.temp_cid);
-                        rs.status = "send failed";
-                        stopped = true;
-                        break :blk null;
-                    },
-                };
-                if (posted) |result| switch (result) {
-                    .ok => |ref| {
-                        feed_core.reconcileOptimisticPost(gpa, store, seg.temp_cid, ref.cid, ref.uri) catch {};
-                        // The thread root: the base reply's root when replying out,
-                        // else segment 0's own created ref. Set once, on segment 0.
-                        if (chain_root == null) chain_root = if (chain.base_target) |bt|
-                            .{ .uri = bt.root_uri, .cid = bt.root_cid }
-                        else
-                            ref;
-                        prev_ref = ref;
-                    },
-                    .failed => |f| {
-                        feed_core.dropOptimisticPost(store, seg.temp_cid);
-                        rs.status = std.fmt.bufPrint(&rs.status_buf, "send refused: {d} {s}", .{ f.status, f.code }) catch "refused";
-                        stopped = true;
-                    },
-                };
+            var submitted = false;
+            if (rs.writer) |w| {
+                submitted = write_worker.submitChain(
+                    w,
+                    chain.segments,
+                    chain.tags,
+                    if (chain.base_target) |t| t.root_uri else "",
+                    if (chain.base_target) |t| t.root_cid else "",
+                    if (chain.base_target) |t| t.parent_uri else "",
+                    if (chain.base_target) |t| t.parent_cid else "",
+                    if (chain.base_quote) |q| q.uri else "",
+                    if (chain.base_quote) |q| q.cid else "",
+                    now,
+                );
+            }
+            if (!submitted) {
+                for (chain.segments) |seg| feed_core.dropOptimisticPost(store, seg.temp_cid);
+                rs.status = "send failed — no write worker";
+                freeChain(gpa, chain);
             }
         }
 
@@ -6021,10 +6004,9 @@ fn handleProfileInput(
 // One post in a queued chain: its optimistic temp cid and its text. The
 // inter-segment reply refs are NOT stored — they depend on each createPost's
 // real result, so the drain threads them as it goes (seg i replies to seg i-1).
-const SendJob = struct {
-    temp_cid: []const u8,
-    text: []const u8,
-};
+/// One queued post of a chain send — the worker's own segment shape (the
+/// chain is handed to the write worker whole, no re-boxing at the seam).
+const SendJob = write_worker.ChainSegment;
 
 // The most posts one thread composer can queue at once (active box + finalized
 // segments). A soft ceiling — a chain longer than this is almost never intended.
@@ -7266,6 +7248,7 @@ fn revertWrite(kind: write_worker.Request.Kind, gpa: Allocator, store: *feed_cor
         .loadout => {}, // loadout writes are not optimistic; nothing to revert
         .publish_algo => {}, // the dev flow reconciles its own state (no store optimism)
         .delete_algo => {}, // the dashboard reconciles its own state
+        .chain => {}, // the chain drain drops its optimistic post explicitly
     }
 }
 
