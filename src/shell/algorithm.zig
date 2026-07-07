@@ -217,6 +217,15 @@ pub fn fetch(
 /// `pds_url` is the record's host; the SSRF guard is on (network content).
 /// DEFERRED SECURITY (Phase 12): bound the response size before parse — same note
 /// as `fetch` above; `parse` clips after std.json allocates.
+/// What a public algorithm read yields: the validated config (what runs) and
+/// the record's Zal SOURCE (what a human reads — "" on pre-schema-rev
+/// records; the transparency page falls back to the serialized config).
+/// A7.2: cold result, size guard waived.
+pub const PublicAlgo = struct {
+    config: discover.FeedConfig,
+    source: []const u8,
+};
+
 pub fn fetchPublic(
     arena: Allocator,
     io: std.Io,
@@ -224,7 +233,7 @@ pub fn fetchPublic(
     pds_url: []const u8,
     repo: []const u8,
     rkey: []const u8,
-) !?discover.FeedConfig {
+) !?PublicAlgo {
     const params = [_]xrpc.Param{
         .{ .name = "repo", .value = repo },
         .{ .name = "collection", .value = lexicon.collection.algorithm },
@@ -232,7 +241,10 @@ pub fn fetchPublic(
     };
     const outcome = try net.query(arena, io, environ, pds_url, lexicon.method.get_record, &params, lexicon.GetRecordResponse(AlgorithmRecord), .{ .guard = .untrusted });
     return switch (outcome) {
-        .ok => |r| algorithm_core.parse(arena, r.value.config) catch discover.DEFAULT_CONFIG,
+        .ok => |r| .{
+            .config = algorithm_core.parse(arena, r.value.config) catch discover.DEFAULT_CONFIG,
+            .source = r.value.source,
+        },
         .failed => null,
     };
 }

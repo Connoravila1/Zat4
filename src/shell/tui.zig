@@ -534,6 +534,7 @@ const RunState = struct {
     market_cards: std.ArrayList(feed_view.MarketAlgoCard),
     on_market_prev: bool,
     inspect_bytes: ?[]const u8,
+    inspect_src: ?[]const u8, // the record's Zal source (null -> fall back to the config bytes)
     inspect_name: []const u8,
     inspect_ref: []const u8,
     transp_return_screen: u8,
@@ -541,6 +542,7 @@ const RunState = struct {
     inspect_loading: bool,
     inspectjob: InspectJob,
     config_cache: std.StringHashMapUnmanaged([]u8),
+    src_cache: std.StringHashMapUnmanaged([]u8), // CID -> Zal source, beside the config cache (A8)
     thread_rerooted: bool,
     gcollapsed: std.ArrayList([]const u8),
     gexpanded: std.ArrayList([]const u8),
@@ -1180,6 +1182,8 @@ fn initRunState(
     // local map hit (instant), only a never-seen algorithm pays the network fetch.
     // (A size cap / eviction is a later concern; the marketplace is small for now.)
     rs.config_cache = .empty;
+    rs.src_cache = .empty;
+    rs.inspect_src = null;
     // RE-ROOT mode: false when a thread is opened from the timeline (show the WHOLE
     // thread, scroll to the focus); true when a reply is tapped INSIDE the thread
     // (re-root on it: condensed ancestors above + the focus + its subtree).
@@ -1240,6 +1244,7 @@ fn deinitRunState(rs: *RunState) void {
     }
     {
         if (rs.inspect_bytes) |b| gpa.free(b);
+        if (rs.inspect_src) |b| gpa.free(b);
         if (rs.inspect_name.len > 0) gpa.free(rs.inspect_name);
         if (rs.inspect_ref.len > 0) gpa.free(rs.inspect_ref);
     }
@@ -1250,6 +1255,12 @@ fn deinitRunState(rs: *RunState) void {
             gpa.free(kv.value_ptr.*);
         }
         rs.config_cache.deinit(gpa);
+        var sit = rs.src_cache.iterator();
+        while (sit.next()) |kv| {
+            gpa.free(kv.key_ptr.*);
+            gpa.free(kv.value_ptr.*);
+        }
+        rs.src_cache.deinit(gpa);
     }
     stopInspect(&rs.inspectjob); // join any in-flight fetch before exit
     {
@@ -2118,6 +2129,28 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     std.heap.page_allocator.free(b);
                     rs.inspectjob.bytes = null;
                 }
+                // The record's Zal source, beside the config (schema rev): shown
+                // by the source sub-view when present; cached like the config.
+                if (rs.inspect_src) |old_src| gpa.free(old_src);
+                rs.inspect_src = null;
+                if (rs.inspectjob.src) |sb| {
+                    rs.inspect_src = gpa.dupe(u8, sb) catch null;
+                    if (rs.inspect_ref.len > 0 and !rs.src_cache.contains(rs.inspect_ref)) {
+                        const k = gpa.dupe(u8, rs.inspect_ref) catch null;
+                        const v = gpa.dupe(u8, sb) catch null;
+                        if (k != null and v != null) {
+                            rs.src_cache.put(gpa, k.?, v.?) catch {
+                                gpa.free(k.?);
+                                gpa.free(v.?);
+                            };
+                        } else {
+                            if (k) |kk| gpa.free(kk);
+                            if (v) |vv| gpa.free(vv);
+                        }
+                    }
+                    std.heap.page_allocator.free(sb);
+                    rs.inspectjob.src = null;
+                }
             } else rs.status = "algorithm: unavailable";
             rs.inspect_loading = false;
         }
@@ -2287,7 +2320,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
+        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
         switch (rs.mode) {
             .timeline => try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status),
             .compose => {
@@ -3385,6 +3418,8 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                             rs.gscreen = rs.transp_return_screen;
                                             if (rs.inspect_bytes) |b| gpa.free(b);
                                             rs.inspect_bytes = null;
+                                            if (rs.inspect_src) |b| gpa.free(b);
+                                            rs.inspect_src = null;
                                         }
                                     } else {
                                         rs.gscreen = if (rs.gscreen == feed_view.screen_zones) rs.zone_return_screen else rs.thread_return_screen;
@@ -3975,12 +4010,19 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                     // the job, so its thread can't outlive the reused fields.
                                     if (rs.inspectjob.active) {
                                         joinInspect(&rs.inspectjob);
-                                        if (rs.inspectjob.ok) if (rs.inspectjob.bytes) |b| std.heap.page_allocator.free(b);
+                                        if (rs.inspectjob.ok) {
+                                            if (rs.inspectjob.bytes) |b| std.heap.page_allocator.free(b);
+                                            if (rs.inspectjob.src) |b| std.heap.page_allocator.free(b);
+                                        }
+                                        rs.inspectjob.bytes = null;
+                                        rs.inspectjob.src = null;
                                     }
                                     if (rs.inspect_name.len > 0) gpa.free(rs.inspect_name);
                                     if (rs.inspect_ref.len > 0) gpa.free(rs.inspect_ref);
                                     if (rs.inspect_bytes) |b| gpa.free(b);
                                     rs.inspect_bytes = null;
+                                    if (rs.inspect_src) |b| gpa.free(b);
+                                    rs.inspect_src = null;
                                     rs.inspect_name = try gpa.dupe(u8, r.name);
                                     rs.inspect_ref = try gpa.dupe(u8, r.cid);
                                     rs.transp_return_screen = rs.gscreen;
@@ -3991,6 +4033,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                     // CID) — serve it from the cache, INSTANT, no network.
                                     if (rs.config_cache.get(r.cid)) |cached| {
                                         rs.inspect_bytes = gpa.dupe(u8, cached) catch null;
+                                        if (rs.src_cache.get(r.cid)) |sc| rs.inspect_src = gpa.dupe(u8, sc) catch null;
                                         rs.inspect_loading = false;
                                     } else {
                                         // Never seen: fetch on a worker (public read, no shared
@@ -6578,6 +6621,7 @@ const InspectJob = struct {
     active: bool = false, // a fetch is running (or finished, not yet consumed)
     ok: bool = false, // a config was produced (read after done-acquire / join)
     bytes: ?[]u8 = null, // page_allocator-owned serialized config on success
+    src: ?[]u8 = null, // page_allocator-owned Zal source (null on old records)
     // Inputs, COPIED in so the worker never reads run-loop state (which the UI
     // thread mutates). io/env are shared but read-only / thread-safe.
     io: std.Io = undefined,
@@ -6598,12 +6642,13 @@ fn inspectWorker(job: *InspectJob) void {
     var arena_state = std.heap.ArenaAllocator.init(a);
     defer arena_state.deinit();
     const scratch = arena_state.allocator();
-    const cfg = algorithm_shell.fetchPublic(scratch, job.io, job.env, job.pds[0..job.pds_len], job.repo[0..job.repo_len], job.rkey[0..job.rkey_len]) catch null;
-    if (cfg) |c| {
+    const pub_algo = algorithm_shell.fetchPublic(scratch, job.io, job.env, job.pds[0..job.pds_len], job.repo[0..job.repo_len], job.rkey[0..job.rkey_len]) catch null;
+    if (pub_algo) |pa| {
         // Serialize into page_allocator (survives the arena deinit); the main
-        // thread copies it into gpa and frees this after join.
-        if (algorithm_core.serialize(a, c)) |b| {
+        // thread copies both into gpa and frees these after join.
+        if (algorithm_core.serialize(a, pa.config)) |b| {
             job.bytes = b;
+            job.src = if (pa.source.len > 0) a.dupe(u8, pa.source) catch null else null;
             job.ok = true;
         } else |_| job.ok = false;
     } else job.ok = false;
@@ -6650,7 +6695,10 @@ fn stopInspect(job: *InspectJob) void {
     if (job.thread) |th| {
         th.join();
         job.thread = null;
-        if (job.ok) if (job.bytes) |b| std.heap.page_allocator.free(b);
+        if (job.ok) {
+            if (job.bytes) |b| std.heap.page_allocator.free(b);
+            if (job.src) |b| std.heap.page_allocator.free(b);
+        }
     }
     job.active = false;
 }
@@ -6717,6 +6765,7 @@ const Grid = struct {
     /// The inspected algorithm's SERIALIZED bytes (stable; the render re-parses
     /// them into the frame arena — see the run-loop note). Empty = not inspecting.
     inspect_bytes: []const u8 = "",
+    inspect_src: []const u8 = "", // Zal source when the record carries it; "" -> config bytes
     inspect_name: []const u8 = "",
     inspect_ref: []const u8 = "",
     /// On the transparency page: false = the summary, true = the byte-exact source.
@@ -7647,7 +7696,7 @@ fn paintFrame(
                 } else if (g.inspect_bytes.len > 0) {
                     if (g.inspect_source) {
                         // The byte-exact source IS the stored serialized config.
-                        g.content_h.* = feed_view.layoutAlgorithmSource(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.inspect_name, g.inspect_ref, g.inspect_bytes) catch g.content_h.*;
+                        g.content_h.* = feed_view.layoutAlgorithmSource(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.inspect_name, g.inspect_ref, if (g.inspect_src.len > 0) g.inspect_src else g.inspect_bytes) catch g.content_h.*;
                     } else {
                         // Re-parse into THIS frame's arena (stable bytes → valid slices).
                         const cfg = algorithm_core.parse(arena, g.inspect_bytes) catch discover.DEFAULT_CONFIG;
@@ -8248,7 +8297,7 @@ fn paintFrameGpu(
                 g.content_h.* = feed_view.layoutAlgorithmLoading(gpa, g.engine, @intCast(gs.design_w), g.draw, g.regions, g.accent, g.inspect_name) catch g.content_h.*;
             } else if (g.inspect_bytes.len > 0) {
                 if (g.inspect_source) {
-                    g.content_h.* = feed_view.layoutAlgorithmSource(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.inspect_name, g.inspect_ref, g.inspect_bytes) catch g.content_h.*;
+                    g.content_h.* = feed_view.layoutAlgorithmSource(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.inspect_name, g.inspect_ref, if (g.inspect_src.len > 0) g.inspect_src else g.inspect_bytes) catch g.content_h.*;
                 } else {
                     const cfg = algorithm_core.parse(arena, g.inspect_bytes) catch discover.DEFAULT_CONFIG;
                     if (transparency.buildPage(arena, g.inspect_name, g.inspect_ref, cfg) catch null) |pg|
