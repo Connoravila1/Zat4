@@ -192,7 +192,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -367,6 +367,19 @@ fn fadeItems(dl: *raster.DrawList, from: usize, t: f32) void {
 /// from a fresh post by a non-empty target handle (the shell already tracks the
 /// reply target separately; this only drives the look).
 pub const ComposeContext = enum(u8) { post, reply, profile };
+
+/// The composer TAG BAR for one frame, as plain values (B5): the live INLINE
+/// #tags mirrored out of the draft, the manual "+ tag" chips, the LOCKED tag
+/// (composing from a zone page — drawn solid, no ×, cannot be removed), and
+/// the add-tag input's text/focus/caret. A7.2: cold — one per frame.
+pub const ComposeTagBarView = struct {
+    inline_tags: []const []const u8 = &.{},
+    manual: []const []const u8 = &.{},
+    locked: []const u8 = "",
+    input: []const u8 = "",
+    input_focus: bool = false,
+    caret_on: bool = false,
+};
 
 /// The viewer's real identity for the Settings → Account info rows. Plain values
 /// handed in by the shell (B5); empty ⇒ the table's placeholder shows instead.
@@ -579,6 +592,19 @@ pub fn homeSocketBottom(socket_tray: ?lens_socket.TrayView, socket_ui: lens_sock
     return @max(base, socket_y_wide + lens_socket.measuredHeight(tray, socket_ui, homeSocketGeom(wide_min)));
 }
 
+/// The ZONE page's occlusion bottom: the collapsing masthead's CURRENT height,
+/// extended over the zone socket's OPEN tray (which drops over the posts,
+/// exactly like Home's) — the same clip contract as homeSocketBottom, at the
+/// live scroll. PURE.
+pub fn zoneSocketBottom(socket_tray: ?lens_socket.TrayView, socket_ui: lens_socket.SocketUi, scroll: i32, wide: bool) i32 {
+    const base = zoneHeaderH(scroll, wide);
+    const tray = socket_tray orelse return base;
+    if (!socket_ui.open) return base;
+    const off: i32 = if (wide) zone_header_h_wide - zone_socket_y_wide else zone_header_h_narrow - zone_socket_y_narrow;
+    const geom: lens_socket.Geometry = .{ .x = 0, .y = base - off, .w = zone_read_w, .scale = 1.0 };
+    return @max(base, (base - off) + lens_socket.measuredHeight(tray, socket_ui, geom));
+}
+
 /// The exact geometry the Home header lays the socket out at, for a given
 /// layout width — so the shell can run `lens_socket.dropIndex` (the drag
 /// insertion math) against the same grid the widget drew.
@@ -763,7 +789,6 @@ fn str(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, weight: text
     while (it.nextCodepoint()) |cp| x = try glyph1(gpa, dl, e, weight, x, baseline, color, px, cp);
     return x;
 }
-
 
 /// Word-wrap `body` to `maxw`, honouring explicit '\n' HARD breaks; returns the
 /// baseline after the last line. When `draw_it` is false it only measures
@@ -2510,6 +2535,8 @@ pub fn layoutCompose(
     /// carrying its index); the "Add" button (`.compose_add`) appends the active
     /// box here, and Send publishes them all as one self-reply chain.
     segments: []const []const u8,
+    /// The TAG BAR's state — see `ComposeTagBarView`.
+    tag_bar: ComposeTagBarView,
     dl: *raster.DrawList,
     regions: ?*Regions,
 ) error{OutOfMemory}!void {
@@ -2529,7 +2556,9 @@ pub fn layoutCompose(
     const body_line: i32 = @max(24, @as(i32, @intCast(text.lineMetrics(e, .regular, 17).height)));
     const seg_row: i32 = body_line + 10;
     const stack_h: i32 = if (segments.len > 0) @as(i32, @intCast(segments.len)) * seg_row + 14 else 0;
-    const card_h: i32 = @min(height - card_y - 40, 380 + stack_h);
+    const has_tag_bar = ctx != .profile;
+    const bar_h: i32 = if (has_tag_bar) 48 else 0;
+    const card_h: i32 = @min(height - card_y - 40, 380 + stack_h + bar_h);
     try rect(gpa, dl, cx0, card_y, cw, card_h, skinPanel(accent), 18);
 
     const pad: i32 = 24;
@@ -2597,6 +2626,68 @@ pub fn layoutCompose(
 
     // Footer: Cancel (left, text) · char count · Send pill (right).
     const fy = card_y + card_h - 46;
+
+    // ── THE TAG BAR — the post's zones, gathered in one place while you
+    // write: the LOCKED chip (composing from a zone page — solid, no ×),
+    // the "+ tag" chips (removable), and the live INLINE #tags mirrored out
+    // of the prose (dim — they live in the text; edit the text to drop
+    // them). Duplicates fold left-to-right: locked > manual > inline.
+    if (has_tag_bar) {
+        const bar_y = fy - 64;
+        var chx = lx;
+        const chip_h: i32 = 30;
+        const right_stop = cx0 + cw - pad;
+        // Locked (the zone you're posting into).
+        if (tag_bar.locked.len > 0) {
+            const w2: i32 = @intCast(text.measure(e, .semibold, tag_bar.locked, 13) + 34);
+            if (chx + w2 <= right_stop) {
+                try rect(gpa, dl, chx, bar_y, w2, chip_h, accent, 15);
+                const hx2 = try str(gpa, dl, e, .semibold, chx + 12, bar_y + 20, bg, 13, "#");
+                _ = try str(gpa, dl, e, .semibold, hx2, bar_y + 20, bg, 13, tag_bar.locked);
+                chx += w2 + 8;
+            }
+        }
+        // Manual chips, each with an × (the × is the tap target).
+        for (tag_bar.manual, 0..) |t, ti| {
+            if (std.ascii.eqlIgnoreCase(t, tag_bar.locked)) continue;
+            const tw2: i32 = @intCast(text.measure(e, .semibold, t, 13));
+            const w2 = tw2 + 52;
+            if (chx + w2 > right_stop) break;
+            try rect(gpa, dl, chx, bar_y, w2, chip_h, 0x33000000, 15);
+            const hx2 = try str(gpa, dl, e, .semibold, chx + 12, bar_y + 20, ink, 13, "#");
+            _ = try str(gpa, dl, e, .semibold, hx2, bar_y + 20, ink, 13, t);
+            _ = try str(gpa, dl, e, .semibold, chx + w2 - 22, bar_y + 20, faint, 13, "\xC3\x97");
+            try emitRegion(gpa, regions, chx + w2 - 30, bar_y, 30, @intCast(chip_h), @intCast(ti), .compose_tag_remove);
+            chx += w2 + 8;
+        }
+        // Inline mirrors (already in the prose) — dim, not removable here.
+        inline_loop: for (tag_bar.inline_tags) |t| {
+            if (std.ascii.eqlIgnoreCase(t, tag_bar.locked)) continue;
+            for (tag_bar.manual) |mt| if (std.ascii.eqlIgnoreCase(mt, t)) continue :inline_loop;
+            const w2: i32 = @intCast(text.measure(e, .semibold, t, 13) + 34);
+            if (chx + w2 > right_stop) break;
+            try rect(gpa, dl, chx, bar_y, w2, chip_h, 0x1AEDEAE0, 15);
+            const hx2 = try str(gpa, dl, e, .semibold, chx + 12, bar_y + 20, muted, 13, "#");
+            _ = try str(gpa, dl, e, .semibold, hx2, bar_y + 20, muted, 13, t);
+            chx += w2 + 8;
+        }
+        // The "+ tag" doorway / the live tag input.
+        if (tag_bar.input_focus) {
+            const iw: i32 = 130;
+            if (chx + iw <= right_stop) {
+                try rect(gpa, dl, chx, bar_y, iw, chip_h, 0x33000000, 15);
+                try rect(gpa, dl, chx, bar_y + chip_h - 2, iw, 2, accent, 1);
+                const hx2 = try str(gpa, dl, e, .semibold, chx + 12, bar_y + 20, muted, 13, "#");
+                const tend = try str(gpa, dl, e, .semibold, hx2, bar_y + 20, ink, 13, tag_bar.input);
+                if (tag_bar.caret_on) try rect(gpa, dl, tend + 1, bar_y + 7, 2, 16, accent, 1);
+                try emitRegion(gpa, regions, chx, bar_y, iw, @intCast(chip_h), 0, .compose_tag_add);
+            }
+        } else if (chx + 70 <= right_stop) {
+            try rect(gpa, dl, chx, bar_y, 66, chip_h, 0x22000000, 15);
+            _ = try str(gpa, dl, e, .semibold, chx + 12, bar_y + 20, faint, 13, "+ tag");
+            try emitRegion(gpa, regions, chx, bar_y, 66, @intCast(chip_h), 0, .compose_tag_add);
+        }
+    }
     // Cancel
     const cancel_w: i32 = @intCast(text.measure(e, .semibold, "Cancel", 14) + 28);
     try rect(gpa, dl, lx, fy, cancel_w, 34, 0x33000000, 14);
@@ -3120,7 +3211,7 @@ pub fn layoutLoadout(
         try rect(gpa, dl, gx, gy, 4, 56, lens_socket.palette[@min(bd.color, lens_socket.palette.len - 1)], 2);
         _ = try str(gpa, dl, e, .semibold, gx + 16, gy + 33, ink, 15, bd.name);
     }
-        return content_h;
+    return content_h;
 }
 
 /// The MARKETPLACE tab: browse published algorithms. Each card shows the name,
@@ -4783,13 +4874,24 @@ fn drawZoneHeader(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m
             try rect(gpa, dl, nend + 14, ty + 8, cw + 24, 24, fadeColor((0x26 << 24) | (on & 0x00FFFFFF), fi), 12);
             _ = try str(gpa, dl, e, .regular, nend + 26, ty + 24, fadeColor(on, fi), 12, chip);
 
+            // "+ Post" — compose INTO this zone (the tag arrives locked in the
+            // composer's tag bar). Left of Pin, same visual weight.
+            const pin = if (zv.pinned) "Pinned" else "Pin";
+            const pw: i32 = @intCast(text.measure(e, .semibold, pin, 14) + 50);
+            const px = redge - pw;
+            {
+                const pl = "+ Post";
+                const plw: i32 = @intCast(text.measure(e, .semibold, pl, 14) + 32);
+                const plx = px - plw - 10;
+                try rect(gpa, dl, plx, ty + 4, plw, 40, fadeColor((0x2A << 24) | (on & 0x00FFFFFF), fi), 12);
+                _ = try str(gpa, dl, e, .semibold, plx + 16, ty + 29, fadeColor(on, fi), 14, pl);
+                if (ct < 0.2) try emitRegion(gpa, regions, plx, ty + 4, plw, 40, 0, .zone_compose);
+            }
+
             // Pin — a LIVE toggle. Unpinned: a quiet translucent pill ("Pin").
             // Pinned: the reverse pill (solid contrast fill) with a filled
             // bookmark ("Pinned") — kept, unmistakably. Its tap target only
             // exists while the block is readable (no invisible toggles).
-            const pin = if (zv.pinned) "Pinned" else "Pin";
-            const pw: i32 = @intCast(text.measure(e, .semibold, pin, 14) + 50);
-            const px = redge - pw;
             if (zv.pinned) {
                 try rect(gpa, dl, px, ty + 4, pw, 40, fadeColor(on, fi), 12);
                 try iconBookmarkFill(gpa, dl, px + 16, ty + 15, 17, fadeColor(zc, fi));
@@ -4890,7 +4992,7 @@ fn drawZoneSidebar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, 
     const sx = m.lx + m.cw + zone_side_gap;
     const sw = zone_side_w;
     const y0 = zoneHeaderH(scroll, true) + 18;
-    const card_h: i32 = 320;
+    const card_h: i32 = 372;
     try rect(gpa, dl, sx, y0, sw, card_h, panel, 14);
     try rect(gpa, dl, sx, y0, sw, 1, 0x14EDEAE0, 14);
     const ix = sx + 20;
@@ -4943,20 +5045,31 @@ fn drawZoneSidebar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, 
     }
     y += 22;
 
-    // The Pin toggle, full width — the sidebar's one action.
+    // "Post in #zone" — the community's primary action, full width.
     const bw = sw - 40;
     const bh: i32 = 40;
+    {
+        var plb: [80]u8 = undefined;
+        const pl = std.fmt.bufPrint(&plb, "Post in #{s}", .{zone_title}) catch "Post here";
+        const plw: i32 = @intCast(text.measure(e, .semibold, pl, 14));
+        try rect(gpa, dl, ix, y, bw, bh, accent, 12);
+        _ = try str(gpa, dl, e, .semibold, ix + @divTrunc(bw - plw, 2), y + 26, bg, 14, pl);
+        try emitRegion(gpa, regions, ix, y, bw, @intCast(bh), 0, .zone_compose);
+        y += bh + 12;
+    }
+
+    // The Pin toggle, full width — secondary to Post (one accent button per
+    // card); pinned state reads from the FILLED accent bookmark.
     const pin_label = if (zv.pinned) "Pinned" else "Pin this zone";
     const lw: i32 = @intCast(text.measure(e, .semibold, pin_label, 14));
     const label_x = ix + @divTrunc(bw - lw, 2) + 12; // shifted right of the icon
     const icon_x = label_x - 24;
+    try rect(gpa, dl, ix, y, bw, bh, skinPanel(accent), 12);
+    try rect(gpa, dl, ix, y, bw, 1, 0x22EDEAE0, 12);
     if (zv.pinned) {
-        try rect(gpa, dl, ix, y, bw, bh, accent, 12);
-        try iconBookmarkFill(gpa, dl, icon_x, y + 11, 17, bg);
-        _ = try str(gpa, dl, e, .semibold, label_x, y + 26, bg, 14, pin_label);
+        try iconBookmarkFill(gpa, dl, icon_x, y + 11, 17, accent);
+        _ = try str(gpa, dl, e, .semibold, label_x, y + 26, ink, 14, pin_label);
     } else {
-        try rect(gpa, dl, ix, y, bw, bh, skinPanel(accent), 12);
-        try rect(gpa, dl, ix, y, bw, 1, 0x22EDEAE0, 12);
         try iconBookmark(gpa, dl, icon_x, y + 11, 17, ink);
         _ = try str(gpa, dl, e, .semibold, label_x, y + 26, ink, 14, pin_label);
     }
@@ -5589,7 +5702,6 @@ fn strEllipsis(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, weig
 /// can scroll. The thread bottom-anchors at scroll 0 (newest visible above
 /// the composer); scroll > 0 reveals older history. The chrome and the
 /// conversation list do not scroll.
-
 pub fn layoutChat(
     gpa: Allocator,
     e: *const text.Engine,
@@ -6604,7 +6716,7 @@ test "layoutCompose emits send + cancel regions; multi-line draft + empty draft 
 
     // A reply draft spanning an explicit newline (Enter inserts '\n').
     const draft_ml = "line one\nline two is a bit longer so it wraps";
-    try layoutCompose(gpa, &engine, 1300, 900, accent_house, .reply, "@mara.zat", "", draft_ml, 5, 9, 17, true, "", &.{}, &dl, &regions);
+    try layoutCompose(gpa, &engine, 1300, 900, accent_house, .reply, "@mara.zat", "", draft_ml, 5, 9, 17, true, "", &.{}, .{}, &dl, &regions);
     try std.testing.expect(dl.len > 0);
     var saw_send = false;
     var saw_cancel = false;
@@ -6622,10 +6734,30 @@ test "layoutCompose emits send + cancel regions; multi-line draft + empty draft 
         try std.testing.expectEqual(r.kind, hit.kind);
     }
 
+    // The TAG BAR: a locked zone chip (no ×), one manual chip (its × emits
+    // .compose_tag_remove with the chip index), an inline mirror (no ×), and
+    // the "+ tag" doorway (.compose_tag_add). The profile editor draws none.
+    dl.len = 0;
+    try layoutCompose(gpa, &engine, 1300, 900, accent_house, .post, "", "", "", 0, 0, 0, true, "", &.{}, .{ .inline_tags = &.{"water"}, .manual = &.{"rivers"}, .locked = "deep" }, &dl, &regions);
+    var n_add: usize = 0;
+    var n_remove: usize = 0;
+    for (regions.items) |r| {
+        if (r.kind == .compose_tag_add) n_add += 1;
+        if (r.kind == .compose_tag_remove) {
+            try std.testing.expectEqual(@as(u16, 0), r.post); // the chip's index
+            n_remove += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), n_add);
+    try std.testing.expectEqual(@as(usize, 1), n_remove); // locked + inline emit NO remove
+
     // An empty profile draft renders the placeholder path without crashing.
     dl.len = 0;
-    try layoutCompose(gpa, &engine, 700, 800, accent_house, .profile, "", "", "", 0, 0, 0, true, "saving...", &.{}, &dl, &regions);
+    try layoutCompose(gpa, &engine, 700, 800, accent_house, .profile, "", "", "", 0, 0, 0, true, "saving...", &.{}, .{}, &dl, &regions);
     try std.testing.expect(dl.len > 0);
+    for (regions.items) |r| {
+        try std.testing.expect(r.kind != .compose_tag_add and r.kind != .compose_tag_remove);
+    }
 
     // The inverse (click → caret offset) replays the same wrap: a click far
     // before the text lands at 0; a click far past it lands at the end.

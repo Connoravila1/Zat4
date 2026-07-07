@@ -398,7 +398,7 @@ pub fn main(init: std.process.Init) !void {
     dl.len = 0;
     try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
     const draft_demo = "a small network is one where you can actually read the room — not weather, a room.";
-    try feed_view.layoutCompose(gpa, &engine, @intCast(W), @intCast(H), feed_view.accent_house, .reply, "@mara.zat", "", draft_demo, draft_demo.len, 0, 0, true, "", &.{}, &dl, null);
+    try feed_view.layoutCompose(gpa, &engine, @intCast(W), @intCast(H), feed_view.accent_house, .reply, "@mara.zat", "", draft_demo, draft_demo.len, 0, 0, true, "", &.{}, .{ .inline_tags = &.{"monospace"}, .manual = &.{"typography"}, .locked = "deep", .input_focus = false }, &dl, null);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_compose.ppm");
     std.debug.print("wrote /tmp/zat_compose.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });

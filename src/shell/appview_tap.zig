@@ -224,7 +224,7 @@ fn applyEvent(
                 .reply_parent_cid = p.reply_parent_cid,
                 .reply_root_cid = p.reply_root_cid,
                 .quote_of_cid = p.quote_of_cid,
-                .tags = lexicon.collectTags(arena, p.facets) catch &.{}, // zone routing
+                .tags = lexicon.collectTags(arena, p.facets, p.record_tags) catch &.{}, // zone routing
             }) catch false;
             lock.unlock();
             if (is_new) {
@@ -239,7 +239,7 @@ fn applyEvent(
                     .{ .record = .{ .cid = p.quote_of_cid } }
                 else
                     null;
-                store.appendPost(log, arena, p.did, p.rkey, p.cid, p.text, p.created_at, reply, p.facets, embed);
+                store.appendPost(log, arena, p.did, p.rkey, p.cid, p.text, p.created_at, reply, p.facets, embed, p.record_tags);
             }
             return is_new;
         },

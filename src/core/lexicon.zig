@@ -288,6 +288,10 @@ pub const PostRecord = struct {
     /// reads this on ingest to record the quote edge and hydrate on serve. Other
     /// embed types (images/external) parse with an empty `record` cid ⇒ no quote.
     embed: ?EmbedRecordIn = null,
+    /// Record-level tags (composer tray authoring — tags chosen without
+    /// appearing in the prose). Merged with the facet tags on ingest
+    /// (`collectTags`); absent on older records (E4).
+    tags: ?[]const []const u8 = null,
 };
 
 /// The `embed` as read off a fetched/firehose record: only the quoted record
@@ -489,20 +493,25 @@ pub const Facet = struct {
 };
 
 /// Pull the tag values (the words behind `#tag` facets, '#' already stripped)
-/// out of a post's facets — the doorways into its zones. PURE (B2); the
-/// returned slice and its strings borrow `arena`. D3: this is the ONE place the
-/// facet wire shape is read into plain values, so the AppView core (ingest →
-/// index) takes a flat `[]const []const u8` and never sees the wire type.
-pub fn collectTags(arena: std.mem.Allocator, facets: ?[]const Facet) std.mem.Allocator.Error![]const []const u8 {
-    const fs = facets orelse return &.{};
+/// out of a post's facets PLUS its record-level `tags` array (composer
+/// tray-authoring: tags chosen without appearing in the prose) — the doorways
+/// into its zones. PURE (B2); the returned slice and its strings borrow
+/// `arena`. D3: this is the ONE place the tag wire shapes are read into plain
+/// values, so the AppView core (ingest → index) takes a flat
+/// `[]const []const u8` and never sees them. Per-post dedup stays downstream
+/// (the index already folds casing).
+pub fn collectTags(arena: std.mem.Allocator, facets: ?[]const Facet, record_tags: ?[]const []const u8) std.mem.Allocator.Error![]const []const u8 {
     var tags: std.ArrayList([]const u8) = .empty;
-    for (fs) |f| {
+    if (facets) |fs| for (fs) |f| {
         for (f.features) |feat| {
             if (!std.mem.eql(u8, feat.@"$type", richtext.facet_tag)) continue;
             const t = feat.tag orelse continue;
             if (t.len > 0) try tags.append(arena, t);
         }
-    }
+    };
+    if (record_tags) |rt| for (rt) |t| {
+        if (t.len > 0) try tags.append(arena, t);
+    };
     return tags.toOwnedSlice(arena);
 }
 
@@ -530,6 +539,10 @@ pub const PostRecordOut = struct {
     reply: ?ReplyRefOut = null,
     facets: ?[]const Facet = null,
     embed: ?EmbedRecordOut = null,
+    /// Tags chosen in the composer's tag bar WITHOUT appearing in the prose
+    /// (tray authoring — the zone-locked tag and the "+ tag" chips). '#'-less
+    /// words, same as a facet's `tag` value. Absent when empty.
+    tags: ?[]const []const u8 = null,
 };
 
 /// Outgoing like/repost — the two share one shape, distinguished by $type.
@@ -866,11 +879,16 @@ test "collectTags: pulls only #tag facet values, skips mentions and links" {
         .{ .index = .{ .byteStart = 7, .byteEnd = 18 }, .features = &.{.{ .@"$type" = richtext.facet_mention, .did = "did:plc:x" }} },
         .{ .index = .{ .byteStart = 19, .byteEnd = 30 }, .features = &.{.{ .@"$type" = richtext.facet_tag, .tag = "rivers" }} },
     };
-    const tags = try collectTags(arena, &facets);
+    const tags = try collectTags(arena, &facets, null);
     try testing.expectEqual(@as(usize, 2), tags.len);
     try testing.expectEqualStrings("water", tags[0]);
     try testing.expectEqualStrings("rivers", tags[1]);
 
-    // No facets at all is an empty list, not an error (E4).
-    try testing.expectEqual(@as(usize, 0), (try collectTags(arena, null)).len);
+    // Record-level tags (tray authoring) join after the facet tags.
+    const both = try collectTags(arena, &facets, &.{ "deep", "" });
+    try testing.expectEqual(@as(usize, 3), both.len); // the empty one is skipped
+    try testing.expectEqualStrings("deep", both[2]);
+
+    // No tags at all is an empty list, not an error (E4).
+    try testing.expectEqual(@as(usize, 0), (try collectTags(arena, null, null)).len);
 }

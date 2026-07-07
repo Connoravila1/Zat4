@@ -67,6 +67,9 @@ pub const Reduced = union(enum) {
         /// derives zone tags via `lexicon.collectTags` and persists these so a
         /// replay restores the tags too. null ⇒ no facets.
         facets: ?[]const lexicon.Facet = null,
+        /// Record-level tags (composer tray authoring), persisted alongside
+        /// the facets so a replay restores them too. null ⇒ none.
+        record_tags: ?[]const []const u8 = null,
     },
     follow: struct {
         did: []const u8, // follower
@@ -104,6 +107,8 @@ const InnerRecord = struct {
     embed: ?lexicon.EmbedRecordIn = null,
     /// A post's rich-text facets (including `#tag` facets); null when none.
     facets: ?[]const lexicon.Facet = null,
+    /// Record-level tags (composer tray authoring); null on older records.
+    tags: ?[]const []const u8 = null,
 };
 
 /// A7.2: cold struct, size guard waived — transient parse target.
@@ -168,6 +173,7 @@ pub fn reduce(arena: Allocator, message_json: []const u8) error{OutOfMemory}!?Ev
             .reply_root_cid = if (rec.reply) |rep| rep.root.cid else "",
             .quote_of_cid = if (rec.embed) |em| em.record.cid else "",
             .facets = rec.facets,
+            .record_tags = rec.tags,
         } } };
     }
     if (std.mem.eql(u8, env.collection, lexicon.collection.follow)) {
@@ -180,9 +186,7 @@ pub fn reduce(arena: Allocator, message_json: []const u8) error{OutOfMemory}!?Ev
         } } };
     }
     const eng: ?EngagementKind =
-        if (std.mem.eql(u8, env.collection, lexicon.collection.like)) .like
-        else if (std.mem.eql(u8, env.collection, lexicon.collection.repost)) .repost
-        else null;
+        if (std.mem.eql(u8, env.collection, lexicon.collection.like)) .like else if (std.mem.eql(u8, env.collection, lexicon.collection.repost)) .repost else null;
     if (eng) |kind| {
         const subject_cid = engagementSubjectCid(rec);
         if (subject_cid.len == 0) return .{ .id = msg.id, .reduced = .ignored };

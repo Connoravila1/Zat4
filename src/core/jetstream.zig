@@ -118,7 +118,7 @@ pub fn reduce(arena: Allocator, event_json: []const u8) error{OutOfMemory}!?Live
         .reply_parent_cid = parent_cid,
         .reply_root_cid = root_cid,
         .quote_of_cid = quote_of_cid,
-        .tags = try lexicon.collectTags(arena, record.facets),
+        .tags = try lexicon.collectTags(arena, record.facets, record.tags),
         .created_at = feed.parseTimestamp(record.createdAt) catch 0,
         .time_us = event.time_us,
     };

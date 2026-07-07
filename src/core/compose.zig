@@ -139,6 +139,29 @@ pub fn tagSpanAt(text: []const u8, i: usize) ?usize {
     return if (end > i + 1) end else null;
 }
 
+/// The draft's INLINE #tags, in order of first appearance, '#'-stripped and
+/// deduped case-insensitively — the composer tag bar's live source, cut by
+/// the SAME spans `resolveFacets` writes so the bar and the record can't
+/// disagree. Slices point INTO `text`; the list rides `arena`. PURE.
+pub fn inlineTags(arena: Allocator, text: []const u8) error{OutOfMemory}![]const []const u8 {
+    const spans = try detectFacetSpans(arena, text);
+    var out: std.ArrayList([]const u8) = .empty;
+    for (spans) |s| {
+        if (s.kind != .tag) continue;
+        const word = text[s.byte_start + 1 .. s.byte_end]; // past the '#'
+        if (word.len == 0) continue;
+        var seen = false;
+        for (out.items) |t| {
+            if (std.ascii.eqlIgnoreCase(t, word)) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) try out.append(arena, word);
+    }
+    return out.toOwnedSlice(arena);
+}
+
 // ---------------------------------------------------------------------------
 // Tests (B2, C6) — byte offsets asserted exactly, including past multibyte
 // text, because the wire takes these numbers verbatim
@@ -249,4 +272,16 @@ test "facets: a tag, a mention and a link coexist in one post" {
     try testing.expectEqual(SpanKind.tag, spans[1].kind);
     try testing.expectEqualStrings("#zig", text[spans[1].byte_start..spans[1].byte_end]);
     try testing.expectEqual(SpanKind.link, spans[2].kind);
+}
+
+test "inlineTags: order of first appearance, '#'-stripped, case-insensitive dedup" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tags = try inlineTags(arena, "on #water and #Zig — more #WATER, mid#word stays prose");
+    try testing.expectEqual(@as(usize, 2), tags.len);
+    try testing.expectEqualStrings("water", tags[0]); // #WATER folded into the first sighting
+    try testing.expectEqualStrings("Zig", tags[1]); // display casing preserved
+    try testing.expectEqual(@as(usize, 0), (try inlineTags(arena, "no tags here")).len);
 }

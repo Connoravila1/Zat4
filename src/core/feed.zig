@@ -1420,6 +1420,11 @@ pub const LivePostInput = struct {
     reply_root_cid: []const u8,
     quote_of_cid: []const u8 = "", // "" when not a quote-post
     created_at: i64,
+    /// The post's zone tags ('#'-less) when the caller knows them — the
+    /// composer's optimistic seat passes inline + bar tags so the tray shows
+    /// the instant the post lands. Empty for stream posts (server truth
+    /// reconciles the tray at the next page dedup).
+    tags: []const []const u8 = &.{},
 };
 
 pub const LiveIngest = enum { added, duplicate };
@@ -1492,9 +1497,16 @@ pub fn ingestLivePost(
     store.repost_uris.items[index] = .empty;
     // Same parallel-array discipline for the zone tags (A6): post_tags MUST grow
     // with posts or a post index overruns it (the snapshot round-trip and the
-    // internPost dedup both rely on post_tags.len == posts.len). The client
-    // firehose path carries no tags yet, so an empty tray.
-    try store.post_tags.append(gpa, .{ .off = @intCast(store.tag_pool.items.len), .len = 0 });
+    // internPost dedup both rely on post_tags.len == posts.len). The stream
+    // paths carry no tags (empty tray, server truth reconciles); the
+    // composer's optimistic seat passes its inline + bar tags so the tray
+    // shows this frame.
+    const tag_off: u32 = @intCast(store.tag_pool.items.len);
+    for (input.tags) |t| {
+        if (t.len == 0) continue;
+        try store.tag_pool.append(gpa, try appendString(gpa, store, t));
+    }
+    try store.post_tags.append(gpa, .{ .off = tag_off, .len = @intCast(store.tag_pool.items.len - tag_off) });
 
     const gop = try store.post_by_cid.getOrPutContextAdapted(
         gpa,
@@ -2056,22 +2068,26 @@ test "zones: listZonesLocal derives the catalog from resident posts, case-folded
     var store: Store = .{};
     defer deinitStore(gpa, &store);
 
-    const page: lexicon.TimelinePage = .{ .feed = &.{
-        .{ .post = .{
-            .uri = "at://did:plc:a/app.zat4.feed.post/r1",
-            .cid = "bafyz1",
-            .author = .{ .did = "did:plc:a", .handle = "a.zat4.com" },
-            .record = .{ .text = "love #water", .createdAt = "2026-06-28T00:00:00Z" },
-            .tags = &.{ "water", "rivers" },
-        } },
-        .{ .post = .{
-            .uri = "at://did:plc:b/app.zat4.feed.post/r2",
-            .cid = "bafyz2",
-            .author = .{ .did = "did:plc:b", .handle = "b.zat4.com" },
-            .record = .{ .text = "more #Water", .createdAt = "2026-06-28T00:00:01Z" },
-            .tags = &.{"Water"}, // different casing → the same zone
-        } },
-    } };
+    const page: lexicon.TimelinePage = .{
+        .feed = &.{
+            .{ .post = .{
+                .uri = "at://did:plc:a/app.zat4.feed.post/r1",
+                .cid = "bafyz1",
+                .author = .{ .did = "did:plc:a", .handle = "a.zat4.com" },
+                .record = .{ .text = "love #water", .createdAt = "2026-06-28T00:00:00Z" },
+                .tags = &.{ "water", "rivers" },
+            } },
+            .{
+                .post = .{
+                    .uri = "at://did:plc:b/app.zat4.feed.post/r2",
+                    .cid = "bafyz2",
+                    .author = .{ .did = "did:plc:b", .handle = "b.zat4.com" },
+                    .record = .{ .text = "more #Water", .createdAt = "2026-06-28T00:00:01Z" },
+                    .tags = &.{"Water"}, // different casing → the same zone
+                },
+            },
+        },
+    };
     _ = try ingestPage(gpa, &store, page);
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -2486,16 +2502,26 @@ test "ingest: a later sighting reconciles a placeholder handle to the resolved o
 
     // First sighting: only the DID is known, so the handle is the DID placeholder.
     _ = try ingestLivePost(gpa, &store, .{
-        .did = "did:plc:bob",          .handle = "did:plc:bob",
-        .uri = "at://did:plc:bob/app.zat4.feed.post/1", .cid = "c1",
-        .text = "one", .reply_parent_cid = "", .reply_root_cid = "", .created_at = 10,
+        .did = "did:plc:bob",
+        .handle = "did:plc:bob",
+        .uri = "at://did:plc:bob/app.zat4.feed.post/1",
+        .cid = "c1",
+        .text = "one",
+        .reply_parent_cid = "",
+        .reply_root_cid = "",
+        .created_at = 10,
     });
     // A later post by the SAME author carries the resolved handle (the AppView
     // now serves it). internAuthor dedups by DID but must reconcile the handle.
     _ = try ingestLivePost(gpa, &store, .{
-        .did = "did:plc:bob",          .handle = "bob.zat4.com",
-        .uri = "at://did:plc:bob/app.zat4.feed.post/2", .cid = "c2",
-        .text = "two", .reply_parent_cid = "", .reply_root_cid = "", .created_at = 20,
+        .did = "did:plc:bob",
+        .handle = "bob.zat4.com",
+        .uri = "at://did:plc:bob/app.zat4.feed.post/2",
+        .cid = "c2",
+        .text = "two",
+        .reply_parent_cid = "",
+        .reply_root_cid = "",
+        .created_at = 20,
     });
 
     const items = try buildTimeline(arena_state.allocator(), &store);
@@ -2603,9 +2629,14 @@ test "optimistic post: reconcile re-keys temp→real; drop detaches on failure" 
 
     // An optimistic top-level post under a temp cid → present in the feed.
     _ = try ingestLivePost(gpa, &store, .{
-        .did = "did:plc:me", .handle = "me.zat",
-        .uri = "", .cid = "pending:0", .text = "hello",
-        .reply_parent_cid = "", .reply_root_cid = "", .created_at = 100,
+        .did = "did:plc:me",
+        .handle = "me.zat",
+        .uri = "",
+        .cid = "pending:0",
+        .text = "hello",
+        .reply_parent_cid = "",
+        .reply_root_cid = "",
+        .created_at = 100,
     });
     try testing.expect(lookupCid(&store, "pending:0") != null);
     const idx = lookupCid(&store, "pending:0").?;
@@ -2617,9 +2648,14 @@ test "optimistic post: reconcile re-keys temp→real; drop detaches on failure" 
 
     // An optimistic REPLY that then FAILS → detached from feed + thread.
     _ = try ingestLivePost(gpa, &store, .{
-        .did = "did:plc:me", .handle = "me.zat",
-        .uri = "", .cid = "pending:1", .text = "a reply",
-        .reply_parent_cid = "bafyreal", .reply_root_cid = "bafyreal", .created_at = 110,
+        .did = "did:plc:me",
+        .handle = "me.zat",
+        .uri = "",
+        .cid = "pending:1",
+        .text = "a reply",
+        .reply_parent_cid = "bafyreal",
+        .reply_root_cid = "bafyreal",
+        .created_at = 110,
     });
     const before = store.feed.len;
     dropOptimisticPost(&store, "pending:1");
@@ -2738,15 +2774,17 @@ test "view model: a profile view is a query over the shared store; engagement is
 
     // A profile FETCH ingests content-only — a new alice post + her resident
     // one (dedup). It must NOT add Home feed-ordering rows (no container/copy).
-    const profile_page = lexicon.TimelinePage{ .feed = &.{
-        .{ .post = .{
-            .uri = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.zat4.feed.post/3kali3",
-            .cid = "bafyreialice3",
-            .author = alice,
-            .record = .{ .text = "alice newest", .createdAt = "2026-01-09T00:00:00Z" },
-        } },
-        .{ .post = alice_post_1 }, // already resident → dedup, no dup
-    } };
+    const profile_page = lexicon.TimelinePage{
+        .feed = &.{
+            .{ .post = .{
+                .uri = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.zat4.feed.post/3kali3",
+                .cid = "bafyreialice3",
+                .author = alice,
+                .record = .{ .text = "alice newest", .createdAt = "2026-01-09T00:00:00Z" },
+            } },
+            .{ .post = alice_post_1 }, // already resident → dedup, no dup
+        },
+    };
     _ = try ingestPosts(gpa, &store, profile_page);
     try testing.expectEqual(home_len, store.feed.len); // Home ordering untouched
 
