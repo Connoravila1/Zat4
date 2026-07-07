@@ -357,6 +357,7 @@ fn installMarketAlgo(rs: *RunState, environ: ?*const std.process.Environ.Map, ro
         .creator = r.author_disp,
         .config = config_bytes,
         .color = @intCast(std.hash.Wyhash.hash(0, r.cid) % lens_socket.palette.len),
+        .designed = r.designed, // the record's declaration rides into the library
         .visibility = .private, // in MY library; "public" means MY submission
     };
     if (rs.algo_lib.add(gpa, new)) |_| {
@@ -530,6 +531,10 @@ const RunState = struct {
     gmarket_map: std.ArrayListUnmanaged(u16),
     gdetail_row: usize,
     gdetail_install_pending: bool,
+    // The bench socket chooser: the tapped shelf/library index and, when a
+    // mismatched target was picked, the pending surface awaiting confirm.
+    gbench_pick: ?u16,
+    gbench_warn: ?u8,
     gchat_store: chat_core.Store,
     gchat_sel: ?chat_core.ConvIndex,
     gchat_draft_buf: [512]u8,
@@ -898,6 +903,19 @@ fn initRunState(
     rs.zone_cards = &rs.empty_cards;
     rs.zone_blob = "";
     rs.zone_seated = 0;
+    // Load the user's saved library (created/downloaded feeds); empty on first run
+    // or a corrupt file (deserialize is total). Saved after each create/adopt.
+    rs.algo_lib = cache_shell.loadLibrary(gpa, environ) orelse .{};
+    rs.algo_uid = 0;
+    // Resume id minting past the highest persisted `user:N`, so a new create can't
+    // collide with a saved one (add is idempotent by id → a collision drops the new).
+    for (rs.algo_lib.records.items) |rec| {
+        const id = rs.algo_lib.slice(rec.id);
+        if (std.mem.startsWith(u8, id, "user:")) {
+            const n = std.fmt.parseInt(u32, id["user:".len..], 10) catch continue;
+            if (n >= rs.algo_uid) rs.algo_uid = n + 1;
+        }
+    }
     // Restore the persisted loadouts from `app.zat4.socket.loadout`; absent
     // (first run) or a failed read falls back to the catalog defaults, which
     // we then write so the record exists going forward.
@@ -906,9 +924,9 @@ fn initRunState(
         defer load_arena.deinit();
         const loaded: ?loadout_store.Loaded = loadout_store.load(gpa, load_arena.allocator(), io, environ, session) catch null;
         if (loaded) |ld| {
-            buildSurfaceFromEntries(gpa, ld.feed, &rs.socket_cards, &rs.socket_blob, &rs.gseated);
-            buildSurfaceFromEntries(gpa, ld.reply, &rs.reply_cards, &rs.reply_blob, &rs.reply_seated);
-            buildSurfaceFromEntries(gpa, ld.zone, &rs.zone_cards, &rs.zone_blob, &rs.zone_seated);
+            buildSurfaceFromEntries(gpa, ld.feed, &rs.algo_lib, &rs.socket_cards, &rs.socket_blob, &rs.gseated);
+            buildSurfaceFromEntries(gpa, ld.reply, &rs.algo_lib, &rs.reply_cards, &rs.reply_blob, &rs.reply_seated);
+            buildSurfaceFromEntries(gpa, ld.zone, &rs.algo_lib, &rs.zone_cards, &rs.zone_blob, &rs.zone_seated);
         }
         // Any surface that didn't resolve from the record → its catalog default.
         if (rs.socket_cards.len == 0) if (lens_catalog.defaultFeedLoadout(gpa)) |t| {
@@ -1005,6 +1023,8 @@ fn initRunState(
     rs.gmarket_map = .empty;
     rs.gdetail_row = 0;
     rs.gdetail_install_pending = false;
+    rs.gbench_pick = null;
+    rs.gbench_warn = null;
     // Zat Chat (M1): the DM view store — a QUERY model over the real E2EE
     // session below (zat-view-model law). Messages are end-to-end encrypted
     // via MLS; this store holds only the plaintext the local user has typed
@@ -1148,19 +1168,6 @@ fn initRunState(
         }
     }
     rs.gcreate_prepare_frames = 0; // the .preparing loading beat's progress (frames)
-    // Load the user's saved library (created/downloaded feeds); empty on first run
-    // or a corrupt file (deserialize is total). Saved after each create/adopt.
-    rs.algo_lib = cache_shell.loadLibrary(gpa, environ) orelse .{};
-    rs.algo_uid = 0;
-    // Resume id minting past the highest persisted `user:N`, so a new create can't
-    // collide with a saved one (add is idempotent by id → a collision drops the new).
-    for (rs.algo_lib.records.items) |rec| {
-        const id = rs.algo_lib.slice(rec.id);
-        if (std.mem.startsWith(u8, id, "user:")) {
-            const n = std.fmt.parseInt(u32, id["user:".len..], 10) catch continue;
-            if (n >= rs.algo_uid) rs.algo_uid = n + 1;
-        }
-    }
     // The active top-level Screen (index into feed_view.nav_labels); the rail
     // sets it on a click. 0 = Home (the feed). Lives across frames in run().
     rs.gscreen = 0;
@@ -2264,8 +2271,8 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
         // siblings order (null on either = the no-scoring path: feed order /
         // chronological threading). Resolved once per frame and reused by the
         // engagement repaints so they rebuild through the same algorithm.
-        const feed_config = seatedLensConfig(rs.socket_cards, rs.socket_blob, rs.gseated);
-        const reply_config = seatedLensConfig(rs.reply_cards, rs.reply_blob, rs.reply_seated);
+        const feed_config = seatedLensConfig(arena, &rs.algo_lib, rs.socket_cards, rs.socket_blob, rs.gseated);
+        const reply_config = seatedLensConfig(arena, &rs.algo_lib, rs.reply_cards, rs.reply_blob, rs.reply_seated);
         const view_items: []const feed_core.TimelineItem = if (on_thread)
             try feed_core.buildThreadView(arena, store, rs.thread_focus_cid, rs.thread_rerooted, rs.gcollapsed.items, now, reply_config)
         else if (on_profile)
@@ -2419,7 +2426,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .market_q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .market_q_focus = rs.gmarket_q_focus, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
+        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .market_q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .market_q_focus = rs.gmarket_q_focus, .bench_pick = benchPickViewOf(rs), .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
         switch (rs.mode) {
             .timeline => try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status),
             .compose => {
@@ -3629,6 +3636,36 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                 },
                                 .dev_field => rs.gdev_focus = @intCast(hit.post),
                                 .dev_surface => rs.gdev_designed ^= @as(u8, 1) << @intCast(hit.post),
+                                // ---- The bench socket chooser (slice 3) ----
+                                .bench_seat => {
+                                    rs.gbench_pick = @intCast(hit.post);
+                                    rs.gbench_warn = null;
+                                },
+                                .bench_target => if (rs.gbench_pick) |bi| {
+                                    if (bi < rs.algo_lib.records.items.len) {
+                                        const rec = rs.algo_lib.records.items[bi];
+                                        const bit = @as(u8, 1) << @intCast(@min(hit.post, 2));
+                                        if (rec.designed != 0 and (rec.designed & bit) == 0) {
+                                            // Declared for other surfaces: heads-up first,
+                                            // never a block (owner decision 2026-07-06).
+                                            rs.gbench_warn = @intCast(hit.post);
+                                        } else {
+                                            seatBenchAlgo(rs, @intCast(hit.post), bi);
+                                            rs.gbench_pick = null;
+                                            rs.gbench_warn = null;
+                                        }
+                                    } else rs.gbench_pick = null;
+                                },
+                                .bench_confirm => if (rs.gbench_pick) |bi| {
+                                    seatBenchAlgo(rs, @intCast(hit.post), bi);
+                                    rs.gbench_pick = null;
+                                    rs.gbench_warn = null;
+                                },
+                                .bench_cancel => {
+                                    if (rs.gbench_warn != null) {
+                                        rs.gbench_warn = null; // back to the chooser
+                                    } else rs.gbench_pick = null;
+                                },
                                 .dev_color => rs.gdev_color = @intCast(hit.post),
                                 .dev_publish => {
                                     if (rs.gdev_config.len == 0 or !rs.gdev_check_ok) {
@@ -5333,6 +5370,7 @@ fn finishDevPublish(rs: *RunState, environ: ?*const std.process.Environ.Map, uri
         .creator = "you",
         .config = rs.gdev_config,
         .color = rs.gdev_color,
+        .designed = rs.gdev_designed,
         .visibility = .public,
     };
     if (rs.algo_lib.add(gpa, new)) |_| {
@@ -5395,6 +5433,57 @@ fn detailViewOf(rs: *RunState) feed_view.AlgoDetailView {
         .installed = rs.algo_lib.indexOf(r.cid) != null,
         .idx = idx,
     };
+}
+
+/// The bench chooser's render view (null = closed / a stale index).
+fn benchPickViewOf(rs: *RunState) ?feed_view.BenchPickView {
+    const bi = rs.gbench_pick orelse return null;
+    if (bi >= rs.algo_lib.records.items.len) return null;
+    const rec = rs.algo_lib.records.items[bi];
+    return .{ .name = rs.algo_lib.slice(rec.name), .designed = rec.designed, .warn = rs.gbench_warn };
+}
+
+/// Seat a bench (library) algorithm into a surface socket: already present ⇒
+/// just seat it; otherwise append it to the surface's entries and rebuild the
+/// tray library-aware. The loadout-dirty flag persists it on leave (the same
+/// flush every socket edit rides).
+fn seatBenchAlgo(rs: *RunState, target: u8, lib_idx: usize) void {
+    const gpa = rs.gpa;
+    if (lib_idx >= rs.algo_lib.records.items.len) return;
+    const rec = rs.algo_lib.records.items[lib_idx];
+    const id = rs.algo_lib.slice(rec.id);
+    const cards, const blob, const seated = switch (target) {
+        0 => .{ &rs.socket_cards, &rs.socket_blob, &rs.gseated },
+        1 => .{ &rs.reply_cards, &rs.reply_blob, &rs.reply_seated },
+        else => .{ &rs.zone_cards, &rs.zone_blob, &rs.zone_seated },
+    };
+    for (cards.*, 0..) |c, ci| {
+        const cid = blob.*[c.cid.off..][0..c.cid.len];
+        if (std.mem.eql(u8, cid, id)) {
+            seated.* = @intCast(ci);
+            rs.loadout_dirty = true;
+            rs.status = "Seated.";
+            return;
+        }
+    }
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const scratch = arena_state.allocator();
+    const entries = scratch.alloc(lens_catalog.Entry, cards.*.len + 1) catch return;
+    for (cards.*, 0..) |c, ci| {
+        const end = @min(blob.*.len, @as(usize, c.cid.off) + c.cid.len);
+        entries[ci] = .{ .id = blob.*[@min(c.cid.off, blob.*.len)..end], .color = c.color };
+    }
+    entries[cards.*.len] = .{ .id = id, .color = rec.color };
+    if (lens_catalog.loadoutFromEntriesLib(gpa, entries, &rs.algo_lib, scratch)) |t2| {
+        if (cards.*.len > 0) gpa.free(cards.*);
+        if (blob.*.len > 0) gpa.free(blob.*);
+        cards.* = t2[0];
+        blob.* = t2[1];
+        seated.* = @intCast(cards.*.len - 1);
+        rs.loadout_dirty = true;
+        rs.status = "Socketed — it's driving that surface now.";
+    } else |_| rs.status = "Couldn't socket it — out of memory.";
 }
 
 fn composeBlinkOn(anchor_ns: u64) bool {
@@ -5701,12 +5790,15 @@ const ComposeKind = enum { post, profile };
 /// agnostic: the SAME resolver serves the feed tray and the reply tray, because
 /// the tray is the user's and identical on every surface (DISCOVER invariant 12).
 /// Empty tray ⇒ null (E4).
-fn seatedLensConfig(cards: []const lens_socket.LensCard, blob: []const u8, seated: u32) ?discover.FeedConfig {
+fn seatedLensConfig(arena: Allocator, lib: *const algo_library.Library, cards: []const lens_socket.LensCard, blob: []const u8, seated: u32) ?discover.FeedConfig {
     if (cards.len == 0) return null;
     const idx = @min(seated, @as(u32, @intCast(cards.len - 1)));
     const span = cards[idx].cid;
     const cid = blob[span.off..][0..span.len];
-    return lens_catalog.scoringConfigForId(cid);
+    // Library-aware: a seated created/installed algorithm scores through the
+    // same one engine as a built-in (invariant 1). Parsed slices live in the
+    // frame arena (C3) — scoring happens within this frame.
+    return lens_catalog.scoringConfig(arena, cid, lib) catch null;
 }
 
 /// Build the ACTIVE view's posts over the SHARED store — Home (scored by the
@@ -6637,9 +6729,14 @@ fn revertEngagement(kind: Engagement, store: *feed_core.Store, cid: []const u8) 
 /// Resolve a persisted surface (id/color entries → gpa-owned cards + blob) via
 /// the catalog. No-op when the surface has no entries (caller then uses the
 /// default). Sets `cards`/`blob`/`seated` on success.
-fn buildSurfaceFromEntries(gpa: Allocator, se: loadout_store.SurfaceEntries, cards: *[]lens_socket.LensCard, blob: *[]const u8, seated: *u32) void {
+fn buildSurfaceFromEntries(gpa: Allocator, se: loadout_store.SurfaceEntries, lib: *const algo_library.Library, cards: *[]lens_socket.LensCard, blob: *[]const u8, seated: *u32) void {
     if (se.entries.len == 0) return;
-    if (lens_catalog.loadoutFromEntries(gpa, se.entries)) |t| {
+    // Library-aware: a persisted entry may be a created/installed algorithm,
+    // not a built-in (ALGO_SUBMISSION slice 3). Scratch feeds the derived-flag
+    // config parse and dies here (C3).
+    var scratch_state = std.heap.ArenaAllocator.init(gpa);
+    defer scratch_state.deinit();
+    if (lens_catalog.loadoutFromEntriesLib(gpa, se.entries, lib, scratch_state.allocator())) |t| {
         cards.* = t[0];
         blob.* = t[1];
         seated.* = se.seated;
@@ -6936,6 +7033,7 @@ const Grid = struct {
     market: []const feed_view.MarketAlgoCard = &.{},
     market_q: []const u8 = "",
     market_q_focus: bool = false,
+    bench_pick: ?feed_view.BenchPickView = null,
     detail: feed_view.AlgoDetailView = .{},
     /// The simple-Create flow's state (loadout tab 2). A value set per frame.
     create: feed_view.CreateView = .{ .step = .landing, .answers = .{}, .config = discover.DEFAULT_CONFIG, .name = "", .color = 0 },
@@ -7873,7 +7971,7 @@ fn paintFrame(
                 g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{}, &.{}, g.chat_recv) catch g.content_h.*;
             } else if (g.screen.* == feed_view.screen_loadout) {
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
-                g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market, g.market_q, g.market_q_focus, g.create, g.dev, g.bench) catch g.content_h.*; // software: draw line-art nav
+                g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market, g.market_q, g.market_q_focus, g.bench_pick, g.create, g.dev, g.bench) catch g.content_h.*; // software: draw line-art nav
             } else if (g.screen.* == feed_view.screen_algo_detail) {
                 g.content_h.* = feed_view.layoutAlgoDetail(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.detail) catch g.content_h.*;
             } else if (g.screen.* == feed_view.screen_transparency) {
@@ -8416,7 +8514,7 @@ fn paintFrameGpu(
             }
             gs.content_x = lg.col_x;
             gs.content_w = lg.col_w;
-            g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, true, true, lg, g.market, g.market_q, g.market_q_focus, g.create, g.dev, g.bench) catch g.content_h.*; // GPU: SDF pass strikes the nav icons crisp
+            g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, true, true, lg, g.market, g.market_q, g.market_q_focus, g.bench_pick, g.create, g.dev, g.bench) catch g.content_h.*; // GPU: SDF pass strikes the nav icons crisp
         } else if (g.chat_store != null and g.screen.* == feed_view.screen_messages) {
             // Zat Chat (U3, dev-gated): the Messages surface in the GPU's logical
             // design space; the rail is the shell's own tile (rail_external), and

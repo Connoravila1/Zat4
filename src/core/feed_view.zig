@@ -191,7 +191,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, bench_seat, bench_target, bench_confirm, bench_cancel };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -2794,6 +2794,8 @@ pub fn layoutLoadout(
     /// The marketplace search draft + whether the box owns the keyboard.
     market_q: []const u8,
     market_q_focus: bool,
+    /// The bench socket-chooser overlay (a tapped shelf card) — null = closed.
+    bench_pick: ?BenchPickView,
     /// The simple-Create flow's state — read only on tab 2 (Create).
     create: CreateView,
     /// The developer submission flow's state — when `dev.active`, tab 2 hosts
@@ -2865,7 +2867,7 @@ pub fn layoutLoadout(
             if (bench.cards.len == 0) {
                 _ = try wrapBody(gpa, dl, e, shelf_x, sy + 12, shelf_w, faint, 13, "Algorithms you create or download park here. Drag one into a socket to use it.", 19, true, null);
             } else {
-                for (bench.cards) |card| {
+                for (bench.cards, 0..) |card, bi| {
                     const ch: i32 = 72;
                     const card_acc = lens_socket.palette[@min(card.color, lens_socket.palette.len - 1)];
                     try rect(gpa, dl, shelf_x, sy, shelf_w, ch, skinPanel(accent), 12);
@@ -2874,7 +2876,8 @@ pub fn layoutLoadout(
                     try rect(gpa, dl, shelf_x + 18, sy + 20, 8, 8, dot, 4);
                     _ = try str(gpa, dl, e, .semibold, shelf_x + 34, sy + 28, ink, 15, bench.text[card.name.off..][0..card.name.len]);
                     _ = try str(gpa, dl, e, .regular, shelf_x + 18, sy + 52, muted, 12, bench.text[card.ranks.off..][0..card.ranks.len]);
-                    _ = try str(gpa, dl, e, .semibold, shelf_x + shelf_w - 26, sy + 44, faint, 15, "\u{22EE}"); // ⋮ drag handle (Part 3 wires the drop)
+                    _ = try str(gpa, dl, e, .semibold, shelf_x + shelf_w - 26, sy + 44, faint, 15, "\u{22EE}"); // ⋮ (drag lands later; tap = the socket chooser)
+                    try emitRegion(gpa, regions, shelf_x, sy, shelf_w, @intCast(ch), @intCast(bi), .bench_seat);
                     sy += ch + 12;
                 }
             }
@@ -2901,6 +2904,67 @@ pub fn layoutLoadout(
         tx += tw + 28;
     }
     try rect(gpa, dl, m.col_x, header_h - 1, m.col_w, 1, divider, 0);
+    if (bench_pick) |bp| {
+        // The socket chooser / designed-for heads-up, topmost. The dimmed
+        // backdrop is itself the cancel target (emitted first — panel buttons
+        // win their overlaps, hitTest is last-in).
+        try rect(gpa, dl, m.col_x, 0, m.col_w, height, 0x99101010, 0);
+        try emitRegion(gpa, regions, m.col_x, 0, m.col_w, @intCast(@min(height, 32767)), 0, .bench_cancel);
+        const pw: i32 = @min(460, m.cw - 24);
+        const px = m.col_x + @divTrunc(m.col_w - pw, 2);
+        var py: i32 = 170;
+        if (bp.warn) |target| {
+            const ph: i32 = 240;
+            try rect(gpa, dl, px, py, pw, ph, 0xFF23221A, 16);
+            try rect(gpa, dl, px, py, pw, 4, accent, 2);
+            _ = try str(gpa, dl, e, .semibold, px + 26, py + 44, ink, 20, "A heads-up");
+            var wb: [192]u8 = undefined;
+            var dl2: [64]u8 = undefined;
+            var dw: usize = 0;
+            for (dev_surfaces, 0..) |surf, si| {
+                if (bp.designed & (@as(u8, 1) << @intCast(si)) == 0) continue;
+                const sep: []const u8 = if (dw == 0) "" else " and ";
+                @memcpy(dl2[dw..][0..sep.len], sep);
+                dw += sep.len;
+                @memcpy(dl2[dw..][0..surf.len], surf);
+                dw += surf.len;
+            }
+            const wt = std.fmt.bufPrint(&wb, "{s} was designed for {s}. It runs anywhere — but its creator built it for that surface.", .{ bp.name, dl2[0..dw] }) catch "";
+            const wy = try wrapBody(gpa, dl, e, px + 26, py + 76, pw - 52, muted, 15, wt, 21, true, null);
+            var bb: [64]u8 = undefined;
+            const bt = std.fmt.bufPrint(&bb, "Socket into {s} anyway", .{dev_surfaces[@min(target, dev_surfaces.len - 1)]}) catch "Socket it anyway";
+            const by = wy + 22;
+            const btw: i32 = @as(i32, @intCast(text.measure(e, .semibold, bt, 15))) + 48;
+            try rect(gpa, dl, px + 26, by, btw, 44, accent, 11);
+            _ = try str(gpa, dl, e, .semibold, px + 50, by + 28, 0xFF0B0B0F, 15, bt);
+            try emitRegion(gpa, regions, px + 26, by, btw, 44, target, .bench_confirm);
+            try rect(gpa, dl, px + 26 + btw + 12, by, 110, 44, 0x14EDEAE0, 11);
+            _ = try str(gpa, dl, e, .semibold, px + 26 + btw + 40, by + 28, ink, 15, "Cancel");
+            try emitRegion(gpa, regions, px + 26 + btw + 12, by, 110, 44, 0, .bench_cancel);
+        } else {
+            const ph: i32 = 118 + @as(i32, @intCast(dev_surfaces.len)) * 56 + 62;
+            try rect(gpa, dl, px, py, pw, ph, 0xFF23221A, 16);
+            try rect(gpa, dl, px, py, pw, 4, accent, 2);
+            var tb: [96]u8 = undefined;
+            const tt = std.fmt.bufPrint(&tb, "Socket \"{s}\" into", .{bp.name}) catch "Socket into";
+            _ = try str(gpa, dl, e, .semibold, px + 26, py + 44, ink, 20, tt);
+            py += 76;
+            for (dev_surfaces, 0..) |surf, si| {
+                const declared = bp.designed & (@as(u8, 1) << @intCast(si)) != 0;
+                try rect(gpa, dl, px + 26, py, pw - 52, 46, 0x14EDEAE0, 11);
+                _ = try str(gpa, dl, e, .semibold, px + 48, py + 29, ink, 15, surf);
+                if (declared) {
+                    _ = try str(gpa, dl, e, .semibold, px + 48 + @as(i32, @intCast(text.measure(e, .semibold, surf, 15))) + 12, py + 29, boost_c, 12, "designed for");
+                }
+                try emitRegion(gpa, regions, px + 26, py, pw - 52, 46, @intCast(si), .bench_target);
+                py += 56;
+            }
+            py += 8;
+            try rect(gpa, dl, px + 26, py, 110, 44, 0x14EDEAE0, 11);
+            _ = try str(gpa, dl, e, .semibold, px + 54, py + 28, ink, 15, "Cancel");
+            try emitRegion(gpa, regions, px + 26, py, 110, 44, 0, .bench_cancel);
+        }
+    }
     return content_h;
 }
 
@@ -3010,6 +3074,15 @@ fn drawMarketplace(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, 
     }
     return (y - scroll) + 20;
 }
+
+/// The bench socket-chooser's render state: which shelf algorithm was tapped
+/// (name + its declared surfaces) and, when set, the mismatch heads-up's
+/// pending target. A7.2: cold — one per frame while the overlay is open.
+pub const BenchPickView = struct {
+    name: []const u8 = "",
+    designed: u8 = 0,
+    warn: ?u8 = null, // pending target surface awaiting the "anyway" confirm
+};
 
 /// One marketplace algorithm as its FULL PAGE needs it (screen_algo_detail) —
 /// the browse card's big sibling: the author's prose beside the proven label,

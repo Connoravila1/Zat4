@@ -447,23 +447,48 @@ pub const Entry = struct { id: []const u8, color: u8 };
 /// Unknown ids (e.g. a marketplace algo not yet modelled) are skipped — an
 /// ordinary result, not an error (E4). Pure; caller owns/frees both slices.
 pub fn loadoutFromEntries(gpa: Allocator, entries: []const Entry) !struct { []lens_socket.LensCard, []const u8 } {
+    return loadoutFromEntriesLib(gpa, entries, null, null);
+}
+
+/// The library-aware form: an entry id that is not a built-in resolves against
+/// the user's LIBRARY (a created or installed algorithm), so a persisted
+/// loadout can seat one (ALGO_SUBMISSION slice 3). `scratch` feeds the derived
+/// flags' config parse (required whenever `library` is given). Unknown ids
+/// still skip — a stale loadout never crashes a tray (E4).
+pub fn loadoutFromEntriesLib(gpa: Allocator, entries: []const Entry, library: ?*const algo_library.Library, scratch: ?Allocator) !struct { []lens_socket.LensCard, []const u8 } {
     var blob: std.ArrayListUnmanaged(u8) = .empty;
     errdefer blob.deinit(gpa);
     var cards: std.ArrayListUnmanaged(lens_socket.LensCard) = .empty;
     errdefer cards.deinit(gpa);
     for (entries) |entry| {
-        const b = findById(entry.id) orelse continue;
-        const name: lens_socket.TextSpan = .{ .off = @intCast(blob.items.len), .len = @intCast(b.name.len) };
-        try blob.appendSlice(gpa, b.name);
-        const ranks: lens_socket.TextSpan = .{ .off = @intCast(blob.items.len), .len = @intCast(b.ranks.len) };
-        try blob.appendSlice(gpa, b.ranks);
-        const desc: lens_socket.TextSpan = .{ .off = @intCast(blob.items.len), .len = @intCast(b.desc.len) };
-        try blob.appendSlice(gpa, b.desc);
-        const author: lens_socket.TextSpan = .{ .off = @intCast(blob.items.len), .len = @intCast("zat4 default".len) };
-        try blob.appendSlice(gpa, "zat4 default");
-        const cid: lens_socket.TextSpan = .{ .off = @intCast(blob.items.len), .len = @intCast(b.id.len) };
-        try blob.appendSlice(gpa, b.id);
-        try cards.append(gpa, .{ .cid = cid, .name = name, .author = author, .ranks = ranks, .desc = desc, .color = entry.color, .flags = derivedFlags(b) });
+        if (findById(entry.id)) |b| {
+            const name: lens_socket.TextSpan = .{ .off = @intCast(blob.items.len), .len = @intCast(b.name.len) };
+            try blob.appendSlice(gpa, b.name);
+            const ranks: lens_socket.TextSpan = .{ .off = @intCast(blob.items.len), .len = @intCast(b.ranks.len) };
+            try blob.appendSlice(gpa, b.ranks);
+            const desc: lens_socket.TextSpan = .{ .off = @intCast(blob.items.len), .len = @intCast(b.desc.len) };
+            try blob.appendSlice(gpa, b.desc);
+            const author: lens_socket.TextSpan = .{ .off = @intCast(blob.items.len), .len = @intCast("zat4 default".len) };
+            try blob.appendSlice(gpa, "zat4 default");
+            const cid: lens_socket.TextSpan = .{ .off = @intCast(blob.items.len), .len = @intCast(b.id.len) };
+            try blob.appendSlice(gpa, b.id);
+            try cards.append(gpa, .{ .cid = cid, .name = name, .author = author, .ranks = ranks, .desc = desc, .color = entry.color, .flags = derivedFlags(b) });
+            continue;
+        }
+        const lib = library orelse continue;
+        const rec = lib.findById(entry.id) orelse continue;
+        const name: lens_socket.TextSpan = .{ .off = @intCast(blob.items.len), .len = rec.name.len };
+        try blob.appendSlice(gpa, lib.slice(rec.name));
+        const ranks: lens_socket.TextSpan = .{ .off = @intCast(blob.items.len), .len = rec.ranks.len };
+        try blob.appendSlice(gpa, lib.slice(rec.ranks));
+        const desc: lens_socket.TextSpan = .{ .off = @intCast(blob.items.len), .len = rec.desc.len };
+        try blob.appendSlice(gpa, lib.slice(rec.desc));
+        const author: lens_socket.TextSpan = .{ .off = @intCast(blob.items.len), .len = rec.creator.len };
+        try blob.appendSlice(gpa, lib.slice(rec.creator));
+        const cid: lens_socket.TextSpan = .{ .off = @intCast(blob.items.len), .len = rec.id.len };
+        try blob.appendSlice(gpa, lib.slice(rec.id));
+        const flags = if (scratch) |sc| recordFlags(sc, lib, rec) else lens_socket.LensFlags{};
+        try cards.append(gpa, .{ .cid = cid, .name = name, .author = author, .ranks = ranks, .desc = desc, .color = entry.color, .flags = flags });
     }
     return .{ try cards.toOwnedSlice(gpa), try blob.toOwnedSlice(gpa) };
 }

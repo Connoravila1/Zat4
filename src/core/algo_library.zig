@@ -89,13 +89,14 @@ pub const AlgoRecord = struct {
     config: Span, // serialized FeedConfig bytes; empty ⇒ the no-scoring chronological path
     color: u8, // default accent palette index (0..8) — the socket tint
     visibility: Visibility,
+    designed: u8, // declared-surface bitmask (1 feed / 2 replies / 4 zones; 0 = undeclared)
     rating: Rating,
 
     comptime {
-        // Budget 60: 6 × Span(8) = 48, + Rating(8) = 56, + color(1) + visibility(1)
-        // = 58, padded to 60 at the u32 alignment of Span/Rating. Exact. Every span
-        // is earned (the cartridge-identity fields); the two enums/bytes ride in the
-        // tail padding.
+        // Budget 60 (A7.1, unchanged from the designed add): 6 × Span(8) = 48,
+        // + Rating(8) = 56, + color(1) + visibility(1) + designed(1) = 59,
+        // padded to 60 at the u32 alignment of Span/Rating — the declaration
+        // byte rides the padding the budget already carried. Exact.
         assert(@sizeOf(AlgoRecord) == 60);
     }
 };
@@ -111,6 +112,7 @@ pub const NewAlgo = struct {
     creator: []const u8,
     config: []const u8 = &.{},
     color: u8 = 0,
+    designed: u8 = 0, // declared-surface bitmask (marketplace/dev flow; 0 = undeclared)
     visibility: Visibility = .private,
     rating: Rating = .{},
 };
@@ -155,6 +157,7 @@ pub const Library = struct {
             .creator = try self.intern(gpa, a.creator),
             .config = try self.intern(gpa, a.config),
             .color = a.color,
+            .designed = a.designed,
             .visibility = a.visibility,
             .rating = a.rating,
         };
@@ -201,7 +204,7 @@ pub const Library = struct {
 // ---------------------------------------------------------------------------
 
 const magic = "ZALB"; // Zat4 ALgorithm-library Blob
-const ser_version: u8 = 1;
+const ser_version: u8 = 2; // v2 adds the per-record designed byte (v1 reads as 0)
 
 fn putU32(gpa: Allocator, out: *std.ArrayListUnmanaged(u8), v: u32) Allocator.Error!void {
     try out.appendSlice(gpa, &std.mem.toBytes(v));
@@ -223,6 +226,7 @@ pub fn serialize(gpa: Allocator, lib: *const Library) Allocator.Error![]u8 {
         }
         try out.append(gpa, r.color);
         try out.append(gpa, @intFromEnum(r.visibility));
+        try out.append(gpa, r.designed);
         try putU32(gpa, &out, r.rating.sum);
         try putU32(gpa, &out, r.rating.count);
     }
@@ -260,7 +264,8 @@ pub fn deserialize(gpa: Allocator, bytes: []const u8) Allocator.Error!Library {
     var r: Reader = .{ .b = bytes };
     const tag = r.take(magic.len) orelse return lib;
     if (!std.mem.eql(u8, tag, magic)) return lib;
-    if ((r.byte() orelse return lib) != ser_version) return lib;
+    const ver = r.byte() orelse return lib;
+    if (ver != ser_version and ver != 1) return lib; // v1: pre-designed records
     const blob_len = r.readU32() orelse return lib;
     const blob = r.take(blob_len) orelse return lib;
     try lib.blob.appendSlice(gpa, blob);
@@ -276,6 +281,7 @@ pub fn deserialize(gpa: Allocator, bytes: []const u8) Allocator.Error!Library {
         }
         const color = r.byte() orelse return lib;
         const vis = r.byte() orelse return lib;
+        const designed: u8 = if (ver >= 2) (r.byte() orelse return lib) else 0;
         const sum = r.readU32() orelse return lib;
         const cnt = r.readU32() orelse return lib;
         if (!ok) continue; // drop a record with an out-of-range span (never OOB later)
@@ -283,6 +289,7 @@ pub fn deserialize(gpa: Allocator, bytes: []const u8) Allocator.Error!Library {
             .id = spans[0],       .name = spans[1],    .ranks = spans[2],
             .desc = spans[3],     .creator = spans[4], .config = spans[5],
             .color = color,       .visibility = @enumFromInt(@min(vis, 1)),
+            .designed = designed,
             .rating = .{ .sum = sum, .count = cnt },
         });
     }
