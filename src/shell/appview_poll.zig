@@ -368,6 +368,14 @@ pub fn pollRepo(
                 .designed = appview.surfaceMask(r.value.designedFor),
             }) catch false;
         }
+        // The delete leg: whatever this author no longer lists is retracted
+        // from the marketplace (same lock as the indexing above).
+        var live_cids: std.ArrayList([]const u8) = .empty;
+        for (f.records) |r| {
+            if (r.cid.len == 0) continue;
+            live_cids.append(arena, r.cid) catch break;
+        }
+        appview.removeAlgorithmsGone(gpa, idx, did, live_cids.items);
     }
 
     // Trust-boundary enforcement is now silent on the happy path; only rejections

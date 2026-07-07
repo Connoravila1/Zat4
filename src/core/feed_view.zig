@@ -191,7 +191,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, bench_seat, bench_confirm, bench_cancel };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, bench_seat, bench_confirm, bench_cancel, pub_delete };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -2485,7 +2485,7 @@ pub fn layoutCompose(
 /// signature stays lean. Each surface's tap targets go to its own hit list.
 /// Loadout-page sub-tabs (the row under the title). Loadout is built; the
 /// other two are placeholders for later tracks.
-pub const loadout_tabs = [_][]const u8{ "Loadout", "Marketplace", "Create" };
+pub const loadout_tabs = [_][]const u8{ "Loadout", "Marketplace", "Create", "Published" };
 
 /// One marketplace browse card, as the Marketplace tab needs it — the shell fills
 /// it from the AppView's `AlgorithmView` rows (D3: the wire type stays in the
@@ -2801,6 +2801,8 @@ pub fn layoutLoadout(
     bench_pick: ?BenchPickView,
     /// A live bench drag (a shelf card riding the pointer) — null = none.
     bench_drag: ?BenchDragView,
+    /// The Published tab's rows (the creator dashboard) — read on tab 3 only.
+    published: []const PublishedRow,
     /// The simple-Create flow's state — read only on tab 2 (Create).
     create: CreateView,
     /// The developer submission flow's state — when `dev.active`, tab 2 hosts
@@ -2889,6 +2891,8 @@ pub fn layoutLoadout(
         }
     } else if (tab == 1) {
         content_h = try drawMarketplace(gpa, dl, e, m, height, scroll, regions, accent, market, market_q, market_q_focus, market_loading);
+    } else if (tab == 3) {
+        content_h = try drawPublished(gpa, dl, e, m, height, scroll, regions, accent, published);
     } else if (dev.active) {
         content_h = try layoutDevSubmit(gpa, e, dl, m, height, scroll, regions, accent, dev);
     } else {
@@ -3074,6 +3078,74 @@ fn drawMarketplace(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, 
 /// The bench socket-chooser's render state: which shelf algorithm was tapped
 /// (name + its declared surfaces) and, when set, the mismatch heads-up's
 /// pending target. A7.2: cold — one per frame while the overlay is open.
+/// One row of the creator DASHBOARD (the Published tab): a marketplace
+/// submission of YOURS, with its live-on-the-marketplace status. The shell
+/// builds these per frame from the library (visibility public) crossed with
+/// the fetched marketplace catalog. A7.2: cold struct, size guard waived.
+pub const PublishedRow = struct {
+    name: []const u8 = "",
+    ranks: []const u8 = "",
+    designed: u8 = 0,
+    live: bool = false, // present in the marketplace catalog (indexed + served)
+    confirm: bool = false, // this row's Delete is armed (tap again to fire)
+    lib_idx: u16 = 0, // the library record index — the action payload
+};
+
+/// The creator dashboard: your published algorithms, their marketplace
+/// status, and the retraction. Download counts await an install-signal
+/// design (installs are local-only today) — absent, never faked.
+fn drawPublished(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, height: i32, scroll: i32, regions: ?*Regions, accent: u32, rows: []const PublishedRow) error{OutOfMemory}!i32 {
+    _ = height;
+    const x0 = m.lx;
+    const w = m.cw;
+    var y: i32 = 140 + scroll;
+
+    if (rows.len == 0) {
+        _ = try str(gpa, dl, e, .semibold, x0, y + 70, ink, 19, "Nothing published yet");
+        _ = try str(gpa, dl, e, .regular, x0, y + 98, muted, 14, "Write one under Create — everything you publish is managed from here.");
+        return (y - scroll) + 160;
+    }
+    _ = try str(gpa, dl, e, .regular, x0, y + 16, muted, 14, "Everything you've published to the marketplace. Deleting retracts the record — installed copies on other devices keep working.");
+    y += 44;
+    for (rows) |row| {
+        const ch: i32 = 108;
+        try rect(gpa, dl, x0, y, w, ch, skinPanel(accent), 16);
+        try rect(gpa, dl, x0, y, w, 1, 0x14EDEAE0, 16);
+        _ = try str(gpa, dl, e, .semibold, x0 + 22, y + 34, ink, 19, row.name);
+        if (row.ranks.len > 0) _ = try str(gpa, dl, e, .regular, x0 + 22, y + 58, muted, 14, row.ranks);
+        // Live status: proven by presence in the fetched marketplace, not assumed.
+        const dot: u32 = if (row.live) boost_c else faint;
+        try rect(gpa, dl, x0 + 22, y + 76, 8, 8, dot, 4);
+        _ = try str(gpa, dl, e, .regular, x0 + 38, y + 86, if (row.live) body_c else faint, 13, if (row.live) "Live on the marketplace" else "Syncing — not in the marketplace listing yet");
+        // Designed-for badges, top-right of the card.
+        var bx = x0 + w - 150;
+        var si: usize = dev_surfaces.len;
+        while (si > 0) {
+            si -= 1;
+            if (row.designed & (@as(u8, 1) << @intCast(si)) == 0) continue;
+            const btw: i32 = @intCast(text.measure(e, .semibold, dev_surfaces[si], 11));
+            bx -= btw + 18;
+            try rect(gpa, dl, bx, y + 22, btw + 14, 20, 0x14EDEAE0, 6);
+            _ = try str(gpa, dl, e, .semibold, bx + 7, y + 36, muted, 11, dev_surfaces[si]);
+            bx -= 6;
+        }
+        // Delete: two-tap (armed reads differently and in the warning color).
+        const bw: i32 = 128;
+        const bx2 = x0 + w - bw - 20;
+        const by2 = y + ch - 34 - 16;
+        if (row.confirm) {
+            try rect(gpa, dl, bx2, by2, bw, 34, like_c, 10);
+            _ = try str(gpa, dl, e, .semibold, bx2 + 14, by2 + 22, 0xFF0B0B0F, 13, "Really delete?");
+        } else {
+            try rect(gpa, dl, bx2, by2, bw, 34, 0x14EDEAE0, 10);
+            _ = try str(gpa, dl, e, .semibold, bx2 + 38, by2 + 22, if (row.live) ink else faint, 13, "Delete");
+        }
+        try emitRegion(gpa, regions, bx2, by2, bw, 34, row.lib_idx, .pub_delete);
+        y += ch + 14;
+    }
+    return (y - scroll) + 40;
+}
+
 /// A dragged shelf card's ghost: what rides the pointer.
 /// A7.2: cold struct, size guard waived — one per frame while a drag lives.
 pub const BenchDragView = struct {

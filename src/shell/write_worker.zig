@@ -93,7 +93,7 @@ pub const Request = struct {
     algo_tags_csv: []const u8 = "",
     algo_designed: u8 = 0,
 
-    pub const Kind = enum(u8) { like, unlike, repost, unrepost, loadout, publish_algo };
+    pub const Kind = enum(u8) { like, unlike, repost, unrepost, loadout, publish_algo, delete_algo };
 };
 
 /// What the worker reports back. `cid` matches the request's post so the
@@ -522,6 +522,9 @@ fn processOne(worker: *Worker, req: Request) void {
         .repost => write.repostPost(gpa, arena, worker.io, worker.environ, worker.session, req.subject_uri, req.subject_cid, req.now),
         .unlike => write.unlikePost(gpa, arena, worker.io, worker.environ, worker.session, req.record_uri),
         .unrepost => write.unrepostPost(gpa, arena, worker.io, worker.environ, worker.session, req.record_uri),
+        // The marketplace retraction: delete the algorithm record by uri.
+        // `cid` carries the record cid back so the UI drops its local rows.
+        .delete_algo => write.deleteAlgorithm(gpa, arena, worker.io, worker.environ, worker.session, req.record_uri),
         .loadout, .publish_algo => unreachable, // handled above
     };
 

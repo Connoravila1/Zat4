@@ -477,6 +477,21 @@ pub fn unlikePost(
     return deleteRecord(gpa, arena, io, environ, session, like_uri);
 }
 
+/// Delete a published ALGORITHM record by its at-uri — the marketplace
+/// retraction (the creator dashboard's Delete). The same generic delete the
+/// unlike/unrepost legs ride; the AppView drops the row on its next poll
+/// reconciliation.
+pub fn deleteAlgorithm(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    session: *auth.Session,
+    record_uri: []const u8,
+) !WriteOutcome {
+    return deleteRecord(gpa, arena, io, environ, session, record_uri);
+}
+
 pub fn unrepostPost(
     gpa: Allocator,
     arena: Allocator,

@@ -539,6 +539,7 @@ const RunState = struct {
     gbench_drag: ?u16,
     gbench_drag_x: i32,
     gbench_drag_y: i32,
+    gpub_confirm: ?u16, // Published tab: the library index whose Delete is armed
     market_loading: bool, // a getAlgorithms fetch is in flight (browse shows a loading state)
     market_prefetched: bool, // the one-shot startup warmup fired
     gchat_store: chat_core.Store,
@@ -1034,6 +1035,7 @@ fn initRunState(
     rs.gbench_drag = null;
     rs.gbench_drag_x = 0;
     rs.gbench_drag_y = 0;
+    rs.gpub_confirm = null;
     rs.market_loading = false;
     rs.market_prefetched = false;
     // Zat Chat (M1): the DM view store — a QUERY model over the real E2EE
@@ -1862,6 +1864,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 .unlike, .unrepost => null,
                 .loadout => null, // loadout writes post no result; defensive only
                 .publish_algo => null, // its result drives the dev flow below
+                .delete_algo => null, // its result drives the dashboard below
             };
             if (deferred) |set| {
                 if (set.remove(std.hash.Wyhash.hash(0, res.cid))) {
@@ -1879,23 +1882,50 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     // the record CID — the library id / transparency anchor).
                     if (res.kind == .publish_algo) {
                         finishDevPublish(rs, environ, uri, res.revert_uri);
+                    } else if (res.kind == .delete_algo) {
+                        // Retracted on the wire: drop the library record + the
+                        // local marketplace row; the AppView reconciles on its
+                        // next poll of this author.
+                        if (rs.algo_lib.removeById(res.cid)) {
+                            _ = cache_shell.saveLibrary(gpa, environ, &rs.algo_lib);
+                        }
+                        for (rs.market_catalog.items, 0..) |mr, mi| {
+                            if (std.mem.eql(u8, mr.cid, res.cid)) {
+                                const r2 = rs.market_catalog.orderedRemove(mi);
+                                gpa.free(r2.name);
+                                gpa.free(r2.author_disp);
+                                gpa.free(r2.author_did);
+                                gpa.free(r2.rkey);
+                                gpa.free(r2.cid);
+                                gpa.free(r2.ranks);
+                                gpa.free(r2.desc);
+                                gpa.free(r2.tags);
+                                break;
+                            }
+                        }
+                        refilterMarket(rs);
+                        rs.status = "Deleted — retracted from the marketplace.";
                     } else if (uri.len > 0) switch (res.kind) {
                         // Record OUR created like/repost uri so a later unlike/
                         // unrepost can delete that record — the AppView never sends
                         // viewer.like, so the optimistic path has no uri otherwise.
                         .like => feed_core.setLikeUri(gpa, store, res.cid, uri) catch {},
                         .repost => feed_core.setRepostUri(gpa, store, res.cid, uri) catch {},
-                        .unlike, .unrepost, .loadout, .publish_algo => {},
+                        .unlike, .unrepost, .loadout, .publish_algo, .delete_algo => {},
                     };
                 },
-                .refused => |f| if (res.kind == .publish_algo) {
+                .refused => |f| if (res.kind == .delete_algo) {
+                    rs.status = std.fmt.bufPrint(&rs.status_buf, "delete refused: {d} {s}", .{ f.status, f.code }) catch "delete refused";
+                } else if (res.kind == .publish_algo) {
                     rs.gdev_step = .review; // nothing was published; the draft stands
                     rs.gdev_status_len = if (std.fmt.bufPrint(&rs.gdev_status_buf, "The server refused the publish ({d} {s}). Nothing went out — fix and retry.", .{ f.status, f.code })) |m| m.len else |_| 0;
                 } else {
                     revertWrite(res.kind, gpa, store, res.cid, res.revert_uri) catch {};
                     rs.status = std.fmt.bufPrint(&rs.status_buf, "refused: {d} {s}", .{ f.status, f.code }) catch "refused";
                 },
-                .net_error => |name| if (res.kind == .publish_algo) {
+                .net_error => |name| if (res.kind == .delete_algo) {
+                    rs.status = std.fmt.bufPrint(&rs.status_buf, "delete failed: {s} — retry", .{name}) catch "delete failed";
+                } else if (res.kind == .publish_algo) {
                     rs.gdev_step = .review;
                     rs.gdev_status_len = if (std.fmt.bufPrint(&rs.gdev_status_buf, "Couldn't reach your repo ({s}). Nothing went out — retry when you're online.", .{name})) |m| m.len else |_| 0;
                 } else {
@@ -2450,7 +2480,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .market_q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .market_q_focus = rs.gmarket_q_focus, .market_loading = rs.market_loading, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
+        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .market_q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .market_q_focus = rs.gmarket_q_focus, .market_loading = rs.market_loading, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .published = publishedRowsOf(arena, rs), .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
         switch (rs.mode) {
             .timeline => try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status),
             .compose => {
@@ -3611,6 +3641,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                 .loadout_tab => {
                                     rs.gloadout_tab = @intCast(hit.post);
                                     rs.gmarket_q_focus = false;
+                                    rs.gpub_confirm = null;
                                     if (hit.post == 2) rs.gcreate_step = .landing; // Create opens on its landing page
                                     rs.gscroll_px = 0; // top of the newly-selected tab
                                 },
@@ -3700,6 +3731,38 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                 .bench_cancel => {
                                     rs.gbench_pick = null;
                                     rs.gbench_warn = null;
+                                },
+                                // ---- The creator dashboard's retraction (two-tap) ----
+                                .pub_delete => {
+                                    if (rs.gpub_confirm == null or rs.gpub_confirm.? != hit.post) {
+                                        rs.gpub_confirm = @intCast(hit.post); // arm; the next tap fires
+                                    } else if (hit.post < rs.algo_lib.records.items.len) {
+                                        rs.gpub_confirm = null;
+                                        const rec = rs.algo_lib.records.items[hit.post];
+                                        const id = rs.algo_lib.slice(rec.id);
+                                        // The record uri needs the rkey — carried by the
+                                        // fetched marketplace row (mine included). Not yet
+                                        // indexed ⇒ can't address it; be honest.
+                                        var found: ?usize = null;
+                                        for (rs.market_catalog.items, 0..) |mr, mi| {
+                                            if (std.mem.eql(u8, mr.cid, id)) {
+                                                found = mi;
+                                                break;
+                                            }
+                                        }
+                                        if (found) |mi| {
+                                            const mr = rs.market_catalog.items[mi];
+                                            var ub: [420]u8 = undefined;
+                                            const uri = std.fmt.bufPrint(&ub, "at://{s}/{s}/{s}", .{ mr.author_did, lexicon.collection.algorithm, mr.rkey }) catch "";
+                                            if (uri.len > 0) {
+                                                if (rs.writer) |w| {
+                                                    if (write_worker.submit(w, .delete_algo, id, "", "", uri, now)) {
+                                                        rs.status = "deleting...";
+                                                    } else rs.status = "Couldn't queue the delete — try again.";
+                                                } else rs.status = "Deleting needs the online session.";
+                                            }
+                                        } else rs.status = "Still syncing — the record isn't addressable yet; try shortly.";
+                                    } else rs.gpub_confirm = null;
                                 },
                                 .dev_color => rs.gdev_color = @intCast(hit.post),
                                 .dev_publish => {
@@ -5600,6 +5663,34 @@ fn removeDraggedFromSurface(rs: *RunState, s: u8) void {
     } else |_| {}
 }
 
+/// The Published tab's rows, built into the frame arena: MY marketplace
+/// submissions (library visibility == public), each crossed with the fetched
+/// marketplace catalog for its honest live status.
+fn publishedRowsOf(arena: Allocator, rs: *RunState) []const feed_view.PublishedRow {
+    if (rs.gscreen != feed_view.screen_loadout or rs.gloadout_tab != 3) return &.{};
+    var out: std.ArrayList(feed_view.PublishedRow) = .empty;
+    for (rs.algo_lib.records.items, 0..) |rec, li| {
+        if (rec.visibility != .public) continue;
+        const id = rs.algo_lib.slice(rec.id);
+        var live = false;
+        for (rs.market_catalog.items) |mr| {
+            if (std.mem.eql(u8, mr.cid, id)) {
+                live = true;
+                break;
+            }
+        }
+        out.append(arena, .{
+            .name = rs.algo_lib.slice(rec.name),
+            .ranks = rs.algo_lib.slice(rec.ranks),
+            .designed = rec.designed,
+            .live = live,
+            .confirm = rs.gpub_confirm != null and rs.gpub_confirm.? == li,
+            .lib_idx = @intCast(li),
+        }) catch break;
+    }
+    return out.items;
+}
+
 /// The bench drag ghost's render view (null = no drag).
 fn benchDragViewOf(rs: *RunState) ?feed_view.BenchDragView {
     const bi = rs.gbench_drag orelse return null;
@@ -6824,6 +6915,7 @@ fn revertWrite(kind: write_worker.Request.Kind, gpa: Allocator, store: *feed_cor
         .unrepost => try feed_core.revertUnrepost(gpa, store, cid, revert_uri),
         .loadout => {}, // loadout writes are not optimistic; nothing to revert
         .publish_algo => {}, // the dev flow reconciles its own state (no store optimism)
+        .delete_algo => {}, // the dashboard reconciles its own state
     }
 }
 
@@ -7158,6 +7250,7 @@ const Grid = struct {
     market_loading: bool = false,
     bench_pick: ?feed_view.BenchPickView = null,
     bench_drag: ?feed_view.BenchDragView = null,
+    published: []const feed_view.PublishedRow = &.{},
     detail: feed_view.AlgoDetailView = .{},
     /// The simple-Create flow's state (loadout tab 2). A value set per frame.
     create: feed_view.CreateView = .{ .step = .landing, .answers = .{}, .config = discover.DEFAULT_CONFIG, .name = "", .color = 0 },
@@ -8095,7 +8188,7 @@ fn paintFrame(
                 g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{}, &.{}, g.chat_recv) catch g.content_h.*;
             } else if (g.screen.* == feed_view.screen_loadout) {
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
-                g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market, g.market_q, g.market_q_focus, g.market_loading, g.bench_pick, g.bench_drag, g.create, g.dev, g.bench) catch g.content_h.*; // software: draw line-art nav
+                g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market, g.market_q, g.market_q_focus, g.market_loading, g.bench_pick, g.bench_drag, g.published, g.create, g.dev, g.bench) catch g.content_h.*; // software: draw line-art nav
             } else if (g.screen.* == feed_view.screen_algo_detail) {
                 g.content_h.* = feed_view.layoutAlgoDetail(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.detail) catch g.content_h.*;
             } else if (g.screen.* == feed_view.screen_transparency) {
@@ -8638,7 +8731,7 @@ fn paintFrameGpu(
             }
             gs.content_x = lg.col_x;
             gs.content_w = lg.col_w;
-            g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, true, true, lg, g.market, g.market_q, g.market_q_focus, g.market_loading, g.bench_pick, g.bench_drag, g.create, g.dev, g.bench) catch g.content_h.*; // GPU: SDF pass strikes the nav icons crisp
+            g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, true, true, lg, g.market, g.market_q, g.market_q_focus, g.market_loading, g.bench_pick, g.bench_drag, g.published, g.create, g.dev, g.bench) catch g.content_h.*; // GPU: SDF pass strikes the nav icons crisp
         } else if (g.chat_store != null and g.screen.* == feed_view.screen_messages) {
             // Zat Chat (U3, dev-gated): the Messages surface in the GPU's logical
             // design space; the rail is the shell's own tile (rail_external), and

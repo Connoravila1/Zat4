@@ -505,6 +505,41 @@ pub fn indexAlgorithm(gpa: Allocator, idx: *Index, in: AlgorithmInput) Allocator
     return true;
 }
 
+/// Reconcile an author's published algorithms against their CURRENT repo
+/// listing: an indexed record no longer present is REMOVED — a creator's
+/// delete must leave the marketplace (the dashboard's retraction leg).
+/// `live_cids` are the cids this poll's listing actually returned. The
+/// cid→row map is rebuilt after removals (rows shift); a map-put OOM only
+/// weakens dedup (a re-seen cid could re-index), never correctness.
+pub fn removeAlgorithmsGone(gpa: Allocator, idx: *Index, author_did: []const u8, live_cids: []const []const u8) void {
+    const author_id = idx.intern.get(author_did) orelse return;
+    var row: usize = idx.algorithms.len;
+    var removed = false;
+    while (row > 0) {
+        row -= 1;
+        const a = idx.algorithms.get(row);
+        if (a.author != author_id) continue;
+        const cid_s = str(idx, a.cid);
+        var live = false;
+        for (live_cids) |c| {
+            if (std.mem.eql(u8, c, cid_s)) {
+                live = true;
+                break;
+            }
+        }
+        if (live) continue;
+        idx.algorithms.orderedRemove(row);
+        removed = true;
+    }
+    if (removed) {
+        idx.algo_by_cid.clearRetainingCapacity();
+        var r: u32 = 0;
+        while (r < idx.algorithms.len) : (r += 1) {
+            idx.algo_by_cid.put(gpa, idx.algorithms.get(r).cid, r) catch {};
+        }
+    }
+}
+
 /// The unique set of DIDs the index knows as authors or graph endpoints (post
 /// authors + follow followers + follow subjects) — the set the AppView polls
 /// for content. DID strings are duped into `arena` so they stay valid across
