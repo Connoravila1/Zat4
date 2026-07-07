@@ -59,7 +59,14 @@ const ProfileValue = struct { displayName: []const u8 = "" };
 /// SERIALIZED config string (atproto forbids floats in records, so the config
 /// rides as one string; `algorithm.parse` decodes it). A7.2: cold transient
 /// parse target (decomposed into the pooled hot Algorithm).
-const AlgorithmValue = struct { name: []const u8 = "", config: []const u8 = "" };
+const AlgorithmValue = struct {
+    name: []const u8 = "",
+    config: []const u8 = "",
+    ranks: []const u8 = "",
+    desc: []const u8 = "",
+    designedFor: []const []const u8 = &.{},
+    tags: []const []const u8 = &.{},
+};
 
 /// One `listRecords` entry over a record value of type `Value`.
 fn Rec(comptime Value: type) type {
@@ -355,6 +362,10 @@ pub fn pollRepo(
                 .rkey = rkeyFromUri(r.uri),
                 .name = r.value.name,
                 .config = cfg,
+                .ranks = r.value.ranks,
+                .desc = r.value.desc,
+                .tags = r.value.tags,
+                .designed = appview.surfaceMask(r.value.designedFor),
             }) catch false;
         }
     }

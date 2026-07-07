@@ -2495,6 +2495,8 @@ pub const loadout_tabs = [_][]const u8{ "Loadout", "Marketplace", "Create" };
 pub const MarketAlgoCard = struct {
     name: []const u8,
     author: []const u8, // "@handle" or the DID when the handle is unresolved
+    ranks: []const u8 = "", // the author's one-liner (schema rev)
+    designed: u8 = 0, // declared-surface bitmask (1 feed / 2 replies / 4 zones)
     learns: bool,
     uses_behavioral: bool,
     state_budget_bytes: u32,
@@ -2929,7 +2931,26 @@ fn drawMarketplace(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, 
             try rect(gpa, dl, x0, y, w, 1, 0x14EDEAE0, 16); // lit top edge
 
             _ = try str(gpa, dl, e, .semibold, x0 + 22, y + 34, ink, 20, a.name);
-            _ = try str(gpa, dl, e, .regular, x0 + 22, y + 58, muted, 14, a.author);
+            var apen = try str(gpa, dl, e, .regular, x0 + 22, y + 58, muted, 14, a.author);
+            if (a.ranks.len > 0) {
+                apen = try str(gpa, dl, e, .regular, apen + 8, y + 58, faint, 13, "·");
+                _ = try str(gpa, dl, e, .regular, apen + 8, y + 58, body_c, 13, a.ranks);
+            }
+            // Designed-for badges, top-right: the author's declaration of which
+            // sockets this was built for (right-to-left so FEED lands leftmost).
+            if (a.designed != 0) {
+                var bx = x0 + w - 20;
+                var si: usize = dev_surfaces.len;
+                while (si > 0) {
+                    si -= 1;
+                    if (a.designed & (@as(u8, 1) << @intCast(si)) == 0) continue;
+                    const btw: i32 = @intCast(text.measure(e, .semibold, dev_surfaces[si], 11));
+                    bx -= btw + 18;
+                    try rect(gpa, dl, bx, y + 22, btw + 14, 20, 0x14EDEAE0, 6);
+                    _ = try str(gpa, dl, e, .semibold, bx + 7, y + 36, muted, 11, dev_surfaces[si]);
+                    bx -= 6;
+                }
+            }
 
             // The proven privacy line: green when candidate-side (a privacy win),
             // accent when it reads or learns from your attention.

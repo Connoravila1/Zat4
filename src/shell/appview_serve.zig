@@ -277,16 +277,36 @@ fn getAlgorithms(arena: Allocator, idx: *const appview.Index, cfg: ServeConfig, 
     }
     const rows = try appview.listAlgorithms(arena, idx, limit);
     const views = try arena.alloc(lexicon.AlgorithmView, rows.len);
-    for (views, rows) |*v, r| v.* = .{
-        .cid = r.cid,
-        .author = r.author_did,
-        .handle = r.author_handle,
-        .rkey = r.rkey,
-        .name = r.name,
-        .usesBehavioral = r.uses_behavioral,
-        .learns = r.learns,
-        .stateBudgetBytes = r.state_budget_bytes,
-    };
+    for (views, rows) |*v, r| {
+        const surf = try arena.alloc([]const u8, 3);
+        var ns: usize = 0;
+        if (r.designed & 1 != 0) {
+            surf[ns] = "feed";
+            ns += 1;
+        }
+        if (r.designed & 2 != 0) {
+            surf[ns] = "replies";
+            ns += 1;
+        }
+        if (r.designed & 4 != 0) {
+            surf[ns] = "zones";
+            ns += 1;
+        }
+        v.* = .{
+            .cid = r.cid,
+            .author = r.author_did,
+            .handle = r.author_handle,
+            .rkey = r.rkey,
+            .name = r.name,
+            .ranks = r.ranks,
+            .desc = r.desc,
+            .tags = r.tags,
+            .designedFor = surf[0..ns],
+            .usesBehavioral = r.uses_behavioral,
+            .learns = r.learns,
+            .stateBudgetBytes = r.state_budget_bytes,
+        };
+    }
     const page: lexicon.AlgorithmsPage = .{ .cursor = null, .algorithms = views };
     return std.json.Stringify.valueAlloc(arena, page, .{ .emit_null_optional_fields = false });
 }

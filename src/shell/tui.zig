@@ -218,14 +218,20 @@ const MarketRow = struct {
     author_did: []const u8,
     rkey: []const u8,
     cid: []const u8,
+    ranks: []const u8, // author prose (schema rev)
+    desc: []const u8,
+    tags: []const u8, // joined ", "
     learns: bool,
     uses_behavioral: bool,
+    designed: u8, // declared-surface bitmask
     state_budget_bytes: u32,
 
     comptime {
-        // Budget: five slices + the flags + the u32, packed. A small catalog
-        // (one browse page), but it is a collection row — guard it (A7).
-        std.debug.assert(@sizeOf(MarketRow) == 88);
+        // A7.1: budget raised 88 → 136 for the schema rev — three more slices
+        // (ranks/desc/tags, 48) + the designed byte (packs into the existing
+        // bool/u32 tail padding). Eight slices (128) + 2 bools + u8 + u32 =
+        // 135, padded to 136. A small catalog, still a guarded collection row.
+        std.debug.assert(@sizeOf(MarketRow) == 136);
     }
 };
 
@@ -246,6 +252,9 @@ fn refillMarket(
         gpa.free(r.author_did);
         gpa.free(r.rkey);
         gpa.free(r.cid);
+        gpa.free(r.ranks);
+        gpa.free(r.desc);
+        gpa.free(r.tags);
     }
     catalog.clearRetainingCapacity();
     for (algos) |a| {
@@ -253,14 +262,29 @@ fn refillMarket(
             try std.fmt.allocPrint(gpa, "@{s}", .{a.handle})
         else
             try gpa.dupe(u8, a.author);
+        // The declared surfaces, back to the compact mask the client renders.
+        var designed: u8 = 0;
+        for (a.designedFor) |n| {
+            if (std.mem.eql(u8, n, "feed")) {
+                designed |= 1;
+            } else if (std.mem.eql(u8, n, "replies")) {
+                designed |= 2;
+            } else if (std.mem.eql(u8, n, "zones")) {
+                designed |= 4;
+            }
+        }
         try catalog.append(gpa, .{
             .name = try gpa.dupe(u8, a.name),
             .author_disp = author_disp,
             .author_did = try gpa.dupe(u8, a.author),
             .rkey = try gpa.dupe(u8, a.rkey),
             .cid = try gpa.dupe(u8, a.cid),
+            .ranks = try gpa.dupe(u8, a.ranks),
+            .desc = try gpa.dupe(u8, a.desc),
+            .tags = try gpa.dupe(u8, a.tags),
             .learns = a.learns,
             .uses_behavioral = a.usesBehavioral,
+            .designed = designed,
             .state_budget_bytes = a.stateBudgetBytes,
         });
     }
@@ -268,6 +292,8 @@ fn refillMarket(
     for (catalog.items) |r| try cards.append(gpa, .{
         .name = r.name,
         .author = r.author_disp,
+        .ranks = r.ranks,
+        .designed = r.designed,
         .learns = r.learns,
         .uses_behavioral = r.uses_behavioral,
         .state_budget_bytes = r.state_budget_bytes,
@@ -1233,6 +1259,9 @@ fn deinitRunState(rs: *RunState) void {
             gpa.free(r.author_did);
             gpa.free(r.rkey);
             gpa.free(r.cid);
+            gpa.free(r.ranks);
+            gpa.free(r.desc);
+            gpa.free(r.tags);
         }
         rs.market_catalog.deinit(gpa);
         rs.market_cards.deinit(gpa);

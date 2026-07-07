@@ -138,6 +138,10 @@ pub fn ingestEvent(gpa: Allocator, arena: Allocator, idx: *appview.Index, event_
             .rkey = commit.rkey,
             .name = arec.name,
             .config = cfg,
+            .ranks = arec.ranks,
+            .desc = arec.desc,
+            .tags = arec.tags,
+            .designed = appview.surfaceMask(arec.designedFor),
         });
         return .algorithm;
     }
@@ -157,6 +161,10 @@ const AlgoCommit = struct {
 const AlgoRecordFlat = struct {
     name: []const u8 = "",
     config: []const u8 = "", // serialized FeedConfig string (atproto: no floats)
+    ranks: []const u8 = "",
+    desc: []const u8 = "",
+    designedFor: []const []const u8 = &.{},
+    tags: []const []const u8 = &.{},
 };
 
 // --- minimal graph-event wire shapes (transient parse targets, A7.2) ------

@@ -110,16 +110,21 @@ pub const Algorithm = struct {
     author: StrId, // publisher DID (interned)
     rkey: StrId, // record key, so a client can get_record the full config
     name: Span, // display name in the string pool
+    ranks: Span, // the author's one-line "what it ranks for" (schema rev)
+    desc: Span, // the author's public-page description
+    tags: Span, // search facets, joined ", " in the pool
     created_at: i64, // record timestamp (sort key, reverse-chron)
     state_budget: u32, // classify's declared on-device state ceiling (0 ⇒ stateless)
     flags: AlgoFlags, // derived privacy bits (uses_behavioral / learns) — A6-style
+    designed: u8, // declared-surface bitmask (1 feed / 2 replies / 4 zones)
 
     comptime {
-        // Budget: name Span(8) + created_at i64(8) = 16, then 4×u32
-        // (cid/author/rkey/state_budget) = 16, + flags(1) = 33, padded to 40 at
-        // the 8-byte alignment of Span/i64. Exact (A7). The derived flags + state
-        // ceiling are the browse card's PROVEN privacy label — earned, kept tight.
-        assert(@sizeOf(Algorithm) == 40);
+        // A7.1: budget raised 40 → 64 for the schema rev (ALGO_SUBMISSION):
+        // three more Spans (ranks/desc/tags, 24) + the designed byte carry the
+        // browse card's author prose + declaration. 4×u32(16) + 4×Span(32) +
+        // i64(8) + flags(1) + designed(1) = 58, padded to 64 at i64 alignment.
+        // Exact (A7); the padding is alignment, not layout drift.
+        assert(@sizeOf(Algorithm) == 64);
     }
 };
 
@@ -419,7 +424,28 @@ pub const AlgorithmInput = struct {
     /// by (author, rkey) when it adopts/inspects, so what runs is re-proven.
     config: discover.FeedConfig,
     created_at: i64 = 0,
+    /// The schema rev's author prose + declaration (empty on old records, E4).
+    ranks: []const u8 = "",
+    desc: []const u8 = "",
+    tags: []const []const u8 = &.{},
+    designed: u8 = 0, // surface bitmask (see surfaceMask)
 };
+
+/// Map a record's declared-surface strings to the compact bitmask the index
+/// stores. Unknown names are ignored — forward-compatible with new sockets.
+pub fn surfaceMask(names: []const []const u8) u8 {
+    var mask: u8 = 0;
+    for (names) |n| {
+        if (std.mem.eql(u8, n, "feed")) {
+            mask |= 1;
+        } else if (std.mem.eql(u8, n, "replies")) {
+            mask |= 2;
+        } else if (std.mem.eql(u8, n, "zones")) {
+            mask |= 4;
+        }
+    }
+    return mask;
+}
 
 /// Index one published algorithm. A8: a re-seen cid is a no-op (same cid ⇒ same
 /// bytes). The privacy `flags` + `state_budget` are DERIVED from the config here
@@ -436,6 +462,28 @@ pub fn indexAlgorithm(gpa: Allocator, idx: *Index, in: AlgorithmInput) Allocator
     try idx.pool_bytes.appendSlice(gpa, in.name);
     const name_span: Span = .{ .off = name_off, .len = @intCast(in.name.len) };
 
+    // Author prose, size-capped AT the boundary (an oversize field becomes
+    // empty, never a truncated mid-UTF-8 slice — E4/D5); tags joined ", ".
+    const ranks_in = if (in.ranks.len <= 300) in.ranks else "";
+    const ranks_off: u32 = @intCast(idx.pool_bytes.items.len);
+    try idx.pool_bytes.appendSlice(gpa, ranks_in);
+    const ranks_span: Span = .{ .off = ranks_off, .len = @intCast(ranks_in.len) };
+    const desc_in = if (in.desc.len <= 2000) in.desc else "";
+    const desc_off: u32 = @intCast(idx.pool_bytes.items.len);
+    try idx.pool_bytes.appendSlice(gpa, desc_in);
+    const desc_span: Span = .{ .off = desc_off, .len = @intCast(desc_in.len) };
+    const tags_off: u32 = @intCast(idx.pool_bytes.items.len);
+    var tags_len: usize = 0;
+    for (in.tags) |tag| {
+        if (tag.len == 0) continue;
+        const sep: []const u8 = if (tags_len == 0) "" else ", ";
+        if (tags_len + sep.len + tag.len > 300) break;
+        try idx.pool_bytes.appendSlice(gpa, sep);
+        try idx.pool_bytes.appendSlice(gpa, tag);
+        tags_len += sep.len + tag.len;
+    }
+    const tags_span: Span = .{ .off = tags_off, .len = @intCast(tags_len) };
+
     // The proven privacy label — derived, not claimed (invariant 6).
     const c = transparency.classify(in.config);
 
@@ -445,9 +493,13 @@ pub fn indexAlgorithm(gpa: Allocator, idx: *Index, in: AlgorithmInput) Allocator
         .author = author_id,
         .rkey = rkey_id,
         .name = name_span,
+        .ranks = ranks_span,
+        .desc = desc_span,
+        .tags = tags_span,
         .created_at = in.created_at,
         .state_budget = c.state_budget_bytes,
         .flags = .{ .uses_behavioral = c.uses_behavioral, .learns = c.learns },
+        .designed = in.designed,
     });
     try idx.algo_by_cid.put(gpa, cid_id, row);
     return true;
@@ -803,17 +855,28 @@ pub fn listAlgorithms(arena: Allocator, idx: *const Index, limit: usize) Allocat
     const authors = idx.algorithms.items(.author);
     const rkeys = idx.algorithms.items(.rkey);
     const names = idx.algorithms.items(.name);
+    const ranks_col = idx.algorithms.items(.ranks);
+    const desc_col = idx.algorithms.items(.desc);
+    const tags_col = idx.algorithms.items(.tags);
+    const designed_col = idx.algorithms.items(.designed);
     const budgets = idx.algorithms.items(.state_budget);
     const flags = idx.algorithms.items(.flags);
     for (out, 0..) |*o, i| {
         const row = total - 1 - i; // newest (last-ingested) first
         const s = names[row];
+        const rk = ranks_col[row];
+        const dc = desc_col[row];
+        const tg = tags_col[row];
         o.* = .{
             .cid = str(idx, cids[row]),
             .author_did = str(idx, authors[row]),
             .author_handle = handleForId(idx, authors[row]),
             .rkey = str(idx, rkeys[row]),
             .name = idx.pool_bytes.items[s.off .. s.off + s.len],
+            .ranks = idx.pool_bytes.items[rk.off .. rk.off + rk.len],
+            .desc = idx.pool_bytes.items[dc.off .. dc.off + dc.len],
+            .tags = idx.pool_bytes.items[tg.off .. tg.off + tg.len],
+            .designed = designed_col[row],
             .uses_behavioral = flags[row].uses_behavioral,
             .learns = flags[row].learns,
             .state_budget_bytes = budgets[row],
@@ -831,6 +894,10 @@ pub const AlgorithmInfo = struct {
     author_handle: []const u8, // resolved handle, or "" (client falls back to did)
     rkey: []const u8, // fetch ref: get_record(author_did, algorithm, rkey)
     name: []const u8,
+    ranks: []const u8, // author prose (schema rev; "" on old records)
+    desc: []const u8,
+    tags: []const u8, // joined ", "
+    designed: u8, // declared-surface bitmask (1 feed / 2 replies / 4 zones)
     uses_behavioral: bool, // proven from the config (invariant 6), not claimed
     learns: bool,
     state_budget_bytes: u32,
@@ -1038,7 +1105,7 @@ test "guard: hot records are exactly sized" {
     try testing.expectEqual(@as(usize, 32), @sizeOf(Post));
     try testing.expectEqual(@as(usize, 8), @sizeOf(Follow));
     try testing.expectEqual(@as(usize, 8), @sizeOf(Span));
-    try testing.expectEqual(@as(usize, 40), @sizeOf(Algorithm));
+    try testing.expectEqual(@as(usize, 64), @sizeOf(Algorithm)); // A7.1: schema rev (see the struct's guard)
     try testing.expectEqual(@as(usize, 1), @sizeOf(AlgoFlags));
 }
 
