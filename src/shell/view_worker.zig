@@ -292,6 +292,9 @@ fn fetchOutcome(worker: *Worker, arena: Allocator, req: Request) Result.Outcome 
             };
         },
         .zones => {
+            // The catalog's recency watermark: the last 24h. The clock read
+            // stays here in the shell (B3); core + server count against it.
+            const since = clock.unixSeconds() - 24 * 60 * 60;
             const fetched = feed_shell.loadZones(
                 worker.gpa,
                 arena,
@@ -299,6 +302,7 @@ fn fetchOutcome(worker: *Worker, arena: Allocator, req: Request) Result.Outcome 
                 worker.environ,
                 worker.session,
                 worker.appview_url,
+                since,
             ) catch |err| return .{ .net_error = @errorName(err) };
             return switch (fetched) {
                 .ok => |tags| .{ .zones = tags },

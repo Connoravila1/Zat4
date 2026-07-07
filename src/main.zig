@@ -1111,6 +1111,7 @@ test {
     _ = @import("core/algo_gate.zig");
     _ = @import("shell/algorithm.zig");
     _ = @import("core/feed_view.zig");
+    _ = @import("core/zone_pins.zig");
     _ = @import("core/settings_view.zig");
     _ = @import("core/lens_socket.zig");
     _ = @import("core/lens_catalog.zig");

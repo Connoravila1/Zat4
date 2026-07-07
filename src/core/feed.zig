@@ -998,13 +998,25 @@ pub fn buildTagView(arena: Allocator, store: *const Store, tag: []const u8) erro
 /// This is what lets the browse page list a zone the client already knows even
 /// before/without the AppView's `listTags` — the shell merges the server's wider
 /// set on top. Allocates into `arena` (C3); the strings are arena-owned.
-pub fn listZonesLocal(arena: Allocator, store: *const Store) error{OutOfMemory}![]lexicon.TagView {
+pub fn listZonesLocal(arena: Allocator, store: *const Store, since: i64) error{OutOfMemory}![]lexicon.TagView {
+    // Per-zone accumulator: the same community stats the AppView serves
+    // (count / distinct posters / posts at-or-after `since` / newest post),
+    // derived from resident posts only. `since` is the shell's recency
+    // watermark (B3 — the clock stays out of the core).
+    const Zs = struct {
+        count: usize = 0,
+        recent: usize = 0,
+        last_at: i64 = 0,
+        authors: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    };
     var order: std.ArrayList([]const u8) = .empty; // zone names, first-seen order
     defer order.deinit(arena);
-    var counts: std.StringHashMapUnmanaged(usize) = .empty;
-    defer counts.deinit(arena);
+    var stats: std.StringHashMapUnmanaged(*Zs) = .empty;
+    defer stats.deinit(arena);
     var nbuf: [128]u8 = undefined;
     var pbuf: [128]u8 = undefined;
+    const createds = store.posts.items(.created_at);
+    const post_authors = store.posts.items(.author);
     for (0..store.posts.len) |p| {
         if (p >= store.post_tags.items.len) continue;
         const r = store.post_tags.items[p];
@@ -1018,17 +1030,25 @@ pub fn listZonesLocal(arena: Allocator, store: *const Store) error{OutOfMemory}!
                 const prev = normalizeTagClient(sliceSpan(store, store.tag_pool.items[r.off + j]), &pbuf) orelse continue;
                 if (std.mem.eql(u8, prev, norm)) continue :next_tag;
             }
-            if (counts.getPtr(norm)) |cp| {
-                cp.* += 1;
-            } else {
+            const zs: *Zs = stats.get(norm) orelse blk: {
                 const dup = try arena.dupe(u8, norm);
-                try counts.put(arena, dup, 1);
+                const fresh = try arena.create(Zs);
+                fresh.* = .{};
+                try stats.put(arena, dup, fresh);
                 try order.append(arena, dup);
-            }
+                break :blk fresh;
+            };
+            zs.count += 1;
+            if (createds[p] >= since) zs.recent += 1;
+            if (createds[p] > zs.last_at) zs.last_at = createds[p];
+            try zs.authors.put(arena, @intFromEnum(post_authors[p]), {});
         }
     }
     const out = try arena.alloc(lexicon.TagView, order.items.len);
-    for (out, order.items) |*t, name| t.* = .{ .tag = name, .count = counts.get(name).? };
+    for (out, order.items) |*t, name| {
+        const zs = stats.get(name).?;
+        t.* = .{ .tag = name, .count = zs.count, .authors = zs.authors.count(), .recent = zs.recent, .lastAt = zs.last_at };
+    }
     return out;
 }
 
@@ -2056,14 +2076,18 @@ test "zones: listZonesLocal derives the catalog from resident posts, case-folded
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    const zones = try listZonesLocal(arena_state.allocator(), &store);
+    // `since` at the second post's timestamp: only it is "recent".
+    const zones = try listZonesLocal(arena_state.allocator(), &store, 1782604801);
     // water (×2, #Water folds in) + rivers (×1) — the browse page's catalog even
     // without the AppView, so a zone reachable by tapping its hashtag lists here.
     try testing.expectEqual(@as(usize, 2), zones.len);
     try testing.expectEqualStrings("water", zones[0].tag); // canonical lowercase, first-seen
     try testing.expectEqual(@as(usize, 2), zones[0].count);
+    try testing.expectEqual(@as(usize, 2), zones[0].authors); // did:plc:a + did:plc:b
+    try testing.expectEqual(@as(usize, 1), zones[0].recent); // only the t+1 post
     try testing.expectEqualStrings("rivers", zones[1].tag);
     try testing.expectEqual(@as(usize, 1), zones[1].count);
+    try testing.expectEqual(@as(usize, 1), zones[1].authors);
 }
 
 test "zones/dates: a reply-parent placeholder gets created_at + tags filled by its full view" {

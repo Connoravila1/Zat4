@@ -398,11 +398,17 @@ pub const ThreadView = struct {
 };
 
 /// One zone in the catalog: its display tag (canonical lowercase, '#' stripped)
-/// and how many posts bear it. The catalog is the set of these.
+/// plus the community stats that make the catalog read as live places — total
+/// posts, distinct posters, posts inside the requester's `since` window, and
+/// the newest post's unix-seconds timestamp. The stat fields default to 0 so an
+/// older server's flat {tag,count} rows still parse (E4).
 /// A7.2: cold struct, size guard waived — transient parse/build target.
 pub const TagView = struct {
     tag: []const u8 = "",
     count: usize = 0,
+    authors: usize = 0,
+    recent: usize = 0,
+    lastAt: i64 = 0,
 };
 
 /// Response of `app.zat4.feed.listTags`: the known zones (manifest-state and

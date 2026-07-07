@@ -71,6 +71,7 @@ const text_core = @import("../core/text.zig");
 const field_core = @import("../core/field.zig");
 const field_ui = @import("../core/field_ui.zig");
 const feed_view = @import("../core/feed_view.zig");
+const pin_store = @import("../core/zone_pins.zig");
 const settings_view = @import("../core/settings_view.zig");
 const text_select = @import("../core/text_select.zig");
 const textedit = @import("../core/textedit.zig");
@@ -620,6 +621,21 @@ const RunState = struct {
     gsettings_picking: u8,
     zone_catalog: std.ArrayList(feed_view.ZoneCard),
     on_browse_prev: bool,
+    /// The viewer's pinned zones (persisted in the client cache).
+    zone_pins: pin_store.Pins,
+    /// The zones hub UI: sub-tab (0 Browse · 1 Pinned · 2 Trending), the live
+    /// search buffer/focus, and the motion scalars the render lerps each frame
+    /// (tab underline glide, tab-switch settle, page-entry fade).
+    gzones_tab: u8,
+    gzones_q_buf: [64]u8,
+    gzones_q_len: usize,
+    gzones_q_focus: bool,
+    gzones_tab_t: f32,
+    gzones_enter_t: f32,
+    /// The open zone page's community stats (distinct posters + newest post),
+    /// recomputed when its view rebuilds — the masthead's real numbers.
+    zone_people: usize,
+    zone_last_at: i64,
     market_catalog: std.ArrayList(MarketRow),
     market_cards: std.ArrayList(feed_view.MarketAlgoCard),
     on_market_prev: bool,
@@ -1256,6 +1272,16 @@ fn initRunState(
     // the browse screen. Each card taps to its zone feed; freed on exit.
     rs.zone_catalog = .empty;
     rs.on_browse_prev = false;
+    // Pinned zones restore from the client cache; absent/torn = none (E4).
+    rs.zone_pins = cache_shell.loadPins(gpa, environ) orelse .{};
+    rs.gzones_tab = 0;
+    rs.gzones_q_buf = undefined;
+    rs.gzones_q_len = 0;
+    rs.gzones_q_focus = false;
+    rs.gzones_tab_t = 0;
+    rs.gzones_enter_t = 1;
+    rs.zone_people = 0;
+    rs.zone_last_at = 0;
     // MARKETPLACE catalog (Algorithms → Marketplace tab): gpa-owned MarketRow
     // rows from the AppView's `getAlgorithms`, (re)fetched on entering the tab
     // and refilled by the view-load drain via refillMarket; `market_cards` is
@@ -1388,6 +1414,7 @@ fn deinitRunState(rs: *RunState) void {
         for (rs.zone_catalog.items) |zc| gpa.free(zc.tag);
         rs.zone_catalog.deinit(gpa);
     }
+    pin_store.deinit(gpa, &rs.zone_pins);
     rs.algo_lib.deinit(gpa);
     {
         devClearCheck(rs); // frees the dev flow's diag/disclosure lines + config
@@ -2095,16 +2122,27 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         var found = false;
                         for (rs.zone_catalog.items) |*zc| {
                             if (std.ascii.eqlIgnoreCase(zc.tag, t.tag)) {
-                                zc.count = t.count;
+                                zc.count = @max(zc.count, t.count);
+                                // A server that predates the community stats
+                                // sends zeros (lastAt 0 marks it) — keep the
+                                // locally-derived numbers rather than letting
+                                // the merge ERASE them a beat after they show
+                                // (the "stats blink away" live finding, E4).
+                                if (t.lastAt != 0) {
+                                    zc.authors = t.authors;
+                                    zc.recent = t.recent;
+                                    zc.last_at = t.lastAt;
+                                }
                                 found = true;
                                 break;
                             }
                         }
                         if (!found) {
                             const dup = gpa.dupe(u8, t.tag) catch continue;
-                            rs.zone_catalog.append(gpa, .{ .tag = dup, .count = t.count }) catch gpa.free(dup);
+                            rs.zone_catalog.append(gpa, .{ .tag = dup, .count = t.count, .authors = t.authors, .recent = t.recent, .last_at = t.lastAt, .pinned = pin_store.has(&rs.zone_pins, t.tag) }) catch gpa.free(dup);
                         }
                     }
+                    feed_view.sortZonesByActivity(rs.zone_catalog.items);
                     rs.status = "";
                 },
                 .algorithms => |algos| {
@@ -2207,12 +2245,23 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
             // must also appear here. The server's wider set merges on top.
             for (rs.zone_catalog.items) |zc| gpa.free(zc.tag);
             rs.zone_catalog.clearRetainingCapacity();
-            if (feed_core.listZonesLocal(arena, store) catch null) |local| {
+            if (feed_core.listZonesLocal(arena, store, now - 24 * 60 * 60) catch null) |local| {
                 for (local) |t| {
                     const dup = gpa.dupe(u8, t.tag) catch continue;
-                    rs.zone_catalog.append(gpa, .{ .tag = dup, .count = t.count }) catch gpa.free(dup);
+                    rs.zone_catalog.append(gpa, .{ .tag = dup, .count = t.count, .authors = t.authors, .recent = t.recent, .last_at = t.lastAt, .pinned = pin_store.has(&rs.zone_pins, t.tag) }) catch gpa.free(dup);
                 }
             }
+            // A pinned zone whose posts aren't resident still deserves its
+            // shelf spot — append it as a bare card (the server merge fills
+            // the stats in when `listTags` lands).
+            pins: for (rs.zone_pins.tags.items) |ptag| {
+                for (rs.zone_catalog.items) |zc| {
+                    if (std.ascii.eqlIgnoreCase(zc.tag, ptag)) continue :pins;
+                }
+                const dup = gpa.dupe(u8, ptag) catch continue;
+                rs.zone_catalog.append(gpa, .{ .tag = dup, .count = 0, .pinned = true }) catch gpa.free(dup);
+            }
+            feed_view.sortZonesByActivity(rs.zone_catalog.items);
             // The AppView's wider catalog: SUBMIT to the view worker (M-Core.1
             // unblocking, 6/7); the drain above merges it over this local set
             // when it lands (a server count is authoritative). Failure leaves
@@ -2358,6 +2407,31 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
             rs.gsocket_ui.open_t += ((if (rs.gsocket_ui.open) @as(f32, 1) else 0) - rs.gsocket_ui.open_t) * oe;
             rs.reply_ui.open_t += ((if (rs.reply_ui.open) @as(f32, 1) else 0) - rs.reply_ui.open_t) * oe;
             rs.zone_ui.open_t += ((if (rs.zone_ui.open) @as(f32, 1) else 0) - rs.zone_ui.open_t) * oe;
+            // Zones hub motion: the tab underline GLIDES toward the active tab
+            // and the incoming tab body settles in. (Page ENTRY rides the GPU
+            // path's screen-switch crossfade — no extra state here.)
+            rs.gzones_tab_t += (@as(f32, @floatFromInt(rs.gzones_tab)) - rs.gzones_tab_t) * 0.30;
+            rs.gzones_enter_t += (1.0 - rs.gzones_enter_t) * 0.22;
+        }
+        // The open zone's community stats — distinct posters + newest post over
+        // the zone view (≤50 rows; plain compares, no allocation). The masthead
+        // draws only real numbers (0 people = the line stays posts-only).
+        if (on_zone) {
+            var people: usize = 0;
+            var last_at: i64 = 0;
+            for (view_items, 0..) |it, i| {
+                if (it.created_at > last_at) last_at = it.created_at;
+                var seen_before = false;
+                for (view_items[0..i]) |prev| {
+                    if (std.mem.eql(u8, prev.author_handle, it.author_handle)) {
+                        seen_before = true;
+                        break;
+                    }
+                }
+                if (!seen_before) people += 1;
+            }
+            rs.zone_people = people;
+            rs.zone_last_at = last_at;
         }
         const home_tray: lens_socket.TrayView = .{ .cards = rs.socket_cards, .text = rs.socket_blob, .seated = rs.gseated };
         // Advance the drag's LIVE REFLOW + lift + settle one step per frame (the
@@ -2485,7 +2559,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .market_q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .market_q_focus = rs.gmarket_q_focus, .market_loading = rs.market_loading, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
+        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .market_q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .market_q_focus = rs.gmarket_q_focus, .market_loading = rs.market_loading, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
         switch (rs.mode) {
             .timeline => try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status),
             .compose => {
@@ -3395,6 +3469,12 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             rs.gsocket_ui.settle_phase = 1; // ghost eases from release point into its slot
                             rs.loadout_dirty = true;
                         }
+                        // The zones search blurs when a tap lands anywhere but
+                        // the field itself (the universal input-blur norm).
+                        if (rs.gzones_q_focus and rs.gscreen == feed_view.screen_zones_browse) {
+                            const over_search = if (feed_view.hitTest(g.regions.items, rx, ry)) |sh| sh.kind == .zone_search else false;
+                            if (!over_search) rs.gzones_q_focus = false;
+                        }
                         // Release-activation: fire the armed feed tap ONLY if the
                         // release lands on the same target the press armed. A press
                         // that began a drag never armed a tap, so a drag never also
@@ -4250,6 +4330,44 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         rs.zone_dirty = true;
                                         rs.gscroll_px = 0;
                                         rs.gsocket_ui.open = false;
+                                        rs.gzones_q_focus = false;
+                                    }
+                                },
+                                // Hub sub-tab: flip + restart the settle so the
+                                // incoming list slides in; the underline glides on
+                                // its own (tab_t lerps toward tab each frame).
+                                .zone_tab => if (hit.post <= 2) {
+                                    const t: u8 = @intCast(hit.post);
+                                    if (t != rs.gzones_tab) {
+                                        rs.gzones_tab = t;
+                                        rs.gzones_enter_t = 0;
+                                        rs.gscroll_px = 0;
+                                    }
+                                    rs.gzones_q_focus = false;
+                                },
+                                .zone_search => {
+                                    rs.gzones_q_focus = true;
+                                    rs.caret_anchor_ns = clock_shell.monotonicNanos();
+                                },
+                                // Pin toggle — from a hub card (idx = catalog row)
+                                // or the zone masthead (screen_zones → the open
+                                // zone's tag). Persisted immediately; the catalog
+                                // card mirrors the new state.
+                                .zone_pin => {
+                                    const tag: []const u8 = if (rs.gscreen == feed_view.screen_zones)
+                                        rs.zone_tag
+                                    else if (hit.post < rs.zone_catalog.items.len)
+                                        rs.zone_catalog.items[hit.post].tag
+                                    else
+                                        "";
+                                    if (tag.len > 0) {
+                                        if (try pin_store.toggle(gpa, &rs.zone_pins, tag)) |now_pinned| {
+                                            for (rs.zone_catalog.items) |*zc| {
+                                                if (std.ascii.eqlIgnoreCase(zc.tag, tag)) zc.pinned = now_pinned;
+                                            }
+                                            _ = cache_shell.savePins(gpa, environ, &rs.zone_pins);
+                                            rs.status = if (now_pinned) "pinned — it keeps a place under Zones · Pinned" else "unpinned";
+                                        }
                                     }
                                 },
                                 // Marketplace "View details": fetch this
@@ -4839,6 +4957,34 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     rs.gbench_warn = null;
                     continue;
                 }
+                // The zones search-or-jump field: live filter per keystroke
+                // (the render matches as it draws); Enter JUMPS straight to the
+                // typed tag's zone (it may not exist yet — a zone is a query,
+                // ZONES inv. 4); Esc gives the keyboard back. ASCII (tags are).
+                if (rs.gscreen == feed_view.screen_zones_browse and rs.gzones_q_focus) {
+                    if (zc == '\r' or zc == '\n') {
+                        rs.gzones_q_focus = false;
+                        const q = std.mem.trim(u8, rs.gzones_q_buf[0..rs.gzones_q_len], " #");
+                        if (q.len > 0 and q.len <= rs.zone_tag_buf.len) {
+                            for (q, 0..) |c, i| rs.zone_tag_buf[i] = std.ascii.toLower(c); // canonical (inv. 1)
+                            rs.zone_return_screen = rs.gscreen;
+                            rs.zone_tag = rs.zone_tag_buf[0..q.len];
+                            rs.gscreen = feed_view.screen_zones;
+                            rs.zone_dirty = true;
+                            rs.gscroll_px = 0;
+                            rs.gzones_q_len = 0; // the jump consumed the query
+                        }
+                    } else if (zc == 27) {
+                        rs.gzones_q_focus = false;
+                    } else if (zc == 8 or zc == 127) {
+                        if (rs.gzones_q_len > 0) rs.gzones_q_len -= 1;
+                    } else if (zc >= 0x20 and zc < 0x7f and rs.gzones_q_len < rs.gzones_q_buf.len) {
+                        rs.gzones_q_buf[rs.gzones_q_len] = @intCast(zc);
+                        rs.gzones_q_len += 1;
+                    }
+                    try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status);
+                    continue;
+                }
                 // The marketplace search box: live filter per keystroke; Enter or
                 // Esc gives the keyboard back. ASCII (names/tags are).
                 if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1 and rs.gmarket_q_focus) {
@@ -5348,6 +5494,8 @@ fn typingOwnsKeyboard(rs: *const RunState) bool {
         (rs.gdev_step == .source or rs.gdev_step == .details)) return true;
     // The marketplace search box.
     if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1 and rs.gmarket_q_focus) return true;
+    // The zones hub search-or-jump field.
+    if (rs.gscreen == feed_view.screen_zones_browse and rs.gzones_q_focus) return true;
     return false;
 }
 
@@ -7307,7 +7455,7 @@ const Grid = struct {
     zone_title: []const u8 = "",
     /// The zone CATALOG for the browse screen (`screen_zones_browse`): the known
     /// zones with post counts. Empty on every other screen.
-    zones: []const feed_view.ZoneCard = &.{},
+    zones: feed_view.ZonesView = .{},
     /// The selected SECTION on the Settings screen (master–detail state). Index
     /// into `settings_view.sections`; ignored off `screen_settings`.
     settings_section: u8 = 0,
@@ -8686,6 +8834,39 @@ fn paintFrameGpu(
             gs.chat_typing_t > 0.01 or g.chat_typing or
             g.chat_input_focus or g.chat_composing or g.chat_pay.open or g.chat_recv.open;
     };
+    // ZONES: the hub + zone page render from state the feed signature can't
+    // see — the sub-tab, the search text/focus/caret, the catalog's pins and
+    // live stats, the motion scalars, and (hub only) the hover position. Fold
+    // it in when on a zones screen, or the cached verts go stale — the chat
+    // A5 lesson exactly: dead tabs, dead pins, a frozen frame (the first
+    // zones live test caught all three).
+    var zones_sig: u64 = 0;
+    if (g.screen.* == feed_view.screen_zones_browse or g.screen.* == feed_view.screen_zones) {
+        zones_sig = (@as(u64, g.zones.tab) +% 1) *% 0x9E37_79B9_7F4A_7C15;
+        zones_sig ^= @as(u64, @intFromBool(g.zones.q_focus)) *% 0x8A91_7F2B_4D3E_61C7;
+        zones_sig ^= @as(u64, @intFromBool(g.zones.caret_on)) *% 0xF29C_511C_8E3D_45A7;
+        zones_sig ^= @as(u64, @intFromBool(g.zones.pinned)) *% 0xBF58_476D_1CE4_E5B9;
+        zones_sig ^= std.hash.Wyhash.hash(0x5A72_C4A7, g.zones.query);
+        // Quantized motion: the underline glide + tab-body settle rebuild
+        // through their animation frames, then go quiet.
+        zones_sig ^= (@as(u64, @intFromFloat(std.math.clamp(g.zones.tab_t, 0.0, 2.0) * 64.0)) +% 1) *% 0xCA6B_9576_3F1D_2E11;
+        zones_sig ^= (@as(u64, @intFromFloat(std.math.clamp(g.zones.enter_t, 0.0, 1.0) * 64.0)) +% 1) *% 0xD6E8_FEB8_6659_FD93;
+        // The catalog: a pin toggles in place and the server merge updates
+        // stats without the length moving — hash the drawn fields.
+        var zh: u64 = g.zones.cards.len;
+        for (g.zones.cards, 0..) |zc, zi| {
+            zh ^= (std.hash.Wyhash.hash(0x2C1B_3C6D, zc.tag) ^
+                ((@as(u64, zc.count) << 20) +% (@as(u64, zc.recent) << 8) +% @as(u64, zc.authors) +% (@as(u64, @intFromBool(zc.pinned)) << 40)) ^
+                @as(u64, @bitCast(zc.last_at))) *% (@as(u64, zi) *% 2 +% 0x9E37_79B1);
+        }
+        zones_sig ^= zh;
+        // Hover lifts hub cards/rows — track the pointer on the HUB only
+        // (it has no posts; its relayout is cheap, G3-measured class).
+        if (g.screen.* == feed_view.screen_zones_browse) {
+            zones_sig ^= @as(u64, @bitCast(@as(i64, g.hover_x))) *% 0x9E37_79B1;
+            zones_sig ^= @as(u64, @bitCast(@as(i64, g.hover_y))) *% 0x85EB_CA77;
+        }
+    }
     // Read-more expanded set → a set hash (XOR of each CID's FNV, order-free). It
     // rides BOTH the frame signature (so a Read-more tap forces a rebuild — the
     // tap changes PostView.expanded, not `items`, so nothing else would) and the
@@ -8699,7 +8880,7 @@ fn paintFrameGpu(
         }
         exp_sig ^= eh;
     }
-    const sig = feedSignature(items, g.scroll.*, w, h) ^ (@as(u64, g.screen.*) *% 0x9E37_79B9_7F4A_7C15) ^ (socket_sig *% 0xD1B5_4A32_D192_ED03) ^ (@as(u64, g.settings_section) *% 0xC2B2_AE3D_27D4_EB4F) ^ (g.settings_toggles *% 0x9E6C_63D0_676A_9A99) ^ (g.settings_choices *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, g.settings_picking) *% 0x8A91_7F2B_4D3E_61C7) ^ (@as(u64, @intFromBool(g.inspect_source)) *% 0xF29C_511C_8E3D_45A7) ^ (@as(u64, @intFromBool(g.inspect_loading)) *% 0xBF58_476D_1CE4_E5B9) ^ chat_sig ^ (exp_sig *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, if (g.repost_menu) |m| m + 1 else 0) *% 0xA0761D6478BD642F);
+    const sig = feedSignature(items, g.scroll.*, w, h) ^ (@as(u64, g.screen.*) *% 0x9E37_79B9_7F4A_7C15) ^ (socket_sig *% 0xD1B5_4A32_D192_ED03) ^ (@as(u64, g.settings_section) *% 0xC2B2_AE3D_27D4_EB4F) ^ (g.settings_toggles *% 0x9E6C_63D0_676A_9A99) ^ (g.settings_choices *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, g.settings_picking) *% 0x8A91_7F2B_4D3E_61C7) ^ (@as(u64, @intFromBool(g.inspect_source)) *% 0xF29C_511C_8E3D_45A7) ^ (@as(u64, @intFromBool(g.inspect_loading)) *% 0xBF58_476D_1CE4_E5B9) ^ chat_sig ^ zones_sig ^ (exp_sig *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, if (g.repost_menu) |m| m + 1 else 0) *% 0xA0761D6478BD642F);
     // A drag/settle animates the socket every frame (lift, reflow, ghost), so
     // bypass the feed cache while it runs — a brief interaction, and the field
     // already rebuilds every frame anyway.
@@ -9368,6 +9549,10 @@ fn drawSdfIcons(g: Grid, gs: *GpuState, items: []const feed_core.TimelineItem, v
     const drawer_open = gs.drawer_t > 0.5;
     const header_bottom: i32 = if (g.screen.* == feed_view.screen_home)
         feed_view.homeSocketBottom(g.socket_tray, g.socket_ui)
+    else if (g.screen.* == feed_view.screen_zones)
+        // The zone masthead COLLAPSES with scroll — clip to its CURRENT
+        // height or icons vanish behind where the tall band used to be.
+        feed_view.zoneHeaderH(g.scroll.*, feed_view.paneGeomFor(@intCast(gs.design_w), feed_view.screen_zones).wide)
     else
         feed_view.headerBottom(g.screen.*);
     const grey: u32 = 0xFFB4B1A8; // feed_view.icon_grey (soft white)
@@ -9478,6 +9663,9 @@ fn drawEngagementHearts(g: Grid, gs: *GpuState, items: []const feed_core.Timelin
     // top, but the heart pass is separate).
     const header_bottom: i32 = if (g.screen.* == feed_view.screen_home)
         feed_view.homeSocketBottom(g.socket_tray, g.socket_ui)
+    else if (g.screen.* == feed_view.screen_zones)
+        // The zone masthead collapses with scroll — clip to its CURRENT height.
+        feed_view.zoneHeaderH(g.scroll.*, feed_view.paneGeomFor(@intCast(gs.design_w), feed_view.screen_zones).wide)
     else
         feed_view.headerBottom(g.screen.*);
     for (g.regions.items) |r| {

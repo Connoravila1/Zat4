@@ -854,25 +854,48 @@ pub fn buildTagFeed(
     return materializeRows(arena, idx, viewer_id, rows.items, limit);
 }
 
-/// The zone catalog: every known tag with its display casing and post count, in
-/// first-seen order. PURE (B2), allocated into `arena`. Manifest-state and
-/// ranking are later phases (Z3/Z7); this is the flat set (the latent layer).
-pub fn listZones(arena: Allocator, idx: *const Index) Allocator.Error![]ZoneInfo {
+/// The zone catalog: every known tag with its display casing and the zone's
+/// COMMUNITY STATS, in first-seen order. PURE (B2) — `since` (a unix-seconds
+/// watermark the SHELL computes from its clock, B3) parameterizes the recency
+/// window instead of a clock read: `recent` counts the pool's posts at/after it,
+/// `authors` is the distinct posters, `last_at` the newest post's timestamp.
+/// Allocated into `arena`. Manifest-state and ranking are later phases (Z3/Z7).
+pub fn listZones(arena: Allocator, idx: *const Index, since: i64) Allocator.Error![]ZoneInfo {
+    const post_authors = idx.posts.items(.author);
+    const post_createds = idx.posts.items(.created_at);
+    var seen: std.AutoHashMapUnmanaged(StrId, void) = .empty; // reused per tag
+    defer seen.deinit(arena);
     const out = try arena.alloc(ZoneInfo, idx.tag_order.items.len);
     for (out, idx.tag_order.items) |*z, norm_id| {
         const display_id = idx.tag_display.get(norm_id) orelse norm_id;
-        const count: usize = if (idx.tag_posts.get(norm_id)) |pool| pool.items.len else 0;
-        z.* = .{ .tag = str(idx, display_id), .count = count };
+        var count: usize = 0;
+        var recent: usize = 0;
+        var last_at: i64 = 0;
+        seen.clearRetainingCapacity();
+        if (idx.tag_posts.get(norm_id)) |pool| {
+            count = pool.items.len;
+            for (pool.items) |row| {
+                const at = post_createds[row];
+                if (at >= since) recent += 1;
+                if (at > last_at) last_at = at;
+                try seen.put(arena, post_authors[row], {});
+            }
+        }
+        z.* = .{ .tag = str(idx, display_id), .count = count, .authors = seen.count(), .recent = recent, .last_at = last_at };
     }
     return out;
 }
 
-/// One catalog entry — a zone's display tag and how many posts bear it. Boundary
-/// value (the shell serializes it). A7.2: cold struct, transient, size guard
-/// waived.
+/// One catalog entry — a zone's display tag plus the stats that make it read as
+/// a live community: post count, distinct posters, posts inside the caller's
+/// recency window, and the newest post's timestamp. Boundary value (the shell
+/// serializes it). A7.2: cold struct, transient, size guard waived.
 pub const ZoneInfo = struct {
     tag: []const u8,
     count: usize,
+    authors: usize = 0,
+    recent: usize = 0,
+    last_at: i64 = 0,
 };
 
 /// The algorithm marketplace: every published `app.zat4.feed.algorithm`, newest
@@ -1268,12 +1291,40 @@ test "zones: listZones lists every zone once with its post count, canonical lowe
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const zones = try listZones(arena, &idx);
+    const zones = try listZones(arena, &idx, 0);
     try testing.expectEqual(@as(usize, 2), zones.len); // water + rivers, water not doubled
     try testing.expectEqualStrings("water", zones[0].tag); // canonical lowercase (#Water → water)
     try testing.expectEqual(@as(usize, 2), zones[0].count); // two posts in water
     try testing.expectEqualStrings("rivers", zones[1].tag);
     try testing.expectEqual(@as(usize, 1), zones[1].count);
+}
+
+test "zones: listZones community stats — distinct authors, recency window, last activity" {
+    const gpa = testing.allocator;
+    var idx: Index = .{};
+    defer deinit(gpa, &idx);
+
+    // #water: three posts by TWO authors (did:a twice), at t=100/200/900.
+    _ = try indexPost(gpa, &idx, .{ .cid = "c1", .author_did = "did:a", .text = "p1", .created_at = 100, .tags = &.{"water"} });
+    _ = try indexPost(gpa, &idx, .{ .cid = "c2", .author_did = "did:b", .text = "p2", .created_at = 200, .tags = &.{"water"} });
+    _ = try indexPost(gpa, &idx, .{ .cid = "c3", .author_did = "did:a", .text = "p3", .created_at = 900, .tags = &.{ "water", "rivers" } });
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Window opens at t=200: #water has 2 recent of 3 total, 2 people, last at 900.
+    const zones = try listZones(arena, &idx, 200);
+    try testing.expectEqual(@as(usize, 2), zones.len);
+    try testing.expectEqualStrings("water", zones[0].tag);
+    try testing.expectEqual(@as(usize, 3), zones[0].count);
+    try testing.expectEqual(@as(usize, 2), zones[0].authors); // did:a counted once
+    try testing.expectEqual(@as(usize, 2), zones[0].recent); // t=200 and t=900 inside the window
+    try testing.expectEqual(@as(i64, 900), zones[0].last_at);
+    // #rivers: one post, one person, inside the window.
+    try testing.expectEqual(@as(usize, 1), zones[1].authors);
+    try testing.expectEqual(@as(usize, 1), zones[1].recent);
+    try testing.expectEqual(@as(i64, 900), zones[1].last_at);
 }
 
 test "intern: same string returns the same id, stored once" {

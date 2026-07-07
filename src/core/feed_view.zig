@@ -192,7 +192,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -258,15 +258,109 @@ pub const ProfileHeader = struct {
 };
 
 /// One zone in the browse catalog (the manifest grid). Plain value handed in by
-/// the shell (B5). The REAL fields today are `tag` (display casing, no leading
-/// `#`) and `count` (posts bearing it, from `listTags`); the editorial copy
-/// (description), the "regulars" standing, the category, and the official badge
-/// are later-engine concerns (Z2/Z3/Z7) and are drawn as scaffold — present-but-
-/// unbacked, like the lens socket. A7.2: cold — a handful per frame, never hot.
+/// the shell (B5). Every field is REAL, computed from the tag index: `tag`
+/// (display casing, no leading `#`), `count` (posts bearing it), `authors`
+/// (distinct posters — the zone's people), `recent` (posts in the shell's
+/// recency window, the trending velocity), `last_at` (newest post, unix secs),
+/// and `pinned` (the viewer pinned this zone). Editorial copy (description,
+/// category, official badge) stays a later-engine concern (Z2/Z3/Z7).
+/// A7.2: cold — a handful per frame, never hot.
 pub const ZoneCard = struct {
     tag: []const u8,
     count: usize,
+    authors: usize = 0,
+    recent: usize = 0,
+    last_at: i64 = 0,
+    pinned: bool = false,
 };
+
+/// EVERYTHING the zones surfaces need for one frame, as one plain value (B5) —
+/// the hub catalog + its UI state (tab, search, pointer), the shell-driven
+/// motion scalars, and the open zone page's own stats. Grouped so new zone
+/// data never widens `layout`'s parameter list again.
+/// A7.2: cold struct, size guard waived — one per frame, never collected.
+pub const ZonesView = struct {
+    /// The catalog, activity-sorted by the shell (`sortZonesByActivity`).
+    /// A `.zone_open`/`.zone_pin` region's idx indexes THIS slice.
+    cards: []const ZoneCard = &.{},
+    /// Hub sub-tab: 0 Browse · 1 Pinned · 2 Trending.
+    tab: u8 = 0,
+    /// Live search text (the shell owns the buffer) + its focus/caret state.
+    query: []const u8 = "",
+    q_focus: bool = false,
+    caret_on: bool = false,
+    /// Pointer position in layout coords for hover states; -1 = no pointer.
+    hover_x: i32 = -1,
+    hover_y: i32 = -1,
+    /// Unix seconds — relative "active …" labels (the clock stays in the
+    /// shell, B3/B4; this is plain data).
+    now: i64 = 0,
+    /// Animated tab position: the shell lerps this toward `tab`; the
+    /// underline draws at the interpolated rect (fractional = mid-flight).
+    tab_t: f32 = 0,
+    /// Tab-switch settle, 0→1: the incoming list slides up + fades in.
+    /// (Page ENTRY needs no state here — the GPU path's screen-switch
+    /// crossfade already dissolves between screens.)
+    enter_t: f32 = 1,
+    /// The OPEN zone page's stats (screen_zones): distinct posters, whether
+    /// the viewer pinned it, and its newest post (0 = unknown → omitted).
+    people: usize = 0,
+    pinned: bool = false,
+    last_at: i64 = 0,
+};
+
+/// Order the catalog like a LIVING directory: most 24h activity first, then
+/// total size, then recency, then name (a stable, deterministic ordering —
+/// same catalog ⇒ same shelf). In-place, no allocation. PURE.
+pub fn sortZonesByActivity(cards: []ZoneCard) void {
+    const S = struct {
+        fn lessThan(_: void, a: ZoneCard, b: ZoneCard) bool {
+            if (a.recent != b.recent) return a.recent > b.recent;
+            if (a.count != b.count) return a.count > b.count;
+            if (a.last_at != b.last_at) return a.last_at > b.last_at;
+            return std.ascii.lessThanIgnoreCase(a.tag, b.tag);
+        }
+    };
+    std.sort.block(ZoneCard, cards, {}, S.lessThan);
+}
+
+/// Human "when was this place last alive" label into `buf`: "active just now"
+/// through "quiet for 3w", "" when unknown (last_at 0 or in the future). PURE.
+pub fn activityLabel(buf: []u8, now: i64, last_at: i64) []const u8 {
+    if (last_at <= 0 or now < last_at) return "";
+    const dt = now - last_at;
+    if (dt < 90) return "active just now";
+    if (dt < 3600) return std.fmt.bufPrint(buf, "active {d}m ago", .{@divTrunc(dt, 60)}) catch "";
+    if (dt < 86400) return std.fmt.bufPrint(buf, "active {d}h ago", .{@divTrunc(dt, 3600)}) catch "";
+    if (dt < 7 * 86400) return std.fmt.bufPrint(buf, "active {d}d ago", .{@divTrunc(dt, 86400)}) catch "";
+    return std.fmt.bufPrint(buf, "quiet for {d}w", .{@divTrunc(dt, 7 * 86400)}) catch "";
+}
+
+/// Scale a colour's alpha by `t` (0..1) — the tab-switch fade-in.
+fn fadeColor(c: u32, t: f32) u32 {
+    const a: u32 = c >> 24;
+    const tc = @max(0.0, @min(1.0, t));
+    const na: u32 = @intFromFloat(@as(f32, @floatFromInt(a)) * tc);
+    return (na << 24) | (c & 0x00FFFFFF);
+}
+
+/// Scale the alpha of every draw item from `from` to the list's current end
+/// by `t` — the collapse fade for a range a widget draws without an alpha
+/// input (the zone masthead's tucking lens socket). PURE.
+fn fadeItems(dl: *raster.DrawList, from: usize, t: f32) void {
+    var i: usize = from;
+    while (i < dl.len) : (i += 1) {
+        var item = dl.get(i);
+        switch (item) {
+            .cell => |*c| c.fg = fadeColor(c.fg, t),
+            .text => |*x| x.color = fadeColor(x.color, t),
+            .rect => |*r| r.color = fadeColor(r.color, t),
+            .line => |*l| l.color = fadeColor(l.color, t),
+            .tri => |*tr| tr.color = fadeColor(tr.color, t),
+        }
+        dl.set(i, item);
+    }
+}
 
 /// The kind of composition the premium composer is hosting — sets the context
 /// line, the placeholder, and the send-button label. Reply is distinguished
@@ -432,10 +526,45 @@ const profile_tabs = [_][]const u8{ "Posts", "Replies", "Media", "Likes" };
 pub fn headerBottom(active_screen: u8) i32 {
     if (active_screen == screen_profile) return profile_header_h_wide;
     // The zone page wears a tall identity masthead above its socket (distinct
-    // from Home, which is just title + socket).
+    // from Home, which is just title + socket). NOTE: the zone masthead
+    // COLLAPSES with scroll — scroll-aware callers use zoneHeaderH instead.
     if (active_screen == screen_zones) return zone_header_h_wide;
     if (active_screen == screen_home) return home_header_h_wide;
     return 111;
+}
+
+/// The zone masthead's collapsed-bar height.
+pub const zone_thin_h_wide: i32 = 64;
+pub const zone_thin_h_narrow: i32 = 52;
+
+/// The zone page's band geometry (the Reddit shape): a reading column and,
+/// when the glass is wide enough for both, the About sidebar beside it.
+const zone_read_w: i32 = 720;
+const zone_side_w: i32 = 340;
+const zone_side_gap: i32 = 28;
+/// The hub's grid band: two comfortable cards, centred in the glass.
+const zones_hub_band_max: i32 = 1080;
+
+/// How far the zone masthead has collapsed, 0 (at rest, tall) → 1 (fully
+/// the thin bar). A pure function of the feed scroll, so leaving and
+/// returning to the top restores the tall masthead PIXEL-PERFECT — the same
+/// contract as the thread chain's sticky header. PURE.
+pub fn zoneCollapseT(scroll: i32, wide: bool) f32 {
+    const tall: i32 = if (wide) zone_header_h_wide else zone_header_h_narrow;
+    const thin: i32 = if (wide) zone_thin_h_wide else zone_thin_h_narrow;
+    const d: f32 = @floatFromInt(tall - thin);
+    return std.math.clamp(@as(f32, @floatFromInt(-scroll)) / d, 0.0, 1.0);
+}
+
+/// The zone masthead's CURRENT height at this scroll — tall at the top,
+/// shrinking to the thin bar as the reader scrolls in. Drives both the drawn
+/// masthead and the shell's occlusion clip (they must agree or hearts/posts
+/// pop behind the wrong edge). PURE.
+pub fn zoneHeaderH(scroll: i32, wide: bool) i32 {
+    const tall: i32 = if (wide) zone_header_h_wide else zone_header_h_narrow;
+    const thin: i32 = if (wide) zone_thin_h_wide else zone_thin_h_narrow;
+    const ct = zoneCollapseT(scroll, wide);
+    return tall - @as(i32, @intFromFloat(@as(f32, @floatFromInt(tall - thin)) * ct));
 }
 
 /// The logical y the HOME header occludes down to, accounting for the lens
@@ -460,6 +589,7 @@ pub fn homeSocketGeom(width: i32) lens_socket.Geometry {
 const wide_min: i32 = rail_w + feed_w + side_w + 40; // ~1244
 
 const panel: u32 = 0xCC1E1C16; // sidebar cards: mostly solid over the field
+const panel_hover: u32 = 0xD8262420; // a card under the pointer — lifted, not lit
 
 const Metrics = struct {
     col_x: i32, // feed column
@@ -1574,10 +1704,10 @@ pub fn layout(
     /// The zone's display name (e.g. "water") when `active_screen == screen_zones`
     /// — shown as the "#name" title in the zone page's header. "" otherwise.
     zone_title: []const u8,
-    /// The zone CATALOG for the browse screen (`screen_zones_browse`): the known
-    /// zones with their post counts. Empty on every other screen. Each card taps
-    /// to its zone feed (a `.zone_open` region carrying the catalog index).
-    zones: []const ZoneCard,
+    /// The zones view-state bundle: the hub's catalog/tab/search/motion for
+    /// `screen_zones_browse`, plus the open zone page's stats for
+    /// `screen_zones` (see `ZonesView`). `.{}` on every other screen.
+    zones: ZonesView,
     /// The tiling foundation (S.1): when present, the pane geometry is SOLVED by
     /// the shell's partition and handed in, so the real UI renders into those
     /// rects (and morphs as they animate). Null ⇒ self-computed `metricsPage`.
@@ -1604,10 +1734,31 @@ pub fn layout(
     /// menu (Repost · Quote post) is drawn AFTER the post loop so it floats on top.
     repost_menu: ?usize,
 ) error{OutOfMemory}!i32 {
-    const m: Metrics = if (geom) |g|
+    var m: Metrics = if (geom) |g|
         .{ .rail_x = g.rail_x, .col_x = g.col_x, .col_w = g.col_w, .lx = g.lx, .cw = g.cw, .side_x = g.side_x, .wide = g.wide }
     else
         metricsPage(width, active_screen);
+    // ZONES read as a community surface inside the wide glass (the Reddit
+    // shape), never content hugging the left of a huge panel:
+    // - the HUB centres its grid band in the glass;
+    // - a ZONE page centres a band of reading column + About sidebar (the
+    //   sidebar drops away when the glass is too narrow for both). The
+    //   masthead's coloured banner still spans the glass (col_x/col_w);
+    //   its contents, the socket, and the posts align on the band (lx/cw).
+    if (active_screen == screen_zones_browse and m.wide) {
+        m.cw = @min(m.col_w - 96, zones_hub_band_max);
+        m.lx = m.col_x + @divTrunc(m.col_w - m.cw, 2);
+    }
+    if (active_screen == screen_zones and m.wide) {
+        const full = zone_read_w + zone_side_gap + zone_side_w;
+        if (m.col_w - 48 >= full) {
+            m.lx = m.col_x + @divTrunc(m.col_w - full, 2);
+            m.cw = zone_read_w;
+        } else if (m.cw > zone_read_w) {
+            m.lx = m.col_x + @divTrunc(m.col_w - zone_read_w, 2);
+            m.cw = zone_read_w;
+        }
+    }
     if (regions) |rg| rg.clearRetainingCapacity();
     if (socket_hits) |sh| sh.clearRetainingCapacity();
     // No focused post laid out this frame ⇒ no selectable body. Cleared up front;
@@ -1693,9 +1844,9 @@ pub fn layout(
         // socket + caption), so the post stack begins below it.
         feed_y0 = if (m.wide) zone_header_h_wide + 14 else zone_header_h_narrow + 12;
     } else if (active_screen == screen_zones_browse) {
-        // The Zones browse catalog draws its own full body (title, sub-tabs,
-        // search, categories, the manifest grid) and owns its scroll, so it
-        // returns its content height directly — no post loop, no top bar.
+        // The Zones hub draws its own full body (title, live sub-tabs, the
+        // search-or-jump field, the tab's grid/list) and owns its scroll, so
+        // it returns its content height directly — no post loop, no top bar.
         return try drawZonesBrowse(gpa, dl, e, m, height, scroll, regions, accent, zones);
     } else if (active_screen == screen_settings) {
         // Settings draws its own master–detail body (a left section list + the
@@ -1706,7 +1857,7 @@ pub fn layout(
         const msg = "Coming soon";
         const tw: i32 = @intCast(text.measure(e, .regular, msg, 16));
         _ = try str(gpa, dl, e, .regular, m.col_x + @divTrunc(m.col_w - tw, 2), @divTrunc(height, 2), muted, 16, msg);
-        try drawTopBar(gpa, dl, e, m, active_screen, regions, profile, accent, socket_tray, socket_ui, socket_hits, zone_title, 0); // no posts scroll here, but keep the title consistent
+        try drawTopBar(gpa, dl, e, m, active_screen, regions, profile, accent, socket_tray, socket_ui, socket_hits, zone_title, 0, zones, scroll); // no posts scroll here, but keep the title consistent
         return height;
     }
 
@@ -2082,7 +2233,12 @@ pub fn layout(
     // The sticky top bar, drawn LAST so the posts above scroll BEHIND its
     // frosted box with the title/tabs crisp on top. `posts.len` feeds the zone
     // masthead's stats line (on the zone screen `posts` IS the zone feed).
-    try drawTopBar(gpa, dl, e, m, active_screen, regions, profile, accent, socket_tray, socket_ui, socket_hits, zone_title, posts.len);
+    try drawTopBar(gpa, dl, e, m, active_screen, regions, profile, accent, socket_tray, socket_ui, socket_hits, zone_title, posts.len, zones, scroll);
+
+    // The zone page's About sidebar (drawn after the masthead so its top
+    // tracks the collapsing band's live bottom edge).
+    if (active_screen == screen_zones and m.wide and m.col_w - 48 >= zone_read_w + zone_side_gap + zone_side_w)
+        try drawZoneSidebar(gpa, dl, e, m, regions, accent, zone_title, posts.len, zones, scroll);
 
     // The "N new posts" pill (Home only): staged arrivals waiting to be revealed.
     // Pinned just below the header, centered; tapping it reveals + scrolls to top
@@ -4151,47 +4307,149 @@ fn drawSettingsRow(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, 
     }
 }
 
-fn drawZoneCard(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, regions: ?*Regions, x: i32, y: i32, w: i32, h: i32, z: ZoneCard, idx: u16) error{OutOfMemory}!void {
-    try rect(gpa, dl, x, y, w, h, panel, 14);
-    try rect(gpa, dl, x, y, w, 1, 0x14EDEAE0, 14); // faint lit top edge
+/// A solid (pinned) bookmark: the body as one rounded rect, the bottom notch
+/// as stepped shrinking rows — filled, unmistakably "kept".
+fn iconBookmarkFill(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, s: i32, c: u32) error{OutOfMemory}!void {
+    const f: f32 = @floatFromInt(s);
+    const left = x + fxi(f * 0.24);
+    const right = x + fxi(f * 0.76);
+    const top = y + fxi(f * 0.08);
+    const notch = y + fxi(f * 0.64);
+    const bot = y + fxi(f * 0.92);
+    try rect(gpa, dl, left, top, right - left, notch - top, c, 2);
+    // The notch: rows narrowing toward the middle as they descend.
+    const steps: i32 = @max(1, bot - notch);
+    var k: i32 = 0;
+    const half: f32 = @as(f32, @floatFromInt(right - left)) / 2.0;
+    while (k < steps) : (k += 1) {
+        const t = @as(f32, @floatFromInt(k)) / @as(f32, @floatFromInt(steps));
+        const inset: i32 = @intFromFloat(half * t);
+        if (right - inset > left + inset) try rect(gpa, dl, left + inset, notch + k, (right - inset) - (left + inset), 1, c, 0);
+    }
+}
+
+/// The live-community pulse: a small filled dot, green when the zone moved
+/// within the last hour.
+const live_green: u32 = 0xFF6CE0B2;
+
+/// One catalog card — a zone as a PLACE: hue tile + initial, #name, the real
+/// community stats ("N posts · N people"), the last-activity line with a live
+/// pulse, and the pin bookmark (filled accent = pinned; a `.zone_pin` region
+/// over it, emitted after the card's `.zone_open` so the pin wins the tap).
+/// Hover lifts the fill and reveals an "open →" hint. `t` fades the whole card
+/// in during a tab-switch settle. PURE.
+fn drawZoneCard(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, regions: ?*Regions, x: i32, y: i32, w: i32, h: i32, z: ZoneCard, idx: u16, zv: ZonesView, accent: u32, t: f32) error{OutOfMemory}!void {
+    const hover = zv.hover_x >= x and zv.hover_x < x + w and zv.hover_y >= y and zv.hover_y < y + h;
+    try rect(gpa, dl, x, y, w, h, fadeColor(if (hover) panel_hover else panel, t), 14);
+    try rect(gpa, dl, x, y, w, 1, fadeColor(if (hover) 0x2AEDEAE0 else 0x14EDEAE0, t), 14); // lit top edge
 
     // Icon tile, with the tag's leading letter struck in the background ink.
     const tile: i32 = 46;
     const tlx = x + 16;
     const tly = y + @divTrunc(h - tile, 2);
-    try rect(gpa, dl, tlx, tly, tile, tile, tilePalette(z.tag), 12);
+    try rect(gpa, dl, tlx, tly, tile, tile, fadeColor(tilePalette(z.tag), t), 12);
     if (z.tag.len > 0) {
         var g0: u8 = z.tag[0];
         if (g0 >= 'a' and g0 <= 'z') g0 -= 32; // uppercase the initial
         const gadv: i32 = @intCast(text.advance(e, .semibold, g0, 22));
-        _ = try glyph1(gpa, dl, e, .semibold, tlx + @divTrunc(tile - gadv, 2), tly + 31, bg, 22, g0);
+        _ = try glyph1(gpa, dl, e, .semibold, tlx + @divTrunc(tile - gadv, 2), tly + 31, fadeColor(bg, t), 22, g0);
     }
 
     // #name (the '#' and the tag share the ink, drawn as two runs).
     const txx = tlx + tile + 14;
-    const hx = try str(gpa, dl, e, .semibold, txx, y + 32, ink, 17, "#");
-    _ = try str(gpa, dl, e, .semibold, hx, y + 32, ink, 17, z.tag);
+    const hx = try str(gpa, dl, e, .semibold, txx, y + 34, fadeColor(ink, t), 17, "#");
+    _ = try str(gpa, dl, e, .semibold, hx, y + 34, fadeColor(ink, t), 17, z.tag);
 
-    // Post count (real). "1 post" / "N posts".
-    var cb: [40]u8 = undefined;
-    const count_str = std.fmt.bufPrint(&cb, "{d} {s}", .{ z.count, if (z.count == 1) "post" else "posts" }) catch "posts";
-    _ = try str(gpa, dl, e, .regular, txx, y + 54, faint, 13, count_str);
+    // The community line — every number real: posts + distinct posters.
+    var cb: [64]u8 = undefined;
+    const stats = if (z.authors > 0)
+        std.fmt.bufPrint(&cb, "{d} {s} · {d} {s}", .{ z.count, if (z.count == 1) "post" else "posts", z.authors, if (z.authors == 1) "person" else "people" }) catch "posts"
+    else
+        std.fmt.bufPrint(&cb, "{d} {s}", .{ z.count, if (z.count == 1) "post" else "posts" }) catch "posts";
+    _ = try str(gpa, dl, e, .regular, txx, y + 56, fadeColor(muted, t), 13, stats);
 
-    // Bookmark affordance (top-right, inert scaffold).
-    try iconBookmark(gpa, dl, x + w - 36, y + 16, 18, faint);
+    // Last-activity line, with a live pulse when the zone moved this hour.
+    var ab: [40]u8 = undefined;
+    const act = activityLabel(&ab, zv.now, z.last_at);
+    if (act.len > 0) {
+        var ax = txx;
+        if (zv.now - z.last_at < 3600) {
+            try rect(gpa, dl, ax, y + 69, 6, 6, fadeColor(live_green, t), 3);
+            ax += 12;
+        }
+        _ = try str(gpa, dl, e, .regular, ax, y + 77, fadeColor(faint, t), 12, act);
+    }
+
+    // Pin bookmark (top-right): filled accent when pinned, faint outline not.
+    if (z.pinned)
+        try iconBookmarkFill(gpa, dl, x + w - 38, y + 14, 18, fadeColor(accent, t))
+    else
+        try iconBookmark(gpa, dl, x + w - 38, y + 14, 18, fadeColor(if (hover) muted else faint, t));
+
+    // Hover hint: the doorway reads as enterable.
+    if (hover) _ = try str(gpa, dl, e, .semibold, x + w - 74, y + h - 14, fadeColor(accent, t), 12, "open \xE2\x86\x92");
 
     try emitRegion(gpa, regions, x, y, w, @intCast(@max(0, @min(32767, h))), idx, .zone_open);
+    try emitRegion(gpa, regions, x + w - 48, y + 6, 44, 36, idx, .zone_pin); // after → wins the overlap
 }
 
-/// The Zones BROWSE catalog (`screen_zones_browse`). A mockup-faithful scaffold:
-/// the title + subtitle, the four browse sub-tabs (Browse active; the rest inert
-/// until the standing/catalog engines land), a search/jump field, the category
-/// row, then the manifest-zone GRID — two columns wide, one narrow. The real data
-/// is each zone's display tag + post count (`listTags`); everything editorial
-/// (descriptions, "regulars", categories, official) is present-but-unbacked, the
-/// same posture as the lens socket. Returns total content height (scroll clamp).
-/// PURE.
-fn drawZonesBrowse(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, height: i32, scroll: i32, regions: ?*Regions, accent: u32, zones: []const ZoneCard) error{OutOfMemory}!i32 {
+/// One TRENDING row — the Twitter-style ranked entry: rank number, big #name,
+/// the velocity line ("N posts today · N people"), a live pulse when moving
+/// this hour. The whole row opens the zone. PURE.
+fn drawTrendRow(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, regions: ?*Regions, x: i32, y: i32, w: i32, h: i32, rank: usize, z: ZoneCard, idx: u16, zv: ZonesView, accent: u32, t: f32) error{OutOfMemory}!void {
+    const hover = zv.hover_x >= x and zv.hover_x < x + w and zv.hover_y >= y and zv.hover_y < y + h;
+    if (hover) try rect(gpa, dl, x - 10, y, w + 20, h - 1, fadeColor(0x10EDEAE0, t), 12);
+
+    var rb: [24]u8 = undefined;
+    const rank_str = std.fmt.bufPrint(&rb, "{d}", .{rank}) catch "·";
+    _ = try str(gpa, dl, e, .regular, x + 2, y + 24, fadeColor(faint, t), 13, rank_str);
+    _ = try str(gpa, dl, e, .regular, x + 2 + @as(i32, @intCast(text.measure(e, .regular, rank_str, 13))) + 8, y + 24, fadeColor(faint, t), 13, "· trending");
+
+    // The term: '#' struck in the accent, the name big beside it.
+    const hx = try str(gpa, dl, e, .semibold, x, y + 52, fadeColor(accent, t), 21, "#");
+    _ = try str(gpa, dl, e, .semibold, hx + 1, y + 52, fadeColor(ink, t), 21, z.tag);
+
+    // The velocity line — the ranking, said out loud, every number real.
+    var vb: [80]u8 = undefined;
+    const vel = std.fmt.bufPrint(&vb, "{d} {s} today · {d} {s}", .{ z.recent, if (z.recent == 1) "post" else "posts", z.authors, if (z.authors == 1) "person" else "people" }) catch "";
+    var vx = x + 2;
+    if (zv.now - z.last_at < 3600) {
+        try rect(gpa, dl, vx, y + 66, 6, 6, fadeColor(live_green, t), 3);
+        vx += 12;
+    }
+    _ = try str(gpa, dl, e, .regular, vx, y + 74, fadeColor(muted, t), 13, vel);
+    if (hover) _ = try str(gpa, dl, e, .semibold, x + w - 64, y + 52, fadeColor(accent, t), 13, "open \xE2\x86\x92");
+
+    try rect(gpa, dl, x, y + h - 1, w, 1, divider, 0);
+    try emitRegion(gpa, regions, x - 10, y, w + 20, @intCast(@max(0, @min(32767, h))), idx, .zone_open);
+}
+
+/// A centred hub EMPTY STATE: a large dim glyph, a title, and a hint line.
+fn drawZonesEmpty(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32, w: i32, y: i32, glyph: []const u8, title: []const u8, hint: []const u8, t: f32) error{OutOfMemory}!i32 {
+    const gw: i32 = @intCast(text.measure(e, .semibold, glyph, 44));
+    _ = try str(gpa, dl, e, .semibold, x0 + @divTrunc(w - gw, 2), y + 64, fadeColor(0x2EEDEAE0, t), 44, glyph);
+    const tw: i32 = @intCast(text.measure(e, .semibold, title, 16));
+    _ = try str(gpa, dl, e, .semibold, x0 + @divTrunc(w - tw, 2), y + 104, fadeColor(muted, t), 16, title);
+    const hw: i32 = @intCast(text.measure(e, .regular, hint, 13));
+    _ = try str(gpa, dl, e, .regular, x0 + @divTrunc(w - hw, 2), y + 128, fadeColor(faint, t), 13, hint);
+    return y + 168;
+}
+
+/// Case-insensitive "does the tag contain the query" — the live search filter.
+fn zoneMatches(tag: []const u8, query: []const u8) bool {
+    if (query.len == 0) return true;
+    return std.ascii.indexOfIgnoreCase(tag, query) != null;
+}
+
+/// The Zones HUB (`screen_zones_browse`) — the catalog as a real directory:
+/// three LIVE sub-tabs (Browse / Pinned / Trending) under an animated accent
+/// underline, a WORKING search-or-jump field (type filters live; Enter jumps
+/// straight to the tag), then the tab's body — the activity-sorted card grid,
+/// the viewer's pinned shelf, or the velocity-ranked trending list. Every
+/// number drawn is real (tag index stats); tab switches settle in (enter_t)
+/// and page entry fades in (fade). Returns total content height (scroll
+/// clamp). PURE — all state arrives in `zv`.
+fn drawZonesBrowse(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, height: i32, scroll: i32, regions: ?*Regions, accent: u32, zv: ZonesView) error{OutOfMemory}!i32 {
     const x0 = m.lx;
     const w = m.cw;
     var y: i32 = (if (m.wide) @as(i32, 40) else 30) + scroll;
@@ -4202,67 +4460,132 @@ fn drawZonesBrowse(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, 
     _ = try str(gpa, dl, e, .regular, x0, y, muted, 14, "places that precipitated out of tags — pin the ones you return to");
     y += 24;
 
-    // Browse sub-tabs (Browse active; the rest are inert scaffold for now).
-    const tabs = [_][]const u8{ "Browse", "Pinned", "Trending", "Official" };
+    // Sub-tabs — all three LIVE, slotted by the semibold width so the label
+    // doesn't shift when its weight changes with focus.
+    const tabs = [_][]const u8{ "Browse", "Pinned", "Trending" };
+    var slot_x: [tabs.len]i32 = undefined;
+    var slot_w: [tabs.len]i32 = undefined;
     var tx: i32 = x0;
     for (tabs, 0..) |tab, ti| {
-        const on = ti == 0;
-        const tw: i32 = @intCast(text.measure(e, if (on) .semibold else .regular, tab, 16));
+        const on = zv.tab == ti;
+        const tw: i32 = @intCast(text.measure(e, .semibold, tab, 16));
+        slot_x[ti] = tx;
+        slot_w[ti] = tw;
         _ = try str(gpa, dl, e, if (on) .semibold else .regular, tx, y + 20, if (on) ink else muted, 16, tab);
-        if (on) try rect(gpa, dl, tx, y + 30, tw, 2, accent, 1);
-        tx += tw + 30;
+        try emitRegion(gpa, regions, tx - 8, y - 2, tw + 16, 36, @intCast(ti), .zone_tab);
+        tx += tw + 34;
+    }
+    // The underline GLIDES between slots: interpolate the rect at tab_t.
+    {
+        const tt = @max(0.0, @min(@as(f32, @floatFromInt(tabs.len - 1)), zv.tab_t));
+        const ia: usize = @intFromFloat(@floor(tt));
+        const ib: usize = @min(ia + 1, tabs.len - 1);
+        const f = tt - @floor(tt);
+        const ux: i32 = @intFromFloat(@as(f32, @floatFromInt(slot_x[ia])) * (1 - f) + @as(f32, @floatFromInt(slot_x[ib])) * f);
+        const uw: i32 = @intFromFloat(@as(f32, @floatFromInt(slot_w[ia])) * (1 - f) + @as(f32, @floatFromInt(slot_w[ib])) * f);
+        try rect(gpa, dl, ux, y + 30, uw, 3, accent, 1);
     }
     y += 42;
     try rect(gpa, dl, x0, y, w, 1, divider, 0);
     y += 22;
 
-    // Search / jump field (visual scaffold).
-    const sh: i32 = 48;
-    try rect(gpa, dl, x0, y, w, sh, skinPanel(accent), 12);
-    try iconSearch(gpa, dl, x0 + 16, y + 14, 20, faint);
-    _ = try str(gpa, dl, e, .regular, x0 + 50, y + 30, faint, 15, "Search zones, or jump straight to a tag…");
-    y += sh + 26;
-
-    // Category row (inert scaffold — the catalog/librarian is Z7).
-    _ = try str(gpa, dl, e, .semibold, x0, y, faint, 11, "CATEGORIES · ARRANGED BY THE CATALOG");
-    y += 16;
-    const cats = [_][]const u8{ "Sports", "Tech", "Zig", "Design", "Music", "+ more" };
-    var cxp: i32 = x0;
-    const chh: i32 = 34;
-    for (cats, 0..) |cat, ci| {
-        const cw: i32 = @intCast(text.measure(e, .regular, cat, 14));
-        const pw = cw + 28;
-        const hot = ci == 2; // one lit category, as in the mockup
-        const fill: u32 = if (hot) (0x22 << 24) | (accent & 0x00FFFFFF) else 0x12EDEAE0;
-        try rect(gpa, dl, cxp, y + 6, pw, chh, fill, 16);
-        if (hot) try rect(gpa, dl, cxp, y + 6, pw, 1, accent, 16);
-        _ = try str(gpa, dl, e, .regular, cxp + 14, y + 28, if (hot) accent else muted, 14, cat);
-        cxp += pw + 10;
+    // The search-or-jump field (Browse only — the other tabs are short lists).
+    if (zv.tab == 0) {
+        const sh: i32 = 48;
+        if (zv.q_focus) try rect(gpa, dl, x0 - 2, y - 2, w + 4, sh + 4, (0x55 << 24) | (accent & 0x00FFFFFF), 14); // focus ring
+        try rect(gpa, dl, x0, y, w, sh, skinPanel(accent), 12);
+        try iconSearch(gpa, dl, x0 + 16, y + 14, 20, if (zv.q_focus) muted else faint);
+        if (zv.query.len == 0 and !zv.q_focus) {
+            _ = try str(gpa, dl, e, .regular, x0 + 50, y + 30, faint, 15, "Search zones, or jump straight to a tag…");
+        } else {
+            const qend = try str(gpa, dl, e, .regular, x0 + 50, y + 30, ink, 15, zv.query);
+            if (zv.q_focus and zv.caret_on) try rect(gpa, dl, qend + 2, y + 13, 2, 22, accent, 1);
+            if (zv.query.len > 0) {
+                var jb: [96]u8 = undefined;
+                const jump = std.fmt.bufPrint(&jb, "\xE2\x86\xB5 opens #{s}", .{zv.query}) catch "";
+                const jw: i32 = @intCast(text.measure(e, .regular, jump, 12));
+                _ = try str(gpa, dl, e, .regular, x0 + w - jw - 16, y + 29, faint, 12, jump);
+            }
+        }
+        try emitRegion(gpa, regions, x0, y, w, @intCast(sh), 0, .zone_search);
+        y += sh + 24;
     }
-    y += chh + 30;
 
-    // Manifest-zone grid.
-    _ = try str(gpa, dl, e, .semibold, x0, y, faint, 11, "MANIFEST ZONES");
-    y += 18;
+    // The tab body settles IN: rises the last few px while fading up.
+    const t = @max(0.0, @min(1.0, zv.enter_t));
+    y += @intFromFloat((1.0 - t) * 14.0);
+
+    switch (zv.tab) {
+        1 => { // ---- PINNED — the viewer's shelf ----
+            _ = try str(gpa, dl, e, .semibold, x0, y, fadeColor(faint, t), 11, "PINNED · THE ONES YOU RETURN TO");
+            y += 18;
+            y = try drawZoneGrid(gpa, dl, e, m, height, regions, accent, zv, y, .pinned, t);
+        },
+        2 => { // ---- TRENDING — ranked by 24h velocity ----
+            try rect(gpa, dl, x0, y - 6, 6, 6, live_green, 3);
+            _ = try str(gpa, dl, e, .semibold, x0 + 14, y, fadeColor(faint, t), 11, "LIVE · RANKED BY 24H ACTIVITY");
+            y += 24;
+            const row_h: i32 = 92;
+            var rank: usize = 0;
+            for (zv.cards, 0..) |z, zi| {
+                if (z.recent == 0) continue;
+                rank += 1;
+                if (y + row_h > 0 and y < height)
+                    try drawTrendRow(gpa, dl, e, regions, x0, y, w, row_h, rank, z, @intCast(zi), zv, accent, t);
+                y += row_h;
+                if (rank >= 30) break; // the tail isn't "trending"
+            }
+            if (rank == 0)
+                y = try drawZonesEmpty(gpa, dl, e, x0, w, y, "~", "Nothing moving yet", "when a zone stirs in the last 24h, it climbs here", t);
+        },
+        else => { // ---- BROWSE — the living directory ----
+            _ = try str(gpa, dl, e, .semibold, x0, y, fadeColor(faint, t), 11, if (zv.query.len > 0) "ZONES · MATCHING" else "ZONES · MOST ACTIVE FIRST");
+            y += 18;
+            y = try drawZoneGrid(gpa, dl, e, m, height, regions, accent, zv, y, .browse, t);
+        },
+    }
+    y += 40;
+    return y - scroll;
+}
+
+/// The card GRID shared by Browse (search-filtered) and Pinned (pin-filtered):
+/// two columns wide, one narrow, culled to the window (i16 draw coords), with
+/// the tab-appropriate empty state. Returns the y past the grid. PURE.
+fn drawZoneGrid(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, height: i32, regions: ?*Regions, accent: u32, zv: ZonesView, y0: i32, which: enum { browse, pinned }, t: f32) error{OutOfMemory}!i32 {
+    const x0 = m.lx;
+    const w = m.cw;
     const cols: i32 = if (m.wide and w >= 640) 2 else 1;
     const col_gap: i32 = 18;
     const card_w: i32 = @divTrunc(w - col_gap * (cols - 1), cols);
-    const card_h: i32 = 78;
+    const card_h: i32 = 96;
     const row_gap: i32 = 16;
-    for (zones, 0..) |z, zi| {
-        const zii: i32 = @intCast(zi);
-        const col = @mod(zii, cols);
-        const row = @divTrunc(zii, cols);
+    var shown: i32 = 0;
+    for (zv.cards, 0..) |z, zi| {
+        const keep = switch (which) {
+            .browse => zoneMatches(z.tag, zv.query),
+            .pinned => z.pinned,
+        };
+        if (!keep) continue;
+        const col = @mod(shown, cols);
+        const row = @divTrunc(shown, cols);
         const cardx = x0 + col * (card_w + col_gap);
-        const cardy = y + row * (card_h + row_gap);
+        const cardy = y0 + row * (card_h + row_gap);
         // Cull rows scrolled out of the window (i16 draw coords; long catalogs).
-        if (cardy + card_h > 0 and cardy < height) {
-            try drawZoneCard(gpa, dl, e, regions, cardx, cardy, card_w, card_h, z, @intCast(zi));
-        }
+        if (cardy + card_h > 0 and cardy < height)
+            try drawZoneCard(gpa, dl, e, regions, cardx, cardy, card_w, card_h, z, @intCast(zi), zv, accent, t);
+        shown += 1;
     }
-    const rows = @divTrunc(@as(i32, @intCast(zones.len)) + cols - 1, cols);
-    y += rows * (card_h + row_gap) + 40;
-    return y - scroll;
+    if (shown == 0) {
+        return switch (which) {
+            .browse => if (zv.query.len > 0)
+                try drawZonesEmpty(gpa, dl, e, x0, w, y0, "#", "No zone by that name yet", "press Enter to jump straight to the tag — you might be first", t)
+            else
+                try drawZonesEmpty(gpa, dl, e, x0, w, y0, "#", "No zones yet", "tag a post with #anything and a zone precipitates here", t),
+            .pinned => try drawZonesEmpty(gpa, dl, e, x0, w, y0, "\xE2\x8C\x96", "Nothing pinned yet", "tap the bookmark on any zone to keep it here", t),
+        };
+    }
+    const rows = @divTrunc(shown + cols - 1, cols);
+    return y0 + rows * (card_h + row_gap);
 }
 
 /// The feed column's sticky TOP BAR: a frosted box over the top strip, then the
@@ -4270,9 +4593,9 @@ fn drawZonesBrowse(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, 
 /// divider. Emitted AFTER the posts so they pass behind it (occluded + dimmed),
 /// the chrome reading crisply on top. The box spans the feed column width; the
 /// rail/sidebar live in their own columns and are untouched.
-fn drawTopBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, active_screen: u8, regions: ?*Regions, profile: ?ProfileHeader, accent: u32, socket_tray: ?lens_socket.TrayView, socket_ui: lens_socket.SocketUi, socket_hits: ?*lens_socket.HitList, zone_title: []const u8, zone_count: usize) error{OutOfMemory}!void {
+fn drawTopBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, active_screen: u8, regions: ?*Regions, profile: ?ProfileHeader, accent: u32, socket_tray: ?lens_socket.TrayView, socket_ui: lens_socket.SocketUi, socket_hits: ?*lens_socket.HitList, zone_title: []const u8, zone_count: usize, zv: ZonesView, scroll: i32) error{OutOfMemory}!void {
     if (active_screen == screen_profile) return drawProfileHeader(gpa, dl, e, m, regions, profile orelse .{ .display_name = "", .handle = "", .post_count = 0 }, accent);
-    if (active_screen == screen_zones) return drawZoneHeader(gpa, dl, e, m, regions, accent, socket_tray, socket_ui, socket_hits, zone_title, zone_count);
+    if (active_screen == screen_zones) return drawZoneHeader(gpa, dl, e, m, regions, accent, socket_tray, socket_ui, socket_hits, zone_title, zone_count, zv, scroll);
     const is_thread = active_screen == screen_thread;
     const is_home = active_screen == screen_home;
     const is_zone = active_screen == screen_zones;
@@ -4361,17 +4684,45 @@ fn menuDots(gpa: Allocator, dl: *raster.DrawList, cx: i32, cy: i32, c: u32) erro
 
 /// The ZONE page MASTHEAD — the band that makes a zone read as a distinct PLACE
 /// rather than the home feed with a different title: an icon tile in the zone's
-/// hue, the big #name beside a "communal face" chip and a Pin button, a
-/// description, a post/standing stats line, then the lens socket and its "the
-/// order is yours" caption. Back returns to wherever the zone was entered from.
-/// The face/standing copy is present-but-unbacked scaffold (Z2/Z4); the #name and
-/// the post count are real. Sticky (posts scroll under it), like the other
-/// headers. PURE.
-fn drawZoneHeader(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, regions: ?*Regions, accent: u32, socket_tray: ?lens_socket.TrayView, socket_ui: lens_socket.SocketUi, socket_hits: ?*lens_socket.HitList, zone_title: []const u8, zone_count: usize) error{OutOfMemory}!void {
-    var zbuf: [160]u8 = undefined;
+/// hue, the big #name beside a "communal face" chip and a LIVE Pin toggle, a
+/// description, the real community stats (posts · people · last activity), then
+/// the lens socket and its "the order is yours" caption.
+///
+/// The masthead COLLAPSES with scroll (the thread chain-header contract):
+/// scrolling in shrinks the tall band toward a thin bar — the identity block
+/// slides up and fades, the socket tucks under the coloured band and fades,
+/// and a compact "tile + #name · count" fades in beside Back. Everything is a
+/// pure function of `scroll` (`zoneCollapseT`/`zoneHeaderH`), so returning to
+/// the top restores the tall masthead PIXEL-PERFECT. Back returns to wherever
+/// the zone was entered from. The face chip stays scaffold (Z4); everything
+/// numeric is real. Sticky (posts scroll under it). PURE.
+fn drawZoneHeader(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, regions: ?*Regions, accent: u32, socket_tray: ?lens_socket.TrayView, socket_ui: lens_socket.SocketUi, socket_hits: ?*lens_socket.HitList, zone_title: []const u8, zone_count: usize, zv: ZonesView, scroll: i32) error{OutOfMemory}!void {
+    // The stats line, every number real: posts, distinct people (when known),
+    // and how recently the place moved.
+    var actb: [40]u8 = undefined;
+    const act = activityLabel(&actb, zv.now, zv.last_at);
+    var statb: [160]u8 = undefined;
+    var stats: []const u8 = std.fmt.bufPrint(&statb, "{d} {s}", .{ zone_count, if (zone_count == 1) "post" else "posts" }) catch "";
+    if (zv.people > 0) {
+        const more = std.fmt.bufPrint(statb[stats.len..], " · {d} {s}", .{ zv.people, if (zv.people == 1) "person" else "people" }) catch "";
+        stats = statb[0 .. stats.len + more.len];
+    }
+    if (act.len > 0) {
+        const more = std.fmt.bufPrint(statb[stats.len..], " · {s}", .{act}) catch "";
+        stats = statb[0 .. stats.len + more.len];
+    }
+
+    // Collapse state: ct 0→1 over the first (tall−thin) px of scroll. The
+    // identity block fades OUT early (fi), the thin bar fades IN late (ti) —
+    // the crossover keeps the bar readable through the whole travel.
+    const ct = zoneCollapseT(scroll, m.wide);
+    const box_h = zoneHeaderH(scroll, m.wide);
+    // The identity block is gone EARLY (by ~1/3 travel) so it never collides
+    // with the fixed Back/more chrome as the band shrinks past it.
+    const fi = std.math.clamp(1.0 - ct * 3.2, 0.0, 1.0);
+    const ti = std.math.clamp((ct - 0.55) / 0.45, 0.0, 1.0);
 
     if (m.wide) {
-        const box_h = zone_header_h_wide;
         // The whole top BLOCK takes the zone ALGO (socket) colour; text auto-
         // contrasts (luminance) so it reads at any hue. This is separate from the
         // app accent — the home feed is untouched; the block follows the ZONE
@@ -4379,15 +4730,32 @@ fn drawZoneHeader(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m
         const zc: u32 = if (socket_tray) |t| lens_socket.seatedAccent(t) else accent;
         const on = readableOn(zc);
         const dim = readableDim(zc);
-        // Colour only the IDENTITY portion (icon/name/chip/Pin/desc/stats); the
-        // lens socket + caption sit on a NEUTRAL strip below, so the socket card
-        // reads on dark like everywhere else instead of clashing on the colour.
-        const id_h: i32 = 160;
-        try rect(gpa, dl, m.col_x, 0, m.col_w, id_h, zc, 0);
-        try rect(gpa, dl, m.col_x, id_h, m.col_w, box_h - id_h, skinHeaderVeil(accent), 0);
+        // The coloured IDENTITY band shrinks 160 → the thin bar; the identity
+        // content rides it (dy) while fading.
+        const id_h: i32 = 160 - @as(i32, @intFromFloat(@as(f32, @floatFromInt(160 - zone_thin_h_wide)) * ct));
+        // A gentle upward drift while it fades — NOT the full band shrink,
+        // which would ram the block into the Back pill before it's gone.
+        const dy: i32 = -@as(i32, @intFromFloat(30.0 * ct));
         const redge = m.lx + m.cw; // right edge of the CENTRED content column
 
-        // Top row: Back (left) + a "more" menu (far right).
+        // 1) The NEUTRAL strip + the socket + its caption — drawn FIRST so the
+        // coloured band covers them as they tuck under it, fading on the way
+        // (the socket widget has no alpha input; fadeItems retints its range).
+        // Its tap targets go dead once it starts tucking (no phantom hits).
+        if (box_h > id_h) try rect(gpa, dl, m.col_x, id_h, m.col_w, box_h - id_h, skinHeaderVeil(accent), 0);
+        if (ct < 0.98) if (socket_tray) |tray| {
+            const sock_from = dl.len;
+            const geom: lens_socket.Geometry = .{ .x = m.lx, .y = box_h - (zone_header_h_wide - zone_socket_y_wide), .w = m.cw, .scale = 1.0 };
+            _ = try lens_socket.build(gpa, e, tray, socket_ui, geom, dl, if (ct < 0.35) socket_hits else null);
+            _ = try str(gpa, dl, e, .regular, m.lx, box_h - 16, faint, 12, "the face is shared; the order is yours — swap in any algorithm");
+            if (ct > 0.001) fadeItems(dl, sock_from, 1.0 - ct);
+        };
+
+        // 2) The coloured identity band (covers the tucking socket).
+        try rect(gpa, dl, m.col_x, 0, m.col_w, id_h, zc, 0);
+
+        // 3) The fixed chrome: Back (left) + the "more" menu (far right) —
+        // both live in the thin bar too, so they never move.
         const bl = "<  Back";
         const blw: i32 = @intCast(text.measure(e, .semibold, bl, 15) + 26);
         try rect(gpa, dl, m.lx, 22, blw, 34, (0x22 << 24) | (on & 0x00FFFFFF), 16);
@@ -4396,77 +4764,203 @@ fn drawZoneHeader(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m
         try menuDots(gpa, dl, redge - 2, 39, dim);
         try emitRegion(gpa, regions, redge - 18, 28, 36, 26, 0, .more);
 
-        // Identity band: icon tile + #name + "communal face" chip (left); Pin (right).
-        const tile: i32 = 50;
-        const ty: i32 = 68;
-        try rect(gpa, dl, m.lx, ty, tile, tile, tilePalette(zone_title), 13);
-        if (zone_title.len > 0) {
-            var g0: u8 = zone_title[0];
-            if (g0 >= 'a' and g0 <= 'z') g0 -= 32;
-            const gadv: i32 = @intCast(text.advance(e, .semibold, g0, 24));
-            _ = try glyph1(gpa, dl, e, .semibold, m.lx + @divTrunc(tile - gadv, 2), ty + 34, bg, 24, g0);
+        // 4) The identity block — slides up with the band and fades out.
+        if (fi > 0.001) {
+            const tile: i32 = 50;
+            const ty: i32 = 68 + dy;
+            try rect(gpa, dl, m.lx, ty, tile, tile, fadeColor(tilePalette(zone_title), fi), 13);
+            if (zone_title.len > 0) {
+                var g0: u8 = zone_title[0];
+                if (g0 >= 'a' and g0 <= 'z') g0 -= 32;
+                const gadv: i32 = @intCast(text.advance(e, .semibold, g0, 24));
+                _ = try glyph1(gpa, dl, e, .semibold, m.lx + @divTrunc(tile - gadv, 2), ty + 34, fadeColor(bg, fi), 24, g0);
+            }
+            const nx = m.lx + tile + 16;
+            const hx = try str(gpa, dl, e, .semibold, nx, ty + 24, fadeColor(on, fi), 28, "#");
+            const nend = try str(gpa, dl, e, .semibold, hx, ty + 24, fadeColor(on, fi), 28, zone_title);
+            const chip = "communal face";
+            const cw: i32 = @intCast(text.measure(e, .regular, chip, 12));
+            try rect(gpa, dl, nend + 14, ty + 8, cw + 24, 24, fadeColor((0x26 << 24) | (on & 0x00FFFFFF), fi), 12);
+            _ = try str(gpa, dl, e, .regular, nend + 26, ty + 24, fadeColor(on, fi), 12, chip);
+
+            // Pin — a LIVE toggle. Unpinned: a quiet translucent pill ("Pin").
+            // Pinned: the reverse pill (solid contrast fill) with a filled
+            // bookmark ("Pinned") — kept, unmistakably. Its tap target only
+            // exists while the block is readable (no invisible toggles).
+            const pin = if (zv.pinned) "Pinned" else "Pin";
+            const pw: i32 = @intCast(text.measure(e, .semibold, pin, 14) + 50);
+            const px = redge - pw;
+            if (zv.pinned) {
+                try rect(gpa, dl, px, ty + 4, pw, 40, fadeColor(on, fi), 12);
+                try iconBookmarkFill(gpa, dl, px + 16, ty + 15, 17, fadeColor(zc, fi));
+                _ = try str(gpa, dl, e, .semibold, px + 40, ty + 29, fadeColor(zc, fi), 14, pin);
+            } else {
+                try rect(gpa, dl, px, ty + 4, pw, 40, fadeColor((0x2A << 24) | (on & 0x00FFFFFF), fi), 12);
+                try iconBookmark(gpa, dl, px + 16, ty + 15, 17, fadeColor(on, fi));
+                _ = try str(gpa, dl, e, .semibold, px + 40, ty + 29, fadeColor(on, fi), 14, pin);
+            }
+            if (ct < 0.2) try emitRegion(gpa, regions, px, ty + 4, pw, 40, 0, .zone_pin);
+
+            // Description + the real stats line (posts · people · last activity).
+            _ = try str(gpa, dl, e, .regular, m.lx, ty + 64, fadeColor(dim, fi), 14, "a place that precipitated out of the tag — ordered by your own lens");
+            _ = try str(gpa, dl, e, .regular, m.lx, ty + 86, fadeColor(dim, fi), 13, stats);
         }
-        const nx = m.lx + tile + 16;
-        const hx = try str(gpa, dl, e, .semibold, nx, ty + 24, on, 28, "#");
-        const nend = try str(gpa, dl, e, .semibold, hx, ty + 24, on, 28, zone_title);
-        const chip = "communal face";
-        const cw: i32 = @intCast(text.measure(e, .regular, chip, 12));
-        try rect(gpa, dl, nend + 14, ty + 8, cw + 24, 24, (0x26 << 24) | (on & 0x00FFFFFF), 12);
-        _ = try str(gpa, dl, e, .regular, nend + 26, ty + 24, on, 12, chip);
 
-        // Pin — a REVERSE pill (solid contrast fill, label in the block colour) so
-        // it pops on the coloured block. Inert scaffold (.bookmark) for now.
-        const pin = "Pin";
-        const pw: i32 = @intCast(text.measure(e, .semibold, pin, 14) + 50);
-        const px = redge - pw;
-        try rect(gpa, dl, px, ty + 4, pw, 40, on, 12);
-        try iconBookmark(gpa, dl, px + 16, ty + 15, 17, zc);
-        _ = try str(gpa, dl, e, .semibold, px + 40, ty + 29, zc, 14, pin);
-        try emitRegion(gpa, regions, px, ty + 4, pw, 40, 0, .bookmark);
-
-        // Description (scaffold) + stats line (real post count + scaffold standing).
-        _ = try str(gpa, dl, e, .regular, m.lx, ty + 64, dim, 14, "a place that precipitated out of the tag — ordered by your own lens");
-        const stats = std.fmt.bufPrint(&zbuf, "{d} {s} · regulars forming", .{ zone_count, if (zone_count == 1) "post" else "posts" }) catch "regulars forming";
-        _ = try str(gpa, dl, e, .regular, m.lx, ty + 86, dim, 13, stats);
-
-        // The lens socket (the zone algo, seated lower than Home's), then its caption.
-        if (socket_tray) |tray| {
-            const geom: lens_socket.Geometry = .{ .x = m.lx, .y = zone_socket_y_wide, .w = m.cw, .scale = 1.0 };
-            _ = try lens_socket.build(gpa, e, tray, socket_ui, geom, dl, socket_hits);
+        // 5) The THIN BAR content — a compact tile + #name · count beside
+        // Back, fading in as the tall block departs.
+        if (ti > 0.001) {
+            const bx = m.lx + blw + 14;
+            try rect(gpa, dl, bx, 19, 26, 26, fadeColor(tilePalette(zone_title), ti), 8);
+            if (zone_title.len > 0) {
+                var g0: u8 = zone_title[0];
+                if (g0 >= 'a' and g0 <= 'z') g0 -= 32;
+                const gadv: i32 = @intCast(text.advance(e, .semibold, g0, 13));
+                _ = try glyph1(gpa, dl, e, .semibold, bx + @divTrunc(26 - gadv, 2), 37, fadeColor(bg, ti), 13, g0);
+            }
+            const thx = try str(gpa, dl, e, .semibold, bx + 26 + 10, 41, fadeColor(on, ti), 17, "#");
+            const thend = try str(gpa, dl, e, .semibold, thx, 41, fadeColor(on, ti), 17, zone_title);
+            var cb2: [32]u8 = undefined;
+            const short = std.fmt.bufPrint(&cb2, "· {d} {s}", .{ zone_count, if (zone_count == 1) "post" else "posts" }) catch "";
+            _ = try str(gpa, dl, e, .regular, thend + 10, 40, fadeColor(dim, ti), 12, short);
         }
-        // Caption sits on the NEUTRAL strip now → neutral text + divider.
-        _ = try str(gpa, dl, e, .regular, m.lx, box_h - 16, faint, 12, "the face is shared; the order is yours — swap in any algorithm");
         try rect(gpa, dl, m.col_x, box_h - 1, m.col_w, 1, divider, 0);
     } else {
-        const box_h = zone_header_h_narrow;
         try rect(gpa, dl, m.col_x, 0, m.col_w, box_h, skinHeaderVeil(accent), 0);
+        // The socket slides up with the shrinking box and fades out (drawn
+        // before the identity content; on narrow there is no covering band,
+        // so the fade IS the tuck). Hits die as soon as it starts moving.
+        if (ct < 0.85) if (socket_tray) |tray| {
+            const sock_from = dl.len;
+            const geom: lens_socket.Geometry = .{ .x = m.lx, .y = box_h - (zone_header_h_narrow - zone_socket_y_narrow), .w = m.cw, .scale = 1.0 };
+            _ = try lens_socket.build(gpa, e, tray, socket_ui, geom, dl, if (ct < 0.25) socket_hits else null);
+            if (ct > 0.001) fadeItems(dl, sock_from, 1.0 - ct * 1.4);
+        };
         const bl = "<  Back";
         const blw: i32 = @intCast(text.measure(e, .semibold, bl, 14) + 22);
         try rect(gpa, dl, m.lx, 14, blw, 30, skinPanel(accent), 15);
         _ = try str(gpa, dl, e, .semibold, m.lx + 11, 34, ink, 14, bl);
         try emitRegion(gpa, regions, m.lx, 14, blw, 30, 0, .back);
 
-        const tile: i32 = 42;
-        const ty: i32 = 50;
-        try rect(gpa, dl, m.lx, ty, tile, tile, tilePalette(zone_title), 11);
-        if (zone_title.len > 0) {
-            var g0: u8 = zone_title[0];
-            if (g0 >= 'a' and g0 <= 'z') g0 -= 32;
-            const gadv: i32 = @intCast(text.advance(e, .semibold, g0, 20));
-            _ = try glyph1(gpa, dl, e, .semibold, m.lx + @divTrunc(tile - gadv, 2), ty + 29, bg, 20, g0);
+        if (fi > 0.001) {
+            const tile: i32 = 42;
+            const ty: i32 = 50 - @as(i32, @intFromFloat(20.0 * ct));
+            try rect(gpa, dl, m.lx, ty, tile, tile, fadeColor(tilePalette(zone_title), fi), 11);
+            if (zone_title.len > 0) {
+                var g0: u8 = zone_title[0];
+                if (g0 >= 'a' and g0 <= 'z') g0 -= 32;
+                const gadv: i32 = @intCast(text.advance(e, .semibold, g0, 20));
+                _ = try glyph1(gpa, dl, e, .semibold, m.lx + @divTrunc(tile - gadv, 2), ty + 29, fadeColor(bg, fi), 20, g0);
+            }
+            const nx = m.lx + tile + 12;
+            const hx = try str(gpa, dl, e, .semibold, nx, ty + 18, fadeColor(ink, fi), 22, "#");
+            const nend = try str(gpa, dl, e, .semibold, hx, ty + 18, fadeColor(ink, fi), 22, zone_title);
+            _ = try str(gpa, dl, e, .regular, nx, ty + 38, fadeColor(faint, fi), 12, stats);
+            // Compact pin toggle: just the bookmark, right of the name. The
+            // tap target only exists while visible.
+            if (zv.pinned)
+                try iconBookmarkFill(gpa, dl, nend + 14, ty + 2, 18, fadeColor(accent, fi))
+            else
+                try iconBookmark(gpa, dl, nend + 14, ty + 2, 18, fadeColor(faint, fi));
+            if (ct < 0.2) try emitRegion(gpa, regions, nend + 6, ty - 6, 34, 34, 0, .zone_pin);
         }
-        const nx = m.lx + tile + 12;
-        const hx = try str(gpa, dl, e, .semibold, nx, ty + 18, ink, 22, "#");
-        _ = try str(gpa, dl, e, .semibold, hx, ty + 18, ink, 22, zone_title);
-        const stats = std.fmt.bufPrint(&zbuf, "{d} {s} · regulars forming", .{ zone_count, if (zone_count == 1) "post" else "posts" }) catch "regulars forming";
-        _ = try str(gpa, dl, e, .regular, nx, ty + 38, faint, 12, stats);
-
-        if (socket_tray) |tray| {
-            const geom: lens_socket.Geometry = .{ .x = m.lx, .y = zone_socket_y_narrow, .w = m.cw, .scale = 1.0 };
-            _ = try lens_socket.build(gpa, e, tray, socket_ui, geom, dl, socket_hits);
+        // The thin bar: #name beside Back.
+        if (ti > 0.001) {
+            const bx = m.lx + blw + 12;
+            try rect(gpa, dl, bx, 15, 22, 22, fadeColor(tilePalette(zone_title), ti), 7);
+            if (zone_title.len > 0) {
+                var g0: u8 = zone_title[0];
+                if (g0 >= 'a' and g0 <= 'z') g0 -= 32;
+                const gadv: i32 = @intCast(text.advance(e, .semibold, g0, 11));
+                _ = try glyph1(gpa, dl, e, .semibold, bx + @divTrunc(22 - gadv, 2), 31, fadeColor(bg, ti), 11, g0);
+            }
+            const thx = try str(gpa, dl, e, .semibold, bx + 22 + 8, 34, fadeColor(ink, ti), 16, "#");
+            _ = try str(gpa, dl, e, .semibold, thx, 34, fadeColor(ink, ti), 16, zone_title);
         }
         try rect(gpa, dl, m.col_x, box_h - 1, m.col_w, 1, divider, 0);
     }
+}
+
+/// The zone page's ABOUT SIDEBAR — the community card beside the reading
+/// column (the subreddit-sidebar shape): the zone's identity, its honest
+/// description, the real stat rows (posts · people · last activity, with a
+/// live pulse), and a full-width Pin toggle. Drawn only when the glass fits
+/// reading column + rail; rides the collapsing masthead's bottom edge so it
+/// rises as the reader scrolls in. Every number is real. PURE.
+fn drawZoneSidebar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, regions: ?*Regions, accent: u32, zone_title: []const u8, zone_count: usize, zv: ZonesView, scroll: i32) error{OutOfMemory}!void {
+    const sx = m.lx + m.cw + zone_side_gap;
+    const sw = zone_side_w;
+    const y0 = zoneHeaderH(scroll, true) + 18;
+    const card_h: i32 = 320;
+    try rect(gpa, dl, sx, y0, sw, card_h, panel, 14);
+    try rect(gpa, dl, sx, y0, sw, 1, 0x14EDEAE0, 14);
+    const ix = sx + 20;
+    var y = y0 + 30;
+    _ = try str(gpa, dl, e, .semibold, ix, y, faint, 11, "ABOUT THIS ZONE");
+    y += 20;
+
+    // Identity row: tile + #name.
+    try rect(gpa, dl, ix, y, 36, 36, tilePalette(zone_title), 10);
+    if (zone_title.len > 0) {
+        var g0: u8 = zone_title[0];
+        if (g0 >= 'a' and g0 <= 'z') g0 -= 32;
+        const gadv: i32 = @intCast(text.advance(e, .semibold, g0, 17));
+        _ = try glyph1(gpa, dl, e, .semibold, ix + @divTrunc(36 - gadv, 2), y + 25, bg, 17, g0);
+    }
+    const hx = try str(gpa, dl, e, .semibold, ix + 36 + 12, y + 24, ink, 17, "#");
+    _ = try str(gpa, dl, e, .semibold, hx, y + 24, ink, 17, zone_title);
+    y += 52;
+    _ = try str(gpa, dl, e, .regular, ix, y, muted, 13, "a place that precipitated out of the tag");
+    y += 18;
+    try rect(gpa, dl, ix, y, sw - 40, 1, divider, 0);
+    y += 8;
+
+    // The stat rows — label left, the real number right.
+    var vb: [40]u8 = undefined;
+    const rows = [_]struct { label: []const u8, live: bool }{
+        .{ .label = "posts", .live = false },
+        .{ .label = "people", .live = false },
+        .{ .label = "activity", .live = true },
+    };
+    for (rows) |row| {
+        y += 26;
+        _ = try str(gpa, dl, e, .regular, ix, y, faint, 13, row.label);
+        var val: []const u8 = "";
+        if (std.mem.eql(u8, row.label, "posts")) {
+            val = std.fmt.bufPrint(&vb, "{d}", .{zone_count}) catch "";
+        } else if (std.mem.eql(u8, row.label, "people")) {
+            val = if (zv.people > 0) std.fmt.bufPrint(&vb, "{d}", .{zv.people}) catch "" else "—";
+        } else {
+            const act = activityLabel(&vb, zv.now, zv.last_at);
+            val = if (act.len > 0) act else "—";
+        }
+        const vw: i32 = @intCast(text.measure(e, .regular, val, 13));
+        var vx = sx + sw - 20 - vw;
+        _ = try str(gpa, dl, e, .regular, vx, y, ink, 13, val);
+        if (row.live and zv.last_at > 0 and zv.now - zv.last_at < 3600) {
+            vx -= 14;
+            try rect(gpa, dl, vx, y - 8, 6, 6, live_green, 3);
+        }
+    }
+    y += 22;
+
+    // The Pin toggle, full width — the sidebar's one action.
+    const bw = sw - 40;
+    const bh: i32 = 40;
+    const pin_label = if (zv.pinned) "Pinned" else "Pin this zone";
+    const lw: i32 = @intCast(text.measure(e, .semibold, pin_label, 14));
+    const label_x = ix + @divTrunc(bw - lw, 2) + 12; // shifted right of the icon
+    const icon_x = label_x - 24;
+    if (zv.pinned) {
+        try rect(gpa, dl, ix, y, bw, bh, accent, 12);
+        try iconBookmarkFill(gpa, dl, icon_x, y + 11, 17, bg);
+        _ = try str(gpa, dl, e, .semibold, label_x, y + 26, bg, 14, pin_label);
+    } else {
+        try rect(gpa, dl, ix, y, bw, bh, skinPanel(accent), 12);
+        try rect(gpa, dl, ix, y, bw, 1, 0x22EDEAE0, 12);
+        try iconBookmark(gpa, dl, icon_x, y + 11, 17, ink);
+        _ = try str(gpa, dl, e, .semibold, label_x, y + 26, ink, 14, pin_label);
+    }
+    try emitRegion(gpa, regions, ix, y, bw, @intCast(bh), 0, .zone_pin);
 }
 
 /// The sticky PROFILE identity header: a compact HORIZONTAL band — avatar on the
@@ -6043,7 +6537,7 @@ test "layout emits 4 tap regions per post (avatar + 3 engagement); hitTest resol
     const posts = [_]PostView{
         .{ .name = "A", .handle = "@a.zat", .age = "1m", .body = "hello there field", .tint = 0xFFAAAAAA, .reply = 1, .boost = 2, .like = 3, .initial = 'A', .liked = true, .boosted = false },
     };
-    const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{}, 0, 255, null);
+    const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null);
     try std.testing.expect(h > 112); // content extends below the top bar
     // 8 regions per post: body tap + avatar + reply/repost/like + bookmark/share/more.
     try std.testing.expectEqual(@as(usize, 8), regions.items.len);
@@ -6088,14 +6582,14 @@ test "layout captures the rooted post's body glyphs for selection (thread screen
         .{ .name = "A", .handle = "@a.zat", .age = "1m", .body = "hello there field", .tint = 0xFFAAAAAA, .reply = 0, .boost = 0, .like = 0, .initial = 'A', .liked = false, .boosted = false, .is_focus = true },
     };
     // A WIDE layout so the focus post is on-screen and the body is drawn.
-    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_thread, null, 0, accent_house, null, .{}, null, null, &sel, "", &.{}, null, 0, 0, .{}, 0, 255, null);
+    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_thread, null, 0, accent_house, null, .{}, null, null, &sel, "", .{}, null, 0, 0, .{}, 0, 255, null);
     // "hello there field" = 15 visible glyphs (spaces are emitted too): the body
     // captured into the selection map, in reading order.
     try std.testing.expect(sel.items.len > 0);
     try std.testing.expectEqual(@as(u32, 'h'), sel.items[0].cp);
 
     // A non-thread screen captures nothing (only the rooted post is selectable).
-    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_home, null, 0, accent_house, null, .{}, null, null, &sel, "", &.{}, null, 0, 0, .{}, 0, 255, null);
+    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_home, null, 0, accent_house, null, .{}, null, null, &sel, "", .{}, null, 0, 0, .{}, 0, 255, null);
     try std.testing.expectEqual(@as(usize, 0), sel.items.len);
 }
 
@@ -6157,7 +6651,7 @@ test "long timeline does not overflow draw coordinates (off-screen posts skipped
     const posts = try arena.alloc(PostView, n);
     for (posts) |*pv| pv.* = .{ .name = "x", .handle = "@x.zat", .age = "1m", .body = "a body line that wraps a little across the feed column width here", .tint = 0xFF888888, .reply = 1, .boost = 2, .like = 3, .initial = 'x', .liked = false, .boosted = false };
 
-    const h = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{}, 0, 255, null); // must not panic
+    const h = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null); // must not panic
     try std.testing.expect(h > 940 * 10); // height accounts for the whole list
     try std.testing.expect(regions.items.len < 4 * 24); // only on-screen posts are tappable
 
@@ -6171,11 +6665,11 @@ test "long timeline does not overflow draw coordinates (off-screen posts skipped
     @memset(heights, -1);
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h_fill = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{}, 0, 255, null);
+    const h_fill = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null);
     const fill_regions = regions.items.len;
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h_cached = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{}, 0, 255, null);
+    const h_cached = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null);
     try std.testing.expectEqual(h, h_fill);
     try std.testing.expectEqual(h, h_cached);
     try std.testing.expectEqual(fill_regions, regions.items.len);
@@ -6198,7 +6692,7 @@ test "profile screen renders the author's posts under a header; other screens st
     // Profile screen: 8 post tap regions (body + avatar + reply/repost/like +
     // bookmark/share/more) + 4 profile-nav tab regions in the sticky header
     // (the header here isn't editable, so no edit-profile region).
-    const hp = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_profile, header, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{}, 0, 255, null);
+    const hp = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_profile, header, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null);
     try std.testing.expect(hp > 112);
     try std.testing.expectEqual(@as(usize, 12), regions.items.len);
 
@@ -6206,7 +6700,7 @@ test "profile screen renders the author's posts under a header; other screens st
     // so no tap regions, and the height clamps to the viewport (no post stack).
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const he = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, 2, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, 0, 0, .{}, 0, 255, null); // Activity (a still-bare placeholder)
+    const he = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, 2, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null); // Activity (a still-bare placeholder)
     try std.testing.expectEqual(@as(i32, 940), he);
     try std.testing.expectEqual(@as(usize, 0), regions.items.len);
 
@@ -6219,7 +6713,7 @@ test "profile screen renders the author's posts under a header; other screens st
     regions.clearRetainingCapacity();
     // Narrow width (460): `m.wide` is false so the rail emits no regions — the
     // only regions are the settings surface's own, keeping the count exact.
-    _ = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_settings, null, 0, accent_house, null, .{}, null, null, null, "", &.{}, null, settings_view.sec_account, 0, .{}, 0, 255, null);
+    _ = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_settings, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, settings_view.sec_account, 0, .{}, 0, 255, null);
     // Rows that emit a tap region: not info, and not WIP-greyed (those are inert).
     var account_interactive: usize = 0;
     for (settings_view.rows) |r| {
@@ -6415,18 +6909,125 @@ test "zones browse: each catalog entry emits one .zone_open card region carrying
         .{ .tag = "zig", .count = 913 },
         .{ .tag = "small-net", .count = 1 },
     };
-    const h = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_zones_browse, null, 0, accent_house, null, .{}, null, null, null, "", &zones, null, 0, 0, .{}, 0, 255, null);
+    const h = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_zones_browse, null, 0, accent_house, null, .{}, null, null, null, "", .{ .cards = &zones }, null, 0, 0, .{}, 0, 255, null);
     try std.testing.expect(h > 0);
-    // The inert chrome (tabs/search/categories) emits no regions; the rail does
-    // (it flanks every wide screen), so filter to the card taps: one `.zone_open`
-    // per catalog entry, each carrying its index for the shell to resolve.
+    // Each card emits `.zone_open` (whole card) AND `.zone_pin` (its bookmark)
+    // carrying the same catalog index; the pin is emitted after so it wins the
+    // overlap under `hitTest`'s last-match rule.
     var card_idx: u16 = 0;
+    var pin_idx: u16 = 0;
     for (regions.items) |r| {
-        if (r.kind != .zone_open) continue;
-        try std.testing.expectEqual(card_idx, r.post);
-        card_idx += 1;
+        if (r.kind == .zone_open) {
+            try std.testing.expectEqual(card_idx, r.post);
+            card_idx += 1;
+        } else if (r.kind == .zone_pin) {
+            try std.testing.expectEqual(pin_idx, r.post);
+            pin_idx += 1;
+        }
     }
     try std.testing.expectEqual(@as(u16, zones.len), card_idx);
+    try std.testing.expectEqual(@as(u16, zones.len), pin_idx);
+    // The live chrome emits its regions too: three tab targets + the search field.
+    var n_tabs: usize = 0;
+    var n_search: usize = 0;
+    for (regions.items) |r| {
+        if (r.kind == .zone_tab) n_tabs += 1;
+        if (r.kind == .zone_search) n_search += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), n_tabs);
+    try std.testing.expectEqual(@as(usize, 1), n_search);
+}
+
+test "zones hub: search filters the browse grid; the pinned tab shows only pins; trending ranks by velocity" {
+    const gpa = std.testing.allocator;
+    var engine = try text.initEngine();
+    defer text.deinitEngine(gpa, &engine);
+    var dl: raster.DrawList = .{};
+    defer dl.deinit(gpa);
+    var regions: Regions = .empty;
+    defer regions.deinit(gpa);
+
+    const posts = [_]PostView{};
+    const zones = [_]ZoneCard{
+        .{ .tag = "water", .count = 10, .recent = 5, .pinned = true },
+        .{ .tag = "zig", .count = 8, .recent = 0 },
+        .{ .tag = "waterfowl", .count = 2, .recent = 1 },
+    };
+
+    // Search "water" on Browse: only the two matching cards emit regions.
+    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_zones_browse, null, 0, accent_house, null, .{}, null, null, null, "", .{ .cards = &zones, .query = "water" }, null, 0, 0, .{}, 0, 255, null);
+    var opens: usize = 0;
+    for (regions.items) |r| {
+        if (r.kind != .zone_open) continue;
+        try std.testing.expect(r.post == 0 or r.post == 2); // water + waterfowl, catalog indices intact
+        opens += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), opens);
+
+    // The Pinned tab: only the pinned card.
+    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_zones_browse, null, 0, accent_house, null, .{}, null, null, null, "", .{ .cards = &zones, .tab = 1, .tab_t = 1 }, null, 0, 0, .{}, 0, 255, null);
+    opens = 0;
+    for (regions.items) |r| {
+        if (r.kind != .zone_open) continue;
+        try std.testing.expectEqual(@as(u16, 0), r.post);
+        opens += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), opens);
+
+    // Trending: only zones that moved in the window (recent > 0) list.
+    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_zones_browse, null, 0, accent_house, null, .{}, null, null, null, "", .{ .cards = &zones, .tab = 2, .tab_t = 2 }, null, 0, 0, .{}, 0, 255, null);
+    opens = 0;
+    for (regions.items) |r| {
+        if (r.kind != .zone_open) continue;
+        try std.testing.expect(r.post == 0 or r.post == 2); // zig (recent 0) never trends
+        opens += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), opens);
+}
+
+test "zones: sortZonesByActivity ranks by 24h velocity, then size, then recency" {
+    var cards = [_]ZoneCard{
+        .{ .tag = "b-quiet", .count = 100, .recent = 0, .last_at = 50 },
+        .{ .tag = "a-alive", .count = 3, .recent = 2, .last_at = 900 },
+        .{ .tag = "c-alive", .count = 9, .recent = 2, .last_at = 100 },
+        .{ .tag = "d-dead", .count = 1, .recent = 0, .last_at = 0 },
+    };
+    sortZonesByActivity(&cards);
+    try std.testing.expectEqualStrings("c-alive", cards[0].tag); // same velocity → bigger first
+    try std.testing.expectEqualStrings("a-alive", cards[1].tag);
+    try std.testing.expectEqualStrings("b-quiet", cards[2].tag); // quiet: size beats recency
+    try std.testing.expectEqualStrings("d-dead", cards[3].tag);
+}
+
+test "zones: the masthead collapse is a pure function of scroll — pixel-perfect return" {
+    // At rest: the tall masthead. Fully scrolled: the thin bar. And the same
+    // scroll always yields the same height (returning to top restores 250).
+    try std.testing.expectEqual(zone_header_h_wide, zoneHeaderH(0, true));
+    try std.testing.expectEqual(zone_thin_h_wide, zoneHeaderH(-10_000, true));
+    try std.testing.expectEqual(zone_header_h_narrow, zoneHeaderH(0, false));
+    try std.testing.expectEqual(zone_thin_h_narrow, zoneHeaderH(-10_000, false));
+    // Monotonic through the travel; scrolling back up retraces exactly.
+    var prev: i32 = zoneHeaderH(0, true);
+    var s: i32 = 0;
+    while (s >= -220) : (s -= 20) {
+        const h = zoneHeaderH(s, true);
+        try std.testing.expect(h <= prev);
+        prev = h;
+    }
+    try std.testing.expectEqual(zone_header_h_wide, zoneHeaderH(0, true)); // the return trip
+    try std.testing.expectEqual(@as(f32, 0.0), zoneCollapseT(0, true));
+    try std.testing.expectEqual(@as(f32, 1.0), zoneCollapseT(-10_000, true));
+}
+
+test "zones: activityLabel buckets — just now, minutes, hours, days, quiet weeks" {
+    var buf: [40]u8 = undefined;
+    try std.testing.expectEqualStrings("active just now", activityLabel(&buf, 1000, 950));
+    try std.testing.expectEqualStrings("active 5m ago", activityLabel(&buf, 1300, 1000));
+    try std.testing.expectEqualStrings("active 3h ago", activityLabel(&buf, 100_000, 100_000 - 3 * 3600 - 10));
+    try std.testing.expectEqualStrings("active 2d ago", activityLabel(&buf, 1_000_000, 1_000_000 - 2 * 86400 - 60));
+    try std.testing.expectEqualStrings("quiet for 3w", activityLabel(&buf, 10_000_000, 10_000_000 - 3 * 7 * 86400 - 60));
+    try std.testing.expectEqualStrings("", activityLabel(&buf, 100, 0)); // unknown stays silent
+    try std.testing.expectEqualStrings("", activityLabel(&buf, 100, 200)); // future = clock skew, stay silent
 }
 
 test "wrapBody honours explicit newlines as hard line breaks" {

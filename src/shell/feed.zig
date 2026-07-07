@@ -323,10 +323,12 @@ pub const ZonesOutcome = union(enum) {
     failed: xrpc.Failure,
 };
 
-/// Fetch the zone CATALOG (`listTags`) — the flat set of known zones with their
-/// post counts. This is metadata, NOT posts, so it does not touch the store; the
-/// caller copies the entries it keeps into its own catalog (the browse screen).
-/// Ranking / manifest-state are later phases (Z3/Z7); this is the latent set.
+/// Fetch the zone CATALOG (`listTags`) — the known zones with their community
+/// stats (post count, distinct posters, recency). This is metadata, NOT posts,
+/// so it does not touch the store; the caller copies the entries it keeps into
+/// its own catalog (the browse screen). `since` is the recency watermark (unix
+/// seconds) the server counts `recent` against — the caller computes it from
+/// its clock (typically now − 24h). Ranking / manifest-state are later (Z3/Z7).
 pub fn loadZones(
     gpa: Allocator,
     arena: Allocator,
@@ -334,7 +336,13 @@ pub fn loadZones(
     environ: ?*const std.process.Environ.Map,
     session: *auth.Session,
     appview_url: []const u8,
+    since: i64,
 ) !ZonesOutcome {
+    var since_buf: [24]u8 = undefined;
+    const since_str = std.fmt.bufPrint(&since_buf, "{d}", .{since}) catch unreachable;
+    const params = [_]xrpc.Param{
+        .{ .name = "since", .value = since_str },
+    };
     const outcome = try auth.queryHost(
         gpa,
         arena,
@@ -343,7 +351,7 @@ pub fn loadZones(
         session,
         appview_url,
         lexicon.method.list_tags,
-        &.{},
+        &params,
         lexicon.TagsPage,
     );
     switch (outcome) {

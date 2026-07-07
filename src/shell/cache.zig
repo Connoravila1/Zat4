@@ -97,6 +97,7 @@ fn winOpen(path: []const u8, write: bool) ?*anyopaque {
 const snapshot = @import("../core/snapshot.zig");
 const feed = @import("../core/feed.zig");
 const algo_library = @import("../core/algo_library.zig");
+const zone_pins = @import("../core/zone_pins.zig");
 const auth = @import("auth.zig");
 const keystore = @import("keystore.zig");
 
@@ -419,6 +420,33 @@ pub fn saveLibrary(gpa: Allocator, environ: ?*const std.process.Environ.Map, lib
     const dir = cacheDir(&dir_buf, environ) orelse return false;
     const path = joinFile(&path_buf, dir, library_file) orelse return false;
     return saveLibraryAt(gpa, path, lib);
+}
+
+// ---------------------------------------------------------------------------
+// Zone pins — the viewer's kept zones, one tag per line (core/zone_pins.zig
+// owns what the bytes mean; this is only the path + fd work)
+// ---------------------------------------------------------------------------
+
+const zone_pins_file = "zone_pins.txt";
+
+pub fn loadPins(gpa: Allocator, environ: ?*const std.process.Environ.Map) ?zone_pins.Pins {
+    var dir_buf: [512]u8 = undefined;
+    var path_buf: [512]u8 = undefined;
+    const dir = cacheDir(&dir_buf, environ) orelse return null;
+    const path = joinFile(&path_buf, dir, zone_pins_file) orelse return null;
+    const bytes = readFileAlloc(gpa, path) orelse return null;
+    defer gpa.free(bytes);
+    return zone_pins.deserialize(gpa, bytes) catch null;
+}
+
+pub fn savePins(gpa: Allocator, environ: ?*const std.process.Environ.Map, pins: *const zone_pins.Pins) bool {
+    var dir_buf: [512]u8 = undefined;
+    var path_buf: [512]u8 = undefined;
+    const dir = cacheDir(&dir_buf, environ) orelse return false;
+    const path = joinFile(&path_buf, dir, zone_pins_file) orelse return false;
+    const bytes = zone_pins.serialize(gpa, pins) catch return false;
+    defer gpa.free(bytes);
+    return writeFileAtomic(path, bytes, 0o644);
 }
 
 // ---------------------------------------------------------------------------

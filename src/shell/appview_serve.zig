@@ -186,7 +186,7 @@ fn route(arena: Allocator, idx: *const appview.Index, cfg: ServeConfig, target: 
         return getPostsForTag(arena, idx, cfg, target);
     }
     if (std.mem.endsWith(u8, path, "app.zat4.feed.listTags")) {
-        return listTags(arena, idx);
+        return listTags(arena, idx, target);
     }
     // The algorithm marketplace: the published algorithms available to browse.
     if (std.mem.endsWith(u8, path, "app.zat4.feed.getAlgorithms")) {
@@ -257,11 +257,16 @@ fn getPostsForTag(arena: Allocator, idx: *const appview.Index, cfg: ServeConfig,
     return serializeFeed(arena, rows);
 }
 
-/// The zone catalog: every known tag with its post count (the latent layer).
-fn listTags(arena: Allocator, idx: *const appview.Index) RouteError![]const u8 {
-    const zones = try appview.listZones(arena, idx);
+/// The zone catalog: every known tag with its post count + community stats.
+/// `since` (unix seconds) is the client's recency watermark — the route stays
+/// clock-free (the caller owns "now"); absent/garbage `since` degrades to 0,
+/// making `recent == count` (E4, not an error).
+fn listTags(arena: Allocator, idx: *const appview.Index, target: []const u8) RouteError![]const u8 {
+    var since: i64 = 0;
+    if (queryValue(target, "since")) |s| since = std.fmt.parseInt(i64, s, 10) catch 0;
+    const zones = try appview.listZones(arena, idx, since);
     const tags = try arena.alloc(lexicon.TagView, zones.len);
-    for (tags, zones) |*t, z| t.* = .{ .tag = z.tag, .count = z.count };
+    for (tags, zones) |*t, z| t.* = .{ .tag = z.tag, .count = z.count, .authors = z.authors, .recent = z.recent, .lastAt = z.last_at };
     const page: lexicon.TagsPage = .{ .cursor = null, .tags = tags };
     return std.json.Stringify.valueAlloc(arena, page, .{ .emit_null_optional_fields = false });
 }
@@ -604,11 +609,14 @@ test "route: listTags returns the zone catalog with post counts" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const json = try route(arena, &idx, .{}, "/xrpc/app.zat4.feed.listTags");
+    const json = try route(arena, &idx, .{}, "/xrpc/app.zat4.feed.listTags?since=2");
     const page = try std.json.parseFromSliceLeaky(lexicon.TagsPage, arena, json, .{ .ignore_unknown_fields = true });
     try testing.expectEqual(@as(usize, 2), page.tags.len);
     try testing.expectEqualStrings("water", page.tags[0].tag); // canonical lowercase (#Water → water)
     try testing.expectEqual(@as(usize, 2), page.tags[0].count);
+    try testing.expectEqual(@as(usize, 2), page.tags[0].authors); // did:a + did:b
+    try testing.expectEqual(@as(usize, 1), page.tags[0].recent); // only t=2 is inside since=2
+    try testing.expectEqual(@as(i64, 2), page.tags[0].lastAt);
     try testing.expectEqualStrings("rivers", page.tags[1].tag);
     try testing.expectEqual(@as(usize, 1), page.tags[1].count);
 }
