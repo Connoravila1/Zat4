@@ -419,6 +419,9 @@ const RunState = struct {
     gdev_desc_len: usize,
     gdev_focus: u8,
     gdev_color: u8,
+    gdev_designed: u8,
+    gdev_tags_buf: [128]u8,
+    gdev_tags_len: usize,
     gdev_checked: bool,
     gdev_check_ok: bool,
     gdev_diags: std.ArrayListUnmanaged([]const u8),
@@ -883,6 +886,9 @@ fn initRunState(
     rs.gdev_desc_len = 0;
     rs.gdev_focus = 0;
     rs.gdev_color = 0;
+    rs.gdev_designed = 1; // feed pre-checked; the author edits from there
+    rs.gdev_tags_buf = undefined;
+    rs.gdev_tags_len = 0;
     rs.gdev_checked = false;
     rs.gdev_check_ok = false;
     rs.gdev_diags = .empty;
@@ -3455,6 +3461,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                     .publishing, .done => {},
                                 },
                                 .dev_field => rs.gdev_focus = @intCast(hit.post),
+                                .dev_surface => rs.gdev_designed ^= @as(u8, 1) << @intCast(hit.post),
                                 .dev_color => rs.gdev_color = @intCast(hit.post),
                                 .dev_publish => {
                                     if (rs.gdev_config.len == 0 or !rs.gdev_check_ok) {
@@ -3484,7 +3491,17 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         const rkey = std.fmt.bufPrint(&rkb, "{s}-{d}", .{ slug[0..sn], rs.algo_uid }) catch "algo";
                                         var idb: [24]u8 = undefined;
                                         const local_id = std.fmt.bufPrint(&idb, "user:{d}", .{rs.algo_uid}) catch "user:x";
-                                        if (write_worker.submitPublishAlgo(w, local_id, rs.gdev_name_buf[0..rs.gdev_name_len], rs.gdev_config, rkey, now)) {
+                                        if (write_worker.submitPublishAlgo(w, .{
+                                            .local_id = local_id,
+                                            .name = rs.gdev_name_buf[0..rs.gdev_name_len],
+                                            .config = rs.gdev_config,
+                                            .rkey = rkey,
+                                            .ranks = rs.gdev_ranks_buf[0..rs.gdev_ranks_len],
+                                            .desc = rs.gdev_desc_buf[0..rs.gdev_desc_len],
+                                            .source = textedit.view(&rs.gdev_src),
+                                            .tags_csv = rs.gdev_tags_buf[0..rs.gdev_tags_len],
+                                            .designed = rs.gdev_designed,
+                                        }, now)) {
                                             rs.gdev_step = .publishing;
                                             rs.gscroll_px = 0;
                                         } else rs.status = "Couldn't queue the publish — out of memory.";
@@ -4490,7 +4507,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 }
                 if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 2 and rs.gdev_active and rs.gdev_step == .details) {
                     if (zc == 9 or ((zc == '\r' or zc == '\n') and rs.gdev_focus != 2)) {
-                        rs.gdev_focus = (rs.gdev_focus + 1) % 3;
+                        rs.gdev_focus = (rs.gdev_focus + 1) % 4;
                     } else if (zc == 8 or zc == 127) {
                         switch (rs.gdev_focus) {
                             0 => {
@@ -4498,6 +4515,9 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             },
                             1 => {
                                 if (rs.gdev_ranks_len > 0) rs.gdev_ranks_len -= 1;
+                            },
+                            3 => {
+                                if (rs.gdev_tags_len > 0) rs.gdev_tags_len -= 1;
                             },
                             else => {
                                 if (rs.gdev_desc_len > 0) rs.gdev_desc_len -= 1;
@@ -4517,6 +4537,10 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             1 => if (rs.gdev_ranks_len < rs.gdev_ranks_buf.len) {
                                 rs.gdev_ranks_buf[rs.gdev_ranks_len] = @intCast(zc);
                                 rs.gdev_ranks_len += 1;
+                            },
+                            3 => if (rs.gdev_tags_len < rs.gdev_tags_buf.len) {
+                                rs.gdev_tags_buf[rs.gdev_tags_len] = @intCast(zc);
+                                rs.gdev_tags_len += 1;
                             },
                             else => if (rs.gdev_desc_len < rs.gdev_desc_buf.len) {
                                 rs.gdev_desc_buf[rs.gdev_desc_len] = @intCast(zc);
@@ -4979,6 +5003,8 @@ fn devReset(rs: *RunState) void {
     rs.gdev_desc_len = 0;
     rs.gdev_focus = 0;
     rs.gdev_color = 0;
+    rs.gdev_designed = 1;
+    rs.gdev_tags_len = 0;
     rs.gdev_status_len = 0;
     rs.gdev_step = .source;
     rs.gdev_active = false;
@@ -5112,6 +5138,8 @@ fn devViewOf(rs: *RunState) feed_view.DevView {
         .desc = rs.gdev_desc_buf[0..rs.gdev_desc_len],
         .focus = rs.gdev_focus,
         .color = rs.gdev_color,
+        .designed = rs.gdev_designed,
+        .tags = rs.gdev_tags_buf[0..rs.gdev_tags_len],
         .status = rs.gdev_status_buf[0..rs.gdev_status_len],
     };
 }

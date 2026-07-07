@@ -877,7 +877,7 @@ pub fn main(init: std.process.Init) !void {
         if (publish_algo_name) |name| {
             const config_out = builder.build(.{});
             try printGateRefusals(out, config_out); // named reasons before the shell's fail-closed refusal
-            const published = algorithm_shell.publish(gpa, arena, io, env, &session, name, config_out, "dev-algo", now) catch |err| {
+            const published = algorithm_shell.publish(gpa, arena, io, env, &session, name, config_out, "dev-algo", now, .{}) catch |err| {
                 try out.print("publish-algo failed: {s}\n", .{@errorName(err)});
                 try out.flush();
                 return err;
@@ -892,7 +892,7 @@ pub fn main(init: std.process.Init) !void {
         if (publish_discover) {
             const cfg = lens_catalog.scoringConfigForId("zat4:discover") orelse builder.build(.{});
             try printGateRefusals(out, cfg);
-            const published = algorithm_shell.publish(gpa, arena, io, env, &session, "Zat4 Discover", cfg, "zat4-discover", now) catch |err| {
+            const published = algorithm_shell.publish(gpa, arena, io, env, &session, "Zat4 Discover", cfg, "zat4-discover", now, .{}) catch |err| {
                 try out.print("publish-discover failed: {s}\n", .{@errorName(err)});
                 try out.flush();
                 return err;

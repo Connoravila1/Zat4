@@ -62,6 +62,17 @@ const AlgorithmRecordOut = struct {
     name: []const u8,
     config: []const u8, // serialized FeedConfig (see above)
     createdAt: []const u8,
+    // The public page's author prose + the open-source guarantee
+    // (ALGO_SUBMISSION schema rev). `source` is the Zal text the config was
+    // compiled from — the record is readable code, not just bytecode; the
+    // engine still trusts ONLY the compiled config (labels stay derived).
+    // `designedFor` declares the sockets it was built for ("feed"/"replies"/
+    // "zones" — declaration, never enforcement); `tags` are search facets.
+    ranks: []const u8 = "",
+    desc: []const u8 = "",
+    source: []const u8 = "",
+    designedFor: []const []const u8 = &.{},
+    tags: []const []const u8 = &.{},
 };
 
 /// The READ shape (all defaulted — absent fields degrade to an empty config
@@ -70,6 +81,22 @@ const AlgorithmRecord = struct {
     name: []const u8 = "",
     config: []const u8 = "", // serialized FeedConfig
     createdAt: []const u8 = "",
+    ranks: []const u8 = "",
+    desc: []const u8 = "",
+    source: []const u8 = "",
+    designedFor: []const []const u8 = &.{},
+    tags: []const []const u8 = &.{},
+};
+
+/// The author-prose + declaration half of a publish (the schema-rev fields).
+/// Split from the positional params so the CLI dev paths can pass `.{}` and
+/// the flow can grow fields without another signature march. A7.2: cold.
+pub const Prose = struct {
+    ranks: []const u8 = "",
+    desc: []const u8 = "",
+    source: []const u8 = "",
+    designed_for: []const []const u8 = &.{},
+    tags: []const []const u8 = &.{},
 };
 
 /// What a publish returns: the record's at:// uri (its reference) and its CID
@@ -97,6 +124,7 @@ pub fn publish(
     config: discover.FeedConfig,
     rkey: []const u8,
     now_epoch: i64,
+    prose: Prose,
 ) !Published {
     // The publish gate (GUEST_TIER_ROADMAP Phase 5; closes the deferred
     // SECURITY_ROADMAP Phase-12 item recorded here). validated() still runs
@@ -110,6 +138,11 @@ pub fn publish(
         // can never be published.
         .config = try algorithm_core.serialize(arena, discover.validated(config)),
         .createdAt = feed_core.formatTimestamp(&ts_buf, now_epoch),
+        .ranks = prose.ranks,
+        .desc = prose.desc,
+        .source = prose.source,
+        .designedFor = prose.designed_for,
+        .tags = prose.tags,
     };
     const input = lexicon.PutRecordInput(@TypeOf(record)){
         .repo = session.did,

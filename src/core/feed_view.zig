@@ -191,7 +191,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -3147,10 +3147,15 @@ pub const DevView = struct {
     name: []const u8 = "",
     ranks: []const u8 = "",
     desc: []const u8 = "",
-    focus: u8 = 0, // details step: which field owns keys (0 name, 1 ranks, 2 desc)
+    focus: u8 = 0, // details step: which field owns keys (0 name, 1 ranks, 2 desc, 3 tags)
     color: u8 = 0, // accent palette index (0..8)
+    designed: u8 = 1, // declared-surface bitmask: 1 feed / 2 replies / 4 zones
+    tags: []const u8 = "", // raw comma-separated tag draft
     status: []const u8 = "", // publish progress / error / the live record uri
 };
+
+/// The declared-surface catalog (bit order = the loadout page's socket order).
+pub const dev_surfaces = [_][]const u8{ "Feed", "Replies", "Zones" };
 
 /// The source-editor geometry, shared by the draw (`devSource`) and the click →
 /// caret inverse (`devSrcCaretAtPoint`) so the two never drift. Code renders as
@@ -3397,7 +3402,27 @@ pub fn layoutDevSubmit(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawLi
                 _ = try str(gpa, dl, e, .regular, x0 + 16, y + 26, faint, 15, "What does it surface, and for whom? Enter breaks the line.");
             }
             try emitRegion(gpa, regions, x0, y, w, @intCast(dh), 2, .dev_field);
-            y += dh + 24;
+            y += dh + 18;
+            y = try devField(gpa, dl, e, x0, y, w, regions, accent, "TAGS — COMMA-SEPARATED, FOR SEARCH", view.tags, "e.g. calm, chronological, search", view.focus == 3, 3);
+            y += 6;
+            // DESIGNED FOR: the author's declaration of which sockets this was
+            // built for (multi-select; declaration, never enforcement — a
+            // mismatched seat later just gets a heads-up).
+            _ = try str(gpa, dl, e, .semibold, x0, y + 12, faint, 12, "DESIGNED FOR — WHICH SOCKETS IS THIS BUILT FOR?");
+            y += 24;
+            var sx = x0;
+            for (dev_surfaces, 0..) |surf, si| {
+                const on = view.designed & (@as(u8, 1) << @intCast(si)) != 0;
+                const tw2: i32 = @intCast(text.measure(e, .semibold, surf, 14));
+                const cw4 = tw2 + 48;
+                try rect(gpa, dl, sx, y, cw4, 34, if (on) skinPanel(accent) else 0x14EDEAE0, 10);
+                if (on) try rect(gpa, dl, sx, y, 3, 34, accent, 2);
+                if (on) _ = try str(gpa, dl, e, .semibold, sx + 14, y + 22, accent, 14, "\u{2713}");
+                _ = try str(gpa, dl, e, .semibold, sx + 30, y + 22, ink, 14, surf);
+                try emitRegion(gpa, regions, sx, y, cw4, 34, @intCast(si), .dev_surface);
+                sx += cw4 + 10;
+            }
+            y += 34 + 24;
             _ = try str(gpa, dl, e, .semibold, x0, y + 12, faint, 12, "ACCENT");
             y += 28;
             const sw: i32 = 34;
@@ -3425,6 +3450,22 @@ pub fn layoutDevSubmit(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawLi
             if (view.ranks.len > 0) {
                 _ = try str(gpa, dl, e, .regular, x0 + 24, y + 8, body_c, 15, view.ranks);
                 y += 26;
+            }
+            if (view.designed != 0) {
+                var px2 = try str(gpa, dl, e, .semibold, x0 + 24, y + 10, faint, 12, "DESIGNED FOR");
+                px2 += 10;
+                for (dev_surfaces, 0..) |surf, si| {
+                    if (view.designed & (@as(u8, 1) << @intCast(si)) == 0) continue;
+                    const tw3: i32 = @intCast(text.measure(e, .semibold, surf, 12));
+                    try rect(gpa, dl, px2, y - 4, tw3 + 20, 22, 0x14EDEAE0, 7);
+                    _ = try str(gpa, dl, e, .semibold, px2 + 10, y + 11, ink, 12, surf);
+                    px2 += tw3 + 28;
+                }
+                y += 28;
+            }
+            if (view.tags.len > 0) {
+                _ = try str(gpa, dl, e, .regular, x0 + 24, y + 8, faint, 13, view.tags);
+                y += 24;
             }
             if (view.desc.len > 0) {
                 y = try wrapBody(gpa, dl, e, x0 + 24, y + 12, w - 48, muted, 15, view.desc, 21, true, null);

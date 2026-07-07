@@ -83,6 +83,15 @@ pub const Request = struct {
     /// result can be matched back). Owned copies, empty otherwise.
     algo_name: []const u8 = "",
     algo_config: []const u8 = "",
+    /// publish_algo prose (the schema rev): author words + the Zal source +
+    /// declarations. `algo_designed` is a surface bitmask (1 feed / 2 replies
+    /// / 4 zones); `algo_tags_csv` is the raw comma-separated tag input (the
+    /// worker splits it). Owned copies, empty otherwise.
+    algo_ranks: []const u8 = "",
+    algo_desc: []const u8 = "",
+    algo_source: []const u8 = "",
+    algo_tags_csv: []const u8 = "",
+    algo_designed: u8 = 0,
 
     pub const Kind = enum(u8) { like, unlike, repost, unrepost, loadout, publish_algo };
 };
@@ -120,6 +129,10 @@ fn freeRequest(gpa: Allocator, r: Request) void {
     gpa.free(r.record_uri);
     gpa.free(r.algo_name);
     gpa.free(r.algo_config);
+    gpa.free(r.algo_ranks);
+    gpa.free(r.algo_desc);
+    gpa.free(r.algo_source);
+    gpa.free(r.algo_tags_csv);
     for (r.loadout) |surf| {
         for (surf.ids) |id| gpa.free(id);
         gpa.free(surf.ids);
@@ -322,33 +335,44 @@ pub fn submitLoadout(worker: *Worker, feed: loadout_store.SurfaceData, reply: lo
 /// back on the result's `cid` so the UI can finish its flow; `config` is the
 /// serialized FeedConfig the check produced (the worker re-parses and the
 /// publish gate re-verifies, fail-closed). False only on OOM.
-pub fn submitPublishAlgo(worker: *Worker, local_id: []const u8, name: []const u8, config: []const u8, rkey: []const u8, now: i64) bool {
+// A7.2: cold struct, size guard waived — one transient per publish action.
+pub const PublishAlgoArgs = struct {
+    local_id: []const u8,
+    name: []const u8,
+    config: []const u8,
+    rkey: []const u8,
+    ranks: []const u8 = "",
+    desc: []const u8 = "",
+    source: []const u8 = "",
+    tags_csv: []const u8 = "",
+    designed: u8 = 0, // surface bitmask: 1 feed / 2 replies / 4 zones
+};
+
+pub fn submitPublishAlgo(worker: *Worker, args: PublishAlgoArgs, now: i64) bool {
     const gpa = worker.gpa;
-    const cid_c = gpa.dupe(u8, local_id) catch return false;
-    const name_c = gpa.dupe(u8, name) catch {
-        gpa.free(cid_c);
-        return false;
-    };
-    const cfg_c = gpa.dupe(u8, config) catch {
-        gpa.free(cid_c);
-        gpa.free(name_c);
-        return false;
-    };
-    const rkey_c = gpa.dupe(u8, rkey) catch {
-        gpa.free(cid_c);
-        gpa.free(name_c);
-        gpa.free(cfg_c);
-        return false;
-    };
+    // Dupe every string; unwind the lot on any miss (C5).
+    var copies: [8][]const u8 = .{ "", "", "", "", "", "", "", "" };
+    const srcs = [_][]const u8{ args.local_id, args.name, args.config, args.rkey, args.ranks, args.desc, args.source, args.tags_csv };
+    for (srcs, 0..) |src, i| {
+        copies[i] = gpa.dupe(u8, src) catch {
+            for (copies[0..i]) |c| gpa.free(c);
+            return false;
+        };
+    }
     const req: Request = .{
         .kind = .publish_algo,
-        .cid = cid_c,
+        .cid = copies[0],
         .subject_uri = "",
         .subject_cid = "",
-        .record_uri = rkey_c,
+        .record_uri = copies[3],
         .now = now,
-        .algo_name = name_c,
-        .algo_config = cfg_c,
+        .algo_name = copies[1],
+        .algo_config = copies[2],
+        .algo_ranks = copies[4],
+        .algo_desc = copies[5],
+        .algo_source = copies[6],
+        .algo_tags_csv = copies[7],
+        .algo_designed = args.designed,
     };
     if (!worker.inbox.push(gpa, req)) {
         freeRequest(gpa, req);
@@ -458,7 +482,26 @@ fn processOne(worker: *Worker, req: Request) void {
             const cfg = algorithm_core.parse(arena, req.algo_config) catch {
                 break :blk .{ .net_error = gpa.dupe(u8, "BadConfig") catch "error" };
             };
-            const published = algorithm_shell.publish(gpa, arena, worker.io, worker.environ, worker.session, req.algo_name, cfg, req.record_uri, req.now) catch |err| {
+            // The declared surfaces + tags, as the record's string lists.
+            var surf: [3][]const u8 = undefined;
+            var ns: usize = 0;
+            if (req.algo_designed & 1 != 0) { surf[ns] = "feed"; ns += 1; }
+            if (req.algo_designed & 2 != 0) { surf[ns] = "replies"; ns += 1; }
+            if (req.algo_designed & 4 != 0) { surf[ns] = "zones"; ns += 1; }
+            var tags: std.ArrayList([]const u8) = .empty;
+            var it = std.mem.splitScalar(u8, req.algo_tags_csv, ',');
+            while (it.next()) |raw| {
+                const tag = std.mem.trim(u8, raw, " #");
+                if (tag.len > 0) tags.append(arena, tag) catch break;
+            }
+            const prose: algorithm_shell.Prose = .{
+                .ranks = req.algo_ranks,
+                .desc = req.algo_desc,
+                .source = req.algo_source,
+                .designed_for = surf[0..ns],
+                .tags = tags.items,
+            };
+            const published = algorithm_shell.publish(gpa, arena, worker.io, worker.environ, worker.session, req.algo_name, cfg, req.record_uri, req.now, prose) catch |err| {
                 break :blk .{ .net_error = gpa.dupe(u8, @errorName(err)) catch "error" };
             };
             record_cid = gpa.dupe(u8, published.cid) catch "";
