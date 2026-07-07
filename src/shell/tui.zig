@@ -535,6 +535,10 @@ const RunState = struct {
     // mismatched target was picked, the pending surface awaiting confirm.
     gbench_pick: ?u16,
     gbench_warn: ?u8,
+    // A live bench drag: the shelf/library index riding the pointer.
+    gbench_drag: ?u16,
+    gbench_drag_x: i32,
+    gbench_drag_y: i32,
     market_loading: bool, // a getAlgorithms fetch is in flight (browse shows a loading state)
     market_prefetched: bool, // the one-shot startup warmup fired
     gchat_store: chat_core.Store,
@@ -1027,6 +1031,9 @@ fn initRunState(
     rs.gdetail_install_pending = false;
     rs.gbench_pick = null;
     rs.gbench_warn = null;
+    rs.gbench_drag = null;
+    rs.gbench_drag_x = 0;
+    rs.gbench_drag_y = 0;
     rs.market_loading = false;
     rs.market_prefetched = false;
     // Zat Chat (M1): the DM view store — a QUERY model over the real E2EE
@@ -2443,7 +2450,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .market_q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .market_q_focus = rs.gmarket_q_focus, .market_loading = rs.market_loading, .bench_pick = benchPickViewOf(rs), .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
+        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .market_q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .market_q_focus = rs.gmarket_q_focus, .market_loading = rs.market_loading, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on } else null;
         switch (rs.mode) {
             .timeline => try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status),
             .compose => {
@@ -3027,6 +3034,10 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             rs.gsocket_ui.drag_x = rx;
                             rs.gsocket_ui.drag_y = ry;
                         }
+                        if (rs.gbench_drag != null) {
+                            rs.gbench_drag_x = rx;
+                            rs.gbench_drag_y = ry;
+                        }
                         const field_hit = field_ui.hitTest(cx, cy, g.hr.slice());
                         g.view.hover = if (field_hit) |hit| hit.target else field_ui.no_target;
                         // Pointer affordance: the hand cursor over anything
@@ -3051,7 +3062,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         // card; the I-beam over the rooted post's selectable body
                         // (or mid text-drag); the hand over anything else
                         // clickable; the arrow otherwise.
-                        const dragging_card = rs.page_drag_surface != null or rs.gsocket_ui.drag_active != null;
+                        const dragging_card = rs.page_drag_surface != null or rs.gsocket_ui.drag_active != null or rs.gbench_drag != null;
                         const over_focus_text = rs.gscreen == feed_view.screen_thread and blk: {
                             const h = feed_view.hitTest(g.regions.items, rx, ry) orelse break :blk false;
                             break :blk h.kind == .post_body and h.post < view_items.len and view_items[h.post].is_focus;
@@ -3283,7 +3294,14 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                 // release without a drag clears it). Don't arm a tap.
                                 const is_focus_body = rs.gscreen == feed_view.screen_thread and hit.kind == .post_body and
                                     hit.post < view_items.len and view_items[hit.post].is_focus;
-                                if (is_focus_body) {
+                                if (hit.kind == .bench_seat and rs.gbench_pick == null) {
+                                    // A press on a shelf card BEGINS the bench drag
+                                    // (direct equip — owner call 2026-07-06); no tap
+                                    // arms, the drop decides on release.
+                                    rs.gbench_drag = @intCast(hit.post);
+                                    rs.gbench_drag_x = rx;
+                                    rs.gbench_drag_y = ry;
+                                } else if (is_focus_body) {
                                     if (g.gpu) |gs| selectPress(gs, rx, ry, &rs.last_click_ns, &rs.last_click_x, &rs.last_click_y, &rs.click_count, clock_shell.monotonicNanos());
                                 } else {
                                     rs.armed_kind = hit.kind;
@@ -3306,12 +3324,27 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         // anchor==focus, i.e. an empty selection = cleared).
                         if (g.gpu) |gs| gs.sel_dragging = false;
                         // Finish any drag with a drop first (the press began it).
+                        // A dragged BENCH card seats into the socket under the
+                        // pointer (full sockets refuse; a mismatched declaration
+                        // gets the heads-up); released elsewhere it fizzles.
+                        if (rs.gbench_drag) |bdi| {
+                            rs.gbench_drag = null;
+                            benchDrop(rs, bdi, rx, ry);
+                        }
                         if (rs.gscreen == feed_view.screen_loadout) {
-                            if (rs.page_drag_surface) |s| switch (s) {
-                                0 => pageDragDrop(rs.socket_cards, rs.socket_blob, &rs.gseated, &rs.gsocket_ui, rs.page_geoms[0], &rs.loadout_dirty),
-                                1 => pageDragDrop(rs.reply_cards, rs.reply_blob, &rs.reply_seated, &rs.reply_ui, rs.page_geoms[1], &rs.loadout_dirty),
-                                else => pageDragDrop(rs.zone_cards, rs.zone_blob, &rs.zone_seated, &rs.zone_ui, rs.page_geoms[2], &rs.loadout_dirty),
-                            };
+                            if (rs.page_drag_surface) |s| {
+                                // A tray card dropped on the LIBRARY column is
+                                // removed from that surface (drag out = unequip;
+                                // it stays in the library / the catalog).
+                                const shelf_x = rs.page_geoms[0].x + rs.page_geoms[0].w + 40;
+                                if (rs.page_geoms[0].w != 0 and rx >= shelf_x) {
+                                    removeDraggedFromSurface(rs, s);
+                                } else switch (s) {
+                                    0 => pageDragDrop(rs.socket_cards, rs.socket_blob, &rs.gseated, &rs.gsocket_ui, rs.page_geoms[0], &rs.loadout_dirty),
+                                    1 => pageDragDrop(rs.reply_cards, rs.reply_blob, &rs.reply_seated, &rs.reply_ui, rs.page_geoms[1], &rs.loadout_dirty),
+                                    else => pageDragDrop(rs.zone_cards, rs.zone_blob, &rs.zone_seated, &rs.zone_ui, rs.page_geoms[2], &rs.loadout_dirty),
+                                }
+                            }
                         } else if (rs.gsocket_ui.drag_active) |d| {
                             const geom = feed_view.homeSocketGeom(if (rs.gpu_state) |*sgs| @as(i32, @intCast(sgs.design_w)) else @as(i32, @intCast(fb_w)));
                             const to: u32 = lens_socket.dropIndex(home_tray, rs.gsocket_ui, geom) orelse d;
@@ -3657,35 +3690,16 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                 },
                                 .dev_field => rs.gdev_focus = @intCast(hit.post),
                                 .dev_surface => rs.gdev_designed ^= @as(u8, 1) << @intCast(hit.post),
-                                // ---- The bench socket chooser (slice 3) ----
-                                .bench_seat => {
-                                    rs.gbench_pick = @intCast(hit.post);
-                                    rs.gbench_warn = null;
-                                },
-                                .bench_target => if (rs.gbench_pick) |bi| {
-                                    if (bi < rs.algo_lib.records.items.len) {
-                                        const rec = rs.algo_lib.records.items[bi];
-                                        const bit = @as(u8, 1) << @intCast(@min(hit.post, 2));
-                                        if (rec.designed != 0 and (rec.designed & bit) == 0) {
-                                            // Declared for other surfaces: heads-up first,
-                                            // never a block (owner decision 2026-07-06).
-                                            rs.gbench_warn = @intCast(hit.post);
-                                        } else {
-                                            seatBenchAlgo(rs, @intCast(hit.post), bi);
-                                            rs.gbench_pick = null;
-                                            rs.gbench_warn = null;
-                                        }
-                                    } else rs.gbench_pick = null;
-                                },
+                                // ---- The bench drag + heads-up (slice 3, drag rework) ----
+                                .bench_seat => {}, // the PRESS starts the drag; a bare tap is a no-op
                                 .bench_confirm => if (rs.gbench_pick) |bi| {
                                     seatBenchAlgo(rs, @intCast(hit.post), bi);
                                     rs.gbench_pick = null;
                                     rs.gbench_warn = null;
                                 },
                                 .bench_cancel => {
-                                    if (rs.gbench_warn != null) {
-                                        rs.gbench_warn = null; // back to the chooser
-                                    } else rs.gbench_pick = null;
+                                    rs.gbench_pick = null;
+                                    rs.gbench_warn = null;
                                 },
                                 .dev_color => rs.gdev_color = @intCast(hit.post),
                                 .dev_publish => {
@@ -4741,6 +4755,12 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status);
                     continue;
                 }
+                // Esc dismisses the designed-for heads-up.
+                if (rs.gbench_pick != null and zc == 27) {
+                    rs.gbench_pick = null;
+                    rs.gbench_warn = null;
+                    continue;
+                }
                 // The marketplace search box: live filter per keystroke; Enter or
                 // Esc gives the keyboard back. ASCII (names/tags are).
                 if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1 and rs.gmarket_q_focus) {
@@ -5505,6 +5525,87 @@ fn seatBenchAlgo(rs: *RunState, target: u8, lib_idx: usize) void {
         rs.loadout_dirty = true;
         rs.status = "Socketed — it's driving that surface now.";
     } else |_| rs.status = "Couldn't socket it — out of memory.";
+}
+
+/// Drop a dragged bench card: seat it into the socket band under the pointer.
+/// A full socket refuses honestly; a mismatched declaration opens the heads-up
+/// modal (never a block); a release off every socket just fizzles.
+fn benchDrop(rs: *RunState, lib_idx: u16, rx: i32, ry: i32) void {
+    if (lib_idx >= rs.algo_lib.records.items.len) return;
+    // The three sockets stack vertically: band i runs from its geometry's top
+    // to the next one's (the last band gets generous tail room for its tray).
+    var target: ?u8 = null;
+    const geoms = rs.page_geoms;
+    for (0..3) |i| {
+        const gm = geoms[i];
+        if (gm.w == 0) continue; // that surface wasn't laid out this frame
+        const y1: i32 = if (i < 2 and geoms[i + 1].w != 0) geoms[i + 1].y else gm.y + 900;
+        if (ry >= gm.y and ry < y1 and rx >= gm.x and rx < gm.x + gm.w) {
+            target = @intCast(i);
+            break;
+        }
+    }
+    const t = target orelse return;
+    const cards_len = switch (t) {
+        0 => rs.socket_cards.len,
+        1 => rs.reply_cards.len,
+        else => rs.zone_cards.len,
+    };
+    if (cards_len >= lens_socket.max_lenses) {
+        rs.status = "That socket is full — drag a lens out to the library first.";
+        return;
+    }
+    const rec = rs.algo_lib.records.items[lib_idx];
+    const bit = @as(u8, 1) << @intCast(t);
+    if (rec.designed != 0 and (rec.designed & bit) == 0) {
+        rs.gbench_pick = lib_idx; // the heads-up modal takes it from here
+        rs.gbench_warn = t;
+        return;
+    }
+    seatBenchAlgo(rs, t, lib_idx);
+}
+
+/// A tray card dragged out to the library column: remove it from that surface
+/// (it stays in the library/catalog — unequip, never delete). Rebuilds the
+/// tray from the remaining entries, library-aware.
+fn removeDraggedFromSurface(rs: *RunState, s: u8) void {
+    const gpa = rs.gpa;
+    const cards, const blob, const seated, const ui = switch (s) {
+        1 => .{ &rs.reply_cards, &rs.reply_blob, &rs.reply_seated, &rs.reply_ui },
+        2 => .{ &rs.zone_cards, &rs.zone_blob, &rs.zone_seated, &rs.zone_ui },
+        else => .{ &rs.socket_cards, &rs.socket_blob, &rs.gseated, &rs.gsocket_ui },
+    };
+    const di = ui.drag_active orelse return;
+    ui.drag_active = null;
+    if (di >= cards.*.len) return;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const scratch = arena_state.allocator();
+    const entries = scratch.alloc(lens_catalog.Entry, cards.*.len - 1) catch return;
+    var n: usize = 0;
+    for (cards.*, 0..) |c, ci| {
+        if (ci == di) continue;
+        const end = @min(blob.*.len, @as(usize, c.cid.off) + c.cid.len);
+        entries[n] = .{ .id = blob.*[@min(c.cid.off, blob.*.len)..end], .color = c.color };
+        n += 1;
+    }
+    if (lens_catalog.loadoutFromEntriesLib(gpa, entries[0..n], &rs.algo_lib, scratch)) |t2| {
+        if (cards.*.len > 0) gpa.free(cards.*);
+        if (blob.*.len > 0) gpa.free(blob.*);
+        cards.* = t2[0];
+        blob.* = t2[1];
+        if (seated.* >= cards.*.len) seated.* = 0;
+        rs.loadout_dirty = true;
+        rs.status = "Removed from the socket — it stays in your library.";
+    } else |_| {}
+}
+
+/// The bench drag ghost's render view (null = no drag).
+fn benchDragViewOf(rs: *RunState) ?feed_view.BenchDragView {
+    const bi = rs.gbench_drag orelse return null;
+    if (bi >= rs.algo_lib.records.items.len) return null;
+    const rec = rs.algo_lib.records.items[bi];
+    return .{ .name = rs.algo_lib.slice(rec.name), .color = rec.color, .x = rs.gbench_drag_x, .y = rs.gbench_drag_y };
 }
 
 fn composeBlinkOn(anchor_ns: u64) bool {
@@ -7056,6 +7157,7 @@ const Grid = struct {
     market_q_focus: bool = false,
     market_loading: bool = false,
     bench_pick: ?feed_view.BenchPickView = null,
+    bench_drag: ?feed_view.BenchDragView = null,
     detail: feed_view.AlgoDetailView = .{},
     /// The simple-Create flow's state (loadout tab 2). A value set per frame.
     create: feed_view.CreateView = .{ .step = .landing, .answers = .{}, .config = discover.DEFAULT_CONFIG, .name = "", .color = 0 },
@@ -7993,7 +8095,7 @@ fn paintFrame(
                 g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{}, &.{}, g.chat_recv) catch g.content_h.*;
             } else if (g.screen.* == feed_view.screen_loadout) {
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
-                g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market, g.market_q, g.market_q_focus, g.market_loading, g.bench_pick, g.create, g.dev, g.bench) catch g.content_h.*; // software: draw line-art nav
+                g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market, g.market_q, g.market_q_focus, g.market_loading, g.bench_pick, g.bench_drag, g.create, g.dev, g.bench) catch g.content_h.*; // software: draw line-art nav
             } else if (g.screen.* == feed_view.screen_algo_detail) {
                 g.content_h.* = feed_view.layoutAlgoDetail(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.detail) catch g.content_h.*;
             } else if (g.screen.* == feed_view.screen_transparency) {
@@ -8536,7 +8638,7 @@ fn paintFrameGpu(
             }
             gs.content_x = lg.col_x;
             gs.content_w = lg.col_w;
-            g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, true, true, lg, g.market, g.market_q, g.market_q_focus, g.market_loading, g.bench_pick, g.create, g.dev, g.bench) catch g.content_h.*; // GPU: SDF pass strikes the nav icons crisp
+            g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, true, true, lg, g.market, g.market_q, g.market_q_focus, g.market_loading, g.bench_pick, g.bench_drag, g.create, g.dev, g.bench) catch g.content_h.*; // GPU: SDF pass strikes the nav icons crisp
         } else if (g.chat_store != null and g.screen.* == feed_view.screen_messages) {
             // Zat Chat (U3, dev-gated): the Messages surface in the GPU's logical
             // design space; the rail is the shell's own tile (rail_external), and
