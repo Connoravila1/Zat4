@@ -191,7 +191,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -240,6 +240,7 @@ pub const screen_zones: u8 = 8;
 /// system-proven privacy verdict. Reached from a lens card; renders
 /// `transparency.Page` via `layoutTransparency`. Off the rail, with a back button.
 pub const screen_transparency: u8 = 9;
+pub const screen_algo_detail: u8 = 10; // one marketplace algorithm, full page
 
 /// The profile screen's header band — the viewed account's identity over its
 /// post list. Plain data handed in by the shell (B5); the post count is the
@@ -2790,6 +2791,9 @@ pub fn layoutLoadout(
     /// already mapped from the wire). Empty ⇒ the "nothing published yet" state.
     /// Only read on tab 1; ignored on the others.
     market: []const MarketAlgoCard,
+    /// The marketplace search draft + whether the box owns the keyboard.
+    market_q: []const u8,
+    market_q_focus: bool,
     /// The simple-Create flow's state — read only on tab 2 (Create).
     create: CreateView,
     /// The developer submission flow's state — when `dev.active`, tab 2 hosts
@@ -2876,7 +2880,7 @@ pub fn layoutLoadout(
             }
         }
     } else if (tab == 1) {
-        content_h = try drawMarketplace(gpa, dl, e, m, height, scroll, regions, accent, market);
+        content_h = try drawMarketplace(gpa, dl, e, m, height, scroll, regions, accent, market, market_q, market_q_focus);
     } else if (dev.active) {
         content_h = try layoutDevSubmit(gpa, e, dl, m, height, scroll, regions, accent, dev);
     } else {
@@ -2907,18 +2911,35 @@ pub fn layoutLoadout(
 /// (drop it into the feed loadout). Emits `.algo_view` / `.algo_add` regions
 /// carrying the card index. Empty list ⇒ a calm "nothing here yet" state. Only
 /// cards intersecting the viewport are painted (i16 coord safety). PURE.
-fn drawMarketplace(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, height: i32, scroll: i32, regions: ?*Regions, accent: u32, market: []const MarketAlgoCard) error{OutOfMemory}!i32 {
+fn drawMarketplace(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, height: i32, scroll: i32, regions: ?*Regions, accent: u32, market: []const MarketAlgoCard, query: []const u8, q_focus: bool) error{OutOfMemory}!i32 {
     const content_top: i32 = 140;
     const x0 = m.lx;
     const w = m.cw;
 
+    // The search box: name / author / one-liner / tags, filtered live by the
+    // shell (the card list arriving here is already the filtered set).
+    {
+        const sh: i32 = 44;
+        const sy = content_top + scroll;
+        try rect(gpa, dl, x0, sy, w, sh, 0x12EDEAE0, 12);
+        if (q_focus) try rect(gpa, dl, x0, sy, 3, sh, accent, 2);
+        const shown = if (query.len > 0) query else "Search algorithms — name, creator, tags";
+        const qc: u32 = if (query.len > 0) ink else faint;
+        const pen = try str(gpa, dl, e, .regular, x0 + 16, sy + 28, qc, 15, shown);
+        if (q_focus) try rect(gpa, dl, (if (query.len > 0) pen else x0 + 16) + 2, sy + 12, 2, 20, accent, 0);
+        try emitRegion(gpa, regions, x0, sy, w, @intCast(sh), 0, .market_search);
+    }
+    const list_top = content_top + 60;
+
     if (market.len == 0) {
-        _ = try str(gpa, dl, e, .semibold, x0, content_top + 70, ink, 19, "No algorithms published yet");
-        _ = try str(gpa, dl, e, .regular, x0, content_top + 98, muted, 14, "Publish one and it shows up here to browse and adopt.");
+        const msg: []const u8 = if (query.len > 0) "Nothing matches that search" else "No algorithms published yet";
+        const sub: []const u8 = if (query.len > 0) "Try fewer words — it matches names, creators, one-liners, and tags." else "Publish one and it shows up here to browse and adopt.";
+        _ = try str(gpa, dl, e, .semibold, x0, list_top + scroll + 70, ink, 19, msg);
+        _ = try str(gpa, dl, e, .regular, x0, list_top + scroll + 98, muted, 14, sub);
         return height; // nothing to scroll
     }
 
-    var y: i32 = content_top + scroll;
+    var y: i32 = list_top + scroll;
     // Narrow (phone) cards grow a row: the privacy/meta line and the button
     // shared a band and collided at 430 (on-device finding) — the button
     // drops below the meta instead.
@@ -2929,6 +2950,9 @@ fn drawMarketplace(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, 
         if (y + card_h > 0 and y < height) {
             try rect(gpa, dl, x0, y, w, card_h, skinPanel(accent), 16);
             try rect(gpa, dl, x0, y, w, 1, 0x14EDEAE0, 16); // lit top edge
+            // The whole card opens the algorithm's PAGE (emitted first — the
+            // View-details button below wins the overlap, hitTest is last-in).
+            try emitRegion(gpa, regions, x0, y, w, @intCast(card_h), @intCast(i), .algo_open);
 
             _ = try str(gpa, dl, e, .semibold, x0 + 22, y + 34, ink, 20, a.name);
             var apen = try str(gpa, dl, e, .regular, x0 + 22, y + 58, muted, 14, a.author);
@@ -2985,6 +3009,128 @@ fn drawMarketplace(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, 
         y += card_h + gap;
     }
     return (y - scroll) + 20;
+}
+
+/// One marketplace algorithm as its FULL PAGE needs it (screen_algo_detail) —
+/// the browse card's big sibling: the author's prose beside the proven label,
+/// the declaration badges, the rating seat, and the working Install. The shell
+/// fills it from the selected catalog row. A7.2: cold — one per frame. Waived.
+pub const AlgoDetailView = struct {
+    name: []const u8 = "",
+    author: []const u8 = "",
+    ranks: []const u8 = "",
+    desc: []const u8 = "",
+    tags: []const u8 = "",
+    designed: u8 = 0,
+    learns: bool = false,
+    uses_behavioral: bool = false,
+    state_budget_bytes: u32 = 0,
+    installed: bool = false,
+    rating_avg: f32 = 0,
+    rating_count: u32 = 0,
+    idx: u16 = 0, // filtered browse index — payload for install/transparency
+};
+
+/// The algorithm's public page: everything a user reads before trying it.
+/// Pure draw over `view`; Back rides the global nav. Returns content height.
+pub fn layoutAlgoDetail(gpa: Allocator, e: *const text.Engine, width: i32, height: i32, dl: *raster.DrawList, regions: ?*Regions, accent: u32, scroll: i32, view: AlgoDetailView) error{OutOfMemory}!i32 {
+    _ = height;
+    const m = metricsFor(width);
+    const x0 = m.lx;
+    const w = m.cw;
+    var y: i32 = 96 + scroll;
+
+    // Back, then the masthead: name, creator, the declaration badges.
+    try rect(gpa, dl, x0, y, 96, 40, 0x12EDEAE0, 11);
+    _ = try str(gpa, dl, e, .semibold, x0 + 22, y + 26, ink, 15, "‹ Back");
+    try emitRegion(gpa, regions, x0, y, 96, 40, 0, .back);
+    y += 72;
+    _ = try str(gpa, dl, e, .semibold, x0, y + 32, ink, 32, if (view.name.len > 0) view.name else "Algorithm");
+    y += 46;
+    var apen = try str(gpa, dl, e, .regular, x0, y + 18, muted, 16, view.author);
+    if (view.designed != 0) {
+        apen += 14;
+        for (dev_surfaces, 0..) |surf, si| {
+            if (view.designed & (@as(u8, 1) << @intCast(si)) == 0) continue;
+            const btw: i32 = @intCast(text.measure(e, .semibold, surf, 12));
+            try rect(gpa, dl, apen, y + 2, btw + 16, 22, 0x14EDEAE0, 7);
+            _ = try str(gpa, dl, e, .semibold, apen + 8, y + 17, muted, 12, surf);
+            apen += btw + 24;
+        }
+    }
+    y += 34;
+    // The rating seat: stars earn their ink only once real ratings exist.
+    if (view.rating_count > 0) {
+        var stars_buf: [24]u8 = undefined;
+        var sw2: usize = 0;
+        const filled: u32 = @intFromFloat(@round(view.rating_avg));
+        for (0..5) |si| {
+            const g: []const u8 = if (si < filled) "\u{2605}" else "\u{2606}";
+            @memcpy(stars_buf[sw2..][0..g.len], g);
+            sw2 += g.len;
+        }
+        var rb: [32]u8 = undefined;
+        const rt = std.fmt.bufPrint(&rb, "{d} rating{s}", .{ view.rating_count, if (view.rating_count == 1) "" else "s" }) catch "";
+        const spen = try str(gpa, dl, e, .semibold, x0, y + 16, accent, 16, stars_buf[0..sw2]);
+        _ = try str(gpa, dl, e, .regular, spen + 12, y + 16, faint, 13, rt);
+    } else {
+        _ = try str(gpa, dl, e, .regular, x0, y + 16, faint, 13, "No ratings yet — be the first to try it.");
+    }
+    y += 42;
+    if (view.ranks.len > 0) {
+        _ = try str(gpa, dl, e, .semibold, x0, y + 18, body_c, 17, view.ranks);
+        y += 34;
+    }
+    if (view.desc.len > 0) {
+        y = try wrapBody(gpa, dl, e, x0, y + 18, w, muted, 16, view.desc, 24, true, null);
+        y += 16;
+    }
+    if (view.tags.len > 0) {
+        _ = try str(gpa, dl, e, .regular, x0, y + 14, faint, 14, view.tags);
+        y += 28;
+    }
+    y += 12;
+
+    // What the code proves — the derived line, never the author's claim.
+    _ = try str(gpa, dl, e, .semibold, x0, y + 14, faint, 12, "WHAT THE CODE PROVES");
+    y += 28;
+    const dot: u32 = if (view.uses_behavioral) accent else boost_c;
+    const label: []const u8 = if (view.learns)
+        "Learns on-device — your attention never leaves this device"
+    else if (view.uses_behavioral)
+        "Uses attention signals — on your device only"
+    else
+        "No behavioral data — candidate-side only";
+    try rect(gpa, dl, x0, y + 4, 9, 9, dot, 4);
+    var ppen = try str(gpa, dl, e, .semibold, x0 + 18, y + 14, ink, 15, label);
+    if (view.state_budget_bytes > 0) {
+        var bb: [48]u8 = undefined;
+        const kib = (view.state_budget_bytes + 1023) / 1024;
+        const bt = std.fmt.bufPrint(&bb, "· up to {d} KB on device", .{kib}) catch "";
+        _ = try str(gpa, dl, e, .regular, ppen + 12, y + 14, faint, 13, bt);
+    }
+    _ = &ppen;
+    y += 34;
+    _ = try str(gpa, dl, e, .regular, x0, y + 12, faint, 13, "Every fact above is derived from the compiled code by the engine.");
+    y += 40;
+
+    // The actions: Install (the primary), then the transparency deep-dive.
+    const bh: i32 = 46;
+    if (view.installed) {
+        try rect(gpa, dl, x0, y, 220, bh, 0x14EDEAE0, 12);
+        _ = try str(gpa, dl, e, .semibold, x0 + 24, y + 29, muted, 15, "In your library \u{2713}");
+        try emitRegion(gpa, regions, x0, y, 220, @intCast(bh), view.idx, .algo_install);
+    } else {
+        try rect(gpa, dl, x0, y, 220, bh, accent, 12);
+        _ = try str(gpa, dl, e, .semibold, x0 + 24, y + 29, 0xFF0B0B0F, 15, "Install to your library");
+        try emitRegion(gpa, regions, x0, y, 220, @intCast(bh), view.idx, .algo_install);
+    }
+    const tx2 = x0 + 236;
+    try rect(gpa, dl, tx2, y, 214, bh, 0x12EDEAE0, 12);
+    _ = try str(gpa, dl, e, .semibold, tx2 + 22, y + 29, ink, 15, "\u{27E8}\u{27E9} Full transparency");
+    try emitRegion(gpa, regions, tx2, y, 214, @intCast(bh), view.idx, .algo_view);
+    y += bh + 40;
+    return (y - scroll) + 40;
 }
 
 /// The state the Create flow renderer reads (the shell owns + drives it). Plain
