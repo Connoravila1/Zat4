@@ -2794,6 +2794,9 @@ pub fn layoutLoadout(
     /// The marketplace search draft + whether the box owns the keyboard.
     market_q: []const u8,
     market_q_focus: bool,
+    /// A marketplace fetch is in flight (the empty state says "loading", not
+    /// "nothing published" — the first fetch rides a cold connection).
+    market_loading: bool,
     /// The bench socket-chooser overlay (a tapped shelf card) — null = closed.
     bench_pick: ?BenchPickView,
     /// The simple-Create flow's state — read only on tab 2 (Create).
@@ -2883,7 +2886,7 @@ pub fn layoutLoadout(
             }
         }
     } else if (tab == 1) {
-        content_h = try drawMarketplace(gpa, dl, e, m, height, scroll, regions, accent, market, market_q, market_q_focus);
+        content_h = try drawMarketplace(gpa, dl, e, m, height, scroll, regions, accent, market, market_q, market_q_focus, market_loading);
     } else if (dev.active) {
         content_h = try layoutDevSubmit(gpa, e, dl, m, height, scroll, regions, accent, dev);
     } else {
@@ -2975,7 +2978,7 @@ pub fn layoutLoadout(
 /// (drop it into the feed loadout). Emits `.algo_view` / `.algo_add` regions
 /// carrying the card index. Empty list ⇒ a calm "nothing here yet" state. Only
 /// cards intersecting the viewport are painted (i16 coord safety). PURE.
-fn drawMarketplace(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, height: i32, scroll: i32, regions: ?*Regions, accent: u32, market: []const MarketAlgoCard, query: []const u8, q_focus: bool) error{OutOfMemory}!i32 {
+fn drawMarketplace(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, height: i32, scroll: i32, regions: ?*Regions, accent: u32, market: []const MarketAlgoCard, query: []const u8, q_focus: bool, loading: bool) error{OutOfMemory}!i32 {
     const content_top: i32 = 140;
     const x0 = m.lx;
     const w = m.cw;
@@ -2996,8 +2999,8 @@ fn drawMarketplace(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, 
     const list_top = content_top + 60;
 
     if (market.len == 0) {
-        const msg: []const u8 = if (query.len > 0) "Nothing matches that search" else "No algorithms published yet";
-        const sub: []const u8 = if (query.len > 0) "Try fewer words — it matches names, creators, one-liners, and tags." else "Publish one and it shows up here to browse and adopt.";
+        const msg: []const u8 = if (loading and query.len == 0) "Loading the marketplace…" else if (query.len > 0) "Nothing matches that search" else "No algorithms published yet";
+        const sub: []const u8 = if (loading and query.len == 0) "One moment — fetching the published algorithms." else if (query.len > 0) "Try fewer words — it matches names, creators, one-liners, and tags." else "Publish one and it shows up here to browse and adopt.";
         _ = try str(gpa, dl, e, .semibold, x0, list_top + scroll + 70, ink, 19, msg);
         _ = try str(gpa, dl, e, .regular, x0, list_top + scroll + 98, muted, 14, sub);
         return height; // nothing to scroll
@@ -3067,8 +3070,11 @@ fn drawMarketplace(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, 
             const view_w: i32 = 128;
             const view_x = x0 + w - view_w - 20;
             try rect(gpa, dl, view_x, btn_y, view_w, btn_h, 0x14EDEAE0, 10); // ghost
-            _ = try str(gpa, dl, e, .semibold, view_x + 18, btn_y + 22, ink, 14, "View details");
-            try emitRegion(gpa, regions, view_x, btn_y, view_w, btn_h, @intCast(i), .algo_view);
+            _ = try str(gpa, dl, e, .semibold, view_x + 42, btn_y + 22, ink, 14, "Open");
+            // ONE destination: the card and its button both open the
+            // algorithm's page (two different pages confused the owner);
+            // transparency lives inside that page.
+            try emitRegion(gpa, regions, view_x, btn_y, view_w, btn_h, @intCast(i), .algo_open);
         }
         y += card_h + gap;
     }
@@ -3107,8 +3113,12 @@ pub const AlgoDetailView = struct {
 /// The algorithm's public page: everything a user reads before trying it.
 /// Pure draw over `view`; Back rides the global nav. Returns content height.
 pub fn layoutAlgoDetail(gpa: Allocator, e: *const text.Engine, width: i32, height: i32, dl: *raster.DrawList, regions: ?*Regions, accent: u32, scroll: i32, view: AlgoDetailView) error{OutOfMemory}!i32 {
-    _ = height;
-    const m = metricsFor(width);
+    // A plain scrolling DOCUMENT like the transparency page: same reading
+    // column, regions cleared here, and an OPAQUE page ground first — without
+    // it the living field bleeds through at full strength (owner-hit bug).
+    const m = metricsPage(width, screen_transparency);
+    if (regions) |rg| rg.clearRetainingCapacity();
+    try rect(gpa, dl, 0, 0, width, @intCast(std.math.clamp(height, 0, 32767)), bg, 0);
     const x0 = m.lx;
     const w = m.cw;
     var y: i32 = 96 + scroll;
