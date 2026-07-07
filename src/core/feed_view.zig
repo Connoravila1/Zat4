@@ -46,6 +46,7 @@ const timefmt = @import("timefmt.zig");
 const compose = @import("compose.zig");
 const settings_view = @import("settings_view.zig");
 const transp = @import("transparency.zig");
+const algo_docs = @import("algo_docs.zig");
 const chat_view = @import("chat_view.zig");
 const chat_msg = @import("chat.zig");
 
@@ -191,7 +192,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, bench_seat, bench_confirm, bench_cancel, pub_delete };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -241,6 +242,7 @@ pub const screen_zones: u8 = 8;
 /// `transparency.Page` via `layoutTransparency`. Off the rail, with a back button.
 pub const screen_transparency: u8 = 9;
 pub const screen_algo_detail: u8 = 10; // one marketplace algorithm, full page
+pub const screen_algo_docs: u8 = 11; // the explainer / writing-guide documents
 
 /// The profile screen's header band — the viewed account's identity over its
 /// post list. Plain data handed in by the shell (B5); the post count is the
@@ -2989,8 +2991,13 @@ fn drawMarketplace(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, 
         const pen = try str(gpa, dl, e, .regular, x0 + 16, sy + 28, qc, 15, shown);
         if (q_focus) try rect(gpa, dl, (if (query.len > 0) pen else x0 + 16) + 2, sy + 12, 2, 20, accent, 0);
         try emitRegion(gpa, regions, x0, sy, w, @intCast(sh), 0, .market_search);
+        // The user explainer's front door, beside the search box.
+        const lt: []const u8 = "How does this work?";
+        const ltw: i32 = @intCast(text.measure(e, .regular, lt, 13));
+        _ = try str(gpa, dl, e, .regular, x0 + w - ltw, sy + sh + 22, faint, 13, lt);
+        try emitRegion(gpa, regions, x0 + w - ltw - 8, sy + sh + 4, ltw + 16, 28, 0, .docs_user);
     }
-    const list_top = content_top + 60;
+    const list_top = content_top + 92;
 
     if (market.len == 0) {
         const msg: []const u8 = if (loading and query.len == 0) "Loading the marketplace…" else if (query.len > 0) "Nothing matches that search" else "No algorithms published yet";
@@ -3163,6 +3170,35 @@ pub const BenchPickView = struct {
     warn: ?u8 = null, // pending target surface awaiting the "anyway" confirm
 };
 
+/// Render a documentation page (screen_algo_docs): the user explainer or the
+/// developer writing guide — one generic document renderer over `algo_docs`
+/// data, the same plain-scrolling-document treatment as transparency. Pure.
+pub fn layoutAlgoDocs(gpa: Allocator, e: *const text.Engine, width: i32, height: i32, dl: *raster.DrawList, regions: ?*Regions, accent: u32, scroll: i32, doc: algo_docs.Doc) error{OutOfMemory}!i32 {
+    const m = metricsPage(width, screen_transparency);
+    if (regions) |rg| rg.clearRetainingCapacity();
+    try rect(gpa, dl, 0, 0, width, @intCast(std.math.clamp(height, 0, 32767)), bg, 0);
+    const x0 = m.lx;
+    const w = m.cw;
+    var y: i32 = 96 + scroll;
+
+    try rect(gpa, dl, x0, y, 96, 40, 0x12EDEAE0, 11);
+    _ = try str(gpa, dl, e, .semibold, x0 + 22, y + 26, ink, 15, "‹ Back");
+    try emitRegion(gpa, regions, x0, y, 96, 40, 0, .back);
+    y += 72;
+    _ = try str(gpa, dl, e, .semibold, x0, y + 32, ink, 30, doc.title);
+    y += 48;
+    y = try wrapBody(gpa, dl, e, x0, y + 18, w, muted, 16, doc.deck, 24, true, null);
+    y += 26;
+    for (doc.sections) |sec| {
+        try rect(gpa, dl, x0, y + 6, 22, 3, accent, 1);
+        _ = try str(gpa, dl, e, .semibold, x0, y + 40, ink, 19, sec.heading);
+        y += 56;
+        y = try wrapBody(gpa, dl, e, x0, y + 16, w, body_c, 15, sec.body, 23, true, null);
+        y += 30;
+    }
+    return (y - scroll) + 40;
+}
+
 /// One marketplace algorithm as its FULL PAGE needs it (screen_algo_detail) —
 /// the browse card's big sibling: the author's prose beside the proven label,
 /// the declaration badges, the rating seat, and the working Install. The shell
@@ -3330,7 +3366,17 @@ pub fn layoutCreate(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawList,
             _ = try str(gpa, dl, e, .semibold, x0 + 26, y + 30, ink, 17, "Submit an algorithm you wrote");
             _ = try str(gpa, dl, e, .regular, x0 + 26, y + 46, muted, 13, "For developers — publish real code to the marketplace.");
             try emitRegion(gpa, regions, x0, y, @intCast(w), @intCast(bh), 0, .create_dev);
-            y += bh + 20;
+            y += bh + 24;
+            // The two documents, as quiet text doors under the big buttons.
+            const l1: []const u8 = "How algorithms work here";
+            const l1w: i32 = @intCast(text.measure(e, .regular, l1, 14));
+            _ = try str(gpa, dl, e, .regular, x0, y + 14, muted, 14, l1);
+            try emitRegion(gpa, regions, x0 - 4, y, l1w + 12, 26, 0, .docs_user);
+            const l2: []const u8 = "The writing guide, for developers";
+            const l2w: i32 = @intCast(text.measure(e, .regular, l2, 14));
+            _ = try str(gpa, dl, e, .regular, x0 + l1w + 34, y + 14, muted, 14, l2);
+            try emitRegion(gpa, regions, x0 + l1w + 30, y, l2w + 12, 26, 0, .docs_dev);
+            y += 34;
         },
         .preparing => {
             y += 120;
@@ -3700,6 +3746,10 @@ pub fn layoutDevSubmit(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawLi
                 y += 28;
             } else {
                 _ = try str(gpa, dl, e, .regular, x0, y + 12, faint, 13, "Check compiles your code and runs the publish gate — every refusal is named, never silent.");
+                const gl: []const u8 = "Open the writing guide";
+                const glw: i32 = @intCast(text.measure(e, .semibold, gl, 13));
+                _ = try str(gpa, dl, e, .semibold, x0 + w - glw, y + 12, muted, 13, gl);
+                try emitRegion(gpa, regions, x0 + w - glw - 8, y - 4, glw + 16, 28, 0, .docs_dev);
                 y += 28;
             }
             y += 10;

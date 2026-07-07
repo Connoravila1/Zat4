@@ -167,6 +167,16 @@ pub const Library = struct {
     }
 
     /// The record index for an id, or null (E4: absence is ordinary data).
+    /// Remove a record by id (a delete/retraction). The blob keeps the dead
+    /// record's bytes until the next serialize cycle rewrites the file —
+    /// garbage, never a dangling reference (spans are per-record). True if
+    /// removed.
+    pub fn removeById(self: *Library, id: []const u8) bool {
+        const i = self.indexOf(id) orelse return false;
+        _ = self.records.orderedRemove(i);
+        return true;
+    }
+
     pub fn indexOf(self: *const Library, id: []const u8) ?u32 {
         for (self.records.items, 0..) |r, i| {
             if (std.mem.eql(u8, self.slice(r.id), id)) return @intCast(i);
@@ -211,15 +221,6 @@ fn putU32(gpa: Allocator, out: *std.ArrayListUnmanaged(u8), v: u32) Allocator.Er
 }
 
 /// Serialize the library to bytes (caller owns them). Allocates in `gpa`.
-/// Remove a record by id (a delete/retraction). The blob keeps the dead
-/// record's bytes until the next serialize cycle rewrites the file — garbage,
-/// never a dangling reference (spans are per-record). True if removed.
-pub fn removeById(lib: *Library, id: []const u8) bool {
-    const i = lib.indexOf(id) orelse return false;
-    _ = lib.records.orderedRemove(i);
-    return true;
-}
-
 pub fn serialize(gpa: Allocator, lib: *const Library) Allocator.Error![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(gpa);
