@@ -669,6 +669,9 @@ pub const ToyKind = enum(u8) { none, gravity, zero_g, liquid, tectonic, depth, l
 /// idiom as the `zones`/`geom` bundles (call sites pass `.{}` for "no toy").
 /// A7.2: cold struct — exactly one per frame, never held in a collection. Guard
 /// waived. (It carries only cold selection/tuning fields as more toys land.)
+/// NOTE: Gravity is NOT a feed transform — it is the full-page SHATTER effect on
+/// the Settings screen, driven entirely by the shell (see `shatter`), so it does
+/// not appear in this feed-facing selection's draw path.
 pub const ToyView = struct {
     feed_toy: ToyKind = .none,
 };
@@ -1919,8 +1922,13 @@ pub fn layout(
     // at its natural column position, then TRANSLATED into its horizontal slot
     // (with a gentle zigzag stagger). Vertical OR horizontal wheel pans it.
     const tect = toys.feed_toy == .tectonic and active_screen == screen_home;
+    // Toy Box: Gravity — the same postcard TILE as tectonic, but positioned by the
+    // shell's physics sim (each card falls and piles at the bottom of the column)
+    // instead of a horizontal slot. Shorter tiles so several stack in view; the
+    // body clamps tighter to fit. Both toys are "tile" toys — they share the card.
+    const tile = tect; // (Gravity's shatter is a shell effect, not a feed tile toy.)
     const tcard_h: i32 = 392; // uniform postcard height (logical)
-    const tect_pitch: i32 = m.col_w + 40; // one card + a gutter
+    const tect_pitch: i32 = m.col_w + 40; // one card + a gutter (tectonic only)
 
     if (regions) |rg| rg.clearRetainingCapacity();
     if (socket_hits) |sh| sh.clearRetainingCapacity();
@@ -2098,9 +2106,10 @@ pub fn layout(
             y += sh + 18;
         };
         var nb: [12]u8 = undefined;
-        // Tectonic emits every card at the SAME fixed top (then translates it into
-        // its strip slot), so no natural vertical stacking — `post_top` is constant.
-        const post_top = if (tect) feed_y0 else y;
+        // Tile toys (tectonic/gravity) emit every card at the SAME fixed top, then
+        // translate it into place, so there is no natural vertical stacking here —
+        // `post_top` is constant and the position comes from the transform below.
+        const post_top = if (tile) feed_y0 else y;
         // Tectonic horizontal cull: skip off-strip cards BEFORE the costly text
         // measure (the vertical cull's role, moved to the X axis). The strip spans
         // the whole width now (sidebar gone), from the rail edge to the window edge.
@@ -2248,13 +2257,15 @@ pub fn layout(
             // rounded panel over the field, an author-tint spine along the top, and
             // a lit edge. Emitted first (behind the content) and inside the captured
             // range, so it travels with the card when it is translated into its slot.
-            if (tect) {
+            if (tile) {
                 try rect(gpa, dl, m.col_x, post_top - 16, m.col_w, tcard_h, 0xF01F1D17, 22); // card body
                 try rect(gpa, dl, m.col_x, post_top - 16, m.col_w, 5, p.tint, 22); // author-tint spine
                 try rect(gpa, dl, m.col_x, post_top - 16, m.col_w, 1, 0x22EDEAE0, 22); // lit top edge
-                // A big, faint FRAME NUMBER anchors the card as a filmstrip frame
-                // and fills the postcard's lower body. The tinted rule above it ties
-                // the number to the author's colour.
+            }
+            if (tect) {
+                // A big, faint FRAME NUMBER anchors the tectonic card as a filmstrip
+                // frame and fills the postcard's lower body. The tinted rule above it
+                // ties the number to the author's colour. (Gravity's tiles are short.)
                 var frbuf: [8]u8 = undefined;
                 const frn = std.fmt.bufPrint(&frbuf, "{d:0>2}", .{pi + 1}) catch "";
                 try rect(gpa, dl, m.col_x + 24, post_top + tcard_h - 96, 40, 3, p.tint, 2);
@@ -2439,7 +2450,7 @@ pub fn layout(
             // divider — the vertical stem + elbow are their separation instead.
             if (is_thread) {
                 if (!in_chain) try rect(gpa, dl, ax, bottom, m.col_x + m.col_w - ax - 4, 1, divider, 0);
-            } else if (!tect) { // tectonic cards are separated by the tile, not a line
+            } else if (!tile) { // tile toys separate cards by the tile, not a line
                 try rect(gpa, dl, m.col_x, bottom, m.col_w, 1, divider, 0);
             }
         }
@@ -4505,6 +4516,217 @@ fn drawSettings(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: 
 
     return @max(ly, dy) - scroll + 40;
 }
+
+/// Toy Box: Gravity SHATTER — the fixed EXIT box geometry (top-right corner), so
+/// the drawer and the input hit-test agree. Logical px.
+pub const shatter_exit_w: i32 = 88;
+pub const shatter_exit_h: i32 = 38;
+pub const shatter_exit_margin: i32 = 16;
+pub fn shatterExitX(design_w: i32) i32 {
+    return design_w - shatter_exit_w - shatter_exit_margin;
+}
+
+/// Draw the always-on-top EXIT box (top-right) — a bright accent chip that ends the
+/// shatter no matter where the pile lands. Appended LAST so it rides over the debris.
+pub fn shatterExitBox(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, design_w: i32, accent: u32) error{OutOfMemory}!void {
+    const x = shatterExitX(design_w);
+    const y = shatter_exit_margin;
+    try rect(gpa, dl, x - 3, y + 4, shatter_exit_w + 6, shatter_exit_h, 0x66000000, 12); // shadow
+    try rect(gpa, dl, x, y, shatter_exit_w, shatter_exit_h, (accent & 0x00FFFFFF) | 0xFF000000, 12);
+    const lbl = "exit";
+    const lw: i32 = @intCast(text.measure(e, .semibold, lbl, 16));
+    _ = try str(gpa, dl, e, .semibold, x + @divTrunc(shatter_exit_w - lw, 2), y + 25, 0xFF17130E, 16, lbl);
+}
+
+/// Toy Box: Gravity SHATTER — thin out the big dark BACKGROUND rects (glass column,
+/// card panels) so the pile isn't dominated by giant slabs: a rect bigger than
+/// `drop_dim` on its long side is removed entirely, a mid-sized one is cut into
+/// `square`-ish pieces, and small rects (toggles, pills) plus text/line/tri pass
+/// through whole (a word/icon/toggle is an asset and stays intact). Rebuilds `dl`.
+pub fn shatterCullBig(alloc: Allocator, dl: *raster.DrawList, square: i32, drop_dim: i32) error{OutOfMemory}!void {
+    if (square <= 0 or dl.len == 0) return;
+    var src = try dl.clone(alloc);
+    defer src.deinit(alloc);
+    dl.len = 0;
+    var i: usize = 0;
+    while (i < src.len) : (i += 1) {
+        const item = src.get(i);
+        switch (item) {
+            .rect => |r| {
+                const rw: i32 = r.w;
+                const rh: i32 = r.h;
+                const long = @max(rw, rh);
+                if (long > drop_dim) continue; // huge background slab — cut it out
+                if (long <= square * 2) { // small enough — keep whole
+                    try dl.append(alloc, item);
+                    continue;
+                }
+                var gy: i32 = 0;
+                while (gy < rh) : (gy += square) {
+                    var gx: i32 = 0;
+                    while (gx < rw) : (gx += square) {
+                        const pw = @min(square, rw - gx);
+                        const ph = @min(square, rh - gy);
+                        try dl.append(alloc, .{ .rect = .{
+                            .x = clampI16(@as(f32, @floatFromInt(@as(i32, r.x) + gx))),
+                            .y = clampI16(@as(f32, @floatFromInt(@as(i32, r.y) + gy))),
+                            .w = @intCast(std.math.clamp(pw, 0, 65535)),
+                            .h = @intCast(std.math.clamp(ph, 0, 65535)),
+                            .color = r.color,
+                            .radius = 0,
+                        } });
+                    }
+                }
+            },
+            else => try dl.append(alloc, item),
+        }
+    }
+}
+
+/// Toy Box: Gravity SHATTER — assign a GROUP ID to each draw item so runs of
+/// adjacent text (a word / label) share one id and fall together as a readable
+/// unit. `gid[i]` = 0 means ungrouped (falls alone). A run is consecutive text
+/// items on the same baseline with a small x-gap; a non-text item breaks the run.
+/// Returns the next free group id (the caller uses it for its own groups). PURE.
+pub fn shatterWordGroups(dl: *const raster.DrawList, gid: []u32) u32 {
+    const n = @min(dl.len, gid.len);
+    for (0..n) |i| gid[i] = 0;
+    var next: u32 = 1;
+    var cur: u32 = 0;
+    var have_prev = false;
+    var prev_x: i32 = 0;
+    var prev_base: i32 = 0;
+    var prev_px: i32 = 0;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        switch (dl.get(i)) {
+            .text => |t| {
+                const gap = @as(i32, t.x) - prev_x;
+                const adjacent = have_prev and t.baseline == prev_base and gap >= 0 and gap < @as(i32, prev_px) * 3 + 6;
+                if (adjacent) {
+                    gid[i] = cur;
+                } else {
+                    cur = next;
+                    next += 1;
+                    gid[i] = cur;
+                }
+                have_prev = true;
+                prev_x = @as(i32, t.x) + @divTrunc(@as(i32, t.px) * 6, 10); // rough advance
+                prev_base = t.baseline;
+                prev_px = t.px;
+            },
+            else => have_prev = false,
+        }
+    }
+    return next;
+}
+
+/// Toy Box: Gravity SHATTER — capture each draw item's HOME top-left anchor and
+/// SIZE into parallel arrays (one entry per item), so the shell can seed a physics
+/// body per INDIVIDUAL element (each word/glyph, icon stroke, toggle, panel falls
+/// as itself). Called once on entry — the settings page is static, so draw item i
+/// is the same element every frame. PURE.
+pub fn shatterCaptureHomes(dl: *const raster.DrawList, hx: []f32, hy: []f32, bw: []f32, bh: []f32) void {
+    const n = @min(dl.len, hx.len);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        var ax: f32 = 0;
+        var ay: f32 = 0;
+        var aw: f32 = 8;
+        var ah: f32 = 8;
+        switch (dl.get(i)) {
+            .text => |t| {
+                const pf: f32 = @floatFromInt(t.px);
+                ax = @floatFromInt(t.x);
+                ay = @as(f32, @floatFromInt(t.baseline)) - pf; // top ≈ baseline − px
+                aw = pf * 0.72;
+                ah = pf;
+            },
+            .rect => |r| {
+                ax = @floatFromInt(r.x);
+                ay = @floatFromInt(r.y);
+                aw = @floatFromInt(r.w);
+                ah = @floatFromInt(r.h);
+            },
+            .line => |l| {
+                ax = @floatFromInt(@min(l.x0, l.x1));
+                ay = @floatFromInt(@min(l.y0, l.y1));
+                aw = @floatFromInt(@abs(@as(i32, l.x1) - @as(i32, l.x0)) + @as(u32, l.thickness));
+                ah = @floatFromInt(@abs(@as(i32, l.y1) - @as(i32, l.y0)) + @as(u32, l.thickness));
+            },
+            .tri => |t| {
+                const xmin = @min(t.x0, @min(t.x1, t.x2));
+                const xmax = @max(t.x0, @max(t.x1, t.x2));
+                const ymin = @min(t.y0, @min(t.y1, t.y2));
+                const ymax = @max(t.y0, @max(t.y1, t.y2));
+                ax = @floatFromInt(xmin);
+                ay = @floatFromInt(ymin);
+                aw = @floatFromInt(xmax - xmin);
+                ah = @floatFromInt(ymax - ymin);
+            },
+            .cell => |c| {
+                ax = @floatFromInt(c.x);
+                ay = @floatFromInt(c.y);
+                aw = 10;
+                ah = 14;
+            },
+        }
+        hx[i] = ax;
+        hy[i] = ay;
+        bw[i] = @max(aw, 2);
+        bh[i] = @max(ah, 2);
+    }
+}
+
+/// Toy Box: Gravity SHATTER — translate each draw item by ITS body's displacement
+/// from home (`bx[i]-hx[i]`, `by[i]-hy[i]`), a rigid move applied to every coord of
+/// the item. One body per item, so each element (word, icon, toggle, panel) moves
+/// as itself. Translate-only. PURE — mutates `dl` in place.
+pub fn applyShatterItems(dl: *raster.DrawList, bx: []const f32, by: []const f32, hx: []const f32, hy: []const f32) void {
+    var sl = dl.slice();
+    const tags = sl.items(.tags);
+    const data = sl.items(.data);
+    const n = @min(tags.len, bx.len);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const dx = bx[i] - hx[i];
+        const dy = by[i] - hy[i];
+        switch (tags[i]) {
+            .text => {
+                const t = &data[i].text;
+                t.x = clampI16(@as(f32, @floatFromInt(t.x)) + dx);
+                t.baseline = clampI16(@as(f32, @floatFromInt(t.baseline)) + dy);
+            },
+            .rect => {
+                const r = &data[i].rect;
+                r.x = clampI16(@as(f32, @floatFromInt(r.x)) + dx);
+                r.y = clampI16(@as(f32, @floatFromInt(r.y)) + dy);
+            },
+            .line => {
+                const l = &data[i].line;
+                l.x0 = clampI16(@as(f32, @floatFromInt(l.x0)) + dx);
+                l.x1 = clampI16(@as(f32, @floatFromInt(l.x1)) + dx);
+                l.y0 = clampI16(@as(f32, @floatFromInt(l.y0)) + dy);
+                l.y1 = clampI16(@as(f32, @floatFromInt(l.y1)) + dy);
+            },
+            .tri => {
+                const t = &data[i].tri;
+                t.x0 = clampI16(@as(f32, @floatFromInt(t.x0)) + dx);
+                t.x1 = clampI16(@as(f32, @floatFromInt(t.x1)) + dx);
+                t.x2 = clampI16(@as(f32, @floatFromInt(t.x2)) + dx);
+                t.y0 = clampI16(@as(f32, @floatFromInt(t.y0)) + dy);
+                t.y1 = clampI16(@as(f32, @floatFromInt(t.y1)) + dy);
+                t.y2 = clampI16(@as(f32, @floatFromInt(t.y2)) + dy);
+            },
+            .cell => {
+                const cc = &data[i].cell;
+                cc.x = clampU16(@as(f32, @floatFromInt(cc.x)) + dx);
+                cc.y = clampU16(@as(f32, @floatFromInt(cc.y)) + dy);
+            },
+        }
+    }
+}
+
 
 /// A floating hover TOOLTIP: a rounded panel with wrapped help text, anchored
 /// below-right of the pointer and clamped into `[view_x0, view_x0+view_w]`. The

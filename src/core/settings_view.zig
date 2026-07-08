@@ -82,6 +82,7 @@ pub const act_accent: u8 = 10; // Appearance: the UI accent colour
 pub const act_field_intensity: u8 = 11; // Appearance: the field's brightness (uGain)
 pub const act_depth: u8 = 12; // Toy Box: Depth feed — posts loom/recede by engagement
 pub const act_tectonic: u8 = 13; // Toy Box: Tectonic timeline — horizontal filmstrip feed
+pub const act_gravity: u8 = 14; // Toy Box: Gravity — posts fall and pile at the bottom
 
 /// Optional one-line explainer shown as a HOVER TOOLTIP over a row — opt-in per
 /// action, empty for the rest. Kept out of band (a switch, not a `Row` field) so
@@ -91,6 +92,7 @@ pub fn helpText(action: u8) []const u8 {
     return switch (action) {
         act_depth => "Posts scale by engagement — the liveliest posts loom nearest while quiet ones recede. Purely cosmetic; changes nothing about the feed itself.",
         act_tectonic => "The feed becomes a horizontal filmstrip — posts lay out left to right as cards, and scrolling pans sideways through them. Purely cosmetic.",
+        act_gravity => "Posts get weight and fall — they drop and pile up at the bottom of the feed, with the most-liked posts falling hardest. Purely cosmetic.",
         else => "",
     };
 }
@@ -252,6 +254,7 @@ pub const rows = [_]Row{
     // lands, convert these into ONE exclusive selection — two can't co-own layout.
     .{ .section = sec_toybox, .group = 2, .kind = .toggle, .action = act_depth, .flags = 0, .label = "Depth feed", .value = "" },
     .{ .section = sec_toybox, .group = 2, .kind = .toggle, .action = act_tectonic, .flags = 0, .label = "Tectonic timeline", .value = "" },
+    .{ .section = sec_toybox, .group = 2, .kind = .toggle, .action = act_gravity, .flags = 0, .label = "Gravity", .value = "" },
 
     // ── About ────────────────────────────────────────────────────────────
     .{ .section = sec_about, .group = 0, .kind = .info, .action = act_none, .flags = 0, .label = "Version", .value = "0.1.0-dev" },

@@ -46,6 +46,7 @@ const feed_core = @import("../core/feed.zig");
 const chat_core = @import("../core/chat.zig");
 const chat_view_core = @import("../core/chat_view.zig");
 const spring = @import("../core/spring.zig");
+const shatter = @import("../core/shatter.zig");
 const gesture = @import("../core/gesture.zig");
 const chat_relay = @import("chat_relay.zig");
 const chat_e2ee = @import("chat_e2ee.zig");
@@ -2549,6 +2550,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
         const frametiming_on = toggleOn(rs.toggle_bits, settings_view.act_frametiming);
         const depth_on = toggleOn(rs.toggle_bits, settings_view.act_depth);
         const tectonic_on = toggleOn(rs.toggle_bits, settings_view.act_tectonic);
+        const gravity_on = toggleOn(rs.toggle_bits, settings_view.act_gravity);
         const settings_account: feed_view.SettingsAccount = .{
             .handle = std.fmt.bufPrint(&rs.account_handle_buf, "@{s}", .{session.handle}) catch session.handle,
             .did = session.did,
@@ -2582,7 +2584,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .market_q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .market_q_focus = rs.gmarket_q_focus, .market_loading = rs.market_loading, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .toys = .{ .feed_toy = if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else .none } } else null;
+        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .market_q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .market_q_focus = rs.gmarket_q_focus, .market_loading = rs.market_loading, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else .none } } else null;
         switch (rs.mode) {
             .timeline => try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status),
             .compose => {
@@ -3071,6 +3073,53 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 const cy: u16 = pev.y / pcell.h;
                 const rx: i32 = if (g.gpu != null) @intFromFloat(@as(f32, @floatFromInt(pev.x)) / gpu_scale) else @intCast(pev.x);
                 const ry: i32 = if (g.gpu != null) @intFromFloat(@as(f32, @floatFromInt(pev.y)) / gpu_scale) else @intCast(pev.y);
+                // Toy Box: Gravity SHATTER owns the pointer while the page is broken —
+                // grab/fling tiles, tap the highlighted OFF toggle to stop, and NOTHING
+                // else is clickable (nav + settings are locked out). Consume the event.
+                if (rs.gpu_state) |*gs| if (gs.shatter_active) {
+                    // The fixed EXIT box (top-right) ends it instantly, wherever the
+                    // debris is — checked before any grab.
+                    const ex = feed_view.shatterExitX(@intCast(gs.design_w));
+                    const in_exit = rx >= ex and rx < ex + feed_view.shatter_exit_w and ry >= feed_view.shatter_exit_margin and ry < feed_view.shatter_exit_margin + feed_view.shatter_exit_h;
+                    if (pev.kind == .button_down and pev.button == 1 and in_exit) {
+                        if (settings_view.rowOf(settings_view.act_gravity)) |grow|
+                            rs.toggle_bits &= ~(@as(u64, 1) << grow);
+                        continue;
+                    }
+                    switch (pev.kind) {
+                        .button_down => if (pev.button == 1) {
+                            gs.shatter_down_x = rx;
+                            gs.shatter_down_y = ry;
+                            if (shatter.pick(gs.shatter_x.items, gs.shatter_y.items, gs.shatter_bw.items, gs.shatter_bh.items, @floatFromInt(rx), @floatFromInt(ry))) |p| {
+                                // Grab a group (word / the Gravity control) by its
+                                // leader so the whole block drags together.
+                                const target: usize = if (p < gs.shatter_leader_of.items.len) gs.shatter_leader_of.items[p] else p;
+                                gs.shatter_held = target;
+                                gs.shatter_grab_dx = @as(f32, @floatFromInt(rx)) - gs.shatter_x.items[target];
+                                gs.shatter_grab_dy = @as(f32, @floatFromInt(ry)) - gs.shatter_y.items[target];
+                            }
+                        },
+                        .move => {
+                            rs.ghover_x = rx; // the render pins the held body to this
+                            rs.ghover_y = ry;
+                        },
+                        .button_up => if (pev.button == 1) {
+                            gs.shatter_held = null; // release → the drag velocity flings it
+                            // A TAP (barely moved) on the Gravity block stops it.
+                            const moved = @abs(rx - gs.shatter_down_x) + @abs(ry - gs.shatter_down_y);
+                            if (moved < 10) {
+                                if (shatter.pick(gs.shatter_x.items, gs.shatter_y.items, gs.shatter_bw.items, gs.shatter_bh.items, @floatFromInt(rx), @floatFromInt(ry))) |hit| {
+                                    if (hit < gs.shatter_group.items.len and gs.shatter_group.items[hit]) {
+                                        if (settings_view.rowOf(settings_view.act_gravity)) |grow|
+                                            rs.toggle_bits &= ~(@as(u64, 1) << grow); // gravity OFF
+                                    }
+                                }
+                            }
+                        },
+                        else => {},
+                    }
+                    continue; // shatter consumes the pointer — no normal dispatch
+                };
                 switch (pev.kind) {
                     .wheel => {
                         if (g.gpu) |gs| gs.menu_open = false; // scrolling dismisses the menu
@@ -4498,13 +4547,21 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                                 rs.toggle_bits ^= @as(u64, 1) << @intCast(hit.post);
                                                 // Layout-owning toys are mutually exclusive (they all
                                                 // resolve a post's on-screen position). Flipping one ON
-                                                // clears the other. F4: fold into a real radio control
-                                                // when a third layout toy lands.
+                                                // clears the others. F4: fold into a real radio control
+                                                // if this list keeps growing.
+                                                const layout_toys = [_]u8{ settings_view.act_depth, settings_view.act_tectonic, settings_view.act_gravity };
                                                 const fa = settings_view.rows[hit.post].action;
                                                 const now_on = (rs.toggle_bits >> @intCast(hit.post)) & 1 != 0;
-                                                if (now_on and (fa == settings_view.act_depth or fa == settings_view.act_tectonic)) {
-                                                    const other = if (fa == settings_view.act_depth) settings_view.act_tectonic else settings_view.act_depth;
-                                                    if (settings_view.rowOf(other)) |orow| rs.toggle_bits &= ~(@as(u64, 1) << orow);
+                                                var is_layout_toy = false;
+                                                for (layout_toys) |a| {
+                                                    if (a == fa) is_layout_toy = true;
+                                                }
+                                                if (now_on and is_layout_toy) {
+                                                    for (layout_toys) |a| {
+                                                        if (a != fa) if (settings_view.rowOf(a)) |orow| {
+                                                            rs.toggle_bits &= ~(@as(u64, 1) << orow);
+                                                        };
+                                                    }
                                                 }
                                                 // Julia mode flipped ON → sparks fly from the
                                                 // SWITCH: a heart-shaped bloom of ripples out of
@@ -7800,6 +7857,30 @@ const GpuState = struct {
     /// for the fps/ms overlay. 0 until the first frame pair.
     frame_ms: f32 = 0,
     last_frame_nanos: u64 = 0,
+    /// Toy Box: Gravity SHATTER — the retained physics state (struct-of-arrays, A3)
+    /// for the Settings-page collapse: one body PER DRAW ITEM (each word/glyph, icon
+    /// stroke, toggle, panel is its own falling piece). Position + velocity + the
+    /// seed home anchor + size. Shell-owned (Rule 4); pure `shatter.step` reads it.
+    /// `shatter_group`/`shatter_leader` bind the Gravity row rigid (label + switch
+    /// fall together — find that block and tap it to stop).
+    shatter_x: std.ArrayListUnmanaged(f32) = .empty,
+    shatter_y: std.ArrayListUnmanaged(f32) = .empty,
+    shatter_vx: std.ArrayListUnmanaged(f32) = .empty,
+    shatter_vy: std.ArrayListUnmanaged(f32) = .empty,
+    shatter_hx: std.ArrayListUnmanaged(f32) = .empty,
+    shatter_hy: std.ArrayListUnmanaged(f32) = .empty,
+    shatter_bw: std.ArrayListUnmanaged(f32) = .empty,
+    shatter_bh: std.ArrayListUnmanaged(f32) = .empty,
+    shatter_gid: std.ArrayListUnmanaged(u32) = .empty, // group id (words, gravity); 0 = alone
+    shatter_leader_of: std.ArrayListUnmanaged(u32) = .empty, // each item's group leader index
+    shatter_group: std.ArrayListUnmanaged(bool) = .empty, // true = a Gravity-toggle item (tap to stop)
+    shatter_active: bool = false,
+    shatter_n: usize = 0,
+    shatter_held: ?usize = null,
+    shatter_grab_dx: f32 = 0,
+    shatter_grab_dy: f32 = 0,
+    shatter_down_x: i32 = 0, // pointer-down position, to tell a tap from a drag
+    shatter_down_y: i32 = 0,
     /// The SDF-icon pass (the heart's technique generalised) — crisp engagement /
     /// nav icons, one draw call each, replacing the aliased line-art.
     icon: gpu.IconRenderer,
@@ -8153,6 +8234,17 @@ fn deinitGpuState(gpa: Allocator, gs: *GpuState) void {
     gs.sel_glyphs.deinit(gpa);
     gs.chat_anims.deinit(gpa);
     gs.chat_world.deinit(gpa);
+    gs.shatter_x.deinit(gpa);
+    gs.shatter_y.deinit(gpa);
+    gs.shatter_vx.deinit(gpa);
+    gs.shatter_vy.deinit(gpa);
+    gs.shatter_hx.deinit(gpa);
+    gs.shatter_hy.deinit(gpa);
+    gs.shatter_bw.deinit(gpa);
+    gs.shatter_bh.deinit(gpa);
+    gs.shatter_gid.deinit(gpa);
+    gs.shatter_leader_of.deinit(gpa);
+    gs.shatter_group.deinit(gpa);
     gpu.deinit(&gs.g);
 }
 
@@ -9096,7 +9188,7 @@ fn paintFrameGpu(
     // A drag/settle animates the socket every frame (lift, reflow, ghost), so
     // bypass the feed cache while it runs — a brief interaction, and the field
     // already rebuilds every frame anyway.
-    if (sig != gs.feed_sig or gs.feed.verts.items.len == 0 or g.socket_ui.drag_active != null or search_animating or zones_animating or drawer_animating or rail_hover_animating or algo_animating or chat_animating or g.screen.* == feed_view.screen_loadout or g.frametiming_on) {
+    if (sig != gs.feed_sig or gs.feed.verts.items.len == 0 or g.socket_ui.drag_active != null or search_animating or zones_animating or drawer_animating or rail_hover_animating or algo_animating or chat_animating or g.screen.* == feed_view.screen_loadout or g.frametiming_on or gs.shatter_active) {
         gs.feed_sig = sig;
         // An empty timeline renders the chrome with no posts (no placeholders).
         const feed_posts = feed_view.fromTimeline(arena, items, now, g.expanded) catch &[_]feed_view.PostView{};
@@ -9265,10 +9357,120 @@ fn paintFrameGpu(
             const fs = std.fmt.bufPrint(&fbuf, "{d:.1} ms   {d:.0} fps", .{ gs.frame_ms, fps }) catch "";
             if (fs.len > 0) feed_view.overlayBadge(gpa, g.draw, g.engine, 16, 26, fs) catch {};
         }
+        // Toy Box: Gravity SHATTER — on the Settings screen with Gravity on, EVERY
+        // individual element (word/glyph, icon stroke, toggle, panel) becomes a
+        // falling, grabbable body. Fold the rail in, seed one body per draw item on
+        // entry (home + a strong launch so it drops instantly), bind the Gravity row
+        // rigid, then step and carry each item by its body. Input owns grab/fling/
+        // tap-to-stop + nav lock.
+        if (g.toys.feed_toy == .gravity and g.screen.* == feed_view.screen_settings) {
+            // Fold the nav rail + logo into the same draw list so they shatter too
+            // (the rail is normally its own tile). skip_nav=false → line-art icons
+            // fall as pieces; regions=null since nav is locked while shattered.
+            if (gs.design_w > feed_view.phone_max) {
+                const rail_home_x = feed_view.paneGeomFor(@intCast(gs.design_w), g.screen.*).rail_x;
+                feed_view.renderRail(gpa, g.draw, g.engine, rail_home_x, @intCast(lh), g.screen.*, null, g.accent, false, 1.0) catch {};
+            }
+            // Thin out the big dark panels: drop the huge backgrounds, cut mid ones
+            // into small squares — so the pile isn't a wall of black boxes.
+            feed_view.shatterCullBig(gpa, g.draw, 88, 240) catch {};
+            const sn = g.draw.len;
+            gs.shatter_x.resize(gpa, sn) catch {};
+            gs.shatter_y.resize(gpa, sn) catch {};
+            gs.shatter_vx.resize(gpa, sn) catch {};
+            gs.shatter_vy.resize(gpa, sn) catch {};
+            gs.shatter_hx.resize(gpa, sn) catch {};
+            gs.shatter_hy.resize(gpa, sn) catch {};
+            gs.shatter_bw.resize(gpa, sn) catch {};
+            gs.shatter_bh.resize(gpa, sn) catch {};
+            gs.shatter_gid.resize(gpa, sn) catch {};
+            gs.shatter_leader_of.resize(gpa, sn) catch {};
+            gs.shatter_group.resize(gpa, sn) catch {};
+            if (gs.shatter_x.items.len == sn and sn > 0) {
+                if (!gs.shatter_active or gs.shatter_n != sn) {
+                    feed_view.shatterCaptureHomes(g.draw, gs.shatter_hx.items, gs.shatter_hy.items, gs.shatter_bw.items, gs.shatter_bh.items);
+                    @memset(gs.shatter_group.items, false);
+                    // Group runs of adjacent glyphs into words (fall together, stay
+                    // readable), and give the Gravity row (label + switch) its own
+                    // group so it stays as one recognizable, tappable control.
+                    const grav_gid = feed_view.shatterWordGroups(g.draw, gs.shatter_gid.items);
+                    for (g.regions.items) |rgn| {
+                        if (rgn.kind == .settings_row and rgn.post < settings_view.rows.len and settings_view.rows[rgn.post].action == settings_view.act_gravity) {
+                            const rl: f32 = @floatFromInt(rgn.x);
+                            const rt: f32 = @floatFromInt(rgn.y);
+                            const rr: f32 = @floatFromInt(@as(i32, rgn.x) + rgn.w);
+                            const rb: f32 = @floatFromInt(@as(i32, rgn.y) + rgn.h);
+                            for (0..sn) |c| {
+                                const px = gs.shatter_hx.items[c] + gs.shatter_bw.items[c] * 0.5;
+                                const py = gs.shatter_hy.items[c] + gs.shatter_bh.items[c] * 0.5;
+                                if (px >= rl and px < rr and py >= rt and py < rb) {
+                                    gs.shatter_gid.items[c] = grav_gid;
+                                    gs.shatter_group.items[c] = true;
+                                }
+                            }
+                        }
+                    }
+                    // Each group's leader = the first item carrying its id (else self).
+                    for (0..sn) |c| gs.shatter_leader_of.items[c] = @intCast(c);
+                    for (0..sn) |c| {
+                        const gid = gs.shatter_gid.items[c];
+                        if (gid == 0) continue;
+                        var f: usize = 0;
+                        while (f < c) : (f += 1) {
+                            if (gs.shatter_gid.items[f] == gid) {
+                                gs.shatter_leader_of.items[c] = @intCast(f);
+                                break;
+                            }
+                        }
+                    }
+                    for (0..sn) |c| {
+                        gs.shatter_x.items[c] = gs.shatter_hx.items[c];
+                        gs.shatter_y.items[c] = gs.shatter_hy.items[c];
+                        // Strong launch kick → an instant, heavy, chaotic drop.
+                        const rxh: u32 = @as(u32, @intCast(c)) *% 2654435761;
+                        const ryh: u32 = @as(u32, @intCast(c)) *% 40503 +% 1013904223;
+                        gs.shatter_vx.items[c] = @floatFromInt(@as(i32, @intCast(rxh % 1200)) - 600);
+                        gs.shatter_vy.items[c] = @floatFromInt(@as(i32, @intCast(ryh % 700)) + 250);
+                    }
+                    gs.shatter_active = true;
+                    gs.shatter_n = sn;
+                }
+                if (gs.shatter_held) |hidx| if (hidx < sn) {
+                    const tx = @as(f32, @floatFromInt(g.hover_x)) - gs.shatter_grab_dx;
+                    const ty = @as(f32, @floatFromInt(g.hover_y)) - gs.shatter_grab_dy;
+                    const dtc = std.math.clamp(gs.frame_ms / 1000.0, 0.004, 0.05);
+                    gs.shatter_vx.items[hidx] = (tx - gs.shatter_x.items[hidx]) / dtc;
+                    gs.shatter_vy.items[hidx] = (ty - gs.shatter_y.items[hidx]) / dtc;
+                    gs.shatter_x.items[hidx] = tx;
+                    gs.shatter_y.items[hidx] = ty;
+                };
+                const sdt: f32 = std.math.clamp(gs.frame_ms / 1000.0, 0.0, 0.05);
+                shatter.step(gs.shatter_x.items, gs.shatter_y.items, gs.shatter_vx.items, gs.shatter_vy.items, gs.shatter_bw.items, gs.shatter_bh.items, gs.shatter_held, @floatFromInt(lh), @floatFromInt(gs.design_w), sdt);
+                // Bind each group member rigidly to its leader, COMPACTED horizontally
+                // so a wide row (the Gravity label + far-right switch) collapses into
+                // one tight block instead of a stretched, dismembered-looking strip.
+                for (0..sn) |c| {
+                    const ld = gs.shatter_leader_of.items[c];
+                    if (ld == @as(u32, @intCast(c))) continue;
+                    const l: usize = ld;
+                    const dx = std.math.clamp(gs.shatter_hx.items[c] - gs.shatter_hx.items[l], -120.0, 120.0);
+                    gs.shatter_x.items[c] = gs.shatter_x.items[l] + dx;
+                    gs.shatter_y.items[c] = gs.shatter_y.items[l] + (gs.shatter_hy.items[c] - gs.shatter_hy.items[l]);
+                    gs.shatter_vx.items[c] = gs.shatter_vx.items[l];
+                    gs.shatter_vy.items[c] = gs.shatter_vy.items[l];
+                }
+                feed_view.applyShatterItems(g.draw, gs.shatter_x.items, gs.shatter_y.items, gs.shatter_hx.items, gs.shatter_hy.items);
+                // A fixed EXIT box, top-right, always on top — the easy way out.
+                feed_view.shatterExitBox(gpa, g.draw, g.engine, @intCast(gs.design_w), g.accent) catch {};
+            }
+        } else {
+            gs.shatter_active = false;
+            gs.shatter_held = null;
+        }
         // Settings: a hover tooltip for rows that opted into a help string. The
         // pointer over a `.settings_row` region → look up the row's help → draw
-        // it last so it overlays the rows. Appended to the feed buffer (below).
-        if (g.screen.* == feed_view.screen_settings) {
+        // it last so it overlays the rows. Suppressed while the page is shattered.
+        if (g.screen.* == feed_view.screen_settings and !gs.shatter_active) {
             if (feed_view.hitTest(g.regions.items, g.hover_x, g.hover_y)) |hit| {
                 if (hit.kind == .settings_row and hit.post < settings_view.rows.len) {
                     const help = settings_view.helpText(settings_view.rows[hit.post].action);
@@ -9285,7 +9487,12 @@ fn paintFrameGpu(
         // crossfade no longer dissolves it — it stays solid, which is correct.
         // Built for EVERY screen (incl. the loadout/Algorithms page, which now
         // skips its own rail via rail_external) with the active nav = the screen.
-        if (gs.design_w <= feed_view.phone_max) {
+        if (gs.shatter_active and gs.design_w > feed_view.phone_max) {
+            // The desktop rail was folded INTO the shattered feed buffer above, so
+            // clear its separate tile — otherwise an intact rail would draw on top
+            // of the debris.
+            gs.rail.verts.items.len = 0;
+        } else if (gs.design_w <= feed_view.phone_max) {
             // PHONE: the nav-chrome tile IS the bottom tab bar (the rail is
             // desktop furniture). Same buffer, same un-crossfaded draw, same
             // region kinds — the dispatch and the SDF icon pass are unchanged.
@@ -9351,8 +9558,10 @@ fn paintFrameGpu(
     // out at the logical design width; map the column's x-range to physical px.
     // Panel softening tracks the LIVE (animated) content column, not the static
     // metricsPage one — so the "distortion" panel follows the widened Zones glass.
-    const panel_l = @as(f32, @floatFromInt(gs.content_x)) * scale;
-    const panel_r = @as(f32, @floatFromInt(gs.content_x + gs.content_w)) * scale;
+    // While the page is shattered there is no content column to soften — the glass
+    // itself has broken into falling debris, so the field must render flat under it.
+    const panel_l = if (gs.shatter_active) 0 else @as(f32, @floatFromInt(gs.content_x)) * scale;
+    const panel_r = if (gs.shatter_active) 0 else @as(f32, @floatFromInt(gs.content_x + gs.content_w)) * scale;
     const field_ink: u32 = if (g.julia) lens_socket.julia_field_ink else 0xFFA6ACBA;
     gs.grid.gain = g.field_gain; // Appearance → "Field intensity" choice
     if (g.field_on) gpu.drawFieldGrid(&gs.grid, &gs.ramp, gs.mcx, gs.mcy, gs.t, @intCast(w), @intCast(h), panel_l, panel_r, field_ink, g.julia); // "Living glyph field" off ⇒ flat background
