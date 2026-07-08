@@ -409,6 +409,20 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("wrote /tmp/zat_tectonic.ppm (Toy Box: Tectonic — horizontal filmstrip)\n", .{});
     }
 
+    // TOY BOX — XP skin: the retro RE-THEME of the whole content area on the teal
+    // desktop (no field), plus the desktop chrome. Proof of the old-software look.
+    {
+        const retro_clear: u32 = feed_view.retro_desktop;
+        @memset(fb.pixels, retro_clear);
+        dl.len = 0;
+        _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, feed_view.screen_home, null, 0, lens_socket.seatedAccent(home_tray), home_tray, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{});
+        try feed_view.rethemeRetro(gpa, &dl, @intCast(W), @intCast(H), true);
+        try feed_view.drawXpSkin(gpa, &dl, &engine, @intCast(W), @intCast(H), 14, 25);
+        try raster.paint(gpa, &engine, dl.slice(), &fb, retro_clear);
+        try writePpm(io, gpa, &fb, "/tmp/zat_xp.ppm");
+        std.debug.print("wrote /tmp/zat_xp.ppm (Toy Box: XP skin — retro re-theme)\n", .{});
+    }
+
     // The socket OPEN on the feed, with Discover (blue) seated — proof that
     // seating re-tints the WHOLE UI (wordmark, active nav, New post) to the
     // seated lens's palette color (§11.5), the open tray over the posts.

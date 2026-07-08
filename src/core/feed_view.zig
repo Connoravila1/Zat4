@@ -4677,6 +4677,293 @@ pub fn drawAvatarToken(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engi
     _ = try glyph1(gpa, dl, e, .semibold, cx - @divTrunc(iadv, 2), cy + @divTrunc(size, 4), 0xFF1A1712, px, initial);
 }
 
+// ── Toy Box: the XP skin — a retro-desktop chrome overlay ──────────────────
+// Built ENTIRELY from the existing rect/line/text vocabulary: the glossy
+// gradients are stacks of interpolated horizontal strips, the 3-D bevels are
+// light/dark line pairs. No new DrawItem variant, so it renders identically on
+// the software and GPU paths with zero backend change (D1/D3). PURE (B2): the
+// shell reads the wall clock and hands `hour`/`minute` in as plain values
+// (B3/B4). Drawn in LOGICAL coordinates; the renderer scales it to the window.
+
+/// The retro chrome's fixed bar heights (logical px). Public so the shell and
+/// tests can reason about the frame without duplicating the constants.
+pub const xp_title_h: i32 = 30;
+pub const xp_task_h: i32 = 34;
+
+/// Blend two 0xAARRGGBB colours, `t` in [0,1] (0 = a, 1 = b). Opaque result —
+/// the chrome is solid. Local to the skin.
+fn xpLerp(a: u32, b: u32, t: f32) u32 {
+    const tt = std.math.clamp(t, 0.0, 1.0);
+    const af = struct {
+        fn ch(c: u32, sh: u5) f32 {
+            return @floatFromInt((c >> sh) & 0xFF);
+        }
+    };
+    const r: u32 = @intFromFloat(af.ch(a, 16) + (af.ch(b, 16) - af.ch(a, 16)) * tt);
+    const g: u32 = @intFromFloat(af.ch(a, 8) + (af.ch(b, 8) - af.ch(a, 8)) * tt);
+    const bl: u32 = @intFromFloat(af.ch(a, 0) + (af.ch(b, 0) - af.ch(a, 0)) * tt);
+    return 0xFF000000 | (r << 16) | (g << 8) | bl;
+}
+
+/// A vertical two-stop gradient as a stack of horizontal strips (the glossy
+/// bar). Chrome-only, so a coarse strip count still reads as smooth.
+fn xpGradientV(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, w: i32, h: i32, top: u32, bot: u32) !void {
+    if (h <= 0 or w <= 0) return;
+    const n: i32 = @min(h, 24);
+    var i: i32 = 0;
+    while (i < n) : (i += 1) {
+        const t: f32 = if (n <= 1) 0.0 else @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n - 1));
+        const sy = y + @divTrunc(i * h, n);
+        const sy2 = y + @divTrunc((i + 1) * h, n);
+        try rect(gpa, dl, x, sy, w, @max(1, sy2 - sy), xpLerp(top, bot, t), 0);
+    }
+}
+
+/// A 3-D bevel border around a box: two light edges + two dark edges. `raised`
+/// lights the top-left (a button popping out); otherwise it lights the
+/// bottom-right (a sunken well). The classic Win9x/XP button relief.
+fn xpBevel(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, w: i32, h: i32, raised: bool, light: u32, dark: u32) !void {
+    if (w <= 0 or h <= 0) return;
+    const tl = if (raised) light else dark;
+    const br = if (raised) dark else light;
+    try rect(gpa, dl, x, y, w, 1, tl, 0); // top
+    try rect(gpa, dl, x, y, 1, h, tl, 0); // left
+    try rect(gpa, dl, x, y + h - 1, w, 1, br, 0); // bottom
+    try rect(gpa, dl, x + w - 1, y, 1, h, br, 0); // right
+}
+
+/// Draw the whole retro-desktop chrome: a glossy Luna title bar (window mark +
+/// "zat" + minimize/maximize/close buttons), the sunken window-edge relief down
+/// the sides, and a taskbar (green Start button + a live clock well). Appended
+/// AFTER the feed content, so it frames whatever is on screen. PURE.
+pub fn drawXpSkin(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, w: i32, h: i32, hour: u8, minute: u8) error{OutOfMemory}!void {
+    const white: u32 = 0xFFFFFFFF;
+    const luna_top: u32 = 0xFF3C8CE8;
+    const luna_bot: u32 = 0xFF0A50C0;
+    const luna_gloss: u32 = 0xFF9CC8F7;
+    const luna_shadow: u32 = 0xFF063A8C;
+
+    // ── Title bar ──────────────────────────────────────────────────────────
+    try xpGradientV(gpa, dl, 0, 0, w, xp_title_h, luna_top, luna_bot);
+    try rect(gpa, dl, 0, 1, w, 1, luna_gloss, 0); // bright gloss under the top edge
+    try rect(gpa, dl, 0, xp_title_h - 1, w, 1, luna_shadow, 0); // dark seam at the base
+
+    // Window mark — an ORIGINAL generic "application window" glyph (deliberately
+    // NOT a vendor logo): a white pane with a blue title strip and content lines.
+    const ix: i32 = 8;
+    const iy: i32 = 7;
+    const isz: i32 = 16;
+    try rect(gpa, dl, ix, iy, isz, isz, 0xFF3E3B33, 0); // dark frame
+    try rect(gpa, dl, ix + 1, iy + 1, isz - 2, isz - 2, white, 0); // pane
+    try rect(gpa, dl, ix + 1, iy + 1, isz - 2, 4, 0xFF1E63C8, 0); // title strip
+    try rect(gpa, dl, ix + 3, iy + 8, isz - 6, 1, 0xFF9A968A, 0); // content lines
+    try rect(gpa, dl, ix + 3, iy + 11, isz - 8, 1, 0xFF9A968A, 0);
+
+    // Title text, with a soft one-px shadow for legibility on the gradient.
+    const tx = ix + isz + 8;
+    _ = try str(gpa, dl, e, .semibold, tx + 1, 22, luna_shadow, 16, "zat");
+    _ = try str(gpa, dl, e, .semibold, tx, 21, white, 16, "zat");
+
+    // Window buttons — minimize, maximize, close — right-aligned.
+    const btn: i32 = 20;
+    const gap: i32 = 4;
+    const bt_y: i32 = 5;
+    const close_x = w - 8 - btn;
+    const max_x = close_x - gap - btn;
+    const min_x = max_x - gap - btn;
+    const btn_lo: u32 = 0xFF1E63C8;
+    const btn_hi: u32 = 0xFF6FB0F2;
+    // minimize
+    try xpGradientV(gpa, dl, min_x, bt_y, btn, btn, btn_hi, btn_lo);
+    try xpBevel(gpa, dl, min_x, bt_y, btn, btn, true, 0xFFCFE4FB, luna_shadow);
+    try rect(gpa, dl, min_x + 5, bt_y + btn - 7, btn - 10, 2, white, 0);
+    // maximize (a small window outline)
+    try xpGradientV(gpa, dl, max_x, bt_y, btn, btn, btn_hi, btn_lo);
+    try xpBevel(gpa, dl, max_x, bt_y, btn, btn, true, 0xFFCFE4FB, luna_shadow);
+    try xpBevel(gpa, dl, max_x + 5, bt_y + 5, btn - 10, btn - 10, false, white, white);
+    try rect(gpa, dl, max_x + 5, bt_y + 5, btn - 10, 2, white, 0);
+    // close (red) with an X
+    try xpGradientV(gpa, dl, close_x, bt_y, btn, btn, 0xFFF08A6E, 0xFFD23B22);
+    try xpBevel(gpa, dl, close_x, bt_y, btn, btn, true, 0xFFF9C9BC, 0xFF9A2414);
+    try line(gpa, dl, close_x + 6, bt_y + 6, close_x + btn - 6, bt_y + btn - 6, white, 2);
+    try line(gpa, dl, close_x + btn - 6, bt_y + 6, close_x + 6, bt_y + btn - 6, white, 2);
+
+    // ── Window-edge relief — a thin sunken frame down the left and right, so
+    // the feed reads as the client area of a desktop window.
+    const tb_y = h - xp_task_h;
+    try rect(gpa, dl, 0, xp_title_h, 2, tb_y - xp_title_h, luna_shadow, 0);
+    try rect(gpa, dl, w - 2, xp_title_h, 2, tb_y - xp_title_h, luna_shadow, 0);
+
+    // ── Taskbar ────────────────────────────────────────────────────────────
+    try xpGradientV(gpa, dl, 0, tb_y, w, xp_task_h, 0xFF3A86E4, 0xFF0B44B4);
+    try rect(gpa, dl, 0, tb_y, w, 1, luna_gloss, 0);
+    try rect(gpa, dl, 0, tb_y + 1, w, 1, 0xFF6FB0F2, 0);
+
+    // Start button — the glossy green pill, bottom-left.
+    const st_x: i32 = 6;
+    const st_h: i32 = xp_task_h - 8;
+    const st_y = tb_y + 4;
+    const st_rad: u8 = @intCast(@divTrunc(st_h, 2));
+    const flag_x = st_x + 10;
+    const flag_y = st_y + @divTrunc(st_h - 12, 2);
+    const start_lbl = "start";
+    const lbl_w: i32 = @intCast(text.measure(e, .semibold, start_lbl, 15));
+    const st_w = flag_x + 14 + lbl_w + 12 - st_x;
+    try rect(gpa, dl, st_x + 1, st_y + 2, st_w, st_h, 0x40000000, st_rad); // drop shadow
+    try rect(gpa, dl, st_x, st_y, st_w, st_h, 0xFF2E7A26, st_rad); // base green
+    try rect(gpa, dl, st_x + 1, st_y + 1, st_w - 2, @divTrunc(st_h, 2), 0x45FFFFFF, st_rad); // top gloss
+    // Original "application window" glyph (NOT a vendor logo).
+    const fsz: i32 = 12;
+    try rect(gpa, dl, flag_x, flag_y, fsz, fsz, 0xFF1A3308, 0);
+    try rect(gpa, dl, flag_x + 1, flag_y + 1, fsz - 2, fsz - 2, white, 0);
+    try rect(gpa, dl, flag_x + 1, flag_y + 1, fsz - 2, 3, 0xFF1E63C8, 0);
+    try rect(gpa, dl, flag_x + 3, flag_y + 7, fsz - 6, 1, 0xFF6A655A, 0);
+    _ = try str(gpa, dl, e, .semibold, flag_x + 15, st_y + @divTrunc(st_h, 2) + 5, luna_shadow, 15, start_lbl);
+    _ = try str(gpa, dl, e, .semibold, flag_x + 14, st_y + @divTrunc(st_h, 2) + 4, white, 15, start_lbl);
+
+    // Clock well — a sunken panel, bottom-right, showing local 12-hour time.
+    var buf: [12]u8 = undefined;
+    const pm = hour >= 12;
+    var h12: u8 = hour % 12;
+    if (h12 == 0) h12 = 12;
+    const clock = std.fmt.bufPrint(&buf, "{d}:{d:0>2} {s}", .{ h12, minute, if (pm) "PM" else "AM" }) catch "--:--";
+    const cw: i32 = @intCast(text.measure(e, .semibold, clock, 14) + 20);
+    const ch: i32 = st_h;
+    const cx0 = w - 8 - cw;
+    const cy0 = st_y;
+    try rect(gpa, dl, cx0, cy0, cw, ch, 0xFF0E4EBE, 4);
+    try xpBevel(gpa, dl, cx0, cy0, cw, ch, false, 0xFF5B97E8, 0xFF07347F);
+    const clw: i32 = @intCast(text.measure(e, .semibold, clock, 14));
+    _ = try str(gpa, dl, e, .semibold, cx0 + @divTrunc(cw - clw, 2), cy0 + @divTrunc(ch, 2) + 5, white, 14, clock);
+}
+
+// ── Toy Box: the XP skin — the retro RE-THEME of the whole content area ──────
+// A pure draw-list transform (the SAME shape as the Gravity shatter): it takes
+// the finished draw list for ANY screen and rewrites every item into an
+// old-software look — square corners, a classic grey window face, black text,
+// and 3-D beveled widgets. Because every screen renders through the one draw
+// list, this single pass re-skins the entire app (feed, settings, zones, chat)
+// at once (D6: one slice, not a per-screen fork). PURE (B2).
+
+pub const retro_desktop: u32 = 0xFF0E7C74; // the classic teal desktop (gpu clear)
+const retro_win: u32 = 0xFFECE9D8; // window client / large panels
+const retro_face: u32 = 0xFFD8D4C8; // button / card face
+const retro_text: u32 = 0xFF1B1B17; // near-black body text
+const retro_muted: u32 = 0xFF57544B; // secondary text
+const retro_faint: u32 = 0xFF7C786C; // tertiary text
+const retro_hi: u32 = 0xFFFFFFFF; // bevel highlight (top-left)
+const retro_sh: u32 = 0xFF8C897C; // bevel inner shadow (bottom-right)
+const retro_dk: u32 = 0xFF3E3B33; // bevel outer line (deeper shadow)
+const retro_navy: u32 = 0xFF0A3D91; // links / coloured labels
+
+fn retroLuma(c: u32) f32 {
+    const r: f32 = @floatFromInt((c >> 16) & 0xFF);
+    const g: f32 = @floatFromInt((c >> 8) & 0xFF);
+    const b: f32 = @floatFromInt(c & 0xFF);
+    return (0.299 * r + 0.587 * g + 0.114 * b) / 255.0;
+}
+fn retroSat(c: u32) f32 {
+    const r: i32 = @intCast((c >> 16) & 0xFF);
+    const g: i32 = @intCast((c >> 8) & 0xFF);
+    const b: i32 = @intCast(c & 0xFF);
+    const mx = @max(r, @max(g, b));
+    const mn = @min(r, @min(g, b));
+    if (mx == 0) return 0;
+    return @as(f32, @floatFromInt(mx - mn)) / @as(f32, @floatFromInt(mx));
+}
+
+/// Remap a FILL colour (rects). Faint overlays become subtle grooves; opaque
+/// saturated fills (avatars, like/boost accents) keep their hue so meaning
+/// survives; everything else becomes the classic window/button grey.
+fn retroFill(c: u32, is_widget: bool) u32 {
+    const a = (c >> 24) & 0xFF;
+    if (a < 0x30) return (a << 24) | 0x00201E18; // faint divider/hover → dark groove, alpha kept
+    if (retroSat(c) > 0.32 and a >= 0x80) return (c & 0x00FFFFFF) | 0xFF000000; // accent keeps hue, opaque
+    const base = if (retroLuma(c) > 0.80) retro_hi else if (is_widget) retro_face else retro_win;
+    return (base & 0x00FFFFFF) | 0xFF000000; // solid grey
+}
+
+/// Remap a TEXT colour: the warm inks map to a black/grey scale; coloured labels
+/// become the classic navy link; other light text goes black.
+fn retroInk(c: u32) u32 {
+    switch (c) {
+        ink => return retro_text,
+        muted => return retro_muted,
+        faint => return retro_faint,
+        else => {},
+    }
+    if (retroSat(c) > 0.35) return retro_navy;
+    if (retroLuma(c) > 0.45) return retro_text;
+    return c;
+}
+
+/// Remap a STROKE colour (line/tri icons): saturated strokes (the red like heart,
+/// etc.) keep their hue; light icon strokes go black so they read on the grey.
+fn retroStroke(c: u32) u32 {
+    if (retroSat(c) > 0.32) return c;
+    const a = c & 0xFF000000;
+    if ((c >> 24) & 0xFF < 0x30) return a | 0x00201E18;
+    if (retroLuma(c) > 0.45) return a | (retro_text & 0x00FFFFFF);
+    return c;
+}
+
+/// Rewrite `dl` in place into the retro look. `add_client_bg` prepends the grey
+/// window client rect (the main content tile wants it; the nav-rail tile, which
+/// draws OVER the content, must not — it would cover the feed). PURE.
+pub fn rethemeRetro(gpa: Allocator, dl: *raster.DrawList, w: i32, h: i32, add_client_bg: bool) error{OutOfMemory}!void {
+    if (dl.len == 0 and !add_client_bg) return;
+    var src = try dl.clone(gpa);
+    defer src.deinit(gpa);
+    dl.len = 0;
+
+    // The grey window client area, floating on the teal desktop — a thin teal
+    // frame shows around it and behind the title bar / taskbar chrome.
+    if (add_client_bg) {
+        const b: i32 = 3;
+        try rect(gpa, dl, b, xp_title_h, w - 2 * b, h - xp_title_h - xp_task_h, retro_win, 0);
+    }
+
+    var i: usize = 0;
+    while (i < src.len) : (i += 1) {
+        const item = src.get(i);
+        switch (item) {
+            .rect => |r| {
+                const rw: i32 = r.w;
+                const rh: i32 = r.h;
+                const a = (r.color >> 24) & 0xFF;
+                // A "widget" (button/pill/card) vs a big background slab: opaque,
+                // in a button/card size band, and not a full-bleed bar.
+                const widget = a >= 0x80 and rw >= 26 and rh >= 14 and rh <= 200 and rw < w - 8;
+                const nc = retroFill(r.color, widget);
+                try rect(gpa, dl, r.x, r.y, rw, rh, nc, 0); // square corners
+                if (widget and (nc & 0xFF000000) == 0xFF000000) {
+                    // Raised 3-D relief: light top-left, shadow bottom-right, a
+                    // deeper outer line under it — the classic beveled button.
+                    try xpBevel(gpa, dl, r.x, r.y, rw, rh, true, retro_hi, retro_sh);
+                    try rect(gpa, dl, r.x, r.y + rh - 1, rw, 1, retro_dk, 0);
+                    try rect(gpa, dl, r.x + rw - 1, r.y, 1, rh, retro_dk, 0);
+                }
+            },
+            .text => |t| {
+                var nt = t;
+                nt.color = retroInk(t.color);
+                try dl.append(gpa, .{ .text = nt });
+            },
+            .line => |ln| {
+                var nl = ln;
+                nl.color = retroStroke(ln.color);
+                try dl.append(gpa, .{ .line = nl });
+            },
+            .tri => |tr| {
+                var ntr = tr;
+                ntr.color = retroStroke(tr.color);
+                try dl.append(gpa, .{ .tri = ntr });
+            },
+            .cell => try dl.append(gpa, item),
+        }
+    }
+}
+
 /// Toy Box: Gravity SHATTER — the fixed EXIT box geometry (top-right corner), so
 /// the drawer and the input hit-test agree. Logical px.
 pub const shatter_exit_w: i32 = 88;
@@ -7452,6 +7739,76 @@ test "Toy Box tectonic: horizontal filmstrip returns strip width and stays tappa
     try std.testing.expect(extent > 900);
     // On-strip cards still emit tap regions (taps + GPU icons track the moved card).
     try std.testing.expect(regions.items.len > 0);
+}
+
+test "Toy Box XP skin: chrome emits from the base vocabulary and spans the frame" {
+    const gpa = std.testing.allocator;
+    var engine = try text.initEngine();
+    defer text.deinitEngine(gpa, &engine);
+    var dl: raster.DrawList = .{};
+    defer dl.deinit(gpa);
+
+    const W: i32 = 1280;
+    const H: i32 = 800;
+    // 11:07 PM — exercises the 12-hour PM path and the zero-padded minute.
+    try drawXpSkin(gpa, &dl, &engine, W, H, 23, 7);
+
+    // The overlay draws only rect/line/text — no new primitive slipped in.
+    var rects: usize = 0;
+    var lines: usize = 0;
+    var top_span: i16 = 0; // widest rect touching the top edge (the title bar)
+    var bot_hit = false; // a rect sits in the taskbar band along the bottom
+    for (0..dl.len) |i| switch (dl.get(i)) {
+        .rect => |r| {
+            rects += 1;
+            if (r.y == 0 and @as(i16, @intCast(r.w)) > top_span) top_span = @intCast(r.w);
+            if (@as(i32, r.y) + r.h >= H - 2 and r.w > 40) bot_hit = true;
+        },
+        .line => lines += 1,
+        .text => {},
+        else => return error.UnexpectedDrawItem, // no cell/tri in the chrome
+    };
+    try std.testing.expect(rects > 0);
+    try std.testing.expect(lines >= 2); // the close-button X is two strokes
+    try std.testing.expectEqual(@as(i16, @intCast(W)), top_span); // title bar spans full width
+    try std.testing.expect(bot_hit); // the taskbar reaches the bottom edge
+}
+
+test "Toy Box XP skin: rethemeRetro squares corners, blackens text, keeps accent hues" {
+    const gpa = std.testing.allocator;
+    var dl: raster.DrawList = .{};
+    defer dl.deinit(gpa);
+
+    // A representative slice of a real frame: dark bg, a rounded card, a warm-ink
+    // body glyph, a saturated avatar tint, and the red "liked" heart stroke.
+    try rect(gpa, &dl, 0, 0, 460, 900, bg, 0); // dark background slab
+    try rect(gpa, &dl, 40, 60, 380, 120, panel, 16); // a rounded card (widget band)
+    try dl.append(gpa, .{ .text = .{ .x = 60, .baseline = 90, .codepoint = 'a', .color = ink, .px = 18, .weight = 0 } });
+    try rect(gpa, &dl, 50, 70, 40, 40, 0xFFE0A868, 20); // saturated avatar tint
+    try dl.append(gpa, .{ .line = .{ .x0 = 60, .y0 = 200, .x1 = 72, .y1 = 212, .color = 0xFFE84D3C, .thickness = 2 } }); // liked heart (red)
+
+    try rethemeRetro(gpa, &dl, 460, 940, true);
+
+    var saw_client_bg = false;
+    var saw_kept_accent_fill = false;
+    var saw_kept_red_stroke = false;
+    var max_radius: u8 = 0;
+    for (0..dl.len) |i| switch (dl.get(i)) {
+        .rect => |r| {
+            max_radius = @max(max_radius, r.radius);
+            if (r.color == retro_win and r.w > 300 and r.h > 300) saw_client_bg = true;
+            if ((r.color & 0x00FFFFFF) == 0x00E0A868) saw_kept_accent_fill = true;
+        },
+        .text => |t| try std.testing.expectEqual(retro_text, t.color), // warm ink → black
+        .line => |ln| {
+            if ((ln.color & 0x00FFFFFF) == 0x00E84D3C) saw_kept_red_stroke = true;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(u8, 0), max_radius); // every corner squared off
+    try std.testing.expect(saw_client_bg); // the grey window client was prepended
+    try std.testing.expect(saw_kept_accent_fill); // avatar hue survived (meaning intact)
+    try std.testing.expect(saw_kept_red_stroke); // the like heart stays red
 }
 
 test "layout captures the rooted post's body glyphs for selection (thread screen)" {

@@ -47,6 +47,39 @@ extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
 extern "kernel32" fn QueryPerformanceCounter(out: *i64) callconv(.winapi) i32;
 extern "kernel32" fn QueryPerformanceFrequency(out: *i64) callconv(.winapi) i32;
 
+/// Win32 wall clock in LOCAL time — the toy taskbar's clock rides this.
+/// A7.2 (FFI): layout is the OS ABI's, not ours; waived.
+const SYSTEMTIME = extern struct {
+    wYear: u16,
+    wMonth: u16,
+    wDayOfWeek: u16,
+    wDay: u16,
+    wHour: u16,
+    wMinute: u16,
+    wSecond: u16,
+    wMilliseconds: u16,
+};
+extern "kernel32" fn GetLocalTime(out: *SYSTEMTIME) callconv(.winapi) void;
+
+/// libc `struct tm` — the first nine `c_int`s are ABI-stable across glibc,
+/// musl, and Darwin (POSIX order); glibc/Darwin append `tm_gmtoff`/`tm_zone`,
+/// declared so `localtime_r` has the full buffer to write. A7.2 (FFI): the
+/// OS ABI owns this layout; guard waived.
+const Tm = extern struct {
+    sec: c_int,
+    min: c_int,
+    hour: c_int,
+    mday: c_int,
+    mon: c_int,
+    year: c_int,
+    wday: c_int,
+    yday: c_int,
+    isdst: c_int,
+    gmtoff: c_long = 0,
+    zone: ?*const u8 = null,
+};
+extern "c" fn localtime_r(timer: *const i64, result: *Tm) ?*Tm;
+
 /// FILETIME epoch (1601) to Unix epoch (1970), in 100 ns units.
 const filetime_unix_offset: u64 = 116_444_736_000_000_000;
 
@@ -103,6 +136,30 @@ pub fn monotonicNanos() u64 {
     const rc = std.os.linux.clock_gettime(.MONOTONIC, &ts);
     if (rc != 0) return 0;
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+/// Local wall-clock hour (0–23) and minute (0–59) — the retro taskbar clock.
+/// SHELL-only (B3); the pure renderer receives the two bytes as plain data.
+/// Falls back to UTC arithmetic if the platform lookup fails (E4: a wrong-by-
+/// -offset clock beats a crash for a cosmetic toy).
+pub fn localHourMinute() struct { hour: u8, minute: u8 } {
+    if (comptime is_windows) {
+        var st: SYSTEMTIME = undefined;
+        GetLocalTime(&st);
+        return .{ .hour = @intCast(@min(st.wHour, 23)), .minute = @intCast(@min(st.wMinute, 59)) };
+    }
+    const t: i64 = unixSeconds();
+    if (comptime !is_windows) {
+        var out: Tm = undefined;
+        if (localtime_r(&t, &out) != null) {
+            const h: c_int = @mod(out.hour, 24);
+            const m: c_int = @mod(out.min, 60);
+            return .{ .hour = @intCast(h), .minute = @intCast(m) };
+        }
+    }
+    const h: i64 = @mod(@divFloor(t, 3600), 24);
+    const m: i64 = @mod(@divFloor(t, 60), 60);
+    return .{ .hour = @intCast(h), .minute = @intCast(m) };
 }
 
 pub fn sleepMillis(ms: u64) void {

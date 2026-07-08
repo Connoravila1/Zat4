@@ -90,6 +90,7 @@ pub const act_pet: u8 = 15; // Toy Box: Pet — a companion in the corner
 pub const act_pet_color: u8 = 16; // Toy Box: Pet colour (choice)
 pub const act_pet_size: u8 = 17; // Toy Box: Pet size (choice)
 pub const act_pet_name: u8 = 18; // Toy Box: Pet name (text field)
+pub const act_xp: u8 = 19; // Toy Box: XP skin — a retro-OS desktop frame over the app
 
 /// Optional one-line explainer shown as a HOVER TOOLTIP over a row — opt-in per
 /// action, empty for the rest. Kept out of band (a switch, not a `Row` field) so
@@ -101,6 +102,7 @@ pub fn helpText(action: u8) []const u8 {
         act_tectonic => "The feed becomes a horizontal filmstrip — posts lay out left to right as cards, and scrolling pans sideways through them. Purely cosmetic.",
         act_gravity => "Posts get weight and fall — they drop and pile up at the bottom of the feed, with the most-liked posts falling hardest. Purely cosmetic.",
         act_pet => "A little companion lives in the corner. It gets hungry and sleepy over time, sulks if you doom-scroll, and cheers up when you click to pet it.",
+        act_xp => "Wraps the app in a retro-desktop frame — a gradient title bar up top, a beveled window edge, and a taskbar with a Start button and a live clock along the bottom. Purely cosmetic chrome.",
         else => "",
     };
 }
@@ -271,6 +273,8 @@ pub const rows = [_]Row{
     .{ .section = sec_toybox, .group = 3, .kind = .choice, .action = act_pet_color, .flags = 0, .label = "Pet colour", .value = "Blue" },
     .{ .section = sec_toybox, .group = 3, .kind = .choice, .action = act_pet_size, .flags = 0, .label = "Pet size", .value = "Medium" },
     .{ .section = sec_toybox, .group = 3, .kind = .textfield, .action = act_pet_name, .flags = 0, .label = "Pet name", .value = "" },
+    // Independent chrome overlay — the retro-desktop frame (title bar + taskbar).
+    .{ .section = sec_toybox, .group = 4, .kind = .toggle, .action = act_xp, .flags = 0, .label = "XP skin", .value = "" },
 
     // ── About ────────────────────────────────────────────────────────────
     .{ .section = sec_about, .group = 0, .kind = .info, .action = act_none, .flags = 0, .label = "Version", .value = "0.1.0-dev" },
