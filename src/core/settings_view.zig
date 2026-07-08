@@ -91,6 +91,8 @@ pub const act_pet_color: u8 = 16; // Toy Box: Pet colour (choice)
 pub const act_pet_size: u8 = 17; // Toy Box: Pet size (choice)
 pub const act_pet_name: u8 = 18; // Toy Box: Pet name (text field)
 pub const act_xp: u8 = 19; // Toy Box: XP skin — a retro-OS desktop frame over the app
+pub const act_zero_g: u8 = 20; // Toy Box: Zero-G — posts drift weightlessly
+pub const act_liquid: u8 = 21; // Toy Box: Liquid — posts slosh with scroll inertia
 
 /// Optional one-line explainer shown as a HOVER TOOLTIP over a row — opt-in per
 /// action, empty for the rest. Kept out of band (a switch, not a `Row` field) so
@@ -103,9 +105,29 @@ pub fn helpText(action: u8) []const u8 {
         act_gravity => "Posts get weight and fall — they drop and pile up at the bottom of the feed, with the most-liked posts falling hardest. Purely cosmetic.",
         act_pet => "A little companion lives in the corner. It gets hungry and sleepy over time, sulks if you doom-scroll, and cheers up when you click to pet it.",
         act_xp => "Wraps the app in a retro-desktop frame — a gradient title bar up top, a beveled window edge, and a taskbar with a Start button and a live clock along the bottom. Purely cosmetic chrome.",
+        act_zero_g => "Cuts the gravity — posts drift weightlessly, each floating on its own slow path. Purely cosmetic; the feed order and scroll are untouched.",
+        act_liquid => "The feed behaves like water — scrolling sends a slosh rippling down the column that sways and then settles. Purely cosmetic.",
         else => "",
     };
 }
+
+/// The Toy Box category title for a group index (the detail pane draws these as
+/// section headers over each tile grid). Empty for an unknown group. Comptime
+/// .rodata; the display ORDER is the group numbering in the row table above.
+pub fn toyCategoryTitle(group: u8) []const u8 {
+    return switch (group) {
+        0 => "Effects",
+        1 => "Companion",
+        2 => "Theme",
+        3 => "Feed motion",
+        else => "",
+    };
+}
+
+/// The Toy Box "feed motion" category — its toys are mutually exclusive (only one
+/// owns the feed), so the detail pane renders them as a pick-one card grid rather
+/// than independent switches. Kept as data here so the renderer stays generic.
+pub const toy_motion_group: u8 = 3;
 
 /// The GLOBAL row index of the (first) row carrying `action`, or null. Lets the
 /// shell map a functional `act_*` to its runtime toggle bit without hardcoding
@@ -254,27 +276,31 @@ pub const rows = [_]Row{
     .{ .section = sec_privacy, .group = 2, .kind = .toggle, .action = act_none, .flags = flag_wip, .label = "Privacy labels on lenses", .value = "" },
 
     // ── Toy Box ──────────────────────────────────────────────────────────
-    // Your playground. Append experimental toggles here freely — clearly fenced
-    // off from the polished sections so a half-baked switch never lands in
-    // Account by accident.
+    // Your playground. Grouped into CATEGORIES (the group index is the category,
+    // in display order); the Toy Box detail pane renders each group as a titled
+    // grid of tiles (see `toyCategoryTitle` + `drawToyBoxDetail`). Feed-motion is
+    // deliberately LAST, with Companion + Theme above it. Append a toggle by
+    // dropping a line into the right group — the grid follows this table verbatim.
+    //
+    // Group 0 — Effects: independent decorative overlays (stack with anything).
     .{ .section = sec_toybox, .group = 0, .kind = .toggle, .action = act_julia, .flags = 0, .label = "Julia mode", .value = "" },
     .{ .section = sec_toybox, .group = 0, .kind = .toggle, .action = act_ripples, .flags = flag_on, .label = "Ripples on like", .value = "" },
-    .{ .section = sec_toybox, .group = 1, .kind = .toggle, .action = act_crt, .flags = 0, .label = "CRT scanlines", .value = "" },
-    .{ .section = sec_toybox, .group = 1, .kind = .toggle, .action = act_frametiming, .flags = 0, .label = "Show frame timing", .value = "" },
-    // Feed-layout toys (they resolve each post's on-screen position). Depth is the
-    // FIRST, so a single toggle is honest. F4: when the 2nd layout toy (tectonic)
-    // lands, convert these into ONE exclusive selection — two can't co-own layout.
-    .{ .section = sec_toybox, .group = 2, .kind = .toggle, .action = act_depth, .flags = 0, .label = "Depth feed", .value = "" },
-    .{ .section = sec_toybox, .group = 2, .kind = .toggle, .action = act_tectonic, .flags = 0, .label = "Tectonic timeline", .value = "" },
-    .{ .section = sec_toybox, .group = 2, .kind = .toggle, .action = act_gravity, .flags = 0, .label = "Gravity", .value = "" },
-    // Independent overlay (stacks with any feed toy) — not a layout toy. The
-    // colour + size options sit beneath it (they apply whenever the pet is on).
-    .{ .section = sec_toybox, .group = 3, .kind = .toggle, .action = act_pet, .flags = 0, .label = "Pet", .value = "" },
-    .{ .section = sec_toybox, .group = 3, .kind = .choice, .action = act_pet_color, .flags = 0, .label = "Pet colour", .value = "Blue" },
-    .{ .section = sec_toybox, .group = 3, .kind = .choice, .action = act_pet_size, .flags = 0, .label = "Pet size", .value = "Medium" },
-    .{ .section = sec_toybox, .group = 3, .kind = .textfield, .action = act_pet_name, .flags = 0, .label = "Pet name", .value = "" },
-    // Independent chrome overlay — the retro-desktop frame (title bar + taskbar).
-    .{ .section = sec_toybox, .group = 4, .kind = .toggle, .action = act_xp, .flags = 0, .label = "XP skin", .value = "" },
+    .{ .section = sec_toybox, .group = 0, .kind = .toggle, .action = act_crt, .flags = 0, .label = "CRT scanlines", .value = "" },
+    .{ .section = sec_toybox, .group = 0, .kind = .toggle, .action = act_frametiming, .flags = 0, .label = "Show frame timing", .value = "" },
+    // Group 1 — Companion: the Pet toggle + its colour / size / name options.
+    .{ .section = sec_toybox, .group = 1, .kind = .toggle, .action = act_pet, .flags = 0, .label = "Pet", .value = "" },
+    .{ .section = sec_toybox, .group = 1, .kind = .choice, .action = act_pet_color, .flags = 0, .label = "Pet colour", .value = "Blue" },
+    .{ .section = sec_toybox, .group = 1, .kind = .choice, .action = act_pet_size, .flags = 0, .label = "Pet size", .value = "Medium" },
+    .{ .section = sec_toybox, .group = 1, .kind = .textfield, .action = act_pet_name, .flags = 0, .label = "Pet name", .value = "" },
+    // Group 2 — Theme: the retro-desktop chrome + full re-theme.
+    .{ .section = sec_toybox, .group = 2, .kind = .toggle, .action = act_xp, .flags = 0, .label = "XP skin", .value = "" },
+    // Group 3 — Feed motion: mutually-exclusive layout toys (only one owns the
+    // feed at a time), rendered as a "pick one" selectable card grid.
+    .{ .section = sec_toybox, .group = 3, .kind = .toggle, .action = act_depth, .flags = 0, .label = "Depth feed", .value = "" },
+    .{ .section = sec_toybox, .group = 3, .kind = .toggle, .action = act_tectonic, .flags = 0, .label = "Tectonic timeline", .value = "" },
+    .{ .section = sec_toybox, .group = 3, .kind = .toggle, .action = act_gravity, .flags = 0, .label = "Gravity", .value = "" },
+    .{ .section = sec_toybox, .group = 3, .kind = .toggle, .action = act_zero_g, .flags = 0, .label = "Zero-G", .value = "" },
+    .{ .section = sec_toybox, .group = 3, .kind = .toggle, .action = act_liquid, .flags = 0, .label = "Liquid", .value = "" },
 
     // ── About ────────────────────────────────────────────────────────────
     .{ .section = sec_about, .group = 0, .kind = .info, .action = act_none, .flags = 0, .label = "Version", .value = "0.1.0-dev" },

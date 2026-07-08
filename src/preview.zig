@@ -70,7 +70,7 @@ fn partitionGeom(arena: std.mem.Allocator, w: i32, h: i32, feed_weight: f32) !fe
 
 const W: u32 = 1280;
 const H: u32 = 880;
-const clear: u32 = 0xFF181812;
+const clear: u32 = 0xFF000000; // app canvas — pure black (field backdrop)
 const cell_w: u16 = 11;
 const cell_h: u16 = 17;
 
@@ -421,6 +421,22 @@ pub fn main(init: std.process.Init) !void {
         try raster.paint(gpa, &engine, dl.slice(), &fb, retro_clear);
         try writePpm(io, gpa, &fb, "/tmp/zat_xp.ppm");
         std.debug.print("wrote /tmp/zat_xp.ppm (Toy Box: XP skin — retro re-theme)\n", .{});
+    }
+
+    // The Toy Box SETTINGS page — the category grid (a few toggles on so the
+    // active/pick-one states show).
+    {
+        @memset(fb.pixels, clear);
+        dl.len = 0;
+        try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
+        var toggles: u64 = 0;
+        if (settings_view.rowOf(settings_view.act_ripples)) |i| toggles |= @as(u64, 1) << @intCast(i);
+        if (settings_view.rowOf(settings_view.act_pet)) |i| toggles |= @as(u64, 1) << @intCast(i);
+        if (settings_view.rowOf(settings_view.act_zero_g)) |i| toggles |= @as(u64, 1) << @intCast(i); // a motion toy active → pick-one card
+        _ = try feed_view.layout(gpa, &engine, @intCast(W), @intCast(H), posts, 0, &dl, null, null, false, feed_view.screen_settings, null, 0, lens_socket.seatedAccent(home_tray), home_tray, .{}, null, null, null, "", .{}, null, @as(u8, 1), toggles, .{}, 0, 255, null, .{});
+        try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+        try writePpm(io, gpa, &fb, "/tmp/zat_toybox.ppm");
+        std.debug.print("wrote /tmp/zat_toybox.ppm (Toy Box settings — category grid)\n", .{});
     }
 
     // The socket OPEN on the feed, with Discover (blue) seated — proof that

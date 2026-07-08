@@ -52,7 +52,7 @@ const chat_msg = @import("chat.zig");
 
 // Palette, copied from field.zig so the view never reaches across a module
 // for a constant (D4: only the value crosses, by copy). ARGB.
-const bg: u32 = 0xFF181812;
+const bg: u32 = 0xFF000000; // app canvas — pure black (field backdrop + card elevation base)
 const ink: u32 = 0xFFEDEAE0;
 const body_c: u32 = 0xFFD8D3C8;
 const muted: u32 = 0xFF9A968A;
@@ -119,6 +119,24 @@ inline fn skinHeaderVeil(accent: u32) u32 {
 }
 inline fn skinPanel(accent: u32) u32 {
     return if (accent == lens_socket.julia_pink) panel_julia else panel;
+}
+
+/// Website palette (index.html): the low-contrast border that DEFINES a card
+/// against the background — ~15 levels lighter than the `#1b1b1b` fill, so it
+/// reads as a soft edge, not a hard outline. The single origin for the future
+/// light mode to swap.
+const card_line: u32 = 0xFF2A2A2A;
+
+/// Draw a CONTAINER panel: a subtle 1px border with `fill` on top. The border is
+/// a slightly-larger rounded rect UNDERNEATH — the "ring" trick, since the rect
+/// vocabulary can't stroke a rounded outline directly. Use for surfaces that HOLD
+/// content (cards, menus, the composer); controls (pills/toggles) stay borderless
+/// so the app doesn't read busy. Solid fill + this edge is the cure for the drab
+/// translucent-over-field mush.
+fn cardBox(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, w: i32, h: i32, radius: u8, fill: u32) error{OutOfMemory}!void {
+    const r2: u8 = if (radius >= 255) 255 else radius + 1;
+    try rect(gpa, dl, x - 1, y - 1, w + 2, h + 2, card_line, r2);
+    try rect(gpa, dl, x, y, w, h, fill, radius);
 }
 
 /// A chat bubble's fill — FULLY OPAQUE, so a message reads as a solid bubble,
@@ -616,8 +634,9 @@ pub fn homeSocketGeom(width: i32) lens_socket.Geometry {
 }
 const wide_min: i32 = rail_w + feed_w + side_w + 40; // ~1244
 
-const panel: u32 = 0xCC1E1C16; // sidebar cards: mostly solid over the field
-const panel_hover: u32 = 0xD8262420; // a card under the pointer — lifted, not lit
+const panel: u32 = 0xFF1B1B1B; // cards/menus: the website's solid grey (#1b1b1b),
+//                                opaque now — a crisp surface, not a translucent tint
+const panel_hover: u32 = 0xFF242424; // a card under the pointer — a hair lighter
 
 const Metrics = struct {
     col_x: i32, // feed column
@@ -676,6 +695,12 @@ pub const ToyKind = enum(u8) { none, gravity, zero_g, liquid, tectonic, depth, l
 /// not appear in this feed-facing selection's draw path.
 pub const ToyView = struct {
     feed_toy: ToyKind = .none,
+    /// Animation time in seconds (the shell's clock, handed in as a plain value
+    /// per B3/B4) — drives the Zero-G drift and the Liquid ripple phase.
+    t: f32 = 0,
+    /// Liquid slosh amplitude in px — a scroll-velocity-kicked spring the shell
+    /// steps and settles to 0 (plain value; the core never reads the scroll state).
+    flow: f32 = 0,
 };
 
 /// The geometry `layout()` would compute for a given window width + screen,
@@ -1667,7 +1692,7 @@ fn drawSidebar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, sx: 
     const searching = so > 0.02;
 
     // search field (lights up while open)
-    try rect(gpa, dl, x0, 28, w, 46, skinPanel(accent), 13);
+    try cardBox(gpa, dl, x0, 28, w, 46, 13, skinPanel(accent));
     if (searching) {
         try rect(gpa, dl, x0, 28, w, 2, accent_house, 0);
         try rect(gpa, dl, x0, 72, w, 2, accent_house, 0);
@@ -1704,7 +1729,7 @@ fn drawSidebar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, sx: 
     // trending — pushed down by the open search tile
     const ty: i32 = 92 + push;
     const th: i32 = 234;
-    try rect(gpa, dl, x0, ty, w, th, skinPanel(accent), 15);
+    try cardBox(gpa, dl, x0, ty, w, th, 15, skinPanel(accent));
     _ = try str(gpa, dl, e, .semibold, x0 + 18, ty + 28, faint, 12, "TRENDING");
     const trends = [_][3][]const u8{
         .{ "protocol", "at://small-net", "2,481 posts" },
@@ -1723,7 +1748,7 @@ fn drawSidebar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, sx: 
     // who to follow
     const wy: i32 = ty + th + 18;
     const wh: i32 = 196;
-    try rect(gpa, dl, x0, wy, w, wh, skinPanel(accent), 15);
+    try cardBox(gpa, dl, x0, wy, w, wh, 15, skinPanel(accent));
     _ = try str(gpa, dl, e, .semibold, x0 + 18, wy + 28, faint, 12, "WHO TO FOLLOW");
     const who = [_][2][]const u8{ .{ "Desh", "@desh.zat" }, .{ "atlas", "@atlas.zat" }, .{ "rune", "@rune.zat" } };
     const tints = [_]u32{ 0xFF9FB0C7, 0xFFC9A87A, 0xFFB59EC9 };
@@ -2481,6 +2506,27 @@ pub fn layout(
                 const stagger: i32 = if (pi % 2 == 1) 54 else 0;
                 const dx = @as(f32, @floatFromInt(screen_x - m.col_x));
                 const dy = @as(f32, @floatFromInt(stagger));
+                transformDlRange(dl, dl_start, dl.len, 1.0, 0, 0, dx, dy);
+                if (regions) |rg| transformRegionsRange(rg, rg_start, rg.items.len, 1.0, 0, 0, dx, dy);
+            },
+            .zero_g => {
+                // Weightless drift: each post floats on a slow 2-D Lissajous, its
+                // phase seeded by index so they wander independently. A pure
+                // function of (time, index) — no persistent state, no scroll.
+                const ph = @as(f32, @floatFromInt(pi)) * 1.7;
+                const dx = @sin(toys.t * 0.55 + ph) * 15.0 + @sin(toys.t * 0.21 + ph * 2.3) * 6.0;
+                const dy = @sin(toys.t * 0.73 + ph * 1.3) * 11.0 + @cos(toys.t * 0.29 + ph) * 5.0;
+                transformDlRange(dl, dl_start, dl.len, 1.0, 0, 0, dx, dy);
+                if (regions) |rg| transformRegionsRange(rg, rg_start, rg.items.len, 1.0, 0, 0, dx, dy);
+            },
+            .liquid => {
+                // Sloshing: a horizontal wave whose amplitude is the shell's
+                // scroll-kicked `flow` spring; the per-post phase makes the column
+                // ripple like water and settle when flow decays to 0.
+                const ph = @as(f32, @floatFromInt(pi)) * 0.6;
+                const amp = toys.flow;
+                const dx = @sin(toys.t * 5.0 - ph) * amp;
+                const dy = @cos(toys.t * 4.2 - ph) * amp * 0.3;
                 transformDlRange(dl, dl_start, dl.len, 1.0, 0, 0, dx, dy);
                 if (regions) |rg| transformRegionsRange(rg, rg_start, rg.items.len, 1.0, 0, 0, dx, dy);
             },
@@ -4463,6 +4509,14 @@ fn drawSettings(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: 
     _ = try str(gpa, dl, e, .semibold, detail_x, detail_y0 + 24, ink, 22, sec.label);
     var dy = detail_y0 + 50;
 
+    // The Toy Box gets a bespoke DETAIL layout: category headers over a grid of
+    // tiles (the flat single column was overwhelming). Every other section keeps
+    // the generic grouped-card list below. Same rows table, same tap handling.
+    if (ss == settings_view.sec_toybox and !phone) {
+        const bottom = try drawToyBoxDetail(gpa, dl, e, regions, detail_x, dy, detail_w, height, accent, toggles, account, choices, picking);
+        return @max(ly, bottom) - scroll + 40;
+    }
+
     // Precompute the contiguous groups of this section, in order, with counts —
     // so each card's background can be drawn at its full height behind its rows.
     var group_ids: [32]u8 = undefined;
@@ -4492,8 +4546,7 @@ fn drawSettings(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: 
         const gid = group_ids[g];
         const card_h = group_cnt[g] * row_h;
         if (dy + card_h > 0 and dy < height) {
-            try rect(gpa, dl, detail_x, dy, detail_w, card_h, skinPanel(accent), 14);
-            try rect(gpa, dl, detail_x, dy, detail_w, 1, 0x14EDEAE0, 14); // lit top edge
+            try cardBox(gpa, dl, detail_x, dy, detail_w, card_h, 14, skinPanel(accent));
             var k: i32 = 0;
             for (settings_view.rows, 0..) |r, ridx| {
                 if (r.section != ss or r.group != gid) continue;
@@ -4523,6 +4576,105 @@ fn drawSettings(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: 
     };
 
     return @max(ly, dy) - scroll + 40;
+}
+
+/// The Toy Box detail pane: each category (a row group) becomes a titled GRID of
+/// tiles instead of one long single-column list. Toggles / choices / the pet-name
+/// field reuse `drawSettingsRow` inside a tile box, so tap handling, the choice
+/// popover, and live state are all unchanged (the shell sees the same `.settings_
+/// row` / `.settings_choice` regions). The "feed motion" category renders as a
+/// pick-one selectable-card grid, since those toys are mutually exclusive. Returns
+/// the bottom Y (scrolled coords). PURE — walks the `settings_view` table.
+fn drawToyBoxDetail(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, regions: ?*Regions, x: i32, y0: i32, w: i32, height: i32, accent: u32, toggles: u64, account: SettingsAccount, choices: u64, picking: u8) error{OutOfMemory}!i32 {
+    const col_gap: i32 = 14;
+    const tile_w = @divTrunc(w - col_gap, 2); // two columns
+    const tile_h: i32 = 60;
+    const tile_gap: i32 = 12;
+
+    // Distinct groups (categories) of the Toy Box section, in table order.
+    var groups: [16]u8 = undefined;
+    var ng: usize = 0;
+    for (settings_view.rows) |r| {
+        if (r.section != settings_view.sec_toybox) continue;
+        if (ng == 0 or groups[ng - 1] != r.group) {
+            if (ng == groups.len) break;
+            groups[ng] = r.group;
+            ng += 1;
+        }
+    }
+
+    // The open choice's picker anchor (a Companion tile), drawn after the grid so
+    // it overlays the tiles beneath it.
+    var pick_act: u8 = 255;
+    var pick_x: i32 = 0;
+    var pick_y: i32 = 0;
+    var pick_w: i32 = 0;
+    var pick_top: i32 = 0;
+
+    var dy = y0;
+    for (0..ng) |gi| {
+        const gid = groups[gi];
+        const motion = gid == settings_view.toy_motion_group;
+
+        // Category header (+ a "pick one" hint over the mutually-exclusive group).
+        dy += if (gi == 0) 6 else 20;
+        _ = try str(gpa, dl, e, .semibold, x, dy + 14, muted, 13, settings_view.toyCategoryTitle(gid));
+        if (motion) {
+            const hint = "pick one";
+            const hw: i32 = @intCast(text.measure(e, .regular, hint, 12));
+            _ = try str(gpa, dl, e, .regular, x + w - hw, dy + 14, faint, 12, hint);
+        }
+        dy += 26;
+
+        // Tiles in two columns, wrapping.
+        var col: i32 = 0;
+        var row_top = dy;
+        for (settings_view.rows, 0..) |r, ridx| {
+            if (r.section != settings_view.sec_toybox or r.group != gid) continue;
+            const tx = x + col * (tile_w + col_gap);
+            const ty = row_top;
+            const on = (toggles >> @as(u6, @intCast(ridx))) & 1 != 0;
+            if (motion) {
+                // Pick-one card: the active toy fills with the accent, the rest sit
+                // as quiet panels. Tapping emits the same toggle region — the shell's
+                // mutual-exclusion clears the others (re-tapping the active = off).
+                const fill: u32 = if (on) (accent & 0x00FFFFFF) | 0xFF000000 else skinPanel(accent);
+                try cardBox(gpa, dl, tx, ty, tile_w, tile_h, 12, fill);
+                if (on) try rect(gpa, dl, tx, ty, tile_w, 2, 0x40FFFFFF, 12);
+                const lw: i32 = @intCast(text.measure(e, .semibold, r.label, 15));
+                _ = try str(gpa, dl, e, .semibold, tx + @divTrunc(tile_w - lw, 2), ty + @divTrunc(tile_h, 2) + 5, if (on) bg else ink, 15, r.label);
+                try emitRegion(gpa, regions, tx, ty, tile_w, tile_h, @intCast(ridx), .settings_row);
+            } else {
+                // A standard tile: a bordered panel + the shared row renderer inside.
+                try cardBox(gpa, dl, tx, ty, tile_w, tile_h, 12, skinPanel(accent));
+                try drawSettingsRow(gpa, dl, e, regions, r, @intCast(ridx), tx, ty, tile_w, tile_h, accent, toggles, account, choices);
+                // Anchor the choice popover under the open picker's tile.
+                if (r.kind == .choice and r.action == picking) {
+                    pick_act = r.action;
+                    pick_x = tx;
+                    pick_y = ty + tile_h;
+                    pick_top = ty;
+                    pick_w = tile_w;
+                }
+            }
+            col += 1;
+            if (col >= 2) {
+                col = 0;
+                row_top += tile_h + tile_gap;
+            }
+        }
+        if (col != 0) row_top += tile_h + tile_gap; // close a half-filled final row
+        dy = row_top;
+    }
+
+    // The open picker popover — flip ABOVE its tile if opening below runs off-screen.
+    if (pick_act != 255) if (settings_view.choiceOf(pick_act)) |ch| {
+        const th = @as(i32, @intCast(ch.options.len)) * 38 + 20;
+        const py2 = if (pick_y + th > height) pick_top - th else pick_y;
+        try drawChoicePopover(gpa, dl, e, regions, ch, pick_x, py2, pick_w, choices);
+    };
+
+    return dy;
 }
 
 /// Toy Box: Pet — the companion's base footprint (logical px, before size scale),
@@ -7739,6 +7891,49 @@ test "Toy Box tectonic: horizontal filmstrip returns strip width and stays tappa
     try std.testing.expect(extent > 900);
     // On-strip cards still emit tap regions (taps + GPU icons track the moved card).
     try std.testing.expect(regions.items.len > 0);
+}
+
+test "Toy Box zero-g / liquid: drift moves pixels, leaves scroll accounting exact" {
+    const gpa = std.testing.allocator;
+    var engine = try text.initEngine();
+    defer text.deinitEngine(gpa, &engine);
+    var dl: raster.DrawList = .{};
+    defer dl.deinit(gpa);
+
+    const posts = [_]PostView{
+        .{ .name = "A", .handle = "@a.zat", .age = "1m", .body = "a post that should float", .tint = 0xFFAAAAAA, .reply = 1, .boost = 0, .like = 2, .initial = 'A', .liked = false, .boosted = false },
+        .{ .name = "B", .handle = "@b.zat", .age = "2m", .body = "another post drifting in space", .tint = 0xFF999999, .reply = 0, .boost = 1, .like = 3, .initial = 'B', .liked = false, .boosted = false },
+    };
+
+    const sumText = struct {
+        fn f(d: *raster.DrawList) i64 {
+            var s: i64 = 0;
+            for (0..d.len) |i| if (d.get(i) == .text) {
+                const t = d.get(i).text;
+                s += @as(i64, t.x) + t.baseline;
+            };
+            return s;
+        }
+    }.f;
+
+    // Baseline height with no toy.
+    const h_none = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, null, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{});
+    const sum_none = sumText(&dl);
+
+    // Zero-G at a non-zero clock: height identical (scroll math untouched), pixels moved.
+    dl.clearRetainingCapacity();
+    const h_zg = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, null, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{ .feed_toy = .zero_g, .t = 3.0 });
+    try std.testing.expectEqual(h_none, h_zg);
+    try std.testing.expect(sum_none != sumText(&dl));
+
+    // Liquid with a live slosh amplitude also moves pixels; zero flow leaves it at rest.
+    dl.clearRetainingCapacity();
+    _ = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, null, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{ .feed_toy = .liquid, .t = 1.0, .flow = 40.0 });
+    try std.testing.expect(sum_none != sumText(&dl));
+
+    dl.clearRetainingCapacity();
+    _ = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, null, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{ .feed_toy = .liquid, .t = 1.0, .flow = 0.0 });
+    try std.testing.expectEqual(sum_none, sumText(&dl)); // flow 0 ⇒ settled, no offset
 }
 
 test "Toy Box XP skin: chrome emits from the base vocabulary and spans the frame" {
