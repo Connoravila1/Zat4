@@ -1097,7 +1097,10 @@ const field_grid_frag_src: [:0]const GLchar =
     \\  float rows = uViewport.y / uCell.y;
     \\  float lx = cols * 0.5 + cols * 0.18 * sin(uTime * 0.05);
     \\  float ly = rows * 0.28 + rows * 0.10 * sin(uTime * 0.07 + 1.0);
-    \\  float pool = max(0.0, 1.0 - distance(cell + 0.5, vec2(lx, ly)) / (cols * 0.85));
+    \\  // [FIELD-DARK TUNE #2] radius was cols*0.85 (near screen-wide → flood). Tighter
+    \\  // radius + squared falloff so the light REVEALS a region instead of lifting all.
+    \\  float pool = max(0.0, 1.0 - distance(cell + 0.5, vec2(lx, ly)) / (cols * 0.40));
+    \\  pool = pool * pool;
     \\  // CURSOR LIGHT: a soft, brighter halo follows the pointer and reveals
     \\  // the field around it — the field's own light mechanic, localized to you.
     \\  float cg = 0.0;
@@ -1111,10 +1114,22 @@ const field_grid_frag_src: [:0]const GLchar =
     \\      hp.y += 0.35;
     \\      cg = 0.62 * smoothstep(0.25, -0.45, juliaHeart(hp));
     \\    } else {
-    \\      cg = 0.55 * max(0.0, 1.0 - distance(cell + 0.5, uMouse) / 9.0);
+    \\      // [FIELD-CURSOR] a LAYERED light, not one flat gradient: a tight bright
+    \\      // core + a fainter, wider ring. Squared falloffs give it a real centre;
+    \\      // the contrast-reveal below breaks the edge on the glyphs so it scatters
+    \\      // into the medium instead of reading as a clean web-glow circle.
+    \\      float cd = distance(cell + 0.5, uMouse);
+    \\      float core = max(0.0, 1.0 - cd / 2.8);
+    \\      float ring = max(0.0, 1.0 - cd / 6.0);
+    \\      cg = 0.55 * core * core + 0.22 * ring * ring;
     \\    }
     \\  }
-    \\  float b = 0.38 + 0.55 * pool + cg;
+    \\  // [FIELD-DARK TUNE #1] ambient floor was 0.38 (whole screen lifted out of black).
+    \\  // Drop toward near-black at rest; the pool/cursor light does the revealing.
+    \\  float b = 0.08 + 0.70 * pool + cg;
+    \\  // [FIELD-LIGHT] how much EXTERNAL light reaches this cell (0 out in the quiet
+    \\  // field) — drives both the contrast-gain and the warm tint further down.
+    \\  float lit_amt = clamp(0.70 * pool + cg, 0.0, 1.0);
     \\  // persistent colour charge from effects (a like stains it red)
     \\  float dye = clamp(texture2D(uDye, (cell + 0.5) / uFieldSize).r, 0.0, 1.0);
     \\  // Amplify the persistent charge for VISIBILITY: dye diffuses thin as it
@@ -1148,18 +1163,29 @@ const field_grid_frag_src: [:0]const GLchar =
     \\    cov = max(cov, glow * 0.5);                   // bloom: soft halo beyond the glyphs
     \\  }
     \\  // cool grey-white, dimmer; tinting to the rose 'like' colour where dyed.
-    \\  float lum = clamp(0.35 + b * 0.45 + intensity * 0.30, 0.0, 1.05);
+    \\  // [FIELD-LIGHT #1 contrast-reveal] the light GAINS the cell's own texture
+    \\  // instead of adding a flat floor: peaks flare, gaps stay black even under the
+    \\  // pool, so the lit region reads as glittering material — not a filled grey disc.
+    \\  float lit = pow(clamp(intensity, 0.0, 1.0), 0.7);
+    \\  float lum = clamp(lit * (0.44 + 1.15 * b), 0.0, 1.10);
+    \\  // Julia hearts are explicit SDF glyphs (cov), not wave peaks — the
+    \\  // intensity-gated reveal above would leave them unlit (black) over the quiet
+    \\  // field. Restore an additive luminance floor for Julia mode so they read pink.
+    \\  if (uHeart > 0.5) lum = max(lum, 0.28 + b * 0.5 + intensity * 0.35);
     \\  // VIGNETTE: dim the ambient field toward the screen edges for depth +
     \\  // focus (the missing 'lighting'). Centre full, corners ~55%. Applied
     \\  // BEFORE the dye floor below, so red likes stay vivid even at the edges.
     \\  vec2 vn = gl_FragCoord.xy / uViewport;
-    \\  lum *= mix(0.5, 1.0, smoothstep(0.85, 0.15, distance(vn, vec2(0.5))));
+    \\  lum *= mix(0.62, 1.0, smoothstep(0.85, 0.15, distance(vn, vec2(0.5))));
     \\  // DEPTH: a slow large-scale undulation so the field reads as a VOLUME with
     \\  // near/far regions, not one flat plane. [REVERT: delete this line]
     \\  lum *= 0.86 + 0.14 * sin(cell.x * 0.06 + uTime * 0.025) * sin(cell.y * 0.08 - uTime * 0.02);
     \\  // glyph colour: dark→bright endpoints derived from uInk (cool grey-white
     \\  // normally; pink in Julia mode). The glow rides this, so it recolours too.
-    \\  vec3 base = mix(uInk * 0.52, uInk, clamp(0.28 + b * 0.5, 0.0, 1.0));
+    \\  vec3 base = mix(uInk * 0.52, uInk, clamp(0.06 + b * 0.6, 0.0, 1.0));
+    \\  // [FIELD-LIGHT #2 warm light] give the pool a temperature — tint the lit
+    \\  // region toward a warm lamp so it reads as illumination, not neutral fog.
+    \\  base = mix(base, base * vec3(1.0, 0.86, 0.66), lit_amt * 0.7);
     \\  vec3 col = mix(base, vec3(245.0, 80.0, 110.0) / 255.0, dyev);
     \\  lum = max(lum, dyev);                   // red reads even in quiet areas
     \\  lum += glow * 0.45;                     // bloom brightens around lit clusters

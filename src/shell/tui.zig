@@ -7860,8 +7860,8 @@ const Grid = struct {
 
 /// Field glyph cell — big enough to read the symbols, still many of them
 /// (matches the preview). The field grid is win/cell in physical pixels.
-const field_cell_w: u16 = 13;
-const field_cell_h: u16 = 17;
+const field_cell_w: u16 = 15;
+const field_cell_h: u16 = 20;
 /// The feed is authored for a fixed LOGICAL width and scaled to FILL the
 /// window (DPI): scale = window_width / design_w. So the three-pane keeps its
 /// cohesion at any window size and the type lands at design size, crisp.
@@ -9001,7 +9001,7 @@ fn paintComposeGpu(
     if (g.xp) gpu.clear(retro_clear_r, retro_clear_g, retro_clear_b) else if (g.julia) gpu.clear(julia_clear_r, julia_clear_g, julia_clear_b) else gpu.clear(gpu_clear_r, gpu_clear_g, gpu_clear_b);
     // Field glyph ink: cool grey-white normally; pink under Julia mode (the glow
     // rides the ink, so it pinks too). 0xA6ACBA = the shader's original bright endpoint.
-    const field_ink: u32 = if (g.julia) lens_socket.julia_field_ink else 0xFFA6ACBA;
+    const field_ink: u32 = if (g.julia) lens_socket.julia_field_ink else 0xFFFFFFFF;
     if (g.field_on and !g.xp) gpu.drawFieldGrid(&gs.grid, &gs.ramp, gs.mcx, gs.mcy, gs.t, @intCast(w), @intCast(h), 0, 0, field_ink, g.julia); // composer: no panel softening ("Living glyph field" off ⇒ flat; XP ⇒ teal desktop)
     gpu.feedDraw(&gs.feed, @intCast(w), @intCast(h));
     gpu.swap(&gs.g);
@@ -9820,7 +9820,7 @@ fn paintFrameGpu(
     // itself has broken into falling debris, so the field must render flat under it.
     const panel_l = if (gs.shatter_active) 0 else @as(f32, @floatFromInt(gs.content_x)) * scale;
     const panel_r = if (gs.shatter_active) 0 else @as(f32, @floatFromInt(gs.content_x + gs.content_w)) * scale;
-    const field_ink: u32 = if (g.julia) lens_socket.julia_field_ink else 0xFFA6ACBA;
+    const field_ink: u32 = if (g.julia) lens_socket.julia_field_ink else 0xFFFFFFFF;
     gs.grid.gain = g.field_gain; // Appearance → "Field intensity" choice
     if (g.field_on and !g.xp) gpu.drawFieldGrid(&gs.grid, &gs.ramp, gs.mcx, gs.mcy, gs.t, @intCast(w), @intCast(h), panel_l, panel_r, field_ink, g.julia); // "Living glyph field" off ⇒ flat background (XP ⇒ teal desktop)
     // Hover highlight (post wash + button highlight), BEHIND the feed so the
