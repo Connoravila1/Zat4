@@ -47,6 +47,7 @@ const chat_core = @import("../core/chat.zig");
 const chat_view_core = @import("../core/chat_view.zig");
 const spring = @import("../core/spring.zig");
 const shatter = @import("../core/shatter.zig");
+const pet_core = @import("../core/pet.zig");
 const gesture = @import("../core/gesture.zig");
 const chat_relay = @import("chat_relay.zig");
 const chat_e2ee = @import("chat_e2ee.zig");
@@ -632,6 +633,10 @@ const RunState = struct {
     gzones_q_buf: [64]u8,
     gzones_q_len: usize,
     gzones_q_focus: bool,
+    // Toy Box: the pet's name (an editable settings field).
+    pet_name_buf: [24]u8 = undefined,
+    pet_name_len: usize = 0,
+    pet_name_focus: bool = false,
     gzones_tab_t: f32,
     gzones_enter_t: f32,
     /// The open zone page's community stats (distinct posters + newest post),
@@ -1282,6 +1287,9 @@ fn initRunState(
     rs.gzones_q_buf = undefined;
     rs.gzones_q_len = 0;
     rs.gzones_q_focus = false;
+    rs.pet_name_buf = undefined;
+    rs.pet_name_len = 0;
+    rs.pet_name_focus = false;
     rs.gzones_tab_t = 0;
     rs.gzones_enter_t = 1;
     rs.zone_people = 0;
@@ -2551,10 +2559,13 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
         const depth_on = toggleOn(rs.toggle_bits, settings_view.act_depth);
         const tectonic_on = toggleOn(rs.toggle_bits, settings_view.act_tectonic);
         const gravity_on = toggleOn(rs.toggle_bits, settings_view.act_gravity);
+        const pet_on = toggleOn(rs.toggle_bits, settings_view.act_pet);
         const settings_account: feed_view.SettingsAccount = .{
             .handle = std.fmt.bufPrint(&rs.account_handle_buf, "@{s}", .{session.handle}) catch session.handle,
             .did = session.did,
             .pds = session.pds_url,
+            .pet_name = rs.pet_name_buf[0..rs.pet_name_len],
+            .pet_name_focus = rs.pet_name_focus,
         };
         // Choice selections → the effects (each frame, declarative like the toggles).
         const settings_choices_packed = packChoices(&rs.choice_sel);
@@ -2584,7 +2595,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .market_q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .market_q_focus = rs.gmarket_q_focus, .market_loading = rs.market_loading, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else .none } } else null;
+        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .market_q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .market_q_focus = rs.gmarket_q_focus, .market_loading = rs.market_loading, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else .none } } else null;
         switch (rs.mode) {
             .timeline => try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status),
             .compose => {
@@ -3119,6 +3130,51 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         else => {},
                     }
                     continue; // shatter consumes the pointer — no normal dispatch
+                };
+                // Toy Box: Pet — any input keeps it awake; scrolling feeds the
+                // doom-scroll signal; grab it to toss it (a tap pets it); and while
+                // it's out you can drag a profile picture from the feed to feed it.
+                if (rs.gpu_state) |*gs| if (toggleOn(rs.toggle_bits, settings_view.act_pet)) {
+                    gs.pet_interacted = true;
+                    if (pev.kind == .wheel) gs.pet_scroll_ms +|= 120;
+                    if (pev.kind == .move and gs.avatar_drag) {
+                        gs.avatar_x = @floatFromInt(rx);
+                        gs.avatar_y = @floatFromInt(ry);
+                    }
+                    const in_pet = rx >= gs.pet_x and rx < gs.pet_x + gs.pet_bw and ry >= gs.pet_y and ry < gs.pet_y + gs.pet_bh;
+                    if (pev.kind == .button_down and pev.button == 1 and in_pet) {
+                        gs.pet_grabbed = true;
+                        gs.pet_grab_dx = @as(f32, @floatFromInt(rx)) - gs.pet_px;
+                        gs.pet_grab_dy = @as(f32, @floatFromInt(ry)) - gs.pet_py;
+                        gs.pet_down_x = rx;
+                        gs.pet_down_y = ry;
+                        continue;
+                    }
+                    // Start dragging a profile picture out of the feed toward the pet.
+                    if (pev.kind == .button_down and pev.button == 1 and !in_pet and !gs.avatar_drag) {
+                        if (feed_view.hitTest(g.regions.items, rx, ry)) |h2| {
+                            if (h2.kind == .author) {
+                                gs.avatar_drag = true;
+                                gs.avatar_post = h2.post;
+                                gs.avatar_x = @floatFromInt(rx);
+                                gs.avatar_y = @floatFromInt(ry);
+                                continue; // dragging the avatar, not opening the profile
+                            }
+                        }
+                    }
+                    if (pev.kind == .button_up and pev.button == 1 and gs.pet_grabbed) {
+                        gs.pet_grabbed = false; // release → the drag velocity tosses it
+                        if (@abs(rx - gs.pet_down_x) + @abs(ry - gs.pet_down_y) < 8) gs.pet_petted = true; // a tap pets it
+                        continue;
+                    }
+                    if (pev.kind == .button_up and pev.button == 1 and gs.avatar_drag) {
+                        if (in_pet) { // dropped on the pet → feed it
+                            gs.pet_petted = true;
+                            gs.pet_fed = 26;
+                        }
+                        gs.avatar_drag = false;
+                        continue;
+                    }
                 };
                 switch (pev.kind) {
                     .wheel => {
@@ -4543,6 +4599,11 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         // bit; other toggles flip but do nothing
                                         // until wired). Non-toggle rows: inert.
                                         .settings_row => {
+                                            // The pet-name field: tapping it focuses the text box;
+                                            // tapping any other row gives the keyboard back.
+                                            if (hit.post < settings_view.rows.len and settings_view.rows[hit.post].action == settings_view.act_pet_name) {
+                                                rs.pet_name_focus = true;
+                                            } else rs.pet_name_focus = false;
                                             if (hit.post < settings_view.rows.len and settings_view.rows[hit.post].kind == .toggle) {
                                                 rs.toggle_bits ^= @as(u64, 1) << @intCast(hit.post);
                                                 // Layout-owning toys are mutually exclusive (they all
@@ -5124,6 +5185,20 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status);
                     continue;
                 }
+                // The Toy Box pet-name field: type a name (ASCII), Enter/Esc give
+                // the keyboard back, Backspace deletes. The name floats over the pet.
+                if (rs.gscreen == feed_view.screen_settings and rs.pet_name_focus) {
+                    if (zc == '\r' or zc == '\n' or zc == 27) {
+                        rs.pet_name_focus = false;
+                    } else if (zc == 8 or zc == 127) {
+                        if (rs.pet_name_len > 0) rs.pet_name_len -= 1;
+                    } else if (zc >= 0x20 and zc < 0x7f and rs.pet_name_len < rs.pet_name_buf.len) {
+                        rs.pet_name_buf[rs.pet_name_len] = @intCast(zc);
+                        rs.pet_name_len += 1;
+                    }
+                    try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status);
+                    continue;
+                }
                 // The marketplace search box: live filter per keystroke; Enter or
                 // Esc gives the keyboard back. ASCII (names/tags are).
                 if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1 and rs.gmarket_q_focus) {
@@ -5637,6 +5712,8 @@ fn typingOwnsKeyboard(rs: *const RunState) bool {
     if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1 and rs.gmarket_q_focus) return true;
     // The zones hub search-or-jump field.
     if (rs.gscreen == feed_view.screen_zones_browse and rs.gzones_q_focus) return true;
+    // The Toy Box pet-name field.
+    if (rs.gscreen == feed_view.screen_settings and rs.pet_name_focus) return true;
     return false;
 }
 
@@ -7746,6 +7823,9 @@ const Grid = struct {
     crt_on: bool = false,
     /// Toy Box "Show frame timing" — an fps/ms overlay.
     frametiming_on: bool = false,
+    /// Toy Box "Pet" — the corner companion is active (forces a per-frame rebuild
+    /// so it animates).
+    pet: bool = false,
     /// Toy Box layout toy (`.depth` = the engagement loom); `.none` = natural.
     toys: feed_view.ToyView = .{},
 };
@@ -7881,6 +7961,35 @@ const GpuState = struct {
     shatter_grab_dy: f32 = 0,
     shatter_down_x: i32 = 0, // pointer-down position, to tell a tap from a drag
     shatter_down_y: i32 = 0,
+    /// Toy Box: Pet — the companion's state + the activity accumulated since the
+    /// last step (reset each frame), plus its on-screen box for tap hit-testing.
+    pet: pet_core.State = .{},
+    pet_scroll_ms: u16 = 0,
+    pet_petted: bool = false,
+    pet_interacted: bool = false,
+    // The pet is a little free physics body: position/velocity/roll, whether it's
+    // held, and its on-screen box (scaled) for the tap/grab hit-test.
+    pet_px: f32 = 0,
+    pet_py: f32 = 0,
+    pet_vx: f32 = 0,
+    pet_vy: f32 = 0,
+    pet_roll: f32 = 0,
+    pet_grabbed: bool = false,
+    pet_grab_dx: f32 = 0,
+    pet_grab_dy: f32 = 0,
+    pet_down_x: i32 = 0,
+    pet_down_y: i32 = 0,
+    pet_seeded: bool = false,
+    pet_x: i32 = 0,
+    pet_y: i32 = 0,
+    pet_bw: i32 = 0,
+    pet_bh: i32 = 0,
+    // Feeding: a profile picture dragged out of the feed toward the pet.
+    avatar_drag: bool = false,
+    avatar_post: usize = 0,
+    avatar_x: f32 = 0,
+    avatar_y: f32 = 0,
+    pet_fed: u16 = 0, // frames of the "just ate" glow
     /// The SDF-icon pass (the heart's technique generalised) — crisp engagement /
     /// nav icons, one draw call each, replacing the aliased line-art.
     icon: gpu.IconRenderer,
@@ -9183,12 +9292,16 @@ fn paintFrameGpu(
     if (g.screen.* == feed_view.screen_settings) {
         settings_hover_sig ^= @as(u64, @bitCast(@as(i64, g.hover_x))) *% 0x9E37_79B1;
         settings_hover_sig ^= @as(u64, @bitCast(@as(i64, g.hover_y))) *% 0x85EB_CA77;
+        // The pet-name field is a live-editing input — fold its text + focus in so
+        // the settings frame rebuilds as you type.
+        settings_hover_sig ^= @as(u64, @intFromBool(g.settings_account.pet_name_focus)) *% 0x2545_F491_4F6C_DD1D;
+        for (g.settings_account.pet_name) |c| settings_hover_sig = settings_hover_sig *% 131 +% c;
     }
     const sig = feedSignature(items, g.scroll.*, w, h) ^ (@as(u64, g.screen.*) *% 0x9E37_79B9_7F4A_7C15) ^ (socket_sig *% 0xD1B5_4A32_D192_ED03) ^ (@as(u64, g.settings_section) *% 0xC2B2_AE3D_27D4_EB4F) ^ (g.settings_toggles *% 0x9E6C_63D0_676A_9A99) ^ (g.settings_choices *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, g.settings_picking) *% 0x8A91_7F2B_4D3E_61C7) ^ (@as(u64, @intFromBool(g.inspect_source)) *% 0xF29C_511C_8E3D_45A7) ^ (@as(u64, @intFromBool(g.inspect_loading)) *% 0xBF58_476D_1CE4_E5B9) ^ chat_sig ^ zones_sig ^ (exp_sig *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, if (g.repost_menu) |m| m + 1 else 0) *% 0xA0761D6478BD642F) ^ settings_hover_sig;
     // A drag/settle animates the socket every frame (lift, reflow, ghost), so
     // bypass the feed cache while it runs — a brief interaction, and the field
     // already rebuilds every frame anyway.
-    if (sig != gs.feed_sig or gs.feed.verts.items.len == 0 or g.socket_ui.drag_active != null or search_animating or zones_animating or drawer_animating or rail_hover_animating or algo_animating or chat_animating or g.screen.* == feed_view.screen_loadout or g.frametiming_on or gs.shatter_active) {
+    if (sig != gs.feed_sig or gs.feed.verts.items.len == 0 or g.socket_ui.drag_active != null or search_animating or zones_animating or drawer_animating or rail_hover_animating or algo_animating or chat_animating or g.screen.* == feed_view.screen_loadout or g.frametiming_on or gs.shatter_active or g.pet) {
         gs.feed_sig = sig;
         // An empty timeline renders the chrome with no posts (no placeholders).
         const feed_posts = feed_view.fromTimeline(arena, items, now, g.expanded) catch &[_]feed_view.PostView{};
@@ -9477,6 +9590,87 @@ fn paintFrameGpu(
                     feed_view.drawTooltip(gpa, g.draw, g.engine, g.hover_x, g.hover_y, 0, @intCast(gs.design_w), help) catch {};
                 }
             }
+        }
+        // Toy Box: Pet — step the pure state machine on this frame's activity, then
+        // draw the companion in the bottom-right, on top of everything. Its box is
+        // stored for the tap hit-test (clicking it "pets" it).
+        if (g.pet) {
+            const act: pet_core.Activity = .{ .petted = gs.pet_petted, .scroll_ms = gs.pet_scroll_ms, .interacted = gs.pet_interacted };
+            const dt_ms: u32 = @intFromFloat(std.math.clamp(gs.frame_ms, 0.0, 100.0));
+            gs.pet = pet_core.step(gs.pet, dt_ms, act);
+            gs.pet_petted = false;
+            gs.pet_scroll_ms = 0;
+            gs.pet_interacted = false;
+
+            const size_ci: u6 = @intCast((settings_view.choiceIndex(settings_view.act_pet_size) orelse 0) * 3);
+            const color_ci: u6 = @intCast((settings_view.choiceIndex(settings_view.act_pet_color) orelse 0) * 3);
+            const pscale = feed_view.petScale(@intCast((g.settings_choices >> size_ci) & 7));
+            const pcolor = feed_view.petColor(@intCast((g.settings_choices >> color_ci) & 7));
+            const pw_s = @as(f32, @floatFromInt(feed_view.pet_w)) * pscale;
+            const ph_s = @as(f32, @floatFromInt(feed_view.pet_h)) * pscale;
+            const wf: f32 = @floatFromInt(gs.design_w);
+            const floor_y: f32 = @as(f32, @floatFromInt(lh)) - 30.0; // the cushion from the bottom
+            if (!gs.pet_seeded) {
+                gs.pet_px = wf - pw_s - 26.0;
+                gs.pet_py = floor_y - ph_s;
+                gs.pet_vx = 0;
+                gs.pet_vy = 0;
+                gs.pet_roll = 0;
+                gs.pet_seeded = true;
+            }
+            const dt: f32 = std.math.clamp(gs.frame_ms / 1000.0, 0.0, 0.05);
+            if (gs.pet_grabbed) {
+                // Follow the cursor; track velocity so releasing TOSSES it.
+                const tx = @as(f32, @floatFromInt(g.hover_x)) - gs.pet_grab_dx;
+                const ty = @as(f32, @floatFromInt(g.hover_y)) - gs.pet_grab_dy;
+                const dtc = @max(dt, 0.004);
+                gs.pet_vx = (tx - gs.pet_px) / dtc;
+                gs.pet_vy = (ty - gs.pet_py) / dtc;
+                gs.pet_px = tx;
+                gs.pet_py = ty;
+            } else {
+                gs.pet_vy += 2600.0 * dt; // gravity
+                gs.pet_px += gs.pet_vx * dt;
+                gs.pet_py += gs.pet_vy * dt;
+                if (gs.pet_px < 0) {
+                    gs.pet_px = 0;
+                    gs.pet_vx = -gs.pet_vx * 0.5;
+                } else if (gs.pet_px + pw_s > wf) {
+                    gs.pet_px = wf - pw_s;
+                    gs.pet_vx = -gs.pet_vx * 0.5;
+                }
+                if (gs.pet_py + ph_s > floor_y) {
+                    gs.pet_py = floor_y - ph_s;
+                    if (gs.pet_vy > 220.0) gs.pet_vy = -gs.pet_vy * 0.45 else gs.pet_vy = 0;
+                    gs.pet_vx *= 0.90; // ground friction
+                }
+                // Roll from horizontal motion (ω = v / radius); settle upright when slow.
+                gs.pet_roll += (gs.pet_vx / (pw_s * 0.5)) * dt;
+                if (@abs(gs.pet_vx) < 12.0) gs.pet_roll -= gs.pet_roll * @min(1.0, 8.0 * dt);
+            }
+            gs.pet_x = @intFromFloat(gs.pet_px);
+            gs.pet_y = @intFromFloat(gs.pet_py);
+            gs.pet_bw = @intFromFloat(pw_s);
+            gs.pet_bh = @intFromFloat(ph_s);
+            // Feeding: a profile picture dragged from the feed — dim the original
+            // in its post, and float the token toward the pet.
+            if (gs.avatar_drag and gs.avatar_post < feed_posts.len) {
+                for (g.regions.items) |rgn| {
+                    if (rgn.kind == .author and rgn.post == gs.avatar_post) {
+                        feed_view.dimAvatar(gpa, g.draw, rgn.x, rgn.y, rgn.w, rgn.h) catch {};
+                    }
+                }
+                const ap = feed_posts[gs.avatar_post];
+                feed_view.drawAvatarToken(gpa, g.draw, g.engine, @intFromFloat(gs.avatar_x), @intFromFloat(gs.avatar_y), 44, ap.tint, ap.initial) catch {};
+            }
+            // Excited face while held, airborne, or freshly fed; otherwise its mood.
+            const airborne = gs.pet_py + ph_s < floor_y - 4.0;
+            if (gs.pet_fed > 0) gs.pet_fed -= 1;
+            const anim_draw: u8 = if (gs.pet_grabbed or airborne or gs.pet_fed > 0) 4 else @intFromEnum(gs.pet.anim);
+            feed_view.drawPet(gpa, g.draw, g.engine, gs.pet_x, gs.pet_y, anim_draw, gs.t * 2.4, gs.pet_roll, pscale, pcolor, g.accent, g.settings_account.pet_name) catch {};
+        } else {
+            gs.pet_seeded = false; // re-toggling drops it back in the corner
+            gs.avatar_drag = false;
         }
         gpu.feedBuild(&gs.feed, gpa, g.engine, g.draw.slice(), scale) catch {};
 

@@ -34,6 +34,9 @@ pub const RowKind = enum(u8) {
     info,
     /// Label + a range track (later; field intensity, text size).
     slider,
+    /// Label + an editable one-line TEXT field (the pet's name). Tapping focuses
+    /// it; the shell routes keystrokes into a buffer and hands the live value back.
+    textfield,
 };
 
 /// Section identity. The list order in `sections` is the on-screen order; these
@@ -83,6 +86,10 @@ pub const act_field_intensity: u8 = 11; // Appearance: the field's brightness (u
 pub const act_depth: u8 = 12; // Toy Box: Depth feed — posts loom/recede by engagement
 pub const act_tectonic: u8 = 13; // Toy Box: Tectonic timeline — horizontal filmstrip feed
 pub const act_gravity: u8 = 14; // Toy Box: Gravity — posts fall and pile at the bottom
+pub const act_pet: u8 = 15; // Toy Box: Pet — a companion in the corner
+pub const act_pet_color: u8 = 16; // Toy Box: Pet colour (choice)
+pub const act_pet_size: u8 = 17; // Toy Box: Pet size (choice)
+pub const act_pet_name: u8 = 18; // Toy Box: Pet name (text field)
 
 /// Optional one-line explainer shown as a HOVER TOOLTIP over a row — opt-in per
 /// action, empty for the rest. Kept out of band (a switch, not a `Row` field) so
@@ -93,6 +100,7 @@ pub fn helpText(action: u8) []const u8 {
         act_depth => "Posts scale by engagement — the liveliest posts loom nearest while quiet ones recede. Purely cosmetic; changes nothing about the feed itself.",
         act_tectonic => "The feed becomes a horizontal filmstrip — posts lay out left to right as cards, and scrolling pans sideways through them. Purely cosmetic.",
         act_gravity => "Posts get weight and fall — they drop and pile up at the bottom of the feed, with the most-liked posts falling hardest. Purely cosmetic.",
+        act_pet => "A little companion lives in the corner. It gets hungry and sleepy over time, sulks if you doom-scroll, and cheers up when you click to pet it.",
         else => "",
     };
 }
@@ -120,6 +128,8 @@ pub const Choice = struct {
 pub const choices = [_]Choice{
     .{ .action = act_accent, .default = 0, .options = &.{ "Auto", "Amber", "Blue", "Green", "Violet", "Rose", "Teal" } },
     .{ .action = act_field_intensity, .default = 1, .options = &.{ "Subtle", "Normal", "Vivid" } },
+    .{ .action = act_pet_color, .default = 0, .options = &.{ "Blue", "Mint", "Rose", "Amber", "Violet", "Grey" } },
+    .{ .action = act_pet_size, .default = 1, .options = &.{ "Small", "Medium", "Large" } },
 };
 
 /// The Choice for `action`, or null if it isn't a wired choice.
@@ -255,6 +265,12 @@ pub const rows = [_]Row{
     .{ .section = sec_toybox, .group = 2, .kind = .toggle, .action = act_depth, .flags = 0, .label = "Depth feed", .value = "" },
     .{ .section = sec_toybox, .group = 2, .kind = .toggle, .action = act_tectonic, .flags = 0, .label = "Tectonic timeline", .value = "" },
     .{ .section = sec_toybox, .group = 2, .kind = .toggle, .action = act_gravity, .flags = 0, .label = "Gravity", .value = "" },
+    // Independent overlay (stacks with any feed toy) — not a layout toy. The
+    // colour + size options sit beneath it (they apply whenever the pet is on).
+    .{ .section = sec_toybox, .group = 3, .kind = .toggle, .action = act_pet, .flags = 0, .label = "Pet", .value = "" },
+    .{ .section = sec_toybox, .group = 3, .kind = .choice, .action = act_pet_color, .flags = 0, .label = "Pet colour", .value = "Blue" },
+    .{ .section = sec_toybox, .group = 3, .kind = .choice, .action = act_pet_size, .flags = 0, .label = "Pet size", .value = "Medium" },
+    .{ .section = sec_toybox, .group = 3, .kind = .textfield, .action = act_pet_name, .flags = 0, .label = "Pet name", .value = "" },
 
     // ── About ────────────────────────────────────────────────────────────
     .{ .section = sec_about, .group = 0, .kind = .info, .action = act_none, .flags = 0, .label = "Version", .value = "0.1.0-dev" },

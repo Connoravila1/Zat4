@@ -388,6 +388,8 @@ pub const SettingsAccount = struct {
     handle: []const u8 = "", // already "@handle" form
     did: []const u8 = "",
     pds: []const u8 = "",
+    pet_name: []const u8 = "", // the pet's name (editable text field)
+    pet_name_focus: bool = false, // draw the caret when the field is focused
 };
 
 /// A pen position (where the next glyph — and so the text cursor — would land)
@@ -4517,6 +4519,138 @@ fn drawSettings(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: 
     return @max(ly, dy) - scroll + 40;
 }
 
+/// Toy Box: Pet — the companion's base footprint (logical px, before size scale),
+/// so the shell places it and hit-tests taps against the same box.
+pub const pet_w: i32 = 66;
+pub const pet_h: i32 = 66;
+
+/// The pet body colour for a "Pet colour" choice index.
+pub fn petColor(idx: u8) u32 {
+    return switch (idx) {
+        1 => 0xFFB8E6C8, // mint
+        2 => 0xFFF2B6C6, // rose
+        3 => 0xFFF1D89C, // amber
+        4 => 0xFFD3BCEC, // violet
+        5 => 0xFFC6CCD6, // grey
+        else => 0xFFCBD6EE, // blue
+    };
+}
+
+/// The "Pet size" choice index → a draw scale.
+pub fn petScale(idx: u8) f32 {
+    return switch (idx) {
+        0 => 0.75, // small
+        2 => 1.45, // large
+        else => 1.0, // medium
+    };
+}
+
+fn petRot(fx: f32, fy: f32, cr: f32, sr: f32, cx: f32, cy: f32) [2]i32 {
+    return .{ @intFromFloat(cx + fx * cr - fy * sr), @intFromFloat(cy + fx * sr + fy * cr) };
+}
+
+/// Draw the Pet: a hand-rolled blob at (ox, oy) top-left of its `scale`d box. Its
+/// face is chosen by `anim` (0 idle, 1 happy, 2 sulk, 3 sleep, 4 excited-when-
+/// thrown); `roll` spins the features around the round body so a flung pet tumbles
+/// like a ball; `body` is its colour; `name` (if any) floats over its head. Bobs on
+/// `phase`. No sprite asset — pure vector vocabulary. PURE.
+pub fn drawPet(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, ox: i32, oy: i32, anim: u8, phase: f32, roll: f32, scale: f32, body: u32, accent: u32, name: []const u8) error{OutOfMemory}!void {
+    const dark: u32 = 0xFF262A36;
+    const s = scale;
+    const R: f32 = 28.0 * s; // body radius
+    const bob: f32 = @sin(phase) * 3.0 * s;
+    const halfw = @as(f32, @floatFromInt(pet_w)) * s * 0.5;
+    const halfh = @as(f32, @floatFromInt(pet_h)) * s * 0.5;
+    const cx = @as(f32, @floatFromInt(ox)) + halfw;
+    const cy = @as(f32, @floatFromInt(oy)) + halfh + bob;
+    const cr = @cos(roll);
+    const sr = @sin(roll);
+    const rad: u8 = @intFromFloat(@min(255.0, R));
+    const dot: i32 = @intFromFloat(@max(3.0, 6.0 * s));
+    // Ground shadow (fixed to the box bottom, doesn't bob).
+    try rect(gpa, dl, ox + @as(i32, @intFromFloat(6.0 * s)), oy + @as(i32, @intFromFloat(@as(f32, @floatFromInt(pet_h)) * s - 4.0)), @intFromFloat(@as(f32, @floatFromInt(pet_w)) * s - 12.0), @intFromFloat(@max(4.0, 7.0 * s)), 0x40000000, 4);
+    // Ears + feet at rotated offsets (they orbit as it rolls), then the round body.
+    const ear = petRot(R * 0.55, -R * 0.9, cr, sr, cx, cy);
+    const ear2 = petRot(-R * 0.55, -R * 0.9, cr, sr, cx, cy);
+    const foot = petRot(R * 0.42, R * 0.82, cr, sr, cx, cy);
+    const foot2 = petRot(-R * 0.42, R * 0.82, cr, sr, cx, cy);
+    const es: i32 = @intFromFloat(@max(6.0, 13.0 * s));
+    try rect(gpa, dl, ear[0] - @divTrunc(es, 2), ear[1] - es, es, @intFromFloat(15.0 * s), body, @intFromFloat(6.0 * s));
+    try rect(gpa, dl, ear2[0] - @divTrunc(es, 2), ear2[1] - es, es, @intFromFloat(15.0 * s), body, @intFromFloat(6.0 * s));
+    try rect(gpa, dl, foot[0] - @divTrunc(es, 2), foot[1], es, @intFromFloat(10.0 * s), body, @intFromFloat(5.0 * s));
+    try rect(gpa, dl, foot2[0] - @divTrunc(es, 2), foot2[1], es, @intFromFloat(10.0 * s), body, @intFromFloat(5.0 * s));
+    try rect(gpa, dl, @intFromFloat(cx - R), @intFromFloat(cy - R * 0.92), @intFromFloat(R * 2.0), @intFromFloat(R * 1.84), body, rad);
+    // Face — feature centres rotate with the roll; expressions drawn at them.
+    const le = petRot(-R * 0.4, -R * 0.08, cr, sr, cx, cy);
+    const re = petRot(R * 0.4, -R * 0.08, cr, sr, cx, cy);
+    const mo = petRot(0, R * 0.42, cr, sr, cx, cy);
+    switch (anim) {
+        1, 4 => { // happy / excited: dot eyes (bigger when excited), open smile
+            const big: i32 = if (anim == 4) dot + 3 else dot;
+            try rect(gpa, dl, le[0] - @divTrunc(big, 2), le[1] - @divTrunc(big, 2), big, big, dark, @intCast(@divTrunc(big, 2)));
+            try rect(gpa, dl, re[0] - @divTrunc(big, 2), re[1] - @divTrunc(big, 2), big, big, dark, @intCast(@divTrunc(big, 2)));
+            try rect(gpa, dl, mo[0] - @as(i32, @intFromFloat(7.0 * s)), mo[1] - @as(i32, @intFromFloat(2.0 * s)), @intFromFloat(14.0 * s), @intFromFloat(8.0 * s), dark, @intFromFloat(4.0 * s));
+            const blush = (accent & 0x00FFFFFF) | 0x55000000;
+            try rect(gpa, dl, le[0] - @as(i32, @intFromFloat(9.0 * s)), le[1] + @as(i32, @intFromFloat(6.0 * s)), @intFromFloat(7.0 * s), @intFromFloat(5.0 * s), blush, 3);
+            try rect(gpa, dl, re[0] + @as(i32, @intFromFloat(2.0 * s)), re[1] + @as(i32, @intFromFloat(6.0 * s)), @intFromFloat(7.0 * s), @intFromFloat(5.0 * s), blush, 3);
+        },
+        2 => { // sulk: dot eyes, a frown (inverted line pair)
+            try rect(gpa, dl, le[0] - @divTrunc(dot, 2), le[1] - @divTrunc(dot, 2), dot, dot, dark, @intCast(@divTrunc(dot, 2)));
+            try rect(gpa, dl, re[0] - @divTrunc(dot, 2), re[1] - @divTrunc(dot, 2), dot, dot, dark, @intCast(@divTrunc(dot, 2)));
+            const fw: i32 = @intFromFloat(7.0 * s);
+            try line(gpa, dl, mo[0] - fw, mo[1] + fw, mo[0], mo[1], dark, 2);
+            try line(gpa, dl, mo[0], mo[1], mo[0] + fw, mo[1] + fw, dark, 2);
+        },
+        3 => { // sleep: closed eyes, a little o, rising z's
+            const lw: i32 = @intFromFloat(9.0 * s);
+            try rect(gpa, dl, le[0] - @divTrunc(lw, 2), le[1], lw, 2, dark, 1);
+            try rect(gpa, dl, re[0] - @divTrunc(lw, 2), re[1], lw, 2, dark, 1);
+            try rect(gpa, dl, mo[0] - @divTrunc(dot, 2), mo[1] - @divTrunc(dot, 2), dot, dot, dark, @intCast(@divTrunc(dot, 2)));
+            const zt: i32 = @intFromFloat(@sin(phase) * 3.0);
+            _ = try str(gpa, dl, e, .semibold, @as(i32, @intFromFloat(cx + R)), @as(i32, @intFromFloat(cy - R)) + zt, dark, 13, "z");
+            _ = try str(gpa, dl, e, .semibold, @as(i32, @intFromFloat(cx + R + 10.0)), @as(i32, @intFromFloat(cy - R - 14.0)), dark, 16, "z");
+        },
+        else => { // idle: dot eyes (occasional blink), neutral mouth line
+            if (@sin(phase * 0.8) > 0.94) {
+                const lw: i32 = @intFromFloat(8.0 * s);
+                try rect(gpa, dl, le[0] - @divTrunc(lw, 2), le[1], lw, 2, dark, 1);
+                try rect(gpa, dl, re[0] - @divTrunc(lw, 2), re[1], lw, 2, dark, 1);
+            } else {
+                try rect(gpa, dl, le[0] - @divTrunc(dot, 2), le[1] - @divTrunc(dot, 2), dot, dot, dark, @intCast(@divTrunc(dot, 2)));
+                try rect(gpa, dl, re[0] - @divTrunc(dot, 2), re[1] - @divTrunc(dot, 2), dot, dot, dark, @intCast(@divTrunc(dot, 2)));
+            }
+            const mw: i32 = @intFromFloat(11.0 * s);
+            try rect(gpa, dl, mo[0] - @divTrunc(mw, 2), mo[1], mw, @intFromFloat(@max(2.0, 3.0 * s)), dark, 1);
+        },
+    }
+    // The pet's NAME floats over its head.
+    if (name.len > 0) {
+        const npx: u16 = 14;
+        const nw: i32 = @intCast(text.measure(e, .semibold, name, npx));
+        const ny = @as(i32, @intFromFloat(cy - R - 12.0 * s)) - 8;
+        try rect(gpa, dl, @intFromFloat(cx - @as(f32, @floatFromInt(nw)) * 0.5 - 7.0), ny - 14, nw + 14, 20, 0xCC1E1C16, 9);
+        _ = try str(gpa, dl, e, .semibold, @intFromFloat(cx - @as(f32, @floatFromInt(nw)) * 0.5), ny, 0xFFF2EEE4, npx, name);
+    }
+}
+
+/// Toy Box: Pet — dim the spot a profile picture was plucked from (a dark disc
+/// over the original avatar), so the post reads as having lost it while you drag.
+pub fn dimAvatar(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, w: i32, hh: i32) error{OutOfMemory}!void {
+    try rect(gpa, dl, x, y, w, hh, 0xC0141210, @intCast(@min(255, @divTrunc(w, 2))));
+}
+
+/// Toy Box: Pet — a floating avatar "token" (a coloured disc + the author's
+/// initial) at centre (cx, cy), drawn while you drag a profile picture out of the
+/// feed toward the pet to feed it. PURE.
+pub fn drawAvatarToken(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, cx: i32, cy: i32, size: i32, tint: u32, initial: u8) error{OutOfMemory}!void {
+    const r = @divTrunc(size, 2);
+    const px: u16 = @intCast(@divTrunc(size * 3, 5));
+    try rect(gpa, dl, cx - r, cy - r + 3, size, size, 0x55000000, @intCast(r)); // shadow
+    try rect(gpa, dl, cx - r, cy - r, size, size, tint, @intCast(r));
+    const iadv: i32 = @intCast(text.advance(e, .semibold, initial, px));
+    _ = try glyph1(gpa, dl, e, .semibold, cx - @divTrunc(iadv, 2), cy + @divTrunc(size, 4), 0xFF1A1712, px, initial);
+}
+
 /// Toy Box: Gravity SHATTER — the fixed EXIT box geometry (top-right corner), so
 /// the drawer and the input hit-test agree. Logical px.
 pub const shatter_exit_w: i32 = 88;
@@ -4864,6 +4998,24 @@ fn drawSettingsRow(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, 
             const ty = y + @divTrunc(h, 2);
             try rect(gpa, dl, tx, ty - 1, tw, 2, 0x33EDEAE0, 1);
             try rect(gpa, dl, tx + @divTrunc(tw, 2) - 6, ty - 7, 12, 14, accent, 6);
+        },
+        .textfield => { // the pet name — an editable one-line box
+            const fw: i32 = 156;
+            const fx = right - fw;
+            const fy = y + @divTrunc(h - 30, 2);
+            const focused = account.pet_name_focus;
+            try rect(gpa, dl, fx, fy, fw, 30, if (focused) 0x26EDEAE0 else 0x14EDEAE0, 8);
+            if (focused) try rect(gpa, dl, fx, fy + 28, fw, 2, (accent & 0x00FFFFFF) | 0xFF000000, 1);
+            const nm = account.pet_name;
+            if (nm.len > 0) {
+                _ = try str(gpa, dl, e, .regular, fx + 11, fy + 20, ink, 14, nm);
+            } else if (!focused) {
+                _ = try str(gpa, dl, e, .regular, fx + 11, fy + 20, faint, 14, "unnamed");
+            }
+            if (focused) {
+                const cw2: i32 = if (nm.len > 0) @intCast(text.measure(e, .regular, nm, 14)) else 0;
+                try rect(gpa, dl, fx + 11 + cw2 + 1, fy + 7, 2, 16, (accent & 0x00FFFFFF) | 0xFF000000, 1);
+            }
         },
         .action => {}, // label already drawn centred above
     }
