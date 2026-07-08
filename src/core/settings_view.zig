@@ -93,6 +93,7 @@ pub const act_pet_name: u8 = 18; // Toy Box: Pet name (text field)
 pub const act_xp: u8 = 19; // Toy Box: XP skin — a retro-OS desktop frame over the app
 pub const act_zero_g: u8 = 20; // Toy Box: Zero-G — posts drift weightlessly
 pub const act_liquid: u8 = 21; // Toy Box: Liquid — posts slosh with scroll inertia
+pub const act_light: u8 = 22; // Appearance: light mode — the whole app on a light canvas
 
 /// Optional one-line explainer shown as a HOVER TOOLTIP over a row — opt-in per
 /// action, empty for the rest. Kept out of band (a switch, not a `Row` field) so
@@ -246,7 +247,7 @@ pub const rows = [_]Row{
     .{ .section = sec_account, .group = 2, .kind = .action, .action = act_sign_out, .flags = flag_destructive, .label = "Sign out", .value = "" },
 
     // ── Appearance ───────────────────────────────────────────────────────
-    .{ .section = sec_appearance, .group = 0, .kind = .choice, .action = act_none, .flags = flag_wip, .label = "Theme", .value = "Dark" },
+    .{ .section = sec_appearance, .group = 0, .kind = .toggle, .action = act_light, .flags = 0, .label = "Light mode", .value = "" },
     .{ .section = sec_appearance, .group = 0, .kind = .choice, .action = act_accent, .flags = 0, .label = "Accent", .value = "Auto" },
     .{ .section = sec_appearance, .group = 0, .kind = .choice, .action = act_none, .flags = flag_wip, .label = "Text size", .value = "Medium" },
     .{ .section = sec_appearance, .group = 1, .kind = .toggle, .action = act_field, .flags = flag_on, .label = "Living glyph field", .value = "" },

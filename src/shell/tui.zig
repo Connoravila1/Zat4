@@ -2563,6 +2563,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
         const zerog_on = toggleOn(rs.toggle_bits, settings_view.act_zero_g);
         const liquid_on = toggleOn(rs.toggle_bits, settings_view.act_liquid);
         const xp_on = toggleOn(rs.toggle_bits, settings_view.act_xp);
+        const light_on = toggleOn(rs.toggle_bits, settings_view.act_light);
         // Toy Box XP skin: the shell reads the wall clock ONCE per frame (B3) and
         // hands the local hour/minute to the pure renderer as plain bytes (B4).
         const xp_hm = clock_shell.localHourMinute();
@@ -2601,7 +2602,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .market_q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .market_q_focus = rs.gmarket_q_focus, .market_loading = rs.market_loading, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
+        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .market_q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .market_q_focus = rs.gmarket_q_focus, .market_loading = rs.market_loading, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
         switch (rs.mode) {
             .timeline => try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status),
             .compose => {
@@ -7841,6 +7842,9 @@ const Grid = struct {
     pet: bool = false,
     /// Toy Box "XP skin" — the retro-desktop chrome overlay (title bar + taskbar).
     xp: bool = false,
+    /// Appearance "Light mode" — re-themes the whole draw list light (rethemeLight)
+    /// and flips the field to dark glyphs on a light canvas.
+    light: bool = false,
     /// Local wall-clock hour (0–23) / minute (0–59) for the XP taskbar clock —
     /// read by the shell (B3), consumed as plain data by the pure renderer (B4).
     xp_hour: u8 = 0,
@@ -7893,6 +7897,11 @@ const julia_clear_b: f32 = @as(f32, 0xF1) / 255.0;
 const retro_clear_r: f32 = @as(f32, 0x0E) / 255.0;
 const retro_clear_g: f32 = @as(f32, 0x7C) / 255.0;
 const retro_clear_b: f32 = @as(f32, 0x74) / 255.0;
+// Light mode: the soft warm-grey canvas the whole app + field ride on. Kept a
+// touch grey (not near-white) so the pure-white cards lift off it (elevation).
+const light_clear_r: f32 = @as(f32, 0xEC) / 255.0;
+const light_clear_g: f32 = @as(f32, 0xEB) / 255.0;
+const light_clear_b: f32 = @as(f32, 0xE4) / 255.0;
 
 fn uiScaleFor(physical_w: u32, dw: u32) f32 {
     return @as(f32, @floatFromInt(physical_w)) / @as(f32, @floatFromInt(dw));
@@ -8992,17 +9001,18 @@ fn paintComposeGpu(
     g.draw.len = 0;
     feed_view.layoutCompose(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.accent, ctx, reply_handle, quoting, draft, caret, sel_start, sel_end, blink_on, status, segments, tag_bar, g.draw, g.regions) catch {};
     if (g.julia) feed_view.juliaRemapText(g.draw); // light theme: dark text
+    if (g.light) feed_view.rethemeLight(gpa, g.draw) catch {};
     gpu.feedBuild(&gs.feed, gpa, g.engine, g.draw.slice(), scale) catch {};
     gs.feed_sig = 0; // force a timeline rebuild when the composer closes
 
     advanceField(gpa, gs, g.active);
 
     gpu.uploadField(&gs.grid, gs.field.height, gs.field.dye, gs.field.cols, gs.field.rows);
-    if (g.xp) gpu.clear(retro_clear_r, retro_clear_g, retro_clear_b) else if (g.julia) gpu.clear(julia_clear_r, julia_clear_g, julia_clear_b) else gpu.clear(gpu_clear_r, gpu_clear_g, gpu_clear_b);
+    if (g.xp) gpu.clear(retro_clear_r, retro_clear_g, retro_clear_b) else if (g.julia) gpu.clear(julia_clear_r, julia_clear_g, julia_clear_b) else if (g.light) gpu.clear(light_clear_r, light_clear_g, light_clear_b) else gpu.clear(gpu_clear_r, gpu_clear_g, gpu_clear_b);
     // Field glyph ink: cool grey-white normally; pink under Julia mode (the glow
     // rides the ink, so it pinks too). 0xA6ACBA = the shader's original bright endpoint.
-    const field_ink: u32 = if (g.julia) lens_socket.julia_field_ink else 0xFFFFFFFF;
-    if (g.field_on and !g.xp) gpu.drawFieldGrid(&gs.grid, &gs.ramp, gs.mcx, gs.mcy, gs.t, @intCast(w), @intCast(h), 0, 0, field_ink, g.julia); // composer: no panel softening ("Living glyph field" off ⇒ flat; XP ⇒ teal desktop)
+    const field_ink: u32 = if (g.julia) lens_socket.julia_field_ink else if (g.light) feed_view.light_field_ink else 0xFFFFFFFF;
+    if (g.field_on and !g.xp) gpu.drawFieldGrid(&gs.grid, &gs.ramp, gs.mcx, gs.mcy, gs.t, @intCast(w), @intCast(h), 0, 0, field_ink, g.julia, g.light); // composer: no panel softening ("Living glyph field" off ⇒ flat; XP ⇒ teal desktop)
     gpu.feedDraw(&gs.feed, @intCast(w), @intCast(h));
     gpu.swap(&gs.g);
 }
@@ -9331,7 +9341,7 @@ fn paintFrameGpu(
         settings_hover_sig ^= @as(u64, @intFromBool(g.settings_account.pet_name_focus)) *% 0x2545_F491_4F6C_DD1D;
         for (g.settings_account.pet_name) |c| settings_hover_sig = settings_hover_sig *% 131 +% c;
     }
-    const sig = feedSignature(items, g.scroll.*, w, h) ^ (@as(u64, g.screen.*) *% 0x9E37_79B9_7F4A_7C15) ^ (socket_sig *% 0xD1B5_4A32_D192_ED03) ^ (@as(u64, g.settings_section) *% 0xC2B2_AE3D_27D4_EB4F) ^ (g.settings_toggles *% 0x9E6C_63D0_676A_9A99) ^ (g.settings_choices *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, g.settings_picking) *% 0x8A91_7F2B_4D3E_61C7) ^ (@as(u64, @intFromBool(g.inspect_source)) *% 0xF29C_511C_8E3D_45A7) ^ (@as(u64, @intFromBool(g.inspect_loading)) *% 0xBF58_476D_1CE4_E5B9) ^ chat_sig ^ zones_sig ^ (exp_sig *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, if (g.repost_menu) |m| m + 1 else 0) *% 0xA0761D6478BD642F) ^ settings_hover_sig ^ (if (g.xp) (@as(u64, g.xp_hour) *% 60 +% g.xp_min +% 1) *% 0xF1357AEA2E62A9C5 else 0);
+    const sig = feedSignature(items, g.scroll.*, w, h) ^ (@as(u64, g.screen.*) *% 0x9E37_79B9_7F4A_7C15) ^ (socket_sig *% 0xD1B5_4A32_D192_ED03) ^ (@as(u64, g.settings_section) *% 0xC2B2_AE3D_27D4_EB4F) ^ (g.settings_toggles *% 0x9E6C_63D0_676A_9A99) ^ (g.settings_choices *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, g.settings_picking) *% 0x8A91_7F2B_4D3E_61C7) ^ (@as(u64, @intFromBool(g.inspect_source)) *% 0xF29C_511C_8E3D_45A7) ^ (@as(u64, @intFromBool(g.inspect_loading)) *% 0xBF58_476D_1CE4_E5B9) ^ chat_sig ^ zones_sig ^ (exp_sig *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, if (g.repost_menu) |m| m + 1 else 0) *% 0xA0761D6478BD642F) ^ settings_hover_sig ^ (if (g.xp) (@as(u64, g.xp_hour) *% 60 +% g.xp_min +% 1) *% 0xF1357AEA2E62A9C5 else 0) ^ (@as(u64, @intFromBool(g.light)) *% 0xD6E8_FEB8_6659_FD93);
     // A drag/settle animates the socket every frame (lift, reflow, ghost), so
     // bypass the feed cache while it runs — a brief interaction, and the field
     // already rebuilds every frame anyway.
@@ -9733,7 +9743,7 @@ fn paintFrameGpu(
         if (g.xp) {
             feed_view.rethemeRetro(gpa, g.draw, @intCast(gs.design_w), @intCast(lh), true) catch {};
             feed_view.drawXpSkin(gpa, g.draw, g.engine, @intCast(gs.design_w), @intCast(lh), g.xp_hour, g.xp_min) catch {};
-        }
+        } else if (g.light) feed_view.rethemeLight(gpa, g.draw) catch {};
         gpu.feedBuild(&gs.feed, gpa, g.engine, g.draw.slice(), scale) catch {};
 
         // The nav rail as its OWN tile (the decomposition): render it into a
@@ -9759,6 +9769,7 @@ fn paintFrameGpu(
             feed_view.drawDrawer(gpa, g.draw, g.engine, @intCast(gs.design_w), @intCast(lh), gs.drawer_t, g.screen.*, g.regions, g.accent, g.you_handle, true) catch {};
             if (g.julia) feed_view.juliaRemapText(g.draw);
             if (g.xp) feed_view.rethemeRetro(gpa, g.draw, @intCast(gs.design_w), @intCast(lh), false) catch {};
+            if (g.light) feed_view.rethemeLight(gpa, g.draw) catch {};
             gpu.feedBuild(&gs.rail, gpa, g.engine, g.draw.slice(), scale) catch {};
         } else {
             const dw: f32 = @floatFromInt(gs.design_w);
@@ -9784,6 +9795,7 @@ fn paintFrameGpu(
             }
             if (g.julia) feed_view.juliaRemapText(g.draw); // light theme: dark text
             if (g.xp) feed_view.rethemeRetro(gpa, g.draw, @intCast(gs.design_w), @intCast(lh), false) catch {};
+            if (g.light) feed_view.rethemeLight(gpa, g.draw) catch {};
             gpu.feedBuild(&gs.rail, gpa, g.engine, g.draw.slice(), scale) catch {};
         }
 
@@ -9811,7 +9823,7 @@ fn paintFrameGpu(
 
     // Render: the living field behind, the feed on top, then swap.
     gpu.uploadField(&gs.grid, gs.field.height, gs.field.dye, gs.field.cols, gs.field.rows);
-    if (g.xp) gpu.clear(retro_clear_r, retro_clear_g, retro_clear_b) else if (g.julia) gpu.clear(julia_clear_r, julia_clear_g, julia_clear_b) else gpu.clear(gpu_clear_r, gpu_clear_g, gpu_clear_b);
+    if (g.xp) gpu.clear(retro_clear_r, retro_clear_g, retro_clear_b) else if (g.julia) gpu.clear(julia_clear_r, julia_clear_g, julia_clear_b) else if (g.light) gpu.clear(light_clear_r, light_clear_g, light_clear_b) else gpu.clear(gpu_clear_r, gpu_clear_g, gpu_clear_b);
     // Soften the field UNDER the content column (glass backdrop). The feed lays
     // out at the logical design width; map the column's x-range to physical px.
     // Panel softening tracks the LIVE (animated) content column, not the static
@@ -9820,9 +9832,9 @@ fn paintFrameGpu(
     // itself has broken into falling debris, so the field must render flat under it.
     const panel_l = if (gs.shatter_active) 0 else @as(f32, @floatFromInt(gs.content_x)) * scale;
     const panel_r = if (gs.shatter_active) 0 else @as(f32, @floatFromInt(gs.content_x + gs.content_w)) * scale;
-    const field_ink: u32 = if (g.julia) lens_socket.julia_field_ink else 0xFFFFFFFF;
+    const field_ink: u32 = if (g.julia) lens_socket.julia_field_ink else if (g.light) feed_view.light_field_ink else 0xFFFFFFFF;
     gs.grid.gain = g.field_gain; // Appearance → "Field intensity" choice
-    if (g.field_on and !g.xp) gpu.drawFieldGrid(&gs.grid, &gs.ramp, gs.mcx, gs.mcy, gs.t, @intCast(w), @intCast(h), panel_l, panel_r, field_ink, g.julia); // "Living glyph field" off ⇒ flat background (XP ⇒ teal desktop)
+    if (g.field_on and !g.xp) gpu.drawFieldGrid(&gs.grid, &gs.ramp, gs.mcx, gs.mcy, gs.t, @intCast(w), @intCast(h), panel_l, panel_r, field_ink, g.julia, g.light); // "Living glyph field" off ⇒ flat background (XP ⇒ teal desktop)
     // Hover highlight (post wash + button highlight), BEHIND the feed so the
     // content draws on top — the app feels alive under the cursor.
     drawHoverOverlay(gpa, g, gs, scale, @intCast(w), @intCast(h));

@@ -653,7 +653,7 @@ fn renderFrame(ctx: *Ctx) void {
         gpu.clear(20.0 / 255.0, 20.0 / 255.0, 22.0 / 255.0);
         // Full-bleed field: no dimmed content pillar yet (that arrives with
         // the feed, M-Core.1) — the band is zero-width at the left edge.
-        gpu.drawFieldGrid(&gfx.grid, &gfx.ramp, -100, -100, ctx.t, @intCast(gfx.width_px), @intCast(gfx.height_px), 0, 0, 0xFFA6ACBA, false);
+        gpu.drawFieldGrid(&gfx.grid, &gfx.ramp, -100, -100, ctx.t, @intCast(gfx.width_px), @intCast(gfx.height_px), 0, 0, 0xFFA6ACBA, false, false);
         gpu.swap(&gfx.g);
     }
 }

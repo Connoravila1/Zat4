@@ -2848,7 +2848,15 @@ pub fn layoutCompose(
     const has_tag_bar = ctx != .profile;
     const bar_h: i32 = if (has_tag_bar) 48 else 0;
     const card_h: i32 = @min(height - card_y - 40, 380 + stack_h + bar_h);
-    try rect(gpa, dl, cx0, card_y, cw, card_h, skinPanel(accent), 18);
+    // Soft shadow so the card lifts off the dimmed backdrop — bracketed by the
+    // theme-lock so the light remap keeps it a dark shadow (not inverted to white).
+    try rect(gpa, dl, 0, 0, 0, 0, lens_socket.theme_keep_begin, 0);
+    try rect(gpa, dl, cx0 - 1, card_y + 8, cw + 2, card_h + 2, 0x18000000, 22);
+    try rect(gpa, dl, cx0, card_y + 4, cw, card_h, 0x20000000, 18);
+    try rect(gpa, dl, 0, 0, 0, 0, lens_socket.theme_keep_end, 0);
+    // The card: a BORDERED panel. The hairline is what defines it against the
+    // backdrop in light mode, where the fill and the veil are both near-white.
+    try cardBox(gpa, dl, cx0, card_y, cw, card_h, 18, skinPanel(accent));
 
     const pad: i32 = 24;
     const lx = cx0 + pad;
@@ -2896,6 +2904,14 @@ pub fn layoutCompose(
         try rect(gpa, dl, cx0, stack_y + 4, cw, 1, divider, 0);
         stack_y += 4;
     }
+
+    // The input WELL: a bordered box around the text-entry area, so the composer
+    // reads as a real field instead of floating text on the card.
+    const fy_well = card_y + card_h - 46;
+    const well_top = stack_y + 6;
+    const well_bottom = if (has_tag_bar) fy_well - 64 - 10 else fy_well - 12;
+    if (well_bottom - well_top > 40)
+        try cardBox(gpa, dl, lx - 10, well_top, inner_w + 20, well_bottom - well_top, 12, panel_hover);
 
     // The draft (or a faint placeholder), wrapped from just under the stack.
     const text_top = stack_y + 14 + body_line;
@@ -5110,6 +5126,148 @@ pub fn rethemeRetro(gpa: Allocator, dl: *raster.DrawList, w: i32, h: i32, add_cl
                 var ntr = tr;
                 ntr.color = retroStroke(tr.color);
                 try dl.append(gpa, .{ .tri = ntr });
+            },
+            .cell => try dl.append(gpa, item),
+        }
+    }
+}
+
+// ── LIGHT MODE ─────────────────────────────────────────────────────────────
+// A real light theme, built to the rethemeRetro standard (classify EVERY draw
+// item by luminance + saturation) — NOT the shallow juliaRemapText (3 named
+// constants). It keeps the modern rounded styling; only the value scale flips.
+const light_ink: u32 = 0xFF1B1B17; // body text / titles (near-black, warm)
+const light_muted: u32 = 0xFF63605A; // handles, secondary
+const light_faint: u32 = 0xFF8C887E; // tertiary
+const light_card: u32 = 0xFFFFFFFF; // card/menu face — pure white, so it lifts off the canvas
+const light_card_hover: u32 = 0xFFF1EFE9; // a card under the pointer — a hair grey
+const light_border: u32 = 0xFFDBD8CF; // the card hairline, visible on white
+const light_col: u32 = 0xF6FFFFFF; // the content column — bright white, a whisper of field through
+const light_header: u32 = 0xFAFFFFFF; // sticky bars over the column — nearly solid white
+const light_socket_glass: u32 = 0xFF2B2A24; // the dark socket panel, softened off pure-black on the light page
+const light_socket_tray: u32 = 0xFF201E19; // the open-tray panel, likewise softened
+pub const light_field_ink: u32 = 0xFF1B1B17; // the field's dark glyphs on the light canvas
+
+/// Invert a neutral's luminance into a warm light neutral: dark card -> near-
+/// white, its slightly-lighter border -> a light grey (the ordering is kept, so
+/// fills and borders stay distinct). Returns 0x00RRGGBB (alpha added by caller).
+fn lightNeutral(c: u32) u32 {
+    const outl = std.math.clamp(1.0 - retroLuma(c), 0.0, 1.0);
+    const r: u32 = @intFromFloat(std.math.clamp(outl * 255.0, 0.0, 255.0));
+    const g: u32 = @intFromFloat(std.math.clamp(outl * 253.0, 0.0, 255.0));
+    const b: u32 = @intFromFloat(std.math.clamp(outl * 247.0, 0.0, 255.0));
+    return (r << 16) | (g << 8) | b;
+}
+
+/// Remap a FILL. The known SURFACE constants get a real light elevation — a pure
+/// luma inversion would flip it (canvas ending up whiter than the cards, so they
+/// recede). Cards -> white, the card outline -> a visible hairline. Saturated
+/// opaque fills (avatars, like/boost, the accent button) keep their hue; every
+/// other neutral inverts dark<->light with its alpha preserved (canvas slabs,
+/// faint dividers/hovers become faint dark ones).
+fn lightFill(c: u32) u32 {
+    switch (c) {
+        panel => return light_card,
+        panel_hover => return light_card_hover,
+        card_line => return light_border,
+        veil => return light_col, // the content column reads bright white, not a dull grey
+        header_veil => return light_header,
+        icon_grey => return light_ink, // engagement icons (incl. the rect "more" dots) go near-black
+        else => {},
+    }
+    const a = (c >> 24) & 0xFF;
+    if (retroSat(c) > 0.32 and a >= 0x80) return c; // accent / avatar / like: keep
+    return (a << 24) | lightNeutral(c);
+}
+
+/// Remap a TEXT colour: the warm inks map to the dark scale; coloured labels keep
+/// their hue; any other light text goes near-black; already-dark text is kept.
+/// The SOURCE ALPHA is preserved throughout — a rail label fading out on collapse
+/// must stay faded, not snap back to solid (the light-mode collapse glitch).
+fn lightInk(c: u32) u32 {
+    const a = c & 0xFF000000;
+    const rgb = c & 0x00FFFFFF;
+    if (rgb == (ink & 0x00FFFFFF)) return a | (light_ink & 0x00FFFFFF);
+    if (rgb == (muted & 0x00FFFFFF)) return a | (light_muted & 0x00FFFFFF);
+    if (rgb == (faint & 0x00FFFFFF)) return a | (light_faint & 0x00FFFFFF);
+    if (retroSat(c) > 0.35) return c; // accent-coloured label: hue + alpha kept
+    if (retroLuma(c) > 0.45) return a | (light_ink & 0x00FFFFFF); // light text -> dark
+    return c; // already dark (e.g. label on an accent button)
+}
+
+/// Remap a STROKE (line/tri icons): saturated strokes (the like heart) keep hue;
+/// faint strokes become faint dark; light icon strokes go near-black.
+fn lightStroke(c: u32) u32 {
+    if (retroSat(c) > 0.32) return c;
+    const a = c & 0xFF000000;
+    if (retroLuma(c) > 0.45) return a | (light_ink & 0x00FFFFFF);
+    return c;
+}
+
+/// Rewrite `dl` in place into the light theme. Unlike rethemeRetro this keeps
+/// rounded corners and adds no window chrome — only the colours flip, item by
+/// item, so nothing renders in a dark-mode colour. The field (a separate GPU
+/// pass) handles its own light-mode inversion. PURE.
+pub fn rethemeLight(gpa: Allocator, dl: *raster.DrawList) error{OutOfMemory}!void {
+    if (dl.len == 0) return;
+    var src = try dl.clone(gpa);
+    defer src.deinit(gpa);
+    dl.len = 0;
+    // While `keep` is set (between a socket's theme_keep sentinels) items pass
+    // through UNCHANGED — the socket keeps its dark identity in light mode.
+    var keep = false;
+    var i: usize = 0;
+    while (i < src.len) : (i += 1) {
+        const item = src.get(i);
+        switch (item) {
+            .rect => |r| {
+                if (r.color == lens_socket.theme_keep_begin) {
+                    keep = true; // drop the marker itself
+                } else if (r.color == lens_socket.theme_keep_end) {
+                    keep = false;
+                } else if (keep) {
+                    // Socket stays dark, but soften its near-black panel to a
+                    // charcoal so it reads as a surface, not a hole, on the page.
+                    const c = if (r.color == lens_socket.glass)
+                        light_socket_glass
+                    else if (r.color == lens_socket.tray_panel)
+                        light_socket_tray
+                    else
+                        r.color;
+                    try rect(gpa, dl, r.x, r.y, r.w, r.h, c, r.radius);
+                } else try rect(gpa, dl, r.x, r.y, r.w, r.h, lightFill(r.color), r.radius);
+            },
+            .text => |t| {
+                if (keep) {
+                    try dl.append(gpa, item);
+                } else {
+                    var nt = t;
+                    nt.color = lightInk(t.color);
+                    try dl.append(gpa, .{ .text = nt });
+                }
+            },
+            .line => |ln| {
+                if (keep) {
+                    try dl.append(gpa, item);
+                } else {
+                    var nl = ln;
+                    if (ln.color == icon_grey) {
+                        // Engagement icons: near-black AND a touch heavier — a thin
+                        // (1px) dark stroke antialiases to grey on white, so bump it.
+                        nl.color = light_ink;
+                        nl.thickness +|= 1;
+                    } else nl.color = lightStroke(ln.color);
+                    try dl.append(gpa, .{ .line = nl });
+                }
+            },
+            .tri => |tr| {
+                if (keep) {
+                    try dl.append(gpa, item);
+                } else {
+                    var ntr = tr;
+                    ntr.color = lightStroke(tr.color);
+                    try dl.append(gpa, .{ .tri = ntr });
+                }
             },
             .cell => try dl.append(gpa, item),
         }

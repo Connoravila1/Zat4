@@ -58,17 +58,23 @@ const ink: u32 = 0xFFEDEAE0;
 const body: u32 = 0xFFD8D3C8; // detail-panel paragraph text
 const muted: u32 = 0xFF9A968A;
 const faint: u32 = 0xFF6A655A;
-const glass: u32 = 0xFF1C1B16; // the socket panel — OPAQUE (owner: no transparency)
+pub const glass: u32 = 0xFF1C1B16; // the socket panel — OPAQUE (owner: no transparency)
 const julia_glass: u32 = 0xFFA6407A; // Julia mode: the socket panel goes bright rose
 const hairline: u32 = 0x18FFFFFF; // ~9% white edge
 const pill_bg: u32 = 0x14FFFFFF; // ~8% white card fill (reads on the dark panel)
 const pill_edge: u32 = 0x1FFFFFFF; // ~12% white card edge
 const rail: u32 = 0x1AFFFFFF; // contact-rail dashes
+// THEME-LOCK SENTINELS: invisible (alpha-0, zero-size) marker rects that bracket
+// a socket's draw items. `rethemeLight` passes everything between them through
+// UNCHANGED, so the socket keeps its dark identity in light mode. Harmless no-ops
+// on every other path (dark mode / software), and the marks are never painted.
+pub const theme_keep_begin: u32 = 0x007A0C01;
+pub const theme_keep_end: u32 = 0x007A0C02;
 /// The open tray's panel — OPAQUE: it drops OVER the feed posts and this
 /// path has no backdrop-blur, so anything less lets the timeline bleed
 /// through (the open-tray conflict the owner caught). A touch darker than
 /// the socket panel so the tray reads as recessed below the seated cartridge.
-const tray_panel: u32 = 0xFF131210;
+pub const tray_panel: u32 = 0xFF131210;
 // Privacy is its OWN channel, never the lens accent (invariant 6): green =
 // no behavioral data, amber = local-learning. Fixed semantics.
 const priv_clean: u32 = 0xFF6FCF97;
@@ -459,6 +465,10 @@ pub fn build(
     dl: *raster.DrawList,
     hits: ?*HitList,
 ) error{OutOfMemory}!i32 {
+    // Bracket this socket's items so light mode leaves them dark (see the
+    // theme_keep_* note above). The end mark rides a defer so every exit balances.
+    try rect(gpa, dl, 0, 0, 0, 0, theme_keep_begin, 0);
+    defer rect(gpa, dl, 0, 0, 0, 0, theme_keep_end, 0) catch {};
     const sc = geom.scale;
     const x0 = geom.x;
     const y0 = geom.y;
@@ -513,6 +523,11 @@ pub fn build(
     };
     const acc = if (ui.julia) julia_pink else palette[@min(seat.color, palette.len - 1)];
 
+    // Soft drop shadow so the socket lifts off the page (it reads as a hole
+    // otherwise on a light background). It rides INSIDE the theme-lock span, so
+    // light mode keeps it a dark shadow; on the dark field it's imperceptible.
+    try rect(gpa, dl, x0 - fxi(1 * sc), y0 + fxi(6 * sc), w + fxi(2 * sc), sock_h + fxi(2 * sc), 0x1A000000, radius + 3);
+    try rect(gpa, dl, x0, y0 + fxi(3 * sc), w, sock_h, 0x22000000, radius + 1);
     // ---- 1. the socket panel (glass over the field) ----
     try rect(gpa, dl, x0, y0, w, sock_h, if (ui.julia) julia_glass else glass, radius);
     try rect(gpa, dl, x0, y0, w, fxi(1 * sc) + 1, hairline, radius); // top inner-light edge

@@ -1079,6 +1079,7 @@ const field_grid_frag_src: [:0]const GLchar =
     \\uniform vec2 uPanel;       // content-column x-range in px (l,r); l>=r ⇒ none
     \\uniform vec3 uInk;         // base glyph colour (bright endpoint); pink in Julia mode
     \\uniform float uHeart;      // Julia mode: >0.5 ⇒ the cursor light pool is HEART-shaped
+    \\uniform float uLight;      // light mode: >0.5 ⇒ dark glyphs on the light canvas
     \\// Classic implicit heart curve: <0 inside, 0 on the outline, >0 outside.
     \\// p is in heart space (origin at the heart's centre, y pointing UP).
     \\float juliaHeart(vec2 p) {
@@ -1200,7 +1201,15 @@ const field_grid_frag_src: [:0]const GLchar =
     \\  float soft_cov = clamp(dn, 0.0, 1.0);   // smooth per-cell wash, no glyph edges
     \\  cov = mix(cov, max(soft_cov * 0.55, dyev), in_panel);
     \\  lum = lum * mix(1.0, 0.55, in_panel);
-    \\  gl_FragColor = vec4(col * lum, cov);
+    \\  if (uLight > 0.5) {
+    \\    // LIGHT MODE: dark glyphs on the light canvas. The SAME contrast-reveal
+    \\    // drives presence instead of brightness — the light makes marks denser and
+    \\    // darker, the quiet field fades into the background. uInk is the dark ink.
+    \\    float a = cov * clamp(0.20 + lum, 0.0, 1.0);
+    \\    gl_FragColor = vec4(uInk, a);
+    \\  } else {
+    \\    gl_FragColor = vec4(col * lum, cov);
+    \\  }
     \\}
 ;
 
@@ -1229,6 +1238,7 @@ pub const FieldGrid = struct {
     u_panel: GLint,
     u_ink: GLint,
     u_heart: GLint,
+    u_light: GLint,
 };
 
 pub fn initFieldGrid() Error!FieldGrid {
@@ -1294,6 +1304,7 @@ pub fn initFieldGrid() Error!FieldGrid {
         .u_panel = glGetUniformLocation(prog, "uPanel"),
         .u_ink = glGetUniformLocation(prog, "uInk"),
         .u_heart = glGetUniformLocation(prog, "uHeart"),
+        .u_light = glGetUniformLocation(prog, "uLight"),
     };
 }
 
@@ -1314,7 +1325,7 @@ pub fn uploadField(fg: *FieldGrid, height: []const f32, dye: []const f32, cols: 
 /// Draw the field grid-intensity. `fr` supplies the ramp texture + cell metrics
 /// (built by initFieldRenderer); `uploadField` must have run this frame.
 /// `mx`,`my` are the cursor in cells (top-down); pass mx<0 for no cursor.
-pub fn drawFieldGrid(fg: *FieldGrid, fr: *FieldRenderer, mx: f32, my: f32, time: f32, vw: i32, vh: i32, panel_l: f32, panel_r: f32, ink: u32, heart: bool) void {
+pub fn drawFieldGrid(fg: *FieldGrid, fr: *FieldRenderer, mx: f32, my: f32, time: f32, vw: i32, vh: i32, panel_l: f32, panel_r: f32, ink: u32, heart: bool, light: bool) void {
     glUseProgram(fg.program);
     glBindBuffer(GL_ARRAY_BUFFER, fg.vbo);
     bindAttrib(fg.a_pos, 2, 2 * @sizeOf(f32), 0);
@@ -1339,6 +1350,7 @@ pub fn drawFieldGrid(fg: *FieldGrid, fr: *FieldRenderer, mx: f32, my: f32, time:
     // passes pink so the whole field — glyphs and the glow that rides them — pinks.
     glUniform3f(fg.u_ink, @as(f32, @floatFromInt((ink >> 16) & 0xFF)) / 255.0, @as(f32, @floatFromInt((ink >> 8) & 0xFF)) / 255.0, @as(f32, @floatFromInt(ink & 0xFF)) / 255.0);
     glUniform1f(fg.u_heart, if (heart) 1.0 else 0.0);
+    glUniform1f(fg.u_light, if (light) 1.0 else 0.0);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDrawArrays(GL_TRIANGLES, 0, 3);
