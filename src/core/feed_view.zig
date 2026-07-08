@@ -4487,6 +4487,7 @@ fn drawSettings(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: 
     var pick_x: i32 = 0;
     var pick_y: i32 = 0;
     var pick_w: i32 = 0;
+    var pick_row_top: i32 = 0;
     for (0..ng) |g| {
         const gid = group_ids[g];
         const card_h = group_cnt[g] * row_h;
@@ -4502,6 +4503,7 @@ fn drawSettings(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: 
                 if (r.kind == .choice and r.action == picking) {
                     pick_x = detail_x;
                     pick_y = ry + row_h;
+                    pick_row_top = ry;
                     pick_w = detail_w;
                     pick_act = r.action;
                 }
@@ -4512,8 +4514,12 @@ fn drawSettings(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: 
     }
 
     // The open choice's picker popover, drawn last so it overlays the rows below.
+    // Flip it ABOVE the row when opening below would run off the bottom (the pet
+    // colour/size sit low in the Toy Box list, so their pickers must open upward).
     if (pick_act != 255) if (settings_view.choiceOf(pick_act)) |ch| {
-        try drawChoicePopover(gpa, dl, e, regions, ch, pick_x, pick_y, pick_w, choices);
+        const th = @as(i32, @intCast(ch.options.len)) * 38 + 20;
+        const py2 = if (pick_y + th > height) pick_row_top - th else pick_y;
+        try drawChoicePopover(gpa, dl, e, regions, ch, pick_x, py2, pick_w, choices);
     };
 
     return @max(ly, dy) - scroll + 40;
@@ -4585,14 +4591,34 @@ pub fn drawPet(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, ox: 
     const re = petRot(R * 0.4, -R * 0.08, cr, sr, cx, cy);
     const mo = petRot(0, R * 0.42, cr, sr, cx, cy);
     switch (anim) {
-        1, 4 => { // happy / excited: dot eyes (bigger when excited), open smile
-            const big: i32 = if (anim == 4) dot + 3 else dot;
-            try rect(gpa, dl, le[0] - @divTrunc(big, 2), le[1] - @divTrunc(big, 2), big, big, dark, @intCast(@divTrunc(big, 2)));
-            try rect(gpa, dl, re[0] - @divTrunc(big, 2), re[1] - @divTrunc(big, 2), big, big, dark, @intCast(@divTrunc(big, 2)));
-            try rect(gpa, dl, mo[0] - @as(i32, @intFromFloat(7.0 * s)), mo[1] - @as(i32, @intFromFloat(2.0 * s)), @intFromFloat(14.0 * s), @intFromFloat(8.0 * s), dark, @intFromFloat(4.0 * s));
+        1 => { // HAPPY: closed ^_^ eyes, a curved SMILE, blush + a floating heart
+            const ew: i32 = @intFromFloat(5.0 * s);
+            try line(gpa, dl, le[0] - ew, le[1] + 2, le[0], le[1] - 3, dark, 2); // left ^
+            try line(gpa, dl, le[0], le[1] - 3, le[0] + ew, le[1] + 2, dark, 2);
+            try line(gpa, dl, re[0] - ew, re[1] + 2, re[0], re[1] - 3, dark, 2); // right ^
+            try line(gpa, dl, re[0], re[1] - 3, re[0] + ew, re[1] + 2, dark, 2);
+            const mw2: i32 = @intFromFloat(8.0 * s);
+            const md: i32 = @intFromFloat(5.0 * s);
+            try line(gpa, dl, mo[0] - mw2, mo[1] - 1, mo[0], mo[1] + md, dark, 2); // smile (U)
+            try line(gpa, dl, mo[0], mo[1] + md, mo[0] + mw2, mo[1] - 1, dark, 2);
             const blush = (accent & 0x00FFFFFF) | 0x55000000;
             try rect(gpa, dl, le[0] - @as(i32, @intFromFloat(9.0 * s)), le[1] + @as(i32, @intFromFloat(6.0 * s)), @intFromFloat(7.0 * s), @intFromFloat(5.0 * s), blush, 3);
             try rect(gpa, dl, re[0] + @as(i32, @intFromFloat(2.0 * s)), re[1] + @as(i32, @intFromFloat(6.0 * s)), @intFromFloat(7.0 * s), @intFromFloat(5.0 * s), blush, 3);
+            // a little heart bobbing over the head
+            const heart: u32 = 0xFFF06B8A;
+            const hx2 = @as(i32, @intFromFloat(cx + R * 0.5));
+            const hy2 = @as(i32, @intFromFloat(cy - R - 6.0 * s)) - @as(i32, @intFromFloat(@sin(phase) * 2.0));
+            const hb: i32 = @intFromFloat(@max(3.0, 5.0 * s));
+            try rect(gpa, dl, hx2 - hb, hy2, hb, hb, heart, @intCast(@divTrunc(hb, 2)));
+            try rect(gpa, dl, hx2, hy2, hb, hb, heart, @intCast(@divTrunc(hb, 2)));
+            try tri(gpa, dl, hx2 - hb, hy2 + hb - 1, hx2 + hb, hy2 + hb - 1, hx2, hy2 + hb + hb, heart);
+        },
+        4 => { // EXCITED "whee": wide-open round eyes + an open O mouth
+            const big: i32 = dot + 4;
+            try rect(gpa, dl, le[0] - @divTrunc(big, 2), le[1] - @divTrunc(big, 2), big, big, dark, @intCast(@divTrunc(big, 2)));
+            try rect(gpa, dl, re[0] - @divTrunc(big, 2), re[1] - @divTrunc(big, 2), big, big, dark, @intCast(@divTrunc(big, 2)));
+            const ms2: i32 = @intFromFloat(@max(6.0, 10.0 * s));
+            try rect(gpa, dl, mo[0] - @divTrunc(ms2, 2), mo[1] - 1, ms2, ms2, dark, @intCast(@divTrunc(ms2, 2)));
         },
         2 => { // sulk: dot eyes, a frown (inverted line pair)
             try rect(gpa, dl, le[0] - @divTrunc(dot, 2), le[1] - @divTrunc(dot, 2), dot, dot, dark, @intCast(@divTrunc(dot, 2)));

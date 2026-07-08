@@ -3164,13 +3164,20 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     }
                     if (pev.kind == .button_up and pev.button == 1 and gs.pet_grabbed) {
                         gs.pet_grabbed = false; // release → the drag velocity tosses it
-                        if (@abs(rx - gs.pet_down_x) + @abs(ry - gs.pet_down_y) < 8) gs.pet_petted = true; // a tap pets it
+                        if (@abs(rx - gs.pet_down_x) + @abs(ry - gs.pet_down_y) < 14) { // a tap (not a fling) pets it
+                            gs.pet_petted = true;
+                            gs.pet_happy = 42; // a brief reaction, then back to neutral
+                            gs.pet_vx = 0; // don't also toss it
+                            gs.pet_vy = 0;
+                        } else {
+                            gs.pet_tossed = true; // a real fling → fun in moderation
+                        }
                         continue;
                     }
                     if (pev.kind == .button_up and pev.button == 1 and gs.avatar_drag) {
                         if (in_pet) { // dropped on the pet → feed it
                             gs.pet_petted = true;
-                            gs.pet_fed = 26;
+                            gs.pet_happy = 55; // a brief, clear smile
                         }
                         gs.avatar_drag = false;
                         continue;
@@ -7966,6 +7973,7 @@ const GpuState = struct {
     pet: pet_core.State = .{},
     pet_scroll_ms: u16 = 0,
     pet_petted: bool = false,
+    pet_tossed: bool = false,
     pet_interacted: bool = false,
     // The pet is a little free physics body: position/velocity/roll, whether it's
     // held, and its on-screen box (scaled) for the tap/grab hit-test.
@@ -7989,7 +7997,7 @@ const GpuState = struct {
     avatar_post: usize = 0,
     avatar_x: f32 = 0,
     avatar_y: f32 = 0,
-    pet_fed: u16 = 0, // frames of the "just ate" glow
+    pet_happy: u16 = 0, // frames of a guaranteed HAPPY reaction after a pet/feed
     /// The SDF-icon pass (the heart's technique generalised) — crisp engagement /
     /// nav icons, one draw call each, replacing the aliased line-art.
     icon: gpu.IconRenderer,
@@ -9595,10 +9603,11 @@ fn paintFrameGpu(
         // draw the companion in the bottom-right, on top of everything. Its box is
         // stored for the tap hit-test (clicking it "pets" it).
         if (g.pet) {
-            const act: pet_core.Activity = .{ .petted = gs.pet_petted, .scroll_ms = gs.pet_scroll_ms, .interacted = gs.pet_interacted };
+            const act: pet_core.Activity = .{ .petted = gs.pet_petted, .tossed = gs.pet_tossed, .scroll_ms = gs.pet_scroll_ms, .interacted = gs.pet_interacted };
             const dt_ms: u32 = @intFromFloat(std.math.clamp(gs.frame_ms, 0.0, 100.0));
             gs.pet = pet_core.step(gs.pet, dt_ms, act);
             gs.pet_petted = false;
+            gs.pet_tossed = false;
             gs.pet_scroll_ms = 0;
             gs.pet_interacted = false;
 
@@ -9663,10 +9672,12 @@ fn paintFrameGpu(
                 const ap = feed_posts[gs.avatar_post];
                 feed_view.drawAvatarToken(gpa, g.draw, g.engine, @intFromFloat(gs.avatar_x), @intFromFloat(gs.avatar_y), 44, ap.tint, ap.initial) catch {};
             }
-            // Excited face while held, airborne, or freshly fed; otherwise its mood.
+            // Held or airborne → the wide-eyed EXCITED "whee" face; a recent pet/
+            // feed → a guaranteed HAPPY smile for a beat (so the reaction always
+            // reads, independent of the slow mood machine); otherwise its mood.
             const airborne = gs.pet_py + ph_s < floor_y - 4.0;
-            if (gs.pet_fed > 0) gs.pet_fed -= 1;
-            const anim_draw: u8 = if (gs.pet_grabbed or airborne or gs.pet_fed > 0) 4 else @intFromEnum(gs.pet.anim);
+            if (gs.pet_happy > 0) gs.pet_happy -= 1;
+            const anim_draw: u8 = if (gs.pet_grabbed or airborne) 4 else if (gs.pet_happy > 0) 1 else @intFromEnum(gs.pet.anim);
             feed_view.drawPet(gpa, g.draw, g.engine, gs.pet_x, gs.pet_y, anim_draw, gs.t * 2.4, gs.pet_roll, pscale, pcolor, g.accent, g.settings_account.pet_name) catch {};
         } else {
             gs.pet_seeded = false; // re-toggling drops it back in the corner

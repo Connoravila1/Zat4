@@ -38,6 +38,7 @@ pub const Anim = enum(u8) { idle, happy, sulk, sleep };
 /// A7.2: cold struct — one per frame, never held in a collection. Guard waived.
 pub const Activity = struct {
     petted: bool = false, // the user tapped the pet (feed + cheer)
+    tossed: bool = false, // the user flung the pet this step
     scroll_ms: u16 = 0, // ms spent scrolling since the last step (doom-scroll signal)
     interacted: bool = false, // any click/scroll this step → the pet stays awake
 };
@@ -50,6 +51,7 @@ pub const State = struct {
     mood: u8 = 190, // 0 = sulking, 255 = delighted
     anim: Anim = .idle,
     ms_idle: u32 = 0, // ms since the last interaction (drives sleepiness)
+    toss_streak: u8 = 0, // recent tossing intensity; decays — a little is fun, a lot annoys
 };
 
 fn subSat(v: u8, d: u8) u8 {
@@ -82,11 +84,26 @@ pub fn step(s: State, dt_ms: u32, act: Activity) State {
     if (n.hunger < 60) n.mood = subSat(n.mood, t); // hungry → grumpy
     if (act.scroll_ms == 0 and n.hunger > 80 and n.mood < 160) n.mood = addSat(n.mood, t);
 
-    // Petting or feeding it makes it decisively HAPPY (not merely un-sad).
+    // Petting/feeding lifts it to CONTENT (the shell flashes the happy face as the
+    // brief reaction; the mood itself just recovers to a calm idle, not a locked
+    // grin — so the smile is a moment, then it settles back to neutral).
     if (act.petted) {
         n.hunger = addSat(n.hunger, 90);
-        n.mood = @max(addSat(n.mood, 110), 216); // clears the happy threshold
+        n.mood = @max(addSat(n.mood, 85), 175);
         n.energy = addSat(n.energy, 45);
+        n.ms_idle = 0;
+    }
+
+    // Tossing: fatigue that decays over time. A little is fun (a small lift); too
+    // much flinging in a short span annoys it (mood drops → it sulks).
+    n.toss_streak = subSat(n.toss_streak, @intCast(@min(255, dt_ms / 350)));
+    if (act.tossed) {
+        n.toss_streak = addSat(n.toss_streak, 1);
+        if (n.toss_streak <= 2) {
+            n.mood = addSat(n.mood, 12); // wheee — good fun
+        } else {
+            n.mood = subSat(n.mood, 55); // too much roughhousing → upset
+        }
         n.ms_idle = 0;
     }
 
@@ -111,13 +128,28 @@ test "pet: time makes it hungry and, when idle, sleepy" {
     try std.testing.expect(s.energy < 200); // got sleepier (idle past 6s)
 }
 
-test "pet: petting a sulking pet makes it decisively HAPPY" {
+test "pet: petting a sulking pet lifts it out of the sulk (to content)" {
     var s = State{ .hunger = 40, .energy = 40, .mood = 20, .anim = .sulk, .ms_idle = 20000 };
     s = step(s, 16, .{ .petted = true, .interacted = true });
     try std.testing.expect(s.hunger > 40);
     try std.testing.expect(s.energy > 40);
+    try std.testing.expect(s.mood >= 175); // recovered to a calm idle
     try std.testing.expectEqual(@as(u32, 0), s.ms_idle);
-    try std.testing.expectEqual(Anim.happy, s.anim); // from sulking straight to happy
+    try std.testing.expectEqual(Anim.idle, s.anim); // no longer sulking (the smile is the shell's reaction)
+}
+
+test "pet: an occasional toss is fun, but rapid-fire tossing upsets it" {
+    // A single toss nudges the mood up a touch.
+    var s = State{ .hunger = 255, .energy = 255, .mood = 180, .anim = .idle };
+    const before = s.mood;
+    s = step(s, 16, .{ .tossed = true, .interacted = true });
+    try std.testing.expect(s.mood >= before);
+    // Rapid-fire tossing (no time to decay the streak) sours the mood into a sulk.
+    var r = State{ .hunger = 255, .energy = 255, .mood = 200, .anim = .idle };
+    var i: usize = 0;
+    while (i < 8) : (i += 1) r = step(r, 16, .{ .tossed = true, .interacted = true });
+    try std.testing.expect(r.mood < 85);
+    try std.testing.expectEqual(Anim.sulk, r.anim);
 }
 
 test "pet: sustained doom-scrolling drops the mood to sulking" {
