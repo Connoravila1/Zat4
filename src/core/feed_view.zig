@@ -1618,7 +1618,7 @@ pub fn drawTabBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, w
     // BEFORE the buttons, so hitTest — which prefers the last-emitted match —
     // still lets the buttons win, but a miss between them hits this no-op
     // instead of the post scrolling behind the bar).
-    try emitRegion(gpa, regions, 0, by - 16, width, height - (by - 16), 0, .blocker);
+    try emitRegion(gpa, regions, 0, by - 16, width, @intCast(@min(height - (by - 16), 65535)), 0, .blocker);
 
     const Slot = union(enum) { nav: u8, you };
     // The locked FIVE nav tabs (Bluesky pattern): home · zones(search) · Zat
