@@ -3653,6 +3653,9 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                             rs.gzones_q_focus = true;
                                             if (rs.gpu_state) |*gsd| gsd.drawer_want = false;
                                         },
+                                        // The bottom bar's tap-swallow: consume the tap so it
+                                        // never falls through to a post behind the bar.
+                                        .blocker => {},
                                         // Avatar tap → open THAT author's profile (any author;
                                         // the DID comes from the post's at-uri). A query over
                                         // the shared store — same engagement/identity truth.
@@ -9896,8 +9899,10 @@ fn paintFrameGpu(
     gs.grid.gain = g.field_gain; // Appearance → "Field intensity" choice
     if (g.field_on and !g.xp and !field_mobile_off) gpu.drawFieldGrid(&gs.grid, &gs.ramp, gs.mcx, gs.mcy, gs.t, @intCast(w), @intCast(h), panel_l, panel_r, field_ink, g.julia, g.light); // "Living glyph field" off ⇒ flat background (XP ⇒ teal desktop; mobile ⇒ off for battery)
     // Hover highlight (post wash + button highlight), BEHIND the feed so the
-    // content draws on top — the app feels alive under the cursor.
-    drawHoverOverlay(gpa, g, gs, scale, @intCast(w), @intCast(h));
+    // content draws on top — the app feels alive under the cursor. DESKTOP only:
+    // on touch there is no persistent cursor, so a tap would leave a stray wash
+    // rectangle lingering at the last tap point (the "random rectangle").
+    if (!field_mobile_off) drawHoverOverlay(gpa, g, gs, scale, @intCast(w), @intCast(h));
     // The feed verts persist across frames (rebuilt above only when the feed
     // changed); just draw them. During a screen-switch CROSSFADE, draw the old
     // screen (fading out) under the new (fading in) — the rail, in both, stays.
