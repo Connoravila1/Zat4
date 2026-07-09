@@ -20,7 +20,8 @@
     <activity
         android:name="android.app.NativeActivity"
         android:exported="true"
-        android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+        android:theme="@android:style/Theme.Material.NoActionBar"
+        android:windowLayoutInDisplayCutoutMode="shortEdges"
         android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|uiMode">
       <meta-data android:name="android.app.lib_name" android:value="zat"/>
       <intent-filter>

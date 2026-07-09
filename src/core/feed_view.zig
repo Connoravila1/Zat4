@@ -50,6 +50,19 @@ const algo_docs = @import("algo_docs.zig");
 const chat_view = @import("chat_view.zig");
 const chat_msg = @import("chat.zig");
 
+/// Safe-area insets in LOGICAL (design-space) pixels — the shell converts the
+/// OS's physical-px insets by the ui scale before handing them in (B5). Zero on
+/// desktop/preview. Cold value (one per layout call), guarded for discipline.
+pub const EdgeInsets = struct {
+    top: i32 = 0,
+    bottom: i32 = 0,
+    left: i32 = 0,
+    right: i32 = 0,
+    comptime {
+        assert(@sizeOf(EdgeInsets) == 16);
+    }
+};
+
 // Palette, copied from field.zig so the view never reaches across a module
 // for a constant (D4: only the value crosses, by copy). ARGB.
 const bg: u32 = 0xFF000000; // app canvas — pure black (field backdrop + card elevation base)
@@ -1592,12 +1605,14 @@ pub const tab_bar_h: i32 = 76;
 /// after ANY screen's layout on a phone-width surface (B5: plain values in,
 /// draw list + regions out). `skip_nav` mirrors drawRail: the GPU draws the
 /// nav icons itself; the software path gets the line-art.
-pub fn drawTabBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, width: i32, height: i32, active: u8, regions: ?*Regions, accent: u32, skip_nav: bool) error{OutOfMemory}!void {
-    const by = height - tab_bar_h;
+pub fn drawTabBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, width: i32, height: i32, bottom_inset: i32, active: u8, regions: ?*Regions, accent: u32, skip_nav: bool) error{OutOfMemory}!void {
+    const by = height - tab_bar_h - bottom_inset;
     // The feed dies out under the bar ("scrims keep chrome legible"), then
     // the same frosted veil the sticky top bar wears, and a hairline lid.
     try rect(gpa, dl, 0, by - 16, width, 16, 0x50181812, 0);
     try rect(gpa, dl, 0, by, width, tab_bar_h, skinHeaderVeil(accent), 0);
+    // Fill behind the home pill so the veil reaches the screen edge (no gap).
+    if (bottom_inset > 0) try rect(gpa, dl, 0, by + tab_bar_h, width, bottom_inset, skinHeaderVeil(accent), 0);
     try rect(gpa, dl, 0, by, width, 1, divider, 0);
 
     const Slot = union(enum) { nav: u8, compose, you };
@@ -1820,6 +1835,25 @@ fn drawExtension(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m:
     try drawAgpl(gpa, dl, e, x0, @max(wy + 8, height - 40));
 }
 
+/// Shift a just-emitted sticky top-bar batch DOWN by `dy` logical px so its
+/// chrome clears the status bar: the draw items (dl[dl0..]), the feed regions
+/// (regions[rg0..]), AND the socket's own hit-list (socket_hits[sh0..]). The
+/// socket hits are a SEPARATE tap space from `regions`, so they MUST move too —
+/// otherwise the socket looks shifted but its targets stay put ("touch higher
+/// than it looks"). No-op when dy == 0 (desktop/preview).
+fn shiftTopBar(dl: *raster.DrawList, regions: ?*Regions, socket_hits: ?*lens_socket.HitList, dl0: usize, rg0: usize, sh0: usize, dy: i32) void {
+    if (dy == 0) return;
+    transformDlRange(dl, dl0, dl.len, 1.0, 0, 0, 0, @floatFromInt(dy));
+    if (regions) |rg| {
+        var i = rg0;
+        while (i < rg.items.len) : (i += 1) rg.items[i].y += @intCast(dy);
+    }
+    if (socket_hits) |sh| {
+        var i = sh0;
+        while (i < sh.items.len) : (i += 1) sh.items[i].y += @intCast(dy);
+    }
+}
+
 /// Emit the whole premium feed for `posts` into `dl`, OVER whatever the
 /// field already composed. `scroll` shifts the post stack (≤0 scrolls up);
 /// the top bar stays pinned. Appends only — the caller cleared the list.
@@ -1916,6 +1950,11 @@ pub fn layout(
     /// `.depth` scales each emitted post by engagement (the "loom"); every other
     /// screen and toy value lays out unchanged.
     toys: ToyView,
+    /// The device's safe-area insets in LOGICAL px (status bar top, home-pill
+    /// bottom, cutout left/right). Zero on desktop/preview. The content origin
+    /// drops by `top`, the bottom scroll clearance grows by `bottom`, and the
+    /// sticky top bar shifts down by `top` so chrome clears the status bar.
+    insets: EdgeInsets,
 ) error{OutOfMemory}!i32 {
     var m: Metrics = if (geom) |g|
         .{ .rail_x = g.rail_x, .col_x = g.col_x, .col_w = g.col_w, .lx = g.lx, .cw = g.cw, .side_x = g.side_x, .wide = g.wide }
@@ -2048,17 +2087,36 @@ pub fn layout(
         // The Zones hub draws its own full body (title, live sub-tabs, the
         // search-or-jump field, the tab's grid/list) and owns its scroll, so
         // it returns its content height directly — no post loop, no top bar.
-        return try drawZonesBrowse(gpa, dl, e, m, height, scroll, regions, accent, zones);
+        // These own-body screens skip the sticky-bar path, so apply the safe-area
+        // top inset here too (else the title collides with the status bar).
+        const _z0 = dl.len;
+        const _zr0: usize = if (regions) |rg| rg.items.len else 0;
+        const _zs0: usize = if (socket_hits) |sh| sh.items.len else 0;
+        const _zh = try drawZonesBrowse(gpa, dl, e, m, height, scroll, regions, accent, zones);
+        shiftTopBar(dl, regions, socket_hits, _z0, _zr0, _zs0, insets.top);
+        if (insets.top > 0) try rect(gpa, dl, 0, 0, width, insets.top, skinHeaderVeil(accent), 0);
+        return _zh;
     } else if (active_screen == screen_settings) {
         // Settings draws its own master–detail body (a left section list + the
         // selected section's grouped rows) and owns its scroll, returning content
         // height directly — no post loop, no top bar (it draws its own title).
-        return try drawSettings(gpa, dl, e, m, height, scroll, regions, accent, settings_section, settings_toggles, settings_account, settings_choices, settings_picking);
+        const _s0 = dl.len;
+        const _sr0: usize = if (regions) |rg| rg.items.len else 0;
+        const _ss0: usize = if (socket_hits) |sh| sh.items.len else 0;
+        const _sh = try drawSettings(gpa, dl, e, m, height, scroll, regions, accent, settings_section, settings_toggles, settings_account, settings_choices, settings_picking);
+        shiftTopBar(dl, regions, socket_hits, _s0, _sr0, _ss0, insets.top);
+        if (insets.top > 0) try rect(gpa, dl, 0, 0, width, insets.top, skinHeaderVeil(accent), 0);
+        return _sh;
     } else if (active_screen != 0) {
         const msg = "Coming soon";
         const tw: i32 = @intCast(text.measure(e, .regular, msg, 16));
         _ = try str(gpa, dl, e, .regular, m.col_x + @divTrunc(m.col_w - tw, 2), @divTrunc(height, 2), muted, 16, msg);
+        const _ptb_dl0 = dl.len;
+        const _ptb_rg0: usize = if (regions) |rg| rg.items.len else 0;
+        const _ptb_sh0: usize = if (socket_hits) |sh| sh.items.len else 0;
         try drawTopBar(gpa, dl, e, m, active_screen, regions, profile, accent, socket_tray, socket_ui, socket_hits, zone_title, 0, zones, scroll); // no posts scroll here, but keep the title consistent
+        shiftTopBar(dl, regions, socket_hits, _ptb_dl0, _ptb_rg0, _ptb_sh0, insets.top);
+        if (insets.top > 0) try rect(gpa, dl, 0, 0, width, insets.top, skinHeaderVeil(accent), 0);
         return height;
     }
 
@@ -2123,6 +2181,7 @@ pub fn layout(
         try rect(gpa, dl, m.rail_x + rail_w, track_y, width - (m.rail_x + rail_w), 2, 0x1CEDEAE0, 0);
     }
 
+    feed_y0 += insets.top; // content clears the status bar in every branch
     var y: i32 = feed_y0 + scroll;
     for (posts, 0..) |p, pi| {
         // The reply socket precedes this post (its seam in the thread).
@@ -2544,7 +2603,16 @@ pub fn layout(
     // The sticky top bar, drawn LAST so the posts above scroll BEHIND its
     // frosted box with the title/tabs crisp on top. `posts.len` feeds the zone
     // masthead's stats line (on the zone screen `posts` IS the zone feed).
+    // Its emitted items, regions AND socket hits are shifted DOWN by insets.top
+    // so the wordmark/socket clear the status bar (only when there is a top
+    // inset). Then a veil strip covers the gap ABOVE the shifted header so posts
+    // scrolling up don't show through between the screen top and the header.
+    const _tb_dl0 = dl.len;
+    const _tb_rg0: usize = if (regions) |rg| rg.items.len else 0;
+    const _tb_sh0: usize = if (socket_hits) |sh| sh.items.len else 0;
     try drawTopBar(gpa, dl, e, m, active_screen, regions, profile, accent, socket_tray, socket_ui, socket_hits, zone_title, posts.len, zones, scroll);
+    shiftTopBar(dl, regions, socket_hits, _tb_dl0, _tb_rg0, _tb_sh0, insets.top);
+    if (insets.top > 0) try rect(gpa, dl, 0, 0, width, insets.top, skinHeaderVeil(accent), 0);
 
     // The zone page's About sidebar (drawn after the masthead so its top
     // tracks the collapsing band's live bottom edge).
@@ -2600,7 +2668,7 @@ pub fn layout(
     };
     // Phone: the tab bar overlays the bottom edge — grow the content height
     // so the last post scrolls clear of it (the shell's clamp uses this).
-    const phone_inset: i32 = if (width <= phone_max) tab_bar_h else 0;
+    const phone_inset: i32 = if (width <= phone_max) tab_bar_h + insets.bottom else 0;
     // Tectonic maps vertical scroll → horizontal pan, so the "content extent" the
     // shell clamps scroll against is the STRIP WIDTH (the total run of cards).
     if (tect) return m.col_x + @as(i32, @intCast(posts.len)) * tect_pitch + 60;
@@ -7905,7 +7973,7 @@ test "layout emits 4 tap regions per post (avatar + 3 engagement); hitTest resol
     const posts = [_]PostView{
         .{ .name = "A", .handle = "@a.zat", .age = "1m", .body = "hello there field", .tint = 0xFFAAAAAA, .reply = 1, .boost = 2, .like = 3, .initial = 'A', .liked = true, .boosted = false },
     };
-    const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{});
+    const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{}, .{});
     try std.testing.expect(h > 112); // content extends below the top bar
     // 8 regions per post: body tap + avatar + reply/repost/like + bookmark/share/more.
     try std.testing.expectEqual(@as(usize, 8), regions.items.len);
@@ -8004,7 +8072,7 @@ test "Toy Box depth: the toy decorates pixels but never moves the scroll account
 
     // Baseline: natural layout. Record the content height and a checksum of every
     // text item's geometry (x + baseline + px) so we can prove pixels changed.
-    const h_none = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{});
+    const h_none = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{}, .{});
     var sum_none: i64 = 0;
     for (0..dl.len) |i| if (dl.get(i) == .text) {
         const t = dl.get(i).text;
@@ -8016,7 +8084,7 @@ test "Toy Box depth: the toy decorates pixels but never moves the scroll account
     // MUST differ (posts are scaled by engagement).
     dl.clearRetainingCapacity();
     regions.clearRetainingCapacity();
-    const h_depth = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{ .feed_toy = .depth });
+    const h_depth = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{ .feed_toy = .depth }, .{});
     var sum_depth: i64 = 0;
     for (0..dl.len) |i| if (dl.get(i) == .text) {
         const t = dl.get(i).text;
@@ -8045,7 +8113,7 @@ test "Toy Box tectonic: horizontal filmstrip returns strip width and stays tappa
     // A vertical layout of three short posts is only a few hundred px tall; the
     // tectonic strip lays them left-to-right, so the returned extent (the width the
     // shell pans across) is much larger — proof the horizontal model is in effect.
-    const extent = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{ .feed_toy = .tectonic });
+    const extent = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{ .feed_toy = .tectonic }, .{});
     try std.testing.expect(extent > 900);
     // On-strip cards still emit tap regions (taps + GPU icons track the moved card).
     try std.testing.expect(regions.items.len > 0);
@@ -8075,22 +8143,22 @@ test "Toy Box zero-g / liquid: drift moves pixels, leaves scroll accounting exac
     }.f;
 
     // Baseline height with no toy.
-    const h_none = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, null, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{});
+    const h_none = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, null, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{}, .{});
     const sum_none = sumText(&dl);
 
     // Zero-G at a non-zero clock: height identical (scroll math untouched), pixels moved.
     dl.clearRetainingCapacity();
-    const h_zg = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, null, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{ .feed_toy = .zero_g, .t = 3.0 });
+    const h_zg = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, null, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{ .feed_toy = .zero_g, .t = 3.0 }, .{});
     try std.testing.expectEqual(h_none, h_zg);
     try std.testing.expect(sum_none != sumText(&dl));
 
     // Liquid with a live slosh amplitude also moves pixels; zero flow leaves it at rest.
     dl.clearRetainingCapacity();
-    _ = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, null, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{ .feed_toy = .liquid, .t = 1.0, .flow = 40.0 });
+    _ = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, null, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{ .feed_toy = .liquid, .t = 1.0, .flow = 40.0 }, .{});
     try std.testing.expect(sum_none != sumText(&dl));
 
     dl.clearRetainingCapacity();
-    _ = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, null, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{ .feed_toy = .liquid, .t = 1.0, .flow = 0.0 });
+    _ = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, null, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{ .feed_toy = .liquid, .t = 1.0, .flow = 0.0 }, .{});
     try std.testing.expectEqual(sum_none, sumText(&dl)); // flow 0 ⇒ settled, no offset
 }
 
@@ -8179,14 +8247,14 @@ test "layout captures the rooted post's body glyphs for selection (thread screen
         .{ .name = "A", .handle = "@a.zat", .age = "1m", .body = "hello there field", .tint = 0xFFAAAAAA, .reply = 0, .boost = 0, .like = 0, .initial = 'A', .liked = false, .boosted = false, .is_focus = true },
     };
     // A WIDE layout so the focus post is on-screen and the body is drawn.
-    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_thread, null, 0, accent_house, null, .{}, null, null, &sel, "", .{}, null, 0, 0, .{}, 0, 255, null, .{});
+    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_thread, null, 0, accent_house, null, .{}, null, null, &sel, "", .{}, null, 0, 0, .{}, 0, 255, null, .{}, .{});
     // "hello there field" = 15 visible glyphs (spaces are emitted too): the body
     // captured into the selection map, in reading order.
     try std.testing.expect(sel.items.len > 0);
     try std.testing.expectEqual(@as(u32, 'h'), sel.items[0].cp);
 
     // A non-thread screen captures nothing (only the rooted post is selectable).
-    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_home, null, 0, accent_house, null, .{}, null, null, &sel, "", .{}, null, 0, 0, .{}, 0, 255, null, .{});
+    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, true, screen_home, null, 0, accent_house, null, .{}, null, null, &sel, "", .{}, null, 0, 0, .{}, 0, 255, null, .{}, .{});
     try std.testing.expectEqual(@as(usize, 0), sel.items.len);
 }
 
@@ -8268,7 +8336,7 @@ test "long timeline does not overflow draw coordinates (off-screen posts skipped
     const posts = try arena.alloc(PostView, n);
     for (posts) |*pv| pv.* = .{ .name = "x", .handle = "@x.zat", .age = "1m", .body = "a body line that wraps a little across the feed column width here", .tint = 0xFF888888, .reply = 1, .boost = 2, .like = 3, .initial = 'x', .liked = false, .boosted = false };
 
-    const h = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{}); // must not panic
+    const h = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{}, .{}); // must not panic
     try std.testing.expect(h > 940 * 10); // height accounts for the whole list
     try std.testing.expect(regions.items.len < 4 * 24); // only on-screen posts are tappable
 
@@ -8282,11 +8350,11 @@ test "long timeline does not overflow draw coordinates (off-screen posts skipped
     @memset(heights, -1);
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h_fill = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{});
+    const h_fill = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{}, .{});
     const fill_regions = regions.items.len;
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h_cached = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{});
+    const h_cached = try layout(gpa, &engine, 460, 940, posts, 0, &dl, &regions, heights, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{}, .{});
     try std.testing.expectEqual(h, h_fill);
     try std.testing.expectEqual(h, h_cached);
     try std.testing.expectEqual(fill_regions, regions.items.len);
@@ -8309,7 +8377,7 @@ test "profile screen renders the author's posts under a header; other screens st
     // Profile screen: 8 post tap regions (body + avatar + reply/repost/like +
     // bookmark/share/more) + 4 profile-nav tab regions in the sticky header
     // (the header here isn't editable, so no edit-profile region).
-    const hp = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_profile, header, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{});
+    const hp = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_profile, header, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{}, .{});
     try std.testing.expect(hp > 112);
     try std.testing.expectEqual(@as(usize, 12), regions.items.len);
 
@@ -8317,7 +8385,7 @@ test "profile screen renders the author's posts under a header; other screens st
     // so no tap regions, and the height clamps to the viewport (no post stack).
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const he = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, 2, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{}); // Activity (a still-bare placeholder)
+    const he = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, 2, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{}, .{}); // Activity (a still-bare placeholder)
     try std.testing.expectEqual(@as(i32, 940), he);
     try std.testing.expectEqual(@as(usize, 0), regions.items.len);
 
@@ -8330,7 +8398,7 @@ test "profile screen renders the author's posts under a header; other screens st
     regions.clearRetainingCapacity();
     // Narrow width (460): `m.wide` is false so the rail emits no regions — the
     // only regions are the settings surface's own, keeping the count exact.
-    _ = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_settings, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, settings_view.sec_account, 0, .{}, 0, 255, null, .{});
+    _ = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_settings, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, settings_view.sec_account, 0, .{}, 0, 255, null, .{}, .{});
     // Rows that emit a tap region: not info, and not WIP-greyed (those are inert).
     var account_interactive: usize = 0;
     for (settings_view.rows) |r| {
@@ -8526,7 +8594,7 @@ test "zones browse: each catalog entry emits one .zone_open card region carrying
         .{ .tag = "zig", .count = 913 },
         .{ .tag = "small-net", .count = 1 },
     };
-    const h = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_zones_browse, null, 0, accent_house, null, .{}, null, null, null, "", .{ .cards = &zones }, null, 0, 0, .{}, 0, 255, null, .{});
+    const h = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_zones_browse, null, 0, accent_house, null, .{}, null, null, null, "", .{ .cards = &zones }, null, 0, 0, .{}, 0, 255, null, .{}, .{});
     try std.testing.expect(h > 0);
     // Each card emits `.zone_open` (whole card) AND `.zone_pin` (its bookmark)
     // carrying the same catalog index; the pin is emitted after so it wins the
@@ -8572,7 +8640,7 @@ test "zones hub: search filters the browse grid; the pinned tab shows only pins;
     };
 
     // Search "water" on Browse: only the two matching cards emit regions.
-    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_zones_browse, null, 0, accent_house, null, .{}, null, null, null, "", .{ .cards = &zones, .query = "water" }, null, 0, 0, .{}, 0, 255, null, .{});
+    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_zones_browse, null, 0, accent_house, null, .{}, null, null, null, "", .{ .cards = &zones, .query = "water" }, null, 0, 0, .{}, 0, 255, null, .{}, .{});
     var opens: usize = 0;
     for (regions.items) |r| {
         if (r.kind != .zone_open) continue;
@@ -8582,7 +8650,7 @@ test "zones hub: search filters the browse grid; the pinned tab shows only pins;
     try std.testing.expectEqual(@as(usize, 2), opens);
 
     // The Pinned tab: only the pinned card.
-    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_zones_browse, null, 0, accent_house, null, .{}, null, null, null, "", .{ .cards = &zones, .tab = 1, .tab_t = 1 }, null, 0, 0, .{}, 0, 255, null, .{});
+    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_zones_browse, null, 0, accent_house, null, .{}, null, null, null, "", .{ .cards = &zones, .tab = 1, .tab_t = 1 }, null, 0, 0, .{}, 0, 255, null, .{}, .{});
     opens = 0;
     for (regions.items) |r| {
         if (r.kind != .zone_open) continue;
@@ -8592,7 +8660,7 @@ test "zones hub: search filters the browse grid; the pinned tab shows only pins;
     try std.testing.expectEqual(@as(usize, 1), opens);
 
     // Trending: only zones that moved in the window (recent > 0) list.
-    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_zones_browse, null, 0, accent_house, null, .{}, null, null, null, "", .{ .cards = &zones, .tab = 2, .tab_t = 2 }, null, 0, 0, .{}, 0, 255, null, .{});
+    _ = try layout(gpa, &engine, 1280, 940, &posts, 0, &dl, &regions, null, false, screen_zones_browse, null, 0, accent_house, null, .{}, null, null, null, "", .{ .cards = &zones, .tab = 2, .tab_t = 2 }, null, 0, 0, .{}, 0, 255, null, .{}, .{});
     opens = 0;
     for (regions.items) |r| {
         if (r.kind != .zone_open) continue;

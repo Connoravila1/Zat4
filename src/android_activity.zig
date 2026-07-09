@@ -201,6 +201,12 @@ const jni_get_method_id = 33; // GetMethodID
 const jni_call_object_method_a = 36; // CallObjectMethodA
 const jni_call_void_method_a = 63; // CallVoidMethodA
 const jni_call_boolean_method_a = 39; // CallBooleanMethodA
+// CallIntMethodA. The table is triples (Call<T>Method / …V / …A) starting at
+// Object=34; each group is +3, and the A-variant is base+2: Object(34/36),
+// Boolean(37/39), Byte(40/42), Char(43/45), Short(46/48), Int(49/51). So
+// CallIntMethodA = 51, NOT 49 (49 is the varargs CallIntMethod). Cross-checked
+// against the constants above (36/39) and CallVoidMethodA=63 (Void base 61).
+const jni_call_int_method_a = 51; // CallIntMethodA
 const jni_get_static_method_id = 113; // GetStaticMethodID
 const jni_call_static_object_method_a = 116; // CallStaticObjectMethodA
 const jni_new_string_utf = 167; // NewStringUTF
@@ -218,6 +224,7 @@ const GetObjectClassFn = *const fn (JniEnv, jobject) callconv(.c) jclass;
 const CallObjectMethodAFn = *const fn (JniEnv, jobject, jmethodID, [*]const jvalue) callconv(.c) jobject;
 const CallVoidMethodAFn = *const fn (JniEnv, jobject, jmethodID, [*]const jvalue) callconv(.c) void;
 const CallBooleanMethodAFn = *const fn (JniEnv, jobject, jmethodID, [*]const jvalue) callconv(.c) u8;
+const CallIntMethodAFn = *const fn (JniEnv, jobject, jmethodID, [*]const jvalue) callconv(.c) i32;
 const CallStaticObjectMethodAFn = *const fn (JniEnv, jclass, jmethodID, [*]const jvalue) callconv(.c) jobject;
 const GetStringUtfCharsFn = *const fn (JniEnv, jstring, ?*u8) callconv(.c) ?[*:0]const u8;
 const ReleaseStringUtfCharsFn = *const fn (JniEnv, jstring, [*:0]const u8) callconv(.c) void;
@@ -384,6 +391,58 @@ fn hapticTick(activity: *Activity) void {
     if (jniFailed(env)) return seam.logcat("haptic: performHapticFeedback threw", .{});
 }
 
+/// Read the OS safe-area insets (status bar, nav/home-pill, cutout) off the
+/// decor view and hand them to the core via the seam. Also switches the window
+/// to edge-to-edge with transparent system bars so the field draws full-bleed.
+/// Render thread; attach/detach like the other JNI hops. getRootWindowInsets
+/// can transiently return null before the first layout pass — guarded, so it
+/// simply retries on the next surface (re)attach. Failures no-op (E2/E4).
+fn applyWindowInsets(activity: *Activity, ctx: ?*anyopaque) void {
+    const vm: JavaVm = @ptrCast(@alignCast(activity.vm));
+    var env: JniEnv = undefined;
+    const attach: AttachFn = @ptrCast(@alignCast(vm.*.slots[vm_attach_current_thread].?));
+    if (attach(vm, &env, null) != 0) return;
+    defer _ = @as(DetachFn, @ptrCast(@alignCast(vm.*.slots[vm_detach_current_thread].?)))(vm);
+
+    const call_void = jniFn(env, jni_call_void_method_a, CallVoidMethodAFn);
+    const call_int = jniFn(env, jni_call_int_method_a, CallIntMethodAFn);
+
+    const get_window = jniMethod(env, activity.clazz, "getWindow", "()Landroid/view/Window;") orelse return;
+    const window = jniCallObj(env, activity.clazz, get_window, &no_args) orelse return;
+    const get_decor = jniMethod(env, window, "getDecorView", "()Landroid/view/View;") orelse return;
+    const decor = jniCallObj(env, window, get_decor, &no_args) orelse return;
+
+    // Edge-to-edge: draw behind the system bars, transparent status/nav bars.
+    // Each lookup is guarded (API-gated methods no-op on older platforms).
+    if (jniMethod(env, window, "setDecorFitsSystemWindows", "(Z)V")) |mid| {
+        call_void(env, window, mid, &[_]jvalue{.{ .z = 0 }});
+        _ = jniFailed(env);
+    }
+    if (jniMethod(env, window, "setStatusBarColor", "(I)V")) |mid| {
+        call_void(env, window, mid, &[_]jvalue{.{ .i = 0 }}); // transparent
+        _ = jniFailed(env);
+    }
+    if (jniMethod(env, window, "setNavigationBarColor", "(I)V")) |mid| {
+        call_void(env, window, mid, &[_]jvalue{.{ .i = 0 }}); // transparent
+        _ = jniFailed(env);
+    }
+
+    // Insets: getRootWindowInsets() then the getSystemWindowInset{Top,…}() ints.
+    const grwi = jniMethod(env, decor, "getRootWindowInsets", "()Landroid/view/WindowInsets;") orelse return;
+    const wi = jniCallObj(env, decor, grwi, &no_args) orelse return; // null before first layout → retry next attach
+    const top_mid = jniMethod(env, wi, "getSystemWindowInsetTop", "()I") orelse return;
+    const bot_mid = jniMethod(env, wi, "getSystemWindowInsetBottom", "()I") orelse return;
+    const left_mid = jniMethod(env, wi, "getSystemWindowInsetLeft", "()I") orelse return;
+    const right_mid = jniMethod(env, wi, "getSystemWindowInsetRight", "()I") orelse return;
+    const top = call_int(env, wi, top_mid, &no_args);
+    const bottom = call_int(env, wi, bot_mid, &no_args);
+    const left = call_int(env, wi, left_mid, &no_args);
+    const right = call_int(env, wi, right_mid, &no_args);
+    if (jniFailed(env)) return;
+    seam.zat_set_insets(ctx, top, bottom, left, right);
+    seam.logcat("insets: top={d} bottom={d} left={d} right={d}", .{ top, bottom, left, right });
+}
+
 /// The redirect trampoline (M-And.5). IF the OS ever stacks a fresh
 /// activity instance for the VIEW intent while this process already runs a
 /// live one, this create must not touch `app` — instead: ferry the intent's
@@ -548,6 +607,11 @@ fn renderThread() void {
                     feed_live = seam.zat_feed_start(ctx, &app.files_dir);
                     feed_errs = 0;
                 }
+            }
+            // Edge-to-edge + safe-area insets: (re)read on every attach so a
+            // rotation/fold (a fresh gen re-enters this branch) refreshes them.
+            if (attached_gen == gen) {
+                if (app.activity) |act| applyWindowInsets(act, ctx);
             }
         }
 

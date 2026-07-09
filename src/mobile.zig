@@ -764,6 +764,15 @@ pub export fn zat_feed_resize(ctx_ptr: ?*anyopaque, width_px: u32, height_px: u3
     if (ctx.feed) |*f| tui.mobileResize(f.run, width_px, height_px);
 }
 
+/// The OS-reported safe-area insets in PHYSICAL px (status bar top, home-pill
+/// bottom, cutout left/right). The activity calls this on surface create/resize
+/// and on inset changes; the tui converts to logical and reserves the regions.
+pub export fn zat_set_insets(ctx_ptr: ?*anyopaque, top: i32, bottom: i32, left: i32, right: i32) void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return));
+    if (comptime !mobile_config.have_gpu) return;
+    if (ctx.feed) |*f| tui.mobileSetInsets(f.run, top, bottom, left, right);
+}
+
 /// M-And.5: the authorize URL for the shim to open in the OS browser —
 /// non-null exactly ONCE per armed flow (the shim must not reopen the
 /// browser every frame). NUL-terminated; the bytes live until zat_shutdown.

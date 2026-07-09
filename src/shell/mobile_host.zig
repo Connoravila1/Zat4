@@ -96,6 +96,12 @@ pub const MobileHost = struct {
     /// while a drag holds the feed past an edge; release hands it to the
     /// bounce spring.
     over_px: f32 = 0,
+    /// Sub-pixel scroll carry: `gscroll_px` is an integer, so each move event
+    /// would truncate the fractional part of the (physical/scale) logical delta
+    /// and lose it — a slow drag (delta < 1 logical px/event) would then scroll
+    /// far less than the finger. This holds the lost fraction across events so
+    /// the feed tracks the finger 1:1 at every speed. Reset on touch-down.
+    scroll_carry: f32 = 0,
     /// The edge-bounce spring channel: displayed overscroll offset + velocity
     /// (logical px, px/s). Active whenever the offset or velocity is nonzero;
     /// integrates toward zero (the edge) via spring.stepScalar.

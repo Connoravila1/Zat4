@@ -2830,6 +2830,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         m.hswipe = false;
                         m.drag_y = tev.y;
                         m.fling_v = 0; // a touch catches the gliding feed (interruptible)
+                        m.scroll_carry = 0; // fresh gesture: no stale sub-pixel remainder
                         gesture.clear(&m.ring);
                         gesture.push(&m.ring, .{ .x = @as(f32, @floatFromInt(tev.x)) / scale, .y = @as(f32, @floatFromInt(tev.y)) / scale, .t_ms = now_ms });
                         // A touch catches a mid-flight edge bounce too, and
@@ -2914,7 +2915,11 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             // the frame's end. While banded, the LOGICAL
                             // scroll is pinned exactly at the edge, so the
                             // accounting below never reads the banded value.
-                            var d = dy;
+                            // Include any sub-pixel fraction carried from the
+                            // previous event so slow drags track the finger 1:1
+                            // (the integer gscroll_px would otherwise truncate it).
+                            var d = dy + m.scroll_carry;
+                            m.scroll_carry = 0;
                             if (m.over_px != 0) {
                                 const was_top = m.over_px > 0;
                                 m.over_px += d;
@@ -2937,7 +2942,9 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                     rs.gscroll_px = min_scroll;
                                     m.over_px = tent - min_scroll_f;
                                 } else {
-                                    rs.gscroll_px = @intFromFloat(tent);
+                                    const npx: i32 = @intFromFloat(tent);
+                                    m.scroll_carry = tent - @as(f32, @floatFromInt(npx)); // keep the lost fraction
+                                    rs.gscroll_px = npx;
                                 }
                             }
                         }
@@ -5617,6 +5624,20 @@ pub fn mobileResize(mr: *MobileRun, width_px: u32, height_px: u32) void {
     mr.host.height_px = height_px;
 }
 
+/// The OS safe-area insets (physical px) → stored on GpuState in LOGICAL px by
+/// dividing by the current ui scale (scale = physical_w / design_w, so logical =
+/// physical / scale). Called from the mobile seam on surface/inset changes.
+pub fn mobileSetInsets(mr: *MobileRun, top: i32, bottom: i32, left: i32, right: i32) void {
+    if (mr.rs.gpu_state) |*gs| {
+        const s: f32 = if (gs.scale > 0) gs.scale else 1.0;
+        gs.inset_top_l = @intFromFloat(@round(@as(f32, @floatFromInt(top)) / s));
+        gs.inset_bottom_l = @intFromFloat(@round(@as(f32, @floatFromInt(bottom)) / s));
+        gs.inset_left_l = @intFromFloat(@round(@as(f32, @floatFromInt(left)) / s));
+        gs.inset_right_l = @intFromFloat(@round(@as(f32, @floatFromInt(right)) / s));
+        gs.feed_sig = 0; // force a rebuild — insets change the layout (see paintFrameGpu sig)
+    }
+}
+
 /// M-And.4: the surface is dying but the app lives on — release ONLY the
 /// GPU leg. The GL context dies with the surface anyway, and every GpuState
 /// object dies with the context; the RunState — store, session, workers,
@@ -8061,6 +8082,13 @@ const GpuState = struct {
     /// thresholds). Fixed at initGpuState; `scale` and every layout call
     /// derive from it, so shape is one number the driver chooses.
     design_w: u32,
+    /// Safe-area insets in LOGICAL (design) px — set by mobileSetInsets from the
+    /// OS physical insets / ui scale. Reserve status bar (top) + home pill
+    /// (bottom); zero on desktop. Folded into feed_sig so a change rebuilds.
+    inset_top_l: i32 = 0,
+    inset_bottom_l: i32 = 0,
+    inset_left_l: i32 = 0,
+    inset_right_l: i32 = 0,
     /// Dirty signature of the last-built feed (scroll + window size + each
     /// post's identity/counts/flags). The field animates every frame, but the
     /// feed — transform + per-post text measurement + vertex build — is rebuilt
@@ -8806,7 +8834,7 @@ fn paintFrame(
                 // seam. Slice 1 hands back the screen's own geometry (identical
                 // render); the animated morph springs this between screens.
                 const sw_geom = feed_view.paneGeomFor(@intCast(win.fb.width), g.screen.*);
-                g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, null, null, g.zone_title, g.zones, sw_geom, g.settings_section, g.settings_toggles, g.settings_account, g.settings_choices, g.settings_picking, g.repost_menu, g.toys) catch g.content_h.*;
+                g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, null, null, g.zone_title, g.zones, sw_geom, g.settings_section, g.settings_toggles, g.settings_account, g.settings_choices, g.settings_picking, g.repost_menu, g.toys, .{}) catch g.content_h.*;
             }
             const t_layout = if (debug_frame_timing) clock_shell.monotonicNanos() else 0;
             window_shell.presentDrawList(win, gpa, g.engine, g.draw.slice(), field_core.background) catch {}; // E2: a lost blit is the next frame's problem
@@ -9007,12 +9035,13 @@ fn paintComposeGpu(
 
     advanceField(gpa, gs, g.active);
 
-    gpu.uploadField(&gs.grid, gs.field.height, gs.field.dye, gs.field.cols, gs.field.rows);
+    const field_mobile_off = gs.design_w <= feed_view.phone_max; // field OFF on phone (battery)
+    if (!field_mobile_off) gpu.uploadField(&gs.grid, gs.field.height, gs.field.dye, gs.field.cols, gs.field.rows);
     if (g.xp) gpu.clear(retro_clear_r, retro_clear_g, retro_clear_b) else if (g.julia) gpu.clear(julia_clear_r, julia_clear_g, julia_clear_b) else if (g.light) gpu.clear(light_clear_r, light_clear_g, light_clear_b) else gpu.clear(gpu_clear_r, gpu_clear_g, gpu_clear_b);
     // Field glyph ink: cool grey-white normally; pink under Julia mode (the glow
     // rides the ink, so it pinks too). 0xA6ACBA = the shader's original bright endpoint.
     const field_ink: u32 = if (g.julia) lens_socket.julia_field_ink else if (g.light) feed_view.light_field_ink else 0xFFFFFFFF;
-    if (g.field_on and !g.xp) gpu.drawFieldGrid(&gs.grid, &gs.ramp, gs.mcx, gs.mcy, gs.t, @intCast(w), @intCast(h), 0, 0, field_ink, g.julia, g.light); // composer: no panel softening ("Living glyph field" off ⇒ flat; XP ⇒ teal desktop)
+    if (g.field_on and !g.xp and !field_mobile_off) gpu.drawFieldGrid(&gs.grid, &gs.ramp, gs.mcx, gs.mcy, gs.t, @intCast(w), @intCast(h), 0, 0, field_ink, g.julia, g.light); // composer: no panel softening (mobile ⇒ field off for battery)
     gpu.feedDraw(&gs.feed, @intCast(w), @intCast(h));
     gpu.swap(&gs.g);
 }
@@ -9341,7 +9370,7 @@ fn paintFrameGpu(
         settings_hover_sig ^= @as(u64, @intFromBool(g.settings_account.pet_name_focus)) *% 0x2545_F491_4F6C_DD1D;
         for (g.settings_account.pet_name) |c| settings_hover_sig = settings_hover_sig *% 131 +% c;
     }
-    const sig = feedSignature(items, g.scroll.*, w, h) ^ (@as(u64, g.screen.*) *% 0x9E37_79B9_7F4A_7C15) ^ (socket_sig *% 0xD1B5_4A32_D192_ED03) ^ (@as(u64, g.settings_section) *% 0xC2B2_AE3D_27D4_EB4F) ^ (g.settings_toggles *% 0x9E6C_63D0_676A_9A99) ^ (g.settings_choices *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, g.settings_picking) *% 0x8A91_7F2B_4D3E_61C7) ^ (@as(u64, @intFromBool(g.inspect_source)) *% 0xF29C_511C_8E3D_45A7) ^ (@as(u64, @intFromBool(g.inspect_loading)) *% 0xBF58_476D_1CE4_E5B9) ^ chat_sig ^ zones_sig ^ (exp_sig *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, if (g.repost_menu) |m| m + 1 else 0) *% 0xA0761D6478BD642F) ^ settings_hover_sig ^ (if (g.xp) (@as(u64, g.xp_hour) *% 60 +% g.xp_min +% 1) *% 0xF1357AEA2E62A9C5 else 0) ^ (@as(u64, @intFromBool(g.light)) *% 0xD6E8_FEB8_6659_FD93);
+    const sig = feedSignature(items, g.scroll.*, w, h) ^ (@as(u64, g.screen.*) *% 0x9E37_79B9_7F4A_7C15) ^ (socket_sig *% 0xD1B5_4A32_D192_ED03) ^ (@as(u64, g.settings_section) *% 0xC2B2_AE3D_27D4_EB4F) ^ (g.settings_toggles *% 0x9E6C_63D0_676A_9A99) ^ (g.settings_choices *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, g.settings_picking) *% 0x8A91_7F2B_4D3E_61C7) ^ (@as(u64, @intFromBool(g.inspect_source)) *% 0xF29C_511C_8E3D_45A7) ^ (@as(u64, @intFromBool(g.inspect_loading)) *% 0xBF58_476D_1CE4_E5B9) ^ chat_sig ^ zones_sig ^ (exp_sig *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, if (g.repost_menu) |m| m + 1 else 0) *% 0xA0761D6478BD642F) ^ settings_hover_sig ^ (if (g.xp) (@as(u64, g.xp_hour) *% 60 +% g.xp_min +% 1) *% 0xF1357AEA2E62A9C5 else 0) ^ (@as(u64, @intFromBool(g.light)) *% 0xD6E8_FEB8_6659_FD93) ^ (@as(u64, @bitCast(@as(i64, gs.inset_top_l) *% 73856093 ^ @as(i64, gs.inset_bottom_l) *% 19349663 ^ @as(i64, gs.inset_left_l) *% 83492791 ^ @as(i64, gs.inset_right_l) *% 49979687)) *% 0x9E37_79B9_7F4A_7C15);
     // A drag/settle animates the socket every frame (lift, reflow, ghost), so
     // bypass the feed cache while it runs — a brief interaction, and the field
     // already rebuilds every frame anyway.
@@ -9519,7 +9548,7 @@ fn paintFrameGpu(
             var toys_frame = g.toys;
             toys_frame.t = gs.t;
             toys_frame.flow = gs.flow;
-            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, &chain_info, &gs.sel_glyphs, g.zone_title, g.zones, gp_geom, g.settings_section, g.settings_toggles, g.settings_account, g.settings_choices, g.settings_picking, g.repost_menu, toys_frame) catch g.content_h.*;
+            g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, &chain_info, &gs.sel_glyphs, g.zone_title, g.zones, gp_geom, g.settings_section, g.settings_toggles, g.settings_account, g.settings_choices, g.settings_picking, g.repost_menu, toys_frame, .{ .top = @intCast(gs.inset_top_l), .bottom = @intCast(gs.inset_bottom_l), .left = @intCast(gs.inset_left_l), .right = @intCast(gs.inset_right_l) }) catch g.content_h.*;
         }
         if (g.julia) feed_view.juliaRemapText(g.draw); // light theme: dark text
         // "Show frame timing": ride the fps/ms badge on the feed buffer. The gate
@@ -9763,7 +9792,7 @@ fn paintFrameGpu(
             // desktop furniture). Same buffer, same un-crossfaded draw, same
             // region kinds — the dispatch and the SDF icon pass are unchanged.
             g.draw.len = 0;
-            feed_view.drawTabBar(gpa, g.draw, g.engine, @intCast(gs.design_w), @intCast(lh), g.screen.*, g.regions, g.accent, true) catch {};
+            feed_view.drawTabBar(gpa, g.draw, g.engine, @intCast(gs.design_w), @intCast(lh), @intCast(gs.inset_bottom_l), g.screen.*, g.regions, g.accent, true) catch {};
             // The nav DRAWER slides over everything (scrim + panel); its
             // regions land last, so while open it owns the taps.
             feed_view.drawDrawer(gpa, g.draw, g.engine, @intCast(gs.design_w), @intCast(lh), gs.drawer_t, g.screen.*, g.regions, g.accent, g.you_handle, true) catch {};
@@ -9821,8 +9850,15 @@ fn paintFrameGpu(
 
     advanceField(gpa, gs, g.active);
 
+    // The living field is OFF on the phone (mobile): it is barely visible under
+    // the full-bleed feed and the per-frame R32F upload + full-screen field
+    // shader is real battery/GPU cost for ~no payoff on a handheld. The CPU sim
+    // (advanceField, tens of µs) stays so effects/dye accounting are intact; only
+    // the GPU upload + draw are skipped. Desktop is unchanged.
+    const field_mobile_off = gs.design_w <= feed_view.phone_max;
+
     // Render: the living field behind, the feed on top, then swap.
-    gpu.uploadField(&gs.grid, gs.field.height, gs.field.dye, gs.field.cols, gs.field.rows);
+    if (!field_mobile_off) gpu.uploadField(&gs.grid, gs.field.height, gs.field.dye, gs.field.cols, gs.field.rows);
     if (g.xp) gpu.clear(retro_clear_r, retro_clear_g, retro_clear_b) else if (g.julia) gpu.clear(julia_clear_r, julia_clear_g, julia_clear_b) else if (g.light) gpu.clear(light_clear_r, light_clear_g, light_clear_b) else gpu.clear(gpu_clear_r, gpu_clear_g, gpu_clear_b);
     // Soften the field UNDER the content column (glass backdrop). The feed lays
     // out at the logical design width; map the column's x-range to physical px.
@@ -9834,7 +9870,7 @@ fn paintFrameGpu(
     const panel_r = if (gs.shatter_active) 0 else @as(f32, @floatFromInt(gs.content_x + gs.content_w)) * scale;
     const field_ink: u32 = if (g.julia) lens_socket.julia_field_ink else if (g.light) feed_view.light_field_ink else 0xFFFFFFFF;
     gs.grid.gain = g.field_gain; // Appearance → "Field intensity" choice
-    if (g.field_on and !g.xp) gpu.drawFieldGrid(&gs.grid, &gs.ramp, gs.mcx, gs.mcy, gs.t, @intCast(w), @intCast(h), panel_l, panel_r, field_ink, g.julia, g.light); // "Living glyph field" off ⇒ flat background (XP ⇒ teal desktop)
+    if (g.field_on and !g.xp and !field_mobile_off) gpu.drawFieldGrid(&gs.grid, &gs.ramp, gs.mcx, gs.mcy, gs.t, @intCast(w), @intCast(h), panel_l, panel_r, field_ink, g.julia, g.light); // "Living glyph field" off ⇒ flat background (XP ⇒ teal desktop; mobile ⇒ off for battery)
     // Hover highlight (post wash + button highlight), BEHIND the feed so the
     // content draws on top — the app feels alive under the cursor.
     drawHoverOverlay(gpa, g, gs, scale, @intCast(w), @intCast(h));
