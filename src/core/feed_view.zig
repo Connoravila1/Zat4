@@ -223,7 +223,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -1615,13 +1615,12 @@ pub fn drawTabBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, w
     if (bottom_inset > 0) try rect(gpa, dl, 0, by + tab_bar_h, width, bottom_inset, skinHeaderVeil(accent), 0);
     try rect(gpa, dl, 0, by, width, 1, divider, 0);
 
-    const Slot = union(enum) { nav: u8, compose, you };
-    // zones = the BROWSE page (nav idx 1) — the search surface until real
-    // search exists (the locked design names "search" here). The locked
-    // FIVE, no more: everything else (Zat Chat, Algorithms, Settings)
-    // lives in the swipe-right nav DRAWER (drawDrawer) — seven slots read
-    // as crowded on the first device pass.
-    const slots = [_]Slot{ .{ .nav = screen_home }, .{ .nav = screen_zones_browse }, .compose, .{ .nav = 2 }, .you };
+    const Slot = union(enum) { nav: u8, you };
+    // The locked FIVE nav tabs (Bluesky pattern): home · zones(search) · Zat
+    // Chat (centre) · activity · you. Composing is NOT a tab — it is the
+    // floating FAB below. Everything else (Algorithms, Settings) lives in the
+    // swipe-right nav DRAWER (drawDrawer).
+    const slots = [_]Slot{ .{ .nav = screen_home }, .{ .nav = screen_zones_browse }, .{ .nav = screen_messages }, .{ .nav = 2 }, .you };
     const slot_w = @divTrunc(width, @as(i32, @intCast(slots.len)));
     const icon_cy = by + 36;
     for (slots, 0..) |slot, i| {
@@ -1633,13 +1632,6 @@ pub fn drawTabBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, w
                 if (!skip_nav) try navIcon(idx, gpa, dl, cx - 11, icon_cy - 11, 22, if (on) accent else muted);
                 try emitRegion(gpa, regions, cx - 21, icon_cy - 19, 42, 42, idx, .nav);
             },
-            .compose => {
-                // The raised accent button; the ＋ is two rects, no glyph needed.
-                try rect(gpa, dl, cx - 25, icon_cy - 25, 50, 50, accent, 25);
-                try rect(gpa, dl, cx - 11, icon_cy - 2, 22, 4, bg, 2);
-                try rect(gpa, dl, cx - 2, icon_cy - 11, 4, 22, bg, 2);
-                try emitRegion(gpa, regions, cx - 27, icon_cy - 27, 54, 54, 0, .compose);
-            },
             .you => {
                 const on = active == screen_profile;
                 if (on) try rect(gpa, dl, cx - 26, icon_cy - 24, 52, 48, (0x22 << 24) | (accent & 0x00FFFFFF), 14);
@@ -1649,6 +1641,17 @@ pub fn drawTabBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, w
             },
         }
     }
+    // The floating COMPOSE button (Bluesky pattern): a raised accent circle
+    // above the bar at the right, distinct from the five nav tabs — posting
+    // lives here now that the centre tab is Zat Chat.
+    const fab_r: i32 = 27;
+    const fab_cx = width - 26 - fab_r;
+    const fab_cy = by - 22 - fab_r;
+    try rect(gpa, dl, fab_cx - fab_r, fab_cy - fab_r + 3, fab_r * 2, fab_r * 2, 0x38000000, @intCast(fab_r)); // soft drop shadow so it lifts off the feed
+    try rect(gpa, dl, fab_cx - fab_r, fab_cy - fab_r, fab_r * 2, fab_r * 2, accent, @intCast(fab_r));
+    try rect(gpa, dl, fab_cx - 12, fab_cy - 2, 24, 4, bg, 2);
+    try rect(gpa, dl, fab_cx - 2, fab_cy - 12, 4, 24, bg, 2);
+    try emitRegion(gpa, regions, fab_cx - fab_r - 2, fab_cy - fab_r - 2, fab_r * 2 + 4, fab_r * 2 + 4, 0, .compose);
 }
 
 /// The PHONE nav DRAWER (the Bluesky-pattern reference, owner-chosen): a
@@ -6061,8 +6064,22 @@ fn drawTopBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Me
             try rect(gpa, dl, m.col_x, box_h - 1, m.col_w, 1, divider, 0);
             return;
         }
-        const wm = try str(gpa, dl, e, .semibold, m.lx, 42, accent, 22, "Zat4");
-        _ = try str(gpa, dl, e, .semibold, wm, 42, ink, 22, ".");
+        // Mobile home header: a hamburger (opens the nav drawer — tap OR the
+        // swipe-right both work) at the left, the wordmark CENTERED, and a
+        // search magnifier at the right.
+        const ham_cy: i32 = 21;
+        try rect(gpa, dl, m.lx, ham_cy - 7, 22, 2, ink, 1);
+        try rect(gpa, dl, m.lx, ham_cy, 22, 2, ink, 1);
+        try rect(gpa, dl, m.lx, ham_cy + 7, 22, 2, ink, 1);
+        try emitRegion(gpa, regions, m.lx - 6, ham_cy - 15, 40, 38, 0, .drawer_open);
+        const ww: i32 = @intCast(text.measure(e, .semibold, "Zat4.", 22));
+        const wmx = m.col_x + @divTrunc(m.col_w - ww, 2);
+        const wm = try str(gpa, dl, e, .semibold, wmx, 29, accent, 22, "Zat4");
+        _ = try str(gpa, dl, e, .semibold, wm, 29, ink, 22, ".");
+        const right_margin = m.lx - m.col_x;
+        const srch_x = m.col_x + m.col_w - right_margin - 26;
+        try iconSearch(gpa, dl, srch_x, 8, 26, ink);
+        try emitRegion(gpa, regions, srch_x - 6, 5, 40, 38, 0, .search);
         if (is_home) if (socket_tray) |tray| {
             const geom: lens_socket.Geometry = .{ .x = m.lx, .y = socket_y_narrow, .w = m.cw, .scale = 1.0 };
             _ = try lens_socket.build(gpa, e, tray, socket_ui, geom, dl, socket_hits);

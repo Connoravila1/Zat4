@@ -3638,6 +3638,21 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         .drawer_close => {
                                             if (rs.gpu_state) |*gsd| gsd.drawer_want = false;
                                         },
+                                        // The mobile header hamburger: tap opens the nav
+                                        // drawer (the swipe-right is the other way in).
+                                        .drawer_open => {
+                                            if (rs.gpu_state) |*gsd| gsd.drawer_want = true;
+                                        },
+                                        // The mobile header search magnifier. Interim: the
+                                        // Zones hub IS the search surface (its "search or jump
+                                        // to a tag" field) until a global search exists — land
+                                        // there with the field focused.
+                                        .search => {
+                                            rs.gscreen = feed_view.screen_zones_browse;
+                                            rs.gscroll_px = 0;
+                                            rs.gzones_q_focus = true;
+                                            if (rs.gpu_state) |*gsd| gsd.drawer_want = false;
+                                        },
                                         // Avatar tap → open THAT author's profile (any author;
                                         // the DID comes from the post's at-uri). A query over
                                         // the shared store — same engagement/identity truth.
