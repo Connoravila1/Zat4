@@ -128,6 +128,7 @@ const action_down: i32 = 0;
 const action_up: i32 = 1;
 const action_move: i32 = 2;
 const key_action_down: i32 = 0;
+const akeycode_back: i32 = 4; // AKEYCODE_BACK — the system back gesture/button
 const meta_shift_on: i32 = 0x1;
 
 extern "android" fn AKeyEvent_getAction(event: *const AInputEvent) callconv(.c) i32;
@@ -207,8 +208,11 @@ const jni_call_boolean_method_a = 39; // CallBooleanMethodA
 // CallIntMethodA = 51, NOT 49 (49 is the varargs CallIntMethod). Cross-checked
 // against the constants above (36/39) and CallVoidMethodA=63 (Void base 61).
 const jni_call_int_method_a = 51; // CallIntMethodA
+const jni_get_field_id = 94; // GetFieldID
+const jni_get_int_field = 100; // GetIntField
 const jni_get_static_method_id = 113; // GetStaticMethodID
 const jni_call_static_object_method_a = 116; // CallStaticObjectMethodA
+const jni_call_static_int_method_a = 131; // CallStaticIntMethodA
 const jni_new_string_utf = 167; // NewStringUTF
 const jni_get_string_utf_chars = 169; // GetStringUTFChars
 const jni_release_string_utf_chars = 170; // ReleaseStringUTFChars
@@ -226,6 +230,10 @@ const CallVoidMethodAFn = *const fn (JniEnv, jobject, jmethodID, [*]const jvalue
 const CallBooleanMethodAFn = *const fn (JniEnv, jobject, jmethodID, [*]const jvalue) callconv(.c) u8;
 const CallIntMethodAFn = *const fn (JniEnv, jobject, jmethodID, [*]const jvalue) callconv(.c) i32;
 const CallStaticObjectMethodAFn = *const fn (JniEnv, jclass, jmethodID, [*]const jvalue) callconv(.c) jobject;
+const CallStaticIntMethodAFn = *const fn (JniEnv, jclass, jmethodID, [*]const jvalue) callconv(.c) i32;
+const jfieldID = ?*anyopaque;
+const GetFieldIdFn = *const fn (JniEnv, jclass, [*:0]const u8, [*:0]const u8) callconv(.c) jfieldID;
+const GetIntFieldFn = *const fn (JniEnv, jobject, jfieldID) callconv(.c) i32;
 const GetStringUtfCharsFn = *const fn (JniEnv, jstring, ?*u8) callconv(.c) ?[*:0]const u8;
 const ReleaseStringUtfCharsFn = *const fn (JniEnv, jstring, [*:0]const u8) callconv(.c) void;
 const ExceptionCheckFn = *const fn (JniEnv) callconv(.c) u8;
@@ -373,6 +381,23 @@ fn imeSetVisible(activity: *Activity, show: bool) void {
 /// respects the user's system haptic setting, which is the polite default;
 /// failures log and no-op (E2/E4 — a missed tick, never a crash). Render
 /// thread; attach/detach like the IME hop.
+/// Back at the app's root: Activity.moveTaskToBack(true) steps the task behind
+/// the launcher WITHOUT finishing — the process, GL context, and feed stay hot,
+/// so returning is instant (the same warm-resume path as Home). Render thread;
+/// attach/detach like the other JNI hops; failures log and no-op (E2/E4).
+fn moveTaskToBack(activity: *Activity) void {
+    const vm: JavaVm = @ptrCast(@alignCast(activity.vm));
+    var env: JniEnv = undefined;
+    const attach: AttachFn = @ptrCast(@alignCast(vm.*.slots[vm_attach_current_thread].?));
+    if (attach(vm, &env, null) != 0) return;
+    defer _ = @as(DetachFn, @ptrCast(@alignCast(vm.*.slots[vm_detach_current_thread].?)))(vm);
+
+    const call_bool = jniFn(env, jni_call_boolean_method_a, CallBooleanMethodAFn);
+    const mid = jniMethod(env, activity.clazz, "moveTaskToBack", "(Z)Z") orelse return;
+    _ = call_bool(env, activity.clazz, mid, &[_]jvalue{.{ .z = 1 }});
+    if (jniFailed(env)) return seam.logcat("back: moveTaskToBack threw", .{});
+}
+
 fn hapticTick(activity: *Activity) void {
     const vm: JavaVm = @ptrCast(@alignCast(activity.vm));
     var env: JniEnv = undefined;
@@ -427,18 +452,74 @@ fn applyWindowInsets(activity: *Activity, ctx: ?*anyopaque) void {
         _ = jniFailed(env);
     }
 
-    // Insets: getRootWindowInsets() then the getSystemWindowInset{Top,…}() ints.
+    // Insets. MODERN PATH FIRST (API 30+): WindowInsets.getInsets(mask) with
+    // statusBars|navigationBars|displayCutout — crucially EXCLUDING ime(). The
+    // deprecated getSystemWindowInset* getters FOLD THE SOFT KEYBOARD IN, so a
+    // resume that caught the IME (or its dismiss animation) stored a ~940px
+    // "bottom inset" and shoved the tab bar to mid-screen (on-device,
+    // 2026-07-09). Every JNI miss falls through to the deprecated path.
     const grwi = jniMethod(env, decor, "getRootWindowInsets", "()Landroid/view/WindowInsets;") orelse return;
     const wi = jniCallObj(env, decor, grwi, &no_args) orelse return; // null before first layout → retry next attach
-    const top_mid = jniMethod(env, wi, "getSystemWindowInsetTop", "()I") orelse return;
-    const bot_mid = jniMethod(env, wi, "getSystemWindowInsetBottom", "()I") orelse return;
-    const left_mid = jniMethod(env, wi, "getSystemWindowInsetLeft", "()I") orelse return;
-    const right_mid = jniMethod(env, wi, "getSystemWindowInsetRight", "()I") orelse return;
-    const top = call_int(env, wi, top_mid, &no_args);
-    const bottom = call_int(env, wi, bot_mid, &no_args);
-    const left = call_int(env, wi, left_mid, &no_args);
-    const right = call_int(env, wi, right_mid, &no_args);
-    if (jniFailed(env)) return;
+
+    var top: i32 = -1;
+    var bottom: i32 = -1;
+    var left: i32 = -1;
+    var right: i32 = -1;
+    modern: {
+        const type_cls = jniFn(env, jni_find_class, FindClassFn)(env, "android/view/WindowInsets$Type");
+        if (jniFailed(env) or type_cls == null) break :modern;
+        const gsm = jniFn(env, jni_get_static_method_id, GetMethodIdFn);
+        const sint = jniFn(env, jni_call_static_int_method_a, CallStaticIntMethodAFn);
+        var mask: i32 = 0;
+        inline for (.{ "statusBars", "navigationBars", "displayCutout" }) |nm| {
+            const mid = gsm(env, type_cls, nm, "()I");
+            if (jniFailed(env) or mid == null) break :modern;
+            mask |= sint(env, type_cls, mid, &no_args);
+            if (jniFailed(env)) break :modern;
+        }
+        const gi_mid = jniMethod(env, wi, "getInsets", "(I)Landroid/graphics/Insets;") orelse break :modern;
+        const ins = jniCallObj(env, wi, gi_mid, &[_]jvalue{.{ .i = mask }}) orelse break :modern;
+        const icls = jniFn(env, jni_get_object_class, GetObjectClassFn)(env, ins);
+        if (jniFailed(env) or icls == null) break :modern;
+        const gfid = jniFn(env, jni_get_field_id, GetFieldIdFn);
+        const gint = jniFn(env, jni_get_int_field, GetIntFieldFn);
+        // android.graphics.Insets exposes its values as public final int FIELDS.
+        const f_top = gfid(env, icls, "top", "I");
+        if (jniFailed(env) or f_top == null) break :modern;
+        const f_bot = gfid(env, icls, "bottom", "I");
+        if (jniFailed(env) or f_bot == null) break :modern;
+        const f_left = gfid(env, icls, "left", "I");
+        if (jniFailed(env) or f_left == null) break :modern;
+        const f_right = gfid(env, icls, "right", "I");
+        if (jniFailed(env) or f_right == null) break :modern;
+        top = gint(env, ins, f_top);
+        bottom = gint(env, ins, f_bot);
+        left = gint(env, ins, f_left);
+        right = gint(env, ins, f_right);
+        if (jniFailed(env)) {
+            top = -1; // poisoned mid-read → the deprecated path below re-reads
+            break :modern;
+        }
+    }
+    if (top < 0) {
+        // Deprecated fallback (pre-API-30): the per-side getters.
+        const top_mid = jniMethod(env, wi, "getSystemWindowInsetTop", "()I") orelse return;
+        const bot_mid = jniMethod(env, wi, "getSystemWindowInsetBottom", "()I") orelse return;
+        const left_mid = jniMethod(env, wi, "getSystemWindowInsetLeft", "()I") orelse return;
+        const right_mid = jniMethod(env, wi, "getSystemWindowInsetRight", "()I") orelse return;
+        top = call_int(env, wi, top_mid, &no_args);
+        bottom = call_int(env, wi, bot_mid, &no_args);
+        left = call_int(env, wi, left_mid, &no_args);
+        right = call_int(env, wi, right_mid, &no_args);
+        if (jniFailed(env)) return;
+    }
+    // Sanity clamp (both paths): bars/pill/cutout insets are small (≲150 device
+    // px on any sane phone). Anything bigger is a transient — an IME mid-dismiss,
+    // an animation frame — so SKIP the update and keep the previous good values
+    // rather than shoving the whole layout around.
+    const inset_cap: i32 = 300;
+    if (top > inset_cap or bottom > inset_cap or left > inset_cap or right > inset_cap)
+        return seam.logcat("insets: transient skipped (top={d} bottom={d} left={d} right={d})", .{ top, bottom, left, right });
     seam.zat_set_insets(ctx, top, bottom, left, right);
     seam.logcat("insets: top={d} bottom={d} left={d} right={d}", .{ top, bottom, left, right });
 }
@@ -456,12 +537,20 @@ fn redirectTrampoline(activity: *Activity) bool {
     if (app.thread == null) return false; // no live instance: a normal launch
     const env: JniEnv = @ptrCast(@alignCast(activity.env));
 
-    _ = deliverIntentRedirect(activity);
+    const delivered = deliverIntentRedirect(activity);
 
-    // Re-front the original task: startActivity(getPackageManager()
-    // .getLaunchIntentForPackage(getPackageName())) — the launcher intent
-    // brings the running task forward instead of stacking a new instance.
-    blk: {
+    // Re-front the original task ONLY when this create actually carried the
+    // OAuth redirect (our task may sit behind the browser's, so the launcher
+    // intent brings it forward). A duplicate MAIN/LAUNCHER create — the
+    // launcher CAN stack a fresh instance on the live task (seen on the Pixel
+    // right after an app-freezer unfreeze, 2026-07-09) — must NOT fire it:
+    // launchMode is standard, so the launch intent stacks yet another
+    // instance, every new create trampolines again, and ActivityManager kills
+    // the app for rapidActivityLaunch (the on-device "zones crash"; the
+    // stacked duplicates also ate taps — their input queues are never wired).
+    // Finishing the duplicate is enough there: the original activity beneath
+    // the same task resumes by itself.
+    if (delivered) blk: {
         const get_pm = jniMethod(env, activity.clazz, "getPackageManager", "()Landroid/content/pm/PackageManager;") orelse break :blk;
         const pm = jniCallObj(env, activity.clazz, get_pm, &no_args) orelse break :blk;
         const get_pkg = jniMethod(env, activity.clazz, "getPackageName", "()Ljava/lang/String;") orelse break :blk;
@@ -472,6 +561,7 @@ fn redirectTrampoline(activity: *Activity) bool {
         jniFn(env, jni_call_void_method_a, CallVoidMethodAFn)(env, activity.clazz, start_mid, &[_]jvalue{.{ .l = launch_intent }});
         _ = jniFailed(env);
     }
+    seam.logcat("trampoline: duplicate create (redirect={}) — finishing it", .{delivered});
 
     // Dismiss the duplicate instance. Its callbacks were never wired, so
     // the teardown that follows touches nothing of ours.
@@ -652,10 +742,19 @@ fn renderThread() void {
                         handled = 1;
                     }
                 } else if (AInputEvent_getType(e) == input_event_type_key) {
-                    // The soft keyboard's KeyEvent fallback (M-UX keyboard
-                    // leg). Mapped keys feed the composer; unmapped ones
-                    // (BACK, volume) stay the system's.
-                    if (AKeyEvent_getAction(e) == key_action_down) {
+                    // BACK (the system edge swipe / back button — the manifest
+                    // leaves enableOnBackInvokedCallback off, so it arrives as
+                    // this key event): route it to the app's own navigation pop
+                    // and CONSUME both halves — unhandled, the framework's
+                    // default finishes the activity (the "back exits the app"
+                    // complaint). Back-at-root minimizes via the poll below.
+                    if (AKeyEvent_getKeyCode(e) == akeycode_back) {
+                        if (AKeyEvent_getAction(e) == key_action_down) seam.zat_back(ctx);
+                        handled = 1;
+                    } else if (AKeyEvent_getAction(e) == key_action_down) {
+                        // The soft keyboard's KeyEvent fallback (M-UX keyboard
+                        // leg). Mapped keys feed the composer; other unmapped
+                        // ones (volume, …) stay the system's.
                         if (keyCodepoint(AKeyEvent_getKeyCode(e), AKeyEvent_getMetaState(e))) |cp| {
                             seam.zat_key(ctx, cp);
                             handled = 1;
@@ -678,6 +777,12 @@ fn renderThread() void {
             // pull-to-refresh arm) land as one taptic each.
             if (seam.zat_haptic(ctx) != 0) {
                 if (app.activity) |act| hapticTick(act);
+            }
+            // Back popped at the ROOT (Home, nothing open): step the task
+            // back to the launcher — the Android convention. Never finish():
+            // the process + feed stay hot for an instant return.
+            if (seam.zat_minimize(ctx)) {
+                if (app.activity) |act| moveTaskToBack(act);
             }
         } else if (ime_shown) {
             if (app.activity) |act| imeSetVisible(act, false);

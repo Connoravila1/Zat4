@@ -116,6 +116,21 @@ pub const MobileHost = struct {
     /// integrates toward zero (the edge) via spring.stepScalar.
     bounce_px: f32 = 0,
     bounce_v: f32 = 0,
+    /// Press-and-hold to drag (the loadout library → socket, like holding a
+    /// home-screen icon): `down_ms` is the shell-stamped ms the finger landed —
+    /// the long-press clock — and `hold_fired` latches once a still press past the
+    /// threshold has PICKED UP a draggable, which locks the gesture out of scroll/
+    /// swipe for its lifetime. Both reset on the next touch-down. The continuous
+    /// render loop ticks even on a motionless finger, so the timer fires.
+    down_ms: u32 = 0,
+    hold_fired: bool = false,
+    /// The system BACK (edge swipe / back button), delivered by the activity's
+    /// key drain: the pump pops one level of in-app navigation. When there is
+    /// nothing left to pop (Home, no overlays), the pump sets `minimize_pending`
+    /// and the activity steps the task back to the launcher (moveTaskToBack) —
+    /// the Android convention; the process and feed stay hot for the return.
+    back_pending: bool = false,
+    minimize_pending: bool = false,
     /// One pending haptic tick, set by the pump the frame a threshold is
     /// CROSSED during a drag (GESTURE_SYSTEM_ROADMAP §3 — the tick lands
     /// under the finger, never on release) and taken (read-and-clear) by the

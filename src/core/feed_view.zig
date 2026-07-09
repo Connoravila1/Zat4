@@ -1631,9 +1631,14 @@ pub fn composeFabBox(width: i32, height: i32, bottom_inset: i32) struct { x0: i3
 
 pub fn drawTabBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, width: i32, height: i32, bottom_inset: i32, active: u8, regions: ?*Regions, accent: u32, skip_nav: bool) error{OutOfMemory}!void {
     const by = height - tab_bar_h - bottom_inset;
-    // The feed dies out under the bar ("scrims keep chrome legible"), then
-    // the same frosted veil the sticky top bar wears, and a hairline lid.
-    try rect(gpa, dl, 0, by - 16, width, 16, 0x50181812, 0);
+    // The frosted veil the sticky top bar wears, and a hairline lid. (A 16px
+    // dark "die-out" strip used to sit above the bar — it read as a stray black
+    // band, worst in light mode; owner removed it 2026-07-09. The blocker below
+    // still covers that band so near-miss taps stay swallowed.)
+    // OPAQUE backing first, spanning the bar AND the home-pill strip: the veil
+    // alone is translucent, so posts scrolling beneath ghosted faintly through
+    // the very bottom of the screen (owner, 2026-07-09). The veil tints on top.
+    try rect(gpa, dl, 0, by, width, tab_bar_h + @max(0, bottom_inset) + 12, bg, 0);
     try rect(gpa, dl, 0, by, width, tab_bar_h, skinHeaderVeil(accent), 0);
     // Fill behind the home pill so the veil reaches the screen edge (no gap).
     if (bottom_inset > 0) try rect(gpa, dl, 0, by + tab_bar_h, width, bottom_inset, skinHeaderVeil(accent), 0);
@@ -1686,6 +1691,22 @@ pub fn drawTabBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, w
     try rect(gpa, dl, fab_cx - 12, fab_cy - 2, 24, 4, bg, 2);
     try rect(gpa, dl, fab_cx - 2, fab_cy - 12, 4, 24, bg, 2);
     try emitRegion(gpa, regions, fab_cx - fab_r - 2, fab_cy - fab_r - 2, fab_r * 2 + 4, fab_r * 2 + 4, 0, .compose);
+}
+
+/// The double-back heads-up (the TikTok pattern, owner-requested): a centred
+/// pill above the tab bar — the first system-back at the root arms it, and only
+/// a second back inside the window minimizes the app. Drawn by the phone nav
+/// tile while armed; expiry drops it via the rebuild signature.
+pub fn drawBackHint(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, width: i32, height: i32, bottom_inset: i32) error{OutOfMemory}!void {
+    const msg = "Swipe back again to exit";
+    const px: u16 = 14;
+    const tw: i32 = @intCast(text.measure(e, .semibold, msg, px));
+    const pw = tw + 44;
+    const ph: i32 = 40;
+    const x = @divTrunc(width - pw, 2);
+    const y = height - tab_bar_h - bottom_inset - ph - 18;
+    try rect(gpa, dl, x, y, pw, ph, 0xF2262620, 20);
+    _ = try str(gpa, dl, e, .semibold, x + 22, y + 26, ink, px, msg);
 }
 
 /// The PHONE nav DRAWER (the Bluesky-pattern reference, owner-chosen): a
@@ -2705,13 +2726,15 @@ pub fn layout(
         .bottom_off = if (chain_ended) chain_bottom_off else (y - scroll), // all-chain → thread end
         .pin_y = feed_y0,
     };
-    // Phone: the tab bar overlays the bottom edge — grow the content height
-    // so the last post scrolls clear of it (the shell's clamp uses this).
-    const phone_inset: i32 = if (width <= phone_max) tab_bar_h + insets.bottom else 0;
     // Tectonic maps vertical scroll → horizontal pan, so the "content extent" the
     // shell clamps scroll against is the STRIP WIDTH (the total run of cards).
     if (tect) return m.col_x + @as(i32, @intCast(posts.len)) * tect_pitch + 60;
-    return y - scroll + phone_inset; // total content height (scroll-independent), for clamping
+    // Pure content height (scroll-independent), for the shell's scroll clamp. The
+    // phone bottom-chrome clearance (tab bar + home-pill inset) that lifts the last
+    // row clear of the tab bar is added ONCE in the shell for EVERY screen (see the
+    // render funnel), not baked in here — every own-body screen gets it uniformly,
+    // and the pure layout stays device-agnostic (B3/B4: the shell owns chrome).
+    return y - scroll;
 }
 
 /// Scale a color's alpha by `al` (0..1), keeping its RGB — for fading an overlay.
@@ -2726,15 +2749,21 @@ fn aScale(c: u32, al: f32) u32 {
 /// under the top bar during the catch-up rather than covering it); the avatar +
 /// text center vertically in the visible band. The shell positions `draw_y` (the
 /// pure-sticky + catch-up math) and animates `alpha`.
-pub fn buildChainHeaderBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, width: i32, draw_y: i32, header_h: i32, pin_y: i32, tint: u32, initial: u21, name: []const u8, handle: []const u8, accent: u32, alpha: f32) error{OutOfMemory}!void {
+pub fn buildChainHeaderBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, width: i32, draw_y: i32, header_h: i32, pin_y: i32, tint: u32, initial: u21, name: []const u8, handle: []const u8, accent: u32, alpha: f32, band_top_override: ?i32) error{OutOfMemory}!void {
     _ = pin_y;
     const m = metricsFor(width);
     // The frosted band fills from the thread top bar's BOTTOM (drawTopBar box_h:
     // 111 wide / 96 narrow) down to the header — so it CONNECTS to the "Thread"
     // bar with no gap (the content still rides at `draw_y` for the seamless seam).
-    const band_top: i32 = if (m.wide) 111 else 96;
+    // PHONE passes an override of 0: the fixed 96 misses the safe-area inset
+    // shift, and the frosted veil alone let the "Thread" title ghost through at
+    // the top (owner, 2026-07-09) — the override band also gets an OPAQUE
+    // backing so nothing shows through it.
+    const band_top: i32 = band_top_override orelse (if (m.wide) 111 else 96);
     const band_bottom = draw_y + header_h;
     if (band_bottom > band_top) {
+        if (band_top_override != null)
+            try rect(gpa, dl, m.col_x, band_top, m.col_w, band_bottom - band_top, aScale(bg, alpha), 0);
         try rect(gpa, dl, m.col_x, band_top, m.col_w, band_bottom - band_top, aScale(skinHeaderVeil(accent), alpha), 0);
         try rect(gpa, dl, m.col_x, band_bottom - 1, m.col_w, 1, aScale((0x66 << 24) | (divider & 0x00FFFFFF), alpha), 0);
     }
@@ -3399,6 +3428,10 @@ pub fn layoutAlgorithmLoading(
     regions: ?*Regions,
     accent: u32,
     name: []const u8,
+    /// True when the fetch already FAILED: draw an honest error line instead of
+    /// "Loading...". Before this, the failed state drew NOTHING — a black page
+    /// with no way back (the on-device transparency bug, 2026-07-09).
+    failed: bool,
 ) error{OutOfMemory}!i32 {
     _ = accent;
     const m = metricsPage(width, screen_transparency);
@@ -3410,7 +3443,12 @@ pub fn layoutAlgorithmLoading(
     _ = try str(gpa, dl, e, .semibold, lx + 16, y - 13, ink, 14, "‹ Back");
     try emitRegion(gpa, regions, lx, y - 34, back_w, 30, 0, .back);
     _ = try str(gpa, dl, e, .semibold, lx, y + 36, ink, 38, name);
-    _ = try str(gpa, dl, e, .regular, lx, y + 78, muted, 16, "Loading...");
+    if (failed) {
+        _ = try str(gpa, dl, e, .regular, lx, y + 78, muted, 16, "Couldn't load this algorithm.");
+        _ = try str(gpa, dl, e, .regular, lx, y + 104, faint, 14, "Check your connection, go back, and tap it again.");
+    } else {
+        _ = try str(gpa, dl, e, .regular, lx, y + 78, muted, 16, "Loading...");
+    }
     return 0;
 }
 
@@ -3473,7 +3511,16 @@ pub fn layoutLoadout(
     /// socket. Rendered as a right-hand shelf on the Loadout tab; drag one into a
     /// socket to load it. Empty ⇒ the empty-state prompt.
     bench: lens_socket.TrayView,
+    /// Safe-area insets (logical px). On phone the header + scroll body shift down
+    /// by `top` so the "Algorithms" title clears the status bar; desktop passes
+    /// zero. (The bottom clearance is added uniformly by the shell — see the funnel.)
+    insets: EdgeInsets,
+    /// Out: the PHONE library band's top edge in screen px (maxInt when the wide
+    /// right-hand shelf is used instead) — the shell's touch drop test reads it:
+    /// a card dragged out of a socket and released over the library unequips.
+    out_lib_y: ?*i32,
 ) error{OutOfMemory}!i32 {
+    if (out_lib_y) |p| p.* = std.math.maxInt(i32);
     // Algorithms is a WIDE page like the others: the glass spans the full
     // rectangle and the content centres in it — NO floating main-feed sidebar.
     const m: Metrics = if (pane_geom) |g|
@@ -3496,7 +3543,11 @@ pub fn layoutLoadout(
         try drawAgpl(gpa, dl, e, m.lx, height - 40);
     }
 
-    const header_h: i32 = 130;
+    // The sticky header grows by the top safe-area inset so the title + tabs sit
+    // BELOW the status bar on phone (the same early-page inset fix the other
+    // own-body screens got); desktop insets are zero, so nothing moves there.
+    const top = insets.top;
+    const header_h: i32 = 130 + top;
     const content_top: i32 = header_h + 10;
     var content_h: i32 = content_top;
 
@@ -3523,48 +3574,80 @@ pub fn layoutLoadout(
         }
         content_h = (y - scroll) + 20; // total (unscrolled) height for scroll clamping
 
-        // The BENCH — a right-hand shelf of library algorithms not in a socket. Drawn
-        // FIXED (it doesn't scroll with the surfaces), in the empty space right of the
-        // content column. Drag one into a socket to load it (the drag is the next slice).
-        const shelf_x = m.lx + m.cw + 40;
-        const shelf_w = m.side_x - shelf_x - 20;
-        if (shelf_w >= 220) {
-            var sy: i32 = content_top;
-            _ = try str(gpa, dl, e, .semibold, shelf_x, sy + 12, muted, 12, "YOUR LIBRARY");
-            sy += 30;
-            if (bench.cards.len == 0) {
-                _ = try wrapBody(gpa, dl, e, shelf_x, sy + 12, shelf_w, faint, 13, "Algorithms you create or download park here. Drag one into a socket to use it.", 19, true, null);
-            } else {
-                for (bench.cards, 0..) |card, bi| {
-                    const ch: i32 = 72;
-                    const card_acc = lens_socket.palette[@min(card.color, lens_socket.palette.len - 1)];
-                    try rect(gpa, dl, shelf_x, sy, shelf_w, ch, skinPanel(accent), 12);
-                    try rect(gpa, dl, shelf_x, sy, 4, ch, card_acc, 2); // accent spine
-                    const dot: u32 = if (card.flags.behavioral) accent else boost_c;
-                    try rect(gpa, dl, shelf_x + 18, sy + 20, 8, 8, dot, 4);
-                    _ = try str(gpa, dl, e, .semibold, shelf_x + 34, sy + 28, ink, 15, bench.text[card.name.off..][0..card.name.len]);
-                    _ = try str(gpa, dl, e, .regular, shelf_x + 18, sy + 52, muted, 12, bench.text[card.ranks.off..][0..card.ranks.len]);
-                    _ = try str(gpa, dl, e, .semibold, shelf_x + shelf_w - 26, sy + 44, faint, 15, "\u{22EE}"); // ⋮ (drag lands later; tap = the socket chooser)
-                    try emitRegion(gpa, regions, shelf_x, sy, shelf_w, @intCast(ch), @intCast(bi), .bench_seat);
-                    sy += ch + 12;
+        // THE LIBRARY — algorithms you've created or downloaded that aren't socketed.
+        // Drag one into a socket to load it. On the WIDE page it's a FIXED right-hand
+        // shelf in the freed space beside the column (it doesn't scroll). On PHONE
+        // there is no room beside the narrow column, so it FLOWS in the scroll body
+        // BELOW the three sockets as a full-width list — otherwise the library is
+        // off-screen and unreachable (the owner's "can't see my loadout").
+        if (m.wide) {
+            const shelf_x = m.lx + m.cw + 40;
+            const shelf_w = m.side_x - shelf_x - 20;
+            if (shelf_w >= 220) {
+                var sy: i32 = content_top;
+                _ = try str(gpa, dl, e, .semibold, shelf_x, sy + 12, muted, 12, "YOUR LIBRARY");
+                sy += 30;
+                if (bench.cards.len == 0) {
+                    _ = try wrapBody(gpa, dl, e, shelf_x, sy + 12, shelf_w, faint, 13, "Algorithms you create or download park here. Drag one into a socket to use it.", 19, true, null);
+                } else {
+                    for (bench.cards, 0..) |card, bi| {
+                        const ch: i32 = 72;
+                        const card_acc = lens_socket.palette[@min(card.color, lens_socket.palette.len - 1)];
+                        try rect(gpa, dl, shelf_x, sy, shelf_w, ch, skinPanel(accent), 12);
+                        try rect(gpa, dl, shelf_x, sy, 4, ch, card_acc, 2); // accent spine
+                        const dot: u32 = if (card.flags.behavioral) accent else boost_c;
+                        try rect(gpa, dl, shelf_x + 18, sy + 20, 8, 8, dot, 4);
+                        _ = try str(gpa, dl, e, .semibold, shelf_x + 34, sy + 28, ink, 15, bench.text[card.name.off..][0..card.name.len]);
+                        _ = try str(gpa, dl, e, .regular, shelf_x + 18, sy + 52, muted, 12, bench.text[card.ranks.off..][0..card.ranks.len]);
+                        _ = try str(gpa, dl, e, .semibold, shelf_x + shelf_w - 26, sy + 44, faint, 15, "\u{22EE}"); // ⋮ (drag lands later; tap = the socket chooser)
+                        try emitRegion(gpa, regions, shelf_x, sy, shelf_w, @intCast(ch), @intCast(bi), .bench_seat);
+                        sy += ch + 12;
+                    }
                 }
             }
+        } else {
+            // Phone: the library flows in-body, full width, beneath the sockets.
+            var ly = y + 6;
+            if (out_lib_y) |p| p.* = ly; // the unequip drop band starts here
+            _ = try str(gpa, dl, e, .semibold, m.lx, ly + 14, muted, 13, "YOUR LIBRARY");
+            ly += 34;
+            if (bench.cards.len == 0) {
+                ly = try wrapBody(gpa, dl, e, m.lx, ly + 12, m.cw, faint, 14, "Algorithms you create or download park here. Press and hold one to drag it into a socket.", 21, true, null);
+                ly += 20;
+            } else {
+                for (bench.cards, 0..) |card, bi| {
+                    const ch: i32 = 78;
+                    const card_acc = lens_socket.palette[@min(card.color, lens_socket.palette.len - 1)];
+                    try rect(gpa, dl, m.lx, ly, m.cw, ch, skinPanel(accent), 13);
+                    try rect(gpa, dl, m.lx, ly, 4, ch, card_acc, 2); // accent spine
+                    const dot: u32 = if (card.flags.behavioral) accent else boost_c;
+                    try rect(gpa, dl, m.lx + 20, ly + 24, 9, 9, dot, 4);
+                    _ = try str(gpa, dl, e, .semibold, m.lx + 40, ly + 32, ink, 16, bench.text[card.name.off..][0..card.name.len]);
+                    _ = try str(gpa, dl, e, .regular, m.lx + 20, ly + 58, muted, 13, bench.text[card.ranks.off..][0..card.ranks.len]);
+                    _ = try str(gpa, dl, e, .semibold, m.lx + m.cw - 28, ly + 48, faint, 17, "\u{22EE}"); // ⋮ — press-hold to drag
+                    try emitRegion(gpa, regions, m.lx, ly, m.cw, @intCast(ch), @intCast(bi), .bench_seat);
+                    ly += ch + 12;
+                }
+            }
+            content_h = (ly - scroll) + 20;
         }
     } else if (tab == 1) {
-        content_h = try drawMarketplace(gpa, dl, e, m, height, scroll, regions, accent, market, market_q, market_q_focus, market_loading);
+        content_h = try drawMarketplace(gpa, dl, e, m, height, scroll, regions, accent, content_top, market, market_q, market_q_focus, market_loading);
     } else if (tab == 3) {
-        content_h = try drawPublished(gpa, dl, e, m, height, scroll, regions, accent, published);
+        content_h = try drawPublished(gpa, dl, e, m, height, scroll, regions, accent, content_top, published);
     } else if (dev.active) {
         content_h = try layoutDevSubmit(gpa, e, dl, m, height, scroll, regions, accent, dev);
     } else {
-        content_h = try layoutCreate(gpa, e, dl, m, height, scroll, regions, accent, create);
+        content_h = try layoutCreate(gpa, e, dl, m, height, scroll, regions, accent, content_top, create);
     }
 
-    // Sticky header: frosted box, title, the tab row, divider — drawn LAST.
+    // Sticky header: frosted box, title, the tab row, divider — drawn LAST. The
+    // veil spans the full header_h (which already includes the top inset), so it
+    // paints under the status bar; the title + tabs ride the inset down.
     try rect(gpa, dl, m.col_x, 0, m.col_w, header_h, skinHeaderVeil(accent), 0);
-    _ = try str(gpa, dl, e, .semibold, m.lx, 50, ink, 27, "Algorithms");
+    _ = try str(gpa, dl, e, .semibold, m.lx, 50 + top, ink, 27, "Algorithms");
     var tx = m.lx;
-    const tab_baseline: i32 = 96;
+    const tab_baseline: i32 = 96 + top;
     for (loadout_tabs, 0..) |label, i| {
         const on = i == tab;
         const tw: i32 = @intCast(text.measure(e, .semibold, label, 15));
@@ -3584,7 +3667,7 @@ pub fn layoutLoadout(
         try emitRegion(gpa, regions, m.col_x, 0, m.col_w, @intCast(@min(height, 32767)), 0, .bench_cancel);
         const pw: i32 = @min(460, m.cw - 24);
         const px = m.col_x + @divTrunc(m.col_w - pw, 2);
-        const py: i32 = 170;
+        const py: i32 = 170 + top;
         const ph: i32 = 240;
         try rect(gpa, dl, px, py, pw, ph, 0xFF23221A, 16);
         try rect(gpa, dl, px, py, pw, 4, accent, 2);
@@ -3633,8 +3716,11 @@ pub fn layoutLoadout(
 /// (drop it into the feed loadout). Emits `.algo_view` / `.algo_add` regions
 /// carrying the card index. Empty list ⇒ a calm "nothing here yet" state. Only
 /// cards intersecting the viewport are painted (i16 coord safety). PURE.
-fn drawMarketplace(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, height: i32, scroll: i32, regions: ?*Regions, accent: u32, market: []const MarketAlgoCard, query: []const u8, q_focus: bool, loading: bool) error{OutOfMemory}!i32 {
-    const content_top: i32 = 140;
+fn drawMarketplace(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, height: i32, scroll: i32, regions: ?*Regions, accent: u32, y0: i32, market: []const MarketAlgoCard, query: []const u8, q_focus: bool, loading: bool) error{OutOfMemory}!i32 {
+    // The sticky header's REAL bottom, passed in: it grows by the safe-area top
+    // inset on phone, and the old hardcoded 140 left this tab's content starting
+    // under the translucent veil — the "Your feed, your rules" ghost (2026-07-09).
+    const content_top: i32 = y0;
     const x0 = m.lx;
     const w = m.cw;
 
@@ -3760,11 +3846,11 @@ pub const PublishedRow = struct {
 /// The creator dashboard: your published algorithms, their marketplace
 /// status, and the retraction. Download counts await an install-signal
 /// design (installs are local-only today) — absent, never faked.
-fn drawPublished(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, height: i32, scroll: i32, regions: ?*Regions, accent: u32, rows: []const PublishedRow) error{OutOfMemory}!i32 {
+fn drawPublished(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, height: i32, scroll: i32, regions: ?*Regions, accent: u32, y0: i32, rows: []const PublishedRow) error{OutOfMemory}!i32 {
     _ = height;
     const x0 = m.lx;
     const w = m.cw;
-    var y: i32 = 140 + scroll;
+    var y: i32 = y0 + scroll;
 
     if (rows.len == 0) {
         _ = try str(gpa, dl, e, .semibold, x0, y + 70, ink, 19, "Nothing published yet");
@@ -4001,11 +4087,11 @@ pub const CreateView = struct {
 /// `view`; the shell owns the state + input). Emits a region for every tap target —
 /// option pick, knob steppers, colour swatches, back / continue / create — so the
 /// shell drives the flow entirely through `Action`s. Returns content height.
-pub fn layoutCreate(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawList, m: Metrics, height: i32, scroll: i32, regions: ?*Regions, accent: u32, view: CreateView) error{OutOfMemory}!i32 {
+pub fn layoutCreate(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawList, m: Metrics, height: i32, scroll: i32, regions: ?*Regions, accent: u32, y0: i32, view: CreateView) error{OutOfMemory}!i32 {
     _ = height;
     const x0 = m.lx;
     const w = m.cw;
-    var y: i32 = 140 + scroll;
+    var y: i32 = y0 + scroll;
 
     switch (view.step) {
         .landing => {

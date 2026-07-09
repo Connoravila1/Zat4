@@ -882,6 +882,25 @@ pub export fn zat_haptic(ctx_ptr: ?*anyopaque) u32 {
     return tui.mobileHapticTake(f.run);
 }
 
+/// The system BACK (edge swipe / back button): queue an in-app back-pop for
+/// the next frame. A no-op with the feed down (field-only mode has no stack).
+pub export fn zat_back(ctx_ptr: ?*anyopaque) void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return));
+    if (comptime !mobile_config.have_gpu) return;
+    const f = if (ctx.feed) |*ff| ff else return;
+    tui.mobileBack(f.run);
+}
+
+/// Did the last back-pop hit the root (read-and-clear)? True → the activity
+/// steps the task back to the launcher (moveTaskToBack) — the back-at-root
+/// convention; the process and feed stay hot for the return.
+pub export fn zat_minimize(ctx_ptr: ?*anyopaque) bool {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return false));
+    if (comptime !mobile_config.have_gpu) return false;
+    const f = if (ctx.feed) |*ff| ff else return false;
+    return tui.mobileMinimizeTake(f.run);
+}
+
 /// Does the frame want the soft keyboard? The activity polls this each lap
 /// and shows/hides the IME on the transition (the composer is the phone's
 /// only text surface so far).

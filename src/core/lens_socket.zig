@@ -238,7 +238,7 @@ pub const Geometry = struct {
 
 /// What a hit-rect maps to. The CID (not an index) rides the rect, so
 /// hitTest can answer with a CID-bearing action from `hits` alone (A5).
-pub const HitTarget = enum(u8) { toggle, seat, expand, collapse, reorder_handle, get_more, swatch, swatch_open, caret };
+pub const HitTarget = enum(u8) { toggle, seat, expand, collapse, reorder_handle, get_more, swatch, swatch_open, caret, detail_close, detail_panel };
 
 /// One tap target. HOT-ish (iterated in hitTest); guarded (A7). It carries
 /// the lens's CID slice (into the shell-owned, frame-stable tray blob) so
@@ -276,6 +276,8 @@ pub const SocketAction = union(enum) {
     get_more,
     open_swatch: []const u8, // tap the swatch → open/close the color picker (§11.5)
     set_color: struct { lens: []const u8, color: u8 }, // pick a color from the picker
+    close_detail, // dismiss the cartridge detail sheet (item 5)
+    noop_detail, // a tap inside the detail panel that isn't a control — swallowed
 };
 
 // ---------------------------------------------------------------------------
@@ -423,6 +425,68 @@ fn str(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, weight: text
         x += @as(i32, @intCast(text.advance(e, weight, cp, px)));
     }
     return x;
+}
+
+/// A UTF-8 run clipped to `max_w` pixels: if the label doesn't fit, it is cut on
+/// a codepoint boundary and an ellipsis appended so it never runs off the
+/// cartridge edge (the narrow phone socket is where this bites). Returns the pen x
+/// after the drawn text. `max_w <= 0` draws nothing.
+fn strClip(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, weight: text.Weight, x0: i32, baseline: i32, color: u32, px: u16, s: []const u8, max_w: i32) !i32 {
+    if (max_w <= 0) return x0;
+    // Fits whole (the common case): draw as-is, no measuring per glyph.
+    if (@as(i32, @intCast(text.measure(e, weight, s, px))) <= max_w)
+        return str(gpa, dl, e, weight, x0, baseline, color, px, s);
+    const ell = "\u{2026}"; // …
+    const ell_w: i32 = @intCast(text.measure(e, weight, ell, px));
+    const budget = max_w - ell_w;
+    var x = x0;
+    var it = (std.unicode.Utf8View.init(s) catch return x).iterator();
+    while (it.nextCodepoint()) |cp| {
+        const adv: i32 = @intCast(text.advance(e, weight, cp, px));
+        if (x + adv - x0 > budget) break;
+        try dl.append(gpa, .{ .text = .{
+            .x = @intCast(x),
+            .baseline = @intCast(baseline),
+            .codepoint = cp,
+            .color = color,
+            .px = px,
+            .weight = @intFromEnum(weight),
+        } });
+        x += adv;
+    }
+    return str(gpa, dl, e, weight, x, baseline, color, px, ell);
+}
+
+/// Greedy word-wrap of `s` into `max_w`-wide lines (regular weight), advancing
+/// `line_h` per line; returns the baseline y after the last line. Breaks on
+/// spaces only — a single word wider than `max_w` overflows rather than splits
+/// (fine for the short lens descriptions this renders). Used by the detail sheet.
+fn wrap(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32, y0: i32, max_w: i32, color: u32, px: u16, s: []const u8, line_h: i32) !i32 {
+    var y = y0;
+    var line_start: usize = 0;
+    var last_break: usize = 0; // last space index seen on the current line
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        if (s[i] != ' ') continue;
+        const w: i32 = @intCast(text.measure(e, .regular, s[line_start..i], px));
+        if (w > max_w and last_break > line_start) {
+            _ = try str(gpa, dl, e, .regular, x0, y, color, px, s[line_start..last_break]);
+            y += line_h;
+            line_start = last_break + 1;
+        }
+        last_break = i;
+    }
+    // The tail: it may itself need one more break before the final run.
+    if (@as(i32, @intCast(text.measure(e, .regular, s[line_start..], px))) > max_w and last_break > line_start) {
+        _ = try str(gpa, dl, e, .regular, x0, y, color, px, s[line_start..last_break]);
+        y += line_h;
+        line_start = last_break + 1;
+    }
+    if (line_start < s.len) {
+        _ = try str(gpa, dl, e, .regular, x0, y, color, px, s[line_start..]);
+        y += line_h;
+    }
+    return y;
 }
 
 /// A dashed horizontal line (the socket's contact rails).
@@ -584,11 +648,14 @@ pub fn build(
     const name_px: u16 = @intCast(@max(1, fxi(15.5 * sc)));
     const meta_px: u16 = @intCast(@max(1, fxi(11.5 * sc)));
     const name_s = if (have) span(tray, seat.name) else "no lens";
-    _ = try str(gpa, dl, e, .semibold, txt_x, cart_y + fxi(22 * sc), alphaScale(ink, a), name_px, name_s);
+    // Clip to the cartridge's inner right edge so a long lens name can't spill
+    // into the "N in tray" strip (it bites at the narrow phone socket width).
+    const seat_txt_w = (cart_x + cart_w) - txt_x - fxi(12 * sc);
+    _ = try strClip(gpa, dl, e, .semibold, txt_x, cart_y + fxi(22 * sc), alphaScale(ink, a), name_px, name_s, seat_txt_w);
     // The two derived bits: the privacy label, then — separated by a dot — the
     // adaptive marker when the lens keeps a model (nothing when it's static).
     const meta_y = cart_y + fxi(38 * sc);
-    const priv_pen = try str(gpa, dl, e, .regular, txt_x, meta_y, alphaScale(muted, a), meta_px, behaveLabel(seat.flags));
+    const priv_pen = try strClip(gpa, dl, e, .regular, txt_x, meta_y, alphaScale(muted, a), meta_px, behaveLabel(seat.flags), seat_txt_w);
     if (have and seat.flags.learns) {
         const dot_pen = try str(gpa, dl, e, .regular, priv_pen + fxi(6 * sc), meta_y, alphaScale(faint, a), meta_px, "·");
         _ = try str(gpa, dl, e, .regular, dot_pen + fxi(6 * sc), meta_y, alphaScale(privColor(seat.flags), a), meta_px, adaptiveMark(seat.flags));
@@ -731,20 +798,25 @@ pub fn build(
         try rect(gpa, dl, sw_x, sw_y, sw_w, sw_h, card_acc, sw_rad);
         try rect(gpa, dl, sw_x, sw_y, sw_w, fxi(1 * sc) + 1, soft(0xFFFFFF, 0x44), sw_rad); // lit top edge
 
-        // name
+        // name — clipped to the card's inner width (a long lens name overflowed
+        // the card edge at the narrow phone socket width).
         const cname_px: u16 = @intCast(@max(1, fxi(14 * sc)));
-        _ = try str(gpa, dl, e, .semibold, in_x, cy + fxi(42 * sc), ink, cname_px, span(tray, card.name));
+        const inner_right = cx + card_w - fxi(11 * sc);
+        _ = try strClip(gpa, dl, e, .semibold, in_x, cy + fxi(42 * sc), ink, cname_px, span(tray, card.name), inner_right - in_x);
 
-        // glanceable stats: "ranks <x>" + behavioral line, anchored low
+        // glanceable stats: "ranks <x>" + behavioral line, anchored low. The
+        // ranks VALUE is clipped to the width left after the "ranks " prefix.
         const stat_px: u16 = @intCast(@max(1, fxi(11 * sc)));
         const ranks_x = try str(gpa, dl, e, .regular, in_x, cy + card_h - fxi(26 * sc), muted, stat_px, "ranks ");
-        _ = try str(gpa, dl, e, .semibold, ranks_x, cy + card_h - fxi(26 * sc), ink, stat_px, span(tray, card.ranks));
+        _ = try strClip(gpa, dl, e, .semibold, ranks_x, cy + card_h - fxi(26 * sc), ink, stat_px, span(tray, card.ranks), inner_right - ranks_x);
+        // The behavioural label shares its baseline with the seated tick / corner
+        // glyph — measure the tick up front so the label clips clear of it.
         const behave_px: u16 = @intCast(@max(1, fxi(10.5 * sc)));
-        _ = try str(gpa, dl, e, .regular, in_x, cy + card_h - fxi(11 * sc), faint, behave_px, behaveLabel(card.flags));
+        const tick_s = "\u{25CF} seated";
+        const tick_meas: i32 = if (seated) @intCast(text.measure(e, .regular, tick_s, behave_px)) else fxi(18 * sc);
+        _ = try strClip(gpa, dl, e, .regular, in_x, cy + card_h - fxi(11 * sc), faint, behave_px, behaveLabel(card.flags), inner_right - tick_meas - fxi(6 * sc) - in_x);
         // seated marker, bottom-right (the accent wash + edge also mark it).
         if (seated) {
-            const tick_s = "\u{25CF} seated";
-            const tick_meas: i32 = @intCast(text.measure(e, .regular, tick_s, behave_px));
             _ = try str(gpa, dl, e, .regular, cx + card_w - fxi(11 * sc) - tick_meas, cy + card_h - fxi(11 * sc), card_acc, behave_px, tick_s);
         }
 
@@ -983,6 +1055,92 @@ pub fn hitBounds(hits: []const HitRect) ?struct { x0: i32, y0: i32, x1: i32, y1:
     return .{ .x0 = x0, .y0 = y0, .x1 = x1, .y1 = y1 };
 }
 
+/// CORE, PURE. The cartridge DETAIL sheet (item 5): a large panel styled like a
+/// cartridge — the lens's accent spine + lit top edge — opened by tapping an
+/// already-seated cartridge. It shows the lens identity, a plain "how it works"
+/// explanation (the L.3 `desc` + what it ranks by + the behavioural line), and a
+/// ROOMY colour picker (the on-card swatch was unusable on the phone). Drawn OVER
+/// the screen: a scrim (tap = close) then the panel. Emits `.detail_close` (scrim
+/// + the X), `.detail_panel` (the body — swallows stray taps so reading doesn't
+/// dismiss), and a `.swatch` per palette colour (tap = set_color) into `hits`.
+/// `w`/`h` = screen size (logical px); `top` = the safe-area inset to centre below.
+/// Same (card, w, h, top) ⇒ same pixels + hits (B2).
+pub fn drawDetail(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, card: LensCard, blob: []const u8, w: i32, h: i32, top: i32, hits: *HitList) !void {
+    const acc = palette[@min(card.color, palette.len - 1)];
+    // Scrim: the screen dims; a tap anywhere OFF the panel closes (pushed first,
+    // so the panel-swallow + the controls layered after win where they overlap).
+    try rect(gpa, dl, 0, 0, w, h, 0xC8101010, 0);
+    try pushHit(gpa, hits, 0, 0, w, h, .detail_close, "", 0);
+
+    // The panel: a tall rounded card, centred, phone-friendly width. Cartridge
+    // cues, enlarged — the accent spine down the left and a lit top edge.
+    const pw = @min(w - 40, 460);
+    const px = @divTrunc(w - pw, 2);
+    const ph: i32 = 476;
+    const py = top + @divTrunc(@max(0, (h - top) - ph), 2) - 16; // a touch above centre
+    try rect(gpa, dl, px, py, pw, ph, 0xFF201F1B, 20); // opaque panel
+    try rect(gpa, dl, px, py, pw, 5, soft(acc, 0xD0), 20); // lit accent top edge
+    try rect(gpa, dl, px + 14, py + 18, @max(3, 4), ph - 36, acc, 2); // accent spine
+    try pushHit(gpa, hits, px, py, pw, ph, .detail_panel, "", 0); // body swallows taps
+
+    const inx = px + 32;
+    const inw = pw - 64;
+    var y = py + 46;
+
+    // Close X, top-right (its hit falls through to the scrim; drawn as the cue).
+    _ = try str(gpa, dl, e, .regular, px + pw - 36, y - 2, muted, 24, "\u{00D7}");
+
+    // Header: privacy dot + name (big) + author.
+    const dotd: i32 = 11;
+    try rect(gpa, dl, inx, y - dotd, dotd, dotd, privColor(card.flags), @intCast(@divTrunc(dotd, 2)));
+    _ = try str(gpa, dl, e, .semibold, inx + dotd + 12, y, ink, 25, blob[card.name.off..][0..card.name.len]);
+    y += 30;
+    var abuf: [128]u8 = undefined;
+    const by_s = std.fmt.bufPrint(&abuf, "by {s}", .{blob[card.author.off..][0..card.author.len]}) catch "";
+    _ = try str(gpa, dl, e, .regular, inx, y, muted, 14, by_s);
+    y += 24;
+    try rect(gpa, dl, inx, y, inw, 1, hairline, 0);
+    y += 28;
+
+    // How it works: the description paragraph, then what it ranks by, then the
+    // behavioural line (attention + adaptive, or "no behavioural data").
+    _ = try str(gpa, dl, e, .semibold, inx, y, faint, 12, "HOW IT WORKS");
+    y += 24;
+    y = try wrap(gpa, dl, e, inx, y, inw, body, 15, blob[card.desc.off..][0..card.desc.len], 22);
+    y += 12;
+    var rbuf: [160]u8 = undefined;
+    const rk = std.fmt.bufPrint(&rbuf, "Ranks by {s}.", .{blob[card.ranks.off..][0..card.ranks.len]}) catch "";
+    y = try wrap(gpa, dl, e, inx, y, inw, muted, 14, rk, 21);
+    y += 6;
+    const behave_c = if (card.flags.behavioral) privColor(card.flags) else faint;
+    const bpen = try str(gpa, dl, e, .regular, inx, y, behave_c, 13, behaveLabel(card.flags));
+    if (card.flags.learns) {
+        const dpen = try str(gpa, dl, e, .regular, bpen + 8, y, faint, 13, "\u{00B7}");
+        _ = try str(gpa, dl, e, .regular, dpen + 8, y, privColor(card.flags), 13, "adaptive");
+    }
+    y += 30;
+    try rect(gpa, dl, inx, y, inw, 1, hairline, 0);
+    y += 28;
+
+    // The ROOMY colour picker: a label + a row of nine big swatches spread across
+    // the panel, the current one ringed. Tapping one recolours the lens (and, if
+    // this is the seated lens, the whole UI accent) — the item-5 headline.
+    _ = try str(gpa, dl, e, .semibold, inx, y, faint, 12, "ACCENT COLOUR");
+    y += 24;
+    const sw: i32 = 30;
+    const n: i32 = @intCast(palette.len);
+    const gap: i32 = @divTrunc(inw - sw * n, n - 1); // spread nine swatches across the panel
+    const cid_s = blob[card.cid.off..][0..card.cid.len];
+    for (0..palette.len) |ci| {
+        const cx = inx + @as(i32, @intCast(ci)) * (sw + gap);
+        const selected = ci == @min(card.color, palette.len - 1);
+        if (selected) try rect(gpa, dl, cx - 4, y - 4, sw + 8, sw + 8, soft(ink, 0x66), 11); // selection ring
+        try rect(gpa, dl, cx, y, sw, sw, palette[ci], 8);
+        try rect(gpa, dl, cx, y, sw, 2, soft(0xFFFFFF, 0x55), 8); // lit top edge
+        try pushHit(gpa, hits, cx - 4, y - 4, sw + 8, sw + 8, .swatch, cid_s, @intCast(ci));
+    }
+}
+
 /// CORE, PURE. Maps a click point to an intent from `hits` alone — no
 /// mutation, no I/O, no index ever returned (A5). Last-drawn-first
 /// (reverse paint order) so a card beats the socket panel beneath it.
@@ -1001,6 +1159,8 @@ pub fn hitTest(hits: []const HitRect, px: i32, py: i32) ?SocketAction {
                 .reorder_handle => .{ .reorder = .{ .lens = r.cid, .to_rank = 0 } },
                 .swatch_open => .{ .open_swatch = r.cid },
                 .swatch => .{ .set_color = .{ .lens = r.cid, .color = r.color } },
+                .detail_close => .close_detail,
+                .detail_panel => .noop_detail,
             };
         }
     }
@@ -1289,4 +1449,56 @@ test "empty tray renders a valid socket, not an error (E4)" {
     const h = try build(testing.allocator, &engine, tray, .{ .open = true, .open_t = 1.0 }, geom, &dl, null);
     try testing.expect(h > 0);
     try testing.expect(dl.len > 0);
+}
+
+test "item 5 detail sheet: emits close + panel + a swatch per palette colour; hitTest maps them" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var engine = try text.initEngine();
+    defer text.deinitEngine(testing.allocator, &engine);
+
+    const tray = try buildSampleTray(arena); // card 0 = "For You", colour 0
+    var dl: raster.DrawList = .{};
+    defer dl.deinit(testing.allocator);
+    var hits: HitList = .empty;
+    defer hits.deinit(testing.allocator);
+    // Renders the seated card's sheet over a 430×880 phone with a 48px top inset.
+    try drawDetail(testing.allocator, &dl, &engine, tray.cards[0], tray.text, 430, 880, 48, &hits);
+    try testing.expect(dl.len > 0);
+
+    var closes: usize = 0;
+    var panels: usize = 0;
+    var swatches: usize = 0;
+    var seen_colors: u16 = 0; // bitset over the 9 palette indices the chips carry
+    for (hits.items) |ht| switch (ht.target) {
+        .detail_close => closes += 1,
+        .detail_panel => panels += 1,
+        .swatch => {
+            swatches += 1;
+            seen_colors |= @as(u16, 1) << @intCast(ht.color);
+        },
+        else => {},
+    };
+    try testing.expect(closes >= 1); // the scrim (and the X falls through to it)
+    try testing.expect(panels >= 1); // the body swallows stray taps
+    try testing.expectEqual(@as(usize, palette.len), swatches); // one chip per colour
+    try testing.expectEqual(@as(u16, (1 << palette.len) - 1), seen_colors); // all nine present
+
+    // A tap on the scrim's top-left corner closes; a tap on a swatch sets a colour.
+    try testing.expectEqual(SocketAction.close_detail, hitTest(hits.items, 2, 2).?);
+    var picked = false;
+    for (hits.items) |ht| {
+        if (ht.target != .swatch) continue;
+        const act = hitTest(hits.items, @as(i32, ht.x) + 1, @as(i32, ht.y) + 1).?;
+        switch (act) {
+            .set_color => |sc| {
+                try testing.expect(sc.lens.len > 0); // carries the lens CID (A5/A8)
+                picked = true;
+            },
+            else => {},
+        }
+        if (picked) break;
+    }
+    try testing.expect(picked);
 }

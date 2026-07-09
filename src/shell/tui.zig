@@ -91,6 +91,10 @@ const algo_library = @import("../core/algo_library.zig");
 const transparency = @import("../core/transparency.zig");
 const algorithm_core = @import("../core/algorithm.zig");
 const algorithm_shell = @import("algorithm.zig");
+// The DID→PDS resolver: a marketplace author's repo lives on THEIR PDS (any
+// host in the network), so the inspect fetch must resolve the DID document's
+// service endpoint — never assume the session PDS (the cross-PDS install bug).
+const identity_shell = @import("identity.zig");
 const loadout_store = @import("loadout.zig");
 const effect_core = @import("../core/effect.zig");
 const clock_shell = @import("clock.zig");
@@ -489,6 +493,10 @@ const RunState = struct {
     zone_ui: lens_socket.SocketUi,
     zone_hits: lens_socket.HitList,
     page_geoms: [3]lens_socket.Geometry,
+    // The phone loadout's library band top (screen px; maxInt = wide shelf mode).
+    // Written by layoutLoadout each frame; the touch drop test reads it —
+    // released over the library = unequip the dragged card.
+    page_lib_y: i32,
     page_drag_surface: ?u8,
     prev_screen: u8,
     gloadout_tab: u8,
@@ -544,6 +552,14 @@ const RunState = struct {
     gbench_drag: ?u16,
     gbench_drag_x: i32,
     gbench_drag_y: i32,
+    // Double-back-to-exit: the deadline (monotonic ns) until which a second
+    // system-back at the root minimizes; the nav tile shows the hint pill.
+    back_hint_until: u64,
+    // The cartridge DETAIL sheet (item 5): which surface's seated cartridge has its
+    // detail/colour overlay open (0 home, 1 reply, 2 zone), or null = closed. Opened
+    // by tapping an already-seated cartridge; drawn topmost with its own hit list.
+    gcart_detail: ?u8,
+    detail_hits: lens_socket.HitList,
     gpub_confirm: ?u16, // Published tab: the library index whose Delete is armed
     gdocs_kind: u8, // the docs page shown (0 = user explainer, 1 = the dev guide)
     docs_return_screen: u8,
@@ -656,6 +672,12 @@ const RunState = struct {
     gtransp_source: bool,
     inspect_loading: bool,
     inspectjob: InspectJob,
+    // The marketplace config PREFETCH: its own job (never shared with the
+    // user-tap inspectjob, so a tap can't block on a prefetch join) + the next
+    // catalog row to warm. Walks the catalog one fetch at a time whenever idle,
+    // filling config_cache/src_cache so Details/install are INSTANT.
+    prefetchjob: InspectJob,
+    market_prefetch_next: usize,
     config_cache: std.StringHashMapUnmanaged([]u8),
     src_cache: std.StringHashMapUnmanaged([]u8), // CID -> Zal source, beside the config cache (A8)
     thread_rerooted: bool,
@@ -1011,6 +1033,7 @@ fn initRunState(
     // Drag on the loadout PAGE: each socket's on-page geometry (filled by
     // layoutLoadout), and which surface is mid-drag (0 feed / 1 reply / 2 zone).
     rs.page_geoms = .{ .{ .x = 0, .y = 0, .w = 0 }, .{ .x = 0, .y = 0, .w = 0 }, .{ .x = 0, .y = 0, .w = 0 } };
+    rs.page_lib_y = std.math.maxInt(i32);
     rs.page_drag_surface = null;
     // Previous frame's screen — flush the loadout when LEAVING the page (the
     // page's sockets are always open, so there's no tray-close beat there).
@@ -1063,6 +1086,9 @@ fn initRunState(
     rs.gbench_drag = null;
     rs.gbench_drag_x = 0;
     rs.gbench_drag_y = 0;
+    rs.gcart_detail = null;
+    rs.detail_hits = .empty;
+    rs.back_hint_until = 0;
     rs.gpub_confirm = null;
     rs.gdocs_kind = 0;
     rs.docs_return_screen = feed_view.screen_loadout;
@@ -1321,6 +1347,8 @@ fn initRunState(
     // The config fetch runs on a worker (no UI freeze); true while it's in flight.
     rs.inspect_loading = false;
     rs.inspectjob = .{};
+    rs.prefetchjob = .{};
+    rs.market_prefetch_next = 0;
     // CID-keyed config cache (A8): an algorithm's config is a content-addressed,
     // immutable record — same CID ⇒ same bytes ⇒ fetch ONCE, never again. Keyed by
     // the record CID (duped), value = the serialized config (owned). A re-view is a
@@ -1407,6 +1435,7 @@ fn deinitRunState(rs: *RunState) void {
         rs.src_cache.deinit(gpa);
     }
     stopInspect(&rs.inspectjob); // join any in-flight fetch before exit
+    stopInspect(&rs.prefetchjob); // and the background prefetch (same shape)
     {
         for (rs.market_catalog.items) |r| {
             gpa.free(r.name);
@@ -1450,6 +1479,7 @@ fn deinitRunState(rs: *RunState) void {
     rs.zone_hits.deinit(gpa);
     rs.reply_hits.deinit(gpa);
     rs.gsocket_hits.deinit(gpa);
+    rs.detail_hits.deinit(gpa);
     if (rs.zone_blob.len > 0) gpa.free(rs.zone_blob);
     if (rs.zone_cards.len > 0) gpa.free(rs.zone_cards);
     if (rs.reply_blob.len > 0) gpa.free(rs.reply_blob);
@@ -2181,6 +2211,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         return err; // OOM only
                     };
                     refilterMarket(rs); // re-apply the live search over the fresh catalog
+                    rs.market_prefetch_next = 0; // fresh catalog → warm every config again
                     rs.market_loading = false;
                     rs.status = "";
                 },
@@ -2395,8 +2426,73 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
             } else {
                 rs.status = "algorithm: unavailable";
                 rs.gdetail_install_pending = false;
+                mobile_host.logcat("inspect: job failed — the page shows the error state", .{});
             }
             rs.inspect_loading = false;
+        }
+
+        // MARKETPLACE PREFETCH (its own job — a user tap never blocks on it):
+        // consume a finished background fetch into the CID caches, then kick the
+        // next catalog row when idle. The first Details/install used to pay a
+        // live DID resolve + a cross-PDS getRecord (seconds); warming every
+        // listed config as soon as the catalog lands makes them instant (A8:
+        // same CID ⇒ same bytes, cached forever). Failures are silent — the
+        // user-tap path still fetches live and shows the honest error page.
+        if (rs.prefetchjob.active and rs.prefetchjob.done.load(.acquire)) {
+            joinInspect(&rs.prefetchjob);
+            if (rs.prefetchjob.ok) {
+                const ref = rs.prefetchjob.cid[0..rs.prefetchjob.cid_len];
+                if (rs.prefetchjob.bytes) |b| {
+                    if (ref.len > 0 and !rs.config_cache.contains(ref)) {
+                        const k = gpa.dupe(u8, ref) catch null;
+                        const v = gpa.dupe(u8, b) catch null;
+                        if (k != null and v != null) {
+                            rs.config_cache.put(gpa, k.?, v.?) catch {
+                                gpa.free(k.?);
+                                gpa.free(v.?);
+                            };
+                        } else {
+                            if (k) |kk| gpa.free(kk);
+                            if (v) |vv| gpa.free(vv);
+                        }
+                    }
+                    std.heap.page_allocator.free(b);
+                    rs.prefetchjob.bytes = null;
+                }
+                if (rs.prefetchjob.src) |sb| {
+                    if (ref.len > 0 and !rs.src_cache.contains(ref)) {
+                        const k = gpa.dupe(u8, ref) catch null;
+                        const v = gpa.dupe(u8, sb) catch null;
+                        if (k != null and v != null) {
+                            rs.src_cache.put(gpa, k.?, v.?) catch {
+                                gpa.free(k.?);
+                                gpa.free(v.?);
+                            };
+                        } else {
+                            if (k) |kk| gpa.free(kk);
+                            if (v) |vv| gpa.free(vv);
+                        }
+                    }
+                    std.heap.page_allocator.free(sb);
+                    rs.prefetchjob.src = null;
+                }
+            }
+        }
+        // Cap the bulk-warm: at marketplace scale, prefetching EVERY config would
+        // be needless bytes + requests — the head of the list (what a browser
+        // actually taps) warms; the tail stays lazy via the live fetch path.
+        const market_prefetch_cap: usize = 24;
+        if (!rs.prefetchjob.active and rs.market_prefetch_next < @min(market_prefetch_cap, rs.market_catalog.items.len)) {
+            const pr = rs.market_catalog.items[rs.market_prefetch_next];
+            rs.market_prefetch_next += 1;
+            if (!rs.config_cache.contains(pr.cid)) {
+                startInspect(&rs.prefetchjob, io, environ, session.pds_url, pr.author_did, pr.rkey);
+                // The cache key, stamped AFTER the spawn: the worker never reads
+                // it — only this drain does, after the join.
+                const cl = @min(pr.cid.len, rs.prefetchjob.cid.len);
+                @memcpy(rs.prefetchjob.cid[0..cl], pr.cid[0..cl]);
+                rs.prefetchjob.cid_len = cl;
+            }
         }
 
         // The ACTIVE view: Home (one ordering over the store), the profile screen
@@ -2610,7 +2706,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .market_q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .market_q_focus = rs.gmarket_q_focus, .market_loading = rs.market_loading, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
+        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .market_q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .market_q_focus = rs.gmarket_q_focus, .market_loading = rs.market_loading, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
         switch (rs.mode) {
             .timeline => try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status),
             .compose => {
@@ -2834,6 +2930,8 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     .button_down => {
                         m.down_x = tev.x;
                         m.down_y = tev.y;
+                        m.down_ms = now_ms; // the long-press clock starts
+                        m.hold_fired = false;
                         m.scrolling = false;
                         m.hswipe = false;
                         m.drag_y = tev.y;
@@ -2857,6 +2955,27 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         }
                     },
                     .move => if (m.down_x >= 0) {
+                        // A live press-and-hold drag owns the finger: the picked-up
+                        // card's ghost tracks it (logical px), and nothing scrolls or
+                        // swipes underneath (the edge auto-scroll below is the one
+                        // exception). Release drops it — benchDrop / pageDragDrop.
+                        if (m.hold_fired) {
+                            const dlx2: i32 = @intFromFloat(@as(f32, @floatFromInt(tev.x)) / scale);
+                            const dly2: i32 = @intFromFloat(@as(f32, @floatFromInt(tev.y)) / scale);
+                            if (rs.page_drag_surface) |ps| {
+                                const dui: *lens_socket.SocketUi = switch (ps) {
+                                    1 => &rs.reply_ui,
+                                    2 => &rs.zone_ui,
+                                    else => &rs.gsocket_ui,
+                                };
+                                dui.drag_x = dlx2;
+                                dui.drag_y = dly2;
+                            } else {
+                                rs.gbench_drag_x = dlx2;
+                                rs.gbench_drag_y = dly2;
+                            }
+                            continue;
+                        }
                         gesture.push(&m.ring, .{ .x = @as(f32, @floatFromInt(tev.x)) / scale, .y = @as(f32, @floatFromInt(tev.y)) / scale, .t_ms = now_ms });
                         // The dominant axis at the slop threshold commits the
                         // gesture: vertical -> scroll (as ever), horizontal ->
@@ -3001,7 +3120,31 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         }
                     },
                     .button_up => {
-                        if (m.socket_swipe) {
+                        if (m.hold_fired) {
+                            // A press-and-hold drag ends. A LIBRARY card drops onto the
+                            // socket under the finger (benchDrop hit-tests all three;
+                            // off any of them it fizzles). A SOCKETED card released over
+                            // the library band UNEQUIPS (back to the library); anywhere
+                            // else it reorders in place — the desktop drop semantics,
+                            // by touch. A drag never fires a tap.
+                            const dpx: i32 = @intFromFloat(@as(f32, @floatFromInt(tev.x)) / scale);
+                            const dpy: i32 = @intFromFloat(@as(f32, @floatFromInt(tev.y)) / scale);
+                            if (rs.page_drag_surface) |ps| {
+                                if (dpy >= rs.page_lib_y) {
+                                    removeDraggedFromSurface(rs, ps);
+                                } else switch (ps) {
+                                    0 => pageDragDrop(rs.socket_cards, rs.socket_blob, &rs.gseated, &rs.gsocket_ui, rs.page_geoms[0], &rs.loadout_dirty),
+                                    1 => pageDragDrop(rs.reply_cards, rs.reply_blob, &rs.reply_seated, &rs.reply_ui, rs.page_geoms[1], &rs.loadout_dirty),
+                                    else => pageDragDrop(rs.zone_cards, rs.zone_blob, &rs.zone_seated, &rs.zone_ui, rs.page_geoms[2], &rs.loadout_dirty),
+                                }
+                                // page_drag_surface stays set — the settle advance
+                                // (advanceSocketDrag) eases the ghost home and clears it.
+                            } else if (rs.gbench_drag) |bdi| {
+                                benchDrop(rs, bdi, dpx, dpy);
+                                rs.gbench_drag = null;
+                            }
+                            m.hold_fired = false;
+                        } else if (m.socket_swipe) {
                             // A socket swipe cycles the seated cartridge on release
                             // if it travelled past the threshold: swipe LEFT → next,
                             // RIGHT → previous, wrapping. Same re-seat the tap path
@@ -3090,6 +3233,91 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     },
                     else => {},
                 };
+                // SYSTEM BACK (the Pixel edge swipe / back button, ferried by the
+                // activity's key drain): pop one level of in-app navigation; with
+                // nothing left to pop, flag the activity to step the task back to
+                // the launcher — back-at-root minimizes, never exits the process.
+                if (m.back_pending) {
+                    m.back_pending = false;
+                    if (!backNavigate(rs)) m.minimize_pending = true;
+                }
+                // PRESS-AND-HOLD to pick up a draggable (phone loadout): a finger
+                // that rests on a library card past the hold threshold — WITHOUT
+                // committing to a scroll or swipe — lifts it into a drag, the way you
+                // hold a home-screen icon to move it. The continuous render loop ticks
+                // even on a motionless finger, so this per-frame timer fires. Once
+                // lifted, the move/up arms above own the ghost + the drop.
+                const hold_ms: u32 = 300;
+                if (m.down_x >= 0 and !m.hold_fired and !m.scrolling and !m.hswipe and !m.socket_swipe and
+                    rs.gbench_drag == null and rs.gbench_pick == null and
+                    rs.gscreen == feed_view.screen_loadout and (now_ms -% m.down_ms) >= hold_ms)
+                {
+                    const hx: i32 = @intFromFloat(@as(f32, @floatFromInt(m.down_x)) / scale);
+                    const hy: i32 = @intFromFloat(@as(f32, @floatFromInt(m.down_y)) / scale);
+                    if (feed_view.hitTest(rs.gregions.items, hx, hy)) |hit| {
+                        if (hit.kind == .bench_seat) {
+                            rs.gbench_drag = @intCast(hit.post);
+                            rs.gbench_drag_x = hx;
+                            rs.gbench_drag_y = hy;
+                            m.hold_fired = true;
+                            m.haptic_pending = 2; // the pick-up ticks under the finger
+                        }
+                    }
+                    // Not a library card: a hold on a SOCKETED tray card lifts it
+                    // into the page drag — reorder within its socket, or carry it
+                    // down to the library to unequip. The SEATED lens stays put
+                    // (§7.3: seat another first), same as the desktop handle rule.
+                    if (!m.hold_fired) socket_pick: {
+                        const Surf = struct { hits: *lens_socket.HitList, ui: *lens_socket.SocketUi, cards: []lens_socket.LensCard, blob: []const u8, seated: u32 };
+                        const surfs = [3]Surf{
+                            .{ .hits = &rs.gsocket_hits, .ui = &rs.gsocket_ui, .cards = rs.socket_cards, .blob = rs.socket_blob, .seated = rs.gseated },
+                            .{ .hits = &rs.reply_hits, .ui = &rs.reply_ui, .cards = rs.reply_cards, .blob = rs.reply_blob, .seated = rs.reply_seated },
+                            .{ .hits = &rs.zone_hits, .ui = &rs.zone_ui, .cards = rs.zone_cards, .blob = rs.zone_blob, .seated = rs.zone_seated },
+                        };
+                        for (surfs, 0..) |sf, si| {
+                            const act = lens_socket.hitTest(sf.hits.items, hx, hy) orelse continue;
+                            switch (act) {
+                                .seat => |cid| {
+                                    const idx = trayIndexOfCid(sf.cards, sf.blob, cid) orelse continue;
+                                    if (idx == sf.seated) continue; // the seated lens isn't draggable
+                                    rs.page_drag_surface = @intCast(si);
+                                    sf.ui.picking = null;
+                                    sf.ui.drag_active = idx;
+                                    sf.ui.drag_x = hx;
+                                    sf.ui.drag_y = hy;
+                                    m.hold_fired = true;
+                                    m.haptic_pending = 2;
+                                    break :socket_pick;
+                                },
+                                else => {},
+                            }
+                        }
+                    }
+                }
+                // EDGE-DRAG AUTO-SCROLL: while a held card rides near the top or
+                // bottom of the viewport, scroll the page under the finger — from
+                // the library below the three sockets, only the BOTTOM socket was
+                // reachable (owner, 2026-07-09). Speed ramps with edge proximity;
+                // the clamp keeps it inside the page.
+                if (m.hold_fired) {
+                    const fy: i32 = if (rs.page_drag_surface) |ps| (switch (ps) {
+                        1 => rs.reply_ui.drag_y,
+                        2 => rs.zone_ui.drag_y,
+                        else => rs.gsocket_ui.drag_y,
+                    }) else rs.gbench_drag_y;
+                    const ins_top: i32 = if (rs.gpu_state) |*gsd| @intCast(gsd.inset_top_l) else 0;
+                    const ins_bot: i32 = if (rs.gpu_state) |*gsd| @intCast(gsd.inset_bottom_l) else 0;
+                    const band: i32 = 110; // trigger band at each edge (logical px)
+                    const top_zone = ins_top + 140 + band; // below the sticky header
+                    const bot_zone = view_h - feed_view.tab_bar_h - ins_bot - band;
+                    var dscroll: i32 = 0;
+                    if (fy < top_zone) {
+                        dscroll = @min(14, @divTrunc(top_zone - fy, 8) + 4);
+                    } else if (fy > bot_zone) {
+                        dscroll = -@min(14, @divTrunc(fy - bot_zone, 8) + 4);
+                    }
+                    if (dscroll != 0) rs.gscroll_px = @max(min_scroll, @min(0, rs.gscroll_px + dscroll));
+                }
                 // MOMENTUM (M-UX, first slice): while dragging, smooth the
                 // per-frame travel into a velocity; with the finger up, the
                 // feed glides on it — exponential friction. Constants are
@@ -3200,6 +3428,21 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 const cy: u16 = pev.y / pcell.h;
                 const rx: i32 = if (g.gpu != null) @intFromFloat(@as(f32, @floatFromInt(pev.x)) / gpu_scale) else @intCast(pev.x);
                 const ry: i32 = if (g.gpu != null) @intFromFloat(@as(f32, @floatFromInt(pev.y)) / gpu_scale) else @intCast(pev.y);
+                // The cartridge DETAIL sheet (item 5) owns the pointer while open: its
+                // hit list is topmost, so resolve it here and CONSUME every event so the
+                // screen beneath never reacts. A swatch recolours (live, incl. the whole-
+                // UI accent when it's the seated lens); the X / scrim / a stray tap close;
+                // a tap on the panel body is swallowed.
+                if (rs.gcart_detail != null) {
+                    if (pev.kind == .button_down and pev.button == 1) {
+                        if (lens_socket.hitTest(rs.detail_hits.items, rx, ry)) |dact| switch (dact) {
+                            .close_detail => rs.gcart_detail = null,
+                            .set_color => |sc| applyDetailColor(rs, sc.color),
+                            else => {}, // noop_detail: a tap on the panel body, swallowed
+                        } else rs.gcart_detail = null;
+                    }
+                    continue;
+                }
                 // Toy Box: Gravity SHATTER owns the pointer while the page is broken —
                 // grab/fling tiles, tap the highlighted OFF toggle to stop, and NOTHING
                 // else is clickable (nav + settings are locked out). Consume the event.
@@ -3454,11 +3697,27 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             // the swap; re-ranking the feed awaits the discover
                             // engine (only Following exists today).
                             var socket_handled = false;
+                            // PHONE: a tap in the bottom TAB-BAR band never reaches the
+                            // socket hit lists — page-socket card rects scroll BEHIND the
+                            // bar and were eating nav taps ("home takes a ton of taps"
+                            // from Algorithms, owner 2026-07-09). The bar's own regions
+                            // (nav buttons + blocker) own that band via the regions path.
+                            const in_bar_band = blk: {
+                                if (rs.gpu_state) |*gsb| {
+                                    if (gsb.design_w <= feed_view.phone_max) {
+                                        const lvh: i32 = @intFromFloat(@as(f32, @floatFromInt(fb_h)) / gpu_scale);
+                                        break :blk ry >= lvh - feed_view.tab_bar_h - @as(i32, @intCast(gsb.inset_bottom_l));
+                                    }
+                                }
+                                break :blk false;
+                            };
                             // The bench socket-chooser overlay owns input while open:
                             // socket hit-lists are tested BEFORE page regions, so
                             // without this gate the trays under the dim eat every
                             // click and the overlay soft-locks (owner-hit bug).
-                            if (rs.gscreen == feed_view.screen_loadout and rs.gbench_pick == null) {
+                            if (in_bar_band) {
+                                // fall through to the regions dispatch (nav/blocker win)
+                            } else if (rs.gscreen == feed_view.screen_loadout and rs.gbench_pick == null) {
                                 // Loadout page: edit the surface under the cursor (feed /
                                 // reply / zone). A handle press (.reorder) starts a drag for
                                 // that surface; everything else is a click edit.
@@ -3469,6 +3728,16 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                             rs.gsocket_ui.drag_active = trayIndexOfCid(rs.socket_cards, rs.socket_blob, r.lens);
                                             rs.gsocket_ui.drag_x = rx;
                                             rs.gsocket_ui.drag_y = ry;
+                                        },
+                                        // Tapping the ALREADY-seated cartridge opens its
+                                        // detail/colour sheet here too (item 5) — the owner
+                                        // expected this door on the Algorithms page as well.
+                                        .seat => |scid| {
+                                            if (trayIndexOfCid(rs.socket_cards, rs.socket_blob, scid)) |six| {
+                                                if (six == rs.gseated) {
+                                                    rs.gcart_detail = 0;
+                                                } else applyLoadoutAction(sact, rs.socket_cards, rs.socket_blob, &rs.gseated, &rs.gsocket_ui, &rs.loadout_dirty);
+                                            }
                                         },
                                         else => applyLoadoutAction(sact, rs.socket_cards, rs.socket_blob, &rs.gseated, &rs.gsocket_ui, &rs.loadout_dirty),
                                     }
@@ -3481,6 +3750,16 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                             rs.reply_ui.drag_x = rx;
                                             rs.reply_ui.drag_y = ry;
                                         },
+                                        // Tapping the ALREADY-seated cartridge opens its
+                                        // detail/colour sheet here too (item 5) — the owner
+                                        // expected this door on the Algorithms page as well.
+                                        .seat => |scid| {
+                                            if (trayIndexOfCid(rs.reply_cards, rs.reply_blob, scid)) |six| {
+                                                if (six == rs.reply_seated) {
+                                                    rs.gcart_detail = 1;
+                                                } else applyLoadoutAction(sact, rs.reply_cards, rs.reply_blob, &rs.reply_seated, &rs.reply_ui, &rs.loadout_dirty);
+                                            }
+                                        },
                                         else => applyLoadoutAction(sact, rs.reply_cards, rs.reply_blob, &rs.reply_seated, &rs.reply_ui, &rs.loadout_dirty),
                                     }
                                     socket_handled = true;
@@ -3491,6 +3770,16 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                             rs.zone_ui.drag_active = trayIndexOfCid(rs.zone_cards, rs.zone_blob, r.lens);
                                             rs.zone_ui.drag_x = rx;
                                             rs.zone_ui.drag_y = ry;
+                                        },
+                                        // Tapping the ALREADY-seated cartridge opens its
+                                        // detail/colour sheet here too (item 5) — the owner
+                                        // expected this door on the Algorithms page as well.
+                                        .seat => |scid| {
+                                            if (trayIndexOfCid(rs.zone_cards, rs.zone_blob, scid)) |six| {
+                                                if (six == rs.zone_seated) {
+                                                    rs.gcart_detail = 2;
+                                                } else applyLoadoutAction(sact, rs.zone_cards, rs.zone_blob, &rs.zone_seated, &rs.zone_ui, &rs.loadout_dirty);
+                                            }
                                         },
                                         else => applyLoadoutAction(sact, rs.zone_cards, rs.zone_blob, &rs.zone_seated, &rs.zone_ui, &rs.loadout_dirty),
                                     }
@@ -3506,8 +3795,12 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         .toggle_tray => rs.reply_ui.open = !rs.reply_ui.open,
                                         .seat => |cid| {
                                             if (trayIndexOfCid(rs.reply_cards, rs.reply_blob, cid)) |idx| {
-                                                rs.reply_seated = idx;
-                                                rs.loadout_dirty = true;
+                                                if (idx == rs.reply_seated) {
+                                                    rs.gcart_detail = 1; // tap the seated cartridge again → detail sheet
+                                                } else {
+                                                    rs.reply_seated = idx;
+                                                    rs.loadout_dirty = true;
+                                                }
                                             }
                                             rs.reply_ui.open = false;
                                             rs.reply_ui.expanded = null;
@@ -3532,8 +3825,12 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         .toggle_tray => rs.zone_ui.open = !rs.zone_ui.open,
                                         .seat => |cid| {
                                             if (trayIndexOfCid(rs.zone_cards, rs.zone_blob, cid)) |idx| {
-                                                rs.zone_seated = idx;
-                                                rs.loadout_dirty = true;
+                                                if (idx == rs.zone_seated) {
+                                                    rs.gcart_detail = 2; // tap the seated cartridge again → detail sheet
+                                                } else {
+                                                    rs.zone_seated = idx;
+                                                    rs.loadout_dirty = true;
+                                                }
                                             }
                                             rs.zone_ui.open = false;
                                             rs.zone_ui.expanded = null;
@@ -3571,6 +3868,10 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                                 // THIS is the seam it plugs into (re-rank the feed by
                                                 // the seated lens here, then reset scroll).
                                                 rs.gscroll_px = 0;
+                                            } else {
+                                                // Tapping the ALREADY-seated cartridge opens its detail
+                                                // + colour sheet (item 5) instead of a no-op re-seat.
+                                                rs.gcart_detail = 0;
                                             }
                                         }
                                         rs.gsocket_ui.expanded = null;
@@ -3614,6 +3915,9 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         rs.gsocket_ui.open = false;
                                         rs.gscreen = feed_view.screen_loadout;
                                     },
+                                    // The detail-sheet actions only arise from its own hit
+                                    // list (dispatched topmost), never the socket — no-op here.
+                                    .close_detail, .noop_detail => {},
                                 }
                             }
                             if (!socket_handled) {
@@ -5731,11 +6035,29 @@ pub fn mobileHapticTake(mr: *MobileRun) u8 {
     return tag;
 }
 
-/// Does the frame WANT the soft keyboard? The composer is the phone's only
-/// text surface so far (chat input joins when its phone shape lands). The
-/// activity polls this and shows/hides the IME on the transition.
+/// Does the frame WANT the soft keyboard? Keyed off the SAME predicate the
+/// desktop keyboard fence uses (typingOwnsKeyboard — every text input registers
+/// there), so the IME rises for chat, the searches, create/dev fields, and the
+/// pet name — not just the composer (the "none of the keyboard stuff works"
+/// on-device finding: only compose mode ever summoned it). The activity polls
+/// this per lap and shows/hides the IME on the transition.
 pub fn mobileImeWanted(mr: *MobileRun) bool {
-    return mr.rs.mode == .compose;
+    return typingOwnsKeyboard(&mr.rs);
+}
+
+/// The system BACK arrived (edge swipe / back button): queue it for the pump,
+/// which pops one level of in-app navigation on the next frame.
+pub fn mobileBack(mr: *MobileRun) void {
+    mr.host.back_pending = true;
+}
+
+/// Did the last back-pop find NOTHING to pop (read-and-clear)? True tells the
+/// activity to step the task back to the launcher (moveTaskToBack) — the
+/// Android back-at-root convention; the process and feed stay hot.
+pub fn mobileMinimizeTake(mr: *MobileRun) bool {
+    const v = mr.host.minimize_pending;
+    mr.host.minimize_pending = false;
+    return v;
 }
 
 /// The surface changed size (rotation / fold): the next frame lays out to
@@ -6238,6 +6560,95 @@ fn benchDragViewOf(rs: *RunState) ?feed_view.BenchDragView {
 
 fn composeBlinkOn(anchor_ns: u64) bool {
     return ((clock_shell.monotonicNanos() -| anchor_ns) / 530_000_000) % 2 == 0;
+}
+
+/// The seated lens card + its blob for whichever surface has its detail sheet
+/// open (item 5) — home / reply / zone. Null when closed or the seat is out of
+/// range. The overlay renders from this; `set_color` writes back to the surface.
+/// One system-BACK step (the Pixel edge swipe / back button): close the topmost
+/// transient first — nav drawer, cartridge detail sheet, repost menu, composer —
+/// else pop the screen stack the same way the on-screen ‹ Back buttons do (the
+/// `.back` region arm mirrors the screen-specific returns), else report false:
+/// the caller minimizes the task (back-at-root never kills the process).
+fn backNavigate(rs: *RunState) bool {
+    const gpa = rs.gpa;
+    if (rs.gpu_state) |*gsd| {
+        if (gsd.drawer_want or gsd.drawer_t > 0.3) {
+            gsd.drawer_want = false;
+            return true;
+        }
+    }
+    if (rs.gcart_detail != null) {
+        rs.gcart_detail = null;
+        return true;
+    }
+    if (rs.grepost_menu != null) {
+        rs.grepost_menu = null;
+        return true;
+    }
+    if (rs.mode == .compose) {
+        rs.mode = .timeline; // the draft is kept; ＋ reopens where you left off
+        return true;
+    }
+    switch (rs.gscreen) {
+        feed_view.screen_home => {
+            // The double-back convention (owner asked for the TikTok pattern):
+            // the FIRST back at the root shows a heads-up pill and arms a short
+            // window; a second back inside it minimizes. Clock is shell-side.
+            const now_ns = clock_shell.monotonicNanos();
+            if (now_ns < rs.back_hint_until) return false; // second swipe → minimize
+            rs.back_hint_until = now_ns + 2_000_000_000;
+            return true; // consumed — the hint pill shows while armed
+        },
+        feed_view.screen_algo_docs => rs.gscreen = rs.docs_return_screen,
+        feed_view.screen_algo_detail => rs.gscreen = feed_view.screen_loadout,
+        feed_view.screen_transparency => {
+            if (rs.gtransp_source) {
+                rs.gtransp_source = false; // source sub-view → back to the summary
+            } else {
+                rs.gscreen = rs.transp_return_screen;
+                if (rs.inspect_bytes) |b| gpa.free(b);
+                rs.inspect_bytes = null;
+                if (rs.inspect_src) |b| gpa.free(b);
+                rs.inspect_src = null;
+            }
+        },
+        feed_view.screen_thread => rs.gscreen = rs.thread_return_screen,
+        feed_view.screen_zones => rs.gscreen = rs.zone_return_screen,
+        // Every other top-level page (zones hub, loadout, settings, chat,
+        // profile, activity) steps back to Home — the tab bar's own root.
+        else => rs.gscreen = feed_view.screen_home,
+    }
+    rs.gscroll_px = 0;
+    return true;
+}
+
+/// Recolour the seated lens of whichever surface has its detail sheet open
+/// (item 5). Writes the palette index back to the tray card; flags the loadout
+/// dirty so it persists. A no-op if the seat is out of range.
+fn applyDetailColor(rs: *RunState, color: u8) void {
+    const surf = rs.gcart_detail orelse return;
+    const cards: []lens_socket.LensCard, const seated: u32 = switch (surf) {
+        1 => .{ rs.reply_cards, rs.reply_seated },
+        2 => .{ rs.zone_cards, rs.zone_seated },
+        else => .{ rs.socket_cards, rs.gseated },
+    };
+    if (seated < cards.len) {
+        cards[seated].color = color;
+        rs.loadout_dirty = true;
+    }
+}
+
+const DetailTarget = struct { card: lens_socket.LensCard, blob: []const u8 };
+fn detailCardOf(rs: *RunState) ?DetailTarget {
+    const surf = rs.gcart_detail orelse return null;
+    const cards: []const lens_socket.LensCard, const blob: []const u8, const seated: u32 = switch (surf) {
+        1 => .{ rs.reply_cards, rs.reply_blob, rs.reply_seated },
+        2 => .{ rs.zone_cards, rs.zone_blob, rs.zone_seated },
+        else => .{ rs.socket_cards, rs.socket_blob, rs.gseated },
+    };
+    if (seated >= cards.len) return null;
+    return .{ .card = cards[seated], .blob = blob };
 }
 
 /// Diff, write, flush, and bring `prev` up to date with what is on screen.
@@ -7761,6 +8172,11 @@ const InspectJob = struct {
     repo_len: usize = 0,
     rkey: [128]u8 = undefined,
     rkey_len: usize = 0,
+    /// The record CID this fetch is FOR — the prefetch drain's cache key (the
+    /// user-tap path keys off rs.inspect_ref instead). Set by the kicker AFTER
+    /// startInspect (the worker never reads it; only the post-join drain does).
+    cid: [128]u8 = undefined,
+    cid_len: usize = 0,
 };
 
 /// Worker body: a public getRecord + serialize, all off the `page_allocator` (a
@@ -7771,7 +8187,25 @@ fn inspectWorker(job: *InspectJob) void {
     var arena_state = std.heap.ArenaAllocator.init(a);
     defer arena_state.deinit();
     const scratch = arena_state.allocator();
-    const pub_algo = algorithm_shell.fetchPublic(scratch, job.io, job.env, job.pds[0..job.pds_len], job.repo[0..job.repo_len], job.rkey[0..job.rkey_len]) catch null;
+    // Narrate to logcat (a no-op off Android): the on-device failure was silent —
+    // a black transparency page / a dead install with nothing in the log.
+    mobile_host.logcat("inspect: fetch repo={s} rkey={s}", .{ job.repo[0..job.repo_len], job.rkey[0..job.rkey_len] });
+    // The author's repo lives on THEIR PDS — resolve the DID document's service
+    // endpoint and fetch THERE. The old code fetched from the SESSION PDS, which
+    // only worked when author and viewer shared a PDS: a cross-PDS marketplace
+    // author (the owner's own bsky-hosted test account) always got RecordNotFound
+    // (found on-device 2026-07-09). Resolution failing (plc unreachable) falls
+    // back to the session PDS, which preserves the old same-PDS behaviour.
+    const author_pds: []const u8 = identity_shell.pdsForDid(scratch, job.io, job.env, .{}, job.repo[0..job.repo_len]) catch |err| blk: {
+        mobile_host.logcat("inspect: DID resolve failed ({s}) — trying the session PDS", .{@errorName(err)});
+        break :blk job.pds[0..job.pds_len];
+    };
+    mobile_host.logcat("inspect: author pds={s}", .{author_pds});
+    const pub_algo = algorithm_shell.fetchPublic(scratch, job.io, job.env, author_pds, job.repo[0..job.repo_len], job.rkey[0..job.rkey_len]) catch |err| blk: {
+        mobile_host.logcat("inspect: fetch ERROR {s}", .{@errorName(err)});
+        break :blk null;
+    };
+    if (pub_algo == null) mobile_host.logcat("inspect: fetch returned nothing (refused or not found)", .{});
     if (pub_algo) |pa| {
         // Serialize into page_allocator (survives the arena deinit); the main
         // thread copies both into gpa and frees these after join.
@@ -7887,6 +8321,14 @@ const Grid = struct {
     market_loading: bool = false,
     bench_pick: ?feed_view.BenchPickView = null,
     bench_drag: ?feed_view.BenchDragView = null,
+    /// The cartridge DETAIL sheet (item 5): the seated lens card whose detail +
+    /// colour overlay is open (null = closed), its text blob, and the hit list the
+    /// overlay writes for the shell to dispatch. Set per frame from `gcart_detail`.
+    cart_detail: ?lens_socket.LensCard = null,
+    /// The double-back hint pill is armed this frame (folded into feed_sig).
+    back_hint: bool = false,
+    cart_detail_blob: []const u8 = "",
+    detail_hits: ?*lens_socket.HitList = null,
     published: []const feed_view.PublishedRow = &.{},
     docs_kind: u8 = 0,
     detail: feed_view.AlgoDetailView = .{},
@@ -7909,6 +8351,9 @@ const Grid = struct {
     inspect_source: bool = false,
     /// True while the background config fetch is in flight (show a loading state).
     inspect_loading: bool = false,
+    /// Out: the phone loadout's library band top (unequip drop test); maxInt
+    /// in wide-shelf mode. Written by layoutLoadout each frame.
+    loadout_lib_y: ?*i32 = null,
     /// Out: layoutLoadout writes each page socket's geometry here for the
     /// shell's drag math (feed / reply / zone).
     loadout_geoms: *[3]lens_socket.Geometry = undefined,
@@ -8931,14 +9376,14 @@ fn paintFrame(
                 g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{}, &.{}, g.chat_recv) catch g.content_h.*;
             } else if (g.screen.* == feed_view.screen_loadout) {
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
-                g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market, g.market_q, g.market_q_focus, g.market_loading, g.bench_pick, g.bench_drag, g.published, g.create, g.dev, g.bench) catch g.content_h.*; // software: draw line-art nav
+                g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market, g.market_q, g.market_q_focus, g.market_loading, g.bench_pick, g.bench_drag, g.published, g.create, g.dev, g.bench, .{}, g.loadout_lib_y) catch g.content_h.*; // software: draw line-art nav
             } else if (g.screen.* == feed_view.screen_algo_docs) {
                 g.content_h.* = feed_view.layoutAlgoDocs(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, if (g.docs_kind == 1) algo_docs.dev_doc else algo_docs.user_doc) catch g.content_h.*;
             } else if (g.screen.* == feed_view.screen_algo_detail) {
                 g.content_h.* = feed_view.layoutAlgoDetail(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.detail) catch g.content_h.*;
             } else if (g.screen.* == feed_view.screen_transparency) {
                 if (g.inspect_loading) {
-                    g.content_h.* = feed_view.layoutAlgorithmLoading(gpa, g.engine, @intCast(win.fb.width), g.draw, g.regions, g.accent, g.inspect_name) catch g.content_h.*;
+                    g.content_h.* = feed_view.layoutAlgorithmLoading(gpa, g.engine, @intCast(win.fb.width), g.draw, g.regions, g.accent, g.inspect_name, false) catch g.content_h.*;
                 } else if (g.inspect_bytes.len > 0) {
                     if (g.inspect_source) {
                         // The byte-exact source IS the stored serialized config.
@@ -8949,6 +9394,9 @@ fn paintFrame(
                         if (transparency.buildPage(arena, g.inspect_name, g.inspect_ref, cfg) catch null) |pg|
                             g.content_h.* = feed_view.layoutTransparency(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, pg) catch g.content_h.*;
                     }
+                } else {
+                    // The fetch FAILED: an honest error page, never a black screen.
+                    g.content_h.* = feed_view.layoutAlgorithmLoading(gpa, g.engine, @intCast(win.fb.width), g.draw, g.regions, g.accent, g.inspect_name, true) catch g.content_h.*;
                 }
             } else {
                 // Tiling foundation (S.1): geometry comes through the partition
@@ -8957,6 +9405,17 @@ fn paintFrame(
                 const sw_geom = feed_view.paneGeomFor(@intCast(win.fb.width), g.screen.*);
                 g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), feed_posts, g.scroll.*, g.draw, g.regions, null, false, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, null, null, g.zone_title, g.zones, sw_geom, g.settings_section, g.settings_toggles, g.settings_account, g.settings_choices, g.settings_picking, g.repost_menu, g.toys, .{}) catch g.content_h.*;
             }
+            // A narrow (phone-width) window renders the tab-bar shape here too, so
+            // reserve the bar's height so the last row clears it — the same
+            // clearance the GPU phone path adds. The software backend is desktop, so
+            // there are no safe-area insets: just the bar.
+            if (win.fb.width <= feed_view.phone_max)
+                g.content_h.* += feed_view.tab_bar_h;
+            // The cartridge DETAIL sheet (item 5): topmost overlay when open.
+            if (g.cart_detail) |cd| if (g.detail_hits) |dh| {
+                dh.clearRetainingCapacity();
+                lens_socket.drawDetail(gpa, g.draw, g.engine, cd, g.cart_detail_blob, @intCast(win.fb.width), @intCast(win.fb.height), 0, dh) catch {};
+            };
             const t_layout = if (debug_frame_timing) clock_shell.monotonicNanos() else 0;
             window_shell.presentDrawList(win, gpa, g.engine, g.draw.slice(), field_core.background) catch {}; // E2: a lost blit is the next frame's problem
             if (debug_frame_timing) {
@@ -9491,7 +9950,13 @@ fn paintFrameGpu(
         settings_hover_sig ^= @as(u64, @intFromBool(g.settings_account.pet_name_focus)) *% 0x2545_F491_4F6C_DD1D;
         for (g.settings_account.pet_name) |c| settings_hover_sig = settings_hover_sig *% 131 +% c;
     }
-    const sig = feedSignature(items, g.scroll.*, w, h) ^ (@as(u64, g.screen.*) *% 0x9E37_79B9_7F4A_7C15) ^ (socket_sig *% 0xD1B5_4A32_D192_ED03) ^ (@as(u64, g.settings_section) *% 0xC2B2_AE3D_27D4_EB4F) ^ (g.settings_toggles *% 0x9E6C_63D0_676A_9A99) ^ (g.settings_choices *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, g.settings_picking) *% 0x8A91_7F2B_4D3E_61C7) ^ (@as(u64, @intFromBool(g.inspect_source)) *% 0xF29C_511C_8E3D_45A7) ^ (@as(u64, @intFromBool(g.inspect_loading)) *% 0xBF58_476D_1CE4_E5B9) ^ chat_sig ^ zones_sig ^ (exp_sig *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, if (g.repost_menu) |m| m + 1 else 0) *% 0xA0761D6478BD642F) ^ settings_hover_sig ^ (if (g.xp) (@as(u64, g.xp_hour) *% 60 +% g.xp_min +% 1) *% 0xF1357AEA2E62A9C5 else 0) ^ (@as(u64, @intFromBool(g.light)) *% 0xD6E8_FEB8_6659_FD93) ^ (@as(u64, @bitCast(@as(i64, gs.inset_top_l) *% 73856093 ^ @as(i64, gs.inset_bottom_l) *% 19349663 ^ @as(i64, gs.inset_left_l) *% 83492791 ^ @as(i64, gs.inset_right_l) *% 49979687)) *% 0x9E37_79B9_7F4A_7C15);
+    const sig = feedSignature(items, g.scroll.*, w, h) ^ (@as(u64, g.screen.*) *% 0x9E37_79B9_7F4A_7C15) ^ (socket_sig *% 0xD1B5_4A32_D192_ED03) ^ (@as(u64, g.settings_section) *% 0xC2B2_AE3D_27D4_EB4F) ^ (g.settings_toggles *% 0x9E6C_63D0_676A_9A99) ^ (g.settings_choices *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, g.settings_picking) *% 0x8A91_7F2B_4D3E_61C7) ^ (@as(u64, @intFromBool(g.inspect_source)) *% 0xF29C_511C_8E3D_45A7) ^ (@as(u64, @intFromBool(g.inspect_loading)) *% 0xBF58_476D_1CE4_E5B9) ^ chat_sig ^ zones_sig ^ (exp_sig *% 0x2545_F491_4F6C_DD1D) ^ (@as(u64, if (g.repost_menu) |m| m + 1 else 0) *% 0xA0761D6478BD642F) ^ settings_hover_sig ^ (if (g.xp) (@as(u64, g.xp_hour) *% 60 +% g.xp_min +% 1) *% 0xF1357AEA2E62A9C5 else 0) ^ (@as(u64, @intFromBool(g.light)) *% 0xD6E8_FEB8_6659_FD93) ^ (@as(u64, @bitCast(@as(i64, gs.inset_top_l) *% 73856093 ^ @as(i64, gs.inset_bottom_l) *% 19349663 ^ @as(i64, gs.inset_left_l) *% 83492791 ^ @as(i64, gs.inset_right_l) *% 49979687)) *% 0x9E37_79B9_7F4A_7C15)
+        // Item 5: the cartridge detail sheet. Open (vs closed) AND its target colour
+        // fold in, so opening, recolouring (the ring + the whole-UI accent), and
+        // closing each rebuild the verts even though the overlay keeps input.
+        ^ (if (g.cart_detail) |cd| (@as(u64, cd.color) +% 1) *% 0x94D0_49BB_1331_11EB else 0)
+        // The double-back hint pill: arming/expiry rebuilds the nav tile.
+        ^ (@as(u64, @intFromBool(g.back_hint)) *% 0x517C_C1B7_2722_0A95);
     // A drag/settle animates the socket every frame (lift, reflow, ghost), so
     // bypass the feed cache while it runs — a brief interaction, and the field
     // already rebuilds every frame anyway.
@@ -9542,7 +10007,7 @@ fn paintFrameGpu(
             }
             gs.content_x = lg.col_x;
             gs.content_w = lg.col_w;
-            g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, true, true, lg, g.market, g.market_q, g.market_q_focus, g.market_loading, g.bench_pick, g.bench_drag, g.published, g.create, g.dev, g.bench) catch g.content_h.*; // GPU: SDF pass strikes the nav icons crisp
+            g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, true, true, lg, g.market, g.market_q, g.market_q_focus, g.market_loading, g.bench_pick, g.bench_drag, g.published, g.create, g.dev, g.bench, .{ .top = @intCast(gs.inset_top_l), .bottom = @intCast(gs.inset_bottom_l), .left = @intCast(gs.inset_left_l), .right = @intCast(gs.inset_right_l) }, g.loadout_lib_y) catch g.content_h.*; // GPU: SDF pass strikes the nav icons crisp
         } else if (g.chat_store != null and g.screen.* == feed_view.screen_messages) {
             // Zat Chat (U3, dev-gated): the Messages surface in the GPU's logical
             // design space; the rail is the shell's own tile (rail_external), and
@@ -9610,7 +10075,7 @@ fn paintFrameGpu(
             // rebuilt from the inspected config each entry (what you see = what runs).
             // Summary by default; the byte-exact serialized source on the tap-through.
             if (g.inspect_loading) {
-                g.content_h.* = feed_view.layoutAlgorithmLoading(gpa, g.engine, @intCast(gs.design_w), g.draw, g.regions, g.accent, g.inspect_name) catch g.content_h.*;
+                g.content_h.* = feed_view.layoutAlgorithmLoading(gpa, g.engine, @intCast(gs.design_w), g.draw, g.regions, g.accent, g.inspect_name, false) catch g.content_h.*;
             } else if (g.inspect_bytes.len > 0) {
                 if (g.inspect_source) {
                     g.content_h.* = feed_view.layoutAlgorithmSource(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.inspect_name, g.inspect_ref, if (g.inspect_src.len > 0) g.inspect_src else g.inspect_bytes) catch g.content_h.*;
@@ -9619,6 +10084,10 @@ fn paintFrameGpu(
                     if (transparency.buildPage(arena, g.inspect_name, g.inspect_ref, cfg) catch null) |pg|
                         g.content_h.* = feed_view.layoutTransparency(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, pg) catch g.content_h.*;
                 }
+            } else {
+                // The fetch FAILED (not loading, no bytes): an honest error page —
+                // before this the arm drew NOTHING and the screen was pure black.
+                g.content_h.* = feed_view.layoutAlgorithmLoading(gpa, g.engine, @intCast(gs.design_w), g.draw, g.regions, g.accent, g.inspect_name, true) catch g.content_h.*;
             }
         } else {
             // skip_heart=true on every screen: the SDF heart pass (drawEngagementHearts,
@@ -9671,6 +10140,14 @@ fn paintFrameGpu(
             toys_frame.flow = gs.flow;
             g.content_h.* = feed_view.layout(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), feed_posts, g.scroll.*, g.draw, g.regions, gs.heights, true, g.screen.*, profile_header, g.pending_new, g.accent, g.socket_tray, g.socket_ui, g.socket_hits, &chain_info, &gs.sel_glyphs, g.zone_title, g.zones, gp_geom, g.settings_section, g.settings_toggles, g.settings_account, g.settings_choices, g.settings_picking, g.repost_menu, toys_frame, .{ .top = @intCast(gs.inset_top_l), .bottom = @intCast(gs.inset_bottom_l), .left = @intCast(gs.inset_left_l), .right = @intCast(gs.inset_right_l) }) catch g.content_h.*;
         }
+        // Phone: EVERY scrollable body reserves the bottom chrome (tab bar +
+        // home-pill inset) so its last row lifts clear of the tab bar — the scroll
+        // clamp reads content_h. Done once here for ALL screens (feed, settings,
+        // zones, loadout, chat, algo pages), so the pure layout functions stay
+        // device-agnostic. Desktop (design_w > phone_max): the nav is a side rail,
+        // no bottom bar, nothing reserved.
+        if (gs.design_w <= feed_view.phone_max)
+            g.content_h.* += feed_view.tab_bar_h + @as(i32, @intCast(gs.inset_bottom_l));
         if (g.julia) feed_view.juliaRemapText(g.draw); // light theme: dark text
         // "Show frame timing": ride the fps/ms badge on the feed buffer. The gate
         // above forces a per-frame rebuild while this is on, so the number is live
@@ -9917,6 +10394,16 @@ fn paintFrameGpu(
             // The nav DRAWER slides over everything (scrim + panel); its
             // regions land last, so while open it owns the taps.
             feed_view.drawDrawer(gpa, g.draw, g.engine, @intCast(gs.design_w), @intCast(lh), gs.drawer_t, g.screen.*, g.regions, g.accent, g.you_handle, true) catch {};
+            // The cartridge DETAIL sheet (item 5) is chrome-topmost: it lives in
+            // THIS tile (drawn after the feed buffer), not the feed buffer, or the
+            // tab bar + FAB paint over its scrim (the on-device bleed, 2026-07-09).
+            // Input is consumed by the sheet's own hit list while open.
+            if (g.cart_detail) |cd| if (g.detail_hits) |dh| {
+                dh.clearRetainingCapacity();
+                lens_socket.drawDetail(gpa, g.draw, g.engine, cd, g.cart_detail_blob, @intCast(gs.design_w), @intCast(lh), @intCast(gs.inset_top_l), dh) catch {};
+            };
+            // The double-back heads-up: a centred pill above the bar while armed.
+            if (g.back_hint) feed_view.drawBackHint(gpa, g.draw, g.engine, @intCast(gs.design_w), @intCast(lh), @intCast(gs.inset_bottom_l)) catch {};
             if (g.julia) feed_view.juliaRemapText(g.draw);
             if (g.xp) feed_view.rethemeRetro(gpa, g.draw, @intCast(gs.design_w), @intCast(lh), false) catch {};
             if (g.light) feed_view.rethemeLight(gpa, g.draw) catch {};
@@ -9943,6 +10430,12 @@ fn paintFrameGpu(
                 const enter_x: i32 = @intFromFloat((dw + 20.0) + (settled_x - (dw + 20.0)) * zt);
                 feed_view.renderRail(gpa, g.draw, g.engine, enter_x, @intCast(lh), g.screen.*, g.regions, g.accent, true, gs.rail_hover_t) catch {};
             }
+            // The cartridge DETAIL sheet (item 5): same chrome-topmost placement as
+            // the phone arm, so the desktop rail can't paint over its scrim.
+            if (g.cart_detail) |cd| if (g.detail_hits) |dh| {
+                dh.clearRetainingCapacity();
+                lens_socket.drawDetail(gpa, g.draw, g.engine, cd, g.cart_detail_blob, @intCast(gs.design_w), @intCast(lh), @intCast(gs.inset_top_l), dh) catch {};
+            };
             if (g.julia) feed_view.juliaRemapText(g.draw); // light theme: dark text
             if (g.xp) feed_view.rethemeRetro(gpa, g.draw, @intCast(gs.design_w), @intCast(lh), false) catch {};
             if (g.light) feed_view.rethemeLight(gpa, g.draw) catch {};
@@ -10015,8 +10508,9 @@ fn paintFrameGpu(
     // glass swallowed it — the "selection does nothing" report).
     drawSelectionOverlay(gpa, g, gs, scale, @intCast(w), @intCast(h));
     // The socket hover highlight rides ON TOP of the feed (its panels are
-    // opaque, so it can't sit behind like the post wash does).
-    drawSocketHoverTop(gpa, g, gs, scale, @intCast(w), @intCast(h));
+    // opaque, so it can't sit behind like the post wash does). Gated off while
+    // the detail sheet is open (modal chrome — nothing may paint over it).
+    if (g.cart_detail == null) drawSocketHoverTop(gpa, g, gs, scale, @intCast(w), @intCast(h));
     // The engagement hearts: one SDF heart per visible like button, drawn IN
     // PLACE (feed_view skips its own), so a like fills + pops the ACTUAL heart.
     drawEngagementHearts(g, gs, items, @intCast(w), @intCast(h));
@@ -10025,7 +10519,9 @@ fn paintFrameGpu(
     drawSdfIcons(g, gs, items, @intCast(w), @intCast(h));
     // The sticky CHAIN header: pins while scrolling the chain, catches up on
     // scroll-down, pushed out at the chain's end. Drawn LAST (on top), per-frame.
-    drawChainSticky(gpa, g, gs, scale, @intCast(w), @intCast(h));
+    // Gated off while the detail sheet is open (it can open from the reply socket
+    // on the thread screen, right where the chain header pins).
+    if (g.cart_detail == null) drawChainSticky(gpa, g, gs, scale, @intCast(w), @intCast(h));
     // The right-click context menu sits ABOVE everything else.
     drawContextMenu(gpa, g, gs, scale, @intCast(w), @intCast(h));
     // Toy Box: CRT scanlines — a post-process over the whole frame.
@@ -10044,11 +10540,22 @@ fn drawChainSticky(gpa: Allocator, g: Grid, gs: *GpuState, scale: f32, vw: i32, 
         return;
     }
     const scroll = g.scroll.*;
-    const pin_y = gs.chain_pin_y;
     const header_h: i32 = 46;
+    const is_phone = gs.design_w <= feed_view.phone_max;
+    const top_edge: i32 = @intCast(gs.inset_top_l); // visible top (status-bar bottom; 0 on desktop)
+    // PHONE: the desktop pin (feed_y0 ≈ 112 + the inset shift) read as a fat dead
+    // band ~40% down the screen, and the bar appeared while the head post's
+    // name/avatar were STILL VISIBLE inline — a doubled header (owner, 2026-07-09).
+    // Owner's rule: appear only once the inline header is ENTIRELY out of view,
+    // and sit snug under the Back/Thread bar. `chain_pin_phone` is the tuck-under
+    // offset — an eyes-on-device [TUNE].
+    const chain_pin_phone: i32 = 48;
+    const pin_y = if (is_phone) top_edge + chain_pin_phone else gs.chain_pin_y;
     const inline_y = gs.chain_top_off + scroll; // screen y of the inline header
     const bottom_y = gs.chain_bottom_off + scroll; // screen y of the chain end
-    const pinned = inline_y < pin_y; // the inline header has scrolled above the pin
+    // Desktop keeps the seamless slide-under handoff (pin the moment the inline
+    // header crosses the pin line); phone waits for it to fully leave the screen.
+    const pinned = if (is_phone) inline_y + header_h < top_edge else inline_y < pin_y;
     // Catch-up edge: newly pinned (scrolled down past) → restart the entrance.
     if (pinned and !gs.chain_was_pinned) gs.chain_catchup_t = 0;
     gs.chain_was_pinned = pinned;
@@ -10072,7 +10579,7 @@ fn drawChainSticky(gpa: Allocator, g: Grid, gs: *GpuState, scale: f32, vw: i32, 
 
     var hd: raster_core.DrawList = .{};
     defer hd.deinit(gpa);
-    feed_view.buildChainHeaderBar(gpa, &hd, g.engine, @intCast(gs.design_w), draw_y, header_h, pin_y, gs.chain_tint, gs.chain_initial, gs.chain_name[0..gs.chain_name_len], gs.chain_handle[0..gs.chain_handle_len], g.accent, alpha) catch return;
+    feed_view.buildChainHeaderBar(gpa, &hd, g.engine, @intCast(gs.design_w), draw_y, header_h, pin_y, gs.chain_tint, gs.chain_initial, gs.chain_name[0..gs.chain_name_len], gs.chain_handle[0..gs.chain_handle_len], g.accent, alpha, if (is_phone) 0 else null) catch return;
     if (hd.len == 0) return;
     gpu.feedBuild(&gs.hover, gpa, g.engine, hd.slice(), scale) catch return;
     gpu.feedDraw(&gs.hover, vw, vh);
@@ -10403,6 +10910,10 @@ fn drawSocketHoverTop(gpa: Allocator, g: Grid, gs: *GpuState, scale: f32, vw: i3
 /// Settings rail slot). Positions mirror feed_view's icon offsets; the full
 /// rollout will have feed_view emit exact placements.
 fn drawSdfIcons(g: Grid, gs: *GpuState, items: []const feed_core.TimelineItem, vw: i32, vh: i32) void {
+    // The cartridge detail sheet is modal chrome drawn after every buffer but
+    // BEFORE this pass — with it open, any icon would paint over its scrim/panel
+    // (the on-device bleed, 2026-07-09). It needs no icons of its own: skip all.
+    if (g.cart_detail != null) return;
     const scale = gs.scale;
     // The phone drawer is OPAQUE chrome, but this pass paints after every
     // buffer — while it's open, only ITS rows get icons (they're the only
@@ -10534,6 +11045,7 @@ fn drawJuliaBurst(gs: *GpuState, vw: i32, vh: i32) void {
 
 fn drawEngagementHearts(g: Grid, gs: *GpuState, items: []const feed_core.TimelineItem, vw: i32, vh: i32) void {
     if (gs.drawer_t > 0.5) return; // the drawer is opaque chrome; hearts are content
+    if (g.cart_detail != null) return; // the detail sheet is modal chrome — same rule
     const scale = gs.scale;
     const s = g.active.slice();
     const recipes = s.items(.recipe);

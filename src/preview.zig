@@ -149,7 +149,7 @@ pub fn main(init: std.process.Init) !void {
         defer raster.deinit(gpa, &pfb);
         dl.len = 0;
         _ = try feed_view.layout(gpa, &engine, @intCast(pw), @intCast(ph), posts, 0, &dl, null, null, false, 0, null, 3, lens_socket.seatedAccent(home_tray), home_tray, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{}, .{});
-        try feed_view.drawTabBar(gpa, &dl, &engine, @intCast(pw), @intCast(ph), 0, null, lens_socket.seatedAccent(home_tray), false);
+        try feed_view.drawTabBar(gpa, &dl, &engine, @intCast(pw), @intCast(ph), 0, 0, null, lens_socket.seatedAccent(home_tray), false);
         try raster.paint(gpa, &engine, dl.slice(), &pfb, clear);
         try writePpm(io, gpa, &pfb, "/tmp/zat_phone.ppm");
 
@@ -761,10 +761,44 @@ pub fn main(init: std.process.Init) !void {
     @memset(fb.pixels, clear);
     dl.len = 0;
     try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
-    _ = try feed_view.layoutLoadout(gpa, &engine, @intCast(W), @intCast(H), &dl, null, lens_socket.seatedAccent(feed_t), 0, 0, null, feed_t, .{}, &fh, reply_t, .{}, &rh, zone_t, .{}, &zh, false, false, null, &.{}, "", false, false, null, null, &.{}, .{ .step = .landing, .answers = .{}, .config = discover.DEFAULT_CONFIG, .name = "", .color = 0 }, .{}, .{ .cards = &.{}, .text = "", .seated = 0 });
+    _ = try feed_view.layoutLoadout(gpa, &engine, @intCast(W), @intCast(H), &dl, null, lens_socket.seatedAccent(feed_t), 0, 0, null, feed_t, .{}, &fh, reply_t, .{}, &rh, zone_t, .{}, &zh, false, false, null, &.{}, "", false, false, null, null, &.{}, .{ .step = .landing, .answers = .{}, .config = discover.DEFAULT_CONFIG, .name = "", .color = 0 }, .{}, .{ .cards = &.{}, .text = "", .seated = 0 }, .{}, null);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_loadout.ppm");
     std.debug.print("wrote /tmp/zat_loadout.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
+
+    // PHASE 2b — the loadout page at PHONE width (430) with a top safe-area inset
+    // and a POPULATED library: proves the phone rework — the "Algorithms" title
+    // sits BELOW the status-bar inset, and "YOUR LIBRARY" flows full-width in the
+    // scroll body beneath the three sockets (it doesn't fit as a right shelf here).
+    // The feed tray stands in as the library. Rendered into the left phone column.
+    @memset(fb.pixels, clear);
+    dl.len = 0;
+    try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
+    _ = try feed_view.layoutLoadout(gpa, &engine, 430, @intCast(H), &dl, null, lens_socket.seatedAccent(feed_t), 0, 0, null, feed_t, .{}, &fh, reply_t, .{}, &rh, zone_t, .{}, &zh, false, false, null, &.{}, "", false, false, null, null, &.{}, .{ .step = .landing, .answers = .{}, .config = discover.DEFAULT_CONFIG, .name = "", .color = 0 }, .{}, feed_t, .{ .top = 48 }, null);
+    try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+    try writePpm(io, gpa, &fb, "/tmp/zat_loadout_phone.ppm");
+    std.debug.print("wrote /tmp/zat_loadout_phone.ppm (430x{d}, {d} items)\n", .{ H, dl.len });
+
+    // PHASE 2b2 — the CREATE tab at phone width with a top inset: proves the
+    // sub-tab content starts BELOW the inset-grown sticky header (the hardcoded
+    // 140 used to leave "Your feed, your rules" ghosting under the veil).
+    @memset(fb.pixels, clear);
+    dl.len = 0;
+    _ = try feed_view.layoutLoadout(gpa, &engine, 430, @intCast(H), &dl, null, lens_socket.seatedAccent(feed_t), 0, 2, null, feed_t, .{}, &fh, reply_t, .{}, &rh, zone_t, .{}, &zh, false, false, null, &.{}, "", false, false, null, null, &.{}, .{ .step = .landing, .answers = .{}, .config = discover.DEFAULT_CONFIG, .name = "", .color = 0 }, .{}, feed_t, .{ .top = 48 }, null);
+    try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+    try writePpm(io, gpa, &fb, "/tmp/zat_create_phone.ppm");
+    std.debug.print("wrote /tmp/zat_create_phone.ppm (430x{d}, {d} items)\n", .{ H, dl.len });
+
+    // PHASE 2c — the cartridge DETAIL sheet (item 5) OVER the phone loadout: the
+    // scrim dims the page behind, the panel shows the lens info + the roomy colour
+    // picker. Drawn onto the same draw list (not cleared) so the dim reads real.
+    var dh: lens_socket.HitList = .empty;
+    defer dh.deinit(gpa);
+    const dcard = feed_t.cards[@min(feed_t.seated, feed_t.cards.len - 1)];
+    try lens_socket.drawDetail(gpa, &dl, &engine, dcard, feed_t.text, 430, @intCast(H), 48, &dh);
+    try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+    try writePpm(io, gpa, &fb, "/tmp/zat_cart_detail.ppm");
+    std.debug.print("wrote /tmp/zat_cart_detail.ppm (430x{d}, {d} items)\n", .{ H, dl.len });
 
     // ── THE ENROLLMENT SURFACE — the calm card over a DETUNED field ──
     // A wispier field: bigger cells (wider spacing), lower ambient, smaller
