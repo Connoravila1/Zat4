@@ -2980,7 +2980,16 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             m.fling_v = 0; // the spring owns the return; no glide underneath
                         }
                         // A scroll release KEEPS m.fling_v — the glide below
-                        // takes over from the sampled velocity.
+                        // takes over from the sampled velocity. FLICK LAUNCH: a
+                        // release throws the glide FASTER than the finger's last
+                        // speed so a quick flick ramps up and carries. The boost
+                        // is multiplicative (a slow release is barely affected)
+                        // and clamped so a hard flick stays controllable.
+                        if (m.over_px == 0 and @abs(m.fling_v) > 0.5) {
+                            const flick_boost: f32 = 2.1;
+                            const flick_v_max: f32 = 240.0; // logical px/frame ceiling
+                            m.fling_v = std.math.clamp(m.fling_v * flick_boost, -flick_v_max, flick_v_max);
+                        }
                         m.down_x = -1;
                         m.down_y = -1;
                         m.scrolling = false;
@@ -2995,7 +3004,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 // every quarter second; rest below half a pixel. A glide that
                 // reaches an edge no longer dies there — it hands its speed
                 // to the bounce spring (roadmap §2.3/§3: no hard walls).
-                const fling_friction: f32 = 0.955;
+                const fling_friction: f32 = 0.966; // softer decay → the flick carries further
                 const fling_rest: f32 = 0.5;
                 if (m.scrolling or m.down_x >= 0) {
                     m.fling_v = m.fling_v * 0.6 + frame_dy * 0.4;
