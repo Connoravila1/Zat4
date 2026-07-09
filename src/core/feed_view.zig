@@ -1617,6 +1617,18 @@ pub const tab_bar_h: i32 = 76;
 /// after ANY screen's layout on a phone-width surface (B5: plain values in,
 /// draw list + regions out). `skip_nav` mirrors drawRail: the GPU draws the
 /// nav icons itself; the software path gets the line-art.
+/// The floating compose FAB's on-screen box (phone only) in LOGICAL px — the
+/// ONE source of truth for its geometry, shared by drawTabBar (which paints it)
+/// and the GPU engagement passes (which must skip any icon that scrolls behind
+/// it, since it sits ABOVE the tab bar and the bottom clip doesn't catch it).
+pub fn composeFabBox(width: i32, height: i32, bottom_inset: i32) struct { x0: i32, y0: i32, x1: i32, y1: i32 } {
+    const fab_r: i32 = 27;
+    const by = height - tab_bar_h - bottom_inset;
+    const fab_cx = width - 26 - fab_r;
+    const fab_cy = by - 22 - fab_r;
+    return .{ .x0 = fab_cx - fab_r, .y0 = fab_cy - fab_r, .x1 = fab_cx + fab_r, .y1 = fab_cy + fab_r };
+}
+
 pub fn drawTabBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, width: i32, height: i32, bottom_inset: i32, active: u8, regions: ?*Regions, accent: u32, skip_nav: bool) error{OutOfMemory}!void {
     const by = height - tab_bar_h - bottom_inset;
     // The feed dies out under the bar ("scrims keep chrome legible"), then
@@ -1645,16 +1657,20 @@ pub fn drawTabBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, w
         switch (slot) {
             .nav => |idx| {
                 const on = idx == active;
-                if (on) try rect(gpa, dl, cx - 26, icon_cy - 24, 52, 48, (0x22 << 24) | (accent & 0x00FFFFFF), 14);
-                if (!skip_nav) try navIcon(idx, gpa, dl, cx - 11, icon_cy - 11, 22, if (on) accent else muted);
-                try emitRegion(gpa, regions, cx - 21, icon_cy - 19, 42, 42, idx, .nav);
+                // Bigger tap targets + icons (the 22px line-art read too small on
+                // phone). Icon 28 box centred on (cx, icon_cy); hit region 52×52.
+                // The GPU SDF nav pass (drawSdfIcons) keys off this 52-tall region
+                // to re-derive the same centre (r.x+26, r.y+24) — keep them in sync.
+                if (on) try rect(gpa, dl, cx - 28, icon_cy - 26, 56, 52, (0x22 << 24) | (accent & 0x00FFFFFF), 15);
+                if (!skip_nav) try navIcon(idx, gpa, dl, cx - 14, icon_cy - 14, 28, if (on) accent else muted);
+                try emitRegion(gpa, regions, cx - 26, icon_cy - 24, 52, 52, idx, .nav);
             },
             .you => {
                 const on = active == screen_profile;
-                if (on) try rect(gpa, dl, cx - 26, icon_cy - 24, 52, 48, (0x22 << 24) | (accent & 0x00FFFFFF), 14);
-                try rect(gpa, dl, cx - 19, icon_cy - 19, 38, 38, 0xFF3F3B2D, 19);
-                _ = try str(gpa, dl, e, .semibold, cx - 5, icon_cy + 6, if (on) accent else ink, 14, "y");
-                try emitRegion(gpa, regions, cx - 21, icon_cy - 21, 42, 42, screen_profile, .nav);
+                if (on) try rect(gpa, dl, cx - 28, icon_cy - 26, 56, 52, (0x22 << 24) | (accent & 0x00FFFFFF), 15);
+                try rect(gpa, dl, cx - 22, icon_cy - 22, 44, 44, 0xFF3F3B2D, 22);
+                _ = try str(gpa, dl, e, .semibold, cx - 6, icon_cy + 7, if (on) accent else ink, 16, "y");
+                try emitRegion(gpa, regions, cx - 26, icon_cy - 24, 52, 52, screen_profile, .nav);
             },
         }
     }
@@ -1662,8 +1678,9 @@ pub fn drawTabBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, w
     // above the bar at the right, distinct from the five nav tabs — posting
     // lives here now that the centre tab is Zat Chat.
     const fab_r: i32 = 27;
-    const fab_cx = width - 26 - fab_r;
-    const fab_cy = by - 22 - fab_r;
+    const fab_box = composeFabBox(width, height, bottom_inset);
+    const fab_cx = fab_box.x0 + fab_r;
+    const fab_cy = fab_box.y0 + fab_r;
     try rect(gpa, dl, fab_cx - fab_r, fab_cy - fab_r + 3, fab_r * 2, fab_r * 2, 0x38000000, @intCast(fab_r)); // soft drop shadow so it lifts off the feed
     try rect(gpa, dl, fab_cx - fab_r, fab_cy - fab_r, fab_r * 2, fab_r * 2, accent, @intCast(fab_r));
     try rect(gpa, dl, fab_cx - 12, fab_cy - 2, 24, 4, bg, 2);
@@ -2151,7 +2168,9 @@ pub fn layout(
     const max_levels: i32 = 7; // cap the indent so a deep thread can't run off-column
     const init_px: u16 = if (is_thread) 17 else 22;
     const av_base: i32 = @divTrunc(av * 2, 3) + 1; // avatar-initial baseline within the disc
-    const body_line: i32 = @max(23, @as(i32, @intCast(text.lineMetrics(e, .regular, 16).height)));
+    // Main post body at px 17 (one notch up from 16); line height scaled with it
+    // (~px*1.4). Measure + paint pass MUST pass the identical px + body_line below.
+    const body_line: i32 = @max(24, @as(i32, @intCast(text.lineMetrics(e, .regular, 17).height)));
 
     // THE REPLY SOCKET (thread screen). It sits after the root + the author's
     // leading self-thread run (consecutive posts by the root author), before
@@ -2326,7 +2345,7 @@ pub fn layout(
             body_end = post_top + adv;
         } else {
             var body_ovf = false;
-            const raw = try wrapBodyLimited(gpa, dl, e, cx, post_top + body_top_off, content_w, body_c, 16, p.body, body_line, false, null, clamp_lines, &body_ovf);
+            const raw = try wrapBodyLimited(gpa, dl, e, cx, post_top + body_top_off, content_w, body_c, 17, p.body, body_line, false, null, clamp_lines, &body_ovf);
             body_end = raw + (if (body_ovf) more_line_h else 0);
             if (heights) |hh| if (pi < hh.len) {
                 hh[pi] = body_end - post_top;
@@ -2468,7 +2487,7 @@ pub fn layout(
             const body_from = dl.len;
             const body_style: BodyTags = .{ .color = tag_blue, .regions = regions, .pi = pi, .tags = p.tags };
             var paint_ovf = false;
-            const paint_baseline = try wrapBodyLimited(gpa, dl, e, cx, post_top + body_top_off, content_w, body_c, 16, p.body, body_line, true, &body_style, clamp_lines, &paint_ovf);
+            const paint_baseline = try wrapBodyLimited(gpa, dl, e, cx, post_top + body_top_off, content_w, body_c, 17, p.body, body_line, true, &body_style, clamp_lines, &paint_ovf);
             // "Read more" doorway (main feed, clamped body): an accent line under
             // the clamped text; its `.expand` region is emitted AFTER the whole-post
             // `.post_body` region, so the reverse hit-test lets it win — a tap

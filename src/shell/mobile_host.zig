@@ -80,6 +80,10 @@ pub const MobileHost = struct {
     /// PRECEDENCE over the nav-drawer swipe: a horizontal drag that starts on the
     /// socket swaps cartridges and never opens the drawer (owner's rule).
     socket_swipe: bool = false,
+    /// Which surface's socket the swipe started on, so release cycles the RIGHT
+    /// seated cartridge: 0 = home feed, 1 = reply/thread, 2 = zone masthead.
+    /// Only meaningful while `socket_swipe` is true.
+    socket_swipe_surface: u8 = 0,
     drag_y: i32 = -1,
     /// Soft-keyboard bytes from the seam (the terminal vocabulary: UTF-8
     /// text, 0x08 backspace, '\r' enter) — drained into the pump's byte

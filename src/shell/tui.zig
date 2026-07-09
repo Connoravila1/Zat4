@@ -2425,9 +2425,17 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
         // Advance the seat animation one step per painted frame, resetting at
         // the end of the swap (the field animates continuously, so frames
         // flow). The widget maps swap_phase→geometry purely (B4).
-        if (rs.gsocket_ui.swap_phase > 0) {
-            rs.gsocket_ui.swap_phase +|= 1;
-            if (rs.gsocket_ui.swap_phase > lens_socket.swap_total_frames) rs.gsocket_ui.swap_phase = 0;
+        // Advance every surface's swap (home / reply / zone) — a swipe can now
+        // re-seat any of them, so each needs its clock advanced. swap_dir resets
+        // with swap_phase so the next TAP re-seat falls back to the vertical eject.
+        for ([_]*lens_socket.SocketUi{ &rs.gsocket_ui, &rs.reply_ui, &rs.zone_ui }) |sui| {
+            if (sui.swap_phase > 0) {
+                sui.swap_phase +|= 1;
+                if (sui.swap_phase > lens_socket.swap_total_frames) {
+                    sui.swap_phase = 0;
+                    sui.swap_dir = 0;
+                }
+            }
         }
         // Spring-open: ease each switcher socket's open progress toward its open
         // state. The widget sweeps the tray + reveals cards by this (page sockets
@@ -2861,18 +2869,46 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             if (ady > touch_slop and ady >= adx) {
                                 m.scrolling = true;
                             } else if (adx > touch_slop and adx > ady) blk: {
-                                // A horizontal swipe that STARTED on the closed home
-                                // socket swaps the seated cartridge and takes
-                                // PRECEDENCE over the nav-drawer swipe — the drawer
-                                // never comes out from a socket swipe.
-                                if (rs.gpu_state) |*gsd| {
+                                // A horizontal swipe that STARTED on the active
+                                // surface's CLOSED socket swaps the seated cartridge
+                                // and takes PRECEDENCE over the nav-drawer swipe — the
+                                // drawer never comes out from a socket swipe. Works on
+                                // ALL THREE sockets (home / reply / zone): the active
+                                // socket's hit list carries its on-screen rects (in
+                                // logical px, rebuilt each frame — the previous frame's
+                                // are valid here), so hitBounds gives the bar box no
+                                // matter where that socket sits (fixed / inline / masthead).
+                                {
                                     const dlx: i32 = @intFromFloat(@as(f32, @floatFromInt(m.down_x)) / scale);
                                     const dly: i32 = @intFromFloat(@as(f32, @floatFromInt(m.down_y)) / scale);
-                                    if (rs.gscreen == feed_view.screen_home and !rs.gsocket_ui.open and
-                                        feed_view.homeSocketHit(@intCast(gsd.design_w), home_tray, rs.gsocket_ui, gsd.inset_top_l, dlx, dly))
-                                    {
-                                        m.socket_swipe = true;
-                                        break :blk;
+                                    const surf: u8 = if (rs.gscreen == feed_view.screen_thread)
+                                        1
+                                    else if (rs.gscreen == feed_view.screen_zones)
+                                        2
+                                    else if (rs.gscreen == feed_view.screen_home)
+                                        0
+                                    else
+                                        255; // no socket surface on this screen
+                                    if (surf != 255) {
+                                        const sock_ui = switch (surf) {
+                                            1 => rs.reply_ui,
+                                            2 => rs.zone_ui,
+                                            else => rs.gsocket_ui,
+                                        };
+                                        const sock_hits = switch (surf) {
+                                            1 => rs.reply_hits,
+                                            2 => rs.zone_hits,
+                                            else => rs.gsocket_hits,
+                                        };
+                                        if (!sock_ui.open) {
+                                            if (lens_socket.hitBounds(sock_hits.items)) |b| {
+                                                if (dlx >= b.x0 and dlx <= b.x1 and dly >= b.y0 and dly <= b.y1) {
+                                                    m.socket_swipe = true;
+                                                    m.socket_swipe_surface = surf;
+                                                    break :blk;
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 m.hswipe = true;
@@ -2969,23 +3005,44 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             // A socket swipe cycles the seated cartridge on release
                             // if it travelled past the threshold: swipe LEFT → next,
                             // RIGHT → previous, wrapping. Same re-seat the tap path
-                            // does (swap animation + re-rank + scroll to top).
+                            // does, but the swap slides HORIZONTALLY along the swipe
+                            // (swap_dir). Cycles the surface the swipe started on.
                             const dx = @as(i32, tev.x) - m.down_x;
-                            const count: i32 = @intCast(rs.socket_cards.len);
+                            const surf = m.socket_swipe_surface;
+                            const seated_ptr: *u32 = switch (surf) {
+                                1 => &rs.reply_seated,
+                                2 => &rs.zone_seated,
+                                else => &rs.gseated,
+                            };
+                            const sock_ui: *lens_socket.SocketUi = switch (surf) {
+                                1 => &rs.reply_ui,
+                                2 => &rs.zone_ui,
+                                else => &rs.gsocket_ui,
+                            };
+                            const count: i32 = switch (surf) {
+                                1 => @intCast(rs.reply_cards.len),
+                                2 => @intCast(rs.zone_cards.len),
+                                else => @intCast(rs.socket_cards.len),
+                            };
                             if (count > 1 and @abs(dx) > 55) {
                                 const delta: i32 = if (dx < 0) 1 else -1;
-                                const ni: u32 = @intCast(@mod(@as(i32, @intCast(rs.gseated)) + delta + count, count));
-                                if (ni != rs.gseated) {
-                                    rs.gsocket_ui.swap_from = rs.gseated;
-                                    rs.gsocket_ui.swap_to = ni;
-                                    rs.gsocket_ui.swap_phase = 1;
-                                    rs.gseated = ni;
-                                    rs.gscroll_px = 0;
+                                const ni: u32 = @intCast(@mod(@as(i32, @intCast(seated_ptr.*)) + delta + count, count));
+                                if (ni != seated_ptr.*) {
+                                    sock_ui.swap_from = seated_ptr.*;
+                                    sock_ui.swap_to = ni;
+                                    sock_ui.swap_phase = 1;
+                                    sock_ui.swap_dir = if (dx < 0) -1 else 1; // slide the cartridge along the swipe
+                                    seated_ptr.* = ni;
+                                    // The home feed re-ranks + scrolls to top on re-seat;
+                                    // the inline reply/zone sockets keep the scroll position
+                                    // (they re-rank in place, no jump).
+                                    if (surf == 0) rs.gscroll_px = 0;
                                     rs.loadout_dirty = true;
                                     m.haptic_pending = 2; // the swap latches under the finger
                                 }
                             }
                             m.socket_swipe = false;
+                            m.socket_swipe_surface = 0;
                         } else if (m.hswipe) {
                             // Release: the settle DECISION comes from where
                             // momentum would land (projection, roadmap §2.2),
@@ -3506,6 +3563,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                                 rs.gsocket_ui.swap_from = rs.gseated;
                                                 rs.gsocket_ui.swap_to = ni;
                                                 rs.gsocket_ui.swap_phase = 1;
+                                                rs.gsocket_ui.swap_dir = 0; // a tap ejects vertically (not a swipe)
                                                 rs.gseated = ni;
                                                 // Seat = re-rank now, scroll to top (owner decision
                                                 // 2026-06-22). The visible gesture today; the actual
@@ -10376,23 +10434,36 @@ fn drawSdfIcons(g: Grid, gs: *GpuState, items: []const feed_core.TimelineItem, v
             return c < top or c > bot;
         }
     }.f;
+    // The compose FAB floats ABOVE the tab bar, so bottom_clip doesn't catch a
+    // post's rightmost engagement icons as they scroll behind it — skip any icon
+    // whose LOGICAL centre lands in the FAB box (phone only; the FAB is phone-only).
+    const fab = feed_view.composeFabBox(@intCast(gs.design_w), logical_h, gs.inset_bottom_l);
+    const inFab = struct {
+        fn f(b: @TypeOf(fab), on: bool, px: i32, py: i32) bool {
+            return on and px >= b.x0 and px <= b.x1 and py >= b.y0 and py <= b.y1;
+        }
+    }.f;
     for (g.regions.items) |r| {
         if (drawer_open and !(r.kind == .nav and r.w > 100)) continue;
         const cy = (@as(f32, @floatFromInt(r.y)) + @as(f32, @floatFromInt(r.h)) * 0.5) * scale;
+        const cyl = @as(i32, r.y) + @divTrunc(@as(i32, r.h), 2); // logical centre y
         switch (r.kind) {
             // LEFT engagement group — the icon sits at region.x + is/2 (8.5).
             .reply => {
                 if (clipped(r, hb_eff, bottom_clip)) continue;
+                if (inFab(fab, is_phone, @as(i32, r.x) + 8, cyl)) continue;
                 gpu.drawIcon(&gs.icon, gpu.icon_reply, (@as(f32, @floatFromInt(r.x)) + 8.5) * scale, cy, eng, grey, vw, vh);
             },
             .repost => {
                 if (clipped(r, hb_eff, bottom_clip) or r.post >= items.len) continue;
+                if (inFab(fab, is_phone, @as(i32, r.x) + 8, cyl)) continue;
                 const col = if (items[r.post].item_flags.viewer_reposted) green else grey;
                 gpu.drawIcon(&gs.icon, gpu.icon_repost, (@as(f32, @floatFromInt(r.x)) + 8.5) * scale, cy, eng, col, vw, vh);
             },
             // RIGHT engagement group — the icon centres in its (narrower) region.
             .bookmark, .share, .more => {
                 if (clipped(r, hb_eff, bottom_clip)) continue;
+                if (inFab(fab, is_phone, @as(i32, r.x) + @divTrunc(@as(i32, r.w), 2), cyl)) continue;
                 const cx = (@as(f32, @floatFromInt(r.x)) + @as(f32, @floatFromInt(r.w)) * 0.5) * scale;
                 const id: i32 = switch (r.kind) {
                     .bookmark => gpu.icon_bookmark,
@@ -10415,10 +10486,17 @@ fn drawSdfIcons(g: Grid, gs: *GpuState, items: []const feed_core.TimelineItem, v
                     5 => gpu.icon_gear, // Settings
                     else => continue, // the "you" card (post 7) is an avatar, not an icon
                 };
-                const cx = (@as(f32, @floatFromInt(r.x)) + 21.0) * scale;
-                const ncy = (@as(f32, @floatFromInt(r.y)) + 19.0) * scale;
+                // The phone TAB BAR emits a taller 52px nav region (drawTabBar) and
+                // its bigger 28px icon centres at (r.x+26, r.y+24); the rail/drawer
+                // keep the 42px region with the 22px icon centred at (r.x+21,r.y+19).
+                const tabbar = r.h >= 50;
+                const off_x: f32 = if (tabbar) 26.0 else 21.0;
+                const off_y: f32 = if (tabbar) 24.0 else 19.0;
+                const half: f32 = if (tabbar) 14.0 * scale else nav;
+                const cx = (@as(f32, @floatFromInt(r.x)) + off_x) * scale;
+                const ncy = (@as(f32, @floatFromInt(r.y)) + off_y) * scale;
                 const col: u32 = if (@as(u16, g.screen.*) == r.post) g.accent else muted;
-                gpu.drawIcon(&gs.icon, id, cx, ncy, nav, col, vw, vh);
+                gpu.drawIcon(&gs.icon, id, cx, ncy, half, col, vw, vh);
             },
             else => {},
         }
@@ -10486,10 +10564,15 @@ fn drawEngagementHearts(g: Grid, gs: *GpuState, items: []const feed_core.Timelin
     const is_phone = gs.design_w <= feed_view.phone_max;
     const logical_h: i32 = @intFromFloat(@as(f32, @floatFromInt(vh)) / scale);
     const bottom_clip: i32 = if (is_phone) logical_h - feed_view.tab_bar_h - gs.inset_bottom_l else std.math.maxInt(i32);
+    // Skip a heart that scrolls behind the floating compose FAB (above the bar,
+    // so bottom_clip misses it). Phone only. Same box source as drawSdfIcons.
+    const fab = feed_view.composeFabBox(@intCast(gs.design_w), logical_h, gs.inset_bottom_l);
     for (g.regions.items) |r| {
         if (r.kind != .like or r.post >= items.len) continue;
         const row_c = @as(i32, r.y) + @divTrunc(@as(i32, r.h), 2);
         if (row_c < hb_eff or row_c > bottom_clip) continue;
+        const heart_cx = @as(i32, r.x) + 8; // logical heart centre
+        if (is_phone and heart_cx >= fab.x0 and heart_cx <= fab.x1 and row_c >= fab.y0 and row_c <= fab.y1) continue;
         const liked = items[r.post].item_flags.viewer_liked;
         // Heart centre: the region starts at the heart's left edge; the icon box
         // is 16 logical wide, so the heart centres 8 in. Vertical centre of the

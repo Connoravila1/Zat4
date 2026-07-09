@@ -190,6 +190,11 @@ pub const SocketUi = struct {
     swap_phase: u8 = 0, // 0 = resting; 1..N = eject/seat animation (L.2)
     swap_from: u32 = 0,
     swap_to: u32 = 0,
+    /// Direction of a swipe-driven swap: 0 = the default VERTICAL eject (taps),
+    /// -1 = slide the cartridge out to the LEFT (incoming from the right),
+    /// +1 = slide out to the RIGHT. Set by the shell's socket-swipe release so
+    /// the swap animates along the swipe axis. (SocketUi is A7.2 cold-waived.)
+    swap_dir: i8 = 0,
     drag_active: ?u32 = null, // card being dragged/settling, or null (E4)
     drag_x: i32 = 0, // live pointer (logical) while dragging — the ghost follows it
     drag_y: i32 = 0,
@@ -489,21 +494,31 @@ pub fn build(
     // displayed lens is `swap_from` while ejecting, `swap_to` while it
     // plugs in — so the content swaps WHILE off-screen (the HTML's trick).
     var disp_idx = tray.seated;
-    var cart_dy: i32 = 0; // vertical offset of the cartridge during the swap
+    var cart_dx: i32 = 0; // horizontal offset during a swipe-driven (directional) swap
+    var cart_dy: i32 = 0; // vertical offset of the cartridge during a tap swap
     var cart_alpha: u8 = 255; // cartridge fade
     var glow: u8 = 0; // seat-glow halo intensity (the "click home" cue)
     if (ui.swap_phase > 0) {
         const seg: u8 = swap_total_frames / 3; // eject | drop | glow
         const p = @min(ui.swap_phase, swap_total_frames);
-        if (p <= seg) { // eject: old lens lifts and fades out
+        // A swipe sets swap_dir (±1): the cartridge slides HORIZONTALLY along the
+        // swipe axis instead of the vertical tap eject — old lens exits toward
+        // swap_dir, new lens enters from the opposite side, same 3-segment timeline.
+        const horiz = ui.swap_dir != 0;
+        const dir: f32 = @floatFromInt(ui.swap_dir);
+        const slide = 46.0; // logical px the cartridge travels off/in horizontally
+        if (p <= seg) { // eject: old lens leaves (up, or out toward the swipe side) + fades
             disp_idx = ui.swap_from;
             const u = @as(f32, @floatFromInt(p)) / @as(f32, @floatFromInt(seg));
-            cart_dy = fxi(-10 * u * sc);
+            if (horiz) cart_dx = fxi(dir * slide * u * sc) else cart_dy = fxi(-10 * u * sc);
             cart_alpha = @intCast(@max(0, 255 - fxi(255 * u)));
-        } else if (p <= seg * 2) { // drop-in: new lens descends, fades in, glow rises
+        } else if (p <= seg * 2) { // drop-in: new lens arrives (down, or in from the far side), fades in, glow rises
             disp_idx = ui.swap_to;
             const u = @as(f32, @floatFromInt(p - seg)) / @as(f32, @floatFromInt(seg));
-            cart_dy = fxi(14 * (1 - easeOutBack(u)) * sc); // springs into the slot (slight overshoot)
+            if (horiz)
+                cart_dx = fxi(-dir * slide * (1 - easeOutBack(u)) * sc) // enters from the opposite side, slight overshoot
+            else
+                cart_dy = fxi(14 * (1 - easeOutBack(u)) * sc); // springs into the slot (slight overshoot)
             cart_alpha = @intCast(@min(255, fxi(255 * u)));
             glow = @intCast(@min(255, fxi(255 * u)));
         } else { // settle: cartridge home, seat-glow decays
@@ -540,7 +555,8 @@ pub fn build(
     // ---- the cartridge (the seated lens, tinted its palette color) ----
     // `dy`/`a` carry the seat animation: the whole cartridge slides + fades
     // as one. The socket panel, rails, count, and chevron below stay put.
-    const cart_x = x0 + pad;
+    const cart_x_base = x0 + pad; // static home (the seat-glow anchors here)
+    const cart_x = cart_x_base + cart_dx; // rides the horizontal swipe slide
     const cart_y = y0 + fxi(10 * sc) + cart_dy;
     const cart_h = sock_h - fxi(20 * sc);
     const count_w = fxi(96 * sc); // reserve room for "N in tray" + chevron
@@ -551,7 +567,7 @@ pub fn build(
     // home and decaying — the "click home" cue (§6). Drawn first, beneath.
     if (glow > 0) {
         const g = fxi(4 * sc);
-        try rect(gpa, dl, cart_x - g, y0 + fxi(10 * sc) - g, cart_w + g * 2, cart_h + g * 2, soft(acc, @intCast(glow / 3)), cart_radius + @as(u8, @intCast(@max(0, g))));
+        try rect(gpa, dl, cart_x_base - g, y0 + fxi(10 * sc) - g, cart_w + g * 2, cart_h + g * 2, soft(acc, @intCast(glow / 3)), cart_radius + @as(u8, @intCast(@max(0, g))));
     }
 
     try rect(gpa, dl, cart_x, cart_y, cart_w, cart_h, alphaScale(soft(acc, 0x24), a), cart_radius);
@@ -941,6 +957,30 @@ pub fn dropIndex(tray: TrayView, ui: SocketUi, geom: Geometry) ?u32 {
         if (ui.drag_x >= p[0] and ui.drag_x < p[0] + card_w and ui.drag_y >= p[1] and ui.drag_y < p[1] + card_h) return @intCast(j);
     }
     return null;
+}
+
+/// CORE, PURE. The bounding box (logical px) of a socket's hit rects for the
+/// frame — the union of every rect. Null when the list is empty. The shell uses
+/// it to test "did this swipe start on the socket?" for ANY surface's socket
+/// (home/reply/zone) without knowing each socket's on-screen geometry: the hit
+/// list already carries the rects the socket rendered at this frame.
+pub fn hitBounds(hits: []const HitRect) ?struct { x0: i32, y0: i32, x1: i32, y1: i32 } {
+    if (hits.len == 0) return null;
+    var x0: i32 = std.math.maxInt(i32);
+    var y0: i32 = std.math.maxInt(i32);
+    var x1: i32 = std.math.minInt(i32);
+    var y1: i32 = std.math.minInt(i32);
+    for (hits) |r| {
+        const rx0: i32 = r.x;
+        const ry0: i32 = r.y;
+        const rx1: i32 = @as(i32, r.x) + r.w;
+        const ry1: i32 = @as(i32, r.y) + r.h;
+        if (rx0 < x0) x0 = rx0;
+        if (ry0 < y0) y0 = ry0;
+        if (rx1 > x1) x1 = rx1;
+        if (ry1 > y1) y1 = ry1;
+    }
+    return .{ .x0 = x0, .y0 = y0, .x1 = x1, .y1 = y1 };
 }
 
 /// CORE, PURE. Maps a click point to an intent from `hits` alone — no
