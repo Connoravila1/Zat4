@@ -75,6 +75,11 @@ pub const MobileHost = struct {
     /// halfway rule.
     hswipe: bool = false,
     hswipe_base: f32 = 0,
+    /// This press committed to a socket SWIPE (cycle the seated cartridge on the
+    /// closed home socket) — mutually exclusive with hswipe/scrolling. It takes
+    /// PRECEDENCE over the nav-drawer swipe: a horizontal drag that starts on the
+    /// socket swaps cartridges and never opens the drawer (owner's rule).
+    socket_swipe: bool = false,
     drag_y: i32 = -1,
     /// Soft-keyboard bytes from the seam (the terminal vocabulary: UTF-8
     /// text, 0x08 backspace, '\r' enter) — drained into the pump's byte

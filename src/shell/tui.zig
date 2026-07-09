@@ -2831,6 +2831,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         m.drag_y = tev.y;
                         m.fling_v = 0; // a touch catches the gliding feed (interruptible)
                         m.scroll_carry = 0; // fresh gesture: no stale sub-pixel remainder
+                        m.socket_swipe = false;
                         gesture.clear(&m.ring);
                         gesture.push(&m.ring, .{ .x = @as(f32, @floatFromInt(tev.x)) / scale, .y = @as(f32, @floatFromInt(tev.y)) / scale, .t_ms = now_ms });
                         // A touch catches a mid-flight edge bounce too, and
@@ -2854,12 +2855,26 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         // the nav-drawer swipe (resolved on release). One
                         // commitment per press; a committed swipe never
                         // scrolls the feed under the moving finger.
-                        if (!m.scrolling and !m.hswipe) {
+                        if (!m.scrolling and !m.hswipe and !m.socket_swipe) {
                             const adx = @abs(@as(i32, tev.x) - m.down_x);
                             const ady = @abs(@as(i32, tev.y) - m.down_y);
                             if (ady > touch_slop and ady >= adx) {
                                 m.scrolling = true;
-                            } else if (adx > touch_slop and adx > ady) {
+                            } else if (adx > touch_slop and adx > ady) blk: {
+                                // A horizontal swipe that STARTED on the closed home
+                                // socket swaps the seated cartridge and takes
+                                // PRECEDENCE over the nav-drawer swipe — the drawer
+                                // never comes out from a socket swipe.
+                                if (rs.gpu_state) |*gsd| {
+                                    const dlx: i32 = @intFromFloat(@as(f32, @floatFromInt(m.down_x)) / scale);
+                                    const dly: i32 = @intFromFloat(@as(f32, @floatFromInt(m.down_y)) / scale);
+                                    if (rs.gscreen == feed_view.screen_home and !rs.gsocket_ui.open and
+                                        feed_view.homeSocketHit(@intCast(gsd.design_w), home_tray, rs.gsocket_ui, gsd.inset_top_l, dlx, dly))
+                                    {
+                                        m.socket_swipe = true;
+                                        break :blk;
+                                    }
+                                }
                                 m.hswipe = true;
                                 if (rs.gpu_state) |*gsd| {
                                     // Re-grab (§2.4): a settling drawer hands its
@@ -2950,7 +2965,28 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         }
                     },
                     .button_up => {
-                        if (m.hswipe) {
+                        if (m.socket_swipe) {
+                            // A socket swipe cycles the seated cartridge on release
+                            // if it travelled past the threshold: swipe LEFT → next,
+                            // RIGHT → previous, wrapping. Same re-seat the tap path
+                            // does (swap animation + re-rank + scroll to top).
+                            const dx = @as(i32, tev.x) - m.down_x;
+                            const count: i32 = @intCast(rs.socket_cards.len);
+                            if (count > 1 and @abs(dx) > 55) {
+                                const delta: i32 = if (dx < 0) 1 else -1;
+                                const ni: u32 = @intCast(@mod(@as(i32, @intCast(rs.gseated)) + delta + count, count));
+                                if (ni != rs.gseated) {
+                                    rs.gsocket_ui.swap_from = rs.gseated;
+                                    rs.gsocket_ui.swap_to = ni;
+                                    rs.gsocket_ui.swap_phase = 1;
+                                    rs.gseated = ni;
+                                    rs.gscroll_px = 0;
+                                    rs.loadout_dirty = true;
+                                    m.haptic_pending = 2; // the swap latches under the finger
+                                }
+                            }
+                            m.socket_swipe = false;
+                        } else if (m.hswipe) {
                             // Release: the settle DECISION comes from where
                             // momentum would land (projection, roadmap §2.2),
                             // not from where the finger stopped — a small

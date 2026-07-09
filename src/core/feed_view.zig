@@ -645,6 +645,18 @@ pub fn homeSocketGeom(width: i32) lens_socket.Geometry {
     const m = metricsFor(width);
     return .{ .x = m.lx, .y = if (m.wide) socket_y_wide else socket_y_narrow, .w = m.cw, .scale = 1.0 };
 }
+
+/// Does the LOGICAL point (x, y) land on the CLOSED home socket bar? Phone only;
+/// `inset_top` is the safe-area shift the header rides (the socket draws shifted
+/// with it). The shell uses this to give a swipe that starts on the socket
+/// precedence over the nav-drawer swipe.
+pub fn homeSocketHit(width: i32, tray: ?lens_socket.TrayView, ui: lens_socket.SocketUi, inset_top: i32, x: i32, y: i32) bool {
+    if (width > phone_max) return false;
+    const geom = homeSocketGeom(width);
+    const y0 = geom.y + inset_top;
+    const y1 = homeSocketBottom(tray, ui) + inset_top;
+    return x >= geom.x and x < geom.x + geom.w and y >= y0 and y < y1;
+}
 const wide_min: i32 = rail_w + feed_w + side_w + 40; // ~1244
 
 const panel: u32 = 0xFF1B1B1B; // cards/menus: the website's solid grey (#1b1b1b),
