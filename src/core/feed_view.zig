@@ -8009,8 +8009,10 @@ test "layout emits 4 tap regions per post (avatar + 3 engagement); hitTest resol
     };
     const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{}, .{});
     try std.testing.expect(h > 112); // content extends below the top bar
-    // 8 regions per post: body tap + avatar + reply/repost/like + bookmark/share/more.
-    try std.testing.expectEqual(@as(usize, 8), regions.items.len);
+    // 8 post regions (body + avatar + reply/repost/like + bookmark/share/more)
+    // + 2 mobile-header regions (the hamburger drawer-opener and the search
+    // magnifier) = 10.
+    try std.testing.expectEqual(@as(usize, 10), regions.items.len);
 
     var saw_like = false;
     var saw_author = false;
@@ -8416,12 +8418,14 @@ test "profile screen renders the author's posts under a header; other screens st
     try std.testing.expectEqual(@as(usize, 12), regions.items.len);
 
     // A non-Home, non-Profile screen is a titled placeholder: no posts render,
-    // so no tap regions, and the height clamps to the viewport (no post stack).
+    // so no POST regions, and the height clamps to the viewport (no post stack).
+    // On the phone header it still carries the 2 chrome regions (hamburger +
+    // search), so the total is 2, not 0.
     dl.len = 0;
     regions.clearRetainingCapacity();
     const he = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, 2, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{}, .{}); // Activity (a still-bare placeholder)
     try std.testing.expectEqual(@as(i32, 940), he);
-    try std.testing.expectEqual(@as(usize, 0), regions.items.len);
+    try std.testing.expectEqual(@as(usize, 2), regions.items.len);
 
     // The Settings screen is now a master–detail surface (driven by the
     // settings_view table): one tap region per SECTION (left list) plus one per
