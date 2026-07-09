@@ -10322,10 +10322,17 @@ fn drawSdfIcons(g: Grid, gs: *GpuState, items: []const feed_core.TimelineItem, v
     const green: u32 = 0xFF8FD18F; // feed_view.boost_c (reposted)
     const eng: f32 = 9.5 * scale; // engagement icon half-extent
     const nav: f32 = 11.0 * scale; // rail icon half-extent (line-art was 22 box)
-    // Engagement icons scroll under the sticky header; clip them there.
+    // Engagement icons scroll under the sticky header (shifted by the safe-area
+    // top inset on mobile) AND under the bottom tab bar — clip both bands. The
+    // nav tab icons live IN the bar and never call clipped(), so they stay.
+    const hb_eff = header_bottom + gs.inset_top_l;
+    const is_phone = gs.design_w <= feed_view.phone_max;
+    const logical_h: i32 = @intFromFloat(@as(f32, @floatFromInt(vh)) / scale);
+    const bottom_clip: i32 = if (is_phone) logical_h - feed_view.tab_bar_h - gs.inset_bottom_l else std.math.maxInt(i32);
     const clipped = struct {
-        fn f(r: feed_view.Region, hb: i32) bool {
-            return @as(i32, r.y) + @divTrunc(@as(i32, r.h), 2) < hb;
+        fn f(r: feed_view.Region, top: i32, bot: i32) bool {
+            const c = @as(i32, r.y) + @divTrunc(@as(i32, r.h), 2);
+            return c < top or c > bot;
         }
     }.f;
     for (g.regions.items) |r| {
@@ -10334,17 +10341,17 @@ fn drawSdfIcons(g: Grid, gs: *GpuState, items: []const feed_core.TimelineItem, v
         switch (r.kind) {
             // LEFT engagement group — the icon sits at region.x + is/2 (8.5).
             .reply => {
-                if (clipped(r, header_bottom)) continue;
+                if (clipped(r, hb_eff, bottom_clip)) continue;
                 gpu.drawIcon(&gs.icon, gpu.icon_reply, (@as(f32, @floatFromInt(r.x)) + 8.5) * scale, cy, eng, grey, vw, vh);
             },
             .repost => {
-                if (clipped(r, header_bottom) or r.post >= items.len) continue;
+                if (clipped(r, hb_eff, bottom_clip) or r.post >= items.len) continue;
                 const col = if (items[r.post].item_flags.viewer_reposted) green else grey;
                 gpu.drawIcon(&gs.icon, gpu.icon_repost, (@as(f32, @floatFromInt(r.x)) + 8.5) * scale, cy, eng, col, vw, vh);
             },
             // RIGHT engagement group — the icon centres in its (narrower) region.
             .bookmark, .share, .more => {
-                if (clipped(r, header_bottom)) continue;
+                if (clipped(r, hb_eff, bottom_clip)) continue;
                 const cx = (@as(f32, @floatFromInt(r.x)) + @as(f32, @floatFromInt(r.w)) * 0.5) * scale;
                 const id: i32 = switch (r.kind) {
                     .bookmark => gpu.icon_bookmark,
@@ -10430,9 +10437,18 @@ fn drawEngagementHearts(g: Grid, gs: *GpuState, items: []const feed_core.Timelin
         feed_view.zoneSocketBottom(g.socket_tray, g.socket_ui, g.scroll.*, feed_view.paneGeomFor(@intCast(gs.design_w), feed_view.screen_zones).wide)
     else
         feed_view.headerBottom(g.screen.*);
+    // The header (and the post regions) are shifted DOWN by the safe-area top
+    // inset on mobile, so the clip band shifts with them. And the bottom tab bar
+    // now occludes too — clip engagement hearts that scroll under it (the nav
+    // icons live IN the bar and are a separate pass, unaffected).
+    const hb_eff = header_bottom + gs.inset_top_l;
+    const is_phone = gs.design_w <= feed_view.phone_max;
+    const logical_h: i32 = @intFromFloat(@as(f32, @floatFromInt(vh)) / scale);
+    const bottom_clip: i32 = if (is_phone) logical_h - feed_view.tab_bar_h - gs.inset_bottom_l else std.math.maxInt(i32);
     for (g.regions.items) |r| {
         if (r.kind != .like or r.post >= items.len) continue;
-        if (@as(i32, r.y) + @divTrunc(@as(i32, r.h), 2) < header_bottom) continue;
+        const row_c = @as(i32, r.y) + @divTrunc(@as(i32, r.h), 2);
+        if (row_c < hb_eff or row_c > bottom_clip) continue;
         const liked = items[r.post].item_flags.viewer_liked;
         // Heart centre: the region starts at the heart's left edge; the icon box
         // is 16 logical wide, so the heart centres 8 in. Vertical centre of the
