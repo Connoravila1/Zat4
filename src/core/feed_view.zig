@@ -223,7 +223,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, chat_search, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -1707,6 +1707,169 @@ pub fn drawBackHint(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine,
     const y = height - tab_bar_h - bottom_inset - ph - 18;
     try rect(gpa, dl, x, y, pw, ph, 0xF2262620, 20);
     _ = try str(gpa, dl, e, .semibold, x + 22, y + 26, ink, px, msg);
+}
+
+// ---------------------------------------------------------------------------
+// THE ZAT4 KEYBOARD (phone; owner-designed): the app draws its own keys, so
+// typing never touches a third-party IME — keystrokes stay in-process (the
+// privacy story), the composer never fights the system keyboard for space,
+// and the keys wear the house accent (they re-tint with the seated socket).
+// Taps feed the SAME byte stream the system keyboard's fallback feeds; the
+// settings toggle (act_zat_kbd, default ON) swaps back to the system IME.
+// ---------------------------------------------------------------------------
+
+/// Total height of the keyboard panel (logical px), excluding the safe-area
+/// bottom inset it also paints over. The chat composer lifts by this.
+pub const keyboard_h: i32 = 4 * (kbd_key_h + kbd_gap) + 14;
+const kbd_key_h: i32 = 50;
+const kbd_gap: i32 = 7;
+
+/// One key of a row: the unshifted/shifted codepoints (equal when shift is
+/// meaningless) and a width in flex units. `cp == 0` marks a CONTROL key
+/// named by `ctrl`. Comptime layout data — iterated per rebuild, tiny.
+const KbdKey = struct {
+    lo: u16,
+    hi: u16 = 0,
+    w: u8 = 2, // flex units (2 = a letter key)
+    ctrl: u8 = 0, // 1 shift, 2 backspace, 3 page, 4 enter
+
+    comptime {
+        // Budget: 2+2+1+1 = 6, padded to 6 at u16 alignment (A7).
+        assert(@sizeOf(KbdKey) == 6);
+    }
+};
+
+fn kbdChar(lo: u16, hi: u16) KbdKey {
+    return .{ .lo = lo, .hi = hi };
+}
+fn kbdRowStr(comptime low: []const u8, comptime high: []const u8) [low.len]KbdKey {
+    var out: [low.len]KbdKey = undefined;
+    for (low, high, 0..) |l, h, i| out[i] = kbdChar(l, h);
+    return out;
+}
+const kbd_r0 = kbdRowStr("qwertyuiop", "QWERTYUIOP");
+const kbd_r1 = kbdRowStr("asdfghjkl", "ASDFGHJKL");
+const kbd_r2_mid = kbdRowStr("zxcvbnm", "ZXCVBNM");
+const kbd_s0 = kbdRowStr("1234567890", "1234567890");
+const kbd_s1 = kbdRowStr("@#$%&-+()", "@#$%&-+()");
+const kbd_s2_mid = kbdRowStr("*\"':;!?/", "*\"':;!?/");
+
+/// The Zat4 keyboard: an opaque panel over the very bottom (it paints the
+/// safe-area inset too), the accent "circuit" lines across its top and
+/// between rows, and one region per key. Shifted codepoints are emitted at
+/// DRAW time, so the dispatch is a dumb byte writer. Pure (B2).
+pub fn drawKeyboard(
+    gpa: Allocator,
+    dl: *raster.DrawList,
+    e: *const text.Engine,
+    regions: ?*Regions,
+    width: i32,
+    view_h: i32,
+    bottom_inset: i32,
+    accent: u32,
+    shift: bool,
+    page: u8,
+) error{OutOfMemory}!void {
+    const top = view_h - keyboard_h - bottom_inset;
+    // The panel: opaque (nothing ghosts through chrome) with a faint wash.
+    try rect(gpa, dl, 0, top, width, keyboard_h + bottom_inset, bg, 0);
+    try rect(gpa, dl, 0, top, width, keyboard_h + bottom_inset, 0x14FFFFFF, 0);
+    // The accent circuit: a lit top edge and a hairline under each row —
+    // the keys sit in an accent lattice that re-tints with the socket.
+    try rect(gpa, dl, 0, top, width, 2, (0xC8 << 24) | (accent & 0x00FFFFFF), 0);
+    // Swallow every tap on the panel (the bar-blocker pattern): keys win by
+    // being emitted after.
+    try emitRegion(gpa, regions, 0, top, width, @intCast(@min(keyboard_h + bottom_inset, 32767)), 0, .blocker);
+
+    const m: i32 = 6; // outer margin
+    const unit_w = @divTrunc((width - 2 * m) * 100, 20 * 100); // 20 flex units per row, integer-safe
+    _ = unit_w;
+    const row_w = width - 2 * m;
+    var y = top + 8;
+    var row_i: usize = 0;
+    while (row_i < 4) : (row_i += 1) {
+        // Assemble the row: pages 0/1 share the frame — mids swap, the
+        // bottom row is common ([?123/abc][bitcoin][space][enter]).
+        var keys_buf: [12]KbdKey = undefined;
+        var nk: usize = 0;
+        switch (row_i) {
+            0 => {
+                const src = if (page == 0) kbd_r0[0..] else kbd_s0[0..];
+                for (src) |k| {
+                    keys_buf[nk] = k;
+                    nk += 1;
+                }
+            },
+            1 => {
+                const src = if (page == 0) kbd_r1[0..] else kbd_s1[0..];
+                for (src) |k| {
+                    keys_buf[nk] = k;
+                    nk += 1;
+                }
+            },
+            2 => {
+                keys_buf[nk] = .{ .lo = 0, .ctrl = 1, .w = 3 }; // shift
+                nk += 1;
+                const src = if (page == 0) kbd_r2_mid[0..] else kbd_s2_mid[0..];
+                for (src) |k| {
+                    keys_buf[nk] = k;
+                    nk += 1;
+                }
+                keys_buf[nk] = .{ .lo = 0, .ctrl = 2, .w = 3 }; // backspace
+                nk += 1;
+            },
+            else => {
+                keys_buf[nk] = .{ .lo = 0, .ctrl = 3, .w = 3 }; // ?123 / abc
+                nk += 1;
+                keys_buf[nk] = .{ .lo = 0x20BF, .hi = 0x20BF, .w = 2 }; // the bitcoin key
+                nk += 1;
+                keys_buf[nk] = .{ .lo = ' ', .hi = ' ', .w = 10 }; // space
+                nk += 1;
+                keys_buf[nk] = .{ .lo = 0, .ctrl = 4, .w = 3 }; // enter
+                nk += 1;
+            },
+        }
+        const keys = keys_buf[0..nk];
+        var units: i32 = 0;
+        for (keys) |k| units += k.w;
+        const kw_num = row_w - @as(i32, @intCast(nk - 1)) * kbd_gap; // total key width
+        var x = m;
+        for (keys) |k| {
+            const kw = @divTrunc(kw_num * k.w, units);
+            const active_ctrl = (k.ctrl == 1 and shift) or (k.ctrl == 3 and page == 1);
+            const fill: u32 = if (active_ctrl) (0x50 << 24) | (accent & 0x00FFFFFF) else 0x1CFFFFFF;
+            try rect(gpa, dl, x, y, kw, kbd_key_h, fill, 9);
+            // the circuit edge: each key wears a soft accent top line
+            try rect(gpa, dl, x, y, kw, 1, (0x46 << 24) | (accent & 0x00FFFFFF), 9);
+            if (k.ctrl != 0) {
+                const glyph: []const u8 = switch (k.ctrl) {
+                    1 => "\u{21E7}", // shift
+                    2 => "\u{232B}", // backspace
+                    3 => if (page == 0) "?123" else "abc",
+                    else => "\u{23CE}", // enter
+                };
+                const gpx: u16 = if (k.ctrl == 3) 13 else 18;
+                const gw: i32 = @intCast(text.measure(e, .regular, glyph, gpx));
+                _ = try str(gpa, dl, e, .regular, x + @divTrunc(kw - gw, 2), y + 32, ink, gpx, glyph);
+                const kind: Action = switch (k.ctrl) {
+                    1 => .kbd_shift,
+                    2 => .kbd_backspace,
+                    3 => .kbd_page,
+                    else => .kbd_key, // enter emits '\r' through kbd_key
+                };
+                try emitRegion(gpa, regions, x, y, kw, @intCast(kbd_key_h), if (k.ctrl == 4) '\r' else 0, kind);
+            } else {
+                const cp: u16 = if (shift and k.hi != 0) k.hi else k.lo;
+                var gb: [4]u8 = undefined;
+                const gn = std.unicode.utf8Encode(@intCast(cp), &gb) catch 1;
+                const gw: i32 = @intCast(text.measure(e, .regular, gb[0..gn], 19));
+                _ = try str(gpa, dl, e, .regular, x + @divTrunc(kw - gw, 2), y + 33, ink, 19, gb[0..gn]);
+                try emitRegion(gpa, regions, x, y, kw, @intCast(kbd_key_h), cp, .kbd_key);
+            }
+            x += kw + kbd_gap;
+        }
+        y += kbd_key_h + kbd_gap;
+    }
 }
 
 /// The PHONE nav DRAWER (the Bluesky-pattern reference, owner-chosen): a

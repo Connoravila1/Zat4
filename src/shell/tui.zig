@@ -557,6 +557,11 @@ const RunState = struct {
     gchat_q_buf: [64]u8,
     gchat_q_len: usize,
     gchat_q_focus: bool,
+    // The Zat4 keyboard (phone): one-shot shift, letters/symbols page, and
+    // the tapped bytes queued for the next frame's input stream.
+    kbd_shift: bool,
+    kbd_page: u8,
+    kbd_bytes: std.ArrayList(u8),
     // Double-back-to-exit: the deadline (monotonic ns) until which a second
     // system-back at the root minimizes; the nav tile shows the hint pill.
     back_hint_until: u64,
@@ -1097,6 +1102,9 @@ fn initRunState(
     rs.gchat_q_buf = undefined;
     rs.gchat_q_len = 0;
     rs.gchat_q_focus = false;
+    rs.kbd_shift = false;
+    rs.kbd_page = 0;
+    rs.kbd_bytes = .empty;
     rs.gpub_confirm = null;
     rs.gdocs_kind = 0;
     rs.docs_return_screen = feed_view.screen_loadout;
@@ -1507,6 +1515,7 @@ fn deinitRunState(rs: *RunState) void {
     rs.reply_hits.deinit(gpa);
     rs.gsocket_hits.deinit(gpa);
     rs.detail_hits.deinit(gpa);
+    rs.kbd_bytes.deinit(gpa);
     if (rs.zone_blob.len > 0) gpa.free(rs.zone_blob);
     if (rs.zone_cards.len > 0) gpa.free(rs.zone_cards);
     if (rs.reply_blob.len > 0) gpa.free(rs.reply_blob);
@@ -2733,7 +2742,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .market_q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .market_q_focus = rs.gmarket_q_focus, .market_loading = rs.market_loading, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_q = rs.gchat_q_buf[0..rs.gchat_q_len], .chat_q_focus = rs.gchat_q_focus, .chat_q_caret = composeBlinkOn(rs.caret_anchor_ns), .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
+        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .market_q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .market_q_focus = rs.gmarket_q_focus, .market_loading = rs.market_loading, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .kbd_visible = toggleOn(rs.toggle_bits, settings_view.act_zat_kbd) and typingOwnsKeyboard(rs), .kbd_shift = rs.kbd_shift, .kbd_page = rs.kbd_page, .chat_q = rs.gchat_q_buf[0..rs.gchat_q_len], .chat_q_focus = rs.gchat_q_focus, .chat_q_caret = composeBlinkOn(rs.caret_anchor_ns), .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
         switch (rs.mode) {
             .timeline => try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status),
             .compose => {
@@ -2974,6 +2983,16 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         // press as a scroll (no slop, no tap on release) —
                         // the finger owns moving content the instant it
                         // lands, exactly like catching a glide.
+                        // A press that lands ON the Zat4 keyboard types; it must
+                        // never commit to a scroll or drawer swipe underneath.
+                        m.press_in_kbd = false;
+                        if (if (pix) |gv| gv.kbd_visible else false) {
+                            if (rs.gpu_state) |*gsd| {
+                                const kly: i32 = @intFromFloat(@as(f32, @floatFromInt(tev.y)) / gsd.scale);
+                                const klh: i32 = @intFromFloat(@as(f32, @floatFromInt(m.height_px)) / gsd.scale);
+                                if (kly >= klh - feed_view.keyboard_h - @as(i32, @intCast(gsd.inset_bottom_l))) m.press_in_kbd = true;
+                            }
+                        }
                         if (m.bounce_px != 0) {
                             m.over_px = gesture.rubberBandInv(std.math.clamp(m.bounce_px, -(view_h_f - 1), view_h_f - 1), view_h_f);
                             m.bounce_px = 0;
@@ -3009,7 +3028,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         // the nav-drawer swipe (resolved on release). One
                         // commitment per press; a committed swipe never
                         // scrolls the feed under the moving finger.
-                        if (!m.scrolling and !m.hswipe and !m.socket_swipe) {
+                        if (!m.scrolling and !m.hswipe and !m.socket_swipe and !m.press_in_kbd) {
                             const adx = @abs(@as(i32, tev.x) - m.down_x);
                             const ady = @abs(@as(i32, tev.y) - m.down_y);
                             if (ady > touch_slop and ady >= adx) {
@@ -4062,7 +4081,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         // The zones search blurs when a tap lands anywhere but
                         // the field itself (the universal input-blur norm).
                         if (rs.gzones_q_focus and rs.gscreen == feed_view.screen_zones_browse) {
-                            const over_search = if (feed_view.hitTest(g.regions.items, rx, ry)) |sh| sh.kind == .zone_search else false;
+                            const over_search = if (feed_view.hitTest(g.regions.items, rx, ry)) |sh| (sh.kind == .zone_search or kbdRegion(sh.kind)) else false;
                             if (!over_search) rs.gzones_q_focus = false;
                         }
                         // The chat input blurs the same way: a tap anywhere off the
@@ -4071,14 +4090,14 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         // keyboard is driving me nuts", owner 2026-07-09).
                         if (rs.gchat_input_focus and rs.gscreen == feed_view.screen_messages) {
                             const over_composer = if (feed_view.hitTest(g.regions.items, rx, ry)) |sh|
-                                (sh.kind == .chat_input or sh.kind == .chat_send or sh.kind == .pay_open)
+                                (sh.kind == .chat_input or sh.kind == .chat_send or sh.kind == .pay_open or kbdRegion(sh.kind))
                             else
                                 false;
                             if (!over_composer) rs.gchat_input_focus = false;
                         }
                         if (rs.gchat_q_focus and rs.gscreen == feed_view.screen_messages) {
                             const over_q = if (feed_view.hitTest(g.regions.items, rx, ry)) |sh|
-                                sh.kind == .chat_search
+                                (sh.kind == .chat_search or kbdRegion(sh.kind))
                             else
                                 false;
                             if (!over_q) rs.gchat_q_focus = false;
@@ -4629,6 +4648,20 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         .chat_search => if (dev_chat) {
                                             rs.gchat_q_focus = true;
                                         },
+                                        // The Zat4 keyboard: a key tap queues its UTF-8 bytes
+                                        // for the next frame's input stream — the SAME stream
+                                        // the system IME feeds, so every consumer (drafts,
+                                        // searches, the composer) works unchanged. Shift is
+                                        // one-shot, like a phone.
+                                        .kbd_key => {
+                                            var kb: [4]u8 = undefined;
+                                            const kn = std.unicode.utf8Encode(@intCast(hit.post), &kb) catch 0;
+                                            if (kn > 0) rs.kbd_bytes.appendSlice(gpa, kb[0..kn]) catch {};
+                                            rs.kbd_shift = false;
+                                        },
+                                        .kbd_shift => rs.kbd_shift = !rs.kbd_shift,
+                                        .kbd_page => rs.kbd_page ^= 1,
+                                        .kbd_backspace => rs.kbd_bytes.append(gpa, 8) catch {},
                                         .chat_input => if (dev_chat) {
                                             rs.gchat_input_focus = true;
                                             rs.gchat_composing = false;
@@ -5324,6 +5357,12 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
             if (pointer_events.items.len > 0) rs.last_input_nanos = clock_shell.monotonicNanos();
         };
         if (backend != .terminal) {
+            // The Zat4 keyboard's taps from LAST frame join the stream first —
+            // one input path; every downstream consumer is IME-agnostic.
+            if (rs.kbd_bytes.items.len > 0) {
+                pumped_bytes.insertSlice(gpa, 0, rs.kbd_bytes.items) catch {};
+                rs.kbd_bytes.clearRetainingCapacity();
+            }
             n = @min(pumped_bytes.items.len, in_buf.len);
             @memcpy(in_buf[0..n], pumped_bytes.items[0..n]);
         }
@@ -6143,6 +6182,9 @@ pub fn mobileHapticTake(mr: *MobileRun) u8 {
 /// on-device finding: only compose mode ever summoned it). The activity polls
 /// this per lap and shows/hides the IME on the transition.
 pub fn mobileImeWanted(mr: *MobileRun) bool {
+    // The Zat4 keyboard replaces the system IME entirely while enabled — the
+    // settings toggle (Appearance → "Zat4 keyboard") swaps back.
+    if (toggleOn(mr.rs.toggle_bits, settings_view.act_zat_kbd)) return false;
     return typingOwnsKeyboard(&mr.rs);
 }
 
@@ -6674,6 +6716,13 @@ fn benchDragViewOf(rs: *RunState) ?feed_view.BenchDragView {
     if (bi >= rs.algo_lib.records.items.len) return null;
     const rec = rs.algo_lib.records.items[bi];
     return .{ .name = rs.algo_lib.slice(rec.name), .color = rec.color, .x = rs.gbench_drag_x, .y = rs.gbench_drag_y };
+}
+
+
+/// Is this region one of the Zat4 keyboard's? A key tap must never read as a
+/// tap-off (it would blur the very input being typed into).
+fn kbdRegion(k: feed_view.Action) bool {
+    return k == .kbd_key or k == .kbd_shift or k == .kbd_page or k == .kbd_backspace or k == .blocker;
 }
 
 fn composeBlinkOn(anchor_ns: u64) bool {
@@ -8547,6 +8596,10 @@ const Grid = struct {
     /// built per frame in paintFrame from these (queries over the one store).
     chat_store: ?*const chat_core.Store = null,
     chat_sel: ?chat_core.ConvIndex = null,
+    /// The Zat4 keyboard (phone): wants-to-show + one-shot shift + page.
+    kbd_visible: bool = false,
+    kbd_shift: bool = false,
+    kbd_page: u8 = 0,
     /// The chat list-search state (phone): query + focus + caret blink.
     chat_q: []const u8 = "",
     chat_q_focus: bool = false,
@@ -10133,7 +10186,9 @@ fn paintFrameGpu(
         // Phone chat: opening/closing a thread swaps the tab bar in/out.
         ^ (@as(u64, @intFromBool(g.chat_sel != null)) *% 0x6C62_2726_93D2_35B1)
         // The live keyboard inset: the chat composer rides above it.
-        ^ (@as(u64, @intCast(@max(0, gs.ime_bottom_l))) *% 0xE703_7ED1_A0B4_28DB);
+        ^ (@as(u64, @intCast(@max(0, gs.ime_bottom_l))) *% 0xE703_7ED1_A0B4_28DB)
+        // The Zat4 keyboard: visibility, shift, and page redraw the tile.
+        ^ ((@as(u64, @intFromBool(g.kbd_visible)) << 9 | @as(u64, @intFromBool(g.kbd_shift)) << 5 | @as(u64, g.kbd_page)) *% 0xA3B1_95E7_4C29_D6F1);
     // A drag/settle animates the socket every frame (lift, reflow, ghost), so
     // bypass the feed cache while it runs — a brief interaction, and the field
     // already rebuilds every frame anyway.
@@ -10242,7 +10297,7 @@ fn paintFrameGpu(
                 }
             } else |_| {}
             const reflow_t: f32 = if (gs.chat_reflow) |rh| (gs.chat_world.position(rh) orelse 1.0) else 1.0;
-            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t }, xforms, g.chat_recv, .{ .top = @intCast(gs.inset_top_l), .bottom = @intCast(@max(gs.inset_bottom_l, gs.ime_bottom_l)), .left = @intCast(gs.inset_left_l), .right = @intCast(gs.inset_right_l) }, .{ .q = g.chat_q, .focus = g.chat_q_focus, .caret_on = g.chat_q_caret }) catch g.content_h.*;
+            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t }, xforms, g.chat_recv, .{ .top = @intCast(gs.inset_top_l), .bottom = @intCast(@max(gs.inset_bottom_l, @max(gs.ime_bottom_l, if (g.kbd_visible) feed_view.keyboard_h + gs.inset_bottom_l else 0))), .left = @intCast(gs.inset_left_l), .right = @intCast(gs.inset_right_l) }, .{ .q = g.chat_q, .focus = g.chat_q_focus, .caret_on = g.chat_q_caret }) catch g.content_h.*;
         } else if (g.screen.* == feed_view.screen_algo_docs) {
             g.content_h.* = feed_view.layoutAlgoDocs(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, if (g.docs_kind == 1) algo_docs.dev_doc else algo_docs.user_doc) catch g.content_h.*;
         } else if (g.screen.* == feed_view.screen_algo_detail) {
@@ -10576,6 +10631,12 @@ fn paintFrameGpu(
             // The nav DRAWER slides over everything (scrim + panel); its
             // regions land last, so while open it owns the taps.
             feed_view.drawDrawer(gpa, g.draw, g.engine, @intCast(gs.design_w), @intCast(lh), gs.drawer_t, g.screen.*, g.regions, g.accent, g.you_handle, true) catch {};
+            // THE ZAT4 KEYBOARD: drawn in this tile (chrome above content, under
+            // the modal sheets), covering the tab bar + inset while a text
+            // input wants keys. Its taps feed the same byte stream the system
+            // IME's fallback feeds — one input path (MC.4d).
+            if (g.kbd_visible)
+                feed_view.drawKeyboard(gpa, g.draw, g.engine, g.regions, @intCast(gs.design_w), @intCast(lh), @intCast(gs.inset_bottom_l), g.accent, g.kbd_shift, g.kbd_page) catch {};
             // The cartridge DETAIL sheet (item 5) is chrome-topmost: it lives in
             // THIS tile (drawn after the feed buffer), not the feed buffer, or the
             // tab bar + FAB paint over its scrim (the on-device bleed, 2026-07-09).

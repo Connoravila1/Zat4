@@ -818,6 +818,13 @@ pub fn main(init: std.process.Init) !void {
     try writePpm(io, gpa, &fb, "/tmp/zat_chat_thread_phone.ppm");
     std.debug.print("wrote /tmp/zat_chat_thread_phone.ppm (430x{d}, {d} items)\n", .{ H, dl.len });
 
+    // PHASE 2e — THE ZAT4 KEYBOARD over the chat thread: the in-app keys with
+    // the accent circuit lines and the bitcoin key (letters page, shift off).
+    try feed_view.drawKeyboard(gpa, &dl, &engine, null, 430, @intCast(H), 24, lens_socket.seatedAccent(feed_t), false, 0);
+    try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+    try writePpm(io, gpa, &fb, "/tmp/zat_kbd_phone.ppm");
+    std.debug.print("wrote /tmp/zat_kbd_phone.ppm (430x{d}, {d} items)\n", .{ H, dl.len });
+
     // PHASE 2c — the cartridge DETAIL sheet (item 5) OVER the phone loadout: the
     // scrim dims the page behind, the panel shows the lens info + the roomy colour
     // picker. Drawn onto the same draw list (not cleared) so the dim reads real.
