@@ -424,6 +424,39 @@ fn moveTaskToBack(activity: *Activity) void {
     if (jniFailed(env)) return seam.logcat("back: moveTaskToBack threw", .{});
 }
 
+/// The IME's current bottom inset in device px (0 = hidden / unavailable).
+/// Polled per lap ONLY while the keyboard is up (no JNI hop when hidden), so
+/// the chat composer rides above the keyboard as it opens and resizes.
+/// Render thread; attach/detach like the other JNI hops; failures read as 0.
+fn imeInsetPx(activity: *Activity) i32 {
+    const vm: JavaVm = @ptrCast(@alignCast(activity.vm));
+    var env: JniEnv = undefined;
+    const attach: AttachFn = @ptrCast(@alignCast(vm.*.slots[vm_attach_current_thread].?));
+    if (attach(vm, &env, null) != 0) return 0;
+    defer _ = @as(DetachFn, @ptrCast(@alignCast(vm.*.slots[vm_detach_current_thread].?)))(vm);
+    const get_window = jniMethod(env, activity.clazz, "getWindow", "()Landroid/view/Window;") orelse return 0;
+    const window = jniCallObj(env, activity.clazz, get_window, &no_args) orelse return 0;
+    const get_decor = jniMethod(env, window, "getDecorView", "()Landroid/view/View;") orelse return 0;
+    const decor = jniCallObj(env, window, get_decor, &no_args) orelse return 0;
+    const grwi = jniMethod(env, decor, "getRootWindowInsets", "()Landroid/view/WindowInsets;") orelse return 0;
+    const wi = jniCallObj(env, decor, grwi, &no_args) orelse return 0;
+    const type_cls = jniFn(env, jni_find_class, FindClassFn)(env, "android/view/WindowInsets$Type");
+    if (jniFailed(env) or type_cls == null) return 0;
+    const ime_mid = jniFn(env, jni_get_static_method_id, GetMethodIdFn)(env, type_cls, "ime", "()I");
+    if (jniFailed(env) or ime_mid == null) return 0;
+    const mask = jniFn(env, jni_call_static_int_method_a, CallStaticIntMethodAFn)(env, type_cls, ime_mid, &no_args);
+    if (jniFailed(env)) return 0;
+    const gi_mid = jniMethod(env, wi, "getInsets", "(I)Landroid/graphics/Insets;") orelse return 0;
+    const ins = jniCallObj(env, wi, gi_mid, &[_]jvalue{.{ .i = mask }}) orelse return 0;
+    const icls = jniFn(env, jni_get_object_class, GetObjectClassFn)(env, ins);
+    if (jniFailed(env) or icls == null) return 0;
+    const f_bot = jniFn(env, jni_get_field_id, GetFieldIdFn)(env, icls, "bottom", "I");
+    if (jniFailed(env) or f_bot == null) return 0;
+    const v = jniFn(env, jni_get_int_field, GetIntFieldFn)(env, ins, f_bot);
+    if (jniFailed(env)) return 0;
+    return v;
+}
+
 fn hapticTick(activity: *Activity) void {
     const vm: JavaVm = @ptrCast(@alignCast(activity.vm));
     var env: JniEnv = undefined;
@@ -814,6 +847,12 @@ fn renderThread() void {
             // the process + feed stay hot for an instant return.
             if (seam.zat_minimize(ctx)) {
                 if (app.activity) |act| moveTaskToBack(act);
+            }
+            // The keyboard's live inset: polled while it is up so the chat
+            // composer rides ABOVE it (it used to be covered — typing blind).
+            // No JNI hop while hidden; 0 clears the lift.
+            if (app.activity) |act| {
+                seam.zat_set_ime_inset(ctx, if (ime_shown) imeInsetPx(act) else 0);
             }
         } else if (ime_shown) {
             if (app.activity) |act| imeSetVisible(act, false);

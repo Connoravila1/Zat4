@@ -778,6 +778,14 @@ pub export fn zat_set_insets(ctx_ptr: ?*anyopaque, top: i32, bottom: i32, left: 
     if (ctx.feed) |*f| tui.mobileSetInsets(f.run, top, bottom, left, right);
 }
 
+/// The soft keyboard's live bottom inset (device px; 0 = hidden) — the
+/// activity polls it per lap while the IME is up; the chat composer lifts.
+pub export fn zat_set_ime_inset(ctx_ptr: ?*anyopaque, bottom_px: i32) void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return));
+    if (comptime !mobile_config.have_gpu) return;
+    if (ctx.feed) |*f| tui.mobileSetImeInset(f.run, bottom_px);
+}
+
 /// M-And.5: the authorize URL for the shim to open in the OS browser —
 /// non-null exactly ONCE per armed flow (the shim must not reopen the
 /// browser every frame). NUL-terminated; the bytes live until zat_shutdown.

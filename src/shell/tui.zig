@@ -4058,6 +4058,17 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             const over_search = if (feed_view.hitTest(g.regions.items, rx, ry)) |sh| sh.kind == .zone_search else false;
                             if (!over_search) rs.gzones_q_focus = false;
                         }
+                        // The chat input blurs the same way: a tap anywhere off the
+                        // composer strip (input / send / pay) drops focus — and with
+                        // it the phone keyboard ("not being able to tap off the
+                        // keyboard is driving me nuts", owner 2026-07-09).
+                        if (rs.gchat_input_focus and rs.gscreen == feed_view.screen_messages) {
+                            const over_composer = if (feed_view.hitTest(g.regions.items, rx, ry)) |sh|
+                                (sh.kind == .chat_input or sh.kind == .chat_send or sh.kind == .pay_open)
+                            else
+                                false;
+                            if (!over_composer) rs.gchat_input_focus = false;
+                        }
                         // Release-activation: fire the armed feed tap ONLY if the
                         // release lands on the same target the press armed. A press
                         // that began a drag never armed a tap, so a drag never also
@@ -6132,6 +6143,17 @@ pub fn mobileResize(mr: *MobileRun, width_px: u32, height_px: u32) void {
 /// The OS safe-area insets (physical px) → stored on GpuState in LOGICAL px by
 /// dividing by the current ui scale (scale = physical_w / design_w, so logical =
 /// physical / scale). Called from the mobile seam on surface/inset changes.
+/// The soft keyboard's CURRENT bottom inset (device px; 0 = hidden), polled
+/// by the activity while the IME is up: the chat composer lifts above it (it
+/// used to be covered — the owner typed blind). Stored in logical px; the
+/// layout call folds it into the chat insets and the rebuild signature.
+pub fn mobileSetImeInset(mr: *MobileRun, bottom_px: i32) void {
+    if (mr.rs.gpu_state) |*gs| {
+        const s: f32 = if (gs.scale > 0) gs.scale else 1.0;
+        gs.ime_bottom_l = @intFromFloat(@round(@as(f32, @floatFromInt(bottom_px)) / s));
+    }
+}
+
 pub fn mobileSetInsets(mr: *MobileRun, top: i32, bottom: i32, left: i32, right: i32) void {
     if (mr.rs.gpu_state) |*gs| {
         const s: f32 = if (gs.scale > 0) gs.scale else 1.0;
@@ -8711,6 +8733,10 @@ const GpuState = struct {
     /// OS physical insets / ui scale. Reserve status bar (top) + home pill
     /// (bottom); zero on desktop. Folded into feed_sig so a change rebuilds.
     inset_top_l: i32 = 0,
+    /// The soft keyboard's LIVE bottom inset (logical px; 0 = hidden) — polled
+    /// per lap by the activity while the IME is up. The chat composer rides
+    /// above it; folded into feed_sig so the lift tracks the keyboard.
+    ime_bottom_l: i32 = 0,
     inset_bottom_l: i32 = 0,
     inset_left_l: i32 = 0,
     inset_right_l: i32 = 0,
@@ -10017,7 +10043,9 @@ fn paintFrameGpu(
         // The double-back hint pill: arming/expiry rebuilds the nav tile.
         ^ (@as(u64, @intFromBool(g.back_hint)) *% 0x517C_C1B7_2722_0A95)
         // Phone chat: opening/closing a thread swaps the tab bar in/out.
-        ^ (@as(u64, @intFromBool(g.chat_sel != null)) *% 0x6C62_2726_93D2_35B1);
+        ^ (@as(u64, @intFromBool(g.chat_sel != null)) *% 0x6C62_2726_93D2_35B1)
+        // The live keyboard inset: the chat composer rides above it.
+        ^ (@as(u64, @intCast(@max(0, gs.ime_bottom_l))) *% 0xE703_7ED1_A0B4_28DB);
     // A drag/settle animates the socket every frame (lift, reflow, ghost), so
     // bypass the feed cache while it runs — a brief interaction, and the field
     // already rebuilds every frame anyway.
@@ -10126,7 +10154,7 @@ fn paintFrameGpu(
                 }
             } else |_| {}
             const reflow_t: f32 = if (gs.chat_reflow) |rh| (gs.chat_world.position(rh) orelse 1.0) else 1.0;
-            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t }, xforms, g.chat_recv, .{ .top = @intCast(gs.inset_top_l), .bottom = @intCast(gs.inset_bottom_l), .left = @intCast(gs.inset_left_l), .right = @intCast(gs.inset_right_l) }) catch g.content_h.*;
+            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t }, xforms, g.chat_recv, .{ .top = @intCast(gs.inset_top_l), .bottom = @intCast(@max(gs.inset_bottom_l, gs.ime_bottom_l)), .left = @intCast(gs.inset_left_l), .right = @intCast(gs.inset_right_l) }) catch g.content_h.*;
         } else if (g.screen.* == feed_view.screen_algo_docs) {
             g.content_h.* = feed_view.layoutAlgoDocs(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, if (g.docs_kind == 1) algo_docs.dev_doc else algo_docs.user_doc) catch g.content_h.*;
         } else if (g.screen.* == feed_view.screen_algo_detail) {
