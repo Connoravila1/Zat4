@@ -5568,7 +5568,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         if (rs.gchat_peer_len > 0) {
                             _ = rs.gchat_arena_state.reset(.retain_capacity);
                             var new_sel: ?chat_core.ConvIndex = null;
-                            rs.gchat_compose_status = chatStartCompose(gpa, rs.gchat_arena_state.allocator(), io, environ, session, if (rs.gchat_e2ee) |*p| p else null, rs.gchat_link, &rs.gchat_store, rs.gchat_peer_buf[0..rs.gchat_peer_len], &new_sel);
+                            rs.gchat_compose_status = chatStartCompose(gpa, rs.gchat_arena_state.allocator(), io, environ, if (rs.gchat_e2ee) |*p| p else null, rs.gchat_link, &rs.gchat_store, rs.gchat_peer_buf[0..rs.gchat_peer_len], &new_sel);
                             if (new_sel) |nc| {
                                 rs.gchat_sel = nc;
                                 rs.gchat_composing = false;
@@ -7721,7 +7721,6 @@ fn chatStartCompose(
     arena: Allocator,
     io: std.Io,
     env: ?*const std.process.Environ.Map,
-    session: *auth.Session,
     st: ?*chat_e2ee.State,
     link: ?*chat_relay.ChatRelay,
     cs: *chat_core.Store,
@@ -7739,23 +7738,17 @@ fn chatStartCompose(
     if (std.mem.startsWith(u8, typed, "did:")) {
         did = typed;
     } else {
-        const outcome = xrpc.query(
-            arena,
-            io,
-            env,
-            session.pds_url,
-            lexicon.method.resolve_handle,
-            &.{.{ .name = "handle", .value = typed }},
-            lexicon.ResolveHandleResponse,
-            .{},
-        ) catch return "Couldn't resolve that handle";
-        switch (outcome) {
-            .ok => |resolved| {
-                if (resolved.did.len == 0) return "Couldn't resolve that handle";
-                did = resolved.did;
-            },
-            .failed => return "Couldn't resolve that handle",
-        }
+        // The peer can live on ANY PDS: resolve the handle through the identity
+        // module (DNS TXT / HTTPS well-known → verified DID document — the
+        // bidirectional check, SSRF-guarded), never the viewer's own PDS
+        // resolveHandle, which only knows its own accounts. That was the
+        // cross-PDS bug, same class as the marketplace record fetch: chat with
+        // any account hosted elsewhere failed "Couldn't resolve that handle"
+        // (found on-device 2026-07-09). Arena-owned result, frame lifetime —
+        // the same lifetime the old xrpc parse had.
+        const identity = identity_shell.resolve(arena, io, env, .{}, typed) catch
+            return "Couldn't resolve that handle";
+        did = identity.did;
         handle = typed;
     }
     if (std.mem.eql(u8, did, state.my_did)) return "That's you — pick someone else";
