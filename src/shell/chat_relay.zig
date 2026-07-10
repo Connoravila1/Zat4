@@ -148,8 +148,11 @@ pub const ChatRelay = struct {
     token: []const u8,
     /// TLS to the public Caddy route; false = the loopback/tunnel dev dial.
     use_tls: bool,
-    /// The one mailbox this client drains (ours).
-    sub: [relay.mailbox_id_len]u8,
+    /// The mailboxes this client drains (ours). ONE today (the standing
+    /// bootstrap inbox); per-epoch ROTATION (metadata privacy M2) subscribes
+    /// the current epoch's ID plus a look-around window — this list is that
+    /// slice's seat, so the rotation lands as data, not surgery. Gpa-owned.
+    subs: [][relay.mailbox_id_len]u8,
     /// Outbound deposits, render thread → worker (spinlock hand-off).
     out_locked: std.atomic.Value(bool),
     outbox: std.ArrayList(Out),
@@ -164,7 +167,7 @@ pub fn start(
     port: u16,
     token: []const u8,
     use_tls: bool,
-    sub: [relay.mailbox_id_len]u8,
+    subs: []const [relay.mailbox_id_len]u8,
 ) !*ChatRelay {
     const cr = try gpa.create(ChatRelay);
     errdefer gpa.destroy(cr);
@@ -172,6 +175,8 @@ pub fn start(
     errdefer gpa.free(host_copy);
     const token_copy = try gpa.dupe(u8, token);
     errdefer gpa.free(token_copy);
+    const subs_copy = try gpa.dupe([relay.mailbox_id_len]u8, subs);
+    errdefer gpa.free(subs_copy);
     cr.* = .{
         .gpa = gpa,
         .io = io,
@@ -183,7 +188,7 @@ pub fn start(
         .port = port,
         .token = token_copy,
         .use_tls = use_tls,
-        .sub = sub,
+        .subs = subs_copy,
         .out_locked = .init(false),
         .outbox = .empty,
     };
@@ -220,6 +225,7 @@ pub fn shutdown(cr: *ChatRelay) void {
     cr.outbox.deinit(cr.gpa);
     cr.gpa.free(cr.host);
     cr.gpa.free(cr.token);
+    cr.gpa.free(cr.subs);
     cr.gpa.destroy(cr);
 }
 
@@ -334,10 +340,12 @@ fn runConnection(cr: *ChatRelay, healthy: *bool) !void {
     @memcpy(acc[0..leftover.len], leftover);
     var acc_len: usize = leftover.len;
 
-    // Subscribe (re-armed on every reconnect; the server re-delivers unacked).
-    {
+    // Subscribe to EVERY mailbox we drain (re-armed on every reconnect; the
+    // server re-delivers unacked). One frame per ID — the rotation window
+    // (M2) is just more entries in cr.subs.
+    for (cr.subs) |sub_id| {
         var sub_op: [relay.subscribe_frame_len]u8 = undefined;
-        try sendFrame(cr, &conn, .binary, relay.buildSubscribe(&sub_op, cr.sub));
+        try sendFrame(cr, &conn, .binary, relay.buildSubscribe(&sub_op, sub_id));
     }
     cr.mailbox.push(gpa, .{ .status = "relay: connected" });
     healthy.* = true;
@@ -370,6 +378,17 @@ fn runConnection(cr: *ChatRelay, healthy: *bool) !void {
             switch (decoded.frame.opcode) {
                 .binary => switch (relay.parseServerOp(decoded.frame.payload) catch return error.ProtocolViolation) {
                     .deliver => |d| {
+                        // STANDING INVARIANT (metadata privacy M1): Zat Chat
+                        // emits NO automatic, machine-speed, non-disableable
+                        // per-message acknowledgment. The relay ack below is
+                        // TRANSPORT bookkeeping to OUR relay (delete the
+                        // delivered blob) — it never reaches the sender and
+                        // says nothing about read state. Any future receipt
+                        // feature must be user-disableable and jittered,
+                        // riding the E2EE path — a reflexive delivery receipt
+                        // is the engine of the statistical-disclosure attack
+                        // (Martiny et al., NDSS 2021).
+                        //
                         // Copy → mailbox → ONLY THEN ack. If the push (or
                         // this process) dies first, the un-acked blob
                         // re-delivers on reconnect: at-least-once.
@@ -485,13 +504,16 @@ test "chat_relay loopback: two clients exchange an opaque bucket through the rea
     var bob_box: Mailbox = .{};
     defer bob_box.deinit(gpa);
 
-    const alice = try start(gpa, io, &alice_box, "127.0.0.1", port, "u5-test-token", false, alice_box_id);
+    // Bob drains TWO mailboxes (the M2 rotation shape: current + window);
+    // the deposit goes to his SECOND, proving the multi-subscription leg.
+    const bob_box_id2: [relay.mailbox_id_len]u8 = @splat(0xB3);
+    const alice = try start(gpa, io, &alice_box, "127.0.0.1", port, "u5-test-token", false, &.{alice_box_id});
     defer shutdown(alice);
-    const bob = try start(gpa, io, &bob_box, "127.0.0.1", port, "u5-test-token", false, bob_box_id);
+    const bob = try start(gpa, io, &bob_box, "127.0.0.1", port, "u5-test-token", false, &.{ bob_box_id, bob_box_id2 });
     defer shutdown(bob);
 
-    // Alice → Bob: deposit the bucket to Bob's mailbox.
-    try deposit(alice, bob_box_id, &payload);
+    // Alice → Bob: deposit the bucket to Bob's SECOND mailbox.
+    try deposit(alice, bob_box_id2, &payload);
 
     // Bob's drain sees it, byte-identical (bounded, politely).
     var drained: std.ArrayList(Mail) = .empty;
@@ -519,14 +541,14 @@ test "chat_relay loopback: two clients exchange an opaque bucket through the rea
     waited_ms = 0;
     while (waited_ms < 5_000) {
         lock.lock();
-        const left = relay.pendingCount(&store, bob_box_id);
+        const left = relay.pendingCount(&store, bob_box_id2);
         lock.unlock();
         if (left == 0) break;
         clock.sleepMillis(20);
         waited_ms += 20;
     }
     lock.lock();
-    const left = relay.pendingCount(&store, bob_box_id);
+    const left = relay.pendingCount(&store, bob_box_id2);
     lock.unlock();
     try testing.expectEqual(@as(u32, 0), left);
 }

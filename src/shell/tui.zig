@@ -1218,7 +1218,7 @@ fn initRunState(
                     _ = rs.gchat_arena_state.reset(.retain_capacity);
                     if (chat_e2ee.init(gpa, rs.gchat_arena_state.allocator(), io, env, session)) |st| {
                         rs.gchat_e2ee = st;
-                        rs.gchat_link = chat_relay.start(gpa, io, &rs.gchat_box, rhost, rport, token, use_tls, st.inbox) catch null;
+                        rs.gchat_link = chat_relay.start(gpa, io, &rs.gchat_box, rhost, rport, token, use_tls, &.{st.inbox}) catch null;
                         // Restore the displayed history (M2) first. A missing
                         // or corrupt blob is a cold start, never a half-restore
                         // (the codec is strict) — the mirror below still
