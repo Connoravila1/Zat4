@@ -1858,8 +1858,9 @@ pub fn drawKeyboard(
                 else => flash_key == k.lo or (k.hi != 0 and flash_key == k.hi),
             };
             if (flashed) try rect(gpa, dl, x, y, kw, kbd_key_h, (@as(u32, flash_a) << 24) | (accent & 0x00FFFFFF), 9);
-            // the circuit edge: each key wears a soft accent top line
-            try rect(gpa, dl, x, y, kw, 1, (0x46 << 24) | (accent & 0x00FFFFFF), 9);
+            // (The per-key accent top line is gone — on-device it read as
+            // odd floating dashes, 2026-07-10; the panel's top circuit line
+            // carries the accent alone.)
             // Caps lock: the shift key carries a solid accent lock bar.
             if (k.ctrl == 1 and caps)
                 try rect(gpa, dl, x + @divTrunc(kw, 2) - 8, y + kbd_key_h - 9, 16, 3, (0xFF << 24) | (accent & 0x00FFFFFF), 1);

@@ -3016,21 +3016,15 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                 const klh: i32 = @intFromFloat(@as(f32, @floatFromInt(m.height_px)) / gsd.scale);
                                 if (kly >= klh - feed_view.keyboard_h - @as(i32, @intCast(gsd.inset_bottom_l))) {
                                     m.press_in_kbd = true;
-                                    // Press feedback NOW (activation stays on
-                                    // release): light the key under the finger.
-                                    if (feed_view.hitTest(rs.gregions.items, klx, kly)) |kh| {
-                                        const fid: u16 = switch (kh.kind) {
-                                            .kbd_key => kh.post,
-                                            .kbd_shift => 0xE001,
-                                            .kbd_backspace => 0xE002,
-                                            .kbd_page => 0xE003,
-                                            else => 0,
-                                        };
-                                        if (fid != 0) {
-                                            rs.kbd_flash_key = fid;
-                                            rs.kbd_flash_ns = clock_shell.monotonicNanos();
-                                        }
-                                    }
+                                    // PRESS-COMMIT: the key fires the instant
+                                    // the finger lands (flash + bytes) — real
+                                    // keyboard latency, not tap-on-release.
+                                    // The release tap is suppressed below so
+                                    // a key never fires twice.
+                                    if (feed_view.hitTest(rs.gregions.items, klx, kly)) |kh| switch (kh.kind) {
+                                        .kbd_key, .kbd_shift, .kbd_page, .kbd_backspace => kbdAction(rs, gpa, kh.kind, kh.post),
+                                        else => {},
+                                    };
                                 }
                             }
                         }
@@ -3147,7 +3141,15 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         if (m.scrolling) {
                             const dy_phys: i32 = @as(i32, tev.y) - m.drag_y;
                             m.drag_y = tev.y;
-                            const dy: f32 = @as(f32, @floatFromInt(dy_phys)) / scale;
+                            var dy: f32 = @as(f32, @floatFromInt(dy_phys)) / scale;
+                            // The open chat thread is BOTTOM-anchored (its
+                            // scroll measures up from the newest message), so
+                            // the finger-to-content mapping FLIPS: dragging
+                            // down walks back into history, like every
+                            // messenger (on-device it read backwards,
+                            // 2026-07-10). Flipped at the source so the
+                            // carry, fling, and edge accounting follow.
+                            if (rs.gscreen == feed_view.screen_messages and rs.gchat_sel != null) dy = -dy;
                             frame_dy += dy;
                             // Pull-to-refresh (the desktop overscroll gesture,
                             // by touch): dragging DOWN while already pinned at
@@ -3289,9 +3291,10 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             }
                         } else if (m.down_x >= 0 and !m.scrolling) {
                             // A clean tap: the press point, then the release —
-                            // unless a HELD backspace already repeated (the
-                            // run doesn't end with a surprise extra delete).
-                            if (m.kbd_bs_repeats == 0) {
+                            // unless the press landed on the Zat4 keyboard
+                            // (its keys already fired at touch-down; the
+                            // panel swallows the rest by design).
+                            if (!m.press_in_kbd) {
                                 pointer_events.append(gpa, .{ .x = @intCast(m.down_x), .y = @intCast(m.down_y), .kind = .button_down, .button = 1, .mods = 0, ._pad = 0 }) catch {};
                                 pointer_events.append(gpa, .{ .x = tev.x, .y = tev.y, .kind = .button_up, .button = 1, .mods = 0, ._pad = 0 }) catch {};
                             }
@@ -4723,44 +4726,10 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         // the system IME feeds, so every consumer (drafts,
                                         // searches, the composer) works unchanged. Shift is
                                         // one-shot, like a phone.
-                                        .kbd_key => {
-                                            var kb: [4]u8 = undefined;
-                                            const kn = std.unicode.utf8Encode(@intCast(hit.post), &kb) catch 0;
-                                            if (kn > 0) rs.kbd_bytes.appendSlice(gpa, kb[0..kn]) catch {};
-                                            if (!rs.kbd_caps) rs.kbd_shift = false; // one-shot unless locked
-                                            rs.kbd_flash_key = hit.post;
-                                            rs.kbd_flash_ns = clock_shell.monotonicNanos();
-                                        },
-                                        // One-shot shift; a second tap inside the
-                                        // double-tap window LOCKS caps; any tap
-                                        // while locked clears both.
-                                        .kbd_shift => {
-                                            const tns = clock_shell.monotonicNanos();
-                                            if (rs.kbd_caps) {
-                                                rs.kbd_caps = false;
-                                                rs.kbd_shift = false;
-                                            } else if (rs.kbd_shift and tns -| rs.kbd_shift_ns < 400_000_000) {
-                                                rs.kbd_caps = true;
-                                            } else {
-                                                rs.kbd_shift = !rs.kbd_shift;
-                                            }
-                                            rs.kbd_shift_ns = tns;
-                                            rs.kbd_flash_key = 0xE001;
-                                            rs.kbd_flash_ns = tns;
-                                        },
-                                        .kbd_page => {
-                                            rs.kbd_page ^= 1;
-                                            rs.kbd_flash_key = 0xE003;
-                                            rs.kbd_flash_ns = clock_shell.monotonicNanos();
-                                        },
-                                        // One delete per tap; a HELD press repeats
-                                        // via the touch pump's timer (which then
-                                        // swallows the release tap).
-                                        .kbd_backspace => {
-                                            rs.kbd_bytes.append(gpa, 8) catch {};
-                                            rs.kbd_flash_key = 0xE002;
-                                            rs.kbd_flash_ns = clock_shell.monotonicNanos();
-                                        },
+                                        // The Zat4 keyboard (desktop mouse path;
+                                        // phone keys commit at touch-DOWN in the
+                                        // pump and never reach this tap).
+                                        .kbd_key, .kbd_shift, .kbd_page, .kbd_backspace => kbdAction(rs, gpa, hit.kind, hit.post),
                                         .chat_input => if (dev_chat) {
                                             rs.gchat_input_focus = true;
                                             rs.gchat_composing = false;
@@ -5788,11 +5757,9 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 // while typing and breathes when idle.
                 if (dev_chat and rs.gscreen == feed_view.screen_messages and rs.gchat_composing) {
                     if (zc == 8 or zc == 127) {
-                        if (rs.gchat_peer_len > 0) rs.gchat_peer_len -= 1;
+                        popUtf8(&rs.gchat_peer_buf, &rs.gchat_peer_len);
                         rs.gchat_key_ns = clock_shell.monotonicNanos();
-                    } else if (zc >= 0x20 and zc < 0x7f and rs.gchat_peer_len < rs.gchat_peer_buf.len) {
-                        rs.gchat_peer_buf[rs.gchat_peer_len] = @intCast(zc);
-                        rs.gchat_peer_len += 1;
+                    } else if (zc >= 0x20 and pushUtf8(&rs.gchat_peer_buf, &rs.gchat_peer_len, zc)) {
                         rs.gchat_key_ns = clock_shell.monotonicNanos();
                     }
                     // Consume the key while the bar owns the keyboard — without
@@ -5802,11 +5769,9 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     continue;
                 } else if (dev_chat and rs.gscreen == feed_view.screen_messages and rs.gchat_input_focus) {
                     if (zc == 8 or zc == 127) {
-                        if (rs.gchat_draft_len > 0) rs.gchat_draft_len -= 1;
+                        popUtf8(&rs.gchat_draft_buf, &rs.gchat_draft_len);
                         rs.gchat_key_ns = clock_shell.monotonicNanos();
-                    } else if (zc >= 0x20 and zc < 0x7f and rs.gchat_draft_len < rs.gchat_draft_buf.len) {
-                        rs.gchat_draft_buf[rs.gchat_draft_len] = @intCast(zc);
-                        rs.gchat_draft_len += 1;
+                    } else if (zc >= 0x20 and pushUtf8(&rs.gchat_draft_buf, &rs.gchat_draft_len, zc)) {
                         rs.gchat_key_ns = clock_shell.monotonicNanos();
                         // One encrypted typing ping per 4s of active typing.
                         // deposit is worker-queued (never blocks the frame);
@@ -6850,6 +6815,52 @@ fn backNavigate(rs: *RunState) bool {
     }
     if (rs.grepost_menu != null) {
         rs.grepost_menu = null;
+        return true;
+    }
+    // The Zat4 keyboard: back DISMISSES the panel first when a plain text
+    // field raised it (blur the field; the next back navigates) — the
+    // Android IME convention; without this the panel stuck to the screen
+    // across pops (on-device, 2026-07-10). Overlays that own their keys
+    // (the composer, the pay/receive sheets, the create/dev editors) keep
+    // their own pop below.
+    if (rs.engine != null and toggleOn(rs.toggle_bits, settings_view.act_zat_kbd)) {
+        var blurred = false;
+        if (rs.gscreen == feed_view.screen_messages) {
+            if (rs.gchat_input_focus) {
+                rs.gchat_input_focus = false;
+                blurred = true;
+            }
+            if (rs.gchat_q_focus) {
+                rs.gchat_q_focus = false;
+                blurred = true;
+            }
+            if (rs.gchat_composing) {
+                rs.gchat_composing = false;
+                blurred = true;
+            }
+        }
+        if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1 and rs.gmarket_q_focus) {
+            rs.gmarket_q_focus = false;
+            blurred = true;
+        }
+        if (rs.gscreen == feed_view.screen_zones_browse and rs.gzones_q_focus) {
+            rs.gzones_q_focus = false;
+            blurred = true;
+        }
+        if (rs.gscreen == feed_view.screen_settings and rs.pet_name_focus) {
+            rs.pet_name_focus = false;
+            blurred = true;
+        }
+        if (blurred) return true;
+    }
+    // The pay/receive sheets are their own back level (they own the screen
+    // while open; popping the thread underneath them was wrong).
+    if (rs.gscreen == feed_view.screen_messages and rs.grecv_open) {
+        rs.grecv_open = false;
+        return true;
+    }
+    if (rs.gscreen == feed_view.screen_messages and rs.gpay_open) {
+        rs.gpay_open = false;
         return true;
     }
     if (rs.mode == .compose) {
@@ -7972,6 +7983,73 @@ fn chatStartCompose(
     sel_out.* = conv;
     chatPersistHistory(gpa, io, env, state, cs);
     return "";
+}
+
+/// One Zat4-keyboard key firing — shared by the desktop mouse dispatch and
+/// the touch pump's PRESS-COMMIT (phone keys type at touch-DOWN, real
+/// keyboard latency; the pump then suppresses the release tap so a key
+/// never fires twice). Queues bytes for the next frame's input stream and
+/// stamps the press flash.
+fn kbdAction(rs: *RunState, gpa: Allocator, kind: feed_view.Action, post: u16) void {
+    switch (kind) {
+        .kbd_key => {
+            var kb: [4]u8 = undefined;
+            const kn = std.unicode.utf8Encode(@intCast(post), &kb) catch 0;
+            if (kn > 0) rs.kbd_bytes.appendSlice(gpa, kb[0..kn]) catch {};
+            if (!rs.kbd_caps) rs.kbd_shift = false; // one-shot unless locked
+            rs.kbd_flash_key = post;
+            rs.kbd_flash_ns = clock_shell.monotonicNanos();
+        },
+        // One-shot shift; a second tap inside the double-tap window LOCKS
+        // caps; any tap while locked clears both.
+        .kbd_shift => {
+            const tns = clock_shell.monotonicNanos();
+            if (rs.kbd_caps) {
+                rs.kbd_caps = false;
+                rs.kbd_shift = false;
+            } else if (rs.kbd_shift and tns -| rs.kbd_shift_ns < 400_000_000) {
+                rs.kbd_caps = true;
+            } else {
+                rs.kbd_shift = !rs.kbd_shift;
+            }
+            rs.kbd_shift_ns = tns;
+            rs.kbd_flash_key = 0xE001;
+            rs.kbd_flash_ns = tns;
+        },
+        .kbd_page => {
+            rs.kbd_page ^= 1;
+            rs.kbd_flash_key = 0xE003;
+            rs.kbd_flash_ns = clock_shell.monotonicNanos();
+        },
+        // One delete per press; a HELD press repeats via the pump's timer.
+        .kbd_backspace => {
+            rs.kbd_bytes.append(gpa, 8) catch {};
+            rs.kbd_flash_key = 0xE002;
+            rs.kbd_flash_ns = clock_shell.monotonicNanos();
+        },
+        else => {},
+    }
+}
+
+/// Append one codepoint to a fixed byte buffer as UTF-8 — the chat draft
+/// and recipient bar take real glyphs, not just ASCII (₿ was silently
+/// dropped on-device, 2026-07-10). False = no room / unencodable.
+fn pushUtf8(buf: []u8, len: *usize, cp: u21) bool {
+    var eb: [4]u8 = undefined;
+    const en = std.unicode.utf8Encode(cp, &eb) catch return false;
+    if (len.* + en > buf.len) return false;
+    @memcpy(buf[len.*..][0..en], eb[0..en]);
+    len.* += en;
+    return true;
+}
+
+/// Backspace one full UTF-8 sequence (never strand continuation bytes).
+fn popUtf8(buf: []const u8, len: *usize) void {
+    while (len.* > 0) {
+        len.* -= 1;
+        const b = buf[len.*];
+        if (b < 0x80 or b >= 0xC0) return; // consumed through the lead byte
+    }
 }
 
 /// The Zat4 keyboard's press-flash alpha this frame: full at the press,
@@ -9958,7 +10036,15 @@ fn paintComposeGpu(
     // the feed lays out — so the emitted button regions map back through gs.scale.
     const lh = logicalHFor(w, h, gs.design_w);
     g.draw.len = 0;
-    feed_view.layoutCompose(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.accent, ctx, reply_handle, quoting, draft, caret, sel_start, sel_end, blink_on, status, segments, tag_bar, g.draw, g.regions) catch {};
+    // The Zat4 keyboard shares the composer surface (it was simply never
+    // drawn in this pass — no keys on the post composer, on-device
+    // 2026-07-10): the composer lays out ABOVE the panel (its footer lifts
+    // clear), the keys draw over the bottom band + inset, and their regions
+    // land last so they win the taps.
+    const kbd_lift: u32 = if (g.kbd_visible) @intCast(feed_view.keyboard_h + @as(i32, @intCast(gs.inset_bottom_l))) else 0;
+    feed_view.layoutCompose(gpa, g.engine, @intCast(gs.design_w), @intCast(lh - kbd_lift), g.accent, ctx, reply_handle, quoting, draft, caret, sel_start, sel_end, blink_on, status, segments, tag_bar, g.draw, g.regions) catch {};
+    if (g.kbd_visible)
+        feed_view.drawKeyboard(gpa, g.draw, g.engine, g.regions, @intCast(gs.design_w), @intCast(lh), @intCast(gs.inset_bottom_l), g.accent, g.kbd_shift, g.kbd_page, g.kbd_caps, g.kbd_flash_key, g.kbd_flash_a) catch {};
     if (g.julia) feed_view.juliaRemapText(g.draw); // light theme: dark text
     if (g.light) feed_view.rethemeLight(gpa, g.draw) catch {};
     gpu.feedBuild(&gs.feed, gpa, g.engine, g.draw.slice(), scale) catch {};
@@ -11317,6 +11403,11 @@ fn drawSdfIcons(g: Grid, gs: *GpuState, items: []const feed_core.TimelineItem, v
     const is_phone = gs.design_w <= feed_view.phone_max;
     const logical_h: i32 = @intFromFloat(@as(f32, @floatFromInt(vh)) / scale);
     const bottom_clip: i32 = if (is_phone) logical_h - feed_view.tab_bar_h - gs.inset_bottom_l else std.math.maxInt(i32);
+    // The Zat4 keyboard is opaque bottom chrome drawn AFTER the bars — any
+    // icon whose centre lands under it would bleed through onto the keys
+    // (the on-device space-bar bleed, 2026-07-10). The cartridge-sheet rule
+    // at panel scale: skip them, tab-bar nav icons included.
+    const kbd_top: i32 = if (g.kbd_visible) logical_h - feed_view.keyboard_h - gs.inset_bottom_l else std.math.maxInt(i32);
     const clipped = struct {
         fn f(r: feed_view.Region, top: i32, bot: i32) bool {
             const c = @as(i32, r.y) + @divTrunc(@as(i32, r.h), 2);
@@ -11336,6 +11427,7 @@ fn drawSdfIcons(g: Grid, gs: *GpuState, items: []const feed_core.TimelineItem, v
         if (drawer_open and !(r.kind == .nav and r.w > 100)) continue;
         const cy = (@as(f32, @floatFromInt(r.y)) + @as(f32, @floatFromInt(r.h)) * 0.5) * scale;
         const cyl = @as(i32, r.y) + @divTrunc(@as(i32, r.h), 2); // logical centre y
+        if (cyl >= kbd_top) continue; // under the Zat4 keyboard panel
         switch (r.kind) {
             // LEFT engagement group — the icon sits at region.x + is/2 (8.5).
             .reply => {
@@ -11457,10 +11549,12 @@ fn drawEngagementHearts(g: Grid, gs: *GpuState, items: []const feed_core.Timelin
     // Skip a heart that scrolls behind the floating compose FAB (above the bar,
     // so bottom_clip misses it). Phone only. Same box source as drawSdfIcons.
     const fab = feed_view.composeFabBox(@intCast(gs.design_w), logical_h, gs.inset_bottom_l);
+    // And the Zat4 keyboard band — the same bleed rule as drawSdfIcons.
+    const kbd_top: i32 = if (g.kbd_visible) logical_h - feed_view.keyboard_h - gs.inset_bottom_l else std.math.maxInt(i32);
     for (g.regions.items) |r| {
         if (r.kind != .like or r.post >= items.len) continue;
         const row_c = @as(i32, r.y) + @divTrunc(@as(i32, r.h), 2);
-        if (row_c < hb_eff or row_c > bottom_clip) continue;
+        if (row_c < hb_eff or row_c > bottom_clip or row_c >= kbd_top) continue;
         const heart_cx = @as(i32, r.x) + 8; // logical heart centre
         if (is_phone and heart_cx >= fab.x0 and heart_cx <= fab.x1 and row_c >= fab.y0 and row_c <= fab.y1) continue;
         const liked = items[r.post].item_flags.viewer_liked;
