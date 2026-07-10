@@ -553,6 +553,10 @@ const RunState = struct {
     gbench_drag: ?u16,
     gbench_drag_x: i32,
     gbench_drag_y: i32,
+    // The chat list's search field (phone): live filter over conversations.
+    gchat_q_buf: [64]u8,
+    gchat_q_len: usize,
+    gchat_q_focus: bool,
     // Double-back-to-exit: the deadline (monotonic ns) until which a second
     // system-back at the root minimizes; the nav tile shows the hint pill.
     back_hint_until: u64,
@@ -1090,6 +1094,9 @@ fn initRunState(
     rs.gcart_detail = null;
     rs.detail_hits = .empty;
     rs.back_hint_until = 0;
+    rs.gchat_q_buf = undefined;
+    rs.gchat_q_len = 0;
+    rs.gchat_q_focus = false;
     rs.gpub_confirm = null;
     rs.gdocs_kind = 0;
     rs.docs_return_screen = feed_view.screen_loadout;
@@ -2726,7 +2733,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .market_q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .market_q_focus = rs.gmarket_q_focus, .market_loading = rs.market_loading, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
+        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .market_q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .market_q_focus = rs.gmarket_q_focus, .market_loading = rs.market_loading, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_q = rs.gchat_q_buf[0..rs.gchat_q_len], .chat_q_focus = rs.gchat_q_focus, .chat_q_caret = composeBlinkOn(rs.caret_anchor_ns), .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
         switch (rs.mode) {
             .timeline => try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status),
             .compose => {
@@ -4069,6 +4076,13 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                 false;
                             if (!over_composer) rs.gchat_input_focus = false;
                         }
+                        if (rs.gchat_q_focus and rs.gscreen == feed_view.screen_messages) {
+                            const over_q = if (feed_view.hitTest(g.regions.items, rx, ry)) |sh|
+                                sh.kind == .chat_search
+                            else
+                                false;
+                            if (!over_q) rs.gchat_q_focus = false;
+                        }
                         // Release-activation: fire the armed feed tap ONLY if the
                         // release lands on the same target the press armed. A press
                         // that began a drag never armed a tap, so a drag never also
@@ -4595,19 +4609,25 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         // the same ordering query the list was built from (no
                                         // store index rides a region, A5).
                                         .chat_conv => if (dev_chat) {
-                                            if (chat_core.conversationsByActivity(gpa, &rs.gchat_store) catch null) |order| {
-                                                defer gpa.free(order);
-                                                if (hit.post < order.len) {
-                                                    rs.gchat_sel = order[hit.post];
-                                                    chat_core.markRead(&rs.gchat_store, order[hit.post]);
-                                                    // M2: read-state survives a relaunch too.
-                                                    chatPersistHistory(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
-                                                    rs.gchat_input_focus = true;
-                                                    rs.gchat_composing = false; // a row tap leaves the compose flow
-                                                    rs.gpay_open = false; // the sheet belongs to one conversation
-                                                    rs.gscroll_px = 0; // newest, bottom-anchored
-                                                }
+                                            // The ordinal is in FILTERED space when a list
+                                            // search is live — map it through the same
+                                            // predicate the render used (chatConvAt).
+                                            const cq = rs.gchat_q_buf[0..rs.gchat_q_len];
+                                            if (chatConvAt(arena, &rs.gchat_store, now, cq, hit.post)) |conv| {
+                                                rs.gchat_sel = conv;
+                                                chat_core.markRead(&rs.gchat_store, conv);
+                                                // M2: read-state survives a relaunch too.
+                                                chatPersistHistory(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
+                                                rs.gchat_input_focus = true;
+                                                rs.gchat_q_focus = false; // opening a thread leaves the search
+                                                rs.gchat_composing = false; // a row tap leaves the compose flow
+                                                rs.gpay_open = false; // the sheet belongs to one conversation
+                                                rs.gscroll_px = 0; // newest, bottom-anchored
                                             }
+                                        },
+                                        // The chat list search field: tap → it owns the keyboard.
+                                        .chat_search => if (dev_chat) {
+                                            rs.gchat_q_focus = true;
                                         },
                                         .chat_input => if (dev_chat) {
                                             rs.gchat_input_focus = true;
@@ -5698,6 +5718,20 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status);
                     continue;
                 }
+                // The chat list search: live filter per keystroke; Enter/Esc give
+                // the keyboard back. ASCII (handles + previews match on ASCII).
+                if (rs.gscreen == feed_view.screen_messages and rs.gchat_q_focus) {
+                    if (zc == '\r' or zc == '\n' or zc == 27) {
+                        rs.gchat_q_focus = false;
+                    } else if (zc == 8 or zc == 127) {
+                        if (rs.gchat_q_len > 0) rs.gchat_q_len -= 1;
+                    } else if (zc >= 0x20 and zc < 0x7f and rs.gchat_q_len < rs.gchat_q_buf.len) {
+                        rs.gchat_q_buf[rs.gchat_q_len] = @intCast(zc);
+                        rs.gchat_q_len += 1;
+                    }
+                    try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status);
+                    continue;
+                }
                 // The Toy Box pet-name field: type a name (ASCII), Enter/Esc give
                 // the keyboard back, Backspace deletes. The name floats over the pet.
                 if (rs.gscreen == feed_view.screen_settings and rs.pet_name_focus) {
@@ -6265,7 +6299,7 @@ fn typingOwnsKeyboard(rs: *const RunState) bool {
     if (rs.mode == .compose) return true;
     if (rs.engine == null) return false; // terminal: none of the GUI inputs exist
     if (rs.gscreen == feed_view.screen_messages and
-        (rs.gchat_composing or rs.gchat_input_focus or rs.gpay_open or rs.grecv_open)) return true;
+        (rs.gchat_composing or rs.gchat_input_focus or rs.gchat_q_focus or rs.gpay_open or rs.grecv_open)) return true;
     if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 2 and rs.gcreate_step == .name) return true;
     // The dev submission flow: the Zal source editor and the details fields.
     if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 2 and rs.gdev_active and
@@ -7807,16 +7841,55 @@ fn chatPersistHistory(gpa: Allocator, io: std.Io, env: ?*const std.process.Envir
     _ = cache_shell.saveChatHistoryAt(gpa, io, path, state.my_did, blob);
 }
 
-fn buildChatFrame(arena: Allocator, cs: *const chat_core.Store, sel: ?chat_core.ConvIndex, now: i64) ChatFrame {
-    const list = chat_view_core.buildList(arena, cs, now) catch return .{};
+/// Does a conversation row match the list-search query? Name or preview,
+/// case-insensitive — the ONE predicate the render and the tap mapping share.
+fn chatRowMatches(row: chat_view_core.ListRow, query: []const u8) bool {
+    return std.ascii.indexOfIgnoreCase(row.name, query) != null or
+        std.ascii.indexOfIgnoreCase(row.preview, query) != null;
+}
+
+/// The conversation at FILTERED ordinal `row` — the tap mapping. Applies the
+/// same activity order + search predicate the render used, so the row tapped
+/// is the row seen. Empty query = the plain activity order.
+fn chatConvAt(arena: Allocator, cs: *const chat_core.Store, now: i64, query: []const u8, row: usize) ?chat_core.ConvIndex {
+    const order = chat_core.conversationsByActivity(arena, cs) catch return null;
+    if (query.len == 0) return if (row < order.len) order[row] else null;
+    const list = chat_view_core.buildList(arena, cs, now) catch return null;
+    var seen: usize = 0;
+    for (order, 0..) |c, i| {
+        if (i >= list.len) break;
+        if (!chatRowMatches(list[i], query)) continue;
+        if (seen == row) return c;
+        seen += 1;
+    }
+    return null;
+}
+
+fn buildChatFrame(arena: Allocator, cs: *const chat_core.Store, sel: ?chat_core.ConvIndex, now: i64, query: []const u8) ChatFrame {
+    const full = chat_view_core.buildList(arena, cs, now) catch return .{};
+    // The list-search filter (phone): rows and the selected ordinal both live
+    // in FILTERED space, in lockstep with chatConvAt's tap mapping.
+    var list = full;
+    if (query.len > 0) {
+        var kept: std.ArrayList(chat_view_core.ListRow) = .empty;
+        for (full) |row| {
+            if (chatRowMatches(row, query)) kept.append(arena, row) catch return .{ .list = full };
+        }
+        list = kept.items;
+    }
     var out: ChatFrame = .{ .list = list };
     const sc = sel orelse return out;
     const order = chat_core.conversationsByActivity(arena, cs) catch return out;
+    var seen: u16 = 0;
     for (order, 0..) |c, i| {
+        if (query.len > 0) {
+            if (i >= full.len or !chatRowMatches(full[i], query)) continue;
+        }
         if (c == sc) {
-            out.sel = @intCast(i);
+            out.sel = seen;
             break;
         }
+        seen += 1;
     }
     if (out.sel != std.math.maxInt(u16) and out.sel < list.len) {
         out.peer = list[out.sel].name;
@@ -8474,6 +8547,11 @@ const Grid = struct {
     /// built per frame in paintFrame from these (queries over the one store).
     chat_store: ?*const chat_core.Store = null,
     chat_sel: ?chat_core.ConvIndex = null,
+    /// The chat list-search state (phone): query + focus + caret blink.
+    chat_q: []const u8 = "",
+    chat_q_focus: bool = false,
+    chat_q_caret: bool = false,
+
     chat_draft: []const u8 = "",
     chat_input_focus: bool = false,
     chat_composing: bool = false,
@@ -8590,6 +8668,8 @@ const GpuState = struct {
     ramp: gpu.FieldRenderer,
     feed: gpu.Feed,
     /// The PREVIOUS screen's feed verts, kept for the screen-switch CROSSFADE:
+    /// The chat pane the fade last saw (0 list / 1 thread) — the in-screen swap.
+    fade_chat_pane: u16 = 0,
     /// on a screen change `feed`↔`feed_prev` swap, then `feed` rebuilds with the
     /// new content while `feed_prev` holds the old; we draw old at (1-fade) + new
     /// at fade. The nav rail is in BOTH so it stays solid; only content dissolves.
@@ -9457,8 +9537,8 @@ fn paintFrame(
             if (g.chat_store != null and g.screen.* == feed_view.screen_messages) {
                 // Zat Chat (U3, dev-gated): the Messages surface. -scroll maps the
                 // shared ≤0 scroll state onto layoutChat's positive history offset.
-                const cf = buildChatFrame(arena, g.chat_store.?, g.chat_sel, now);
-                g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{}, &.{}, g.chat_recv, .{}) catch g.content_h.*;
+                const cf = buildChatFrame(arena, g.chat_store.?, g.chat_sel, now, g.chat_q);
+                g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{}, &.{}, g.chat_recv, .{}, .{}) catch g.content_h.*;
             } else if (g.screen.* == feed_view.screen_loadout) {
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
                 g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market, g.market_q, g.market_q_focus, g.market_loading, g.bench_pick, g.bench_drag, g.published, g.create, g.dev, g.bench, .{}, g.loadout_lib_y) catch g.content_h.*; // software: draw line-art nav
@@ -9804,12 +9884,16 @@ fn paintFrameGpu(
     // rebuilds with the new content (it fades IN). The nav rail is identical in
     // both, so it stays solid; only the differing content dissolves. Cheap — no
     // relayout during the fade, just two cached draws at a uniform alpha.
-    if (gs.fade_screen != g.screen.*) {
+    // The chat list↔thread swap is a pane change on ONE screen — treat it
+    // like a screen switch so the same crossfade covers it (the pop read raw).
+    const chat_pane: u16 = if (g.screen.* == feed_view.screen_messages and g.chat_sel != null) 1 else 0;
+    if (gs.fade_screen != g.screen.* or gs.fade_chat_pane != chat_pane) {
         const tmp = gs.feed;
         gs.feed = gs.feed_prev;
         gs.feed_prev = tmp;
         gs.fade_t = 0;
         gs.fade_screen = g.screen.*;
+        gs.fade_chat_pane = chat_pane;
         gs.feed_sig = 0; // the swapped-in buffer is stale → force a rebuild below
     }
     gs.fade_t += (1.0 - gs.fade_t) * 0.16; // ease in (~0.25 s)
@@ -9871,7 +9955,11 @@ fn paintFrameGpu(
     if (g.screen.* == feed_view.screen_messages) if (g.chat_store) |cs| {
         chat_sig = (@as(u64, cs.msgs.len) *% 0x9E37_79B9_7F4A_7C15) ^
             ((if (g.chat_sel) |sc| @as(u64, @intFromEnum(sc)) +% 1 else 0) *% 0xC2B2_AE3D_27D4_EB4F) ^
-            std.hash.Wyhash.hash(0x5A72_C4A7, g.chat_draft);
+            std.hash.Wyhash.hash(0x5A72_C4A7, g.chat_draft) ^
+            // The list search: each keystroke refilters; focus + blink redraw.
+            std.hash.Wyhash.hash(0x3C6E_F372, g.chat_q) ^
+            (@as(u64, @intFromBool(g.chat_q_focus)) *% 0x9E6C_63D0_676A_9A99) ^
+            (@as(u64, @intFromBool(g.chat_q_focus and g.chat_q_caret)) *% 0xD6E8_FEB8_6659_FD93);
         var unread_sum: u64 = 0;
         for (cs.convs.items(.unread)) |u| unread_sum +%= u;
         chat_sig ^= unread_sum *% 0x2545_F491_4F6C_DD1D;
@@ -10122,7 +10210,7 @@ fn paintFrameGpu(
             }
             gs.content_x = lg.col_x;
             gs.content_w = lg.col_w;
-            const cf = buildChatFrame(arena, g.chat_store.?, g.chat_sel, now);
+            const cf = buildChatFrame(arena, g.chat_store.?, g.chat_sel, now, g.chat_q);
             // Seconds since the last chat keystroke, wrapped onto one blink
             // period past the solid window — f32-precise forever, and a
             // never-touched input still breathes (clock-since-launch).
@@ -10154,7 +10242,7 @@ fn paintFrameGpu(
                 }
             } else |_| {}
             const reflow_t: f32 = if (gs.chat_reflow) |rh| (gs.chat_world.position(rh) orelse 1.0) else 1.0;
-            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t }, xforms, g.chat_recv, .{ .top = @intCast(gs.inset_top_l), .bottom = @intCast(@max(gs.inset_bottom_l, gs.ime_bottom_l)), .left = @intCast(gs.inset_left_l), .right = @intCast(gs.inset_right_l) }) catch g.content_h.*;
+            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t }, xforms, g.chat_recv, .{ .top = @intCast(gs.inset_top_l), .bottom = @intCast(@max(gs.inset_bottom_l, gs.ime_bottom_l)), .left = @intCast(gs.inset_left_l), .right = @intCast(gs.inset_right_l) }, .{ .q = g.chat_q, .focus = g.chat_q_focus, .caret_on = g.chat_q_caret }) catch g.content_h.*;
         } else if (g.screen.* == feed_view.screen_algo_docs) {
             g.content_h.* = feed_view.layoutAlgoDocs(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, if (g.docs_kind == 1) algo_docs.dev_doc else algo_docs.user_doc) catch g.content_h.*;
         } else if (g.screen.* == feed_view.screen_algo_detail) {
