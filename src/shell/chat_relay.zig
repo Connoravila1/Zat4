@@ -74,9 +74,10 @@ pub const mailbox_id_len = relay.mailbox_id_len;
 /// A7.2: cold union, size guard waived — slice-carrying hand-off message at
 /// chat rates (the stream.zig Mail reasoning).
 pub const Mail = union(enum) {
-    /// One delivered bucket; `data` is gpa-owned by the message (always
-    /// exactly `relay.bucket_len` bytes). Consumer calls `freeMail`.
-    blob: []u8,
+    /// One delivered bucket: the mailbox it arrived on (metadata privacy
+    /// M2.3 routes Welcomes vs traffic by this) + the bytes, gpa-owned by
+    /// the message (always exactly `relay.bucket_len`). `freeMail` releases.
+    blob: struct { id: [relay.mailbox_id_len]u8, data: []u8 },
     /// The relay refused a deposit (mailbox_full / store_full) — surfaced
     /// so a send failure is a visible state, never silence (E3).
     refused: relay.DepositResult,
@@ -85,7 +86,7 @@ pub const Mail = union(enum) {
 };
 
 pub fn freeMail(gpa: Allocator, mail: Mail) void {
-    if (mail == .blob) gpa.free(mail.blob);
+    if (mail == .blob) gpa.free(mail.blob.data);
 }
 
 /// A7.2: cold struct, size guard waived — one per relay link; the
@@ -128,12 +129,21 @@ pub const Mailbox = struct {
 // The subsystem handle
 // ---------------------------------------------------------------------------
 
-/// One queued outbound deposit. A7.2: cold struct, size guard waived —
-/// transient hand-off, a handful in flight at human send rates.
-const Out = struct {
-    id: [relay.mailbox_id_len]u8,
-    blob: *[relay.bucket_len]u8, // gpa-owned until sent
+/// One queued outbound op, render thread → worker. A7.2: cold union, size
+/// guard waived — transient hand-off, a handful in flight at human rates.
+const Out = union(enum) {
+    deposit: struct {
+        id: [relay.mailbox_id_len]u8,
+        blob: *[relay.bucket_len]u8, // gpa-owned until sent
+    },
+    /// Subscribe to one more mailbox mid-session (M2 rotation: a new
+    /// conversation or an epoch advance minted a fresh traffic mailbox).
+    subscribe: [relay.mailbox_id_len]u8,
 };
+
+fn freeOut(gpa: Allocator, out: Out) void {
+    if (out == .deposit) gpa.destroy(out.deposit.blob);
+}
 
 /// A7.2: cold struct, size guard waived — one per live chat session.
 pub const ChatRelay = struct {
@@ -148,11 +158,13 @@ pub const ChatRelay = struct {
     token: []const u8,
     /// TLS to the public Caddy route; false = the loopback/tunnel dev dial.
     use_tls: bool,
-    /// The mailboxes this client drains (ours). ONE today (the standing
-    /// bootstrap inbox); per-epoch ROTATION (metadata privacy M2) subscribes
-    /// the current epoch's ID plus a look-around window — this list is that
-    /// slice's seat, so the rotation lands as data, not surgery. Gpa-owned.
-    subs: [][relay.mailbox_id_len]u8,
+    /// The mailboxes this client drains (ours): the bootstrap inbox + every
+    /// open conversation's current-epoch traffic mailbox (metadata privacy
+    /// M2.1). Grows via `subscribe` as conversations open and epochs
+    /// advance; never shrinks within a session — the lingering old-epoch
+    /// entry IS the look-behind window (the relay has no unsubscribe op).
+    /// Guarded by `out_locked`; the worker snapshots it on every reconnect.
+    subs: std.ArrayList([relay.mailbox_id_len]u8),
     /// Outbound deposits, render thread → worker (spinlock hand-off).
     out_locked: std.atomic.Value(bool),
     outbox: std.ArrayList(Out),
@@ -175,8 +187,9 @@ pub fn start(
     errdefer gpa.free(host_copy);
     const token_copy = try gpa.dupe(u8, token);
     errdefer gpa.free(token_copy);
-    const subs_copy = try gpa.dupe([relay.mailbox_id_len]u8, subs);
-    errdefer gpa.free(subs_copy);
+    var subs_list: std.ArrayList([relay.mailbox_id_len]u8) = .empty;
+    errdefer subs_list.deinit(gpa);
+    try subs_list.appendSlice(gpa, subs);
     cr.* = .{
         .gpa = gpa,
         .io = io,
@@ -188,7 +201,7 @@ pub fn start(
         .port = port,
         .token = token_copy,
         .use_tls = use_tls,
-        .subs = subs_copy,
+        .subs = subs_list,
         .out_locked = .init(false),
         .outbox = .empty,
     };
@@ -204,7 +217,22 @@ pub fn deposit(cr: *ChatRelay, id: [relay.mailbox_id_len]u8, blob: *const [relay
     copy.* = blob.*;
     while (cr.out_locked.swap(true, .acquire)) std.atomic.spinLoopHint();
     defer cr.out_locked.store(false, .release);
-    try cr.outbox.append(cr.gpa, .{ .id = id, .blob = copy });
+    try cr.outbox.append(cr.gpa, .{ .deposit = .{ .id = id, .blob = copy } });
+}
+
+/// Subscribe to one more mailbox (idempotent; the ID is copied). Called
+/// from the render thread as conversations open and epochs advance (M2.1);
+/// the worker sends the frame within a poll tick and re-arms it on every
+/// reconnect. The relay's mailboxes are durable, so a bucket deposited
+/// before its subscription lands simply waits there — no look-ahead window
+/// is needed.
+pub fn subscribe(cr: *ChatRelay, id: [relay.mailbox_id_len]u8) error{OutOfMemory}!void {
+    while (cr.out_locked.swap(true, .acquire)) std.atomic.spinLoopHint();
+    defer cr.out_locked.store(false, .release);
+    for (cr.subs.items) |have| if (std.mem.eql(u8, &have, &id)) return;
+    try cr.subs.ensureUnusedCapacity(cr.gpa, 1);
+    try cr.outbox.append(cr.gpa, .{ .subscribe = id });
+    cr.subs.appendAssumeCapacity(id);
 }
 
 fn takeOutbox(cr: *ChatRelay, into: *std.ArrayList(Out)) error{OutOfMemory}!void {
@@ -221,11 +249,11 @@ pub fn shutdown(cr: *ChatRelay) void {
     const fd = cr.socket_fd.swap(-1, .acq_rel);
     if (fd >= 0) stream_shell.shutdownSocket(fd);
     cr.thread.join();
-    for (cr.outbox.items) |out| cr.gpa.destroy(out.blob);
+    for (cr.outbox.items) |out| freeOut(cr.gpa, out);
     cr.outbox.deinit(cr.gpa);
     cr.gpa.free(cr.host);
     cr.gpa.free(cr.token);
-    cr.gpa.free(cr.subs);
+    cr.subs.deinit(cr.gpa);
     cr.gpa.destroy(cr);
 }
 
@@ -341,9 +369,18 @@ fn runConnection(cr: *ChatRelay, healthy: *bool) !void {
     var acc_len: usize = leftover.len;
 
     // Subscribe to EVERY mailbox we drain (re-armed on every reconnect; the
-    // server re-delivers unacked). One frame per ID — the rotation window
-    // (M2) is just more entries in cr.subs.
-    for (cr.subs) |sub_id| {
+    // server re-delivers unacked). Snapshot under the outbox lock — the
+    // render thread appends via `subscribe`; an ID added mid-snapshot still
+    // reaches the wire through its queued outbox op (a duplicate subscribe
+    // frame is harmless).
+    var subs_snap: std.ArrayList([relay.mailbox_id_len]u8) = .empty;
+    defer subs_snap.deinit(gpa);
+    {
+        while (cr.out_locked.swap(true, .acquire)) std.atomic.spinLoopHint();
+        defer cr.out_locked.store(false, .release);
+        try subs_snap.appendSlice(gpa, cr.subs.items);
+    }
+    for (subs_snap.items) |sub_id| {
         var sub_op: [relay.subscribe_frame_len]u8 = undefined;
         try sendFrame(cr, &conn, .binary, relay.buildSubscribe(&sub_op, sub_id));
     }
@@ -352,7 +389,7 @@ fn runConnection(cr: *ChatRelay, healthy: *bool) !void {
 
     var pending_out: std.ArrayList(Out) = .empty;
     defer {
-        for (pending_out.items) |out| gpa.destroy(out.blob);
+        for (pending_out.items) |out| freeOut(gpa, out);
         pending_out.deinit(gpa);
     }
 
@@ -363,9 +400,17 @@ fn runConnection(cr: *ChatRelay, healthy: *bool) !void {
         try takeOutbox(cr, &pending_out);
         while (pending_out.items.len > 0) {
             const out = pending_out.items[0];
-            var dep_op: [relay.deposit_frame_len]u8 = undefined;
-            try sendFrame(cr, &conn, .binary, relay.buildDeposit(&dep_op, out.id, out.blob));
-            gpa.destroy(out.blob);
+            switch (out) {
+                .deposit => |d| {
+                    var dep_op: [relay.deposit_frame_len]u8 = undefined;
+                    try sendFrame(cr, &conn, .binary, relay.buildDeposit(&dep_op, d.id, d.blob));
+                    gpa.destroy(d.blob);
+                },
+                .subscribe => |sid| {
+                    var sub_op: [relay.subscribe_frame_len]u8 = undefined;
+                    try sendFrame(cr, &conn, .binary, relay.buildSubscribe(&sub_op, sid));
+                },
+            }
             _ = pending_out.orderedRemove(0);
         }
 
@@ -393,7 +438,7 @@ fn runConnection(cr: *ChatRelay, healthy: *bool) !void {
                         // this process) dies first, the un-acked blob
                         // re-delivers on reconnect: at-least-once.
                         const copy = try gpa.dupe(u8, d.blob);
-                        cr.mailbox.push(gpa, .{ .blob = copy });
+                        cr.mailbox.push(gpa, .{ .blob = .{ .id = d.id, .data = copy } });
                         var ack_op: [relay.ack_frame_len]u8 = undefined;
                         try sendFrame(cr, &conn, .binary, relay.buildAck(&ack_op, d.id));
                     },
@@ -527,7 +572,34 @@ test "chat_relay loopback: two clients exchange an opaque bucket through the rea
         try bob_box.drain(gpa, &drained);
         for (drained.items) |m| {
             if (m == .blob) {
-                try testing.expectEqualSlices(u8, &payload, m.blob);
+                try testing.expectEqualSlices(u8, &payload, m.blob.data);
+                // The delivery names its mailbox — what M2.3's Welcome-vs-
+                // traffic routing keys on.
+                try testing.expectEqualSlices(u8, &bob_box_id2, &m.blob.id);
+                got = true;
+            }
+        }
+        if (got) break;
+        clock.sleepMillis(20);
+        waited_ms += 20;
+    }
+    try testing.expect(got);
+
+    // The LIVE subscription leg (M2.1 rotation shape): a mailbox subscribed
+    // mid-session — after the connection is already up — still delivers.
+    const bob_box_id3: [relay.mailbox_id_len]u8 = @splat(0xB4);
+    try subscribe(bob, bob_box_id3);
+    try subscribe(bob, bob_box_id3); // idempotent — no duplicate sub entry
+    try deposit(alice, bob_box_id3, &payload);
+    for (drained.items) |m| freeMail(gpa, m);
+    drained.clearRetainingCapacity();
+    got = false;
+    waited_ms = 0;
+    while (waited_ms < 10_000 and !got) {
+        try bob_box.drain(gpa, &drained);
+        for (drained.items) |m| {
+            if (m == .blob and std.mem.eql(u8, &m.blob.id, &bob_box_id3)) {
+                try testing.expectEqualSlices(u8, &payload, m.blob.data);
                 got = true;
             }
         }

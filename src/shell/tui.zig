@@ -558,9 +558,17 @@ const RunState = struct {
     gchat_q_len: usize,
     gchat_q_focus: bool,
     // The Zat4 keyboard (phone): one-shot shift, letters/symbols page, and
-    // the tapped bytes queued for the next frame's input stream.
+    // the tapped bytes queued for the next frame's input stream. `kbd_caps`
+    // is the double-tap shift lock; `kbd_shift_ns` stamps the last shift
+    // tap (the double-tap window). `kbd_flash_key`/`kbd_flash_ns` are the
+    // press-feedback flash: the pressed key's identity + when it landed —
+    // the grid carries a decayed alpha each frame (kbdFlashAlpha).
     kbd_shift: bool,
+    kbd_caps: bool,
     kbd_page: u8,
+    kbd_shift_ns: u64,
+    kbd_flash_key: u16,
+    kbd_flash_ns: u64,
     kbd_bytes: std.ArrayList(u8),
     // Double-back-to-exit: the deadline (monotonic ns) until which a second
     // system-back at the root minimizes; the nav tile shows the hint pill.
@@ -1103,7 +1111,11 @@ fn initRunState(
     rs.gchat_q_len = 0;
     rs.gchat_q_focus = false;
     rs.kbd_shift = false;
+    rs.kbd_caps = false;
     rs.kbd_page = 0;
+    rs.kbd_shift_ns = 0;
+    rs.kbd_flash_key = 0;
+    rs.kbd_flash_ns = 0;
     rs.kbd_bytes = .empty;
     rs.gpub_confirm = null;
     rs.gdocs_kind = 0;
@@ -1226,7 +1238,12 @@ fn initRunState(
                     _ = rs.gchat_arena_state.reset(.retain_capacity);
                     if (chat_e2ee.init(gpa, rs.gchat_arena_state.allocator(), io, env, session)) |st| {
                         rs.gchat_e2ee = st;
-                        rs.gchat_link = chat_relay.start(gpa, io, &rs.gchat_box, rhost, rport, token, use_tls, &.{st.inbox}) catch null;
+                        // M2.1: bootstrap inbox (Welcomes) + every restored
+                        // conversation's current-epoch traffic mailbox.
+                        if (chat_e2ee.subscriptions(gpa, &st)) |subs| {
+                            defer gpa.free(subs);
+                            rs.gchat_link = chat_relay.start(gpa, io, &rs.gchat_box, rhost, rport, token, use_tls, subs) catch null;
+                        } else |_| {}
                         // Restore the displayed history (M2) first. A missing
                         // or corrupt blob is a cold start, never a half-restore
                         // (the codec is strict) — the mirror below still
@@ -1700,11 +1717,13 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
             rs.gchat_mail.clearRetainingCapacity();
             try rs.gchat_box.drain(gpa, &rs.gchat_mail);
             var chat_mutated = false;
+            var saw_bucket = false;
             for (rs.gchat_mail.items) |m| {
                 switch (m) {
                     .blob => |b| {
+                        saw_bucket = true;
                         _ = rs.gchat_arena_state.reset(.retain_capacity);
-                        const inc = chat_e2ee.onBucket(gpa, rs.gchat_arena_state.allocator(), io, environ, st, b) catch null;
+                        const inc = chat_e2ee.onBucket(gpa, rs.gchat_arena_state.allocator(), io, environ, st, b.id, b.data) catch null;
                         if (inc) |ev| {
                             defer chat_e2ee.freeIncoming(gpa, ev);
                             switch (ev) {
@@ -1801,6 +1820,9 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
             // decrypted message can NEVER be recovered from the wire again, so
             // it reaches disk before this frame ends.
             if (chat_mutated) chatPersistHistory(gpa, io, environ, st, &rs.gchat_store);
+            // M2.1: a drained bucket may have advanced an epoch or opened a
+            // conversation — re-arm the rotated traffic mailboxes.
+            if (saw_bucket) chatEnsureSubs(gpa, st, rs.gchat_link.?);
         };
 
         // Prefetch OUR own receive-setup once, in the background, the first
@@ -2742,7 +2764,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .market_q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .market_q_focus = rs.gmarket_q_focus, .market_loading = rs.market_loading, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .kbd_visible = toggleOn(rs.toggle_bits, settings_view.act_zat_kbd) and typingOwnsKeyboard(rs), .kbd_shift = rs.kbd_shift, .kbd_page = rs.kbd_page, .chat_q = rs.gchat_q_buf[0..rs.gchat_q_len], .chat_q_focus = rs.gchat_q_focus, .chat_q_caret = composeBlinkOn(rs.caret_anchor_ns), .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
+        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .market_q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .market_q_focus = rs.gmarket_q_focus, .market_loading = rs.market_loading, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .kbd_visible = toggleOn(rs.toggle_bits, settings_view.act_zat_kbd) and typingOwnsKeyboard(rs), .kbd_shift = rs.kbd_shift, .kbd_page = rs.kbd_page, .kbd_caps = rs.kbd_caps, .kbd_flash_key = rs.kbd_flash_key, .kbd_flash_a = kbdFlashAlpha(rs), .chat_q = rs.gchat_q_buf[0..rs.gchat_q_len], .chat_q_focus = rs.gchat_q_focus, .chat_q_caret = composeBlinkOn(rs.caret_anchor_ns), .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
         switch (rs.mode) {
             .timeline => try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status),
             .compose => {
@@ -2986,11 +3008,30 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         // A press that lands ON the Zat4 keyboard types; it must
                         // never commit to a scroll or drawer swipe underneath.
                         m.press_in_kbd = false;
+                        m.kbd_bs_repeats = 0;
                         if (if (pix) |gv| gv.kbd_visible else false) {
                             if (rs.gpu_state) |*gsd| {
+                                const klx: i32 = @intFromFloat(@as(f32, @floatFromInt(tev.x)) / gsd.scale);
                                 const kly: i32 = @intFromFloat(@as(f32, @floatFromInt(tev.y)) / gsd.scale);
                                 const klh: i32 = @intFromFloat(@as(f32, @floatFromInt(m.height_px)) / gsd.scale);
-                                if (kly >= klh - feed_view.keyboard_h - @as(i32, @intCast(gsd.inset_bottom_l))) m.press_in_kbd = true;
+                                if (kly >= klh - feed_view.keyboard_h - @as(i32, @intCast(gsd.inset_bottom_l))) {
+                                    m.press_in_kbd = true;
+                                    // Press feedback NOW (activation stays on
+                                    // release): light the key under the finger.
+                                    if (feed_view.hitTest(rs.gregions.items, klx, kly)) |kh| {
+                                        const fid: u16 = switch (kh.kind) {
+                                            .kbd_key => kh.post,
+                                            .kbd_shift => 0xE001,
+                                            .kbd_backspace => 0xE002,
+                                            .kbd_page => 0xE003,
+                                            else => 0,
+                                        };
+                                        if (fid != 0) {
+                                            rs.kbd_flash_key = fid;
+                                            rs.kbd_flash_ns = clock_shell.monotonicNanos();
+                                        }
+                                    }
+                                }
                             }
                         }
                         if (m.bounce_px != 0) {
@@ -3247,9 +3288,13 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                 gsd.drawer_v = v_t;
                             }
                         } else if (m.down_x >= 0 and !m.scrolling) {
-                            // A clean tap: the press point, then the release.
-                            pointer_events.append(gpa, .{ .x = @intCast(m.down_x), .y = @intCast(m.down_y), .kind = .button_down, .button = 1, .mods = 0, ._pad = 0 }) catch {};
-                            pointer_events.append(gpa, .{ .x = tev.x, .y = tev.y, .kind = .button_up, .button = 1, .mods = 0, ._pad = 0 }) catch {};
+                            // A clean tap: the press point, then the release —
+                            // unless a HELD backspace already repeated (the
+                            // run doesn't end with a surprise extra delete).
+                            if (m.kbd_bs_repeats == 0) {
+                                pointer_events.append(gpa, .{ .x = @intCast(m.down_x), .y = @intCast(m.down_y), .kind = .button_down, .button = 1, .mods = 0, ._pad = 0 }) catch {};
+                                pointer_events.append(gpa, .{ .x = tev.x, .y = tev.y, .kind = .button_up, .button = 1, .mods = 0, ._pad = 0 }) catch {};
+                            }
                         }
                         if (m.over_px != 0) {
                             // A banded release hands the stretch to the bounce
@@ -3320,6 +3365,31 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 if (m.back_pending) {
                     m.back_pending = false;
                     if (!backNavigate(rs)) m.minimize_pending = true;
+                }
+                // PRESS-AND-HOLD backspace (Zat4 keyboard): a finger resting
+                // on the backspace key repeats the delete — first at 350 ms,
+                // then ~18/s — the way every phone keyboard behaves. The
+                // continuous render loop ticks on a motionless finger, so
+                // this per-frame timer fires; the burst cap keeps a hitched
+                // frame from dumping deletes. Once a repeat lands, the
+                // release tap is spent (swallowed at button_up).
+                if (m.down_x >= 0 and m.press_in_kbd and !m.scrolling and
+                    (now_ms -% m.down_ms) >= 350) bs_rep:
+                {
+                    const bx: i32 = @intFromFloat(@as(f32, @floatFromInt(m.down_x)) / scale);
+                    const by: i32 = @intFromFloat(@as(f32, @floatFromInt(m.down_y)) / scale);
+                    const bhit = feed_view.hitTest(rs.gregions.items, bx, by) orelse break :bs_rep;
+                    if (bhit.kind != .kbd_backspace) break :bs_rep;
+                    const due: u32 = 1 + ((now_ms -% m.down_ms) - 350) / 55;
+                    var burst: u32 = 0;
+                    while (m.kbd_bs_repeats < due and burst < 2) : (burst += 1) {
+                        rs.kbd_bytes.append(gpa, 8) catch break;
+                        m.kbd_bs_repeats += 1;
+                    }
+                    if (burst > 0) {
+                        rs.kbd_flash_key = 0xE002;
+                        rs.kbd_flash_ns = clock_shell.monotonicNanos();
+                    }
                 }
                 // PRESS-AND-HOLD to pick up a draggable (phone loadout): a finger
                 // that rests on a library card past the hold threshold — WITHOUT
@@ -4657,11 +4727,40 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                             var kb: [4]u8 = undefined;
                                             const kn = std.unicode.utf8Encode(@intCast(hit.post), &kb) catch 0;
                                             if (kn > 0) rs.kbd_bytes.appendSlice(gpa, kb[0..kn]) catch {};
-                                            rs.kbd_shift = false;
+                                            if (!rs.kbd_caps) rs.kbd_shift = false; // one-shot unless locked
+                                            rs.kbd_flash_key = hit.post;
+                                            rs.kbd_flash_ns = clock_shell.monotonicNanos();
                                         },
-                                        .kbd_shift => rs.kbd_shift = !rs.kbd_shift,
-                                        .kbd_page => rs.kbd_page ^= 1,
-                                        .kbd_backspace => rs.kbd_bytes.append(gpa, 8) catch {},
+                                        // One-shot shift; a second tap inside the
+                                        // double-tap window LOCKS caps; any tap
+                                        // while locked clears both.
+                                        .kbd_shift => {
+                                            const tns = clock_shell.monotonicNanos();
+                                            if (rs.kbd_caps) {
+                                                rs.kbd_caps = false;
+                                                rs.kbd_shift = false;
+                                            } else if (rs.kbd_shift and tns -| rs.kbd_shift_ns < 400_000_000) {
+                                                rs.kbd_caps = true;
+                                            } else {
+                                                rs.kbd_shift = !rs.kbd_shift;
+                                            }
+                                            rs.kbd_shift_ns = tns;
+                                            rs.kbd_flash_key = 0xE001;
+                                            rs.kbd_flash_ns = tns;
+                                        },
+                                        .kbd_page => {
+                                            rs.kbd_page ^= 1;
+                                            rs.kbd_flash_key = 0xE003;
+                                            rs.kbd_flash_ns = clock_shell.monotonicNanos();
+                                        },
+                                        // One delete per tap; a HELD press repeats
+                                        // via the touch pump's timer (which then
+                                        // swallows the release tap).
+                                        .kbd_backspace => {
+                                            rs.kbd_bytes.append(gpa, 8) catch {};
+                                            rs.kbd_flash_key = 0xE002;
+                                            rs.kbd_flash_ns = clock_shell.monotonicNanos();
+                                        },
                                         .chat_input => if (dev_chat) {
                                             rs.gchat_input_focus = true;
                                             rs.gchat_composing = false;
@@ -7865,11 +7964,37 @@ fn chatStartCompose(
             error.RelayDown => return "Relay unreachable — try again",
             error.CryptoFailed, error.OutOfMemory => return "Couldn't start the conversation",
         };
+        // M2.1: subscribe the fresh conversation's traffic mailbox now —
+        // the peer's first reply rides it, not the bootstrap inbox.
+        chatEnsureSubs(gpa, state, l);
     }
     const conv = chat_core.openConversation(gpa, cs, did, handle) catch return "Couldn't start the conversation";
     sel_out.* = conv;
     chatPersistHistory(gpa, io, env, state, cs);
     return "";
+}
+
+/// The Zat4 keyboard's press-flash alpha this frame: full at the press,
+/// gone 220 ms later. Nonzero alpha folds into feed_sig, so the fade
+/// rebuilds the keyboard tile frame-by-frame only while it runs.
+fn kbdFlashAlpha(rs: *const RunState) u8 {
+    if (rs.kbd_flash_key == 0) return 0;
+    const age = clock_shell.monotonicNanos() -| rs.kbd_flash_ns;
+    const dur: u64 = 220_000_000;
+    if (age >= dur) return 0;
+    return @intCast(170 - age * 170 / dur);
+}
+
+/// M2.1: keep the relay subscribed to every mailbox we currently drain —
+/// the bootstrap inbox + each conversation's current-epoch traffic mailbox.
+/// An idempotent walk (chat_relay.subscribe dedupes), run after any drained
+/// batch (a Welcome or an epoch advance may have minted a fresh ID) and
+/// after starting a conversation. Old-epoch subscriptions linger for the
+/// session — that lingering IS the look-behind window.
+fn chatEnsureSubs(gpa: Allocator, st: *const chat_e2ee.State, link: *chat_relay.ChatRelay) void {
+    const subs = chat_e2ee.subscriptions(gpa, st) catch return;
+    defer gpa.free(subs);
+    for (subs) |id| chat_relay.subscribe(link, id) catch {};
 }
 
 /// M2 persist: the displayed history survives a relaunch. Serialize the view
@@ -8600,6 +8725,14 @@ const Grid = struct {
     kbd_visible: bool = false,
     kbd_shift: bool = false,
     kbd_page: u8 = 0,
+    /// Double-tap shift lock: letters stay shifted, the key wears a bar.
+    kbd_caps: bool = false,
+    /// Press feedback: the pressed key's identity (its codepoint; 0xE001
+    /// shift / 0xE002 backspace / 0xE003 page / '\r' enter) + the flash's
+    /// current alpha, decayed per frame by the shell (kbdFlashAlpha). Both
+    /// fold into feed_sig, so the fade rebuilds the verts while it runs.
+    kbd_flash_key: u16 = 0,
+    kbd_flash_a: u8 = 0,
     /// The chat list-search state (phone): query + focus + caret blink.
     chat_q: []const u8 = "",
     chat_q_focus: bool = false,
@@ -10187,8 +10320,10 @@ fn paintFrameGpu(
         ^ (@as(u64, @intFromBool(g.chat_sel != null)) *% 0x6C62_2726_93D2_35B1)
         // The live keyboard inset: the chat composer rides above it.
         ^ (@as(u64, @intCast(@max(0, gs.ime_bottom_l))) *% 0xE703_7ED1_A0B4_28DB)
-        // The Zat4 keyboard: visibility, shift, and page redraw the tile.
-        ^ ((@as(u64, @intFromBool(g.kbd_visible)) << 9 | @as(u64, @intFromBool(g.kbd_shift)) << 5 | @as(u64, g.kbd_page)) *% 0xA3B1_95E7_4C29_D6F1);
+        // The Zat4 keyboard: visibility, shift, caps, and page redraw the
+        // tile; the press-flash key + its decaying alpha rebuild it each
+        // frame of the fade (the rebuild-signature law).
+        ^ ((@as(u64, @intFromBool(g.kbd_visible)) << 9 | @as(u64, @intFromBool(g.kbd_shift)) << 5 | @as(u64, @intFromBool(g.kbd_caps)) << 4 | @as(u64, g.kbd_page)) *% 0xA3B1_95E7_4C29_D6F1) ^ ((@as(u64, g.kbd_flash_key) << 8 | @as(u64, g.kbd_flash_a)) *% 0xC4CE_B9FE_1A85_EC53);
     // A drag/settle animates the socket every frame (lift, reflow, ghost), so
     // bypass the feed cache while it runs — a brief interaction, and the field
     // already rebuilds every frame anyway.
@@ -10636,7 +10771,7 @@ fn paintFrameGpu(
             // input wants keys. Its taps feed the same byte stream the system
             // IME's fallback feeds — one input path (MC.4d).
             if (g.kbd_visible)
-                feed_view.drawKeyboard(gpa, g.draw, g.engine, g.regions, @intCast(gs.design_w), @intCast(lh), @intCast(gs.inset_bottom_l), g.accent, g.kbd_shift, g.kbd_page) catch {};
+                feed_view.drawKeyboard(gpa, g.draw, g.engine, g.regions, @intCast(gs.design_w), @intCast(lh), @intCast(gs.inset_bottom_l), g.accent, g.kbd_shift, g.kbd_page, g.kbd_caps, g.kbd_flash_key, g.kbd_flash_a) catch {};
             // The cartridge DETAIL sheet (item 5) is chrome-topmost: it lives in
             // THIS tile (drawn after the feed buffer), not the feed buffer, or the
             // tab bar + FAB paint over its scrim (the on-device bleed, 2026-07-09).

@@ -136,6 +136,10 @@ pub const MobileHost = struct {
     touch_cancel: bool = false,
     /// The press began on the Zat4 keyboard: taps type; never scroll/swipe.
     press_in_kbd: bool = false,
+    /// Backspace auto-repeat: deletes this press has fired from the pump's
+    /// hold timer. Nonzero swallows the release tap (the run already typed);
+    /// reset on the next touch-down.
+    kbd_bs_repeats: u32 = 0,
     /// One pending haptic tick, set by the pump the frame a threshold is
     /// CROSSED during a drag (GESTURE_SYSTEM_ROADMAP §3 — the tick lands
     /// under the finger, never on release) and taken (read-and-clear) by the

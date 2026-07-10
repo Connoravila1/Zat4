@@ -1758,6 +1758,11 @@ const kbd_s2_mid = kbdRowStr("*\"':;!?/", "*\"':;!?/");
 /// safe-area inset too), the accent "circuit" lines across its top and
 /// between rows, and one region per key. Shifted codepoints are emitted at
 /// DRAW time, so the dispatch is a dumb byte writer. Pure (B2).
+/// `caps` is the double-tap shift lock (letters stay shifted; the shift key
+/// wears a lock bar). `flash_key`/`flash_a` are the shell's press feedback:
+/// the identity of the last-pressed key (its codepoint; 0xE001 shift /
+/// 0xE002 backspace / 0xE003 page / '\r' enter) and the flash's current
+/// alpha — the key glows accent and fades as the shell decays it.
 pub fn drawKeyboard(
     gpa: Allocator,
     dl: *raster.DrawList,
@@ -1769,6 +1774,9 @@ pub fn drawKeyboard(
     accent: u32,
     shift: bool,
     page: u8,
+    caps: bool,
+    flash_key: u16,
+    flash_a: u8,
 ) error{OutOfMemory}!void {
     const top = view_h - keyboard_h - bottom_inset;
     // The panel: opaque (nothing ghosts through chrome) with a faint wash.
@@ -1836,11 +1844,25 @@ pub fn drawKeyboard(
         var x = m;
         for (keys) |k| {
             const kw = @divTrunc(kw_num * k.w, units);
-            const active_ctrl = (k.ctrl == 1 and shift) or (k.ctrl == 3 and page == 1);
+            const active_ctrl = (k.ctrl == 1 and (shift or caps)) or (k.ctrl == 3 and page == 1);
             const fill: u32 = if (active_ctrl) (0x50 << 24) | (accent & 0x00FFFFFF) else 0x1CFFFFFF;
             try rect(gpa, dl, x, y, kw, kbd_key_h, fill, 9);
+            // Press feedback: the last-tapped key glows accent and fades
+            // (the shell decays flash_a). Char keys match either case —
+            // shift may have cleared between press and draw.
+            const flashed = flash_a != 0 and switch (k.ctrl) {
+                1 => flash_key == 0xE001,
+                2 => flash_key == 0xE002,
+                3 => flash_key == 0xE003,
+                4 => flash_key == '\r',
+                else => flash_key == k.lo or (k.hi != 0 and flash_key == k.hi),
+            };
+            if (flashed) try rect(gpa, dl, x, y, kw, kbd_key_h, (@as(u32, flash_a) << 24) | (accent & 0x00FFFFFF), 9);
             // the circuit edge: each key wears a soft accent top line
             try rect(gpa, dl, x, y, kw, 1, (0x46 << 24) | (accent & 0x00FFFFFF), 9);
+            // Caps lock: the shift key carries a solid accent lock bar.
+            if (k.ctrl == 1 and caps)
+                try rect(gpa, dl, x + @divTrunc(kw, 2) - 8, y + kbd_key_h - 9, 16, 3, (0xFF << 24) | (accent & 0x00FFFFFF), 1);
             if (k.ctrl != 0) {
                 const glyph: []const u8 = switch (k.ctrl) {
                     1 => "\u{21E7}", // shift
@@ -1859,7 +1881,7 @@ pub fn drawKeyboard(
                 };
                 try emitRegion(gpa, regions, x, y, kw, @intCast(kbd_key_h), if (k.ctrl == 4) '\r' else 0, kind);
             } else {
-                const cp: u16 = if (shift and k.hi != 0) k.hi else k.lo;
+                const cp: u16 = if ((shift or caps) and k.hi != 0) k.hi else k.lo;
                 var gb: [4]u8 = undefined;
                 const gn = std.unicode.utf8Encode(@intCast(cp), &gb) catch 1;
                 const gw: i32 = @intCast(text.measure(e, .regular, gb[0..gn], 19));

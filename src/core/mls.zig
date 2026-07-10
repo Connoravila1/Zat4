@@ -1890,6 +1890,31 @@ pub fn peerIdentity(g: *const Group) []const u8 {
     return ln.credential.identity;
 }
 
+/// Which member's inbox a traffic mailbox belongs to (two-member group).
+pub const MailboxSide = enum { mine, peers };
+
+/// Metadata privacy M2.1 — the per-epoch TRAFFIC mailbox ID for one side's
+/// inbox, derived through the RFC 9420 §8.5 exporter (the sanctioned root
+/// for application-level secrets): MLS-Exporter("zat4 mailbox", leaf, 32).
+/// Both members derive the same pair, and every commit rotates it with the
+/// epoch — the relay sees 32 opaque bytes carrying no linkage to an anchor
+/// key, a DID, or the previous epoch's IDs. The anchor-derived bootstrap
+/// mailbox (keydir.bootstrapMailbox) stays first-contact-only (M2.3).
+pub fn mailboxId(g: *const Group, side: MailboxSide) [hash_len]u8 {
+    const leaf: u32 = switch (side) {
+        .mine => g.my_leaf,
+        .peers => 1 - g.my_leaf,
+    };
+    const root = schedule.deriveSecret(g.secrets.exporter, "zat4 mailbox");
+    var ctx: [4]u8 = undefined;
+    std.mem.writeInt(u32, &ctx, leaf, .big);
+    var ctx_hash: [hash_len]u8 = undefined;
+    Sha256.hash(&ctx, &ctx_hash, .{});
+    var out: [hash_len]u8 = undefined;
+    schedule.expandWithLabel(root, "exported", &ctx_hash, &out);
+    return out;
+}
+
 /// What kind of MLS message a padded inbox bucket carries — the shell's
 /// routing switch (welcome → join path; private_message → an open group).
 pub const MessageKind = enum { welcome, private_message, other };
@@ -2353,6 +2378,13 @@ test "end to end: create, add via Welcome, exchange, rotate (PCS), forward secre
     try testing.expectEqualSlices(u8, &a.secrets.epoch_authenticator, &b.secrets.epoch_authenticator);
     try testing.expect(b.root_priv_present);
 
+    // M2.1 traffic mailboxes: both members derive the same pair, mirrored
+    // by side, and the two inboxes never collide.
+    const a_inbox_e1 = mailboxId(&a, .mine);
+    try testing.expectEqualSlices(u8, &a_inbox_e1, &mailboxId(&b, .peers));
+    try testing.expectEqualSlices(u8, &mailboxId(&b, .mine), &mailboxId(&a, .peers));
+    try testing.expect(!std.mem.eql(u8, &a_inbox_e1, &mailboxId(&b, .mine)));
+
     // Both directions, multiple generations, padding on.
     const m1 = try encrypt(gpa, &a, "hello bob", 0, .{ 1, 2, 3, 4 });
     defer gpa.free(m1);
@@ -2404,6 +2436,11 @@ test "end to end: create, add via Welcome, exchange, rotate (PCS), forward secre
     try testing.expectEqual(@as(u64, 2), b.epoch);
     try testing.expectEqualSlices(u8, &a.secrets.epoch_authenticator, &b.secrets.epoch_authenticator);
     try testing.expect(!std.mem.eql(u8, &old_auth, &a.secrets.epoch_authenticator));
+
+    // The commit ROTATED the traffic mailboxes: the new epoch's IDs still
+    // match across members and share nothing with epoch 1's (M2.1).
+    try testing.expectEqualSlices(u8, &mailboxId(&a, .mine), &mailboxId(&b, .peers));
+    try testing.expect(!std.mem.eql(u8, &a_inbox_e1, &mailboxId(&a, .mine)));
 
     // Forward secrecy, behaviorally: an old-epoch message can no longer
     // enter (the epoch is gone), and replaying the commit is refused.

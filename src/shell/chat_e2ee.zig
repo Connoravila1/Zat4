@@ -42,12 +42,17 @@
 //! persistence because the wipe points fire before serialization ever runs:
 //! spent generations are already gone from what is written.
 //!
-//! v1 mailbox posture (recorded, honest): ONE standing inbox per account,
-//! derived from the anchor public key — the same "bootstrap mailbox"
-//! caveat U4 recorded (a relay operator who also scrapes repos could link
-//! it to a DID). Per-epoch mailbox rotation out of the MLS secret tree is
-//! the recorded follow-up; it needs multi-mailbox subscriptions at the
-//! relay. v1 blocking posture (recorded): startConversation and the
+//! Mailbox posture (metadata privacy M2): the anchor-derived bootstrap
+//! mailbox carries ONLY first contact — Welcomes in, Welcomes out (M2.3).
+//! Conversation traffic rides per-epoch TRAFFIC mailboxes derived through
+//! the MLS exporter (mls.mailboxId, M2.1): opaque to the relay, unlinkable
+//! to a DID or an anchor key, rotated by every commit. The shell keeps the
+//! relay subscribed to `subscriptions()` — bootstrap + each group's
+//! current-epoch inbox — re-walking after every drained batch so epoch
+//! advances and new conversations pick up their rotated IDs; the relay's
+//! durable mailboxes make a look-ahead window unnecessary (a bucket
+//! deposited before its subscription waits at the relay).
+//! v1 blocking posture (recorded): startConversation and the
 //! Welcome-verify fetch run on the caller's thread — first-contact events,
 //! rare by nature; a worker is the recorded upgrade if they ever jank.
 
@@ -155,6 +160,19 @@ pub fn deinit(gpa: Allocator, st: *State) void {
     st.peer_anchors.deinit(gpa);
     for (st.groups.items) |*g| g.deinit(gpa);
     st.groups.deinit(gpa);
+}
+
+/// Every mailbox this account drains right now: the bootstrap inbox
+/// (Welcomes only — M2.3) + each open conversation's current-epoch traffic
+/// mailbox (M2.1). The shell subscribes these at relay start and re-walks
+/// them (chat_relay.subscribe is idempotent) after every drained batch, so
+/// epoch advances and newly opened conversations pick up their rotated IDs.
+/// Caller owns the slice.
+pub fn subscriptions(gpa: Allocator, st: *const State) error{OutOfMemory}![][relay.mailbox_id_len]u8 {
+    const out = try gpa.alloc([relay.mailbox_id_len]u8, 1 + st.groups.items.len);
+    out[0] = st.inbox;
+    for (st.groups.items, 0..) |*g, i| out[1 + i] = mls.mailboxId(g, .mine);
+    return out;
 }
 
 fn conversationIndex(st: *const State, peer_did: []const u8) ?usize {
@@ -337,7 +355,11 @@ fn depositPlain(
     persist(gpa, environ, st);
     var bucket: [relay.bucket_len]u8 = undefined;
     bucketPack(&bucket, msg) catch return error.CryptoFailed;
-    chat_relay.deposit(link, keydir.bootstrapMailbox(st.peer_anchors.items[idx]), &bucket) catch return error.RelayDown;
+    // The peer's current-epoch TRAFFIC mailbox (M2.1) — never the bootstrap
+    // (that ID is anchor-linkable; it carries only Welcomes, M2.3). Same
+    // fixed bucket either way: rotation moves the address, never the shape
+    // (M2.4 — no length side-channel).
+    chat_relay.deposit(link, mls.mailboxId(&st.groups.items[idx], .peers), &bucket) catch return error.RelayDown;
 }
 
 /// Encrypt one message ([kind][text]) into the peer's mailbox. Payment
@@ -572,28 +594,39 @@ pub fn acceptWelcome(
     return .{ .started = .{ .peer_did = try gpa.dupe(u8, pw.peer_did) } };
 }
 
-/// Route one delivered bucket. Null = nothing user-visible (damage from a
-/// stranger, an epoch advance, an unverifiable Welcome) — the connection
-/// and every conversation stay intact (E2/E4). The Welcome branch performs
-/// the one network fetch (directory verification) on this thread —
-/// first-contact events, rare by nature (the module header's recorded v1
-/// posture).
+/// Route one delivered bucket. `from` is the mailbox it arrived on — the
+/// M2.3 gate: a Welcome is believed ONLY off the bootstrap inbox (a
+/// stranger stuffing Welcomes into a traffic mailbox is refused before any
+/// crypto runs). Null = nothing user-visible (damage from a stranger, an
+/// epoch advance, an unverifiable Welcome) — the connection and every
+/// conversation stay intact (E2/E4). The Welcome branch performs the one
+/// network fetch (directory verification) on this thread — first-contact
+/// events, rare by nature (the module header's recorded v1 posture).
 pub fn onBucket(
     gpa: Allocator,
     arena: Allocator,
     io: std.Io,
     environ: ?*const std.process.Environ.Map,
     st: *State,
+    from: [relay.mailbox_id_len]u8,
     blob: []const u8,
 ) error{OutOfMemory}!?Incoming {
     const payload = bucketUnpack(blob) orelse return null;
     switch (mls.messageKind(payload)) {
         .welcome => {
+            if (!std.mem.eql(u8, &from, &st.inbox)) return null; // M2.3: Welcomes ride the bootstrap inbox only
             const pw = openWelcome(gpa, st, payload) orelse return null;
             const fetched = chat_keys.fetchPeer(gpa, arena, io, environ, pw.peer_did) catch null;
             return acceptWelcome(gpa, environ, st, pw, if (fetched) |p| p.anchor_pub else null);
         },
         .private_message => {
+            // M2.3 transition allowance: a private message arriving ON the
+            // bootstrap inbox is a pre-rotation client's deposit (one such
+            // message is known in flight at cutover). Still processed —
+            // routing by group id is safe; the linkage leak is the SENDER'S
+            // old address choice, already fixed at every upgraded sender.
+            // FLIP TO STRICT (drop when `from == st.inbox`) at the
+            // pre-launch per-user relay-auth gate.
             const gid = mls.privateMessageGroupId(payload) catch return null;
             const idx = for (st.groups.items, 0..) |*g, i| {
                 if (std.mem.eql(u8, g.group_id, gid)) break i;
@@ -784,6 +817,26 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
     }
     try testing.expect(hasConversation(&b, a.my_did));
 
+    // M2.1: the traffic mailboxes both sides derive — the sender's .peers
+    // view IS the receiver's .mine subscription, and neither is the
+    // anchor-linkable bootstrap inbox.
+    const a_traffic = mls.mailboxId(&a.groups.items[0], .mine);
+    const b_traffic = mls.mailboxId(&b.groups.items[0], .mine);
+    try testing.expectEqualSlices(u8, &b_traffic, &mls.mailboxId(&a.groups.items[0], .peers));
+    try testing.expectEqualSlices(u8, &a_traffic, &mls.mailboxId(&b.groups.items[0], .peers));
+    try testing.expect(!std.mem.eql(u8, &b_traffic, &b.inbox));
+    {
+        const subs = try subscriptions(gpa, &b);
+        defer gpa.free(subs);
+        try testing.expectEqual(@as(usize, 2), subs.len);
+        try testing.expectEqualSlices(u8, &b.inbox, &subs[0]);
+        try testing.expectEqualSlices(u8, &b_traffic, &subs[1]);
+    }
+
+    // M2.3: the same Welcome bucket arriving on a TRAFFIC mailbox is
+    // refused before any crypto runs.
+    try testing.expect((try onBucket(gpa, gpa, io, &env, &b, b_traffic, &welcome_bucket)) == null);
+
     // A → B: encrypt with the kind byte, bucket it, route it through
     // onBucket's private-message path (no network there).
     {
@@ -794,7 +847,7 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
         defer gpa.free(msg);
         var bucket: [relay.bucket_len]u8 = undefined;
         try bucketPack(&bucket, msg);
-        const inc = (try onBucket(gpa, gpa, io, &env, &b, &bucket)) orelse return error.TestUnexpectedResult;
+        const inc = (try onBucket(gpa, gpa, io, &env, &b, b_traffic, &bucket)) orelse return error.TestUnexpectedResult;
         defer freeIncoming(gpa, inc);
         try testing.expectEqual(chat.Kind.text, inc.message.kind);
         try testing.expectEqualStrings("hello, bob", inc.message.text);
@@ -816,7 +869,7 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
         defer gpa.free(msg);
         var bucket: [relay.bucket_len]u8 = undefined;
         try bucketPack(&bucket, msg);
-        const inc = (try onBucket(gpa, gpa, io, &env, &b2, &bucket)) orelse return error.TestUnexpectedResult;
+        const inc = (try onBucket(gpa, gpa, io, &env, &b2, b_traffic, &bucket)) orelse return error.TestUnexpectedResult;
         defer freeIncoming(gpa, inc);
         try testing.expectEqualStrings("after a restart", inc.message.text);
     }
@@ -829,7 +882,7 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
         defer gpa.free(msg);
         var bucket: [relay.bucket_len]u8 = undefined;
         try bucketPack(&bucket, msg);
-        const inc = (try onBucket(gpa, gpa, io, &env, &a, &bucket)) orelse return error.TestUnexpectedResult;
+        const inc = (try onBucket(gpa, gpa, io, &env, &a, a_traffic, &bucket)) orelse return error.TestUnexpectedResult;
         defer freeIncoming(gpa, inc);
         try testing.expectEqualStrings("hi alice", inc.message.text);
     }
@@ -843,7 +896,7 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
         defer gpa.free(msg);
         var bucket: [relay.bucket_len]u8 = undefined;
         try bucketPack(&bucket, msg);
-        const inc = (try onBucket(gpa, gpa, io, &env, &b2, &bucket)) orelse return error.TestUnexpectedResult;
+        const inc = (try onBucket(gpa, gpa, io, &env, &b2, b_traffic, &bucket)) orelse return error.TestUnexpectedResult;
         defer freeIncoming(gpa, inc);
         try testing.expectEqualStrings(a.my_did, inc.typing.peer_did);
 
@@ -854,7 +907,7 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
         defer gpa.free(msg2);
         var bucket2: [relay.bucket_len]u8 = undefined;
         try bucketPack(&bucket2, msg2);
-        const inc2 = (try onBucket(gpa, gpa, io, &env, &b2, &bucket2)) orelse return error.TestUnexpectedResult;
+        const inc2 = (try onBucket(gpa, gpa, io, &env, &b2, b_traffic, &bucket2)) orelse return error.TestUnexpectedResult;
         defer freeIncoming(gpa, inc2);
         try testing.expectEqualStrings("after ping", inc2.message.text);
     }
@@ -876,7 +929,7 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
         defer gpa.free(msg);
         var bucket: [relay.bucket_len]u8 = undefined;
         try bucketPack(&bucket, msg);
-        const inc = (try onBucket(gpa, gpa, io, &env, &b2, &bucket)) orelse return error.TestUnexpectedResult;
+        const inc = (try onBucket(gpa, gpa, io, &env, &b2, b_traffic, &bucket)) orelse return error.TestUnexpectedResult;
         defer freeIncoming(gpa, inc);
         try testing.expectEqual(chat.Kind.payment_request, inc.payment.kind);
         try testing.expectEqual(@as(u64, 0xCAFE), inc.payment.id);
@@ -905,7 +958,7 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
         defer gpa.free(msg);
         var bucket: [relay.bucket_len]u8 = undefined;
         try bucketPack(&bucket, msg);
-        const inc = (try onBucket(gpa, gpa, io, &env, &b2, &bucket)) orelse return error.TestUnexpectedResult;
+        const inc = (try onBucket(gpa, gpa, io, &env, &b2, b_traffic, &bucket)) orelse return error.TestUnexpectedResult;
         defer freeIncoming(gpa, inc);
         try testing.expectEqual(chat.PayStatus.settled, inc.payment_update.status);
         try testing.expectEqual(@as(u64, 0xCAFE), inc.payment_update.id);
@@ -930,7 +983,7 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
         defer gpa.free(msg);
         var bucket: [relay.bucket_len]u8 = undefined;
         try bucketPack(&bucket, msg);
-        const inc = (try onBucket(gpa, gpa, io, &env, &b2, &bucket)) orelse return error.TestUnexpectedResult;
+        const inc = (try onBucket(gpa, gpa, io, &env, &b2, b_traffic, &bucket)) orelse return error.TestUnexpectedResult;
         defer freeIncoming(gpa, inc);
         try testing.expect(inc.payment.is_offer);
         try testing.expectEqual(chat.Kind.payment_sent, inc.payment.kind);
@@ -955,7 +1008,7 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
         defer gpa.free(msg);
         var bucket: [relay.bucket_len]u8 = undefined;
         try bucketPack(&bucket, msg);
-        const inc = (try onBucket(gpa, gpa, io, &env, &b2, &bucket)) orelse return error.TestUnexpectedResult;
+        const inc = (try onBucket(gpa, gpa, io, &env, &b2, b_traffic, &bucket)) orelse return error.TestUnexpectedResult;
         defer freeIncoming(gpa, inc);
         try testing.expectEqual(chat.PayStatus.ready, inc.payment_update.status);
         try testing.expectEqual(@as(u64, 0x0FFE), inc.payment_update.id);
@@ -970,10 +1023,10 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
         defer gpa.free(msg);
         var bucket: [relay.bucket_len]u8 = undefined;
         try bucketPack(&bucket, msg);
-        try testing.expect((try onBucket(gpa, gpa, io, &env, &b2, &bucket)) == null);
+        try testing.expect((try onBucket(gpa, gpa, io, &env, &b2, b_traffic, &bucket)) == null);
     }
 
     // A stranger's random bucket is dropped without a mark.
     var junk: [relay.bucket_len]u8 = @splat(0x5A);
-    try testing.expect((try onBucket(gpa, gpa, io, &env, &a, &junk)) == null);
+    try testing.expect((try onBucket(gpa, gpa, io, &env, &a, a.inbox, &junk)) == null);
 }
