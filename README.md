@@ -1,5 +1,7 @@
 # Zat4
 
+**[zat4.com](https://zat4.com)**
+
 Zat4 is a social network written from scratch in Zig — a native client, its own
 indexer, and its own account host, all speaking the AT Protocol, with zero
 third-party dependencies. The only linked library is libc. TLS comes from the

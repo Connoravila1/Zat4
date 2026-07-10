@@ -7390,9 +7390,9 @@ pub fn layoutChat(
     // included), so a long message builds lines inside the pane instead of
     // running off it; the thread above yields the space. Enter sends,
     // Shift+Enter breaks the line ('\n' in the draft is a real line).
-    const send_w: i32 = 84;
+    const send_w: i32 = if (phone) 46 else 84; // phone: a round send button
     // The pay button (M5 A4) sits left of the input; the input yields it room.
-    const pay_btn: i32 = 40;
+    const pay_btn: i32 = if (phone) 46 else 40;
     const input_x = detail_x + pay_btn + 8;
     const input_w = detail_w - send_w - 12 - pay_btn - 8;
     const input_line_h: i32 = 20;
@@ -7513,9 +7513,10 @@ pub fn layoutChat(
                 const bw = if (fits_one) one_w + 2 * pad_x else bub_max;
                 const bx = if (b.mine) detail_x + detail_w - bw else detail_x;
                 const fill: u32 = bubbleFill(accent, b.mine);
+                const bub_rad: u8 = if (phone) 17 else 14; // rounder on phone
                 if (!is_fly) {
                     if (b.tail) try bubbleTail(gpa, dl, b.mine, bx, by, bw, hh, fill);
-                    try rect(gpa, dl, bx, by, bw, hh, fill, 14);
+                    try rect(gpa, dl, bx, by, bw, hh, fill, bub_rad);
                     _ = try wrapBody(gpa, dl, e, bx + pad_x, by + pad_y + 12, bub_max - 2 * pad_x, ink, 14, b.body, line_h, true, null);
                 } else {
                     // THE MORPH. Spring physics, not easing: rise and scale
@@ -7541,7 +7542,7 @@ pub fn layoutChat(
                     const by_a = @as(i32, @intFromFloat(@round(bot_a))) - hh_a;
                     const fill_a = scaleAlpha(fill, fade);
                     if (b.tail) try bubbleTail(gpa, dl, b.mine, bx_a, by_a, bw_a, hh_a, fill_a);
-                    try rect(gpa, dl, bx_a, by_a, bw_a, hh_a, fill_a, 14);
+                    try rect(gpa, dl, bx_a, by_a, bw_a, hh_a, fill_a, bub_rad);
                     _ = try wrapBody(gpa, dl, e, bx + pad_x, by_a + pad_y + 12, bub_max - 2 * pad_x, scaleAlpha(ink, fade), 14, b.body, line_h, true, null);
                 }
             }
@@ -7549,7 +7550,17 @@ pub fn layoutChat(
         y += hh + gap;
     }
     if (thread.len == 0) {
-        _ = try str(gpa, dl, e, .regular, detail_x, thread_top + 20, faint, 14, "No messages yet — say hello");
+        if (phone) {
+            // Centred, calm, and the trust line where a first message begins.
+            const l1 = "End-to-end encrypted";
+            const w1: i32 = @intCast(text.measure(e, .semibold, l1, 12));
+            _ = try str(gpa, dl, e, .semibold, detail_x + @divTrunc(detail_w - w1, 2), thread_top + 34, faint, 12, l1);
+            const l2 = "No messages yet \u{2014} say hello";
+            const w2: i32 = @intCast(text.measure(e, .regular, l2, 14));
+            _ = try str(gpa, dl, e, .regular, detail_x + @divTrunc(detail_w - w2, 2), thread_top + 58, muted, 14, l2);
+        } else {
+            _ = try str(gpa, dl, e, .regular, detail_x, thread_top + 20, faint, 14, "No messages yet — say hello");
+        }
     }
 
     // The typing indicator (U6a): a counterparty-side bubble that grows in
@@ -7617,9 +7628,18 @@ pub fn layoutChat(
     // through the same wrap engine as the bubbles (soft wrap + hard
     // word-break + '\n' from Shift+Enter); the caret sits after the last
     // glyph and BREATHES when idle (caretAlpha — lit while typing).
-    try rect(gpa, dl, input_x, comp_y, input_w, comp_h, skinPanel(accent), 14);
-    try rect(gpa, dl, input_x, comp_y, input_w, 1, 0x14EDEAE0, 14);
-    if (input_focus) {
+    // Phone: the input is a PILL (the messenger grammar) — a rounded ring
+    // drawn as a slightly larger accent round-rect UNDER the fill, so focus
+    // reads as a true rounded outline (edge-line rects overhang a pill's
+    // corners). Desktop keeps the squarer field + edge-line ring.
+    const in_rad: u8 = if (phone) 23 else 14;
+    if (phone and input_focus) {
+        const ring_c = (0xC0 << 24) | (accent & 0x00FFFFFF);
+        try rect(gpa, dl, input_x - 1, comp_y - 1, input_w + 2, comp_h + 2, ring_c, 24);
+    }
+    try rect(gpa, dl, input_x, comp_y, input_w, comp_h, skinPanel(accent), in_rad);
+    try rect(gpa, dl, input_x, comp_y, input_w, 1, 0x14EDEAE0, in_rad);
+    if (!phone and input_focus) {
         // Focus ring: a one-pixel accent outline (the rounded fill draws
         // first, so four thin edge rects read as a ring at this radius).
         const ring_c = (0xC0 << 24) | (accent & 0x00FFFFFF);
@@ -7634,7 +7654,8 @@ pub fn layoutChat(
         caret_base = try wrapBodyPen(gpa, dl, e, input_x + 14, comp_y + 29, input_w - 28, ink, 14, draft, input_line_h, true, null, &caret_x, null, null) - input_line_h;
     } else {
         var pbuf: [96]u8 = undefined;
-        const ph = std.fmt.bufPrint(&pbuf, "Message {s}", .{peer}) catch "Message";
+        // Phone: plain "Message" — the peer already heads the app bar.
+        const ph = if (phone) "Message" else std.fmt.bufPrint(&pbuf, "Message {s}", .{peer}) catch "Message";
         try strEllipsis(gpa, dl, e, .regular, input_x + 14, comp_y + 29, faint, 14, ph, input_w - 28);
     }
     if (input_focus) {
@@ -7647,7 +7668,7 @@ pub fn layoutChat(
     // input's bottom edge like Send; accent-filled while the sheet is open.
     {
         const py = comp_y + comp_h - 46;
-        try rect(gpa, dl, detail_x, py, pay_btn, 46, if (pay.open) accent else skinPanel(accent), 14);
+        try rect(gpa, dl, detail_x, py, pay_btn, 46, if (pay.open) accent else skinPanel(accent), if (phone) 23 else 14);
         const bc: u32 = if (pay.open) 0xFF20201A else body_c;
         const bw2: i32 = @intCast(text.measure(e, .semibold, "B", 17));
         const bx2 = detail_x + @divTrunc(pay_btn - bw2, 2);
@@ -7656,13 +7677,21 @@ pub fn layoutChat(
         try rect(gpa, dl, bx2 + @divTrunc(bw2, 2) - 1, py + 31, 2, 4, bc, 0);
         try emitRegion(gpa, regions, detail_x, py, pay_btn, 46, 0, .pay_open);
     }
-    // Send pins to the input's bottom edge as the composer grows.
+    // Send pins to the input's bottom edge as the composer grows. Phone: a
+    // ROUND accent button with an up-arrow (the messenger grammar) — armed it
+    // fills accent, resting it sits as a quiet disc; the tap target stays 46.
     const sx = detail_x + detail_w - send_w;
     const sy = comp_y + comp_h - 46;
     const armed = draft.len > 0;
-    try rect(gpa, dl, sx, sy, send_w, 46, if (armed) accent else skinPanel(accent), 14);
-    const sw3: i32 = @intCast(text.measure(e, .semibold, "Send", 14));
-    _ = try str(gpa, dl, e, .semibold, sx + @divTrunc(send_w - sw3, 2), sy + 29, if (armed) 0xFF20201A else faint, 14, "Send");
+    if (phone) {
+        try rect(gpa, dl, sx, sy, send_w, 46, if (armed) accent else skinPanel(accent), 23);
+        const aw3: i32 = @intCast(text.measure(e, .semibold, "\u{2191}", 22));
+        _ = try str(gpa, dl, e, .semibold, sx + @divTrunc(send_w - aw3, 2), sy + 31, if (armed) 0xFF20201A else faint, 22, "\u{2191}");
+    } else {
+        try rect(gpa, dl, sx, sy, send_w, 46, if (armed) accent else skinPanel(accent), 14);
+        const sw3: i32 = @intCast(text.measure(e, .semibold, "Send", 14));
+        _ = try str(gpa, dl, e, .semibold, sx + @divTrunc(send_w - sw3, 2), sy + 29, if (armed) 0xFF20201A else faint, 14, "Send");
+    }
     try emitRegion(gpa, regions, sx, sy, send_w, 46, 0, .chat_send);
 
     // ── The pay sheet (M5 A4): compose a request or a send. Sits above the
