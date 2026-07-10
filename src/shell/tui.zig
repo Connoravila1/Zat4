@@ -95,6 +95,7 @@ const algorithm_shell = @import("algorithm.zig");
 // host in the network), so the inspect fetch must resolve the DID document's
 // service endpoint — never assume the session PDS (the cross-PDS install bug).
 const identity_shell = @import("identity.zig");
+const dist_config = @import("dist_config");
 const loadout_store = @import("loadout.zig");
 const effect_core = @import("../core/effect.zig");
 const clock_shell = @import("clock.zig");
@@ -1179,11 +1180,30 @@ fn initRunState(
     rs.gchat_mail = .empty;
     if (dev_chat) {
         if (environ) |env| {
-            if (env.get("ZAT4_RELAY")) |hostport| {
-                const token = env.get("ZAT_RELAY_TOKEN") orelse "";
+            // The endpoint + token: env wins; the compiled-in dist values are
+            // the fallback (a phone has no env vars — the AppView-token
+            // pattern). Two forms: "wss://host[:port]" = TLS via the public
+            // Caddy route (default port 443); "host:port" = the plaintext
+            // loopback/SSH-tunnel dev posture. No other cleartext path.
+            const raw_ep: []const u8 = env.get("ZAT4_RELAY") orelse dist_config.relay_url;
+            if (raw_ep.len > 0) {
+                const token = env.get("ZAT_RELAY_TOKEN") orelse dist_config.relay_token;
+                var use_tls = false;
+                var hostport = raw_ep;
+                if (std.mem.startsWith(u8, raw_ep, "wss://")) {
+                    use_tls = true;
+                    hostport = raw_ep["wss://".len..];
+                } else if (std.mem.startsWith(u8, raw_ep, "ws://")) {
+                    hostport = raw_ep["ws://".len..];
+                }
                 const colon = std.mem.lastIndexOfScalar(u8, hostport, ':');
-                const rhost = if (colon) |c| hostport[0..c] else "";
-                const rport = if (colon) |c| std.fmt.parseInt(u16, hostport[c + 1 ..], 10) catch 0 else 0;
+                const rhost = if (colon) |c| hostport[0..c] else hostport;
+                const rport: u16 = if (colon) |c|
+                    std.fmt.parseInt(u16, hostport[c + 1 ..], 10) catch 0
+                else if (use_tls)
+                    443
+                else
+                    0;
                 if (rport != 0 and token.len > 0 and rhost.len > 0) {
                     // Bring up the crypto (publishes our keyPackage, restores
                     // saved conversations), then the relay link subscribed to
@@ -1191,7 +1211,7 @@ fn initRunState(
                     _ = rs.gchat_arena_state.reset(.retain_capacity);
                     if (chat_e2ee.init(gpa, rs.gchat_arena_state.allocator(), io, env, session)) |st| {
                         rs.gchat_e2ee = st;
-                        rs.gchat_link = chat_relay.start(gpa, io, &rs.gchat_box, rhost, rport, token, st.inbox) catch null;
+                        rs.gchat_link = chat_relay.start(gpa, io, &rs.gchat_box, rhost, rport, token, use_tls, st.inbox) catch null;
                         // Restore the displayed history (M2) first. A missing
                         // or corrupt blob is a cold start, never a half-restore
                         // (the codec is strict) — the mirror below still
@@ -3233,6 +3253,40 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     },
                     else => {},
                 };
+                // ACTION_CANCEL: the OS claimed the in-flight gesture (the back
+                // edge, the notification shade). Reset the whole machine — no tap
+                // fires, a held card is dropped in place, the drawer settles from
+                // wherever the finger left it. Before this, the cancel was simply
+                // DROPPED and the pump kept a phantom finger.
+                if (m.touch_cancel) {
+                    m.touch_cancel = false;
+                    m.down_x = -1;
+                    m.down_y = -1;
+                    m.scrolling = false;
+                    m.drag_y = -1;
+                    m.socket_swipe = false;
+                    m.over_px = 0;
+                    m.fling_v = 0;
+                    if (m.hswipe) {
+                        m.hswipe = false;
+                        if (rs.gpu_state) |*gsd| {
+                            gsd.drawer_drag = false;
+                            gsd.drawer_want = gesture.settleOpen(gsd.drawer_t, 0);
+                        }
+                    }
+                    if (m.hold_fired) {
+                        m.hold_fired = false;
+                        rs.gbench_drag = null;
+                        if (rs.page_drag_surface) |cps| {
+                            switch (cps) {
+                                1 => rs.reply_ui.drag_active = null,
+                                2 => rs.zone_ui.drag_active = null,
+                                else => rs.gsocket_ui.drag_active = null,
+                            }
+                            rs.page_drag_surface = null;
+                        }
+                    }
+                }
                 // SYSTEM BACK (the Pixel edge swipe / back button, ferried by the
                 // activity's key drain): pop one level of in-app navigation; with
                 // nothing left to pop, flag the activity to step the task back to
@@ -6051,6 +6105,12 @@ pub fn mobileImeWanted(mr: *MobileRun) bool {
 /// which pops one level of in-app navigation on the next frame.
 pub fn mobileBack(mr: *MobileRun) void {
     mr.host.back_pending = true;
+}
+
+/// ACTION_CANCEL: the OS claimed the in-flight gesture — the pump resets its
+/// touch machine (no tap, no drop, the drawer settles from where it is).
+pub fn mobileTouchCancel(mr: *MobileRun) void {
+    mr.host.touch_cancel = true;
 }
 
 /// Did the last back-pop find NOTHING to pop (read-and-clear)? True tells the

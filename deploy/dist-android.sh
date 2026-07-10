@@ -20,7 +20,12 @@ PLATFORM="${ANDROID_PLATFORM_JAR:-$HOME/android-sdk/android-34/android.jar}"
 JAVA="${JAVA:-$HOME/jre/bin/java}"
 KEYTOOL="${KEYTOOL:-$HOME/jre/bin/keytool}"
 
-"$ZIG" build libzat -Doptimize=ReleaseSafe -Dandroid-ndk="$NDK" -Dappview-token="$ZAT_APPVIEW_TOKEN"
+# The chat relay endpoint + token (optional): baked like the AppView token —
+# a phone has no env vars. ZAT_RELAY_URL is the public wss:// route; unset =
+# chat stays offline on the phone (the honest empty surface).
+RELAY_ARGS=""
+if [ -n "${ZAT_RELAY_URL:-}" ]; then RELAY_ARGS="-Drelay-url=$ZAT_RELAY_URL -Drelay-token=${ZAT_RELAY_TOKEN:?ZAT_RELAY_URL set but ZAT_RELAY_TOKEN missing}"; fi
+"$ZIG" build libzat -Doptimize=ReleaseSafe -Dandroid-ndk="$NDK" -Dappview-token="$ZAT_APPVIEW_TOKEN" $RELAY_ARGS
 
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT

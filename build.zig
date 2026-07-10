@@ -57,6 +57,14 @@ pub fn build(b: *std.Build) void {
     const dist = b.option(bool, "dist", "Distribution build: fence dev credential env vars (in-app login only)") orelse false;
     const dist_opts = b.addOptions();
     dist_opts.addOption([]const u8, "appview_token", appview_token);
+    // The chat relay endpoint + token for distributed builds (a phone has no
+    // env vars). Same posture as the AppView token: default empty = env-only;
+    // the env always wins when present. "wss://host[/…]" = TLS via the public
+    // Caddy route; "host:port" = the plaintext SSH-tunnel dev posture.
+    const relay_url = b.option([]const u8, "relay-url", "Compiled-in chat relay endpoint (default: empty = env-only)") orelse "";
+    const relay_token = b.option([]const u8, "relay-token", "Compiled-in chat relay service token (default: empty = env-only)") orelse "";
+    dist_opts.addOption([]const u8, "relay_url", relay_url);
+    dist_opts.addOption([]const u8, "relay_token", relay_token);
     dist_opts.addOption(bool, "dist", dist);
     exe_mod.addOptions("dist_config", dist_opts);
 

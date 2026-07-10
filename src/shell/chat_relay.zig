@@ -35,12 +35,18 @@
 //! the Mailbox. Outbound deposits are queued by the render thread and
 //! flushed by the worker; a refusal comes back as mail, not silence (E3).
 //!
-//! Trust posture of the dial: the relay endpoint is OPERATOR CONFIG (env),
-//! the same trusted class as the AppView tunnel and the jetstream host —
-//! netguard's SSRF verdicts apply to attacker-influenced URLs, not here
-//! (core/netguard.zig's own header draws exactly this line). v1 dials
-//! plaintext TCP: the deployed relay is reached through the SSH tunnel,
-//! the AppView's existing posture; TLS-to-Caddy is the recorded upgrade.
+//! Trust posture of the dial: the relay endpoint is OPERATOR CONFIG (env or
+//! the compiled-in dist value), the same trusted class as the AppView and
+//! jetstream hosts — netguard's SSRF verdicts apply to attacker-influenced
+//! URLs, not here (core/netguard.zig's own header draws exactly this line).
+//! TRANSPORT: `use_tls` rides stream.zig's device-proven TLS dial (WebPKI
+//! verification against the host, fail-closed — a refused handshake is a
+//! reconnect-with-backoff, never a cleartext fallback). Plaintext TCP remains
+//! ONLY the loopback/SSH-tunnel dev posture. The buckets inside are MLS
+//! ciphertext either way (defense in depth); what TLS adds on the public
+//! route is token secrecy + wire-metadata cover. Fixed-size buckets stay
+//! fixed-size inside TLS records — no new length signal (METADATA_PRIVACY
+//! audit invariant). The service token is never logged.
 //!
 //! This module carries OPAQUE bytes only: it neither packs nor reads the
 //! bucket payload. `shell/chat_e2ee.zig` frames the MLS ciphertext into the
@@ -140,6 +146,8 @@ pub const ChatRelay = struct {
     host: []const u8,
     port: u16,
     token: []const u8,
+    /// TLS to the public Caddy route; false = the loopback/tunnel dev dial.
+    use_tls: bool,
     /// The one mailbox this client drains (ours).
     sub: [relay.mailbox_id_len]u8,
     /// Outbound deposits, render thread → worker (spinlock hand-off).
@@ -155,6 +163,7 @@ pub fn start(
     host: []const u8,
     port: u16,
     token: []const u8,
+    use_tls: bool,
     sub: [relay.mailbox_id_len]u8,
 ) !*ChatRelay {
     const cr = try gpa.create(ChatRelay);
@@ -173,6 +182,7 @@ pub fn start(
         .host = host_copy,
         .port = port,
         .token = token_copy,
+        .use_tls = use_tls,
         .sub = sub,
         .out_locked = .init(false),
         .outbox = .empty,
@@ -264,27 +274,21 @@ fn runConnection(cr: *ChatRelay, healthy: *bool) !void {
     const gpa = cr.gpa;
     const io = cr.io;
 
-    // Dial (operator-configured endpoint — see the header's trust note).
-    var tcp: std.Io.net.Stream = blk: {
-        if (std.Io.net.IpAddress.resolve(io, cr.host, cr.port)) |address| {
-            var addr = address;
-            break :blk try addr.connect(io, .{ .mode = .stream });
-        } else |_| {}
-        const name = try std.Io.net.HostName.init(cr.host);
-        break :blk try name.connect(io, cr.port, .{ .mode = .stream });
-    };
+    // Dial (operator-configured endpoint — see the header's trust note):
+    // stream.zig's shared TLS-capable connection. Fail-closed by shape — a
+    // refused TLS handshake errors out of this attempt into the backoff;
+    // there is no cleartext fallback path.
+    var conn: stream_shell.Conn = undefined;
+    try stream_shell.dialConn(gpa, io, cr.host, cr.port, cr.use_tls, &conn);
     defer {
         _ = cr.socket_fd.swap(-1, .acq_rel);
-        tcp.close(io);
+        conn.tcp.close(io);
+        for (conn.bufs) |buf| gpa.free(buf);
     }
-    cr.socket_fd.store(stream_shell.handleToI64(tcp.socket.handle), .release);
+    cr.socket_fd.store(stream_shell.handleToI64(conn.tcp.socket.handle), .release);
 
-    var read_buf: [16 * 1024]u8 = undefined;
-    var write_buf: [8 * 1024]u8 = undefined;
-    var tcp_reader = tcp.reader(io, &read_buf);
-    var tcp_writer = tcp.writer(io, &write_buf);
-    const reader = &tcp_reader.interface;
-    const writer = &tcp_writer.interface;
+    const reader = conn.reader();
+    const writer = conn.writer();
 
     // --- Handshake. Emitted directly (not websocket.buildHandshake): the
     // relay's upgrade carries the Authorization service token, which the
@@ -306,7 +310,7 @@ fn runConnection(cr: *ChatRelay, healthy: *bool) !void {
         .{ cr.host, key, cr.token },
     ) catch return error.HandshakeRefused;
     try writer.writeAll(request);
-    try writer.flush();
+    try conn.flushOut();
 
     var response_buf: [4096]u8 = undefined;
     var response_len: usize = 0;
@@ -333,7 +337,7 @@ fn runConnection(cr: *ChatRelay, healthy: *bool) !void {
     // Subscribe (re-armed on every reconnect; the server re-delivers unacked).
     {
         var sub_op: [relay.subscribe_frame_len]u8 = undefined;
-        try sendFrame(cr, writer, .binary, relay.buildSubscribe(&sub_op, cr.sub));
+        try sendFrame(cr, &conn, .binary, relay.buildSubscribe(&sub_op, cr.sub));
     }
     cr.mailbox.push(gpa, .{ .status = "relay: connected" });
     healthy.* = true;
@@ -352,7 +356,7 @@ fn runConnection(cr: *ChatRelay, healthy: *bool) !void {
         while (pending_out.items.len > 0) {
             const out = pending_out.items[0];
             var dep_op: [relay.deposit_frame_len]u8 = undefined;
-            try sendFrame(cr, writer, .binary, relay.buildDeposit(&dep_op, out.id, out.blob));
+            try sendFrame(cr, &conn, .binary, relay.buildDeposit(&dep_op, out.id, out.blob));
             gpa.destroy(out.blob);
             _ = pending_out.orderedRemove(0);
         }
@@ -372,12 +376,12 @@ fn runConnection(cr: *ChatRelay, healthy: *bool) !void {
                         const copy = try gpa.dupe(u8, d.blob);
                         cr.mailbox.push(gpa, .{ .blob = copy });
                         var ack_op: [relay.ack_frame_len]u8 = undefined;
-                        try sendFrame(cr, writer, .binary, relay.buildAck(&ack_op, d.id));
+                        try sendFrame(cr, &conn, .binary, relay.buildAck(&ack_op, d.id));
                     },
                     .deposit_ok => {},
                     .refused => |r| cr.mailbox.push(gpa, .{ .refused = r }),
                 },
-                .ping => try sendFrame(cr, writer, .pong, decoded.frame.payload),
+                .ping => try sendFrame(cr, &conn, .pong, decoded.frame.payload),
                 .close => return error.ConnectionClosed,
                 .pong => {},
                 else => return error.ProtocolViolation,
@@ -393,7 +397,7 @@ fn runConnection(cr: *ChatRelay, healthy: *bool) !void {
         // responsiveness only; if userspace already buffers bytes, read now.
         if (reader.bufferedLen() == 0) {
             const ready: usize = if (comptime builtin.os.tag == .windows) 1 else blk: {
-                var pfds = [_]posix.pollfd{.{ .fd = tcp.socket.handle, .events = posix.POLL.IN, .revents = 0 }};
+                var pfds = [_]posix.pollfd{.{ .fd = conn.tcp.socket.handle, .events = posix.POLL.IN, .revents = 0 }};
                 break :blk posix.poll(&pfds, 250) catch 0;
             };
             if (ready == 0) {
@@ -402,7 +406,7 @@ fn runConnection(cr: *ChatRelay, healthy: *bool) !void {
                 idle_ms += 250;
                 if (sent_ping and idle_ms >= 60_000) return error.PingUnanswered;
                 if (!sent_ping and idle_ms >= 30_000) {
-                    try sendFrame(cr, writer, .ping, "");
+                    try sendFrame(cr, &conn, .ping, "");
                     sent_ping = true;
                 }
                 continue;
@@ -413,16 +417,17 @@ fn runConnection(cr: *ChatRelay, healthy: *bool) !void {
     }
 }
 
-fn sendFrame(cr: *ChatRelay, writer: *std.Io.Writer, opcode: websocket.Opcode, payload: []const u8) !void {
+fn sendFrame(cr: *ChatRelay, conn: *stream_shell.Conn, opcode: websocket.Opcode, payload: []const u8) !void {
     var mask: [4]u8 = undefined;
     fillRandom(cr.io, &mask);
     var frame_buf: [relay.deposit_frame_len + websocket.max_header_len]u8 = undefined;
     const frame = websocket.encodeFrame(&frame_buf, opcode, payload, mask) catch return error.ProtocolViolation;
-    try writer.writeAll(frame);
-    try writer.flush();
+    try conn.writer().writeAll(frame);
+    try conn.flushOut(); // through the TLS layer to the wire, not just staged
 }
 
-/// The stream.zig read idiom (local copy; plaintext TCP, no TLS layer).
+/// The stream.zig read idiom (local copy) — works on the plain AND the TLS
+/// reader alike: fillMore on the TLS interface decrypts into its buffer.
 fn readAvailable(reader: *std.Io.Reader, dst: []u8) error{ReadFailed}!?usize {
     while (reader.bufferedLen() == 0) {
         reader.fillMore() catch |err| switch (err) {
@@ -480,9 +485,9 @@ test "chat_relay loopback: two clients exchange an opaque bucket through the rea
     var bob_box: Mailbox = .{};
     defer bob_box.deinit(gpa);
 
-    const alice = try start(gpa, io, &alice_box, "127.0.0.1", port, "u5-test-token", alice_box_id);
+    const alice = try start(gpa, io, &alice_box, "127.0.0.1", port, "u5-test-token", false, alice_box_id);
     defer shutdown(alice);
-    const bob = try start(gpa, io, &bob_box, "127.0.0.1", port, "u5-test-token", bob_box_id);
+    const bob = try start(gpa, io, &bob_box, "127.0.0.1", port, "u5-test-token", false, bob_box_id);
     defer shutdown(bob);
 
     // Alice → Bob: deposit the bucket to Bob's mailbox.

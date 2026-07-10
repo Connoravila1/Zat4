@@ -429,8 +429,10 @@ fn readAvailable(reader: *std.Io.Reader, dst: []u8) error{ReadFailed}!?usize {
     return n;
 }
 
-const Conn = struct {
+pub const Conn = struct {
     // A7.2: cold struct, size guard waived — one per connection attempt.
+    // Pub for chat_relay.zig: the relay client rides this exact TLS-capable
+    // connection (D2 — one deep dial, not a second copy of the TLS carving).
 
     tcp: std.Io.net.Stream,
     tcp_reader: std.Io.net.Stream.Reader,
@@ -438,11 +440,11 @@ const Conn = struct {
     tls: ?std.crypto.tls.Client,
     bufs: [4][]u8,
 
-    fn reader(conn: *Conn) *std.Io.Reader {
+    pub fn reader(conn: *Conn) *std.Io.Reader {
         if (conn.tls) |*client| return &client.reader;
         return &conn.tcp_reader.interface;
     }
-    fn writer(conn: *Conn) *std.Io.Writer {
+    pub fn writer(conn: *Conn) *std.Io.Writer {
         if (conn.tls) |*client| return &client.writer;
         return &conn.tcp_writer.interface;
     }
@@ -450,7 +452,7 @@ const Conn = struct {
     /// Flush all the way to the wire. The TLS writer's flush only STAGES
     /// ciphertext into the socket writer's buffer — the socket writer must
     /// then be flushed itself, or the bytes never leave the process.
-    fn flushOut(conn: *Conn) !void {
+    pub fn flushOut(conn: *Conn) !void {
         try conn.writer().flush();
         if (conn.tls != null) try conn.tcp_writer.interface.flush();
     }
@@ -669,13 +671,13 @@ fn sendFrame(stream: *Stream, conn: *Conn, opcode: websocket.Opcode, payload: []
 // snapshots; roadmap caution 1a)
 // ---------------------------------------------------------------------------
 
-fn dialTcp(stream: *Stream) !std.Io.net.Stream {
-    if (std.Io.net.IpAddress.resolve(stream.io, stream.host, stream.port)) |address| {
+fn dialTcp(io: std.Io, host: []const u8, port: u16) !std.Io.net.Stream {
+    if (std.Io.net.IpAddress.resolve(io, host, port)) |address| {
         var addr = address;
-        return addr.connect(stream.io, .{ .mode = .stream });
+        return addr.connect(io, .{ .mode = .stream });
     } else |_| {}
-    const name = try std.Io.net.HostName.init(stream.host);
-    return name.connect(stream.io, stream.port, .{ .mode = .stream });
+    const name = try std.Io.net.HostName.init(host);
+    return name.connect(io, port, .{ .mode = .stream });
 }
 
 /// Fills `conn` in place: the TLS client captures pointers to the tcp
@@ -684,9 +686,14 @@ fn dialTcp(stream: *Stream) !std.Io.net.Stream {
 /// Conn by value moved those interfaces and left the TLS client pointing
 /// into a dead frame; std's http.Client pins the same way, on the heap.)
 fn dial(stream: *Stream, conn: *Conn) !void {
-    const gpa = stream.gpa;
-    const io = stream.io;
+    return dialConn(stream.gpa, stream.io, stream.host, stream.port, stream.use_tls, conn);
+}
 
+/// The parameterized dial — pub for chat_relay.zig (the same TLS-capable
+/// connection the jetstream leg is device-proven on). Fills `conn` in place;
+/// the caller owns its storage for the connection's lifetime and frees
+/// `conn.bufs` after close.
+pub fn dialConn(gpa: Allocator, io: std.Io, host: []const u8, port: u16, use_tls: bool, conn: *Conn) !void {
     // Buffer sizes mirror std http.Client's own TLS carving exactly: the
     // SOCKET writer and reader get precisely `min_buffer_len` (the tls
     // flush stages whole ciphertext records there and its accounting
@@ -710,7 +717,7 @@ fn dial(stream: *Stream, conn: *Conn) !void {
         allocated += 1;
     }
 
-    const tcp = try dialTcp(stream);
+    const tcp = try dialTcp(io, host, port);
     errdefer tcp.close(io);
 
     conn.* = .{
@@ -722,17 +729,17 @@ fn dial(stream: *Stream, conn: *Conn) !void {
     };
     conn.tcp_reader = conn.tcp.reader(io, bufs[0]);
     conn.tcp_writer = conn.tcp.writer(io, bufs[1]);
-    if (stream.use_tls) conn.tls = try dialTls(stream, conn, bufs[2], bufs[3]);
+    if (use_tls) conn.tls = try dialTls(gpa, io, host, conn, bufs[2], bufs[3]);
 }
 
 fn dialTls(
-    stream: *Stream,
+    gpa: Allocator,
+    io: std.Io,
+    host: []const u8,
     conn: *Conn,
     tls_read_buf: []u8,
     tls_write_buf: []u8,
 ) !std.crypto.tls.Client {
-    const gpa = stream.gpa;
-    const io = stream.io;
     const Options = std.crypto.tls.Client.Options;
 
     const now_sec: i64 = clock.unixSeconds();
@@ -762,7 +769,7 @@ fn dialTls(
             &conn.tcp_reader.interface,
             &conn.tcp_writer.interface,
             .{
-                .host = .{ .explicit = stream.host },
+                .host = .{ .explicit = host },
                 .ca = .{ .bundle = ca_bundle },
                 .read_buffer = tls_read_buf,
                 .write_buffer = tls_write_buf,
@@ -775,7 +782,7 @@ fn dialTls(
             &conn.tcp_reader.interface,
             &conn.tcp_writer.interface,
             .{
-                .host = .{ .explicit = stream.host },
+                .host = .{ .explicit = host },
                 .ca = .{ .bundle = .{
                     .gpa = gpa,
                     .io = io,

@@ -127,6 +127,7 @@ const action_mask: i32 = 0xff;
 const action_down: i32 = 0;
 const action_up: i32 = 1;
 const action_move: i32 = 2;
+const action_cancel: i32 = 3; // the system claimed the gesture (back edge, shade)
 const key_action_down: i32 = 0;
 const akeycode_back: i32 = 4; // AKEYCODE_BACK — the system back gesture/button
 const meta_shift_on: i32 = 0x1;
@@ -187,10 +188,13 @@ const jobject = ?*anyopaque;
 const jclass = jobject;
 const jstring = jobject;
 const jmethodID = ?*anyopaque;
+// A7.2 (FFI): layout is the JVM ABI's, not ours; waived.
 const jvalue = extern union { l: jobject, z: u8, i: i32, j: i64 };
 
+// A7.2 (FFI): layout is the JVM ABI's, not ours; waived.
 const JniTable = extern struct { slots: [233]?*const anyopaque };
 const JniEnv = *const *const JniTable;
+// A7.2 (FFI): layout is the JVM ABI's, not ours; waived.
 const VmTable = extern struct { slots: [8]?*const anyopaque };
 const JavaVm = *const *const VmTable;
 
@@ -362,6 +366,28 @@ fn imeSetVisible(activity: *Activity, show: bool) void {
     const decor = jniCallObj(env, window, get_decor, &no_args) orelse return;
 
     if (show) {
+        // MODERN PATH (API 30+): WindowInsetsController.show(ime()) — needs no
+        // focused editor AND carries no FORCED semantics. The old SHOW_FORCED
+        // show marked the IME "user-forced, don't auto-dismiss", which made the
+        // system's back-GESTURE dismissal commit as a no-op — the on-device
+        // "takes two swipes to close the keyboard" (2026-07-09; a back KEY
+        // event still hid it, which is why the adb repro passed first try).
+        modern: {
+            const gic = jniMethod(env, decor, "getWindowInsetsController", "()Landroid/view/WindowInsetsController;") orelse break :modern;
+            const ctrl = jniCallObj(env, decor, gic, &no_args) orelse break :modern;
+            const type_cls = jniFn(env, jni_find_class, FindClassFn)(env, "android/view/WindowInsets$Type");
+            if (jniFailed(env) or type_cls == null) break :modern;
+            const ime_mid = jniFn(env, jni_get_static_method_id, GetMethodIdFn)(env, type_cls, "ime", "()I");
+            if (jniFailed(env) or ime_mid == null) break :modern;
+            const ime_mask = jniFn(env, jni_call_static_int_method_a, CallStaticIntMethodAFn)(env, type_cls, ime_mid, &no_args);
+            if (jniFailed(env)) break :modern;
+            const show_mid = jniMethod(env, ctrl, "show", "(I)V") orelse break :modern;
+            jniFn(env, jni_call_void_method_a, CallVoidMethodAFn)(env, ctrl, show_mid, &[_]jvalue{.{ .i = ime_mask }});
+            if (jniFailed(env)) break :modern;
+            seam.logcat("ime: shown (insets controller)", .{});
+            return;
+        }
+        // Fallback (pre-30): the old forced show — better than no keyboard.
         const show_mid = jniMethod(env, imm, "showSoftInput", "(Landroid/view/View;I)Z") orelse return;
         const shown = call_bool(env, imm, show_mid, &[_]jvalue{ .{ .l = decor }, .{ .i = 2 } }); // 2 = SHOW_FORCED
         if (jniFailed(env)) return seam.logcat("ime: showSoftInput threw", .{});
@@ -735,9 +761,14 @@ fn renderThread() void {
                         action_down => 0,
                         action_move => 1,
                         action_up => 2,
-                        else => 3,
+                        // CANCEL is forwarded too: the system claims the touch
+                        // stream mid-gesture (the back edge, the shade) and the
+                        // machine must RESET — dropped, it left a phantom finger
+                        // (down with no up) in the pump's state.
+                        action_cancel => 3,
+                        else => 4,
                     };
-                    if (kind != 3) {
+                    if (kind != 4) {
                         seam.zat_touch(ctx, kind, AMotionEvent_getX(e, 0), AMotionEvent_getY(e, 0));
                         handled = 1;
                     }

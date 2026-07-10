@@ -251,6 +251,11 @@ fn touch(ctx: *Ctx, kind: u32, x_px: f32, y_px: f32) void {
     // Field-only mode keeps the splash.
     if (comptime mobile_config.have_gpu) {
         if (ctx.feed) |*f| {
+            if (kind == 3) {
+                // ACTION_CANCEL: the OS claimed the gesture — reset, never a tap.
+                tui.mobileTouchCancel(f.run);
+                return;
+            }
             const ev: layout_core.InputEvent = .{
                 .x = @intFromFloat(std.math.clamp(x_px, 0, 65535)),
                 .y = @intFromFloat(std.math.clamp(y_px, 0, 65535)),

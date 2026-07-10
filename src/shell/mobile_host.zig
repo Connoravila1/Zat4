@@ -131,6 +131,9 @@ pub const MobileHost = struct {
     /// the Android convention; the process and feed stay hot for the return.
     back_pending: bool = false,
     minimize_pending: bool = false,
+    /// The OS claimed the in-flight gesture (ACTION_CANCEL — back edge, shade):
+    /// the pump resets its touch machine without firing a tap or a drop.
+    touch_cancel: bool = false,
     /// One pending haptic tick, set by the pump the frame a threshold is
     /// CROSSED during a drag (GESTURE_SYSTEM_ROADMAP §3 — the tick lands
     /// under the finger, never on release) and taken (read-and-clear) by the
