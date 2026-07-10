@@ -7219,6 +7219,9 @@ pub fn layoutChat(
     xforms: []const BubbleXform,
     /// The "set up your receive address" sheet; `.{}` = closed.
     recv: ChatReceiveSheet,
+    /// Safe-area insets (logical px): the phone shape shifts its headers below
+    /// the status bar and lifts the composer above the home pill. Desktop: zero.
+    insets: EdgeInsets,
 ) error{OutOfMemory}!i32 {
     const m: Metrics = if (pane_geom) |g|
         .{ .rail_x = g.rail_x, .col_x = g.col_x, .col_w = g.col_w, .lx = g.lx, .cw = g.cw, .side_x = g.side_x, .wide = g.wide }
@@ -7237,22 +7240,44 @@ pub fn layoutChat(
 
     const x0 = m.lx;
     const w = m.cw;
-    const top: i32 = if (m.wide) 40 else 30;
-    const list_w: i32 = std.math.clamp(@divTrunc(w * 34, 100), 220, 320);
+    // ── THE PHONE SHAPE: single-pane (this surface must carry a standalone
+    // app one day — the desktop master–detail squeezed into 430px read as
+    // half-broken). No conversation open → the LIST fills the column, a
+    // proper front page. A conversation open → the THREAD fills it,
+    // immersive: the shell hides the tab bar; the header's back chevron or
+    // the system back returns to the list. ──
+    const phone = width <= phone_max;
+    const phone_thread = phone and peer.len > 0;
+    const top: i32 = if (phone) insets.top + 18 else if (m.wide) 40 else 30;
+    const list_w: i32 = if (phone) w else std.math.clamp(@divTrunc(w * 34, 100), 220, 320);
     const split_gap: i32 = 28;
-    const detail_x = x0 + list_w + split_gap;
-    const detail_w = w - list_w - split_gap;
+    const detail_x = if (phone) x0 else x0 + list_w + split_gap;
+    const detail_w = if (phone) w else w - list_w - split_gap;
     // The split divider runs the full pane height: the two columns each own
     // their chrome now (list header left, peer header right), so the seam is
-    // the page's one structural line.
-    try rect(gpa, dl, detail_x - @divTrunc(split_gap, 2), top - 10, 1, height - top - 20, divider, 0);
+    // the page's one structural line. (Desktop only — the phone is one pane.)
+    if (!phone) try rect(gpa, dl, detail_x - @divTrunc(split_gap, 2), top - 10, 1, height - top - 20, divider, 0);
 
     // ── Left column header: the page title, "+ New" under it, and the E2EE
     // honesty line — all fitted to the LIST column so the thread column keeps
     // its full height for messages (the owner's reorg: the old full-width
     // banner block cost the thread ~130px of chrome). ──
-    _ = try str(gpa, dl, e, .semibold, x0, top + 22, ink, 24, "Zat Chat");
-    {
+    if (phone_thread) {
+        // The open thread owns the whole phone pane — no list chrome at all;
+        // jump straight to the thread section below.
+    } else if (phone) {
+        // The front page: a big title with the new-conversation button as a
+        // round accent-ready control at the right — the standalone-app face.
+        _ = try str(gpa, dl, e, .semibold, x0, top + 36, ink, 30, "Zat Chat");
+        const nb: i32 = 42;
+        const nx = x0 + w - nb;
+        const ny = top + 4;
+        try rect(gpa, dl, nx, ny, nb, nb, if (composing) accent else skinPanel(accent), 21);
+        const plw: i32 = @intCast(text.measure(e, .semibold, "+", 24));
+        _ = try str(gpa, dl, e, .semibold, nx + @divTrunc(nb - plw, 2), ny + 29, if (composing) 0xFF20201A else body_c, 24, "+");
+        try emitRegion(gpa, regions, nx - 6, ny - 6, nb + 12, nb + 12, 0, .chat_new);
+    } else {
+        _ = try str(gpa, dl, e, .semibold, x0, top + 22, ink, 24, "Zat Chat");
         const label = "+ New";
         const lw: i32 = @intCast(text.measure(e, .semibold, label, 14));
         const pill_w = lw + 28;
@@ -7266,8 +7291,11 @@ pub fn layoutChat(
     // full, the mechanism suffix ellipsized to whatever the column spares.
     // It names only what ships — content secrecy — never metadata privacy
     // against a global observer (vision §8).
-    const ban_y = top + 74;
+    const ban_y = if (phone) top + 62 else top + 74;
     const ban_h: i32 = 22;
+    if (phone_thread) {
+        // No list chrome in the open thread; fall through to the thread pane.
+    } else {
     try rect(gpa, dl, x0, ban_y, list_w, ban_h, skinPanel(accent), 8);
     try rect(gpa, dl, x0, ban_y, 3, ban_h, (0xC0 << 24) | (accent & 0x00FFFFFF), 1);
     const ban_pen = try str(gpa, dl, e, .semibold, x0 + 12, ban_y + 15, ink, 11, "End-to-end encrypted");
@@ -7305,54 +7333,59 @@ pub fn layoutChat(
         body_y += 24;
     }
 
-    // ── Left: the conversation list (avatar + name + preview / age + unread). ──
-    const row_h: i32 = 64;
+    // ── Left: the conversation list (avatar + name + preview / age + unread).
+    // Phone rows breathe: taller, bigger avatar, a hairline between rows. ──
+    const row_h: i32 = if (phone) 78 else 64;
     var ly = body_y;
     if (list.len == 0) {
         _ = try str(gpa, dl, e, .regular, x0, body_y + 24, faint, 14, "No conversations yet");
     }
     for (list, 0..) |row, i| {
-        const on = i == sel;
+        const on = !phone and i == sel; // no persistent selection wash on phone
         if (on) try rect(gpa, dl, x0, ly, list_w, row_h - 6, (0x1F << 24) | (accent & 0x00FFFFFF), 12);
-        const av: i32 = 40;
-        try rect(gpa, dl, x0 + 10, ly + 9, av, av, tintFor(row.name), 20);
+        const av: i32 = if (phone) 50 else 40;
+        const av_y = ly + @divTrunc(row_h - 6 - av, 2);
+        try rect(gpa, dl, x0 + 10, av_y, av, av, tintFor(row.name), @intCast(@divTrunc(av, 2)));
         const ini = [1]u8{initialOf(row.name)};
-        const iw: i32 = @intCast(text.measure(e, .semibold, &ini, 18));
-        _ = try str(gpa, dl, e, .semibold, x0 + 10 + @divTrunc(av - iw, 2), ly + 36, 0xFF20201A, 18, &ini);
+        const ini_px: u16 = if (phone) 21 else 18;
+        const iw: i32 = @intCast(text.measure(e, .semibold, &ini, ini_px));
+        _ = try str(gpa, dl, e, .semibold, x0 + 10 + @divTrunc(av - iw, 2), av_y + @divTrunc(av, 2) + 7, 0xFF20201A, ini_px, &ini);
         const right = x0 + list_w - 12;
         if (row.age.len > 0) {
             const aw: i32 = @intCast(text.measure(e, .regular, row.age, 12));
-            _ = try str(gpa, dl, e, .regular, right - aw, ly + 26, faint, 12, row.age);
+            _ = try str(gpa, dl, e, .regular, right - aw, ly + @as(i32, if (phone) 30 else 26), faint, 12, row.age);
         }
         if (row.unread > 0) {
             var nbuf: [8]u8 = undefined;
             const ns = std.fmt.bufPrint(&nbuf, "{d}", .{@min(row.unread, 99)}) catch "99";
             const nw: i32 = @intCast(text.measure(e, .semibold, ns, 12));
             const pw = nw + 14;
-            try rect(gpa, dl, right - pw, ly + 34, pw, 20, accent, 10);
-            _ = try str(gpa, dl, e, .semibold, right - pw + 7, ly + 48, 0xFF20201A, 12, ns);
+            try rect(gpa, dl, right - pw, ly + @as(i32, if (phone) 40 else 34), pw, 20, accent, 10);
+            _ = try str(gpa, dl, e, .semibold, right - pw + 7, ly + @as(i32, if (phone) 54 else 48), 0xFF20201A, 12, ns);
         }
-        const tx = x0 + 10 + av + 12;
+        const tx = x0 + 10 + av + 14;
         const tw = right - 46 - tx; // clear of the age column
-        try strEllipsis(gpa, dl, e, .semibold, tx, ly + 26, if (on) ink else body_c, 15, row.name, tw);
+        try strEllipsis(gpa, dl, e, .semibold, tx, ly + @as(i32, if (phone) 30 else 26), if (on) ink else body_c, @as(u16, if (phone) 16 else 15), row.name, tw);
         if (row.preview.len > 0) {
-            // Unread conversations keep their preview bright (the iOS cue).
+            // Unread conversations keep their preview bright (the classic cue).
             const pw: text.Weight = if (row.unread > 0) .semibold else .regular;
             const pc: u32 = if (row.unread > 0) body_c else muted;
-            try strEllipsis(gpa, dl, e, pw, tx, ly + 48, pc, 13, row.preview, tw);
+            try strEllipsis(gpa, dl, e, pw, tx, ly + @as(i32, if (phone) 54 else 48), pc, @as(u16, if (phone) 14 else 13), row.preview, tw);
         }
+        if (phone and i + 1 < list.len) try rect(gpa, dl, tx, ly + row_h - 7, right - tx, 1, divider, 0);
         try emitRegion(gpa, regions, x0, ly, list_w, @intCast(row_h - 6), @intCast(i), .chat_conv);
         ly += row_h;
     }
+    } // (phone_thread skips the whole list block)
 
     // ── Right: the open thread + the composer strip. The peer header sits at
     // the very TOP of the column and costs ~50px — everything under it is
     // messages (the owner's reorg: this column is only the conversation). ──
     if (peer.len == 0) {
-        _ = try str(gpa, dl, e, .regular, detail_x + 20, top + 26, faint, 15, "Select a conversation");
-        return height;
+        if (!phone) _ = try str(gpa, dl, e, .regular, detail_x + 20, top + 26, faint, 15, "Select a conversation");
+        return height; // phone: the list IS the page
     }
-    const thread_top = top + 52;
+    const thread_top = if (phone) insets.top + 64 else top + 52;
     // The composer GROWS DOWNWARD as the draft wraps (hard word-break
     // included), so a long message builds lines inside the pane instead of
     // running off it; the thread above yields the space. Enter sends,
@@ -7368,7 +7401,7 @@ pub fn layoutChat(
     else
         try wrapBody(gpa, dl, e, 0, input_line_h, input_w - 28, 0, 14, draft, input_line_h, false, null) - input_line_h;
     const comp_h: i32 = @max(46, draft_h + 26);
-    const comp_y = height - comp_h - 24;
+    const comp_y = if (phone) height - comp_h - insets.bottom - 12 else height - comp_h - 24;
     // The typing indicator claims space between the thread and the composer
     // as it grows (typing_t 0→1) — the bubbles above LIFT with it, so the
     // grow-in / melt-away is fluid, not a pop over the thread.
@@ -7554,10 +7587,31 @@ pub fn layoutChat(
     // top, drawn AFTER the thread so a scrolled bubble slides beneath it and
     // ghosts faintly through — the feed's header_veil pattern — then the
     // peer name + divider on top.
-    const hdr_x = detail_x - @divTrunc(split_gap, 2) + 1;
-    try rect(gpa, dl, hdr_x, 0, x0 + w - hdr_x, thread_top, skinHeaderVeil(accent), 0);
-    _ = try str(gpa, dl, e, .semibold, detail_x, top + 26, ink, 16, peer);
-    try rect(gpa, dl, detail_x, top + 40, detail_w, 1, divider, 0);
+    if (phone) {
+        // The thread app-bar: OPAQUE under the status bar (nothing ghosts
+        // through chrome), a back chevron at the left, the avatar + peer name
+        // centred — the standalone-app face.
+        try rect(gpa, dl, m.col_x, 0, m.col_w, thread_top, bg, 0);
+        try rect(gpa, dl, m.col_x, 0, m.col_w, thread_top, skinHeaderVeil(accent), 0);
+        try rect(gpa, dl, m.col_x, thread_top - 1, m.col_w, 1, divider, 0);
+        const bar_cy = insets.top + 32;
+        _ = try str(gpa, dl, e, .semibold, x0 + 2, bar_cy + 10, ink, 27, "\u{2039}");
+        try emitRegion(gpa, regions, x0 - 12, bar_cy - 22, 60, 52, 0, .back);
+        const pav: i32 = 30;
+        const pnw: i32 = @intCast(text.measure(e, .semibold, peer, 16));
+        const block_w = pav + 10 + @min(pnw, w - 140);
+        const bx0 = x0 + @divTrunc(w - block_w, 2);
+        try rect(gpa, dl, bx0, bar_cy - @divTrunc(pav, 2) - 3, pav, pav, tintFor(peer), @intCast(@divTrunc(pav, 2)));
+        const pini = [1]u8{initialOf(peer)};
+        const piw: i32 = @intCast(text.measure(e, .semibold, &pini, 14));
+        _ = try str(gpa, dl, e, .semibold, bx0 + @divTrunc(pav - piw, 2), bar_cy + 8, 0xFF20201A, 14, &pini);
+        try strEllipsis(gpa, dl, e, .semibold, bx0 + pav + 10, bar_cy + 8, ink, 16, peer, w - 140);
+    } else {
+        const hdr_x = detail_x - @divTrunc(split_gap, 2) + 1;
+        try rect(gpa, dl, hdr_x, 0, x0 + w - hdr_x, thread_top, skinHeaderVeil(accent), 0);
+        _ = try str(gpa, dl, e, .semibold, detail_x, top + 26, ink, 16, peer);
+        try rect(gpa, dl, detail_x, top + 40, detail_w, 1, divider, 0);
+    }
 
     // The composer: a growing multi-line input + Send. The draft renders
     // through the same wrap engine as the bubbles (soft wrap + hard
@@ -8579,10 +8633,11 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
         .{ .body = "a longer reply that should wrap across the bubble width once it exceeds the maximum line", .age = "2h", .mine = false, .stamp = false, .kind = .text, .tail = true },
     };
 
-    // Narrow width (460): no rail regions, so the counts are exactly the
-    // surface's own — one region per conversation row + the composer pair +
-    // the "+ New" pill.
-    const h = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", true, false, "", "", .{}, .{}, &.{}, .{});
+    // Narrow DESKTOP width (700 — above phone_max, below the wide rail): no
+    // rail regions, so the counts are exactly the surface's own — one region
+    // per conversation row + the composer pair + the "+ New" pill. (460 now
+    // exercises the PHONE single-pane shape — its own test below.)
+    const h = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", true, false, "", "", .{}, .{}, &.{}, .{}, .{});
     var n_conv: usize = 0;
     var n_input: usize = 0;
     var n_send: usize = 0;
@@ -8608,7 +8663,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // no thread pane and no composer to arm. The "+ New" pill is always there.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h2 = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", false, false, "", "", .{}, .{}, &.{}, .{});
+    const h2 = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", false, false, "", "", .{}, .{}, &.{}, .{}, .{});
     try std.testing.expectEqual(@as(i32, 940), h2);
     var n2_conv: usize = 0;
     var n2_new: usize = 0;
@@ -8624,7 +8679,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // line draws when the shell hands one over.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", false, true, "chattest.zat4.com", "Couldn't resolve that handle", .{}, .{}, &.{}, .{});
+    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", false, true, "chattest.zat4.com", "Couldn't resolve that handle", .{}, .{}, &.{}, .{}, .{});
     var n3_compose: usize = 0;
     for (regions.items) |r| {
         if (r.kind == .chat_compose_input) n3_compose += 1;
@@ -8637,14 +8692,70 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // (motion never moves a tap target).
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", true, false, "", "", .{}, .{}, &.{}, .{});
+    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", true, false, "", "", .{}, .{}, &.{}, .{}, .{});
     const rest_items = dl.len;
     const rest_regions = regions.items.len;
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 460, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", true, false, "", "", .{}, .{ .typing_t = 1, .typing_phase = 0.7 }, &.{}, .{});
+    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", true, false, "", "", .{}, .{ .typing_t = 1, .typing_phase = 0.7 }, &.{}, .{}, .{});
     try std.testing.expect(dl.len > rest_items);
     try std.testing.expectEqual(rest_regions, regions.items.len);
+}
+
+test "messages screen: the phone shape — list page, then an immersive thread with back" {
+    const gpa = std.testing.allocator;
+    var engine = try text.initEngine();
+    defer text.deinitEngine(gpa, &engine);
+    var dl: raster.DrawList = .{};
+    defer dl.deinit(gpa);
+    var regions: Regions = .empty;
+    defer regions.deinit(gpa);
+
+    const lrows = [_]chat_view.ListRow{
+        .{ .name = "maya.zat4.com", .preview = "You: hey", .age = "2h", .unread = 0 },
+        .{ .name = "did:plc:xyz", .preview = "hello there", .age = "1m", .unread = 3 },
+    };
+    const brows = [_]chat_view.BubbleRow{
+        .{ .body = "hey", .age = "2h", .mine = true, .stamp = true, .kind = .text, .tail = true },
+    };
+
+    // LIST page (no peer): full-width rows + the new-conversation button; no
+    // composer, no thread chrome, no back — the tab bar is the way out.
+    _ = try layoutChat(gpa, &engine, 430, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", false, false, "", "", .{}, .{}, &.{}, .{}, .{ .top = 48 });
+    var l_conv: usize = 0;
+    var l_new: usize = 0;
+    var l_back: usize = 0;
+    for (regions.items) |r| {
+        if (r.kind == .chat_conv) l_conv += 1;
+        if (r.kind == .chat_new) l_new += 1;
+        if (r.kind == .back) l_back += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), l_conv);
+    try std.testing.expectEqual(@as(usize, 1), l_new);
+    try std.testing.expectEqual(@as(usize, 0), l_back);
+
+    // THREAD page (peer open): immersive — NO list rows, NO new button; the
+    // app-bar's back region + the composer trio are the page's controls.
+    dl.len = 0;
+    regions.clearRetainingCapacity();
+    _ = try layoutChat(gpa, &engine, 430, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", true, false, "", "", .{}, .{}, &.{}, .{}, .{ .top = 48, .bottom = 34 });
+    var t_conv: usize = 0;
+    var t_new: usize = 0;
+    var t_back: usize = 0;
+    var t_input: usize = 0;
+    var t_send: usize = 0;
+    for (regions.items) |r| {
+        if (r.kind == .chat_conv) t_conv += 1;
+        if (r.kind == .chat_new) t_new += 1;
+        if (r.kind == .back) t_back += 1;
+        if (r.kind == .chat_input) t_input += 1;
+        if (r.kind == .chat_send) t_send += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), t_conv);
+    try std.testing.expectEqual(@as(usize, 0), t_new);
+    try std.testing.expectEqual(@as(usize, 1), t_back);
+    try std.testing.expectEqual(@as(usize, 1), t_input);
+    try std.testing.expectEqual(@as(usize, 1), t_send);
 }
 
 test "messages screen: payment cards and the pay sheet emit their regions (M5 A4)" {
@@ -8676,7 +8787,7 @@ test "messages screen: payment cards and the pay sheet emit their regions (M5 A4
     };
 
     // Sheet closed: the card buttons carry their thread ordinals.
-    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", false, false, "", "", .{}, .{}, &.{}, .{});
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", false, false, "", "", .{}, .{}, &.{}, .{}, .{});
     var pay_at: u16 = 999;
     var cancel_at: u16 = 999;
     var received_at: u16 = 999;
@@ -8693,7 +8804,7 @@ test "messages screen: payment cards and the pay sheet emit their regions (M5 A4
     // and the amber status line renders without disturbing the regions.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", false, false, "", "", .{ .open = true, .rail = .onchain, .amount = "5000", .note = "dinner", .status = "They haven't set up payments" }, .{}, &.{}, .{});
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", false, false, "", "", .{ .open = true, .rail = .onchain, .amount = "5000", .note = "dinner", .status = "They haven't set up payments" }, .{}, &.{}, .{}, .{});
     var n_rail: usize = 0;
     var n_chip: usize = 0;
     var n_amount: usize = 0;

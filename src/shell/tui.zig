@@ -4236,7 +4236,9 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         .back => {
                                             // The transparency page, zone page, and thread
                                             // share Back; each returns where it was entered.
-                                            if (rs.gscreen == feed_view.screen_algo_docs) {
+                                            if (rs.gscreen == feed_view.screen_messages) {
+                                                rs.gchat_sel = null; // phone chat thread → the list
+                                            } else if (rs.gscreen == feed_view.screen_algo_docs) {
                                                 rs.gscreen = rs.docs_return_screen;
                                                 rs.gscroll_px = 0;
                                             } else if (rs.gscreen == feed_view.screen_algo_detail) {
@@ -6588,6 +6590,10 @@ fn backNavigate(rs: *RunState) bool {
     }
     if (rs.mode == .compose) {
         rs.mode = .timeline; // the draft is kept; ＋ reopens where you left off
+        return true;
+    }
+    if (rs.gscreen == feed_view.screen_messages and rs.gchat_sel != null) {
+        rs.gchat_sel = null; // the phone chat thread pops to the conversation list
         return true;
     }
     switch (rs.gscreen) {
@@ -9373,7 +9379,7 @@ fn paintFrame(
                 // Zat Chat (U3, dev-gated): the Messages surface. -scroll maps the
                 // shared ≤0 scroll state onto layoutChat's positive history offset.
                 const cf = buildChatFrame(arena, g.chat_store.?, g.chat_sel, now);
-                g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{}, &.{}, g.chat_recv) catch g.content_h.*;
+                g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{}, &.{}, g.chat_recv, .{}) catch g.content_h.*;
             } else if (g.screen.* == feed_view.screen_loadout) {
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
                 g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market, g.market_q, g.market_q_focus, g.market_loading, g.bench_pick, g.bench_drag, g.published, g.create, g.dev, g.bench, .{}, g.loadout_lib_y) catch g.content_h.*; // software: draw line-art nav
@@ -9956,7 +9962,9 @@ fn paintFrameGpu(
         // closing each rebuild the verts even though the overlay keeps input.
         ^ (if (g.cart_detail) |cd| (@as(u64, cd.color) +% 1) *% 0x94D0_49BB_1331_11EB else 0)
         // The double-back hint pill: arming/expiry rebuilds the nav tile.
-        ^ (@as(u64, @intFromBool(g.back_hint)) *% 0x517C_C1B7_2722_0A95);
+        ^ (@as(u64, @intFromBool(g.back_hint)) *% 0x517C_C1B7_2722_0A95)
+        // Phone chat: opening/closing a thread swaps the tab bar in/out.
+        ^ (@as(u64, @intFromBool(g.chat_sel != null)) *% 0x6C62_2726_93D2_35B1);
     // A drag/settle animates the socket every frame (lift, reflow, ghost), so
     // bypass the feed cache while it runs — a brief interaction, and the field
     // already rebuilds every frame anyway.
@@ -10065,7 +10073,7 @@ fn paintFrameGpu(
                 }
             } else |_| {}
             const reflow_t: f32 = if (gs.chat_reflow) |rh| (gs.chat_world.position(rh) orelse 1.0) else 1.0;
-            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t }, xforms, g.chat_recv) catch g.content_h.*;
+            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t }, xforms, g.chat_recv, .{ .top = @intCast(gs.inset_top_l), .bottom = @intCast(gs.inset_bottom_l), .left = @intCast(gs.inset_left_l), .right = @intCast(gs.inset_right_l) }) catch g.content_h.*;
         } else if (g.screen.* == feed_view.screen_algo_docs) {
             g.content_h.* = feed_view.layoutAlgoDocs(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, if (g.docs_kind == 1) algo_docs.dev_doc else algo_docs.user_doc) catch g.content_h.*;
         } else if (g.screen.* == feed_view.screen_algo_detail) {
@@ -10390,7 +10398,12 @@ fn paintFrameGpu(
             // desktop furniture). Same buffer, same un-crossfaded draw, same
             // region kinds — the dispatch and the SDF icon pass are unchanged.
             g.draw.len = 0;
-            feed_view.drawTabBar(gpa, g.draw, g.engine, @intCast(gs.design_w), @intCast(lh), @intCast(gs.inset_bottom_l), g.screen.*, g.regions, g.accent, true) catch {};
+            // Zat Chat's open THREAD is immersive on the phone: no tab bar — the
+            // header's back chevron / the system back leave it, and the composer
+            // owns the bottom edge (the future standalone app's shape).
+            const chat_thread_open = g.screen.* == feed_view.screen_messages and g.chat_sel != null;
+            if (!chat_thread_open)
+                feed_view.drawTabBar(gpa, g.draw, g.engine, @intCast(gs.design_w), @intCast(lh), @intCast(gs.inset_bottom_l), g.screen.*, g.regions, g.accent, true) catch {};
             // The nav DRAWER slides over everything (scrim + panel); its
             // regions land last, so while open it owns the taps.
             feed_view.drawDrawer(gpa, g.draw, g.engine, @intCast(gs.design_w), @intCast(lh), gs.drawer_t, g.screen.*, g.regions, g.accent, g.you_handle, true) catch {};
