@@ -1662,20 +1662,22 @@ pub fn drawTabBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, w
         switch (slot) {
             .nav => |idx| {
                 const on = idx == active;
-                // Bigger tap targets + icons (the 22px line-art read too small on
-                // phone). Icon 28 box centred on (cx, icon_cy); hit region 52×52.
-                // The GPU SDF nav pass (drawSdfIcons) keys off this 52-tall region
-                // to re-derive the same centre (r.x+26, r.y+24) — keep them in sync.
+                // The icon keeps its 28px box, but the tap target is the WHOLE
+                // SLOT, bar-top to screen-bottom — a miss between buttons used
+                // to select nothing (owner, 2026-07-11); now the nearest button
+                // owns its full fifth. The GPU SDF nav pass (drawSdfIcons)
+                // re-derives the icon centre from THIS geometry (r.x + r.w/2,
+                // r.y + 36) — keep them in sync.
                 if (on) try rect(gpa, dl, cx - 28, icon_cy - 26, 56, 52, (0x22 << 24) | (accent & 0x00FFFFFF), 15);
                 if (!skip_nav) try navIcon(idx, gpa, dl, cx - 14, icon_cy - 14, 28, if (on) accent else muted);
-                try emitRegion(gpa, regions, cx - 26, icon_cy - 24, 52, 52, idx, .nav);
+                try emitRegion(gpa, regions, slot_w * @as(i32, @intCast(i)), by, slot_w, @intCast(@min(tab_bar_h + @max(0, bottom_inset), 32767)), idx, .nav);
             },
             .you => {
                 const on = active == screen_profile;
                 if (on) try rect(gpa, dl, cx - 28, icon_cy - 26, 56, 52, (0x22 << 24) | (accent & 0x00FFFFFF), 15);
                 try rect(gpa, dl, cx - 22, icon_cy - 22, 44, 44, 0xFF3F3B2D, 22);
                 _ = try str(gpa, dl, e, .semibold, cx - 6, icon_cy + 7, if (on) accent else ink, 16, "y");
-                try emitRegion(gpa, regions, cx - 26, icon_cy - 24, 52, 52, screen_profile, .nav);
+                try emitRegion(gpa, regions, slot_w * @as(i32, @intCast(i)), by, slot_w, @intCast(@min(tab_bar_h + @max(0, bottom_inset), 32767)), screen_profile, .nav);
             },
         }
     }
@@ -1720,8 +1722,10 @@ pub fn drawBackHint(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine,
 
 /// Total height of the keyboard panel (logical px), excluding the safe-area
 /// bottom inset it also paints over. The chat composer lifts by this.
-pub const keyboard_h: i32 = 4 * (kbd_key_h + kbd_gap) + 14;
-const kbd_key_h: i32 = 50;
+/// FIVE rows since the owner's pass 2 (2026-07-11): a number row (1–9 +
+/// emoji) rides on top of the letters, and keys grew a touch taller.
+pub const keyboard_h: i32 = 5 * (kbd_key_h + kbd_gap) + 14;
+const kbd_key_h: i32 = 52;
 const kbd_gap: i32 = 7;
 
 /// One key of a row: the unshifted/shifted codepoints (equal when shift is
@@ -1731,7 +1735,7 @@ const KbdKey = struct {
     lo: u16,
     hi: u16 = 0,
     w: u8 = 2, // flex units (2 = a letter key)
-    ctrl: u8 = 0, // 1 shift, 2 backspace, 3 page, 4 enter
+    ctrl: u8 = 0, // 1 shift, 2 backspace, 3 page, 4 enter, 5 emoji (dead — the emoji story is queued)
 
     comptime {
         // Budget: 2+2+1+1 = 6, padded to 6 at u16 alignment (A7).
@@ -1753,6 +1757,9 @@ const kbd_r2_mid = kbdRowStr("zxcvbnm", "ZXCVBNM");
 const kbd_s0 = kbdRowStr("1234567890", "1234567890");
 const kbd_s1 = kbdRowStr("@#$%&-+()", "@#$%&-+()");
 const kbd_s2_mid = kbdRowStr("*\"':;!?/", "*\"':;!?/");
+// The standing number row (both pages): 1–9 + the emoji key — the owner
+// wants numbers one tap away while the symbols page keeps its full 0-run.
+const kbd_num = kbdRowStr("123456789", "123456789");
 
 /// The Zat4 keyboard: an opaque panel over the very bottom (it paints the
 /// safe-area inset too), the accent "circuit" lines across its top and
@@ -1782,40 +1789,60 @@ pub fn drawKeyboard(
     // The panel: opaque (nothing ghosts through chrome) with a faint wash.
     try rect(gpa, dl, 0, top, width, keyboard_h + bottom_inset, bg, 0);
     try rect(gpa, dl, 0, top, width, keyboard_h + bottom_inset, 0x14FFFFFF, 0);
-    // The accent circuit: a lit top edge and a hairline under each row —
-    // the keys sit in an accent lattice that re-tints with the socket.
+    // The lit top edge — the circuit's supply rail.
     try rect(gpa, dl, 0, top, width, 2, (0xC8 << 24) | (accent & 0x00FFFFFF), 0);
     // Swallow every tap on the panel (the bar-blocker pattern): keys win by
     // being emitted after.
     try emitRegion(gpa, regions, 0, top, width, @intCast(@min(keyboard_h + bottom_inset, 32767)), 0, .blocker);
 
     const m: i32 = 6; // outer margin
-    const unit_w = @divTrunc((width - 2 * m) * 100, 20 * 100); // 20 flex units per row, integer-safe
-    _ = unit_w;
     const row_w = width - 2 * m;
+    const n_rows: usize = 5;
+
+    // THE CIRCUIT LATTICE (the owner's tron lines, done as a board, not as
+    // dashes on keys — the pass-1 miss): the accent runs through the GUTTERS
+    // between rows and keys, a soft wide trace with a bright 1px core, so the
+    // whole panel reads as one lit board the keys sit on. Horizontal traces
+    // here; vertical traces per key boundary inside the loop below.
+    var gr: usize = 1;
+    while (gr < n_rows) : (gr += 1) {
+        const gy = top + 8 + @as(i32, @intCast(gr)) * (kbd_key_h + kbd_gap) - @divTrunc(kbd_gap + 1, 2);
+        try rect(gpa, dl, m, gy - 1, row_w, 3, (0x16 << 24) | (accent & 0x00FFFFFF), 0);
+        try rect(gpa, dl, m, gy, row_w, 1, (0x48 << 24) | (accent & 0x00FFFFFF), 0);
+    }
+
     var y = top + 8;
     var row_i: usize = 0;
-    while (row_i < 4) : (row_i += 1) {
-        // Assemble the row: pages 0/1 share the frame — mids swap, the
-        // bottom row is common ([?123/abc][bitcoin][space][enter]).
+    while (row_i < n_rows) : (row_i += 1) {
+        // Assemble the row: the number row (1–9 + emoji) rides both pages;
+        // pages 0/1 share the frame below it — mids swap, the bottom row is
+        // common ([?123/abc][bitcoin][space][enter]).
         var keys_buf: [12]KbdKey = undefined;
         var nk: usize = 0;
         switch (row_i) {
             0 => {
+                for (kbd_num) |k| {
+                    keys_buf[nk] = k;
+                    nk += 1;
+                }
+                keys_buf[nk] = .{ .lo = 0, .ctrl = 5, .w = 2 }; // emoji (dead for now)
+                nk += 1;
+            },
+            1 => {
                 const src = if (page == 0) kbd_r0[0..] else kbd_s0[0..];
                 for (src) |k| {
                     keys_buf[nk] = k;
                     nk += 1;
                 }
             },
-            1 => {
+            2 => {
                 const src = if (page == 0) kbd_r1[0..] else kbd_s1[0..];
                 for (src) |k| {
                     keys_buf[nk] = k;
                     nk += 1;
                 }
             },
-            2 => {
+            3 => {
                 keys_buf[nk] = .{ .lo = 0, .ctrl = 1, .w = 3 }; // shift
                 nk += 1;
                 const src = if (page == 0) kbd_r2_mid[0..] else kbd_s2_mid[0..];
@@ -1841,9 +1868,16 @@ pub fn drawKeyboard(
         var units: i32 = 0;
         for (keys) |k| units += k.w;
         const kw_num = row_w - @as(i32, @intCast(nk - 1)) * kbd_gap; // total key width
+        const hg = @divTrunc(kbd_gap, 2);
         var x = m;
-        for (keys) |k| {
+        for (keys, 0..) |k, ki| {
             const kw = @divTrunc(kw_num * k.w, units);
+            // Vertical circuit trace in the gutter left of this key.
+            if (ki > 0) {
+                const gx = x - @divTrunc(kbd_gap + 1, 2);
+                try rect(gpa, dl, gx - 1, y, 3, kbd_key_h, (0x16 << 24) | (accent & 0x00FFFFFF), 0);
+                try rect(gpa, dl, gx, y, 1, kbd_key_h, (0x48 << 24) | (accent & 0x00FFFFFF), 0);
+            }
             const active_ctrl = (k.ctrl == 1 and (shift or caps)) or (k.ctrl == 3 and page == 1);
             const fill: u32 = if (active_ctrl) (0x50 << 24) | (accent & 0x00FFFFFF) else 0x1CFFFFFF;
             try rect(gpa, dl, x, y, kw, kbd_key_h, fill, 9);
@@ -1855,39 +1889,58 @@ pub fn drawKeyboard(
                 2 => flash_key == 0xE002,
                 3 => flash_key == 0xE003,
                 4 => flash_key == '\r',
+                5 => flash_key == 0xE005,
                 else => flash_key == k.lo or (k.hi != 0 and flash_key == k.hi),
             };
             if (flashed) try rect(gpa, dl, x, y, kw, kbd_key_h, (@as(u32, flash_a) << 24) | (accent & 0x00FFFFFF), 9);
-            // (The per-key accent top line is gone — on-device it read as
-            // odd floating dashes, 2026-07-10; the panel's top circuit line
-            // carries the accent alone.)
             // Caps lock: the shift key carries a solid accent lock bar.
             if (k.ctrl == 1 and caps)
                 try rect(gpa, dl, x + @divTrunc(kw, 2) - 8, y + kbd_key_h - 9, 16, 3, (0xFF << 24) | (accent & 0x00FFFFFF), 1);
+            // THE TAP TARGET TILES THE GUTTER (owner: misses between keys
+            // typed nothing) — regions abut edge-to-edge and reach the panel
+            // and screen edges; the visual key keeps its gap. The nearest key
+            // owns the miss.
+            const rx0: i32 = if (ki == 0) 0 else x - hg;
+            const rx1: i32 = if (ki == nk - 1) width else x + kw + hg;
+            const ry0: i32 = if (row_i == 0) top + 2 else y - hg;
+            const ry1: i32 = if (row_i == n_rows - 1) view_h else y + kbd_key_h + hg;
             if (k.ctrl != 0) {
-                const glyph: []const u8 = switch (k.ctrl) {
-                    1 => "\u{21E7}", // shift
-                    2 => "\u{232B}", // backspace
-                    3 => if (page == 0) "?123" else "abc",
-                    else => "\u{23CE}", // enter
-                };
-                const gpx: u16 = if (k.ctrl == 3) 13 else 18;
-                const gw: i32 = @intCast(text.measure(e, .regular, glyph, gpx));
-                _ = try str(gpa, dl, e, .regular, x + @divTrunc(kw - gw, 2), y + 32, ink, gpx, glyph);
+                if (k.ctrl == 5) {
+                    // The emoji key: a drawn face (the embedded font carries
+                    // no emoji; the story is queued — this key is DEAD, it
+                    // only flashes). Disc + eyes + smile from primitives.
+                    const ecx = x + @divTrunc(kw, 2);
+                    const ecy = y + @divTrunc(kbd_key_h, 2);
+                    try rect(gpa, dl, ecx - 10, ecy - 10, 20, 20, 0x30EDEAE0, 10);
+                    try rect(gpa, dl, ecx - 8, ecy - 8, 16, 16, 0xE0212019, 8);
+                    try rect(gpa, dl, ecx - 4, ecy - 4, 2, 4, ink, 1);
+                    try rect(gpa, dl, ecx + 2, ecy - 4, 2, 4, ink, 1);
+                    try rect(gpa, dl, ecx - 4, ecy + 4, 8, 2, ink, 1);
+                } else {
+                    const glyph: []const u8 = switch (k.ctrl) {
+                        1 => "\u{21E7}", // shift
+                        2 => "\u{232B}", // backspace
+                        3 => if (page == 0) "?123" else "abc",
+                        else => "\u{23CE}", // enter
+                    };
+                    const gpx: u16 = if (k.ctrl == 3) 13 else 18;
+                    const gw: i32 = @intCast(text.measure(e, .regular, glyph, gpx));
+                    _ = try str(gpa, dl, e, .regular, x + @divTrunc(kw - gw, 2), y + 33, ink, gpx, glyph);
+                }
                 const kind: Action = switch (k.ctrl) {
                     1 => .kbd_shift,
                     2 => .kbd_backspace,
                     3 => .kbd_page,
-                    else => .kbd_key, // enter emits '\r' through kbd_key
+                    else => .kbd_key, // enter emits '\r'; the dead emoji key emits 0
                 };
-                try emitRegion(gpa, regions, x, y, kw, @intCast(kbd_key_h), if (k.ctrl == 4) '\r' else 0, kind);
+                try emitRegion(gpa, regions, rx0, ry0, rx1 - rx0, @intCast(@min(ry1 - ry0, 32767)), if (k.ctrl == 4) '\r' else 0, kind);
             } else {
                 const cp: u16 = if ((shift or caps) and k.hi != 0) k.hi else k.lo;
                 var gb: [4]u8 = undefined;
                 const gn = std.unicode.utf8Encode(@intCast(cp), &gb) catch 1;
                 const gw: i32 = @intCast(text.measure(e, .regular, gb[0..gn], 19));
-                _ = try str(gpa, dl, e, .regular, x + @divTrunc(kw - gw, 2), y + 33, ink, 19, gb[0..gn]);
-                try emitRegion(gpa, regions, x, y, kw, @intCast(kbd_key_h), cp, .kbd_key);
+                _ = try str(gpa, dl, e, .regular, x + @divTrunc(kw - gw, 2), y + 34, ink, 19, gb[0..gn]);
+                try emitRegion(gpa, regions, rx0, ry0, rx1 - rx0, @intCast(@min(ry1 - ry0, 32767)), cp, .kbd_key);
             }
             x += kw + kbd_gap;
         }
@@ -7361,6 +7414,12 @@ pub const ChatListSearch = struct {
     caret_on: bool = false,
 };
 
+/// Chat body type: bubbles + the composer input. 14px read too small on the
+/// phone (owner, 2026-07-11) — 16 on a 23px line is the default until the
+/// settings text-size control lands.
+const chat_px: u16 = 16;
+const chat_line_h: i32 = 23;
+
 pub fn layoutChat(
     gpa: Allocator,
     e: *const text.Engine,
@@ -7392,6 +7451,10 @@ pub fn layoutChat(
     /// The composer strip's draft ("" shows the placeholder). Editing state
     /// (caret, selection) arrives with the U3 wiring.
     draft: []const u8,
+    /// Caret byte offset into `draft` (clamped to its length) — the shell
+    /// moves it with arrow keys / the space-hold slide; pass `draft.len`
+    /// (or anything larger) for a plain end-of-text caret.
+    draft_caret: usize,
     /// True while the composer owns the keyboard: the strip shows an accent
     /// ring + caret so "can I type?" is answered by the pixels (the owner's
     /// U5 field note — an input with no focus state reads as dead).
@@ -7612,11 +7675,11 @@ pub fn layoutChat(
     const pay_btn: i32 = if (phone) 46 else 40;
     const input_x = detail_x + pay_btn + 8;
     const input_w = detail_w - send_w - 12 - pay_btn - 8;
-    const input_line_h: i32 = 20;
+    const input_line_h: i32 = chat_line_h;
     const draft_h: i32 = if (draft.len == 0)
         input_line_h
     else
-        try wrapBody(gpa, dl, e, 0, input_line_h, input_w - 28, 0, 14, draft, input_line_h, false, null) - input_line_h;
+        try wrapBody(gpa, dl, e, 0, input_line_h, input_w - 28, 0, chat_px, draft, input_line_h, false, null) - input_line_h;
     const comp_h: i32 = @max(46, draft_h + 26);
     const comp_y = if (phone) height - comp_h - insets.bottom - 12 else height - comp_h - 24;
     // The typing indicator claims space between the thread and the composer
@@ -7627,10 +7690,10 @@ pub fn layoutChat(
     const thread_bot = comp_y - 12 - typing_room;
 
     // Bubble geometry: measure pass (draw_it = false), then a bottom-anchored
-    // draw pass. Text is 14px on a 20px line; a bubble is its wrapped text
-    // plus padding; a stamp is a centred relative-time divider.
+    // draw pass. Text is chat_px on a chat_line_h line; a bubble is its
+    // wrapped text plus padding; a stamp is a centred relative-time divider.
     const bub_max: i32 = @min(420, detail_w - 90);
-    const line_h: i32 = 20;
+    const line_h: i32 = chat_line_h;
     const pad_x: i32 = 14;
     const pad_y: i32 = 10;
     const stamp_h: i32 = 26;
@@ -7644,7 +7707,7 @@ pub fn layoutChat(
         } else if (b.pay != chat_view.no_pay and b.pay < cards.len) {
             hslot.* = try payCardHeight(gpa, dl, e, b, cards[b.pay], @min(pay_card_w_max, bub_max));
         } else {
-            const text_h = try wrapBody(gpa, dl, e, 0, 0, bub_max - 2 * pad_x, 0, 14, b.body, line_h, false, null);
+            const text_h = try wrapBody(gpa, dl, e, 0, 0, bub_max - 2 * pad_x, 0, chat_px, b.body, line_h, false, null);
             hslot.* = text_h + 2 * pad_y - 4;
         }
         total += hslot.* + gap;
@@ -7725,7 +7788,7 @@ pub fn layoutChat(
                 try drawPayCard(gpa, dl, e, regions, accent, cbx, by, cw2, hh, b, cards[b.pay], @intCast(@min(idx, std.math.maxInt(u16))));
             } else {
                 // Single-line bubbles shrink-wrap; wrapped ones take the max.
-                const one_w: i32 = @intCast(text.measure(e, .regular, b.body, 14));
+                const one_w: i32 = @intCast(text.measure(e, .regular, b.body, chat_px));
                 const fits_one = std.mem.indexOfScalar(u8, b.body, '\n') == null and one_w <= bub_max - 2 * pad_x;
                 const bw = if (fits_one) one_w + 2 * pad_x else bub_max;
                 const bx = if (b.mine) detail_x + detail_w - bw else detail_x;
@@ -7734,7 +7797,7 @@ pub fn layoutChat(
                 if (!is_fly) {
                     if (b.tail) try bubbleTail(gpa, dl, b.mine, bx, by, bw, hh, fill);
                     try rect(gpa, dl, bx, by, bw, hh, fill, bub_rad);
-                    _ = try wrapBody(gpa, dl, e, bx + pad_x, by + pad_y + 12, bub_max - 2 * pad_x, ink, 14, b.body, line_h, true, null);
+                    _ = try wrapBody(gpa, dl, e, bx + pad_x, by + pad_y + 14, bub_max - 2 * pad_x, ink, chat_px, b.body, line_h, true, null);
                 } else {
                     // THE MORPH. Spring physics, not easing: rise and scale
                     // ride the SAME spring (unclamped t — a gentle ~2%
@@ -7760,7 +7823,7 @@ pub fn layoutChat(
                     const fill_a = scaleAlpha(fill, fade);
                     if (b.tail) try bubbleTail(gpa, dl, b.mine, bx_a, by_a, bw_a, hh_a, fill_a);
                     try rect(gpa, dl, bx_a, by_a, bw_a, hh_a, fill_a, bub_rad);
-                    _ = try wrapBody(gpa, dl, e, bx + pad_x, by_a + pad_y + 12, bub_max - 2 * pad_x, scaleAlpha(ink, fade), 14, b.body, line_h, true, null);
+                    _ = try wrapBody(gpa, dl, e, bx + pad_x, by_a + pad_y + 14, bub_max - 2 * pad_x, scaleAlpha(ink, fade), chat_px, b.body, line_h, true, null);
                 }
             }
         }
@@ -7866,18 +7929,24 @@ pub fn layoutChat(
         try rect(gpa, dl, input_x + input_w - 1, comp_y, 1, comp_h, ring_c, 0);
     }
     var caret_x: i32 = input_x + 14;
-    var caret_base: i32 = comp_y + 29;
+    var caret_base: i32 = comp_y + 31;
     if (draft.len > 0) {
-        caret_base = try wrapBodyPen(gpa, dl, e, input_x + 14, comp_y + 29, input_w - 28, ink, 14, draft, input_line_h, true, null, &caret_x, null, null) - input_line_h;
+        // The draft wrapper carries a MID-TEXT caret (the composer's
+        // machinery): the shell moves `draft_caret` with arrow keys and the
+        // keyboard's space-hold slide, and the caret pen lands wherever
+        // that byte offset wrapped to.
+        const pens = try wrapDraft(gpa, dl, e, input_x + 14, comp_y + 31, input_w - 28, ink, chat_px, draft, input_line_h, @min(draft_caret, draft.len), 0, 0);
+        caret_x = pens.caret.x;
+        caret_base = pens.caret.baseline;
     } else {
         var pbuf: [96]u8 = undefined;
         // Phone: plain "Message" — the peer already heads the app bar.
         const ph = if (phone) "Message" else std.fmt.bufPrint(&pbuf, "Message {s}", .{peer}) catch "Message";
-        try strEllipsis(gpa, dl, e, .regular, input_x + 14, comp_y + 29, faint, 14, ph, input_w - 28);
+        try strEllipsis(gpa, dl, e, .regular, input_x + 14, comp_y + 31, faint, chat_px, ph, input_w - 28);
     }
     if (input_focus) {
         const ca = caretAlpha(motion.caret_phase);
-        try rect(gpa, dl, caret_x + 1, caret_base - 14, 2, 18, scaleAlpha((0xE0 << 24) | (accent & 0x00FFFFFF), ca), 0);
+        try rect(gpa, dl, caret_x + 1, caret_base - 16, 2, 20, scaleAlpha((0xE0 << 24) | (accent & 0x00FFFFFF), ca), 0);
     }
     try emitRegion(gpa, regions, input_x, comp_y, input_w, @intCast(comp_h), 0, .chat_input);
     // The pay button: a "B" wearing the two ₿ ticks (the embedded fonts
@@ -8883,7 +8952,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // rail regions, so the counts are exactly the surface's own — one region
     // per conversation row + the composer pair + the "+ New" pill. (460 now
     // exercises the PHONE single-pane shape — its own test below.)
-    const h = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{});
+    const h = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", 0, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{});
     var n_conv: usize = 0;
     var n_input: usize = 0;
     var n_send: usize = 0;
@@ -8909,7 +8978,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // no thread pane and no composer to arm. The "+ New" pill is always there.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h2 = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{});
+    const h2 = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", 0, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{});
     try std.testing.expectEqual(@as(i32, 940), h2);
     var n2_conv: usize = 0;
     var n2_new: usize = 0;
@@ -8925,7 +8994,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // line draws when the shell hands one over.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", false, true, "chattest.zat4.com", "Couldn't resolve that handle", .{}, .{}, &.{}, .{}, .{}, .{});
+    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", 0, false, true, "chattest.zat4.com", "Couldn't resolve that handle", .{}, .{}, &.{}, .{}, .{}, .{});
     var n3_compose: usize = 0;
     for (regions.items) |r| {
         if (r.kind == .chat_compose_input) n3_compose += 1;
@@ -8938,12 +9007,12 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // (motion never moves a tap target).
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{});
+    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", 0, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{});
     const rest_items = dl.len;
     const rest_regions = regions.items.len;
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", true, false, "", "", .{}, .{ .typing_t = 1, .typing_phase = 0.7 }, &.{}, .{}, .{}, .{});
+    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", 0, true, false, "", "", .{}, .{ .typing_t = 1, .typing_phase = 0.7 }, &.{}, .{}, .{}, .{});
     try std.testing.expect(dl.len > rest_items);
     try std.testing.expectEqual(rest_regions, regions.items.len);
 }
@@ -8967,7 +9036,7 @@ test "messages screen: the phone shape — list page, then an immersive thread w
 
     // LIST page (no peer): full-width rows + the new-conversation button; no
     // composer, no thread chrome, no back — the tab bar is the way out.
-    _ = try layoutChat(gpa, &engine, 430, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", false, false, "", "", .{}, .{}, &.{}, .{}, .{ .top = 48 }, .{});
+    _ = try layoutChat(gpa, &engine, 430, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", 0, false, false, "", "", .{}, .{}, &.{}, .{}, .{ .top = 48 }, .{});
     var l_conv: usize = 0;
     var l_new: usize = 0;
     var l_back: usize = 0;
@@ -8984,7 +9053,7 @@ test "messages screen: the phone shape — list page, then an immersive thread w
     // app-bar's back region + the composer trio are the page's controls.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 430, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", true, false, "", "", .{}, .{}, &.{}, .{}, .{ .top = 48, .bottom = 34 }, .{});
+    _ = try layoutChat(gpa, &engine, 430, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", 0, true, false, "", "", .{}, .{}, &.{}, .{}, .{ .top = 48, .bottom = 34 }, .{});
     var t_conv: usize = 0;
     var t_new: usize = 0;
     var t_back: usize = 0;
@@ -9033,7 +9102,7 @@ test "messages screen: payment cards and the pay sheet emit their regions (M5 A4
     };
 
     // Sheet closed: the card buttons carry their thread ordinals.
-    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{});
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", 0, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{});
     var pay_at: u16 = 999;
     var cancel_at: u16 = 999;
     var received_at: u16 = 999;
@@ -9050,7 +9119,7 @@ test "messages screen: payment cards and the pay sheet emit their regions (M5 A4
     // and the amber status line renders without disturbing the regions.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", false, false, "", "", .{ .open = true, .rail = .onchain, .amount = "5000", .note = "dinner", .status = "They haven't set up payments" }, .{}, &.{}, .{}, .{}, .{});
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", 0, false, false, "", "", .{ .open = true, .rail = .onchain, .amount = "5000", .note = "dinner", .status = "They haven't set up payments" }, .{}, &.{}, .{}, .{}, .{});
     var n_rail: usize = 0;
     var n_chip: usize = 0;
     var n_amount: usize = 0;

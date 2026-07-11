@@ -140,6 +140,13 @@ pub const MobileHost = struct {
     /// hold timer. Nonzero swallows the release tap (the run already typed);
     /// reset on the next touch-down.
     kbd_bs_repeats: u32 = 0,
+    /// Space-hold caret navigation (Zat4 keyboard): the press began on the
+    /// space bar; sliding horizontally past the engage slop turns the hold
+    /// into caret motion (arrow escapes into the byte stream) and eats the
+    /// space — a clean release still types it.
+    kbd_space_down: bool = false,
+    kbd_nav: bool = false,
+    kbd_nav_x: f32 = 0,
     /// One pending haptic tick, set by the pump the frame a threshold is
     /// CROSSED during a drag (GESTURE_SYSTEM_ROADMAP §3 — the tick lands
     /// under the finger, never on release) and taken (read-and-clear) by the

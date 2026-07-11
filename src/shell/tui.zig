@@ -587,6 +587,8 @@ const RunState = struct {
     gchat_sel: ?chat_core.ConvIndex,
     gchat_draft_buf: [512]u8,
     gchat_draft_len: usize,
+    /// Caret byte offset into the draft (always kept <= gchat_draft_len).
+    gchat_caret: usize,
     gchat_input_focus: bool,
     gchat_composing: bool,
     gchat_peer_buf: [254]u8,
@@ -1130,6 +1132,7 @@ fn initRunState(
     rs.gchat_sel = null;
     rs.gchat_draft_buf = undefined;
     rs.gchat_draft_len = 0;
+    rs.gchat_caret = 0;
     rs.gchat_input_focus = false;
     // The new-conversation flow: the recipient draft (a handle or DID being
     // typed) and why the last attempt refused (static strings, "" = none).
@@ -2764,7 +2767,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .market_q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .market_q_focus = rs.gmarket_q_focus, .market_loading = rs.market_loading, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .kbd_visible = toggleOn(rs.toggle_bits, settings_view.act_zat_kbd) and typingOwnsKeyboard(rs), .kbd_shift = rs.kbd_shift, .kbd_page = rs.kbd_page, .kbd_caps = rs.kbd_caps, .kbd_flash_key = rs.kbd_flash_key, .kbd_flash_a = kbdFlashAlpha(rs), .chat_q = rs.gchat_q_buf[0..rs.gchat_q_len], .chat_q_focus = rs.gchat_q_focus, .chat_q_caret = composeBlinkOn(rs.caret_anchor_ns), .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
+        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .market_q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .market_q_focus = rs.gmarket_q_focus, .market_loading = rs.market_loading, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .kbd_visible = toggleOn(rs.toggle_bits, settings_view.act_zat_kbd) and typingOwnsKeyboard(rs), .kbd_shift = rs.kbd_shift, .kbd_page = rs.kbd_page, .kbd_caps = rs.kbd_caps, .kbd_flash_key = rs.kbd_flash_key, .kbd_flash_a = kbdFlashAlpha(rs), .chat_q = rs.gchat_q_buf[0..rs.gchat_q_len], .chat_q_focus = rs.gchat_q_focus, .chat_q_caret = composeBlinkOn(rs.caret_anchor_ns), .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_caret = @min(rs.gchat_caret, rs.gchat_draft_len), .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
         switch (rs.mode) {
             .timeline => try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status),
             .compose => {
@@ -3022,7 +3025,16 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                     // The release tap is suppressed below so
                                     // a key never fires twice.
                                     if (feed_view.hitTest(rs.gregions.items, klx, kly)) |kh| switch (kh.kind) {
-                                        .kbd_key, .kbd_shift, .kbd_page, .kbd_backspace => kbdAction(rs, gpa, kh.kind, kh.post),
+                                        .kbd_key => if (kh.post == ' ') {
+                                            // Space commits on RELEASE — a held
+                                            // space is the caret slide (.move).
+                                            m.kbd_space_down = true;
+                                            m.kbd_nav = false;
+                                            m.kbd_nav_x = @as(f32, @floatFromInt(tev.x)) / gsd.scale;
+                                            rs.kbd_flash_key = ' ';
+                                            rs.kbd_flash_ns = clock_shell.monotonicNanos();
+                                        } else kbdAction(rs, gpa, kh.kind, kh.post),
+                                        .kbd_shift, .kbd_page, .kbd_backspace => kbdAction(rs, gpa, kh.kind, kh.post),
                                         else => {},
                                     };
                                 }
@@ -3058,6 +3070,25 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             continue;
                         }
                         gesture.push(&m.ring, .{ .x = @as(f32, @floatFromInt(tev.x)) / scale, .y = @as(f32, @floatFromInt(tev.y)) / scale, .t_ms = now_ms });
+                        // SPACE-HOLD CARET SLIDE (Zat4 keyboard): with the
+                        // press parked on the space bar, horizontal travel
+                        // walks the caret — arrow escapes ride the same byte
+                        // stream typed keys do (~14 logical px per step).
+                        // Engaging eats the pending space.
+                        if (m.kbd_space_down) {
+                            const fx = @as(f32, @floatFromInt(tev.x)) / scale;
+                            if (!m.kbd_nav and @abs(fx - m.kbd_nav_x) > 10) {
+                                m.kbd_nav = true;
+                                m.kbd_nav_x = fx;
+                            }
+                            if (m.kbd_nav) {
+                                const nav_step: f32 = 14;
+                                while (fx - m.kbd_nav_x >= nav_step) : (m.kbd_nav_x += nav_step)
+                                    rs.kbd_bytes.appendSlice(gpa, "\x1b[C") catch break;
+                                while (m.kbd_nav_x - fx >= nav_step) : (m.kbd_nav_x -= nav_step)
+                                    rs.kbd_bytes.appendSlice(gpa, "\x1b[D") catch break;
+                            }
+                        }
                         // The dominant axis at the slop threshold commits the
                         // gesture: vertical -> scroll (as ever), horizontal ->
                         // the nav-drawer swipe (resolved on release). One
@@ -3209,6 +3240,13 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         }
                     },
                     .button_up => {
+                        // A space release: a clean tap TYPES the space; an
+                        // engaged caret slide already did its work.
+                        if (m.kbd_space_down) {
+                            if (!m.kbd_nav) kbdAction(rs, gpa, .kbd_key, ' ');
+                            m.kbd_space_down = false;
+                            m.kbd_nav = false;
+                        }
                         if (m.hold_fired) {
                             // A press-and-hold drag ends. A LIBRARY card drops onto the
                             // socket under the finger (benchDrop hit-tests all three;
@@ -3334,6 +3372,8 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 // DROPPED and the pump kept a phantom finger.
                 if (m.touch_cancel) {
                     m.touch_cancel = false;
+                    m.kbd_space_down = false;
+                    m.kbd_nav = false;
                     m.down_x = -1;
                     m.down_y = -1;
                     m.scrolling = false;
@@ -4733,6 +4773,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         .chat_input => if (dev_chat) {
                                             rs.gchat_input_focus = true;
                                             rs.gchat_composing = false;
+                                            rs.gchat_caret = rs.gchat_draft_len;
                                         },
                                         // "+ New": open (or close) the recipient bar; it owns
                                         // the keyboard while open. Tapping the bar itself is
@@ -4751,6 +4792,8 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                                 chatSend(gpa, io, environ, if (rs.gchat_e2ee) |*st| st else null, rs.gchat_link, &rs.gchat_store, sc, body);
                                                 chatPersistHistory(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
                                                 rs.gchat_draft_len = 0;
+                            rs.gchat_caret = 0;
+                                                rs.gchat_caret = 0;
                                                 rs.gchat_input_focus = true;
                                                 rs.gscroll_px = 0;
                                             };
@@ -5726,10 +5769,23 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             rs.gscroll_px = 0; // re-anchor to the newest message
                         };
                     },
-                    .shift_enter => if (!rs.gchat_composing and rs.gchat_draft_len < rs.gchat_draft_buf.len) {
-                        rs.gchat_draft_buf[rs.gchat_draft_len] = '\n';
-                        rs.gchat_draft_len += 1;
+                    .shift_enter => if (!rs.gchat_composing and insertUtf8At(&rs.gchat_draft_buf, &rs.gchat_draft_len, &rs.gchat_caret, '\n')) {
                         rs.gchat_key_ns = clock_shell.monotonicNanos();
+                    },
+                    // Caret navigation (arrow keys; the phone keyboard's
+                    // space-hold slide arrives as the same escapes).
+                    .left => if (!rs.gchat_composing and rs.gchat_input_focus) {
+                        rs.gchat_caret = @min(rs.gchat_caret, rs.gchat_draft_len);
+                        caretLeftUtf8(&rs.gchat_draft_buf, &rs.gchat_caret);
+                        rs.gchat_key_ns = clock_shell.monotonicNanos();
+                    } else {
+                        chat_key = false;
+                    },
+                    .right => if (!rs.gchat_composing and rs.gchat_input_focus) {
+                        caretRightUtf8(&rs.gchat_draft_buf, rs.gchat_draft_len, &rs.gchat_caret);
+                        rs.gchat_key_ns = clock_shell.monotonicNanos();
+                    } else {
+                        chat_key = false;
                     },
                     .escape => if (rs.gchat_composing) {
                         rs.gchat_composing = false;
@@ -5769,9 +5825,9 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     continue;
                 } else if (dev_chat and rs.gscreen == feed_view.screen_messages and rs.gchat_input_focus) {
                     if (zc == 8 or zc == 127) {
-                        popUtf8(&rs.gchat_draft_buf, &rs.gchat_draft_len);
+                        deleteUtf8Before(&rs.gchat_draft_buf, &rs.gchat_draft_len, &rs.gchat_caret);
                         rs.gchat_key_ns = clock_shell.monotonicNanos();
-                    } else if (zc >= 0x20 and pushUtf8(&rs.gchat_draft_buf, &rs.gchat_draft_len, zc)) {
+                    } else if (zc >= 0x20 and insertUtf8At(&rs.gchat_draft_buf, &rs.gchat_draft_len, &rs.gchat_caret, zc)) {
                         rs.gchat_key_ns = clock_shell.monotonicNanos();
                         // One encrypted typing ping per 4s of active typing.
                         // deposit is worker-queued (never blocks the frame);
@@ -7993,6 +8049,11 @@ fn chatStartCompose(
 fn kbdAction(rs: *RunState, gpa: Allocator, kind: feed_view.Action, post: u16) void {
     switch (kind) {
         .kbd_key => {
+            if (post == 0) { // the dead emoji key: flash only, no byte (yet)
+                rs.kbd_flash_key = 0xE005;
+                rs.kbd_flash_ns = clock_shell.monotonicNanos();
+                return;
+            }
             var kb: [4]u8 = undefined;
             const kn = std.unicode.utf8Encode(@intCast(post), &kb) catch 0;
             if (kn > 0) rs.kbd_bytes.appendSlice(gpa, kb[0..kn]) catch {};
@@ -8041,6 +8102,45 @@ fn pushUtf8(buf: []u8, len: *usize, cp: u21) bool {
     @memcpy(buf[len.*..][0..en], eb[0..en]);
     len.* += en;
     return true;
+}
+
+/// Insert one codepoint at the caret (UTF-8), shifting the tail right.
+fn insertUtf8At(buf: []u8, len: *usize, at: *usize, cp: u21) bool {
+    var eb: [4]u8 = undefined;
+    const en = std.unicode.utf8Encode(cp, &eb) catch return false;
+    if (len.* + en > buf.len) return false;
+    const a = @min(at.*, len.*);
+    std.mem.copyBackwards(u8, buf[a + en .. len.* + en], buf[a..len.*]);
+    @memcpy(buf[a..][0..en], eb[0..en]);
+    len.* += en;
+    at.* = a + en;
+    return true;
+}
+
+/// Backspace one full UTF-8 sequence BEFORE the caret, closing the gap.
+fn deleteUtf8Before(buf: []u8, len: *usize, at: *usize) void {
+    const a = @min(at.*, len.*);
+    if (a == 0) {
+        at.* = 0;
+        return;
+    }
+    var st = a - 1;
+    while (st > 0 and buf[st] >= 0x80 and buf[st] < 0xC0) st -= 1;
+    std.mem.copyForwards(u8, buf[st .. st + (len.* - a)], buf[a..len.*]);
+    len.* -= a - st;
+    at.* = st;
+}
+
+/// One caret step left/right over UTF-8 sequence boundaries.
+fn caretLeftUtf8(buf: []const u8, at: *usize) void {
+    if (at.* == 0) return;
+    at.* -= 1;
+    while (at.* > 0 and buf[at.*] >= 0x80 and buf[at.*] < 0xC0) at.* -= 1;
+}
+fn caretRightUtf8(buf: []const u8, len: usize, at: *usize) void {
+    if (at.* >= len) return;
+    at.* += 1;
+    while (at.* < len and buf[at.*] >= 0x80 and buf[at.*] < 0xC0) at.* += 1;
 }
 
 /// Backspace one full UTF-8 sequence (never strand continuation bytes).
@@ -8817,6 +8917,8 @@ const Grid = struct {
     chat_q_caret: bool = false,
 
     chat_draft: []const u8 = "",
+    /// Caret byte offset into the draft (arrow keys / space-hold move it).
+    chat_caret: usize = 0,
     chat_input_focus: bool = false,
     chat_composing: bool = false,
     chat_compose: []const u8 = "",
@@ -9802,7 +9904,7 @@ fn paintFrame(
                 // Zat Chat (U3, dev-gated): the Messages surface. -scroll maps the
                 // shared ≤0 scroll state onto layoutChat's positive history offset.
                 const cf = buildChatFrame(arena, g.chat_store.?, g.chat_sel, now, g.chat_q);
-                g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{}, &.{}, g.chat_recv, .{}, .{}) catch g.content_h.*;
+                g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_caret, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{}, &.{}, g.chat_recv, .{}, .{}) catch g.content_h.*;
             } else if (g.screen.* == feed_view.screen_loadout) {
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
                 g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market, g.market_q, g.market_q_focus, g.market_loading, g.bench_pick, g.bench_drag, g.published, g.create, g.dev, g.bench, .{}, g.loadout_lib_y) catch g.content_h.*; // software: draw line-art nav
@@ -10237,6 +10339,8 @@ fn paintFrameGpu(
         chat_sig ^= unread_sum *% 0x2545_F491_4F6C_DD1D;
         // The composer focus ring must appear the frame the input is tapped.
         chat_sig ^= @as(u64, @intFromBool(g.chat_input_focus)) *% 0x8A91_7F2B_4D3E_61C7;
+        // Caret moves rebuild the composer strip (the rebuild-signature law).
+        chat_sig ^= (@as(u64, g.chat_caret) +% 1) *% 0xD1B5_4A32_D192_ED03;
         // The recipient bar: open/close, every keystroke, and the status
         // line must each repaint the frame they change.
         chat_sig ^= @as(u64, @intFromBool(g.chat_composing)) *% 0xF29C_511C_8E3D_45A7;
@@ -10518,7 +10622,7 @@ fn paintFrameGpu(
                 }
             } else |_| {}
             const reflow_t: f32 = if (gs.chat_reflow) |rh| (gs.chat_world.position(rh) orelse 1.0) else 1.0;
-            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t }, xforms, g.chat_recv, .{ .top = @intCast(gs.inset_top_l), .bottom = @intCast(@max(gs.inset_bottom_l, @max(gs.ime_bottom_l, if (g.kbd_visible) feed_view.keyboard_h + gs.inset_bottom_l else 0))), .left = @intCast(gs.inset_left_l), .right = @intCast(gs.inset_right_l) }, .{ .q = g.chat_q, .focus = g.chat_q_focus, .caret_on = g.chat_q_caret }) catch g.content_h.*;
+            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_caret, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t }, xforms, g.chat_recv, .{ .top = @intCast(gs.inset_top_l), .bottom = @intCast(@max(gs.inset_bottom_l, @max(gs.ime_bottom_l, if (g.kbd_visible) feed_view.keyboard_h + gs.inset_bottom_l else 0))), .left = @intCast(gs.inset_left_l), .right = @intCast(gs.inset_right_l) }, .{ .q = g.chat_q, .focus = g.chat_q_focus, .caret_on = g.chat_q_caret }) catch g.content_h.*;
         } else if (g.screen.* == feed_view.screen_algo_docs) {
             g.content_h.* = feed_view.layoutAlgoDocs(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, if (g.docs_kind == 1) algo_docs.dev_doc else algo_docs.user_doc) catch g.content_h.*;
         } else if (g.screen.* == feed_view.screen_algo_detail) {
@@ -11467,15 +11571,17 @@ fn drawSdfIcons(g: Grid, gs: *GpuState, items: []const feed_core.TimelineItem, v
                     5 => gpu.icon_gear, // Settings
                     else => continue, // the "you" card (post 7) is an avatar, not an icon
                 };
-                // The phone TAB BAR emits a taller 52px nav region (drawTabBar) and
-                // its bigger 28px icon centres at (r.x+26, r.y+24); the rail/drawer
-                // keep the 42px region with the 22px icon centred at (r.x+21,r.y+19).
+                // The phone TAB BAR emits full-slot nav regions (drawTabBar —
+                // bar-top to screen-bottom, ≥76 tall): its 28px icon centres at
+                // (r.x + r.w/2, r.y + 36). The rail/drawer keep the 42px region
+                // with the 22px icon centred at (r.x+21, r.y+19).
                 const tabbar = r.h >= 50;
-                const off_x: f32 = if (tabbar) 26.0 else 21.0;
-                const off_y: f32 = if (tabbar) 24.0 else 19.0;
                 const half: f32 = if (tabbar) 14.0 * scale else nav;
-                const cx = (@as(f32, @floatFromInt(r.x)) + off_x) * scale;
-                const ncy = (@as(f32, @floatFromInt(r.y)) + off_y) * scale;
+                const cx = if (tabbar)
+                    (@as(f32, @floatFromInt(r.x)) + @as(f32, @floatFromInt(r.w)) * 0.5) * scale
+                else
+                    (@as(f32, @floatFromInt(r.x)) + 21.0) * scale;
+                const ncy = (@as(f32, @floatFromInt(r.y)) + if (tabbar) @as(f32, 36.0) else @as(f32, 19.0)) * scale;
                 const col: u32 = if (@as(u16, g.screen.*) == r.post) g.accent else muted;
                 gpu.drawIcon(&gs.icon, id, cx, ncy, half, col, vw, vh);
             },
