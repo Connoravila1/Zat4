@@ -44,6 +44,7 @@
 //! network dominates regardless).
 
 const std = @import("std");
+const fixture = @import("test_fixture.zig");
 const netguard = @import("../core/netguard.zig");
 
 /// SSRF trust posture for a request (Phase 1). `.trusted` is for
@@ -347,15 +348,10 @@ test "loopback: authorization and accept reach the wire verbatim" {
     const gpa = std.testing.allocator; // C6
     const io = std.testing.io;
 
-    var port: u16 = 38530;
-    var address: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
-    var server = address.listen(io, .{ .reuse_address = true }) catch blk: {
-        port += 11;
-        address = .{ .ip4 = .loopback(port) };
-        break :blk try address.listen(io, .{ .reuse_address = true });
-    };
-    defer server.deinit(io);
-    const thread = try std.Thread.spawn(.{}, serveCheckingHeadersOnce, .{ &server, io });
+    var bound = try fixture.listenLoopback(io, 38530);
+    const port = bound.port;
+    defer bound.server.deinit(io);
+    const thread = try std.Thread.spawn(.{}, serveCheckingHeadersOnce, .{ &bound.server, io });
     defer thread.join();
 
     var url_buf: [48]u8 = undefined;
@@ -392,15 +388,10 @@ test "loopback: requestCapturing returns the DPoP-Nonce header and the body" {
     const gpa = std.testing.allocator; // C6
     const io = std.testing.io;
 
-    var port: u16 = 38570;
-    var address: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
-    var server = address.listen(io, .{ .reuse_address = true }) catch blk: {
-        port += 13;
-        address = .{ .ip4 = .loopback(port) };
-        break :blk try address.listen(io, .{ .reuse_address = true });
-    };
-    defer server.deinit(io);
-    const thread = try std.Thread.spawn(.{}, serveWithNonceOnce, .{ &server, io });
+    var bound = try fixture.listenLoopback(io, 38570);
+    const port = bound.port;
+    defer bound.server.deinit(io);
+    const thread = try std.Thread.spawn(.{}, serveWithNonceOnce, .{ &bound.server, io });
     defer thread.join();
 
     var url_buf: [48]u8 = undefined;
@@ -437,15 +428,10 @@ test "loopback: the response budget is a hard cap, surfaced as the module's own 
     const gpa = std.testing.allocator; // C6
     const io = std.testing.io;
 
-    var port: u16 = 38552;
-    var address: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
-    var server = address.listen(io, .{ .reuse_address = true }) catch blk: {
-        port += 11;
-        address = .{ .ip4 = .loopback(port) };
-        break :blk try address.listen(io, .{ .reuse_address = true });
-    };
-    defer server.deinit(io);
-    const thread = try std.Thread.spawn(.{}, serveOversizedOnce, .{ &server, io });
+    var bound = try fixture.listenLoopback(io, 38552);
+    const port = bound.port;
+    defer bound.server.deinit(io);
+    const thread = try std.Thread.spawn(.{}, serveOversizedOnce, .{ &bound.server, io });
     defer thread.join();
 
     var url_buf: [48]u8 = undefined;

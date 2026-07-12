@@ -1862,7 +1862,7 @@ pub fn drawKeyboard(
     var gr: usize = 1;
     while (gr < n_rows) : (gr += 1) {
         const gy = top + 8 + @as(i32, @intCast(gr)) * (kbd_key_h + kbd_gap) - @divTrunc(kbd_gap + 1, 2);
-        try rect(gpa, dl, m, gy, row_w, 1, (0x30 << 24) | (accent & 0x00FFFFFF), 0);
+        try rect(gpa, dl, m, gy, row_w, 1, (0x1E << 24) | (accent & 0x00FFFFFF), 0);
     }
 
     // THE PULSES (owner: whispy glints riding the lines): two travel row
@@ -1985,7 +1985,7 @@ pub fn drawKeyboard(
             // Vertical circuit trace in the gutter left of this key.
             if (ki > 0) {
                 const gx = x - @divTrunc(kbd_gap + 1, 2);
-                try rect(gpa, dl, gx, y, 1, kbd_key_h, (0x30 << 24) | (accent & 0x00FFFFFF), 0);
+                try rect(gpa, dl, gx, y, 1, kbd_key_h, (0x1E << 24) | (accent & 0x00FFFFFF), 0);
             }
             const active_ctrl = (k.ctrl == 1 and (shift or caps)) or (k.ctrl == 3 and k.lo == 0 and page != 0);
             const fill: u32 = if (active_ctrl) (0x50 << 24) | (accent & 0x00FFFFFF) else 0x1CFFFFFF;

@@ -147,6 +147,8 @@ pub const MobileHost = struct {
     kbd_space_down: bool = false,
     kbd_nav: bool = false,
     kbd_nav_x: f32 = 0,
+    /// The previous slide sample (velocity for the glide's step tuning).
+    kbd_nav_fx: f32 = 0,
     /// The char key this press committed at touch-down (0 = none): sliding
     /// off it before lifting UNDOES the char (slide-off cancel).
     kbd_press_cp: u16 = 0,

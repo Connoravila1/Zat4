@@ -80,12 +80,23 @@ pub fn serveScript(server: *std.Io.net.Server, io: std.Io, steps: []const Script
 }
 
 pub fn listenLoopback(io: std.Io, base_port: u16) !struct { server: std.Io.net.Server, port: u16 } {
+    // NO reuse_address here, ever: on Linux it grants port SHARING
+    // (REUSEPORT), so the probe "succeeds" on a taken port and the kernel
+    // then load-balances client connections BETWEEN the parallel test
+    // binaries — a wrong-process accept queue, a listener that never
+    // wakes, an hour-long join (three listeners on one port, observed
+    // 2026-07-11). Without it a taken port honestly refuses and the probe
+    // walks on; TIME_WAIT collisions also walk on — right for tests.
     var port = base_port;
-    var address: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
-    const server = address.listen(io, .{ .reuse_address = true }) catch blk: {
-        port += 11;
-        address = .{ .ip4 = .loopback(port) };
-        break :blk try address.listen(io, .{ .reuse_address = true });
-    };
-    return .{ .server = server, .port = port };
+    var tries: u8 = 0;
+    while (true) {
+        var address: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+        const server = address.listen(io, .{ .reuse_address = false }) catch {
+            tries += 1;
+            if (tries >= 8) return error.NoFreePort;
+            port += 11;
+            continue;
+        };
+        return .{ .server = server, .port = port };
+    }
 }

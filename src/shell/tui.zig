@@ -3082,6 +3082,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                             m.kbd_space_down = true;
                                             m.kbd_nav = false;
                                             m.kbd_nav_x = @as(f32, @floatFromInt(tev.x)) / gsd.scale;
+                                            m.kbd_nav_fx = m.kbd_nav_x;
                                             rs.kbd_flash_key = ' ';
                                             rs.kbd_flash_ns = clock_shell.monotonicNanos();
                                         } else {
@@ -3139,7 +3140,9 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         // committed before lifting — undo the char (one
                         // backspace), kill its flash. The standard escape
                         // hatch press-commit otherwise loses.
-                        if (m.press_in_kbd and m.kbd_press_cp != 0 and rs.kbd_popup_kind == 0) {
+                        if (m.press_in_kbd and m.kbd_press_cp != 0 and rs.kbd_popup_kind == 0 and
+                            (now_ms -% m.down_ms) > 120)
+                        {
                             const cdx = @abs(@as(f32, @floatFromInt(@as(i32, tev.x) - m.down_x))) / scale;
                             const cdy = @abs(@as(f32, @floatFromInt(@as(i32, tev.y) - m.down_y))) / scale;
                             if (cdx > 30 or cdy > 34) {
@@ -3167,7 +3170,11 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                 m.kbd_nav_x = fx;
                             }
                             if (m.kbd_nav) {
-                                const nav_step: f32 = 14;
+                                // Velocity-tuned: a slow slide steps every
+                                // ~15 px (precision); a fast one every ~6
+                                // (reach) — the Gboard glide's feel.
+                                const spd = @abs(fx - m.kbd_nav_fx);
+                                const nav_step: f32 = std.math.clamp(15.0 - spd * 0.45, 6.0, 15.0);
                                 const nav_x0 = m.kbd_nav_x;
                                 while (fx - m.kbd_nav_x >= nav_step) : (m.kbd_nav_x += nav_step)
                                     rs.kbd_bytes.appendSlice(gpa, "\x1b[C") catch break;
@@ -3178,6 +3185,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                 // haptic channel; lands mid-gesture, §3).
                                 if (m.kbd_nav_x != nav_x0) m.haptic_pending = 1;
                             }
+                            m.kbd_nav_fx = fx;
                         }
                         // The dominant axis at the slop threshold commits the
                         // gesture: vertical -> scroll (as ever), horizontal ->
@@ -8341,7 +8349,9 @@ fn kbdFlashAlpha(rs: *const RunState) u8 {
     if (rs.kbd_flash_held) return 190; // held: the pop stays until release
     if (age < attack) return 190;
     if (age >= dur) return 0;
-    return @intCast(190 - (age - attack) * 190 / (dur - attack));
+    // Quantized to 16 levels: each level is one vert rebuild, not each frame.
+    const a: u8 = @intCast(190 - (age - attack) * 190 / (dur - attack));
+    return a & 0xF0;
 }
 
 /// M2.1: keep the relay subscribed to every mailbox we currently drain —
@@ -10696,15 +10706,17 @@ fn paintFrameGpu(
         // The Zat4 keyboard: visibility, shift, caps, and page redraw the
         // tile; the press-flash key + its decaying alpha rebuild it each
         // frame of the fade (the rebuild-signature law).
-        ^ ((@as(u64, @intFromBool(g.kbd_visible)) << 9 | @as(u64, @intFromBool(g.kbd_shift)) << 5 | @as(u64, @intFromBool(g.kbd_caps)) << 4 | @as(u64, g.kbd_page)) *% 0xA3B1_95E7_4C29_D6F1) ^ ((@as(u64, g.kbd_flash_key) << 8 | @as(u64, g.kbd_flash_a)) *% 0xC4CE_B9FE_1A85_EC53);
+        ^ ((@as(u64, @intFromBool(g.kbd_visible)) << 9 | @as(u64, @intFromBool(g.kbd_shift)) << 5 | @as(u64, @intFromBool(g.kbd_caps)) << 4 | @as(u64, g.kbd_page)) *% 0xA3B1_95E7_4C29_D6F1) ^ ((@as(u64, g.kbd_flash_key) << 8 | @as(u64, g.kbd_flash_a)) *% 0xC4CE_B9FE_1A85_EC53) ^ (if (g.kbd_visible and toggleOn(g.settings_toggles, settings_view.act_kbd_pulses)) (@as(u64, @intFromFloat(@max(0, (if (g.gpu) |gsp| gsp.t else 0)) * 20.0)) +% 1) *% 0x94D0_49BB_1331_11EB else 0) ^ ((@as(u64, @intCast(g.kbd_popup.sel + 2)) << 4 | @as(u64, g.kbd_popup.opts.len)) *% 0xA0761D6478BD642F);
     // A drag/settle animates the socket every frame (lift, reflow, ghost), so
     // bypass the feed cache while it runs — a brief interaction, and the field
     // already rebuilds every frame anyway.
     const feed_animating = g.toys.feed_toy == .zero_g or g.toys.feed_toy == .liquid;
-    // The Zat4 keyboard animates while up (lattice pulses + press-flash
-    // decay) — bypass the cache like any other live interaction.
-    const kbd_animating = g.kbd_visible;
-    if (sig != gs.feed_sig or gs.feed.verts.items.len == 0 or g.socket_ui.drag_active != null or search_animating or zones_animating or drawer_animating or rail_hover_animating or algo_animating or chat_animating or g.screen.* == feed_view.screen_loadout or g.frametiming_on or gs.shatter_active or g.pet or feed_animating or kbd_animating) {
+    // The Zat4 keyboard animates by SIGNATURE, not by bypass: a full
+    // per-frame rebuild re-shaped every chat bubble at the display rate and
+    // made TYPING mushy (the owner's "something isn't right", 2026-07-11).
+    // The pulse clock folds in at 50 ms buckets (~20 fps motion) and the
+    // flash alpha is quantized — rebuilds now track change, not refresh.
+    if (sig != gs.feed_sig or gs.feed.verts.items.len == 0 or g.socket_ui.drag_active != null or search_animating or zones_animating or drawer_animating or rail_hover_animating or algo_animating or chat_animating or g.screen.* == feed_view.screen_loadout or g.frametiming_on or gs.shatter_active or g.pet or feed_animating) {
         gs.feed_sig = sig;
         // An empty timeline renders the chrome with no posts (no placeholders).
         const feed_posts = feed_view.fromTimeline(arena, items, now, g.expanded) catch &[_]feed_view.PostView{};
