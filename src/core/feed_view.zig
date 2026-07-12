@@ -154,6 +154,83 @@ fn cardBox(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, w: i32, h: i32,
     try rect(gpa, dl, x, y, w, h, fill, radius);
 }
 
+// ---------------------------------------------------------------------------
+// Shared control vocabulary (the Algorithms surfaces): one button language,
+// one identity mark, one progress affordance — so the four tabs read as a
+// designed system instead of ad-hoc grey slabs. Pure draws over rect/str.
+// ---------------------------------------------------------------------------
+
+/// Primary action: the accent at full strength, dark ink, centered label.
+/// Disabled dims to a ghost but keeps its region — the shell's handler is
+/// where a refused tap explains itself (the dev-flow convention).
+fn buttonPrimary(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawList, regions: ?*Regions, x: i32, y: i32, w: i32, h: i32, label: []const u8, accent: u32, payload: u16, action: Action, enabled: bool) error{OutOfMemory}!void {
+    const fill: u32 = if (enabled) accent else 0x2AEDEAE0;
+    const label_c: u32 = if (enabled) 0xFF0B0B0F else muted;
+    try rect(gpa, dl, x, y, w, h, fill, 11);
+    const tw: i32 = @intCast(text.measure(e, .semibold, label, 15));
+    _ = try str(gpa, dl, e, .semibold, x + @divTrunc(w - tw, 2), y + @divTrunc(h, 2) + 6, label_c, 15, label);
+    try emitRegion(gpa, regions, x, y, w, @intCast(@max(0, @min(32767, h))), payload, action);
+}
+
+/// Secondary action: a quiet solid card (panel + hairline edge) with ink text.
+/// Replaces the translucent grey slabs that read as disabled controls.
+fn buttonSecondary(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawList, regions: ?*Regions, x: i32, y: i32, w: i32, h: i32, label: []const u8, payload: u16, action: Action) error{OutOfMemory}!void {
+    try cardBox(gpa, dl, x, y, w, h, 11, panel);
+    const tw: i32 = @intCast(text.measure(e, .semibold, label, 15));
+    _ = try str(gpa, dl, e, .semibold, x + @divTrunc(w - tw, 2), y + @divTrunc(h, 2) + 6, ink, 15, label);
+    try emitRegion(gpa, regions, x, y, w, @intCast(@max(0, @min(32767, h))), payload, action);
+}
+
+/// The algorithm identity mark: a rounded accent tile wearing the record's
+/// initials (first letters of the first two ASCII words). One mark on every
+/// surface — tray, shelf, marketplace, published, detail — so "an algorithm"
+/// is a shape you recognize, not a row of text.
+fn monogramTile(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x: i32, y: i32, size: i32, fill: u32, name: []const u8) error{OutOfMemory}!void {
+    const rad: u8 = @intCast(@min(255, @divTrunc(size, 4) + 3));
+    try rect(gpa, dl, x, y, size, size, fill, rad);
+    var initials: [2]u8 = undefined;
+    var n: usize = 0;
+    var it = std.mem.tokenizeScalar(u8, name, ' ');
+    while (it.next()) |word| {
+        if (n == 2) break;
+        if (word[0] < 0x80) { // ASCII only; multi-byte leads would draw junk
+            initials[n] = std.ascii.toUpper(word[0]);
+            n += 1;
+        }
+    }
+    if (n == 0) {
+        initials[0] = 'Z';
+        n = 1;
+    }
+    const px: u16 = @intCast(@max(10, @divTrunc(size * 2, 5)));
+    const s = initials[0..n];
+    const tw: i32 = @intCast(text.measure(e, .semibold, s, px));
+    const baseline = y + @divTrunc(size, 2) + @divTrunc(@as(i32, px), 3);
+    _ = try str(gpa, dl, e, .semibold, x + @divTrunc(size - tw, 2), baseline, onFill(fill), px, s);
+}
+
+/// The wizard's progress affordance: one dot per step joined by thin segments,
+/// filled through the current step in the accent (the current dot gets a soft
+/// halo); the step label sits faint at the right. Non-interactive. Returns the
+/// content y below the rail.
+fn progressRail(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawList, x: i32, y: i32, w: i32, accent: u32, step: usize, total: usize, label: []const u8) error{OutOfMemory}!i32 {
+    const dot: i32 = 8;
+    const seg_w: i32 = 26;
+    var cx = x;
+    var i: usize = 0;
+    while (i < total) : (i += 1) {
+        if (i == step) try rect(gpa, dl, cx - 3, y - 3, dot + 6, dot + 6, (0x40 << 24) | (accent & 0x00FFFFFF), 7);
+        try rect(gpa, dl, cx, y, dot, dot, if (i <= step) accent else 0x24EDEAE0, 4);
+        if (i + 1 < total) try rect(gpa, dl, cx + dot + 4, y + 3, seg_w, 2, if (i < step) accent else 0x18EDEAE0, 1);
+        cx += dot + 4 + seg_w + 4;
+    }
+    var buf: [64]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "Step {d} of {d} · {s}", .{ step + 1, total, label }) catch label;
+    const tw: i32 = @intCast(text.measure(e, .regular, s, 13));
+    _ = try str(gpa, dl, e, .regular, x + w - tw, y + dot, faint, 13, s);
+    return y + dot + 26;
+}
+
 /// A chat bubble's fill — FULLY OPAQUE, so a message reads as a solid bubble,
 /// not a tint you can see the field through. Mine = the accent at full opacity
 /// (the "sent" bubble); theirs = the opaque panel skin (the "received" bubble).
@@ -225,7 +302,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -1755,6 +1832,35 @@ pub const keyboard_h: i32 = 5 * (kbd_key_h + kbd_gap) + 8 + 24;
 const kbd_key_h: i32 = 52;
 const kbd_gap: i32 = 7;
 
+/// The emoji picker's scroll geometry — shared with the shell so the
+/// clamp and the layout can never drift. The grid holds `count + 1`
+/// slots in 8 columns (slot 7, the top-right corner, is the fixed `abc`
+/// exit key — the same corner the letters layout keeps its emoji key),
+/// scrolled vertically over a 4-row viewport above the space/backspace
+/// row.
+const emoji_grid_cols: i32 = 8;
+const emoji_row_h: i32 = @divTrunc(4 * (kbd_key_h + kbd_gap) - 4, 4);
+/// Public: the picker viewport height doubles as the nav column's full
+/// reveal — the shell's rubber-band dimension.
+pub const emoji_view_h: i32 = 4 * emoji_row_h;
+pub fn emojiScrollMax() i32 {
+    const slots: i32 = @intCast(emoji_atlas.count + 1);
+    const rows: i32 = @divTrunc(slots + emoji_grid_cols - 1, emoji_grid_cols);
+    return @max(0, rows * emoji_row_h - emoji_view_h);
+}
+
+/// The scroll offset that puts a category's first row at the viewport
+/// top — the nav rollout's jump target (same slot math as the grid walk).
+pub fn emojiCategoryScroll(cat: u16) i32 {
+    const start: i32 = emoji_atlas.cat_starts[@min(cat, emoji_atlas.category_count - 1)];
+    const slot = if (start < 7) start else start + 1; // slot 7 = the abc key
+    return @min(@divTrunc(slot, emoji_grid_cols) * emoji_row_h, emojiScrollMax());
+}
+
+/// The nav rollout's GIF entry rides `Region.post` past the category
+/// range (categories are 0..category_count-1).
+pub const emoji_nav_gif: u16 = 255;
+
 /// One key of a row: the unshifted/shifted codepoints (equal when shift is
 /// meaningless) and a width in flex units. `cp == 0` marks a CONTROL key
 /// named by `ctrl`. Comptime layout data — iterated per rebuild, tiny.
@@ -1790,9 +1896,11 @@ const kbd_s2_mid = kbdRowStr("*\"':;!?/", "*\"':;!?/");
 const kbd_x0 = kbdRowStr("[]{}<>^_~|", "[]{}<>^_~|");
 const kbd_x1 = kbdRowStr("`\\=*#%+&@", "`\\=*#%+&@");
 const kbd_x2_mid = kbdRowStr("$-'\"/:;!", "$-'\"/:;!");
-// The standing number row (every page): 1–9 + the emoji key — the owner
-// wants numbers one tap away while the symbols pages keep their own runs.
-const kbd_num = kbdRowStr("123456789", "123456789");
+// The standing number row (every page): 1–9, 0, + the emoji key — the
+// owner wants numbers one tap away while the symbols pages keep their own
+// runs. (The zero was simply MISSING; owner, 2026-07-12 — row 0 lays out
+// its eleven keys a fraction narrower than the letter unit to seat it.)
+const kbd_num = kbdRowStr("1234567890", "1234567890");
 
 /// The chat draft's edit state as the view needs it: caret + selection
 /// byte offsets (sel_a == sel_b = no selection) + whether the Copy/Cut/
@@ -1887,7 +1995,7 @@ pub fn kbdResolve(regions: []const Region, px: i32, py: i32, ctx: [2]u8) ?Region
     var best_score: f32 = 2.6 + 0.35; // reach bound, prior-inclusive
     for (regions) |r| {
         switch (r.kind) {
-            .kbd_key, .kbd_shift, .kbd_page, .kbd_backspace, .kbd_emoji => {},
+            .kbd_key, .kbd_shift, .kbd_page, .kbd_backspace, .kbd_emoji, .kbd_nav, .kbd_cat => {},
             else => continue,
         }
         const cx = @as(f32, @floatFromInt(r.x)) + @as(f32, @floatFromInt(r.w)) * 0.5;
@@ -1994,10 +2102,22 @@ pub fn drawKeyboard(
     pop_on: bool,
     /// The open long-press popup (empty opts = closed).
     popup: KbdPopup,
-    /// The emoji picker: open replaces the key rows with a sprite grid;
-    /// `emoji_page` pages through the atlas 40 at a time.
+    /// The emoji picker: open replaces the key rows with a sprite grid,
+    /// scrolled vertically by `emoji_scroll` logical px (the shell owns
+    /// the offset + its physics; clamp bound = `emojiScrollMax()`).
     emoji_open: bool,
-    emoji_page: u8,
+    emoji_scroll: i32,
+    /// The picker's SECTION (0 = emoji grid, 1 = GIFs) — the last choice
+    /// persists across opens (the shell owns + saves it).
+    picker_mode: u8,
+    /// The nav rollout's reveal [0,1] (the shell springs it): the bottom-
+    /// left square unrolls the category column upward over the grid.
+    nav_t: f32,
+    /// The rollout column's rubber-band GIVE (logical px, positive = the
+    /// entries ride down) — the strip feels scrollable even though it
+    /// fits; the shell maps the drag through the band curve and springs
+    /// it home on release.
+    nav_scroll: i32,
 ) error{OutOfMemory}!void {
     const top = view_h - keyboard_h - bottom_inset;
     // The panel: opaque (nothing ghosts through chrome) with a faint wash.
@@ -2049,49 +2169,111 @@ pub fn drawKeyboard(
         try rect(gpa, dl, hx - 1 - 2 * tail, gy - 1, 3, 3, (0x1C << 24) | (accent & 0x00FFFFFF), 1);
     };
 
-    // THE EMOJI PICKER: the key rows yield to an 8-wide sprite grid (40 per
-    // page); the bottom row becomes [abc][<][>][space][backspace]. Cells
-    // emit .kbd_emoji with the CELL INDEX (the dispatch maps it to its
-    // codepoint through the atlas — Region.post is u16, emoji aren't).
+    // THE EMOJI PICKER: the key rows yield to an 8-wide sprite grid over
+    // the whole set, faces first (`emoji_atlas.display`), scrolled
+    // VERTICALLY in pixels — edge rows crop hard at the viewport, so
+    // nothing ever ghosts under the chrome. Slot 7 (top-right) is the
+    // fixed `abc` exit key; the bottom row keeps space + backspace.
+    // Cells emit .kbd_emoji with the atlas CELL INDEX (the dispatch maps
+    // it to its codepoint — Region.post is u16, emoji aren't).
     if (emoji_open) {
-        const grid_cols: i32 = 8;
-        const grid_rows: i32 = 5;
+        const grid_cols = emoji_grid_cols;
         const cw = @divTrunc(row_w - (grid_cols - 1) * kbd_gap, grid_cols);
-        const ch = @divTrunc(4 * (kbd_key_h + kbd_gap) + kbd_key_h, grid_rows);
-        var gy2 = top + 8;
-        var ri: i32 = 0;
-        while (ri < grid_rows) : (ri += 1) {
-            var ci: i32 = 0;
-            while (ci < grid_cols) : (ci += 1) {
-                const cell_i: u32 = @as(u32, emoji_page) * 40 + @as(u32, @intCast(ri * grid_cols + ci));
-                if (cell_i >= emoji_atlas.count) break;
-                const cx2 = m + ci * (cw + kbd_gap);
-                const ebox: i32 = 34;
-                try dl.append(gpa, .{ .emoji = .{
-                    .x = @intCast(cx2 + @divTrunc(cw - ebox, 2)),
-                    .y = @intCast(gy2 + @divTrunc(ch - ebox, 2)),
-                    .px = @intCast(ebox),
-                    .cell = @intCast(cell_i),
-                } });
-                try emitRegion(gpa, regions, cx2, gy2, cw, @intCast(@min(ch, 32767)), @intCast(cell_i), .kbd_emoji);
-                ci += 0;
-            }
-            gy2 += ch + 2;
+        const vt = top + 8; // viewport top
+        const vb = vt + emoji_view_h; // viewport bottom
+        const rh = emoji_row_h;
+        const sc = std.math.clamp(emoji_scroll, 0, emojiScrollMax());
+        const ebox: i32 = 34;
+        const nt = std.math.clamp(nav_t, 0.0, 1.0);
+        const nav_out = nt > 0.5; // the rollout column is (mostly) open
+        // The GIF section: the grid yields to an honest placeholder until
+        // the image pipeline lands (the nav + abc + bottom row all stay,
+        // so the section swap is chrome-stable).
+        if (picker_mode != 0) {
+            const gt = "GIFs";
+            const gw: i32 = @intCast(text.measure(e, .semibold, gt, 20));
+            _ = try str(gpa, dl, e, .semibold, m + @divTrunc(row_w - gw, 2), vt + @divTrunc(emoji_view_h, 2) - 8, ink, 20, gt);
+            const gs = "Search and send GIFs — landing with the image pipeline.";
+            const gsw: i32 = @intCast(text.measure(e, .regular, gs, 13));
+            _ = try str(gpa, dl, e, .regular, m + @divTrunc(row_w - gsw, 2), vt + @divTrunc(emoji_view_h, 2) + 16, faint, 13, gs);
         }
-        // The bottom control row.
-        const bot_y = top + 8 + 4 * (kbd_key_h + kbd_gap);
+        var i: u32 = if (picker_mode != 0) emoji_atlas.count else 0;
+        while (i < emoji_atlas.count) : (i += 1) {
+            const cell = emoji_atlas.display[i];
+            const s: i32 = if (i < 7) @intCast(i) else @intCast(i + 1); // slot 7 = abc
+            const ri = @divTrunc(s, grid_cols);
+            const ci = @mod(s, grid_cols);
+            const cy = vt + ri * rh - sc;
+            if (cy + rh <= vt or cy >= vb) continue;
+            const cx2 = m + ci * (cw + kbd_gap);
+            const ey = cy + @divTrunc(rh - ebox, 2);
+            const ct: i32 = std.math.clamp(vt - ey, 0, ebox);
+            const cb: i32 = std.math.clamp(ey + ebox - vb, 0, ebox - ct);
+            if (ct + cb < ebox) try dl.append(gpa, .{ .emoji = .{
+                .x = @intCast(cx2 + @divTrunc(cw - ebox, 2)),
+                .y = @intCast(ey),
+                .px = @intCast(ebox),
+                .cell = cell,
+                .crop_top = @intCast(ct),
+                .crop_bot = @intCast(cb),
+            } });
+            // The tap target: the cell clamped to the viewport — and, in
+            // the abc column, clamped below the fixed exit key so a sprite
+            // scrolled beneath it can never steal the exit tap. The FIRST
+            // column stands down entirely while the nav rollout covers it:
+            // its centers sit INSIDE the strip, so the nearest-key resolver
+            // handed imperfect nav presses to hidden emoji (owner,
+            // 2026-07-12).
+            const rtop = if (ci == grid_cols - 1) @max(cy, vt + rh) else @max(cy, vt);
+            const rbot = @min(cy + rh, vb);
+            if (!(nav_out and ci == 0) and rbot - rtop >= 14)
+                try emitRegion(gpa, regions, cx2, rtop, cw, @intCast(@min(rbot - rtop, 32767)), cell, .kbd_emoji);
+        }
+        // The fixed abc exit key, top-right: an OPAQUE cover (panel bg +
+        // wash) so scrolling sprites pass under it, then the key face.
+        const abc_x = m + (grid_cols - 1) * (cw + kbd_gap);
+        try rect(gpa, dl, abc_x, vt, cw, rh, bg, 0);
+        try rect(gpa, dl, abc_x, vt, cw, rh, 0x14FFFFFF, 0);
+        try rect(gpa, dl, abc_x, vt + 2, cw, kbd_key_h, 0x66000000, 9);
+        try rect(gpa, dl, abc_x, vt, cw, kbd_key_h, 0x26FFFFFF, 9);
+        {
+            const gw2: i32 = @intCast(text.measure(e, .regular, "abc", 13));
+            _ = try str(gpa, dl, e, .regular, abc_x + @divTrunc(cw - gw2, 2), vt + 31, ink, 13, "abc");
+        }
+        try emitRegion(gpa, regions, abc_x, vt, cw, @intCast(rh), 0, .kbd_page);
+        // The bottom row: [nav][space][backspace]. Sprites crop at `vb`,
+        // so the band these sit on is clean panel — the old picker drew
+        // its 5th sprite row UNDER the translucent faces (the owner's
+        // "weird half transparent thing", 2026-07-12).
+        const bot_y = vt + 4 * (kbd_key_h + kbd_gap);
+        const nav_w: i32 = kbd_key_h; // one square, bottom-left
+        // The nav square: key face + a 2x2 grid glyph; the face brightens
+        // while the rollout is out.
+        try rect(gpa, dl, m, bot_y, nav_w, kbd_key_h + 2, 0x66000000, 9);
+        try rect(gpa, dl, m, bot_y, nav_w, kbd_key_h, if (nt > 0.5) @as(u32, 0x3AFFFFFF) else 0x26FFFFFF, 9);
+        {
+            var gy: i32 = 0;
+            while (gy < 2) : (gy += 1) {
+                var gx: i32 = 0;
+                while (gx < 2) : (gx += 1) {
+                    try rect(gpa, dl, m + @divTrunc(nav_w, 2) - 10 + gx * 12, bot_y + @divTrunc(kbd_key_h, 2) - 10 + gy * 12, 8, 8, (0xC8 << 24) | (accent & 0x00FFFFFF), 2);
+                }
+            }
+        }
+        try emitRegion(gpa, regions, m, bot_y, nav_w, @intCast(kbd_key_h + kbd_gap), 0, .kbd_nav);
+        // Space + backspace share the rest (their tap regions stand down
+        // while the rollout covers them).
+        const flex_x = m + nav_w + kbd_gap;
+        const flex_w = row_w - nav_w - kbd_gap;
         const Btn = struct { lab: []const u8, kind: Action, post: u16, w: i32 };
         const btns = [_]Btn{
-            .{ .lab = "abc", .kind = .kbd_page, .post = 0, .w = 3 },
-            .{ .lab = "<", .kind = .kbd_page, .post = 10, .w = 2 },
-            .{ .lab = ">", .kind = .kbd_page, .post = 11, .w = 2 },
-            .{ .lab = "", .kind = .kbd_key, .post = ' ', .w = 8 },
+            .{ .lab = "", .kind = .kbd_key, .post = ' ', .w = 10 },
             .{ .lab = "\u{232B}", .kind = .kbd_backspace, .post = 0, .w = 3 },
         };
         var units2: i32 = 0;
         for (btns) |bt| units2 += bt.w;
-        const bw_num = row_w - @as(i32, @intCast(btns.len - 1)) * kbd_gap;
-        var bx2 = m;
+        const bw_num = flex_w - @as(i32, @intCast(btns.len - 1)) * kbd_gap;
+        var bx2 = flex_x;
         for (btns) |bt| {
             const bw2 = @divTrunc(bw_num * bt.w, units2);
             try rect(gpa, dl, bx2, bot_y, bw2, kbd_key_h + 2, 0x66000000, 9);
@@ -2101,8 +2283,74 @@ pub fn drawKeyboard(
                 const gw2: i32 = @intCast(text.measure(e, .regular, bt.lab, gpx2));
                 _ = try str(gpa, dl, e, .regular, bx2 + @divTrunc(bw2 - gw2, 2), bot_y + 33, ink, gpx2, bt.lab);
             }
-            try emitRegion(gpa, regions, bx2, bot_y, bw2, @intCast(kbd_key_h + kbd_gap), bt.post, bt.kind);
+            if (nt <= 0.5)
+                try emitRegion(gpa, regions, bx2, bot_y, bw2, @intCast(kbd_key_h + kbd_gap), bt.post, bt.kind);
             bx2 += bw2 + kbd_gap;
+        }
+        // THE NAV ROLLOUT: an opaque COLUMN unrolling UPWARD out of the
+        // nav square, over the grid's left edge — category tabs pop in as
+        // the reveal rises to them (GIF nearest the thumb, faces at the
+        // top), current section highlighted. The column is a scrollable
+        // list by feel: everything fits, so `nav_scroll` is pure rubber-
+        // band GIVE (shell-owned; entries track the finger and spring
+        // home). Drawn LAST so it covers the grid column beneath.
+        if (nt > 0.01) {
+            const strip_bot = bot_y - 4;
+            const strip_full: i32 = strip_bot - vt; // == emoji_view_h
+            const reveal: i32 = @intFromFloat(@as(f32, @floatFromInt(strip_full)) * nt);
+            const strip_top = strip_bot - reveal;
+            try rect(gpa, dl, m, strip_top, nav_w, reveal, bg, 9);
+            try rect(gpa, dl, m, strip_top, nav_w, reveal, 0x14FFFFFF, 9);
+            try rect(gpa, dl, m, strip_top, nav_w, 1, (0x66 << 24) | (accent & 0x00FFFFFF), 0);
+            const n_entries: i32 = @intCast(emoji_atlas.category_count + 1);
+            const eg: i32 = 3; // inner gap
+            const pad: i32 = 4;
+            const eh = @divTrunc(strip_full - 2 * pad - (n_entries - 1) * eg, n_entries);
+            // The lit section: GIF when that's the mode, else the category
+            // the viewport top currently sits in.
+            var cur: i32 = @intCast(emoji_atlas.category_count); // = the GIF entry
+            if (picker_mode == 0) {
+                cur = 0;
+                var ci2: u16 = 0;
+                while (ci2 < emoji_atlas.category_count) : (ci2 += 1) {
+                    if (emojiCategoryScroll(ci2) <= sc + 1) cur = @intCast(ci2);
+                }
+            }
+            var en: i32 = 0;
+            while (en < n_entries) : (en += 1) {
+                // Full-reveal position (vt-anchored), shifted by the give.
+                const ey2 = vt + pad + en * (eh + eg) + nav_scroll;
+                if (ey2 + eh <= strip_top or ey2 >= strip_bot) continue; // rolled up / banded out
+                const vis_top = @max(ey2, strip_top);
+                const vis_bot = @min(ey2 + eh, strip_bot);
+                if (en == cur and vis_bot - vis_top > 4)
+                    try rect(gpa, dl, m + 3, vis_top, nav_w - 6, vis_bot - vis_top, (0x2E << 24) | (accent & 0x00FFFFFF), 8);
+                if (en < emoji_atlas.category_count) {
+                    const icell = emoji_atlas.cellOf(emoji_atlas.cat_icons[@intCast(en)]) orelse 0;
+                    const ib: i32 = 24;
+                    const iy = ey2 + @divTrunc(eh - ib, 2);
+                    const ict: i32 = std.math.clamp(strip_top - iy, 0, ib);
+                    const icb: i32 = std.math.clamp(iy + ib - strip_bot, 0, ib - ict);
+                    if (ict + icb < ib) try dl.append(gpa, .{ .emoji = .{
+                        .x = @intCast(m + @divTrunc(nav_w - ib, 2)),
+                        .y = @intCast(iy),
+                        .px = @intCast(ib),
+                        .cell = @intCast(icell),
+                        .crop_top = @intCast(ict),
+                        .crop_bot = @intCast(icb),
+                    } });
+                } else if (ey2 >= strip_top and ey2 + eh <= strip_bot) {
+                    // The GIF label is text (no crop support): draw only
+                    // fully inside — it can only edge-clip mid-band.
+                    const gl = "GIF";
+                    const glw: i32 = @intCast(text.measure(e, .semibold, gl, 12));
+                    _ = try str(gpa, dl, e, .semibold, m + @divTrunc(nav_w - glw, 2), ey2 + @divTrunc(eh, 2) + 4, ink, 12, gl);
+                }
+                if (nt > 0.5 and vis_bot - vis_top >= 12) {
+                    const post: u16 = if (en < emoji_atlas.category_count) @intCast(en) else emoji_nav_gif;
+                    try emitRegion(gpa, regions, m, vis_top, nav_w, @intCast(@min(vis_bot - vis_top, 32767)), post, .kbd_cat);
+                }
+            }
         }
         return; // the picker replaces the rows entirely
     }
@@ -2226,6 +2474,19 @@ pub fn drawKeyboard(
             }
             kx_buf[nk - 1] = xx;
             kww_buf[nk - 1] = m + row_w - xx;
+        } else if (row_i == 0) {
+            // The number row seats ELEVEN keys (1–9, 0, emoji): each is a
+            // fraction narrower than the letter unit so the zero fits —
+            // the uniform-width rule stays a letters-rows property.
+            const nk_i: i32 = @intCast(nk);
+            const kw0 = @divTrunc(row_w - (nk_i - 1) * kbd_gap, nk_i);
+            const total = nk_i * kw0 + (nk_i - 1) * kbd_gap;
+            var xx = m + @divTrunc(row_w - total, 2);
+            for (0..nk) |kidx| {
+                kx_buf[kidx] = xx;
+                kww_buf[kidx] = kw0;
+                xx += kw0 + kbd_gap;
+            }
         } else {
             const nk_i: i32 = @intCast(nk);
             const total = nk_i * unit_kw + (nk_i - 1) * kbd_gap;
@@ -2310,7 +2571,10 @@ pub fn drawKeyboard(
                     };
                     const gpx: u16 = if (k.ctrl == 3) 13 else 18;
                     const gw: i32 = @intCast(text.measure(e, .regular, glyph, gpx));
-                    _ = try str(gpa, dl, e, .regular, x + @divTrunc(kw - gw, 2), y + 33, ink, gpx, glyph);
+                    // Layer labels are lowercase-dominant at 13px: optical
+                    // centre wants the baseline higher than the symbol keys'.
+                    const gbase: i32 = if (k.ctrl == 3) y + 31 else y + 33;
+                    _ = try str(gpa, dl, e, .regular, x + @divTrunc(kw - gw, 2), gbase, ink, gpx, glyph);
                 }
                 const kind: Action = switch (k.ctrl) {
                     1 => .kbd_shift,
@@ -2328,7 +2592,18 @@ pub fn drawKeyboard(
                 var gb: [4]u8 = undefined;
                 const gn = std.unicode.utf8Encode(@intCast(cp), &gb) catch 1;
                 const gw: i32 = @intCast(text.measure(e, .regular, gb[0..gn], 19));
-                _ = try str(gpa, dl, e, .regular, x + @divTrunc(kw - gw, 2), y + 34, ink, 19, gb[0..gn]);
+                // OPTICAL centring per glyph class (the labels sat visibly
+                // low, owner 2026-07-12): lowercase centres on the x-height
+                // band, caps/digits on the cap band; punctuation is a
+                // BASELINE mark and stays put — "centring" a comma reads
+                // wrong.
+                const kbase: i32 = if (cp >= 'a' and cp <= 'z')
+                    y + 31
+                else if ((cp >= '0' and cp <= '9') or (cp >= 'A' and cp <= 'Z'))
+                    y + 33
+                else
+                    y + 34;
+                _ = try str(gpa, dl, e, .regular, x + @divTrunc(kw - gw, 2), kbase, ink, 19, gb[0..gn]);
                 try emitRegion(gpa, regions, rx0, ry0, rx1 - rx0, @intCast(@min(ry1 - ry0, 32767)), cp, .kbd_key);
             }
         }
@@ -3441,9 +3716,11 @@ pub fn buildChainHeaderBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.
     _ = try str(gpa, dl, e, .regular, nx + 9, draw_y + 18, aScale(faint, alpha), 13, handle);
 }
 
-/// The end pen and the caret pen returned by the draft wrapper.
+/// The end pen, the caret pen, and the SELECTION-END pens returned by the
+/// draft wrapper (the selection handles anchor on sel_a/sel_b; both sit at
+/// the wrapper's origin when there is no selection).
 /// A7.2: cold — a single transient value per compose frame, never collected.
-const DraftPens = struct { end: Pen, caret: Pen };
+const DraftPens = struct { end: Pen, caret: Pen, sel_a: Pen, sel_b: Pen };
 
 /// Word-wrap `draft` into `maxw`, honouring explicit '\n' line breaks, drawing
 /// as it goes. Returns the pen after the last glyph AND the pen at byte offset
@@ -3456,6 +3733,8 @@ fn wrapDraft(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i3
     var baseline = first_baseline;
     var x = x0;
     var caret_pen: Pen = .{ .x = x0, .baseline = first_baseline };
+    var sa_pen: Pen = .{ .x = x0, .baseline = first_baseline };
+    var sb_pen: Pen = .{ .x = x0, .baseline = first_baseline };
     var word_start: usize = 0;
     var i: usize = 0;
     while (i <= draft.len) : (i += 1) {
@@ -3469,7 +3748,8 @@ fn wrapDraft(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i3
                 baseline += line_h;
                 x = x0;
             }
-            // Selection highlight behind the selected sub-run of this word.
+            // Selection highlight behind the selected sub-run of this word,
+            // and the END PENS (the drag handles anchor on them).
             if (sel_end > sel_start) {
                 const ss = @max(sel_start, word_start);
                 const se = @min(sel_end, i);
@@ -3478,6 +3758,10 @@ fn wrapDraft(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i3
                     const hx1 = x + @as(i32, @intCast(text.measure(e, .regular, draft[word_start..se], px)));
                     try rect(gpa, dl, hx0, baseline - 15, hx1 - hx0, 20, sel_fill, 2);
                 }
+                if (sel_start >= word_start and sel_start <= i)
+                    sa_pen = .{ .x = x + @as(i32, @intCast(text.measure(e, .regular, draft[word_start..sel_start], px))), .baseline = baseline };
+                if (sel_end >= word_start and sel_end <= i)
+                    sb_pen = .{ .x = x + @as(i32, @intCast(text.measure(e, .regular, draft[word_start..sel_end], px))), .baseline = baseline };
             }
             // Caret inside this word (or at its edges): measure the sub-run.
             if (caret_at >= word_start and caret_at <= i) {
@@ -3503,7 +3787,7 @@ fn wrapDraft(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i3
         }
         word_start = i + 1;
     }
-    return .{ .end = .{ .x = x, .baseline = baseline }, .caret = caret_pen };
+    return .{ .end = .{ .x = x, .baseline = baseline }, .caret = caret_pen, .sel_a = sa_pen, .sel_b = sb_pen };
 }
 
 /// The composer text-box geometry, shared by `layoutCompose` (drawing + caret)
@@ -3852,6 +4136,136 @@ pub const MarketAlgoCard = struct {
     state_budget_bytes: u32,
 };
 
+/// The Marketplace tab's render state, bundled (it outgrew four loose
+/// parameters when the filter chips + card hover arrived). A7.2: cold —
+/// one per frame. Waived.
+pub const MarketView = struct {
+    cards: []const MarketAlgoCard = &.{},
+    q: []const u8 = "", // the search draft
+    q_focus: bool = false, // the box owns the keyboard
+    loading: bool = false, // a fetch is in flight (empty ⇒ "loading", not "nothing")
+    filter: u8 = 0, // active capability chip: 0 all · 1 private · 2 learns · 3 attention
+    hover_x: i32 = -1, // pointer, logical px (−1 when off-page) — card hover lift
+    hover_y: i32 = -1,
+};
+
+/// The capability-filter chips, in payload order (the shell's refilter
+/// switch indexes this same order).
+const market_filters = [_][]const u8{ "All", "Private", "Learns on-device", "Uses attention" };
+
+/// Everything the SHARED algorithm card renders — marketplace, published,
+/// detail header — so the entity wears one face everywhere. A7.2: cold
+/// struct, size guard waived — one per card draw, never collected.
+pub const AlgoCardSpec = struct {
+    name: []const u8,
+    author: []const u8 = "",
+    desc: []const u8 = "", // one-line; ellipsized, never wrapped
+    tile_color: u32, // the monogram tile fill (stored accent or tilePalette)
+    learns: bool = false,
+    uses_behavioral: bool = false,
+    state_budget_bytes: u32 = 0,
+    designed: u8 = 0, // declared-surface bitmask (micro-pills, top-right)
+    status: enum { none, live, syncing } = .none, // Published tab's state pill
+    show_caps: bool = true, // false when the capability facts are unknown (never guess)
+    hover: bool = false,
+    action: ?Action = null, // whole-card tap target (null = inert)
+    payload: u16 = 0,
+};
+
+/// The shared algorithm card. Height is the caller's (>= 112 reads right);
+/// the whole card is the tap target — a hover lift + "Open →" hint carry the
+/// affordance, so no lonely ghost button.
+fn algoCard(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, regions: ?*Regions, accent: u32, x: i32, y: i32, w: i32, h: i32, spec: AlgoCardSpec) error{OutOfMemory}!void {
+    try cardBox(gpa, dl, x, y, w, h, 16, skinPanel(accent));
+    try rect(gpa, dl, x, y, w, 1, 0x14EDEAE0, 16); // lit top edge
+    if (spec.hover) try rect(gpa, dl, x, y, w, h, 0x08FFFFFF, 16); // lift (theme-safe overlay)
+    if (spec.action) |act| try emitRegion(gpa, regions, x, y, w, @intCast(@max(0, @min(32767, h))), spec.payload, act);
+    try monogramTile(gpa, dl, e, x + 18, y + 18, 46, spec.tile_color, spec.name);
+    // Top-right chrome, right-to-left: the status pill, then designed-for pills.
+    var bx = x + w - 16;
+    switch (spec.status) {
+        .live => {
+            const lbl: []const u8 = "Live";
+            const tw: i32 = @intCast(text.measure(e, .semibold, lbl, 11));
+            bx -= tw + 30;
+            try rect(gpa, dl, bx, y + 18, tw + 30, 20, 0x228FD18F, 7);
+            try rect(gpa, dl, bx + 9, y + 24, 7, 7, boost_c, 3);
+            _ = try str(gpa, dl, e, .semibold, bx + 21, y + 32, boost_c, 11, lbl);
+            bx -= 8;
+        },
+        .syncing => {
+            const lbl: []const u8 = "Syncing…";
+            const tw: i32 = @intCast(text.measure(e, .semibold, lbl, 11));
+            bx -= tw + 16;
+            try rect(gpa, dl, bx, y + 18, tw + 16, 20, 0x14EDEAE0, 7);
+            _ = try str(gpa, dl, e, .semibold, bx + 8, y + 32, faint, 11, lbl);
+            bx -= 8;
+        },
+        .none => {},
+    }
+    if (spec.designed != 0) {
+        var si: usize = dev_surfaces.len;
+        while (si > 0) {
+            si -= 1;
+            if (spec.designed & (@as(u8, 1) << @intCast(si)) == 0) continue;
+            const btw: i32 = @intCast(text.measure(e, .semibold, dev_surfaces[si], 11));
+            bx -= btw + 18;
+            try rect(gpa, dl, bx, y + 18, btw + 14, 20, 0x14EDEAE0, 6);
+            _ = try str(gpa, dl, e, .semibold, bx + 7, y + 32, muted, 11, dev_surfaces[si]);
+            bx -= 6;
+        }
+    }
+    // Name + author · one-liner.
+    const tx0 = x + 80;
+    try strEllipsis(gpa, dl, e, .semibold, tx0, y + 36, ink, 17, spec.name, @max(60, bx - tx0 - 10));
+    var pen = try str(gpa, dl, e, .regular, tx0, y + 58, muted, 13, spec.author);
+    if (spec.desc.len > 0) {
+        pen = try str(gpa, dl, e, .regular, pen + 8, y + 58, faint, 13, "·");
+        try strEllipsis(gpa, dl, e, .regular, pen + 8, y + 58, body_c, 13, spec.desc, @max(40, x + w - (pen + 8) - 20));
+    }
+    // The capability badge, bottom-left (one badge — the strongest true fact).
+    var px2 = x + 18;
+    if (!spec.show_caps) {
+        // Facts unknown (a syncing published row): show nothing, claim nothing.
+    } else if (spec.learns) {
+        px2 = try badgePill(gpa, dl, e, px2, y + h - 32, "Learns on-device", tag_blue);
+        if (spec.state_budget_bytes > 0) {
+            var buf: [48]u8 = undefined;
+            const kib = (spec.state_budget_bytes + 1023) / 1024;
+            const s = std.fmt.bufPrint(&buf, "up to {d} KB on device", .{kib}) catch "";
+            _ = try str(gpa, dl, e, .regular, px2 + 2, y + h - 18, faint, 12, s);
+        }
+    } else if (spec.uses_behavioral) {
+        px2 = try badgePill(gpa, dl, e, px2, y + h - 32, "Uses attention", accent_house);
+    } else {
+        px2 = try badgePill(gpa, dl, e, px2, y + h - 32, "No behavioral data", boost_c);
+    }
+    // The hover hint, bottom-right — the card is the button.
+    if (spec.hover and spec.action != null) {
+        const cta: []const u8 = "Open →";
+        const cw2: i32 = @intCast(text.measure(e, .semibold, cta, 13));
+        _ = try str(gpa, dl, e, .semibold, x + w - cw2 - 18, y + h - 18, accent, 13, cta);
+    }
+}
+
+/// Destructive action: a quiet red-tinted resting state; solid warning red
+/// when `armed`, so the two-tap confirm reads in pixels.
+fn buttonDestructive(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawList, regions: ?*Regions, x: i32, y: i32, w: i32, h: i32, label: []const u8, payload: u16, action: Action, armed: bool) error{OutOfMemory}!void {
+    try rect(gpa, dl, x, y, w, h, if (armed) like_c else 0x22F0617A, 10);
+    const tw: i32 = @intCast(text.measure(e, .semibold, label, 14));
+    _ = try str(gpa, dl, e, .semibold, x + @divTrunc(w - tw, 2), y + @divTrunc(h, 2) + 5, if (armed) 0xFF0B0B0F else like_c, 14, label);
+    try emitRegion(gpa, regions, x, y, w, @intCast(@max(0, @min(32767, h))), payload, action);
+}
+
+/// A small tinted capability pill: `color`-tinted fill, `color` text.
+/// Returns the x after the pill (+ gap), so pills chain.
+fn badgePill(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x: i32, y: i32, label: []const u8, color: u32) error{OutOfMemory}!i32 {
+    const tw: i32 = @intCast(text.measure(e, .semibold, label, 11));
+    try rect(gpa, dl, x, y, tw + 16, 20, (0x22 << 24) | (color & 0x00FFFFFF), 7);
+    _ = try str(gpa, dl, e, .semibold, x + 8, y + 14, color, 11, label);
+    return x + tw + 16 + 8;
+}
+
 /// A category's screen heading.
 fn transpCategory(c: transp.Category) []const u8 {
     return switch (c) {
@@ -4145,16 +4559,9 @@ pub fn layoutLoadout(
     /// Optional partition geometry (the shell expands the loadout content into
     /// the freed space when the left rail condenses). Null ⇒ self-computed.
     pane_geom: ?PaneGeom,
-    /// The Marketplace tab's browse list (the AppView's published algorithms,
-    /// already mapped from the wire). Empty ⇒ the "nothing published yet" state.
+    /// The Marketplace tab's render state (cards + search + filter + hover).
     /// Only read on tab 1; ignored on the others.
-    market: []const MarketAlgoCard,
-    /// The marketplace search draft + whether the box owns the keyboard.
-    market_q: []const u8,
-    market_q_focus: bool,
-    /// A marketplace fetch is in flight (the empty state says "loading", not
-    /// "nothing published" — the first fetch rides a cold connection).
-    market_loading: bool,
+    market: MarketView,
     /// The designed-for heads-up modal (a mismatched drop) — null = closed.
     bench_pick: ?BenchPickView,
     /// A live bench drag (a shelf card riding the pointer) — null = none.
@@ -4252,12 +4659,13 @@ pub fn layoutLoadout(
                     for (bench.cards, 0..) |card, bi| {
                         const ch: i32 = 72;
                         const card_acc = lens_socket.palette[@min(card.color, lens_socket.palette.len - 1)];
-                        try rect(gpa, dl, shelf_x, sy, shelf_w, ch, skinPanel(accent), 12);
-                        try rect(gpa, dl, shelf_x, sy, 4, ch, card_acc, 2); // accent spine
+                        const nm = bench.text[card.name.off..][0..card.name.len];
+                        try cardBox(gpa, dl, shelf_x, sy, shelf_w, ch, 12, skinPanel(accent));
+                        try monogramTile(gpa, dl, e, shelf_x + 14, sy + 14, 32, card_acc, nm);
+                        try strEllipsis(gpa, dl, e, .semibold, shelf_x + 58, sy + 28, ink, 15, nm, shelf_w - 58 - 34);
                         const dot: u32 = if (card.flags.behavioral) accent else boost_c;
-                        try rect(gpa, dl, shelf_x + 18, sy + 20, 8, 8, dot, 4);
-                        _ = try str(gpa, dl, e, .semibold, shelf_x + 34, sy + 28, ink, 15, bench.text[card.name.off..][0..card.name.len]);
-                        _ = try str(gpa, dl, e, .regular, shelf_x + 18, sy + 52, muted, 12, bench.text[card.ranks.off..][0..card.ranks.len]);
+                        try rect(gpa, dl, shelf_x + 58, sy + 45, 7, 7, dot, 3);
+                        try strEllipsis(gpa, dl, e, .regular, shelf_x + 71, sy + 52, muted, 12, bench.text[card.ranks.off..][0..card.ranks.len], shelf_w - 71 - 34);
                         _ = try str(gpa, dl, e, .semibold, shelf_x + shelf_w - 26, sy + 44, faint, 15, "\u{22EE}"); // ⋮ (drag lands later; tap = the socket chooser)
                         try emitRegion(gpa, regions, shelf_x, sy, shelf_w, @intCast(ch), @intCast(bi), .bench_seat);
                         sy += ch + 12;
@@ -4277,12 +4685,13 @@ pub fn layoutLoadout(
                 for (bench.cards, 0..) |card, bi| {
                     const ch: i32 = 78;
                     const card_acc = lens_socket.palette[@min(card.color, lens_socket.palette.len - 1)];
-                    try rect(gpa, dl, m.lx, ly, m.cw, ch, skinPanel(accent), 13);
-                    try rect(gpa, dl, m.lx, ly, 4, ch, card_acc, 2); // accent spine
+                    const nm = bench.text[card.name.off..][0..card.name.len];
+                    try cardBox(gpa, dl, m.lx, ly, m.cw, ch, 13, skinPanel(accent));
+                    try monogramTile(gpa, dl, e, m.lx + 16, ly + 17, 34, card_acc, nm);
+                    try strEllipsis(gpa, dl, e, .semibold, m.lx + 62, ly + 32, ink, 16, nm, m.cw - 62 - 36);
                     const dot: u32 = if (card.flags.behavioral) accent else boost_c;
-                    try rect(gpa, dl, m.lx + 20, ly + 24, 9, 9, dot, 4);
-                    _ = try str(gpa, dl, e, .semibold, m.lx + 40, ly + 32, ink, 16, bench.text[card.name.off..][0..card.name.len]);
-                    _ = try str(gpa, dl, e, .regular, m.lx + 20, ly + 58, muted, 13, bench.text[card.ranks.off..][0..card.ranks.len]);
+                    try rect(gpa, dl, m.lx + 62, ly + 50, 8, 8, dot, 4);
+                    try strEllipsis(gpa, dl, e, .regular, m.lx + 76, ly + 58, muted, 13, bench.text[card.ranks.off..][0..card.ranks.len], m.cw - 76 - 36);
                     _ = try str(gpa, dl, e, .semibold, m.lx + m.cw - 28, ly + 48, faint, 17, "\u{22EE}"); // ⋮ — press-hold to drag
                     try emitRegion(gpa, regions, m.lx, ly, m.cw, @intCast(ch), @intCast(bi), .bench_seat);
                     ly += ch + 12;
@@ -4291,7 +4700,7 @@ pub fn layoutLoadout(
             content_h = (ly - scroll) + 20;
         }
     } else if (tab == 1) {
-        content_h = try drawMarketplace(gpa, dl, e, m, height, scroll, regions, accent, content_top, market, market_q, market_q_focus, market_loading);
+        content_h = try drawMarketplace(gpa, dl, e, m, height, scroll, regions, accent, content_top, market);
     } else if (tab == 3) {
         content_h = try drawPublished(gpa, dl, e, m, height, scroll, regions, accent, content_top, published);
     } else if (dev.active) {
@@ -4375,115 +4784,93 @@ pub fn layoutLoadout(
 /// (drop it into the feed loadout). Emits `.algo_view` / `.algo_add` regions
 /// carrying the card index. Empty list ⇒ a calm "nothing here yet" state. Only
 /// cards intersecting the viewport are painted (i16 coord safety). PURE.
-fn drawMarketplace(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, height: i32, scroll: i32, regions: ?*Regions, accent: u32, y0: i32, market: []const MarketAlgoCard, query: []const u8, q_focus: bool, loading: bool) error{OutOfMemory}!i32 {
+fn drawMarketplace(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, height: i32, scroll: i32, regions: ?*Regions, accent: u32, y0: i32, mv: MarketView) error{OutOfMemory}!i32 {
     // The sticky header's REAL bottom, passed in: it grows by the safe-area top
     // inset on phone, and the old hardcoded 140 left this tab's content starting
     // under the translucent veil — the "Your feed, your rules" ghost (2026-07-09).
     const content_top: i32 = y0;
     const x0 = m.lx;
-    const w = m.cw;
+    // The browse GRID earns a wider span than the 760 reading column (capped
+    // for composure); metricsPage stays untouched — the Loadout tab's shelf
+    // depends on the freed side space, and the read-shaped tabs keep the column.
+    const w: i32 = if (m.wide) @min(m.side_x - 20 - m.lx, 1120) else m.cw;
 
-    // The search box: name / author / one-liner / tags, filtered live by the
-    // shell (the card list arriving here is already the filtered set).
+    // Row one: the search field + the explainer link. Row two: capability chips.
     {
-        const sh: i32 = 44;
-        const sy = content_top + scroll;
-        try rect(gpa, dl, x0, sy, w, sh, 0x12EDEAE0, 12);
-        if (q_focus) try rect(gpa, dl, x0, sy, 3, sh, accent, 2);
-        const shown = if (query.len > 0) query else "Search algorithms — name, creator, tags";
-        const qc: u32 = if (query.len > 0) ink else faint;
-        const pen = try str(gpa, dl, e, .regular, x0 + 16, sy + 28, qc, 15, shown);
-        if (q_focus) try rect(gpa, dl, (if (query.len > 0) pen else x0 + 16) + 2, sy + 12, 2, 20, accent, 0);
-        try emitRegion(gpa, regions, x0, sy, w, @intCast(sh), 0, .market_search);
-        // The user explainer's front door, beside the search box.
+        const sh: i32 = 40;
+        const sy = content_top + scroll + 14;
         const lt: []const u8 = "How does this work?";
         const ltw: i32 = @intCast(text.measure(e, .regular, lt, 13));
-        _ = try str(gpa, dl, e, .regular, x0 + w - ltw, sy + sh + 22, faint, 13, lt);
-        try emitRegion(gpa, regions, x0 + w - ltw - 8, sy + sh + 4, ltw + 16, 28, 0, .docs_user);
+        const sw = w - ltw - 28;
+        try cardBox(gpa, dl, x0, sy, sw, sh, 12, panel);
+        if (mv.q_focus) try rect(gpa, dl, x0, sy, 3, sh, accent, 2);
+        try iconSearch(gpa, dl, x0 + 14, sy + 13, 14, faint);
+        const shown = if (mv.q.len > 0) mv.q else "Search algorithms — name, creator, tags";
+        const qc: u32 = if (mv.q.len > 0) ink else faint;
+        const pen = try str(gpa, dl, e, .regular, x0 + 38, sy + 26, qc, 14, shown);
+        if (mv.q_focus) try rect(gpa, dl, (if (mv.q.len > 0) pen else x0 + 38) + 2, sy + 11, 2, 18, accent, 0);
+        try emitRegion(gpa, regions, x0, sy, sw, @intCast(sh), 0, .market_search);
+        _ = try str(gpa, dl, e, .regular, x0 + w - ltw, sy + 26, faint, 13, lt);
+        try emitRegion(gpa, regions, x0 + w - ltw - 8, sy + 6, ltw + 16, 28, 0, .docs_user);
+        // The capability-filter chips (the shell refilters on tap).
+        var fx = x0;
+        const fy = sy + sh + 14;
+        for (market_filters, 0..) |fl, fi| {
+            const on = mv.filter == fi;
+            const ftw: i32 = @intCast(text.measure(e, .semibold, fl, 12));
+            const fw = ftw + 24;
+            if (on) {
+                try rect(gpa, dl, fx, fy, fw, 26, (0x28 << 24) | (accent & 0x00FFFFFF), 9);
+                _ = try str(gpa, dl, e, .semibold, fx + 12, fy + 17, accent, 12, fl);
+            } else {
+                try cardBox(gpa, dl, fx, fy, fw, 26, 9, panel);
+                _ = try str(gpa, dl, e, .semibold, fx + 12, fy + 17, muted, 12, fl);
+            }
+            try emitRegion(gpa, regions, fx, fy, fw, 26, @intCast(fi), .market_filter);
+            fx += fw + 8;
+        }
     }
-    const list_top = content_top + 92;
+    const list_top = content_top + 14 + 40 + 14 + 26 + 18;
 
-    if (market.len == 0) {
-        const msg: []const u8 = if (loading and query.len == 0) "Loading the marketplace…" else if (query.len > 0) "Nothing matches that search" else "No algorithms published yet";
-        const sub: []const u8 = if (loading and query.len == 0) "One moment — fetching the published algorithms." else if (query.len > 0) "Try fewer words — it matches names, creators, one-liners, and tags." else "Publish one and it shows up here to browse and adopt.";
+    if (mv.cards.len == 0) {
+        const filtered = mv.q.len > 0 or mv.filter != 0;
+        const msg: []const u8 = if (mv.loading and !filtered) "Loading the marketplace…" else if (filtered) "Nothing matches" else "No algorithms published yet";
+        const sub: []const u8 = if (mv.loading and !filtered) "One moment — fetching the published algorithms." else if (filtered) "Try fewer words or All — search matches names, creators, one-liners, and tags." else "Publish one and it shows up here to browse and adopt.";
         _ = try str(gpa, dl, e, .semibold, x0, list_top + scroll + 70, ink, 19, msg);
         _ = try str(gpa, dl, e, .regular, x0, list_top + scroll + 98, muted, 14, sub);
         return height; // nothing to scroll
     }
 
-    var y: i32 = list_top + scroll;
-    // Narrow (phone) cards grow a row: the privacy/meta line and the button
-    // shared a band and collided at 430 (on-device finding) — the button
-    // drops below the meta instead.
-    const narrow = w < 520;
-    const card_h: i32 = if (narrow) 162 else 128;
+    // The card grid: two columns when the span affords it. The whole card is
+    // the ONE destination (the algorithm's page — two pages confused the
+    // owner); a hover lift + "Open →" carry the affordance.
+    const y: i32 = list_top + scroll;
+    const cols: usize = if (w >= 900) 2 else 1;
     const gap: i32 = 16;
-    for (market, 0..) |a, i| {
-        if (y + card_h > 0 and y < height) {
-            try rect(gpa, dl, x0, y, w, card_h, skinPanel(accent), 16);
-            try rect(gpa, dl, x0, y, w, 1, 0x14EDEAE0, 16); // lit top edge
-            // The whole card opens the algorithm's PAGE (emitted first — the
-            // View-details button below wins the overlap, hitTest is last-in).
-            try emitRegion(gpa, regions, x0, y, w, @intCast(card_h), @intCast(i), .algo_open);
-
-            _ = try str(gpa, dl, e, .semibold, x0 + 22, y + 34, ink, 20, a.name);
-            var apen = try str(gpa, dl, e, .regular, x0 + 22, y + 58, muted, 14, a.author);
-            if (a.ranks.len > 0) {
-                apen = try str(gpa, dl, e, .regular, apen + 8, y + 58, faint, 13, "·");
-                _ = try str(gpa, dl, e, .regular, apen + 8, y + 58, body_c, 13, a.ranks);
-            }
-            // Designed-for badges, top-right: the author's declaration of which
-            // sockets this was built for (right-to-left so FEED lands leftmost).
-            if (a.designed != 0) {
-                var bx = x0 + w - 20;
-                var si: usize = dev_surfaces.len;
-                while (si > 0) {
-                    si -= 1;
-                    if (a.designed & (@as(u8, 1) << @intCast(si)) == 0) continue;
-                    const btw: i32 = @intCast(text.measure(e, .semibold, dev_surfaces[si], 11));
-                    bx -= btw + 18;
-                    try rect(gpa, dl, bx, y + 22, btw + 14, 20, 0x14EDEAE0, 6);
-                    _ = try str(gpa, dl, e, .semibold, bx + 7, y + 36, muted, 11, dev_surfaces[si]);
-                    bx -= 6;
-                }
-            }
-
-            // The proven privacy line: green when candidate-side (a privacy win),
-            // accent when it reads or learns from your attention.
-            const dot: u32 = if (a.uses_behavioral) accent else boost_c;
-            const label: []const u8 = if (a.learns)
-                "Learns on-device"
-            else if (a.uses_behavioral)
-                "Uses attention signals"
-            else
-                "No behavioral data";
-            try rect(gpa, dl, x0 + 22, y + 78, 9, 9, dot, 4);
-            const after = try str(gpa, dl, e, .semibold, x0 + 40, y + 89, body_c, 14, label);
-            if (a.learns and a.state_budget_bytes > 0) {
-                var buf: [48]u8 = undefined;
-                const kib = (a.state_budget_bytes + 1023) / 1024;
-                const s = std.fmt.bufPrint(&buf, "· up to {d} KB on device", .{kib}) catch "";
-                _ = try str(gpa, dl, e, .regular, after + 12, y + 89, faint, 13, s);
-            }
-
-            // The primary affordance, right-aligned: open this algorithm's
-            // transparency page (browse → inspect exactly what it does). "Add to
-            // loadout" (adopt + score) is the next slice — it needs the fetched
-            // config wired into the scoring resolver.
-            const btn_h: i32 = 34;
-            const btn_y = if (narrow) y + 108 else y + card_h - btn_h - 18;
-            const view_w: i32 = 128;
-            const view_x = x0 + w - view_w - 20;
-            try rect(gpa, dl, view_x, btn_y, view_w, btn_h, 0x14EDEAE0, 10); // ghost
-            _ = try str(gpa, dl, e, .semibold, view_x + 42, btn_y + 22, ink, 14, "Open");
-            // ONE destination: the card and its button both open the
-            // algorithm's page (two different pages confused the owner);
-            // transparency lives inside that page.
-            try emitRegion(gpa, regions, view_x, btn_y, view_w, btn_h, @intCast(i), .algo_open);
+    const card_w = @divTrunc(w - gap * (@as(i32, @intCast(cols)) - 1), @as(i32, @intCast(cols)));
+    const card_h: i32 = 118;
+    for (mv.cards, 0..) |a, i| {
+        const cx = x0 + @as(i32, @intCast(i % cols)) * (card_w + gap);
+        const cy = y + @as(i32, @intCast(i / cols)) * (card_h + gap);
+        if (cy + card_h > 0 and cy < height) { // viewport cull (i16 coords)
+            const hov = mv.hover_x >= cx and mv.hover_x < cx + card_w and mv.hover_y >= cy and mv.hover_y < cy + card_h;
+            try algoCard(gpa, dl, e, regions, accent, cx, cy, card_w, card_h, .{
+                .name = a.name,
+                .author = a.author,
+                .desc = a.ranks,
+                .tile_color = tilePalette(a.name),
+                .learns = a.learns,
+                .uses_behavioral = a.uses_behavioral,
+                .state_budget_bytes = a.state_budget_bytes,
+                .designed = a.designed,
+                .hover = hov,
+                .action = .algo_open,
+                .payload = @intCast(i),
+            });
         }
-        y += card_h + gap;
     }
-    return (y - scroll) + 20;
+    const rows: i32 = @intCast((mv.cards.len + cols - 1) / cols);
+    return (y - scroll) + rows * (card_h + gap) + 20;
 }
 
 /// The bench socket-chooser's render state: which shelf algorithm was tapped
@@ -4497,9 +4884,15 @@ pub const PublishedRow = struct {
     name: []const u8 = "",
     ranks: []const u8 = "",
     designed: u8 = 0,
+    color: u8 = 0, // the record's accent palette index — the identity tile
     live: bool = false, // present in the marketplace catalog (indexed + served)
     confirm: bool = false, // this row's Delete is armed (tap again to fire)
     lib_idx: u16 = 0, // the library record index — the action payload
+    // Capability facts, from the MATCHED marketplace row (the library doesn't
+    // store them). Only trustworthy when `caps_known` — never guessed.
+    caps_known: bool = false,
+    learns: bool = false,
+    uses_behavioral: bool = false,
 };
 
 /// The creator dashboard: your published algorithms, their marketplace
@@ -4512,46 +4905,43 @@ fn drawPublished(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m:
     var y: i32 = y0 + scroll;
 
     if (rows.len == 0) {
-        _ = try str(gpa, dl, e, .semibold, x0, y + 70, ink, 19, "Nothing published yet");
-        _ = try str(gpa, dl, e, .regular, x0, y + 98, muted, 14, "Write one under Create — everything you publish is managed from here.");
-        return (y - scroll) + 160;
+        // A composed empty state: centered title + hint + the door to Create.
+        const cxm = x0 + @divTrunc(w, 2);
+        const t1: []const u8 = "Nothing published yet";
+        const t1w: i32 = @intCast(text.measure(e, .semibold, t1, 19));
+        _ = try str(gpa, dl, e, .semibold, cxm - @divTrunc(t1w, 2), y + 110, ink, 19, t1);
+        const t2: []const u8 = "Everything you publish to the marketplace is managed from here.";
+        const t2w: i32 = @intCast(text.measure(e, .regular, t2, 14));
+        _ = try str(gpa, dl, e, .regular, cxm - @divTrunc(t2w, 2), y + 138, muted, 14, t2);
+        try buttonPrimary(gpa, e, dl, regions, cxm - 110, y + 166, 220, 44, "Write one under Create", accent, 2, .loadout_tab, true);
+        return (y - scroll) + 240;
     }
+    y += 14;
     _ = try str(gpa, dl, e, .regular, x0, y + 16, muted, 14, "Everything you've published to the marketplace. Deleting retracts the record — installed copies on other devices keep working.");
     y += 44;
     for (rows) |row| {
-        const ch: i32 = 108;
-        try rect(gpa, dl, x0, y, w, ch, skinPanel(accent), 16);
-        try rect(gpa, dl, x0, y, w, 1, 0x14EDEAE0, 16);
-        _ = try str(gpa, dl, e, .semibold, x0 + 22, y + 34, ink, 19, row.name);
-        if (row.ranks.len > 0) _ = try str(gpa, dl, e, .regular, x0 + 22, y + 58, muted, 14, row.ranks);
-        // Live status: proven by presence in the fetched marketplace, not assumed.
-        const dot: u32 = if (row.live) boost_c else faint;
-        try rect(gpa, dl, x0 + 22, y + 76, 8, 8, dot, 4);
-        _ = try str(gpa, dl, e, .regular, x0 + 38, y + 86, if (row.live) body_c else faint, 13, if (row.live) "Live on the marketplace" else "Syncing — not in the marketplace listing yet");
-        // Designed-for badges, top-right of the card.
-        var bx = x0 + w - 150;
-        var si: usize = dev_surfaces.len;
-        while (si > 0) {
-            si -= 1;
-            if (row.designed & (@as(u8, 1) << @intCast(si)) == 0) continue;
-            const btw: i32 = @intCast(text.measure(e, .semibold, dev_surfaces[si], 11));
-            bx -= btw + 18;
-            try rect(gpa, dl, bx, y + 22, btw + 14, 20, 0x14EDEAE0, 6);
-            _ = try str(gpa, dl, e, .semibold, bx + 7, y + 36, muted, 11, dev_surfaces[si]);
-            bx -= 6;
-        }
-        // Delete: two-tap (armed reads differently and in the warning color).
-        const bw: i32 = 128;
-        const bx2 = x0 + w - bw - 20;
-        const by2 = y + ch - 34 - 16;
-        if (row.confirm) {
-            try rect(gpa, dl, bx2, by2, bw, 34, like_c, 10);
-            _ = try str(gpa, dl, e, .semibold, bx2 + 14, by2 + 22, 0xFF0B0B0F, 13, "Really delete?");
-        } else {
-            try rect(gpa, dl, bx2, by2, bw, 34, 0x14EDEAE0, 10);
-            _ = try str(gpa, dl, e, .semibold, bx2 + 38, by2 + 22, if (row.live) ink else faint, 13, "Delete");
-        }
-        try emitRegion(gpa, regions, bx2, by2, bw, 34, row.lib_idx, .pub_delete);
+        const ch: i32 = 118;
+        // The shared card carries the identity + status; capability facts come
+        // from the matched marketplace row and are hidden while syncing.
+        try algoCard(gpa, dl, e, regions, accent, x0, y, w, ch, .{
+            .name = row.name,
+            .author = "by you",
+            .desc = row.ranks,
+            .tile_color = lens_socket.palette[@min(row.color, lens_socket.palette.len - 1)],
+            .designed = row.designed,
+            .status = if (row.live) .live else .syncing,
+            .show_caps = row.caps_known,
+            .learns = row.learns,
+            .uses_behavioral = row.uses_behavioral,
+        });
+        // Actions, bottom-right: a quiet View + the two-tap Delete.
+        const bh: i32 = 32;
+        const by2 = y + ch - bh - 14;
+        const dw: i32 = if (row.confirm) 128 else 96;
+        const dx = x0 + w - dw - 16;
+        try buttonDestructive(gpa, e, dl, regions, dx, by2, dw, bh, if (row.confirm) "Really delete?" else "Delete", row.lib_idx, .pub_delete, row.confirm);
+        const vw: i32 = 84;
+        try buttonSecondary(gpa, e, dl, regions, dx - vw - 10, by2, vw, bh, "View", row.lib_idx, .pub_view);
         y += ch + 14;
     }
     return (y - scroll) + 40;
@@ -4585,9 +4975,7 @@ pub fn layoutAlgoDocs(gpa: Allocator, e: *const text.Engine, width: i32, height:
     const w = m.cw;
     var y: i32 = 96 + scroll;
 
-    try rect(gpa, dl, x0, y, 96, 40, 0x12EDEAE0, 11);
-    _ = try str(gpa, dl, e, .semibold, x0 + 22, y + 26, ink, 15, "‹ Back");
-    try emitRegion(gpa, regions, x0, y, 96, 40, 0, .back);
+    try buttonSecondary(gpa, e, dl, regions, x0, y, 96, 40, "‹ Back", 0, .back);
     y += 72;
     _ = try str(gpa, dl, e, .semibold, x0, y + 32, ink, 30, doc.title);
     y += 48;
@@ -4636,13 +5024,13 @@ pub fn layoutAlgoDetail(gpa: Allocator, e: *const text.Engine, width: i32, heigh
     const w = m.cw;
     var y: i32 = 96 + scroll;
 
-    // Back, then the masthead: name, creator, the declaration badges.
-    try rect(gpa, dl, x0, y, 96, 40, 0x12EDEAE0, 11);
-    _ = try str(gpa, dl, e, .semibold, x0 + 22, y + 26, ink, 15, "‹ Back");
-    try emitRegion(gpa, regions, x0, y, 96, 40, 0, .back);
+    // Back, then the masthead: the shared identity tile, name, creator, the
+    // declaration badges — the same face the card wore in the browse grid.
+    try buttonSecondary(gpa, e, dl, regions, x0, y, 96, 40, "‹ Back", 0, .back);
     y += 72;
-    _ = try str(gpa, dl, e, .semibold, x0, y + 32, ink, 32, if (view.name.len > 0) view.name else "Algorithm");
-    y += 46;
+    try monogramTile(gpa, dl, e, x0, y - 6, 54, tilePalette(view.name), view.name);
+    _ = try str(gpa, dl, e, .semibold, x0 + 72, y + 32, ink, 32, if (view.name.len > 0) view.name else "Algorithm");
+    y += 62;
     var apen = try str(gpa, dl, e, .regular, x0, y + 18, muted, 16, view.author);
     if (view.designed != 0) {
         apen += 14;
@@ -4713,18 +5101,11 @@ pub fn layoutAlgoDetail(gpa: Allocator, e: *const text.Engine, width: i32, heigh
     // The actions: Install (the primary), then the transparency deep-dive.
     const bh: i32 = 46;
     if (view.installed) {
-        try rect(gpa, dl, x0, y, 220, bh, 0x14EDEAE0, 12);
-        _ = try str(gpa, dl, e, .semibold, x0 + 24, y + 29, muted, 15, "In your library \u{2713}");
-        try emitRegion(gpa, regions, x0, y, 220, @intCast(bh), view.idx, .algo_install);
+        try buttonSecondary(gpa, e, dl, regions, x0, y, 220, bh, "In your library \u{2713}", view.idx, .algo_install);
     } else {
-        try rect(gpa, dl, x0, y, 220, bh, accent, 12);
-        _ = try str(gpa, dl, e, .semibold, x0 + 24, y + 29, 0xFF0B0B0F, 15, "Install to your library");
-        try emitRegion(gpa, regions, x0, y, 220, @intCast(bh), view.idx, .algo_install);
+        try buttonPrimary(gpa, e, dl, regions, x0, y, 220, bh, "Install to your library", accent, view.idx, .algo_install, true);
     }
-    const tx2 = x0 + 236;
-    try rect(gpa, dl, tx2, y, 214, bh, 0x12EDEAE0, 12);
-    _ = try str(gpa, dl, e, .semibold, tx2 + 22, y + 29, ink, 15, "\u{27E8}\u{27E9} Full transparency");
-    try emitRegion(gpa, regions, tx2, y, 214, @intCast(bh), view.idx, .algo_view);
+    try buttonSecondary(gpa, e, dl, regions, x0 + 236, y, 214, bh, "\u{27E8}\u{27E9} Full transparency", view.idx, .algo_view);
     y += bh + 40;
     return (y - scroll) + 40;
 }
@@ -4754,24 +5135,22 @@ pub fn layoutCreate(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawList,
 
     switch (view.step) {
         .landing => {
+            y += 24;
             _ = try str(gpa, dl, e, .semibold, x0, y + 30, ink, 30, "Your feed, your rules");
             y += 52;
             y = try wrapBody(gpa, dl, e, x0, y + 18, w, muted, 16, "An algorithm decides which posts you see and in what order. On Zat4 it's yours to shape — everything runs on your device, and what it can and can't touch is provable, never a black box.", 24, true, null);
-            y += 34;
-            // Primary: the five-minute guided builder (→ the questions).
-            const bh: i32 = 56;
-            try rect(gpa, dl, x0, y, w, bh, accent, 14);
-            _ = try str(gpa, dl, e, .semibold, x0 + 26, y + 30, 0xFF0B0B0F, 17, "Create your own in five minutes");
-            _ = try str(gpa, dl, e, .regular, x0 + 26, y + 46, 0xCC0B0B0F, 13, "A few questions, then fine-tune — saved privately, just for you.");
-            try emitRegion(gpa, regions, x0, y, @intCast(w), @intCast(bh), 0, .create_next);
-            y += bh + 16;
-            // Secondary: the developer submission path (a later slice; honest for now).
-            try rect(gpa, dl, x0, y, w, bh, 0x12EDEAE0, 14);
-            _ = try str(gpa, dl, e, .semibold, x0 + 26, y + 30, ink, 17, "Submit an algorithm you wrote");
-            _ = try str(gpa, dl, e, .regular, x0 + 26, y + 46, muted, 13, "For developers — publish real code to the marketplace.");
-            try emitRegion(gpa, regions, x0, y, @intCast(w), @intCast(bh), 0, .create_dev);
-            y += bh + 24;
-            // The two documents, as quiet text doors under the big buttons.
+            y += 40;
+            // The two doors, as proper CHOICE CARDS side by side (stacked when
+            // the column is narrow): the guided builder and the developer path.
+            const two = w >= 620;
+            const cw2: i32 = if (two) @divTrunc(w - 16, 2) else w;
+            const ch: i32 = 168;
+            try createChoiceCard(gpa, e, dl, regions, x0, y, cw2, ch, accent, accent, "Guided Builder", "Create your own", "A few questions, then fine-tune — saved privately, just for you. About five minutes.", "Start →", .create_next);
+            const x2 = if (two) x0 + cw2 + 16 else x0;
+            const y2 = if (two) y else y + ch + 16;
+            try createChoiceCard(gpa, e, dl, regions, x2, y2, cw2, ch, tilePalette("developer"), accent, "Zal Dev", "Submit an algorithm you wrote", "For developers — real Zal code, checked by the gate, published to the marketplace.", "Open the editor →", .create_dev);
+            y = y2 + ch + 30;
+            // The two documents, as quiet text doors under the cards.
             const l1: []const u8 = "How algorithms work here";
             const l1w: i32 = @intCast(text.measure(e, .regular, l1, 14));
             _ = try str(gpa, dl, e, .regular, x0, y + 14, muted, 14, l1);
@@ -4783,124 +5162,143 @@ pub fn layoutCreate(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawList,
             y += 34;
         },
         .preparing => {
+            const cwid: i32 = @min(640, w);
+            const cx = x0 + @divTrunc(w - cwid, 2);
             y += 120;
-            _ = try str(gpa, dl, e, .semibold, x0, y + 30, ink, 26, "Preparing your custom algorithm");
+            _ = try str(gpa, dl, e, .semibold, cx, y + 30, ink, 26, "Preparing your custom algorithm");
             y += 52;
-            _ = try str(gpa, dl, e, .regular, x0, y + 16, muted, 15, "Calibrating the numbers from your answers…");
+            _ = try str(gpa, dl, e, .regular, cx, y + 16, muted, 15, "Calibrating the numbers from your answers…");
             y += 44;
             // A determinate progress bar the shell fills over the beat, then advances.
-            const bar_w = w - 40;
-            try rect(gpa, dl, x0, y, bar_w, 6, 0x18EDEAE0, 3);
+            const bar_w = cwid - 40;
+            try rect(gpa, dl, cx, y, bar_w, 6, 0x18EDEAE0, 3);
             const fill: i32 = @intFromFloat(@as(f32, @floatFromInt(bar_w)) * std.math.clamp(view.prepare_t, 0, 1));
-            try rect(gpa, dl, x0, y, fill, 6, accent, 3);
+            try rect(gpa, dl, cx, y, fill, 6, accent, 3);
             y += 40;
         },
         .pace, .reach, .conversation, .privacy => {
             const qi = @intFromEnum(view.step) - 1; // .pace is step 1 (landing is 0) → question 0
             const q = create_flow.questions[qi];
-            var buf: [24]u8 = undefined;
-            const step_lbl = std.fmt.bufPrint(&buf, "STEP {d} OF 4", .{qi + 1}) catch "";
-            _ = try str(gpa, dl, e, .semibold, x0, y + 14, faint, 12, step_lbl);
-            y += 34;
-            _ = try str(gpa, dl, e, .semibold, x0, y + 30, ink, 30, q.title);
+            // A tighter centered column so the step reads composed, not stretched.
+            const cwid: i32 = @min(640, w);
+            const cx = x0 + @divTrunc(w - cwid, 2);
+            y += 24;
+            y = try progressRail(gpa, e, dl, cx, y + 8, cwid, accent, qi, create_flow.questions.len, q.title);
+            _ = try str(gpa, dl, e, .semibold, cx, y + 30, ink, 30, q.title);
             y += 46;
-            _ = try str(gpa, dl, e, .regular, x0, y + 16, muted, 15, q.prompt);
+            _ = try str(gpa, dl, e, .regular, cx, y + 16, muted, 15, q.prompt);
             y += 40;
             const sel = create_flow.answerIndex(view.answers, view.step);
             for (q.options, 0..) |opt, oi| {
                 const oh: i32 = 76;
                 const chosen = oi == sel;
-                try rect(gpa, dl, x0, y, w, oh, if (chosen) skinPanel(accent) else 0x0EEDEAE0, 14);
-                if (chosen) try rect(gpa, dl, x0, y, 4, oh, accent, 2); // accent spine
-                _ = try str(gpa, dl, e, .semibold, x0 + 22, y + 30, ink, 18, opt.label);
-                _ = try str(gpa, dl, e, .regular, x0 + 22, y + 54, muted, 14, opt.blurb);
-                try emitRegion(gpa, regions, x0, y, @intCast(w), @intCast(oh), @intCast(oi), .create_pick);
+                try cardBox(gpa, dl, cx, y, cwid, oh, 14, if (chosen) skinPanel(accent) else panel);
+                if (chosen) try rect(gpa, dl, cx, y, 4, oh, accent, 2); // accent spine
+                // The radio: a quiet ring, filled with an accent dot when chosen.
+                const rcx = cx + 30;
+                const rcy = y + @divTrunc(oh, 2);
+                try ring(gpa, dl, rcx, rcy, 9, if (chosen) accent else faint, 2, 20);
+                if (chosen) try rect(gpa, dl, rcx - 5, rcy - 5, 10, 10, accent, 5);
+                _ = try str(gpa, dl, e, .semibold, cx + 56, y + 30, ink, 18, opt.label);
+                _ = try str(gpa, dl, e, .regular, cx + 56, y + 54, muted, 14, opt.blurb);
+                try emitRegion(gpa, regions, cx, y, cwid, @intCast(oh), @intCast(oi), .create_pick);
                 y += oh + 12;
             }
+            // Picking selects; the nav advances — so a choice can be read back
+            // before it's committed, and Back is always in the same place.
+            y += 12;
+            y = try createNav(gpa, e, dl, cx, y, cwid, regions, accent, "Continue", .create_next);
         },
         .recap => {
-            _ = try str(gpa, dl, e, .semibold, x0, y + 30, ink, 30, "Fine-tune");
+            const cwid: i32 = @min(640, w);
+            const cx = x0 + @divTrunc(w - cwid, 2);
+            y += 24;
+            _ = try str(gpa, dl, e, .semibold, cx, y + 30, ink, 30, "Fine-tune");
             y += 44;
-            _ = try str(gpa, dl, e, .regular, x0, y + 16, muted, 15, "Adjust anything you like — this feed is just for you.");
+            _ = try str(gpa, dl, e, .regular, cx, y + 16, muted, 15, "Adjust anything you like — this feed is just for you.");
             y += 44;
             for (std.enums.values(create_flow.Knob)) |k| {
                 const meta = create_flow.knobMeta(k);
                 const val = create_flow.knobValue(view.config, k);
-                _ = try str(gpa, dl, e, .semibold, x0, y + 14, ink, 16, meta.label);
+                _ = try str(gpa, dl, e, .semibold, cx, y + 14, ink, 16, meta.label);
                 // − and + steppers, then the value to the RIGHT of the +.
                 const sb: i32 = 30;
-                const minus_x = x0 + w - 118;
+                const minus_x = cx + cwid - 118;
                 const plus_x = minus_x + sb + 8;
-                try rect(gpa, dl, minus_x, y - 6, sb, sb, 0x14EDEAE0, 8);
-                _ = try str(gpa, dl, e, .semibold, minus_x + 11, y + 13, ink, 18, "-");
-                try emitRegion(gpa, regions, minus_x, y - 6, sb, sb, @intCast(@intFromEnum(k)), .create_knob_dec);
-                try rect(gpa, dl, plus_x, y - 6, sb, sb, 0x14EDEAE0, 8);
-                _ = try str(gpa, dl, e, .semibold, plus_x + 10, y + 13, ink, 18, "+");
-                try emitRegion(gpa, regions, plus_x, y - 6, sb, sb, @intCast(@intFromEnum(k)), .create_knob_inc);
+                try buttonSecondary(gpa, e, dl, regions, minus_x, y - 6, sb, sb, "-", @intCast(@intFromEnum(k)), .create_knob_dec);
+                try buttonSecondary(gpa, e, dl, regions, plus_x, y - 6, sb, sb, "+", @intCast(@intFromEnum(k)), .create_knob_inc);
                 var vb: [24]u8 = undefined;
                 const vs = std.fmt.bufPrint(&vb, "{d}", .{val}) catch "";
                 _ = try str(gpa, dl, e, .semibold, plus_x + sb + 14, y + 14, accent, 16, vs);
                 y += 26;
-                _ = try str(gpa, dl, e, .regular, x0, y + 12, faint, 13, meta.hint);
+                _ = try str(gpa, dl, e, .regular, cx, y + 12, faint, 13, meta.hint);
                 y += 22;
                 // A slider bar showing the value's position in its range.
-                const bar_w = w - 80;
-                try rect(gpa, dl, x0, y, bar_w, 5, 0x18EDEAE0, 2);
+                const bar_w = cwid - 80;
+                try rect(gpa, dl, cx, y, bar_w, 5, 0x18EDEAE0, 2);
                 const frac = if (meta.max > meta.min) (val - meta.min) / (meta.max - meta.min) else 0;
                 const fill: i32 = @intFromFloat(@as(f32, @floatFromInt(bar_w)) * std.math.clamp(frac, 0, 1));
-                try rect(gpa, dl, x0, y, fill, 5, accent, 2);
+                try rect(gpa, dl, cx, y, fill, 5, accent, 2);
                 y += 26;
             }
             y += 8;
-            y = try createNav(gpa, e, dl, x0, y, w, regions, accent, "Continue", .create_next);
+            y = try createNav(gpa, e, dl, cx, y, cwid, regions, accent, "Continue", .create_next);
         },
         .name => {
-            _ = try str(gpa, dl, e, .semibold, x0, y + 30, ink, 30, "Name it");
+            const cwid: i32 = @min(640, w);
+            const cx = x0 + @divTrunc(w - cwid, 2);
+            y += 24;
+            _ = try str(gpa, dl, e, .semibold, cx, y + 30, ink, 30, "Name it");
             y += 52;
             // The name field (the shell owns the text edit; here we draw the box +
             // the current text, and a caret when focused).
             const fh: i32 = 48;
-            try rect(gpa, dl, x0, y, w, fh, 0x12EDEAE0, 12);
-            if (view.naming) try rect(gpa, dl, x0, y, w, fh, 0x00000000, 12);
+            try cardBox(gpa, dl, cx, y, cwid, fh, 12, panel);
+            if (view.naming) try rect(gpa, dl, cx, y, 3, fh, accent, 2); // focus spine
             const shown = if (view.name.len > 0) view.name else "My feed";
             const nc = if (view.name.len > 0) ink else faint;
-            const pen = try str(gpa, dl, e, .semibold, x0 + 18, y + 31, nc, 18, shown);
+            const pen = try str(gpa, dl, e, .semibold, cx + 18, y + 31, nc, 18, shown);
             if (view.naming) try rect(gpa, dl, pen + 2, y + 14, 2, 22, accent, 0);
             // The field is implicitly focused on the name step (the shell routes
             // keystrokes here), so there is no separate focus region to emit.
             y += fh + 30;
             // Accent picker: the 9 palette swatches; the chosen one ringed.
-            _ = try str(gpa, dl, e, .semibold, x0, y + 12, muted, 13, "ACCENT");
+            _ = try str(gpa, dl, e, .semibold, cx, y + 12, muted, 13, "ACCENT");
             y += 28;
             const sw: i32 = 34;
             const sgap: i32 = 12;
             for (lens_socket.palette, 0..) |col, ci| {
-                const cx = x0 + @as(i32, @intCast(ci)) * (sw + sgap);
-                if (ci == view.color) try rect(gpa, dl, cx - 3, y - 3, sw + 6, sw + 6, 0x40FFFFFF, 11);
-                try rect(gpa, dl, cx, y, sw, sw, col, 9);
-                try emitRegion(gpa, regions, cx, y, @intCast(sw), @intCast(sw), @intCast(ci), .create_color);
+                const swx = cx + @as(i32, @intCast(ci)) * (sw + sgap);
+                if (ci == view.color) try rect(gpa, dl, swx - 3, y - 3, sw + 6, sw + 6, 0x40FFFFFF, 11);
+                try rect(gpa, dl, swx, y, sw, sw, col, 9);
+                try emitRegion(gpa, regions, swx, y, @intCast(sw), @intCast(sw), @intCast(ci), .create_color);
             }
             y += sw + 34;
-            y = try createNav(gpa, e, dl, x0, y, w, regions, accent, "Create feed", .create_save);
+            y = try createNav(gpa, e, dl, cx, y, cwid, regions, accent, "Create feed", .create_save);
         },
     }
     return (y - scroll) + 40;
 }
 
-/// The bottom nav row of a Create step: a "‹ Back" ghost + a filled primary button.
+/// The bottom nav row of a Create step: a quiet "‹ Back" + the filled primary.
 fn createNav(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawList, x0: i32, y: i32, w: i32, regions: ?*Regions, accent: u32, primary: []const u8, primary_action: Action) error{OutOfMemory}!i32 {
     const bh: i32 = 44;
-    const back_w: i32 = 96;
-    try rect(gpa, dl, x0, y, back_w, bh, 0x12EDEAE0, 11);
-    _ = try str(gpa, dl, e, .semibold, x0 + 24, y + 28, ink, 15, "‹ Back");
-    try emitRegion(gpa, regions, x0, y, @intCast(back_w), @intCast(bh), 0, .create_back);
+    try buttonSecondary(gpa, e, dl, regions, x0, y, 96, bh, "‹ Back", 0, .create_back);
     const pw: i32 = 168;
-    const px = x0 + w - pw;
-    try rect(gpa, dl, px, y, pw, bh, accent, 11);
-    const tw: i32 = @intCast(text.measure(e, .semibold, primary, 15));
-    _ = try str(gpa, dl, e, .semibold, px + @divTrunc(pw - tw, 2), y + 28, 0xFF0B0B0F, 15, primary);
-    try emitRegion(gpa, regions, px, y, @intCast(pw), @intCast(bh), 0, primary_action);
+    try buttonPrimary(gpa, e, dl, regions, x0 + w - pw, y, pw, bh, primary, accent, 0, primary_action, true);
     return y + bh + 20;
+}
+
+/// One landing choice card (Create tab): identity tile, title, a short wrapped
+/// blurb, and an accent call-to-action line. The whole card is the tap target.
+fn createChoiceCard(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawList, regions: ?*Regions, x: i32, y: i32, w: i32, h: i32, tile_c: u32, accent: u32, tile_name: []const u8, title: []const u8, blurb: []const u8, cta: []const u8, action: Action) error{OutOfMemory}!void {
+    try cardBox(gpa, dl, x, y, w, h, 16, panel);
+    try rect(gpa, dl, x, y, w, 1, 0x14EDEAE0, 16); // lit top edge
+    try monogramTile(gpa, dl, e, x + 20, y + 20, 40, tile_c, tile_name);
+    _ = try str(gpa, dl, e, .semibold, x + 20, y + 92, ink, 17, title);
+    _ = try wrapBodyLimited(gpa, dl, e, x + 20, y + 114, w - 40, muted, 13, blurb, 19, true, null, 2, null);
+    _ = try str(gpa, dl, e, .semibold, x + 20, y + h - 18, accent, 14, cta);
+    try emitRegion(gpa, regions, x, y, w, @intCast(@max(0, @min(32767, h))), 0, action);
 }
 
 /// The developer-submission flow's render state (ALGO_SUBMISSION slice 1) —
@@ -5018,7 +5416,7 @@ fn devField(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32
     _ = try str(gpa, dl, e, .semibold, x0, y + 12, faint, 12, label);
     y += 22;
     const fh: i32 = 46;
-    try rect(gpa, dl, x0, y, w, fh, 0x12EDEAE0, 12);
+    try cardBox(gpa, dl, x0, y, w, fh, 12, panel);
     if (focused) try rect(gpa, dl, x0, y, 3, fh, accent, 2);
     const shown = if (value.len > 0) value else placeholder;
     const vc: u32 = if (value.len > 0) ink else faint;
@@ -5033,22 +5431,13 @@ fn devField(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32
 /// the shell can answer a tap with WHY it is disabled instead of dead pixels).
 fn devNav(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawList, x0: i32, y: i32, w: i32, regions: ?*Regions, accent: u32, mid: ?[]const u8, mid_action: Action, primary: []const u8, primary_action: Action, enabled: bool) !i32 {
     const bh: i32 = 44;
-    const back_w: i32 = 96;
-    try rect(gpa, dl, x0, y, back_w, bh, 0x12EDEAE0, 11);
-    _ = try str(gpa, dl, e, .semibold, x0 + 24, y + 28, ink, 15, "‹ Back");
-    try emitRegion(gpa, regions, x0, y, back_w, @intCast(bh), 0, .dev_back);
+    try buttonSecondary(gpa, e, dl, regions, x0, y, 96, bh, "‹ Back", 0, .dev_back);
     const pw: i32 = @max(168, @as(i32, @intCast(text.measure(e, .semibold, primary, 15))) + 48);
     const px = x0 + w - pw;
-    try rect(gpa, dl, px, y, pw, bh, if (enabled) accent else 0x2AEDEAE0, 11);
-    const tw: i32 = @intCast(text.measure(e, .semibold, primary, 15));
-    _ = try str(gpa, dl, e, .semibold, px + @divTrunc(pw - tw, 2), y + 28, if (enabled) 0xFF0B0B0F else muted, 15, primary);
-    try emitRegion(gpa, regions, px, y, pw, @intCast(bh), 0, primary_action);
+    try buttonPrimary(gpa, e, dl, regions, px, y, pw, bh, primary, accent, 0, primary_action, enabled);
     if (mid) |label| {
         const mw: i32 = @as(i32, @intCast(text.measure(e, .semibold, label, 15))) + 44;
-        const mx = px - mw - 12;
-        try rect(gpa, dl, mx, y, mw, bh, 0x12EDEAE0, 11);
-        _ = try str(gpa, dl, e, .semibold, mx + 22, y + 28, ink, 15, label);
-        try emitRegion(gpa, regions, mx, y, mw, @intCast(bh), 0, mid_action);
+        try buttonSecondary(gpa, e, dl, regions, px - mw - 12, y, mw, bh, label, 0, mid_action);
     }
     return y + bh + 20;
 }
@@ -5073,20 +5462,22 @@ pub fn layoutDevSubmit(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawLi
             if (view.src.len == 0) {
                 _ = try str(gpa, dl, e, .semibold, x0, y + 14, faint, 12, "START FROM");
                 y += 24;
-                var cx = x0;
+                // An equal-width chip grid — the catalog fills whole rows
+                // instead of ragged-wrapping with an orphan on the last line.
+                const cols: usize = if (w >= 560) 4 else 2;
+                const cgap: i32 = 10;
+                const chip_w = @divTrunc(w - cgap * (@as(i32, @intCast(cols)) - 1), @as(i32, @intCast(cols)));
+                const chip_h: i32 = 34;
                 for (zal_templates.all, 0..) |tpl, ti| {
+                    const cxg = x0 + @as(i32, @intCast(ti % cols)) * (chip_w + cgap);
+                    const cyg = y + @as(i32, @intCast(ti / cols)) * (chip_h + cgap);
+                    try cardBox(gpa, dl, cxg, cyg, chip_w, chip_h, 10, panel);
                     const tw: i32 = @intCast(text.measure(e, .semibold, tpl.name, 13));
-                    const cw2 = tw + 26;
-                    if (cx + cw2 > x0 + w and cx > x0) { // wrap: the catalog outgrew one row
-                        cx = x0;
-                        y += 40;
-                    }
-                    try rect(gpa, dl, cx, y, cw2, 30, 0x14EDEAE0, 9);
-                    _ = try str(gpa, dl, e, .semibold, cx + 13, y + 20, ink, 13, tpl.name);
-                    try emitRegion(gpa, regions, cx, y, cw2, 30, @intCast(ti), .dev_template);
-                    cx += cw2 + 10;
+                    try strEllipsis(gpa, dl, e, .semibold, cxg + @max(10, @divTrunc(chip_w - tw, 2)), cyg + 22, ink, 13, tpl.name, chip_w - 20);
+                    try emitRegion(gpa, regions, cxg, cyg, chip_w, @intCast(chip_h), @intCast(ti), .dev_template);
                 }
-                y += 44;
+                const crows: i32 = @intCast((zal_templates.all.len + cols - 1) / cols);
+                y += crows * (chip_h + cgap) + 10;
             }
             // The editor panel: literal lines over a line-number gutter. Geometry
             // follows the running y (chips may wrap), matching the caret inverse
@@ -5097,16 +5488,21 @@ pub fn layoutDevSubmit(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawLi
             // OPAQUE panel (owner call, 2026-07-06): the code sits on solid
             // ground, not glass — a slightly lifted plate over the page bg,
             // with a header strip and a darker gutter column giving it a
-            // tool's anatomy instead of a floating rectangle.
-            try rect(gpa, dl, g.panel_x, g.panel_y, g.panel_w, eh, 0xFF201F17, 14);
-            try rect(gpa, dl, g.panel_x, g.panel_y, g.panel_w, 34, 0xFF262419, 14);
-            try rect(gpa, dl, g.panel_x, g.panel_y + 30, g.panel_w, 4, 0xFF262419, 0); // square off the strip's bottom
-            _ = try str(gpa, dl, e, .semibold, g.panel_x + 16, g.panel_y + 22, faint, 11, "ZAL SOURCE");
+            // tool's anatomy instead of a floating rectangle. NEUTRAL greys
+            // (the old warm-tinted triplet clashed with the page); a hairline
+            // edge + accent spine define the plate. COLORS ONLY here — the
+            // geometry must keep agreeing with devSrcCaretAtPoint's replay.
+            try rect(gpa, dl, g.panel_x - 1, g.panel_y - 1, g.panel_w + 2, eh + 2, card_line, 15);
+            try rect(gpa, dl, g.panel_x, g.panel_y, g.panel_w, eh, 0xFF1A1A1A, 14);
+            try rect(gpa, dl, g.panel_x, g.panel_y, g.panel_w, 34, 0xFF232323, 14);
+            try rect(gpa, dl, g.panel_x, g.panel_y + 30, g.panel_w, 4, 0xFF232323, 0); // square off the strip's bottom
+            _ = try str(gpa, dl, e, .semibold, g.panel_x + 16, g.panel_y + 22, body_c, 12, "score.zal");
             var lcb: [24]u8 = undefined;
             const lct = std.fmt.bufPrint(&lcb, "{d} lines", .{if (view.src.len == 0) 0 else nlines}) catch "";
             const lcw: i32 = @intCast(text.measure(e, .regular, lct, 11));
             _ = try str(gpa, dl, e, .regular, g.panel_x + g.panel_w - lcw - 16, g.panel_y + 22, faint, 11, lct);
-            try rect(gpa, dl, g.panel_x, g.panel_y + 34, 44, eh - 34 - 14, 0xFF1B1A13, 0); // the gutter column
+            try rect(gpa, dl, g.panel_x, g.panel_y + 34, 44, eh - 34 - 14, 0xFF151515, 0); // the gutter column
+            try rect(gpa, dl, g.panel_x, g.panel_y + 34, 3, eh - 34 - 14, accent, 0); // focus spine — the editor owns the keys on this step
             try emitRegion(gpa, regions, g.panel_x, g.panel_y, g.panel_w, @intCast(@min(eh, 32767)), 0, .dev_src);
             if (view.src.len == 0) {
                 _ = try str(gpa, dl, e, .regular, g.tx, g.ty0, faint, 15, "fn score() {");
@@ -5137,17 +5533,25 @@ pub fn layoutDevSubmit(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawLi
                 }
             }
             y = g.panel_y + eh + 18;
-            // Check feedback: named refusals/errors, the pass line, or the hint.
+            // Check feedback as tinted result rows: red rows for the named
+            // refusals/errors, one green row for the pass — a list, not
+            // sentences floating on the page.
             if (view.diags.len > 0) {
                 for (view.diags) |d| {
-                    try rect(gpa, dl, x0, y + 4, 8, 8, like_c, 4);
-                    y = try wrapBody(gpa, dl, e, x0 + 18, y + 12, w - 18, body_c, 14, d, 20, true, null);
-                    y += 10;
+                    const bot = try wrapBody(gpa, dl, e, x0 + 34, y + 24, w - 50, body_c, 14, d, 20, false, null);
+                    const rh = (bot - y) + 12;
+                    try rect(gpa, dl, x0, y, w, rh, 0x1AF0617A, 10);
+                    try rect(gpa, dl, x0 + 14, y + 17, 8, 8, like_c, 4);
+                    _ = try wrapBody(gpa, dl, e, x0 + 34, y + 24, w - 50, body_c, 14, d, 20, true, null);
+                    y += rh + 8;
                 }
+                y += 2;
             } else if (view.checked) {
-                try rect(gpa, dl, x0, y + 4, 8, 8, boost_c, 4);
-                _ = try str(gpa, dl, e, .semibold, x0 + 18, y + 12, ink, 15, "Compiles clean — and passes the publish gate.");
-                y += 28;
+                const rh: i32 = 40;
+                try rect(gpa, dl, x0, y, w, rh, 0x1A8FD18F, 10);
+                try rect(gpa, dl, x0 + 14, y + 16, 8, 8, boost_c, 4);
+                _ = try str(gpa, dl, e, .semibold, x0 + 34, y + 25, ink, 15, "Compiles clean — and passes the publish gate.");
+                y += rh + 6;
             } else {
                 _ = try str(gpa, dl, e, .regular, x0, y + 12, faint, 13, "Check compiles your code and runs the publish gate — every refusal is named, never silent.");
                 const gl: []const u8 = "Open the writing guide";
@@ -5170,7 +5574,7 @@ pub fn layoutDevSubmit(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawLi
             _ = try str(gpa, dl, e, .semibold, x0, y + 12, faint, 12, "DESCRIPTION");
             y += 22;
             const dh: i32 = 140;
-            try rect(gpa, dl, x0, y, w, dh, 0x12EDEAE0, 12);
+            try cardBox(gpa, dl, x0, y, w, dh, 12, panel);
             if (view.focus == 2) try rect(gpa, dl, x0, y, 3, dh, accent, 2);
             if (view.desc.len > 0) {
                 const end_y = try wrapBody(gpa, dl, e, x0 + 16, y + 26, w - 32, ink, 15, view.desc, 21, true, null);
@@ -5192,7 +5596,7 @@ pub fn layoutDevSubmit(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawLi
                 const on = view.designed & (@as(u8, 1) << @intCast(si)) != 0;
                 const tw2: i32 = @intCast(text.measure(e, .semibold, surf, 14));
                 const cw4 = tw2 + 48;
-                try rect(gpa, dl, sx, y, cw4, 34, if (on) skinPanel(accent) else 0x14EDEAE0, 10);
+                try cardBox(gpa, dl, sx, y, cw4, 34, 10, if (on) skinPanel(accent) else panel);
                 if (on) try rect(gpa, dl, sx, y, 3, 34, accent, 2);
                 if (on) _ = try str(gpa, dl, e, .semibold, sx + 14, y + 22, accent, 14, "\u{2713}");
                 _ = try str(gpa, dl, e, .semibold, sx + 30, y + 22, ink, 14, surf);
@@ -8365,6 +8769,8 @@ pub fn layoutChat(
     }
     var caret_x: i32 = input_x + 14;
     var caret_base: i32 = comp_y + 31;
+    var hnd_a: ?Pen = null;
+    var hnd_b: ?Pen = null;
     if (draft.len > 0) {
         // The draft wrapper carries a MID-TEXT caret (the composer's
         // machinery): the shell moves `draft_caret` with arrow keys and the
@@ -8373,6 +8779,10 @@ pub fn layoutChat(
         const pens = try wrapDraft(gpa, dl, e, input_x + 14, comp_y + 31, input_w - 28, ink, chat_px, draft, input_line_h, @min(edit.caret, draft.len), @min(edit.sel_a, draft.len), @min(edit.sel_b, draft.len));
         caret_x = pens.caret.x;
         caret_base = pens.caret.baseline;
+        if (edit.sel_b > edit.sel_a) {
+            hnd_a = pens.sel_a;
+            hnd_b = pens.sel_b;
+        }
     } else {
         var pbuf: [96]u8 = undefined;
         // Phone: plain "Message" — the peer already heads the app bar.
@@ -8384,6 +8794,20 @@ pub fn layoutChat(
         try rect(gpa, dl, caret_x + 1, caret_base - 16, 2, 20, scaleAlpha((0xE0 << 24) | (accent & 0x00FFFFFF), ca), 0);
     }
     try emitRegion(gpa, regions, input_x, comp_y, input_w, @intCast(comp_h), 0, .chat_input);
+    // SELECTION HANDLES (the owner's ask, 2026-07-12: drag to grow/shrink
+    // the selection): teardrop knobs under each end — start hangs left,
+    // end hangs right, the messenger grammar. Emitted AFTER the input
+    // region so their generous targets win its taps (hitTest last-wins);
+    // the shell drags them through chatDraftOffsetAt.
+    if (input_focus) if (hnd_a) |ha| if (hnd_b) |hb| {
+        const hc = (0xF0 << 24) | (accent & 0x00FFFFFF);
+        try rect(gpa, dl, ha.x - 1, ha.baseline - 15, 2, 24, hc, 0);
+        try rect(gpa, dl, ha.x - 13, ha.baseline + 7, 14, 14, hc, 7);
+        try rect(gpa, dl, hb.x - 1, hb.baseline - 15, 2, 24, hc, 0);
+        try rect(gpa, dl, hb.x - 1, hb.baseline + 7, 14, 14, hc, 7);
+        try emitRegion(gpa, regions, ha.x - 24, ha.baseline - 4, 34, 40, 0, .chat_handle);
+        try emitRegion(gpa, regions, hb.x - 10, hb.baseline - 4, 34, 40, 1, .chat_handle);
+    };
     // The EDIT BAR (long-press summons it): Copy/Cut/Paste/Select all in a
     // strip riding above the input. Copy/Cut only light with a selection.
     if (edit.bar and input_focus) {

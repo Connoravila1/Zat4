@@ -352,7 +352,9 @@ pub fn measuredHeight(tray: TrayView, ui: SocketUi, geom: Geometry) i32 {
     const col_gap = fxi(8 * sc);
     const card_h = fxi(104 * sc);
     const n = tray.cards.len;
-    const shown: i32 = @intCast(@max(n, max_lenses)); // capacity slots (incl. placeholders)
+    // Real cards + ONE trailing add-slot (a run of empty ghosts read as
+    // wireframe); capacity still caps the count. MUST agree with build().
+    const shown: i32 = @intCast(@min(n + 1, max_lenses));
     const rows: i32 = @divFloor(shown + 2, 3);
     const expanded = if (ui.expanded) |ex| (n > 0 and ex < n) else false;
     const detail_h = fxi(124 * sc);
@@ -489,14 +491,6 @@ fn wrap(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32, y0
     return y;
 }
 
-/// A dashed horizontal line (the socket's contact rails).
-fn dashedH(gpa: Allocator, dl: *raster.DrawList, x0: i32, x1: i32, y: i32, color: u32, th: u8, dash: i32, gap: i32) !void {
-    var x = x0;
-    while (x < x1) : (x += dash + gap) {
-        try line(gpa, dl, x, y, @min(x + dash, x1), y, color, th);
-    }
-}
-
 /// A chevron at (cx, cy): a small "v" pointing down (closed) or up (open).
 fn chevron(gpa: Allocator, dl: *raster.DrawList, cx: i32, cy: i32, s: i32, color: u32, th: u8, up: bool) !void {
     const dy = if (up) -s else s;
@@ -610,11 +604,10 @@ pub fn build(
     // ---- 1. the socket panel (glass over the field) ----
     try rect(gpa, dl, x0, y0, w, sock_h, if (ui.julia) julia_glass else glass, radius);
     try rect(gpa, dl, x0, y0, w, fxi(1 * sc) + 1, hairline, radius); // top inner-light edge
-    // contact rails, top & bottom (dashed, faint)
-    const dash = fxi(6 * sc);
-    const gap = fxi(6 * sc);
-    try dashedH(gpa, dl, x0 + fxi(8 * sc), x0 + w - fxi(8 * sc), y0 + fxi(5 * sc), rail, 1, dash, gap);
-    try dashedH(gpa, dl, x0 + fxi(8 * sc), x0 + w - fxi(8 * sc), y0 + sock_h - fxi(5 * sc), rail, 1, dash, gap);
+    // contact rails, top & bottom — solid faint lines (dashes read as
+    // wireframe scaffolding; a thin solid rail reads as built hardware)
+    try rect(gpa, dl, x0 + fxi(8 * sc), y0 + fxi(5 * sc), w - fxi(16 * sc), 1, rail, 0);
+    try rect(gpa, dl, x0 + fxi(8 * sc), y0 + sock_h - fxi(5 * sc), w - fxi(16 * sc), 1, rail, 0);
 
     // ---- the cartridge (the seated lens, tinted its palette color) ----
     // `dy`/`a` carry the seat animation: the whole cartridge slides + fades
@@ -695,10 +688,11 @@ pub fn build(
     const card_w = @divTrunc(grid_w - col_gap * 2, 3);
 
     const n = tray.cards.len;
-    // The tray always shows the full CAPACITY (max_lenses slots): real cards
-    // fill the front, empty slots become "add a lens" placeholders into the
-    // marketplace. So the grid is sized to the capacity, not the loaded count.
-    const shown: i32 = @intCast(@max(n, max_lenses));
+    // Real cards + ONE trailing "add a lens" slot into the marketplace (a
+    // whole capacity of empty ghosts read as unfinished wireframe; one quiet
+    // door says the same thing). Capacity caps it: a full tray shows no add
+    // slot. MUST agree with measuredHeight().
+    const shown: i32 = @intCast(@min(n + 1, max_lenses));
     const rows: i32 = @divFloor(shown + 2, 3);
     // L.3 — an expanded card inserts a full-width detail panel below its row,
     // shifting later rows down. `exp` is the expanded card (validated, E4);
@@ -725,7 +719,7 @@ pub fn build(
     // has revealed the header strip.
     const hint_px: u16 = @intCast(@max(1, fxi(11 * sc)));
     if (sweep_h > hdr_h - fxi(4 * sc)) {
-        _ = try str(gpa, dl, e, .regular, grid_x, tray_top + fxi(16 * sc), faint, hint_px, "YOUR TRAY \u{00B7} TAP TO SEAT \u{00B7} DRAG HANDLE TO REORDER");
+        _ = try str(gpa, dl, e, .regular, grid_x, tray_top + fxi(16 * sc), faint, hint_px, "Tap a card to seat it \u{00B7} drag the grip to reorder");
         const more_s = "+ get more";
         const more_meas: i32 = @intCast(text.measure(e, .regular, more_s, hint_px));
         const more_x = x0 + w - box_pad - more_meas;
@@ -886,10 +880,9 @@ pub fn build(
         }
     };
 
-    // Empty-slot PLACEHOLDERS: every capacity slot past the loaded lenses reads
-    // as "another could go here," and tapping one opens the marketplace
-    // (get_more). A dashed outline + a centred "+", deliberately quiet so it
-    // doesn't compete with the real cards.
+    // The ONE trailing add-slot (shown = n + 1, capped): a quiet solid card —
+    // clearly below the real cards, clearly a door — into the marketplace
+    // (get_more). Solid, not dashed: dashes read as wireframe scaffolding.
     {
         var s: usize = n;
         while (s < @as(usize, @intCast(shown))) : (s += 1) {
@@ -898,12 +891,9 @@ pub fn build(
             const px2 = grid_x + col * (card_w + col_gap);
             const py2 = grid_top + row * (card_h + col_gap) + (if (exp != null and row > row_e) detail_h + col_gap else 0);
             if (py2 + card_h > reveal_bottom + fxi(2 * sc)) continue; // not yet revealed by the sweep
-            // a faint dashed border (four edges) + a soft "+" in the centre
-            try dashedH(gpa, dl, px2 + fxi(6 * sc), px2 + card_w - fxi(6 * sc), py2 + fxi(2 * sc), rail, 1, fxi(7 * sc), fxi(5 * sc));
-            try dashedH(gpa, dl, px2 + fxi(6 * sc), px2 + card_w - fxi(6 * sc), py2 + card_h - fxi(2 * sc), rail, 1, fxi(7 * sc), fxi(5 * sc));
-            // Quiet: dimmer than `faint` so the placeholders whisper, sitting
-            // clearly below the real cards (§4) — they brighten on hover later.
-            const ghost = soft(0xFFFFFF, 0x1C);
+            const slot_rad: u8 = @intCast(@max(0, fxi(10 * sc)));
+            try rect(gpa, dl, px2, py2, card_w, card_h, soft(0xFFFFFF, 0x0A), slot_rad);
+            const ghost = soft(0xFFFFFF, 0x30);
             const plus_px: u16 = @intCast(@max(1, fxi(20 * sc)));
             const plus_w: i32 = @intCast(text.measure(e, .regular, "+", plus_px));
             _ = try str(gpa, dl, e, .regular, px2 + @divTrunc(card_w - plus_w, 2), py2 + @divTrunc(card_h, 2), ghost, plus_px, "+");
