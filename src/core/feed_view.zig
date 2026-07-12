@@ -224,7 +224,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -1771,6 +1771,78 @@ const kbd_x2_mid = kbdRowStr("$-'\"/:;!", "$-'\"/:;!");
 // The standing number row (every page): 1–9 + the emoji key — the owner
 // wants numbers one tap away while the symbols pages keep their own runs.
 const kbd_num = kbdRowStr("123456789", "123456789");
+
+/// The chat draft's edit state as the view needs it: caret + selection
+/// byte offsets (sel_a == sel_b = no selection) + whether the Copy/Cut/
+/// Paste bar is up. A7.2: cold view struct, transient per frame.
+pub const ChatEdit = struct {
+    caret: usize = std.math.maxInt(usize), // clamped to draft.len (= end)
+    sel_a: usize = 0,
+    sel_b: usize = 0,
+    bar: bool = false,
+};
+
+/// Map a point (logical px, relative to the INPUT REGION's box) to the
+/// nearest byte offset in the draft — replays wrapDraft's wrap rule (break
+/// before a word that overflows; '\n' explicit) with the same text origin
+/// the input draws at (region + 14, baseline +31, width -28). The shell
+/// calls this on a long-press to plant the selection.
+pub fn chatDraftOffsetAt(e: *const text.Engine, draft: []const u8, region_w: i32, hx: i32, hy: i32) u32 {
+    const maxw = region_w - 28;
+    const x0: i32 = 14;
+    var baseline: i32 = 31;
+    var x = x0;
+    var best: u32 = @intCast(draft.len);
+    var best_score: i64 = std.math.maxInt(i64);
+    var word_start: usize = 0;
+    var i: usize = 0;
+    while (i <= draft.len) : (i += 1) {
+        const at_end = i == draft.len;
+        const ch: u8 = if (at_end) 0 else draft[i];
+        if (!at_end and ch != ' ' and ch != '\n') continue;
+        const word = draft[word_start..i];
+        if (word.len > 0) {
+            const ww: i32 = @intCast(text.measure(e, .regular, word, chat_px));
+            if (x > x0 and x + ww > x0 + maxw) {
+                baseline += chat_line_h;
+                x = x0;
+            }
+            // every byte boundary inside the word is a caret candidate
+            var k: usize = 0;
+            while (k <= word.len) : (k += 1) {
+                const sw: i32 = @intCast(text.measure(e, .regular, word[0..k], chat_px));
+                nearerBoundary(@intCast(word_start + k), x + sw, baseline, hx, hy, &best, &best_score);
+            }
+            x += ww;
+        } else {
+            nearerBoundary(@intCast(word_start), x, baseline, hx, hy, &best, &best_score);
+        }
+        if (at_end) break;
+        if (ch == ' ') {
+            if (x > x0) x += @intCast(text.advance(e, .regular, ' ', chat_px));
+        } else {
+            baseline += chat_line_h;
+            x = x0;
+        }
+        word_start = i + 1;
+    }
+    return best;
+}
+
+/// Expand a byte offset to the word around it (non-space run); a space
+/// under the finger selects the gap's neighbouring word to the left.
+pub fn wordAround(draft: []const u8, off: usize) struct { a: usize, b: usize } {
+    if (draft.len == 0) return .{ .a = 0, .b = 0 };
+    var o = @min(off, draft.len - 1);
+    if (draft[o] == ' ' or draft[o] == '\n') {
+        while (o > 0 and (draft[o] == ' ' or draft[o] == '\n')) o -= 1;
+    }
+    var a = o;
+    while (a > 0 and draft[a - 1] != ' ' and draft[a - 1] != '\n') a -= 1;
+    var b = o;
+    while (b < draft.len and draft[b] != ' ' and draft[b] != '\n') b += 1;
+    return .{ .a = a, .b = b };
+}
 
 /// TAP-MODEL v1 (the forgiveness layer, measured 2026-07-12): a touch is
 /// scored against every key's CENTRE, normalised by that key's extents —
@@ -7718,10 +7790,9 @@ pub fn layoutChat(
     /// The composer strip's draft ("" shows the placeholder). Editing state
     /// (caret, selection) arrives with the U3 wiring.
     draft: []const u8,
-    /// Caret byte offset into `draft` (clamped to its length) — the shell
-    /// moves it with arrow keys / the space-hold slide; pass `draft.len`
-    /// (or anything larger) for a plain end-of-text caret.
-    draft_caret: usize,
+    /// Caret + selection + edit-bar state; `.{}` = caret at end, no
+    /// selection, no bar.
+    edit: ChatEdit,
     /// True while the composer owns the keyboard: the strip shows an accent
     /// ring + caret so "can I type?" is answered by the pixels (the owner's
     /// U5 field note — an input with no focus state reads as dead).
@@ -8202,7 +8273,7 @@ pub fn layoutChat(
         // machinery): the shell moves `draft_caret` with arrow keys and the
         // keyboard's space-hold slide, and the caret pen lands wherever
         // that byte offset wrapped to.
-        const pens = try wrapDraft(gpa, dl, e, input_x + 14, comp_y + 31, input_w - 28, ink, chat_px, draft, input_line_h, @min(draft_caret, draft.len), 0, 0);
+        const pens = try wrapDraft(gpa, dl, e, input_x + 14, comp_y + 31, input_w - 28, ink, chat_px, draft, input_line_h, @min(edit.caret, draft.len), @min(edit.sel_a, draft.len), @min(edit.sel_b, draft.len));
         caret_x = pens.caret.x;
         caret_base = pens.caret.baseline;
     } else {
@@ -8216,6 +8287,30 @@ pub fn layoutChat(
         try rect(gpa, dl, caret_x + 1, caret_base - 16, 2, 20, scaleAlpha((0xE0 << 24) | (accent & 0x00FFFFFF), ca), 0);
     }
     try emitRegion(gpa, regions, input_x, comp_y, input_w, @intCast(comp_h), 0, .chat_input);
+    // The EDIT BAR (long-press summons it): Copy/Cut/Paste/Select all in a
+    // strip riding above the input. Copy/Cut only light with a selection.
+    if (edit.bar and input_focus) {
+        const acts = [_]struct { label: []const u8, act: Action, needs_sel: bool }{
+            .{ .label = "Copy", .act = .chat_copy, .needs_sel = true },
+            .{ .label = "Cut", .act = .chat_cut, .needs_sel = true },
+            .{ .label = "Paste", .act = .chat_paste, .needs_sel = false },
+            .{ .label = "Select all", .act = .chat_selall, .needs_sel = false },
+        };
+        const bar_h: i32 = 44;
+        const by0 = comp_y - bar_h - 8;
+        var bx = input_x;
+        const have_sel = edit.sel_b > edit.sel_a;
+        for (acts) |a2| {
+            const lw: i32 = @intCast(text.measure(e, .semibold, a2.label, 14));
+            const cw = lw + 28;
+            const on = have_sel or !a2.needs_sel;
+            try rect(gpa, dl, bx - 1, by0 - 1, cw + 2, bar_h + 2, (0x70 << 24) | (accent & 0x00FFFFFF), 11);
+            try rect(gpa, dl, bx, by0, cw, bar_h, 0xFF23221B, 10);
+            _ = try str(gpa, dl, e, .semibold, bx + 14, by0 + 28, if (on) ink else faint, 14, a2.label);
+            if (on) try emitRegion(gpa, regions, bx, by0, cw, @intCast(bar_h), 0, a2.act);
+            bx += cw + 8;
+        }
+    }
     // The pay button: a "B" wearing the two ₿ ticks (the embedded fonts
     // carry no bitcoin glyph; the line-art spelling is ours). Pins to the
     // input's bottom edge like Send; accent-filled while the sheet is open.
@@ -9219,7 +9314,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // rail regions, so the counts are exactly the surface's own — one region
     // per conversation row + the composer pair + the "+ New" pill. (460 now
     // exercises the PHONE single-pane shape — its own test below.)
-    const h = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", 0, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{});
+    const h = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{});
     var n_conv: usize = 0;
     var n_input: usize = 0;
     var n_send: usize = 0;
@@ -9245,7 +9340,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // no thread pane and no composer to arm. The "+ New" pill is always there.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h2 = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", 0, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{});
+    const h2 = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{});
     try std.testing.expectEqual(@as(i32, 940), h2);
     var n2_conv: usize = 0;
     var n2_new: usize = 0;
@@ -9261,7 +9356,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // line draws when the shell hands one over.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", 0, false, true, "chattest.zat4.com", "Couldn't resolve that handle", .{}, .{}, &.{}, .{}, .{}, .{});
+    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", .{}, false, true, "chattest.zat4.com", "Couldn't resolve that handle", .{}, .{}, &.{}, .{}, .{}, .{});
     var n3_compose: usize = 0;
     for (regions.items) |r| {
         if (r.kind == .chat_compose_input) n3_compose += 1;
@@ -9274,12 +9369,12 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // (motion never moves a tap target).
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", 0, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{});
+    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{});
     const rest_items = dl.len;
     const rest_regions = regions.items.len;
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", 0, true, false, "", "", .{}, .{ .typing_t = 1, .typing_phase = 0.7 }, &.{}, .{}, .{}, .{});
+    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{ .typing_t = 1, .typing_phase = 0.7 }, &.{}, .{}, .{}, .{});
     try std.testing.expect(dl.len > rest_items);
     try std.testing.expectEqual(rest_regions, regions.items.len);
 }
@@ -9303,7 +9398,7 @@ test "messages screen: the phone shape — list page, then an immersive thread w
 
     // LIST page (no peer): full-width rows + the new-conversation button; no
     // composer, no thread chrome, no back — the tab bar is the way out.
-    _ = try layoutChat(gpa, &engine, 430, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", 0, false, false, "", "", .{}, .{}, &.{}, .{}, .{ .top = 48 }, .{});
+    _ = try layoutChat(gpa, &engine, 430, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{ .top = 48 }, .{});
     var l_conv: usize = 0;
     var l_new: usize = 0;
     var l_back: usize = 0;
@@ -9320,7 +9415,7 @@ test "messages screen: the phone shape — list page, then an immersive thread w
     // app-bar's back region + the composer trio are the page's controls.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 430, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", 0, true, false, "", "", .{}, .{}, &.{}, .{}, .{ .top = 48, .bottom = 34 }, .{});
+    _ = try layoutChat(gpa, &engine, 430, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{ .top = 48, .bottom = 34 }, .{});
     var t_conv: usize = 0;
     var t_new: usize = 0;
     var t_back: usize = 0;
@@ -9369,7 +9464,7 @@ test "messages screen: payment cards and the pay sheet emit their regions (M5 A4
     };
 
     // Sheet closed: the card buttons carry their thread ordinals.
-    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", 0, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{});
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{});
     var pay_at: u16 = 999;
     var cancel_at: u16 = 999;
     var received_at: u16 = 999;
@@ -9386,7 +9481,7 @@ test "messages screen: payment cards and the pay sheet emit their regions (M5 A4
     // and the amber status line renders without disturbing the regions.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", 0, false, false, "", "", .{ .open = true, .rail = .onchain, .amount = "5000", .note = "dinner", .status = "They haven't set up payments" }, .{}, &.{}, .{}, .{}, .{});
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{ .open = true, .rail = .onchain, .amount = "5000", .note = "dinner", .status = "They haven't set up payments" }, .{}, &.{}, .{}, .{}, .{});
     var n_rail: usize = 0;
     var n_chip: usize = 0;
     var n_amount: usize = 0;

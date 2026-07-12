@@ -153,6 +153,11 @@ pub const MobileHost = struct {
     /// interpretation (slide-off cancel, the space glide) stands down; two
     /// thumbs typing means no slides. Cleared when the gesture fully ends.
     kbd_multi: bool = false,
+    /// The press began on the chat INPUT strip: held past the long-press
+    /// threshold it plants a word selection + the edit bar; `input_lp`
+    /// spends the release tap once that fires.
+    input_press: bool = false,
+    input_lp: bool = false,
     /// The previous slide sample (velocity for the glide's step tuning).
     kbd_nav_fx: f32 = 0,
     /// The char key this press committed at touch-down (0 = none): sliding

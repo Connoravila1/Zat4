@@ -611,6 +611,20 @@ const RunState = struct {
     gchat_sel: ?chat_core.ConvIndex,
     gchat_draft_buf: [512]u8,
     gchat_draft_len: usize,
+    /// Selection over the draft ([a,b) bytes; a == b = none) + the edit
+    /// bar's visibility (long-press summons; edits dismiss).
+    /// The clipboard seam (phone): copy/cut queue text OUT here (the
+    /// activity polls + hands it to the OS clipboard); paste raises `want`
+    /// and the activity feeds the OS clipboard back IN next lap.
+    clip_out_buf: [1024]u8,
+    clip_out_len: usize,
+    clip_want: bool,
+    clip_in_buf: [1024]u8,
+    clip_in_len: usize,
+    clip_in_ready: bool,
+    gchat_sel_a: usize,
+    gchat_sel_b: usize,
+    gchat_edit_bar: bool,
     /// Caret byte offset into the draft (always kept <= gchat_draft_len).
     gchat_caret: usize,
     gchat_input_focus: bool,
@@ -1169,6 +1183,15 @@ fn initRunState(
     rs.gchat_draft_buf = undefined;
     rs.gchat_draft_len = 0;
     rs.gchat_caret = 0;
+    rs.gchat_sel_a = 0;
+    rs.gchat_sel_b = 0;
+    rs.gchat_edit_bar = false;
+    rs.clip_out_buf = undefined;
+    rs.clip_out_len = 0;
+    rs.clip_want = false;
+    rs.clip_in_buf = undefined;
+    rs.clip_in_len = 0;
+    rs.clip_in_ready = false;
     rs.gchat_input_focus = false;
     // The new-conversation flow: the recipient draft (a handle or DID being
     // typed) and why the last attempt refused (static strings, "" = none).
@@ -2803,7 +2826,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        var pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .market_q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .market_q_focus = rs.gmarket_q_focus, .market_loading = rs.market_loading, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .kbd_visible = toggleOn(rs.toggle_bits, settings_view.act_zat_kbd) and typingOwnsKeyboard(rs), .kbd_shift = rs.kbd_shift, .kbd_page = rs.kbd_page, .kbd_caps = rs.kbd_caps, .kbd_flash_key = rs.kbd_flash_key, .kbd_flash_a = kbdFlashAlpha(rs), .kbd_popup = .{ .opts = rs.kbd_popup_opts[0..rs.kbd_popup_n], .anchor_x = rs.kbd_popup_ax, .anchor_y = rs.kbd_popup_ay, .anchor_w = rs.kbd_popup_aw, .sel = rs.kbd_popup_sel }, .chat_q = rs.gchat_q_buf[0..rs.gchat_q_len], .chat_q_focus = rs.gchat_q_focus, .chat_q_caret = composeBlinkOn(rs.caret_anchor_ns), .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_caret = @min(rs.gchat_caret, rs.gchat_draft_len), .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
+        var pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .market_q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .market_q_focus = rs.gmarket_q_focus, .market_loading = rs.market_loading, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .kbd_visible = toggleOn(rs.toggle_bits, settings_view.act_zat_kbd) and typingOwnsKeyboard(rs), .kbd_shift = rs.kbd_shift, .kbd_page = rs.kbd_page, .kbd_caps = rs.kbd_caps, .kbd_flash_key = rs.kbd_flash_key, .kbd_flash_a = kbdFlashAlpha(rs), .kbd_popup = .{ .opts = rs.kbd_popup_opts[0..rs.kbd_popup_n], .anchor_x = rs.kbd_popup_ax, .anchor_y = rs.kbd_popup_ay, .anchor_w = rs.kbd_popup_aw, .sel = rs.kbd_popup_sel }, .chat_q = rs.gchat_q_buf[0..rs.gchat_q_len], .chat_q_focus = rs.gchat_q_focus, .chat_q_caret = composeBlinkOn(rs.caret_anchor_ns), .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_edit = .{ .caret = @min(rs.gchat_caret, rs.gchat_draft_len), .sel_a = @min(rs.gchat_sel_a, rs.gchat_draft_len), .sel_b = @min(rs.gchat_sel_b, rs.gchat_draft_len), .bar = rs.gchat_edit_bar }, .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
         switch (rs.mode) {
             .timeline => try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status),
             .compose => {
@@ -3076,6 +3099,8 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         m.kbd_bs_repeats = 0;
                         m.kbd_press_cp = 0;
                         m.kbd_multi = false;
+                        m.input_press = false;
+                        m.input_lp = false;
                         if (if (pix) |gv| gv.kbd_visible else false) {
                             if (rs.gpu_state) |*gsd| {
                                 const klx: i32 = @intFromFloat(@as(f32, @floatFromInt(tev.x)) / gsd.scale);
@@ -3126,6 +3151,13 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                 }
                             }
                         }
+                        if (!m.press_in_kbd) if (rs.gpu_state) |*gsi| {
+                            const iix: i32 = @intFromFloat(@as(f32, @floatFromInt(tev.x)) / gsi.scale);
+                            const iiy: i32 = @intFromFloat(@as(f32, @floatFromInt(tev.y)) / gsi.scale);
+                            if (feed_view.hitTest(rs.gregions.items, iix, iiy)) |ih| {
+                                if (ih.kind == .chat_input) m.input_press = true;
+                            }
+                        };
                         if (m.bounce_px != 0) {
                             m.over_px = gesture.rubberBandInv(std.math.clamp(m.bounce_px, -(view_h_f - 1), view_h_f - 1), view_h_f);
                             m.bounce_px = 0;
@@ -3492,10 +3524,11 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             // unless the press landed on the Zat4 keyboard
                             // (its keys already fired at touch-down; the
                             // panel swallows the rest by design).
-                            if (!m.press_in_kbd) {
+                            if (!m.press_in_kbd and !m.input_lp) {
                                 pointer_events.append(gpa, .{ .x = @intCast(m.down_x), .y = @intCast(m.down_y), .kind = .button_down, .button = 1, .mods = 0, ._pad = 0 }) catch {};
                                 pointer_events.append(gpa, .{ .x = tev.x, .y = tev.y, .kind = .button_up, .button = 1, .mods = 0, ._pad = 0 }) catch {};
                             }
+                            m.input_lp = false;
                         }
                         if (m.over_px != 0) {
                             // A banded release hands the stretch to the bounce
@@ -3653,6 +3686,30 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             m.kbd_press_cp = 0; // one popup per press
                         },
                         else => {},
+                    }
+                }
+                // LONG-PRESS on the chat INPUT: select the word under the
+                // finger + summon the Copy/Cut/Paste bar (the standard
+                // text-editing entry the strip was missing).
+                if (m.down_x >= 0 and m.input_press and !m.scrolling and (now_ms -% m.down_ms) >= 420) {
+                    m.input_press = false;
+                    m.input_lp = true; // the release tap is spent
+                    if (rs.engine) |*ieng| {
+                        for (rs.gregions.items) |r2| {
+                            if (r2.kind != .chat_input) continue;
+                            const lx: i32 = @intFromFloat(@as(f32, @floatFromInt(m.down_x)) / scale);
+                            const ly: i32 = @intFromFloat(@as(f32, @floatFromInt(m.down_y)) / scale);
+                            const off = feed_view.chatDraftOffsetAt(ieng, rs.gchat_draft_buf[0..rs.gchat_draft_len], r2.w, lx - r2.x, ly - r2.y);
+                            const wd = feed_view.wordAround(rs.gchat_draft_buf[0..rs.gchat_draft_len], off);
+                            rs.gchat_sel_a = wd.a;
+                            rs.gchat_sel_b = wd.b;
+                            rs.gchat_caret = wd.b;
+                            rs.gchat_edit_bar = true;
+                            rs.gchat_input_focus = true;
+                            rs.kbd_dirty = true;
+                            m.haptic_pending = 2;
+                            break;
+                        }
                     }
                 }
                 // PRESS-AND-HOLD to pick up a draggable (phone loadout): a finger
@@ -4995,6 +5052,38 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                             rs.gchat_input_focus = true;
                                             rs.gchat_composing = false;
                                             rs.gchat_caret = rs.gchat_draft_len;
+                                            chatCollapseSel(rs);
+                                        },
+                                        // The edit bar (long-press summons it).
+                                        .chat_copy, .chat_cut => if (dev_chat) {
+                                            const ca = @min(rs.gchat_sel_a, rs.gchat_draft_len);
+                                            const cb = @min(rs.gchat_sel_b, rs.gchat_draft_len);
+                                            if (cb > ca) {
+                                                const t = rs.gchat_draft_buf[ca..cb];
+                                                switch (backend) {
+                                                    .window => |w| window_shell.setClipboard(w, t),
+                                                    else => {},
+                                                }
+                                                const cn = @min(t.len, rs.clip_out_buf.len);
+                                                @memcpy(rs.clip_out_buf[0..cn], t[0..cn]);
+                                                rs.clip_out_len = cn;
+                                                if (hit.kind == .chat_cut) _ = chatDeleteSelection(rs);
+                                                rs.gchat_edit_bar = false;
+                                                rs.kbd_dirty = true;
+                                                rs.status = if (hit.kind == .chat_cut) "cut" else "copied";
+                                            }
+                                        },
+                                        .chat_paste => if (dev_chat) {
+                                            // The OS clipboard arrives via the
+                                            // seam next lap (clip_in drain).
+                                            rs.clip_want = true;
+                                            rs.gchat_edit_bar = false;
+                                        },
+                                        .chat_selall => if (dev_chat) {
+                                            rs.gchat_sel_a = 0;
+                                            rs.gchat_sel_b = rs.gchat_draft_len;
+                                            rs.gchat_caret = rs.gchat_draft_len;
+                                            rs.kbd_dirty = true;
                                         },
                                         // "+ New": open (or close) the recipient bar; it owns
                                         // the keyboard while open. Tapping the bar itself is
@@ -5014,6 +5103,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                                 chatPersistHistory(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
                                                 rs.gchat_draft_len = 0;
                             rs.gchat_caret = 0;
+                            chatCollapseSel(rs);
                                                 rs.gchat_caret = 0;
                                                 rs.gchat_input_focus = true;
                                                 rs.gscroll_px = 0;
@@ -5688,6 +5778,25 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
             }
             if (pointer_events.items.len > 0) rs.last_input_nanos = clock_shell.monotonicNanos();
         };
+        // The OS clipboard arrived (the activity fed it after a paste tap):
+        // it replaces the selection / lands at the caret, like typing does.
+        if (rs.clip_in_ready) {
+            rs.clip_in_ready = false;
+            if (rs.gchat_input_focus and rs.gscreen == feed_view.screen_messages) {
+                _ = chatDeleteSelection(rs);
+                const room = rs.gchat_draft_buf.len - rs.gchat_draft_len;
+                const pn = @min(rs.clip_in_len, room);
+                if (pn > 0) {
+                    const at = @min(rs.gchat_caret, rs.gchat_draft_len);
+                    std.mem.copyBackwards(u8, rs.gchat_draft_buf[at + pn .. rs.gchat_draft_len + pn], rs.gchat_draft_buf[at..rs.gchat_draft_len]);
+                    @memcpy(rs.gchat_draft_buf[at..][0..pn], rs.clip_in_buf[0..pn]);
+                    rs.gchat_draft_len += pn;
+                    rs.gchat_caret = at + pn;
+                    rs.gchat_key_ns = clock_shell.monotonicNanos();
+                    rs.kbd_dirty = true;
+                }
+            }
+        }
         if (backend != .terminal) {
             // The Zat4 keyboard's taps from LAST frame join the stream first —
             // one input path; every downstream consumer is IME-agnostic.
@@ -6004,6 +6113,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     // Caret navigation (arrow keys; the phone keyboard's
                     // space-hold slide arrives as the same escapes).
                     .left => if (!rs.gchat_composing and rs.gchat_input_focus) {
+                        chatCollapseSel(rs);
                         rs.gchat_caret = @min(rs.gchat_caret, rs.gchat_draft_len);
                         caretLeftUtf8(&rs.gchat_draft_buf, &rs.gchat_caret);
                         rs.gchat_key_ns = clock_shell.monotonicNanos();
@@ -6011,6 +6121,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         chat_key = false;
                     },
                     .right => if (!rs.gchat_composing and rs.gchat_input_focus) {
+                        chatCollapseSel(rs);
                         caretRightUtf8(&rs.gchat_draft_buf, rs.gchat_draft_len, &rs.gchat_caret);
                         rs.gchat_key_ns = clock_shell.monotonicNanos();
                     } else {
@@ -6056,9 +6167,15 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     continue;
                 } else if (dev_chat and rs.gscreen == feed_view.screen_messages and rs.gchat_input_focus) {
                     if (zc == 8 or zc == 127) {
-                        deleteUtf8Before(&rs.gchat_draft_buf, &rs.gchat_draft_len, &rs.gchat_caret);
+                        // Backspace eats the SELECTION when one exists.
+                        if (!chatDeleteSelection(rs)) deleteUtf8Before(&rs.gchat_draft_buf, &rs.gchat_draft_len, &rs.gchat_caret);
+                        rs.gchat_edit_bar = false;
                         rs.gchat_key_ns = clock_shell.monotonicNanos();
-                    } else if (zc >= 0x20 and insertUtf8At(&rs.gchat_draft_buf, &rs.gchat_draft_len, &rs.gchat_caret, zc)) {
+                    } else if (zc >= 0x20 and blk: {
+                        _ = chatDeleteSelection(rs); // typing over a selection replaces it
+                        rs.gchat_edit_bar = false;
+                        break :blk insertUtf8At(&rs.gchat_draft_buf, &rs.gchat_draft_len, &rs.gchat_caret, zc);
+                    }) {
                         rs.gchat_key_ns = clock_shell.monotonicNanos();
                         // One encrypted typing ping per 4s of active typing.
                         // deposit is worker-queued (never blocks the frame);
@@ -6531,6 +6648,31 @@ pub fn mobileHapticTake(mr: *MobileRun) u8 {
     const tag = mr.host.haptic_pending;
     mr.host.haptic_pending = 0;
     return tag;
+}
+
+/// Copy/cut queued clipboard text OUT (read-and-clear); the activity hands
+/// it to the OS clipboard. The pointer stays valid until the next frame.
+pub fn mobileClipTake(mr: *MobileRun, len_out: *u32) ?[*]const u8 {
+    if (mr.rs.clip_out_len == 0) return null;
+    len_out.* = @intCast(mr.rs.clip_out_len);
+    mr.rs.clip_out_len = 0;
+    return &mr.rs.clip_out_buf;
+}
+
+/// Paste wants the OS clipboard (read-and-clear, one-shot per tap).
+pub fn mobileClipWant(mr: *MobileRun) bool {
+    const w = mr.rs.clip_want;
+    mr.rs.clip_want = false;
+    return w;
+}
+
+/// The activity feeds the OS clipboard's text back in; the next frame's
+/// drain lands it in the focused draft.
+pub fn mobileClipFeed(mr: *MobileRun, bytes: []const u8) void {
+    const n = @min(bytes.len, mr.rs.clip_in_buf.len);
+    @memcpy(mr.rs.clip_in_buf[0..n], bytes[0..n]);
+    mr.rs.clip_in_len = n;
+    mr.rs.clip_in_ready = true;
 }
 
 /// Does the frame WANT the soft keyboard? Keyed off the SAME predicate the
@@ -8406,6 +8548,27 @@ fn popUtf8(buf: []const u8, len: *usize) void {
     }
 }
 
+/// Delete the draft's selection (if any), closing the gap and parking the
+/// caret at the wound. False = there was no selection.
+fn chatDeleteSelection(rs: *RunState) bool {
+    const a = @min(rs.gchat_sel_a, rs.gchat_draft_len);
+    const b = @min(rs.gchat_sel_b, rs.gchat_draft_len);
+    if (b <= a) return false;
+    std.mem.copyForwards(u8, rs.gchat_draft_buf[a .. rs.gchat_draft_len - (b - a)], rs.gchat_draft_buf[b..rs.gchat_draft_len]);
+    rs.gchat_draft_len -= b - a;
+    rs.gchat_caret = a;
+    rs.gchat_sel_a = 0;
+    rs.gchat_sel_b = 0;
+    return true;
+}
+
+/// Collapse the selection + drop the edit bar (any ordinary edit does).
+fn chatCollapseSel(rs: *RunState) void {
+    rs.gchat_sel_a = 0;
+    rs.gchat_sel_b = 0;
+    rs.gchat_edit_bar = false;
+}
+
 /// The tap decoder's two-class context (the last two typed), or the
 /// disabled sentinel when the smart-targeting toggle is off.
 fn kbdCtx(rs: *const RunState) [2]u8 {
@@ -8431,7 +8594,7 @@ fn kbdRestamp(rs: *RunState, pix: *?Grid) void {
         g.kbd_flash_a = kbdFlashAlpha(rs);
         g.kbd_popup = .{ .opts = rs.kbd_popup_opts[0..rs.kbd_popup_n], .anchor_x = rs.kbd_popup_ax, .anchor_y = rs.kbd_popup_ay, .anchor_w = rs.kbd_popup_aw, .sel = rs.kbd_popup_sel };
         g.chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len];
-        g.chat_caret = @min(rs.gchat_caret, rs.gchat_draft_len);
+        g.chat_edit = .{ .caret = @min(rs.gchat_caret, rs.gchat_draft_len), .sel_a = @min(rs.gchat_sel_a, rs.gchat_draft_len), .sel_b = @min(rs.gchat_sel_b, rs.gchat_draft_len), .bar = rs.gchat_edit_bar };
         g.chat_key_ns = rs.gchat_key_ns;
         g.chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len];
     }
@@ -9219,8 +9382,8 @@ const Grid = struct {
     chat_q_caret: bool = false,
 
     chat_draft: []const u8 = "",
-    /// Caret byte offset into the draft (arrow keys / space-hold move it).
-    chat_caret: usize = 0,
+    /// Caret + selection + edit-bar state for the draft.
+    chat_edit: feed_view.ChatEdit = .{},
     chat_input_focus: bool = false,
     chat_composing: bool = false,
     chat_compose: []const u8 = "",
@@ -10206,7 +10369,7 @@ fn paintFrame(
                 // Zat Chat (U3, dev-gated): the Messages surface. -scroll maps the
                 // shared ≤0 scroll state onto layoutChat's positive history offset.
                 const cf = buildChatFrame(arena, g.chat_store.?, g.chat_sel, now, g.chat_q);
-                g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_caret, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{}, &.{}, g.chat_recv, .{}, .{}) catch g.content_h.*;
+                g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_edit, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{}, &.{}, g.chat_recv, .{}, .{}) catch g.content_h.*;
             } else if (g.screen.* == feed_view.screen_loadout) {
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
                 g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market, g.market_q, g.market_q_focus, g.market_loading, g.bench_pick, g.bench_drag, g.published, g.create, g.dev, g.bench, .{}, g.loadout_lib_y) catch g.content_h.*; // software: draw line-art nav
@@ -10641,8 +10804,9 @@ fn paintFrameGpu(
         chat_sig ^= unread_sum *% 0x2545_F491_4F6C_DD1D;
         // The composer focus ring must appear the frame the input is tapped.
         chat_sig ^= @as(u64, @intFromBool(g.chat_input_focus)) *% 0x8A91_7F2B_4D3E_61C7;
-        // Caret moves rebuild the composer strip (the rebuild-signature law).
-        chat_sig ^= (@as(u64, g.chat_caret) +% 1) *% 0xD1B5_4A32_D192_ED03;
+        // Caret/selection/bar changes rebuild the strip (the rebuild law).
+        chat_sig ^= (@as(u64, g.chat_edit.caret) +% 1) *% 0xD1B5_4A32_D192_ED03;
+        chat_sig ^= ((@as(u64, g.chat_edit.sel_a) << 20 ^ @as(u64, g.chat_edit.sel_b) << 1 ^ @as(u64, @intFromBool(g.chat_edit.bar))) +% 1) *% 0x94D0_49BB_1331_11EB;
         // The recipient bar: open/close, every keystroke, and the status
         // line must each repaint the frame they change.
         chat_sig ^= @as(u64, @intFromBool(g.chat_composing)) *% 0xF29C_511C_8E3D_45A7;
@@ -10929,7 +11093,7 @@ fn paintFrameGpu(
                 }
             } else |_| {}
             const reflow_t: f32 = if (gs.chat_reflow) |rh| (gs.chat_world.position(rh) orelse 1.0) else 1.0;
-            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_caret, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t }, xforms, g.chat_recv, .{ .top = @intCast(gs.inset_top_l), .bottom = @intCast(@max(gs.inset_bottom_l, @max(gs.ime_bottom_l, if (g.kbd_visible) feed_view.keyboard_h + gs.inset_bottom_l else 0))), .left = @intCast(gs.inset_left_l), .right = @intCast(gs.inset_right_l) }, .{ .q = g.chat_q, .focus = g.chat_q_focus, .caret_on = g.chat_q_caret }) catch g.content_h.*;
+            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_edit, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t }, xforms, g.chat_recv, .{ .top = @intCast(gs.inset_top_l), .bottom = @intCast(@max(gs.inset_bottom_l, @max(gs.ime_bottom_l, if (g.kbd_visible) feed_view.keyboard_h + gs.inset_bottom_l else 0))), .left = @intCast(gs.inset_left_l), .right = @intCast(gs.inset_right_l) }, .{ .q = g.chat_q, .focus = g.chat_q_focus, .caret_on = g.chat_q_caret }) catch g.content_h.*;
         } else if (g.screen.* == feed_view.screen_algo_docs) {
             g.content_h.* = feed_view.layoutAlgoDocs(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, if (g.docs_kind == 1) algo_docs.dev_doc else algo_docs.user_doc) catch g.content_h.*;
         } else if (g.screen.* == feed_view.screen_algo_detail) {

@@ -711,6 +711,35 @@ pub export fn zat_touch(ctx_ptr: ?*anyopaque, kind: u32, x_px: f32, y_px: f32) v
     touch(ctx, kind, x_px, y_px);
 }
 
+/// Clipboard OUT (copy/cut): text the app wants on the OS clipboard, or
+/// null. Read-and-clear; the buffer lives until the next frame.
+pub export fn zat_clip_take(ctx_ptr: ?*anyopaque, len_out: ?*u32) ?[*]const u8 {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return null));
+    const lo = len_out orelse return null;
+    if (comptime mobile_config.have_gpu) {
+        if (ctx.feed) |*f| return tui.mobileClipTake(f.run, lo);
+    }
+    return null;
+}
+
+/// Clipboard IN: 1 = the app wants the OS clipboard's text this lap (a
+/// paste was tapped); the activity answers with zat_clip_feed.
+pub export fn zat_clip_want(ctx_ptr: ?*anyopaque) u32 {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return 0));
+    if (comptime mobile_config.have_gpu) {
+        if (ctx.feed) |*f| return @intFromBool(tui.mobileClipWant(f.run));
+    }
+    return 0;
+}
+
+pub export fn zat_clip_feed(ctx_ptr: ?*anyopaque, ptr: ?[*]const u8, len: u32) void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return));
+    const bp = ptr orelse return;
+    if (comptime mobile_config.have_gpu) {
+        if (ctx.feed) |*f| tui.mobileClipFeed(f.run, bp[0..len]);
+    }
+}
+
 pub export fn zat_step(ctx_ptr: ?*anyopaque, dt_ns: u64) void {
     const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return));
     stepSim(ctx, dt_ns);

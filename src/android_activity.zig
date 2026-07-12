@@ -460,6 +460,59 @@ fn imeInsetPx(activity: *Activity) i32 {
     return v;
 }
 
+/// The activity's half of the clipboard seam: resolve the OS
+/// ClipboardManager once per call (render-lap rate is copy/paste taps —
+/// human-rare). `text` -> setPrimaryClip; read -> the primary clip's first
+/// item as UTF-8 handed back through zat_clip_feed.
+fn clipboardManager(env: JniEnv, activity: *Activity) jobject {
+    const svc = jniFn(env, jni_new_string_utf, NewStringUtfFn)(env, "clipboard");
+    if (jniFailed(env) or svc == null) return null;
+    const get_svc = jniMethod(env, activity.clazz, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;") orelse return null;
+    return jniCallObj(env, activity.clazz, get_svc, &[_]jvalue{.{ .l = svc }});
+}
+
+fn clipboardSet(activity: *Activity, text: [*:0]const u8) void {
+    const vm: JavaVm = @ptrCast(@alignCast(activity.vm));
+    var env: JniEnv = undefined;
+    const attach: AttachFn = @ptrCast(@alignCast(vm.*.slots[vm_attach_current_thread].?));
+    if (attach(vm, &env, null) != 0) return;
+    defer _ = @as(DetachFn, @ptrCast(@alignCast(vm.*.slots[vm_detach_current_thread].?)))(vm);
+    const cm = clipboardManager(env, activity) orelse return;
+    const new_string = jniFn(env, jni_new_string_utf, NewStringUtfFn);
+    const label = new_string(env, "zat4");
+    const txt = new_string(env, text);
+    if (jniFailed(env) or label == null or txt == null) return;
+    const clip_cls = jniFn(env, jni_find_class, FindClassFn)(env, "android/content/ClipData");
+    if (jniFailed(env) or clip_cls == null) return;
+    const new_plain = jniFn(env, jni_get_static_method_id, GetMethodIdFn)(env, clip_cls, "newPlainText", "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Landroid/content/ClipData;");
+    if (jniFailed(env) or new_plain == null) return;
+    const clip = jniFn(env, jni_call_static_object_method_a, CallStaticObjectMethodAFn)(env, clip_cls, new_plain, &[_]jvalue{ .{ .l = label }, .{ .l = txt } });
+    if (jniFailed(env) or clip == null) return;
+    const set_prim = jniMethod(env, cm, "setPrimaryClip", "(Landroid/content/ClipData;)V") orelse return;
+    jniFn(env, jni_call_void_method_a, CallVoidMethodAFn)(env, cm, set_prim, &[_]jvalue{.{ .l = clip }});
+    if (jniFailed(env)) seam.logcat("clipboard: setPrimaryClip threw", .{});
+}
+
+fn clipboardRead(activity: *Activity, ctx: *anyopaque) void {
+    const vm: JavaVm = @ptrCast(@alignCast(activity.vm));
+    var env: JniEnv = undefined;
+    const attach: AttachFn = @ptrCast(@alignCast(vm.*.slots[vm_attach_current_thread].?));
+    if (attach(vm, &env, null) != 0) return;
+    defer _ = @as(DetachFn, @ptrCast(@alignCast(vm.*.slots[vm_detach_current_thread].?)))(vm);
+    const cm = clipboardManager(env, activity) orelse return;
+    const get_clip = jniMethod(env, cm, "getPrimaryClip", "()Landroid/content/ClipData;") orelse return;
+    const clip = jniCallObj(env, cm, get_clip, &no_args) orelse return;
+    const get_item = jniMethod(env, clip, "getItemAt", "(I)Landroid/content/ClipData$Item;") orelse return;
+    const item = jniCallObj(env, clip, get_item, &[_]jvalue{.{ .i = 0 }}) orelse return;
+    const get_text = jniMethod(env, item, "getText", "()Ljava/lang/CharSequence;") orelse return;
+    const cs = jniCallObj(env, item, get_text, &no_args) orelse return;
+    const to_str = jniMethod(env, cs, "toString", "()Ljava/lang/String;") orelse return;
+    const jstr = jniCallObj(env, cs, to_str, &no_args) orelse return;
+    const chars = jniFn(env, jni_get_string_utf_chars, GetStringUtfCharsFn)(env, jstr, null) orelse return;
+    defer jniFn(env, jni_release_string_utf_chars, ReleaseStringUtfCharsFn)(env, jstr, chars);
+    seam.zat_clip_feed(ctx, chars, @intCast(std.mem.len(chars)));
+}
+
 fn hapticTick(activity: *Activity) void {
     const vm: JavaVm = @ptrCast(@alignCast(activity.vm));
     var env: JniEnv = undefined;
@@ -852,6 +905,21 @@ fn renderThread() void {
             }
             // The gesture system's threshold ticks (drawer latch,
             // pull-to-refresh arm) land as one taptic each.
+            {
+                // The clipboard seam: copy/cut out, paste's read back in.
+                var clen: u32 = 0;
+                if (seam.zat_clip_take(ctx, &clen)) |cp| {
+                    if (clen > 0 and clen < 1024) {
+                        var zbuf: [1024]u8 = undefined;
+                        @memcpy(zbuf[0..clen], cp[0..clen]);
+                        zbuf[clen] = 0;
+                        if (app.activity) |act| clipboardSet(act, zbuf[0..clen :0]);
+                    }
+                }
+                if (seam.zat_clip_want(ctx) != 0) {
+                    if (app.activity) |act| clipboardRead(act, ctx);
+                }
+            }
             if (seam.zat_haptic(ctx) != 0) {
                 if (app.activity) |act| hapticTick(act);
             }
