@@ -6076,6 +6076,7 @@ pub fn rethemeLight(gpa: Allocator, dl: *raster.DrawList) error{OutOfMemory}!voi
     while (i < src.len) : (i += 1) {
         const item = src.get(i);
         switch (item) {
+            .emoji => try dl.append(gpa, item), // sprites pass through
             .rect => |r| {
                 if (r.color == lens_socket.theme_keep_begin) {
                     keep = true; // drop the marker itself
@@ -6255,6 +6256,12 @@ pub fn shatterCaptureHomes(dl: *const raster.DrawList, hx: []f32, hy: []f32, bw:
                 aw = pf * 0.72;
                 ah = pf;
             },
+            .emoji => |em| {
+                ax = @floatFromInt(em.x);
+                ay = @floatFromInt(em.y);
+                aw = @floatFromInt(em.px);
+                ah = @floatFromInt(em.px);
+            },
             .rect => |r| {
                 ax = @floatFromInt(r.x);
                 ay = @floatFromInt(r.y);
@@ -6309,6 +6316,11 @@ pub fn applyShatterItems(dl: *raster.DrawList, bx: []const f32, by: []const f32,
                 const t = &data[i].text;
                 t.x = clampI16(@as(f32, @floatFromInt(t.x)) + dx);
                 t.baseline = clampI16(@as(f32, @floatFromInt(t.baseline)) + dy);
+            },
+            .emoji => {
+                const em = &data[i].emoji;
+                em.x = clampI16(@as(f32, @floatFromInt(em.x)) + dx);
+                em.y = clampI16(@as(f32, @floatFromInt(em.y)) + dy);
             },
             .rect => {
                 const r = &data[i].rect;

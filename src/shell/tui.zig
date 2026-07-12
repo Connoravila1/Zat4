@@ -5053,7 +5053,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         // The Zat4 keyboard (desktop mouse path;
                                         // phone keys commit at touch-DOWN in the
                                         // pump and never reach this tap).
-                                        .kbd_key, .kbd_shift, .kbd_page, .kbd_backspace => kbdAction(rs, gpa, hit.kind, hit.post),
+                                        .kbd_key, .kbd_shift, .kbd_page, .kbd_backspace, .kbd_emoji => kbdAction(rs, gpa, hit.kind, hit.post),
                                         .chat_input => if (dev_chat) {
                                             rs.gchat_input_focus = true;
                                             rs.gchat_composing = false;
