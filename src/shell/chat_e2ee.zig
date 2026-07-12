@@ -126,17 +126,29 @@ pub fn init(
     environ: ?*const std.process.Environ.Map,
     session: *@import("auth.zig").Session,
 ) !State {
-    _ = chat_keys.ensurePublished(gpa, arena, io, environ, session) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.NoAnchor => return error.NoAnchor,
-        error.NoCacheDir => return error.NoCacheDir,
-        else => return error.PublishFailed,
-    };
+    // LOCAL-FIRST. The old order ran the keyPackage PUBLISH (a network
+    // write) before anything else, so ANY auth/network failure aborted
+    // init and emptied the Messages screen — with the MLS groups and the
+    // history blob sitting intact on disk (the owner's disappeared-
+    // conversations incident, 2026-07-12). The conversation list is LOCAL
+    // truth (E2/E4): local state loads unconditionally; the publish runs
+    // last and is fatal only on a FIRST RUN, where the keyPackage must be
+    // minted before Welcomes can ever arrive.
     var anchor_load = cache.loadOrCreateAnchorSeed(gpa, io, environ, session.did) orelse return error.NoAnchor;
     errdefer std.crypto.secureZero(u8, &anchor_load.seed);
     var kp_path_buf: [512]u8 = undefined;
     const kp_path = cache.chatKeyPackagePath(&kp_path_buf, environ, session.did) orelse return error.NoCacheDir;
-    var kp = cache.loadChatKeyPackageAt(gpa, kp_path, session.did) orelse return error.NoCacheDir;
+    var minted_now = false;
+    var kp = cache.loadChatKeyPackageAt(gpa, kp_path, session.did) orelse blk: {
+        minted_now = true;
+        _ = chat_keys.ensurePublished(gpa, arena, io, environ, session) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.NoAnchor => return error.NoAnchor,
+            error.NoCacheDir => return error.NoCacheDir,
+            else => return error.PublishFailed,
+        };
+        break :blk cache.loadChatKeyPackageAt(gpa, kp_path, session.did) orelse return error.NoCacheDir;
+    };
     errdefer cache.freeChatKeyPackage(gpa, &kp);
 
     const anchor_pub = anchor.publicKey(anchor_load.seed) catch return error.NoAnchor;
@@ -148,6 +160,10 @@ pub fn init(
     };
     errdefer gpa.free(st.my_did);
     restoreGroups(gpa, environ, &st);
+    // Re-assert the published record (heals a wiped/expired PDS record) —
+    // best-effort on a returning device: a failed network leg must never
+    // hide the local conversations again.
+    if (!minted_now) _ = chat_keys.ensurePublished(gpa, arena, io, environ, session) catch {};
     return st;
 }
 
