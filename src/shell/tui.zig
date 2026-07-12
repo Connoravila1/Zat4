@@ -8289,9 +8289,6 @@ fn kbdAction(rs: *RunState, gpa: Allocator, kind: feed_view.Action, post: u16) v
     // via `adb logcat -s zat4`): every commit, in byte-stream order, with
     // a monotonic stamp. Flip off after the verdict.
     rs.kbd_dirty = true;
-    const debug_keylog = true;
-    if (debug_keylog and kind == .kbd_key and post != 0)
-        mobile_host.logcat("key: {u} +{d}ms", .{ @as(u21, post), clock_shell.monotonicNanos() / 1_000_000 % 100_000 });
     switch (kind) {
         .kbd_key => {
             if (post == 0) { // the dead emoji key: flash only, no byte (yet)

@@ -1797,7 +1797,12 @@ pub fn kbdResolve(regions: []const Region, px: i32, py: i32, ctx: [2]u8) ?Region
         const hw = @max(1.0, @as(f32, @floatFromInt(r.w)) * 0.5);
         const hh = @max(1.0, @as(f32, @floatFromInt(r.h)) * 0.5);
         const dx = (@as(f32, @floatFromInt(px)) - cx) / hw;
-        const dy = (@as(f32, @floatFromInt(py)) - cy) / hh;
+        // Vertical leniency 1.35x: measured finger scatter is ~1.8x taller
+        // than wide (250 presses, 2026-07-12) — row-neighbour misses were
+        // the dominant typo, so crossing a row needs more evidence than
+        // crossing a column. (The platform keyboards weight it the same
+        // way.)
+        const dy = (@as(f32, @floatFromInt(py)) - cy) / (hh * 1.35);
         var score = dx * dx + dy * dy;
         if (score > 2.6) continue; // out of this key's reach
         if (lm_on) {
