@@ -147,6 +147,9 @@ pub const MobileHost = struct {
     kbd_space_down: bool = false,
     kbd_nav: bool = false,
     kbd_nav_x: f32 = 0,
+    /// The char key this press committed at touch-down (0 = none): sliding
+    /// off it before lifting UNDOES the char (slide-off cancel).
+    kbd_press_cp: u16 = 0,
     /// One pending haptic tick, set by the pump the frame a threshold is
     /// CROSSED during a drag (GESTURE_SYSTEM_ROADMAP §3 — the tick lands
     /// under the finger, never on release) and taken (read-and-clear) by the

@@ -1792,6 +1792,9 @@ pub fn drawKeyboard(
     flash_a: u8,
     /// The shell's running clock (seconds) — drives the lattice pulses.
     t: f32,
+    /// Settings: the traveling lattice glints, and the key-preview pop.
+    pulses_on: bool,
+    pop_on: bool,
 ) error{OutOfMemory}!void {
     const top = view_h - keyboard_h - bottom_inset;
     // The panel: opaque (nothing ghosts through chrome) with a faint wash.
@@ -1829,7 +1832,7 @@ pub fn drawKeyboard(
         .{ .row = 3, .speed = 0.047, .phase = 0.45, .dirn = -1 },
         .{ .row = -1, .speed = 0.113, .phase = 0.20, .dirn = 1 }, // the top rail
     };
-    for (pulses) |p| {
+    for (pulses) |p| if (pulses_on) {
         const gy = if (p.row < 0)
             top + 1
         else
@@ -1841,8 +1844,12 @@ pub fn drawKeyboard(
         try rect(gpa, dl, hx - 2, gy - 2, 5, 5, (0x6E << 24) | (accent & 0x00FFFFFF), 2);
         try rect(gpa, dl, hx - 1 - tail, gy - 1, 3, 3, (0x3A << 24) | (accent & 0x00FFFFFF), 1);
         try rect(gpa, dl, hx - 1 - 2 * tail, gy - 1, 3, 3, (0x1C << 24) | (accent & 0x00FFFFFF), 1);
-    }
+    };
 
+    var pop_x: i32 = std.math.minInt(i32);
+    var pop_w: i32 = 0;
+    var pop_y: i32 = 0;
+    var pop_cp: u16 = 0;
     var y = top + 8;
     var row_i: usize = 0;
     while (row_i < n_rows) : (row_i += 1) {
@@ -1951,6 +1958,16 @@ pub fn drawKeyboard(
                 else => flash_key == k.lo or (k.hi != 0 and flash_key == k.hi),
             };
             if (flashed) try rect(gpa, dl, x, y, kw, kbd_key_h, (@as(u32, flash_a) << 24) | (accent & 0x00FFFFFF), 9);
+            // The key-preview POP (iOS's signature, ours): the pressed CHAR
+            // key's glyph rises above the finger while the flash is young —
+            // the fingertip occludes the key; the confirmation lives above
+            // it. Captured here, drawn after the rows (topmost).
+            if (flashed and pop_on and k.ctrl == 0 and k.lo != ' ') {
+                pop_x = x;
+                pop_w = kw;
+                pop_y = y;
+                pop_cp = if ((shift or caps) and k.hi != 0) k.hi else k.lo;
+            }
             // Caps lock: the shift key carries a solid accent lock bar.
             if (k.ctrl == 1 and caps)
                 try rect(gpa, dl, x + @divTrunc(kw, 2) - 8, y + kbd_key_h - 9, 16, 3, (0xFF << 24) | (accent & 0x00FFFFFF), 1);
@@ -2011,6 +2028,20 @@ pub fn drawKeyboard(
             x += kw + kbd_gap;
         }
         y += kbd_key_h + kbd_gap;
+    }
+    // The pop cap: a raised key face just above the pressed key, accent
+    // edge, big glyph — alpha rides the press flash (snaps in, fades fast).
+    if (pop_x != std.math.minInt(i32) and flash_a > 40) {
+        const pw = @max(pop_w + 10, 44);
+        const px0 = std.math.clamp(pop_x - @divTrunc(pw - pop_w, 2), 2, width - pw - 2);
+        const py0 = pop_y - 58;
+        const pa: u32 = @min(255, @as(u32, flash_a) * 3);
+        try rect(gpa, dl, px0 - 1, py0 - 1, pw + 2, 52, ((pa * 0x70 / 255) << 24) | (accent & 0x00FFFFFF), 11);
+        try rect(gpa, dl, px0, py0, pw, 50, (pa << 24) | 0x212019, 10);
+        var pgb: [4]u8 = undefined;
+        const pgn = std.unicode.utf8Encode(@intCast(pop_cp), &pgb) catch 1;
+        const pgw: i32 = @intCast(text.measure(e, .regular, pgb[0..pgn], 26));
+        _ = try str(gpa, dl, e, .regular, px0 + @divTrunc(pw - pgw, 2), py0 + 34, scaleAlpha(ink, @as(f32, @floatFromInt(pa)) / 255.0), 26, pgb[0..pgn]);
     }
 }
 

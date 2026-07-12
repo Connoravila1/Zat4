@@ -105,6 +105,9 @@ pub const act_zero_g: u8 = 20; // Toy Box: Zero-G — posts drift weightlessly
 pub const act_liquid: u8 = 21; // Toy Box: Liquid — posts slosh with scroll inertia
 pub const act_light: u8 = 22; // Appearance: light mode — the whole app on a light canvas
 pub const act_zat_kbd: u8 = 23; // Input: the Zat4 keyboard (phone) — in-app keys, no system IME
+pub const act_kbd_pulses: u8 = 24; // Keyboard: the circuit-lattice glints
+pub const act_kbd_haptic: u8 = 25; // Keyboard: a soft tick per keystroke
+pub const act_kbd_pop: u8 = 26; // Keyboard: the key-preview pop above the finger
 
 /// Optional one-line explainer shown as a HOVER TOOLTIP over a row — opt-in per
 /// action, empty for the rest. Kept out of band (a switch, not a `Row` field) so
@@ -260,6 +263,9 @@ pub const rows = [_]Row{
     // ── Appearance ───────────────────────────────────────────────────────
     .{ .section = sec_appearance, .group = 0, .kind = .toggle, .action = act_light, .flags = 0, .label = "Light mode", .value = "" },
     .{ .section = sec_appearance, .group = 0, .kind = .toggle, .action = act_zat_kbd, .flags = flag_on, .label = "Zat4 keyboard", .value = "" },
+    .{ .section = sec_appearance, .group = 0, .kind = .toggle, .action = act_kbd_pulses, .flags = flag_on, .label = "Keyboard circuit pulses", .value = "" },
+    .{ .section = sec_appearance, .group = 0, .kind = .toggle, .action = act_kbd_haptic, .flags = flag_on, .label = "Keyboard haptics", .value = "" },
+    .{ .section = sec_appearance, .group = 0, .kind = .toggle, .action = act_kbd_pop, .flags = flag_on, .label = "Key preview pop", .value = "" },
     .{ .section = sec_appearance, .group = 0, .kind = .choice, .action = act_accent, .flags = 0, .label = "Accent", .value = "Auto" },
     .{ .section = sec_appearance, .group = 0, .kind = .choice, .action = act_none, .flags = flag_wip, .label = "Text size", .value = "Medium" },
     .{ .section = sec_appearance, .group = 1, .kind = .toggle, .action = act_field, .flags = flag_on, .label = "Living glyph field", .value = "" },

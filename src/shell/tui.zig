@@ -3000,10 +3000,13 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                 if (rs.gpu_state) |*gsd| {
                                     const ax: i32 = @intFromFloat(@as(f32, @floatFromInt(tev.x)) / gsd.scale);
                                     const ay: i32 = @intFromFloat(@as(f32, @floatFromInt(tev.y)) / gsd.scale);
-                                    if (feed_view.hitTest(rs.gregions.items, ax, ay)) |kh| switch (kh.kind) {
+                                    if (feed_view.hitTest(rs.gregions.items, ax, ay - kbd_touch_bias_y)) |kh| switch (kh.kind) {
                                         // A second-thumb space types plainly
                                         // (no caret slide from an aux finger).
-                                        .kbd_key, .kbd_shift, .kbd_page, .kbd_backspace => kbdAction(rs, gpa, kh.kind, kh.post),
+                                        .kbd_key, .kbd_shift, .kbd_page, .kbd_backspace => {
+                                            kbdAction(rs, gpa, kh.kind, kh.post);
+                                            if (toggleOn(rs.toggle_bits, settings_view.act_kbd_haptic)) m.haptic_pending = 1;
+                                        },
                                         else => {},
                                     };
                                 }
@@ -3033,6 +3036,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         // never commit to a scroll or drawer swipe underneath.
                         m.press_in_kbd = false;
                         m.kbd_bs_repeats = 0;
+                        m.kbd_press_cp = 0;
                         if (if (pix) |gv| gv.kbd_visible else false) {
                             if (rs.gpu_state) |*gsd| {
                                 const klx: i32 = @intFromFloat(@as(f32, @floatFromInt(tev.x)) / gsd.scale);
@@ -3045,7 +3049,9 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                     // keyboard latency, not tap-on-release.
                                     // The release tap is suppressed below so
                                     // a key never fires twice.
-                                    if (feed_view.hitTest(rs.gregions.items, klx, kly)) |kh| switch (kh.kind) {
+                                    // Thumbs land LOW: resolve the key a few
+                                    // logical px above the touch centroid.
+                                    if (feed_view.hitTest(rs.gregions.items, klx, kly - kbd_touch_bias_y)) |kh| switch (kh.kind) {
                                         .kbd_key => if (kh.post == ' ') {
                                             // Space commits on RELEASE — a held
                                             // space is the caret slide (.move).
@@ -3054,8 +3060,17 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                             m.kbd_nav_x = @as(f32, @floatFromInt(tev.x)) / gsd.scale;
                                             rs.kbd_flash_key = ' ';
                                             rs.kbd_flash_ns = clock_shell.monotonicNanos();
-                                        } else kbdAction(rs, gpa, kh.kind, kh.post),
-                                        .kbd_shift, .kbd_page, .kbd_backspace => kbdAction(rs, gpa, kh.kind, kh.post),
+                                        } else {
+                                            kbdAction(rs, gpa, kh.kind, kh.post);
+                                            // Arm slide-off cancel: leave the key
+                                            // before lifting and the char undoes.
+                                            m.kbd_press_cp = kh.post;
+                                            if (toggleOn(rs.toggle_bits, settings_view.act_kbd_haptic)) m.haptic_pending = 1;
+                                        },
+                                        .kbd_shift, .kbd_page, .kbd_backspace => {
+                                            kbdAction(rs, gpa, kh.kind, kh.post);
+                                            if (toggleOn(rs.toggle_bits, settings_view.act_kbd_haptic)) m.haptic_pending = 1;
+                                        },
                                         else => {},
                                     };
                                 }
@@ -3091,6 +3106,19 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             continue;
                         }
                         gesture.push(&m.ring, .{ .x = @as(f32, @floatFromInt(tev.x)) / scale, .y = @as(f32, @floatFromInt(tev.y)) / scale, .t_ms = now_ms });
+                        // SLIDE-OFF CANCEL: the finger leaves the key it
+                        // committed before lifting — undo the char (one
+                        // backspace), kill its flash. The standard escape
+                        // hatch press-commit otherwise loses.
+                        if (m.press_in_kbd and m.kbd_press_cp != 0) {
+                            const cdx = @abs(@as(f32, @floatFromInt(@as(i32, tev.x) - m.down_x))) / scale;
+                            const cdy = @abs(@as(f32, @floatFromInt(@as(i32, tev.y) - m.down_y))) / scale;
+                            if (cdx > 30 or cdy > 34) {
+                                rs.kbd_bytes.append(gpa, 8) catch {};
+                                rs.kbd_flash_key = 0;
+                                m.kbd_press_cp = 0;
+                            }
+                        }
                         // SPACE-HOLD CARET SLIDE (Zat4 keyboard): with the
                         // press parked on the space bar, horizontal travel
                         // walks the caret — arrow escapes ride the same byte
@@ -3269,7 +3297,10 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         // A space release: a clean tap TYPES the space; an
                         // engaged caret slide already did its work.
                         if (m.kbd_space_down) {
-                            if (!m.kbd_nav) kbdAction(rs, gpa, .kbd_key, ' ');
+                            if (!m.kbd_nav) {
+                                kbdAction(rs, gpa, .kbd_key, ' ');
+                                if (toggleOn(rs.toggle_bits, settings_view.act_kbd_haptic)) m.haptic_pending = 1;
+                            }
                             m.kbd_space_down = false;
                             m.kbd_nav = false;
                         }
@@ -8180,15 +8211,24 @@ fn popUtf8(buf: []const u8, len: *usize) void {
     }
 }
 
+/// Thumbs consistently strike BELOW the key they aim at — resolve keyboard
+/// presses this many logical px above the touch centroid (the correction
+/// every serious keyboard applies; per-user learning is the follow-up).
+const kbd_touch_bias_y: i32 = 5;
+
 /// The Zat4 keyboard's press-flash alpha this frame: full at the press,
 /// gone 220 ms later. Nonzero alpha folds into feed_sig, so the fade
 /// rebuilds the keyboard tile frame-by-frame only while it runs.
 fn kbdFlashAlpha(rs: *const RunState) u8 {
     if (rs.kbd_flash_key == 0) return 0;
     const age = clock_shell.monotonicNanos() -| rs.kbd_flash_ns;
-    const dur: u64 = 220_000_000;
+    // A full-bright ATTACK (~2 frames) then a fast fall — the snap is what
+    // reads as crispness; a slow even fade read as lag.
+    const attack: u64 = 35_000_000;
+    const dur: u64 = 120_000_000;
+    if (age < attack) return 190;
     if (age >= dur) return 0;
-    return @intCast(170 - age * 170 / dur);
+    return @intCast(190 - (age - attack) * 190 / (dur - attack));
 }
 
 /// M2.1: keep the relay subscribed to every mailbox we currently drain —
@@ -10174,7 +10214,7 @@ fn paintComposeGpu(
     const kbd_lift: u32 = if (g.kbd_visible) @intCast(feed_view.keyboard_h + @as(i32, @intCast(gs.inset_bottom_l))) else 0;
     feed_view.layoutCompose(gpa, g.engine, @intCast(gs.design_w), @intCast(lh - kbd_lift), g.accent, ctx, reply_handle, quoting, draft, caret, sel_start, sel_end, blink_on, status, segments, tag_bar, g.draw, g.regions) catch {};
     if (g.kbd_visible)
-        feed_view.drawKeyboard(gpa, g.draw, g.engine, g.regions, @intCast(gs.design_w), @intCast(lh), @intCast(gs.inset_bottom_l), g.accent, g.kbd_shift, g.kbd_page, g.kbd_caps, g.kbd_flash_key, g.kbd_flash_a, gs.t) catch {};
+        feed_view.drawKeyboard(gpa, g.draw, g.engine, g.regions, @intCast(gs.design_w), @intCast(lh), @intCast(gs.inset_bottom_l), g.accent, g.kbd_shift, g.kbd_page, g.kbd_caps, g.kbd_flash_key, g.kbd_flash_a, gs.t, toggleOn(g.settings_toggles, settings_view.act_kbd_pulses), toggleOn(g.settings_toggles, settings_view.act_kbd_pop)) catch {};
     if (g.julia) feed_view.juliaRemapText(g.draw); // light theme: dark text
     if (g.light) feed_view.rethemeLight(gpa, g.draw) catch {};
     gpu.feedBuild(&gs.feed, gpa, g.engine, g.draw.slice(), scale) catch {};
@@ -10992,7 +11032,7 @@ fn paintFrameGpu(
             // input wants keys. Its taps feed the same byte stream the system
             // IME's fallback feeds — one input path (MC.4d).
             if (g.kbd_visible)
-                feed_view.drawKeyboard(gpa, g.draw, g.engine, g.regions, @intCast(gs.design_w), @intCast(lh), @intCast(gs.inset_bottom_l), g.accent, g.kbd_shift, g.kbd_page, g.kbd_caps, g.kbd_flash_key, g.kbd_flash_a, gs.t) catch {};
+                feed_view.drawKeyboard(gpa, g.draw, g.engine, g.regions, @intCast(gs.design_w), @intCast(lh), @intCast(gs.inset_bottom_l), g.accent, g.kbd_shift, g.kbd_page, g.kbd_caps, g.kbd_flash_key, g.kbd_flash_a, gs.t, toggleOn(g.settings_toggles, settings_view.act_kbd_pulses), toggleOn(g.settings_toggles, settings_view.act_kbd_pop)) catch {};
             // The cartridge DETAIL sheet (item 5) is chrome-topmost: it lives in
             // THIS tile (drawn after the feed buffer), not the feed buffer, or the
             // tab bar + FAB paint over its scrim (the on-device bleed, 2026-07-09).

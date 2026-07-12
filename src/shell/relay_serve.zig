@@ -81,6 +81,16 @@ const max_connections = 64;
 const max_head_len = 8 * 1024;
 
 /// Serve until `cfg.stop` is set (or forever). The caller owns the store.
+/// run() minus the bind — public for SIBLING loopback tests (chat_relay)
+/// that must own a fixture-probed port before the server thread exists.
+/// Unique per-binary ports are load-bearing: `zig build test` runs its test
+/// binaries IN PARALLEL, and two suites sharing a hardcoded port cross-talk
+/// — clients of one binary reach the other's server, and the orphaned
+/// listener blocks its join forever (the 51-minute hang, 2026-07-11).
+pub fn runBound(gpa: Allocator, io: std.Io, server: *std.Io.net.Server, store: *relay.Store, cfg: ServeConfig, lock: *StoreLock) !void {
+    try serveLoop(gpa, io, server, store, cfg, lock);
+}
+
 pub fn run(gpa: Allocator, io: std.Io, store: *relay.Store, cfg: ServeConfig, lock: *StoreLock) !void {
     var address: std.Io.net.IpAddress = .{ .ip4 = .loopback(cfg.port) };
     var server = try address.listen(io, .{ .reuse_address = true });

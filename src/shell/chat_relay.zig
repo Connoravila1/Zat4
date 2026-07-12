@@ -515,6 +515,7 @@ fn readAvailable(reader: *std.Io.Reader, dst: []u8) error{ReadFailed}!?usize {
 
 const testing = std.testing;
 const relay_serve = @import("relay_serve.zig");
+const fixture = @import("test_fixture.zig");
 
 test "chat_relay loopback: two clients exchange an opaque bucket through the real relay" {
     const gpa = testing.allocator;
@@ -525,9 +526,15 @@ test "chat_relay loopback: two clients exchange an opaque bucket through the rea
     defer relay.deinit(gpa, &store);
     var lock: relay_serve.StoreLock = .{};
     var stop: std.atomic.Value(bool) = .init(false);
-    const port: u16 = 25911;
+    // The port comes from the fixture, NOT a constant: the build runs its
+    // test binaries in parallel, and a hardcoded port cross-talks between
+    // them (one binary's clients reach the other's server; the orphaned
+    // accept then blocks its join forever — the 2026-07-11 hang).
+    var bound = try fixture.listenLoopback(io, 25911);
+    const port = bound.port;
+    defer bound.server.deinit(io);
     const server_thread = try std.Thread.spawn(.{}, serveForTest, .{
-        gpa, io, &store, relay_serve.ServeConfig{ .port = port, .token = "u5-test-token", .stop = &stop }, &lock,
+        gpa, io, &bound.server, &store, relay_serve.ServeConfig{ .port = port, .token = "u5-test-token", .stop = &stop }, &lock,
     });
     defer {
         stop.store(true, .release);
@@ -625,6 +632,6 @@ test "chat_relay loopback: two clients exchange an opaque bucket through the rea
     try testing.expectEqual(@as(u32, 0), left);
 }
 
-fn serveForTest(gpa: Allocator, io: std.Io, store: *relay.Store, cfg: relay_serve.ServeConfig, lock: *relay_serve.StoreLock) void {
-    relay_serve.run(gpa, io, store, cfg, lock) catch {};
+fn serveForTest(gpa: Allocator, io: std.Io, server: *std.Io.net.Server, store: *relay.Store, cfg: relay_serve.ServeConfig, lock: *relay_serve.StoreLock) void {
+    relay_serve.runBound(gpa, io, server, store, cfg, lock) catch {};
 }
