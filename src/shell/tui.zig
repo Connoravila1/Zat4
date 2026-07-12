@@ -3035,6 +3035,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         // (no caret slide from an aux finger).
                                         .kbd_key, .kbd_shift, .kbd_page, .kbd_backspace => {
                                             kbdAction(rs, gpa, kh.kind, kh.post);
+                                            rs.kbd_flash_held = true; // this finger owns the pop until a lift
                                             if (toggleOn(rs.toggle_bits, settings_view.act_kbd_haptic)) m.haptic_pending = 1;
                                         },
                                         else => {},
@@ -3357,9 +3358,20 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         }
                     },
                     .button_up => {
-                        // An aux finger lifting is bookkeeping only — its key
-                        // already committed at its down.
-                        if (tev.button == 2) continue;
+                        // An aux finger lifting: its key committed at its
+                        // down, but SOME finger left the glass — the pop
+                        // fades NOW. Per-pointer previews need ids we don't
+                        // track; any-lift-fades + any-press-rearms reads
+                        // right (alternating-finger spam pinned the pop
+                        // solid for a measured 7.2 s, 2026-07-12).
+                        if (tev.button == 2) {
+                            if (rs.kbd_flash_held) {
+                                rs.kbd_flash_held = false;
+                                rs.kbd_flash_ns = clock_shell.monotonicNanos() -| 25_000_000;
+                                rs.kbd_dirty = true;
+                            }
+                            continue;
+                        }
                         // The long-press popup commits on release: the cell
                         // under the finger types its remainder (the sigil is
                         // already in the draft); off every cell = cancel.
