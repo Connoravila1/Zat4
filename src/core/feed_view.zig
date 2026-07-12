@@ -36,6 +36,7 @@ const Allocator = std.mem.Allocator;
 const text = @import("text.zig");
 const raster = @import("raster.zig");
 const lens_socket = @import("lens_socket.zig");
+const kbd_lm = @import("kbd_lm.zig");
 const create_flow = @import("create_flow.zig");
 const dev_flow = @import("dev_flow.zig");
 const zal_templates = @import("zal_templates.zig");
@@ -1773,9 +1774,19 @@ const kbd_num = kbdRowStr("123456789", "123456789");
 /// key the finger was closest to at that key's own scale (wide keys are
 /// proportionally tolerant, so space keeps its edges). Pure; the pump
 /// calls this instead of raw hitTest for keyboard presses.
-pub fn kbdResolve(regions: []const Region, px: i32, py: i32) ?Region {
+/// TAP-MODEL v2: the spatial score blends with a letter-trigram prior —
+/// P(this key's letter | the last two typed) from kbd_lm — so a
+/// boundary-ambiguous press resolves to the letter that CONTINUES what the
+/// fingers were typing ("th" + a press between e/w -> e). The weight is
+/// sized so the prior decides ties and near-ties ONLY: a clean press's
+/// spatial margin (>= ~1.5 key-radii²) always beats the maximum prior
+/// swing (~0.7). ctx = the last two typed classes (kbd_lm.classOf);
+/// ctx[0] == 255 disables the prior (the settings toggle / desktop mouse).
+pub fn kbdResolve(regions: []const Region, px: i32, py: i32, ctx: [2]u8) ?Region {
+    const lm_on = ctx[0] != 255;
+    const lam: f32 = 0.0055; // key-radii² per 1/16 nat
     var best: ?Region = null;
-    var best_score: f32 = 2.6; // beyond ~1.6 key-radii: no key claimed
+    var best_score: f32 = 2.6 + 0.35; // reach bound, prior-inclusive
     for (regions) |r| {
         switch (r.kind) {
             .kbd_key, .kbd_shift, .kbd_page, .kbd_backspace => {},
@@ -1787,7 +1798,19 @@ pub fn kbdResolve(regions: []const Region, px: i32, py: i32) ?Region {
         const hh = @max(1.0, @as(f32, @floatFromInt(r.h)) * 0.5);
         const dx = (@as(f32, @floatFromInt(px)) - cx) / hw;
         const dy = (@as(f32, @floatFromInt(py)) - cy) / hh;
-        const score = dx * dx + dy * dy;
+        var score = dx * dx + dy * dy;
+        if (score > 2.6) continue; // out of this key's reach
+        if (lm_on) {
+            // Letter and boundary keys carry their trigram cost; keys the
+            // model doesn't speak for (digits, symbols, controls) carry the
+            // average-ish flat cost so the prior never crowds them out.
+            const nll: u8 = if (r.kind == .kbd_key and r.post != 0) blk: {
+                const c3 = kbd_lm.classOf(@intCast(@min(r.post, 255)));
+                const modeled = c3 != 26 or r.post == ' ' or r.post == ',' or r.post == '.';
+                break :blk if (modeled) @min(kbd_lm.nll(ctx[0], ctx[1], c3), 128) else 55;
+            } else 55;
+            score += lam * @as(f32, @floatFromInt(nll));
+        }
         if (score < best_score) {
             best_score = score;
             best = r;
@@ -2149,16 +2172,19 @@ pub fn drawKeyboard(
     // The pop cap: a raised key face just above the pressed key, accent
     // edge, big glyph — alpha rides the press flash (snaps in, fades fast).
     if (pop_x != std.math.minInt(i32) and flash_a > 40) {
-        const pw = @max(pop_w + 10, 44);
+        // ENLARGED, the platform way (owner, 2026-07-12): the pop is the
+        // magnifier — a wider cap, a higher rise, and a 34px glyph vs the
+        // key's 19 — not a copy of the key.
+        const pw = @max(pop_w + 16, 54);
         const px0 = std.math.clamp(pop_x - @divTrunc(pw - pop_w, 2), 2, width - pw - 2);
-        const py0 = pop_y - 58;
+        const py0 = pop_y - 68;
         const pa: u32 = @min(255, @as(u32, flash_a) * 3);
-        try rect(gpa, dl, px0 - 1, py0 - 1, pw + 2, 52, ((pa * 0x70 / 255) << 24) | (accent & 0x00FFFFFF), 11);
-        try rect(gpa, dl, px0, py0, pw, 50, (pa << 24) | 0x212019, 10);
+        try rect(gpa, dl, px0 - 1, py0 - 1, pw + 2, 60, ((pa * 0x70 / 255) << 24) | (accent & 0x00FFFFFF), 12);
+        try rect(gpa, dl, px0, py0, pw, 58, (pa << 24) | 0x212019, 11);
         var pgb: [4]u8 = undefined;
         const pgn = std.unicode.utf8Encode(@intCast(pop_cp), &pgb) catch 1;
-        const pgw: i32 = @intCast(text.measure(e, .regular, pgb[0..pgn], 26));
-        _ = try str(gpa, dl, e, .regular, px0 + @divTrunc(pw - pgw, 2), py0 + 34, scaleAlpha(ink, @as(f32, @floatFromInt(pa)) / 255.0), 26, pgb[0..pgn]);
+        const pgw: i32 = @intCast(text.measure(e, .regular, pgb[0..pgn], 34));
+        _ = try str(gpa, dl, e, .regular, px0 + @divTrunc(pw - pgw, 2), py0 + 42, scaleAlpha(ink, @as(f32, @floatFromInt(pa)) / 255.0), 34, pgb[0..pgn]);
     }
     // The long-press popup strip: opaque cells above the anchor key, the
     // finger-tracked cell accent-filled. Selection is the shell's; release

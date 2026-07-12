@@ -76,6 +76,7 @@ const feed_view = @import("../core/feed_view.zig");
 const pin_store = @import("../core/zone_pins.zig");
 const compose_core = @import("../core/compose.zig");
 const settings_view = @import("../core/settings_view.zig");
+const kbd_lm = @import("../core/kbd_lm.zig");
 const text_select = @import("../core/text_select.zig");
 const textedit = @import("../core/textedit.zig");
 const lens_socket = @import("../core/lens_socket.zig");
@@ -577,6 +578,10 @@ const RunState = struct {
     /// an extra paint (after a grid re-stamp) so the pixels land the same
     /// tick as the finger — the razor-tap paint. One frame bought back.
     kbd_dirty: bool,
+    /// The tap decoder's context: the last few typed classes (kbd_lm), a
+    /// ring so backspace can pop. Feeds kbdResolve's trigram prior.
+    kbd_hist: [8]u8,
+    kbd_hist_n: usize,
     /// The long-press popup: 0 closed / 1 @-handles / 2 #-zones. Options
     /// are copied into the fixed bufs; `kbd_popup_opts` slices into them
     /// (RunState never moves). The anchor is the pressed key's region.
@@ -1139,6 +1144,8 @@ fn initRunState(
     rs.kbd_flash_ns = 0;
     rs.kbd_flash_held = false;
     rs.kbd_dirty = false;
+    rs.kbd_hist = .{26} ** 8;
+    rs.kbd_hist_n = 0;
     rs.kbd_popup_kind = 0;
     rs.kbd_popup_n = 0;
     rs.kbd_popup_bufs = undefined;
@@ -3030,7 +3037,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                 if (rs.gpu_state) |*gsd| {
                                     const ax: i32 = @intFromFloat(@as(f32, @floatFromInt(tev.x)) / gsd.scale);
                                     const ay: i32 = @intFromFloat(@as(f32, @floatFromInt(tev.y)) / gsd.scale);
-                                    if (feed_view.kbdResolve(rs.gregions.items, ax, ay - kbd_touch_bias_y)) |kh| switch (kh.kind) {
+                                    if (feed_view.kbdResolve(rs.gregions.items, ax, ay - kbd_touch_bias_y, kbdCtx(rs))) |kh| switch (kh.kind) {
                                         // A second-thumb space types plainly
                                         // (no caret slide from an aux finger).
                                         .kbd_key, .kbd_shift, .kbd_page, .kbd_backspace => {
@@ -3083,7 +3090,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                     // a key never fires twice.
                                     // Thumbs land LOW: resolve the key a few
                                     // logical px above the touch centroid.
-                                    if (feed_view.kbdResolve(rs.gregions.items, klx, kly - kbd_touch_bias_y)) |kh| switch (kh.kind) {
+                                    if (feed_view.kbdResolve(rs.gregions.items, klx, kly - kbd_touch_bias_y, kbdCtx(rs))) |kh| switch (kh.kind) {
                                         .kbd_key => if (kh.post == ' ') {
                                             // Space commits at DOWN like every
                                             // key — commit-on-release made it
@@ -8295,6 +8302,15 @@ fn kbdAction(rs: *RunState, gpa: Allocator, kind: feed_view.Action, post: u16) v
             var kb: [4]u8 = undefined;
             const kn = std.unicode.utf8Encode(@intCast(post), &kb) catch 0;
             if (kn > 0) rs.kbd_bytes.appendSlice(gpa, kb[0..kn]) catch {};
+            // The decoder context: letters push their class; boundaries
+            // collapse. (kbd_lm.classOf maps anything non-letter to 26.)
+            if (post < 256) {
+                const c = kbd_lm.classOf(@intCast(post));
+                if (!(c == 26 and rs.kbd_hist_n > 0 and rs.kbd_hist[(rs.kbd_hist_n - 1) % 8] == 26)) {
+                    rs.kbd_hist[rs.kbd_hist_n % 8] = c;
+                    rs.kbd_hist_n += 1;
+                }
+            }
             if (!rs.kbd_caps) rs.kbd_shift = false; // one-shot unless locked
             rs.kbd_flash_key = post;
             rs.kbd_flash_ns = clock_shell.monotonicNanos();
@@ -8325,6 +8341,7 @@ fn kbdAction(rs: *RunState, gpa: Allocator, kind: feed_view.Action, post: u16) v
         // One delete per press; a HELD press repeats via the pump's timer.
         .kbd_backspace => {
             rs.kbd_bytes.append(gpa, 8) catch {};
+            if (rs.kbd_hist_n > 0) rs.kbd_hist_n -= 1; // the context pops too
             rs.kbd_flash_key = 0xE002;
             rs.kbd_flash_ns = clock_shell.monotonicNanos();
         },
@@ -8390,6 +8407,16 @@ fn popUtf8(buf: []const u8, len: *usize) void {
         const b = buf[len.*];
         if (b < 0x80 or b >= 0xC0) return; // consumed through the lead byte
     }
+}
+
+/// The tap decoder's two-class context (the last two typed), or the
+/// disabled sentinel when the smart-targeting toggle is off.
+fn kbdCtx(rs: *const RunState) [2]u8 {
+    if (!toggleOn(rs.toggle_bits, settings_view.act_kbd_lm)) return .{ 255, 255 };
+    const n = rs.kbd_hist_n;
+    const c2: u8 = if (n > 0) rs.kbd_hist[(n - 1) % 8] else 26;
+    const c1: u8 = if (n > 1) rs.kbd_hist[(n - 2) % 8] else 26;
+    return .{ c1, c2 };
 }
 
 /// The razor-tap re-stamp: the frame's Grid was snapshotted BEFORE input

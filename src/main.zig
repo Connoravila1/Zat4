@@ -1064,6 +1064,7 @@ test {
     _ = @import("core/mls_wire.zig");
     _ = @import("core/mls_schedule.zig");
     _ = @import("core/mls.zig");
+    _ = @import("core/kbd_lm.zig");
     _ = @import("core/anchor.zig");
     _ = @import("core/keydir.zig");
     _ = @import("shell/chat_relay.zig");
