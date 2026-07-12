@@ -386,6 +386,7 @@ pub fn deinit(self: *Gpu) void {
 
 const raster = @import("../core/raster.zig");
 const atlas_mod = @import("../core/atlas.zig");
+const emoji_atlas = @import("../core/emoji_atlas.zig");
 const text = @import("../core/text.zig");
 const field = @import("../core/field.zig");
 
@@ -484,6 +485,7 @@ const GL_TRIANGLES: GLenum = 0x0004;
 const GL_TEXTURE_2D: GLenum = 0x0DE1;
 const GL_TEXTURE0: GLenum = 0x84C0;
 const GL_LUMINANCE: GLenum = 0x1909;
+const GL_RGBA: GLenum = 0x1908;
 const GL_UNSIGNED_BYTE: GLenum = 0x1401;
 const GL_R32F: GLint = 0x822E; // single-channel float — the CPU field's height upload
 const GL_RED: GLenum = 0x1903;
@@ -551,6 +553,7 @@ const Vertex = extern struct {
 const mode_rrect: f32 = 0; // rounded rect: SDF coverage
 const mode_glyph: f32 = 1; // glyph: atlas .r coverage
 const mode_solid: f32 = 2; // solid fill: full coverage (sharp rects, lines)
+const mode_emoji: f32 = 3; // emoji: RGBA sprite from the emoji sheet
 
 const vert_src: [:0]const GLchar =
     \\attribute vec2 aPos;
@@ -579,6 +582,7 @@ const vert_src: [:0]const GLchar =
 const frag_src: [:0]const GLchar =
     \\precision mediump float;
     \\uniform sampler2D uAtlas;
+    \\uniform sampler2D uEmoji;
     \\uniform float uAlpha;
     \\varying vec4 vColor;
     \\varying vec2 vUV;
@@ -587,6 +591,11 @@ const frag_src: [:0]const GLchar =
     \\varying float vRadius;
     \\varying float vMode;
     \\void main() {
+    \\  if (vMode > 2.5) {
+    \\    vec4 t = texture2D(uEmoji, vUV);
+    \\    gl_FragColor = vec4(t.rgb, t.a * vColor.a * uAlpha);
+    \\    return;
+    \\  }
     \\  float cov = 1.0;
     \\  if (vMode < 0.5) {
     \\    vec2 d = abs(vLocal) - (vHalf - vec2(vRadius));
@@ -608,8 +617,11 @@ pub const Renderer = struct {
     vbo: GLuint,
     atlas_tex: GLuint,
     atlas_dim: u32,
+    /// The emoji sprite sheet (RGBA, unit 1), uploaded once at init.
+    emoji_tex: GLuint,
     u_viewport: GLint,
     u_atlas: GLint,
+    u_emoji: GLint,
     u_alpha: GLint,
     a_pos: GLint,
     a_color: GLint,
@@ -660,15 +672,29 @@ pub fn initRenderer() Error!Renderer {
     glGenBuffers(1, @ptrCast(&vbo));
     var tex: GLuint = 0;
     glGenTextures(1, @ptrCast(&tex));
+    // The emoji sheet: baked RGBA, uploaded once — the one color texture
+    // in the text pipeline (unit 1 at draw; the glyph atlas keeps unit 0).
+    var etex: GLuint = 0;
+    glGenTextures(1, @ptrCast(&etex));
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, etex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, @intCast(GL_RGBA), @intCast(emoji_atlas.sheet_w), @intCast(emoji_atlas.sheet_h), 0, GL_RGBA, GL_UNSIGNED_BYTE, emoji_atlas.sheet_rgba.ptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-    elog("renderer ready (program linked, atlas texture + vbo created)", .{});
+    elog("renderer ready (program linked, atlas + emoji textures + vbo created)", .{});
     return .{
         .program = prog,
         .vbo = vbo,
         .atlas_tex = tex,
         .atlas_dim = 0,
+        .emoji_tex = etex,
         .u_viewport = glGetUniformLocation(prog, "uViewport"),
         .u_atlas = glGetUniformLocation(prog, "uAtlas"),
+        .u_emoji = glGetUniformLocation(prog, "uEmoji"),
         .u_alpha = glGetUniformLocation(prog, "uAlpha"),
         .a_pos = glGetAttribLocation(prog, "aPos"),
         .a_color = glGetAttribLocation(prog, "aColor"),
@@ -848,6 +874,22 @@ pub fn buildVertices(
             const uv = [4][2]f32{ .{ ua, va }, .{ ub, va }, .{ ub, vb }, .{ ua, vb } };
             try pushQuad(&verts, gpa, p, uv, zero_local, .{ 0, 0 }, 0, mode_glyph, argb(it.color));
         },
+        .emoji => {
+            const it = bare.emoji;
+            const o = emoji_atlas.cellOrigin(it.cell);
+            const dx: f32 = @as(f32, @floatFromInt(it.x)) * scale;
+            const dy: f32 = @as(f32, @floatFromInt(it.y)) * scale;
+            const bw: f32 = @as(f32, @floatFromInt(it.px)) * scale;
+            const ew: f32 = 1.0 / @as(f32, @floatFromInt(emoji_atlas.sheet_w));
+            const eh: f32 = 1.0 / @as(f32, @floatFromInt(emoji_atlas.sheet_h));
+            const ua: f32 = @as(f32, @floatFromInt(o.x)) * ew;
+            const va: f32 = @as(f32, @floatFromInt(o.y)) * eh;
+            const ub: f32 = @as(f32, @floatFromInt(o.x + emoji_atlas.cell_px)) * ew;
+            const vb: f32 = @as(f32, @floatFromInt(o.y + emoji_atlas.cell_px)) * eh;
+            const p = [4][2]f32{ .{ dx, dy }, .{ dx + bw, dy }, .{ dx + bw, dy + bw }, .{ dx, dy + bw } };
+            const uv = [4][2]f32{ .{ ua, va }, .{ ub, va }, .{ ub, vb }, .{ ua, vb } };
+            try pushQuad(&verts, gpa, p, uv, zero_local, .{ 0, 0 }, 0, mode_emoji, .{ 1, 1, 1, 1 });
+        },
         .tri => {
             const it = bare.tri;
             const ax: f32 = @as(f32, @floatFromInt(it.x0)) * scale;
@@ -886,10 +928,13 @@ pub fn draw(r: *Renderer, verts: []const Vertex, vw: i32, vh: i32, alpha: f32) v
     // Bind the glyph atlas on unit 0 HERE every frame: the field pass binds
     // its own ramp texture to the same unit, so the feed must reclaim it or
     // it samples the ramp instead and all text vanishes.
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, r.emoji_tex);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, r.atlas_tex);
     glUniform2f(r.u_viewport, @floatFromInt(vw), @floatFromInt(vh));
     glUniform1i(r.u_atlas, 0);
+    glUniform1i(r.u_emoji, 1);
     glUniform1f(r.u_alpha, alpha);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);

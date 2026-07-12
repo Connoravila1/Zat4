@@ -87,14 +87,18 @@ pub fn listenLoopback(io: std.Io, base_port: u16) !struct { server: std.Io.net.S
     // wakes, an hour-long join (three listeners on one port, observed
     // 2026-07-11). Without it a taken port honestly refuses and the probe
     // walks on; TIME_WAIT collisions also walk on — right for tests.
-    var port = base_port;
+    // Honest binding leaves TIME_WAIT residue from just-closed tests, so
+    // the probe needs real headroom: start at a PER-PROCESS offset (the two
+    // parallel test binaries begin in different slots) and walk up to 32
+    // steps of 7 — ~224 ports of room per base, exhaustion ~impossible.
+    var port = base_port +% @as(u16, @intCast(@mod(std.os.linux.getpid() >> 1, 13))) * 7;
     var tries: u8 = 0;
     while (true) {
         var address: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
         const server = address.listen(io, .{ .reuse_address = false }) catch {
             tries += 1;
-            if (tries >= 8) return error.NoFreePort;
-            port += 11;
+            if (tries >= 32) return error.NoFreePort;
+            port +%= 7;
             continue;
         };
         return .{ .server = server, .port = port };

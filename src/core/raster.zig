@@ -39,6 +39,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const text = @import("text.zig");
+const emoji_atlas = @import("emoji_atlas.zig");
 
 /// A7.2: cold struct, size guard waived — one per window, never in a
 /// collection. Its CONTENTS (pixels) are the hot array.
@@ -147,12 +148,27 @@ pub const TriItem = struct {
 /// The paint vocabulary. Each variant is guarded above; the union's
 /// bare payload is their common 16 bytes, the tag rides its own SoA
 /// array (MultiArrayList splits tagged unions exactly this way).
+/// An inline EMOJI sprite: the atlas cell blitted into a `px`-square box
+/// whose TOP-left is (x, y) — sprites are boxes, not baselines.
+pub const EmojiItem = struct {
+    x: i16,
+    y: i16,
+    px: u16,
+    cell: u16,
+
+    comptime {
+        // Budget: 8 exact — half the union's payload (A7).
+        assert(@sizeOf(EmojiItem) == 8);
+    }
+};
+
 pub const DrawItem = union(enum) {
     cell: CellItem,
     text: TextItem,
     rect: RectItem,
     line: LineItem,
     tri: TriItem,
+    emoji: EmojiItem,
 
     comptime {
         // HOT (thousands per frame, stored in DrawList). Each variant is a
@@ -222,6 +238,7 @@ pub fn paint(
             const g = try text.glyph(gpa, e, @enumFromInt(it.weight), it.codepoint, it.px);
             drawCoverage(fb, it.x + g.bear_x, it.baseline + g.bear_y, g, it.color);
         },
+        .emoji => drawEmoji(fb, bare.emoji),
     };
 }
 
@@ -387,6 +404,34 @@ fn drawCell(fb: *Framebuffer, px: u32, py: u32, codepoint: u32, fg: u32, bg: u32
 }
 
 /// Integer alpha blend, exact at both endpoints: a=0 ⇒ bg, a=255 ⇒ fg.
+/// Blit one emoji sprite (nearest-scaled from its 48px atlas cell),
+/// straight-alpha blended — the software path's answer to the GPU's
+/// emoji quad.
+fn drawEmoji(fb: *Framebuffer, it: EmojiItem) void {
+    const o = emoji_atlas.cellOrigin(it.cell);
+    const box: i32 = it.px;
+    var oy: i32 = 0;
+    while (oy < box) : (oy += 1) {
+        const py = it.y + oy;
+        if (py < 0 or py >= fb.height) continue;
+        const sy = o.y + @as(u32, @intCast(@divTrunc(oy * @as(i32, @intCast(emoji_atlas.cell_px)), box)));
+        var ox: i32 = 0;
+        while (ox < box) : (ox += 1) {
+            const px2 = it.x + ox;
+            if (px2 < 0 or px2 >= fb.width) continue;
+            const sx = o.x + @as(u32, @intCast(@divTrunc(ox * @as(i32, @intCast(emoji_atlas.cell_px)), box)));
+            const si = (@as(usize, sy) * emoji_atlas.sheet_w + sx) * 4;
+            const a: u32 = emoji_atlas.sheet_rgba[si + 3];
+            if (a == 0) continue;
+            const fg = (@as(u32, emoji_atlas.sheet_rgba[si]) << 16) |
+                (@as(u32, emoji_atlas.sheet_rgba[si + 1]) << 8) |
+                emoji_atlas.sheet_rgba[si + 2];
+            const idx = @as(usize, @intCast(py)) * @as(usize, @intCast(fb.width)) + @as(usize, @intCast(px2));
+            fb.pixels[idx] = blend(fg, fb.pixels[idx], a);
+        }
+    }
+}
+
 fn blend(fg: u32, bg: u32, a: u32) u32 {
     const inv = 255 - a;
     var out: u32 = 0xFF000000;

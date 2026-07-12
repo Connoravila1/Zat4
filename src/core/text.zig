@@ -35,6 +35,7 @@
 //! import it (D3 — the asset is an implementation detail of the engine).
 
 const std = @import("std");
+const emoji_atlas = @import("emoji_atlas.zig");
 const assert = std.debug.assert;
 const font = @import("font.zig");
 
@@ -305,6 +306,12 @@ fn glyphIndex(info: *const c.stbtt_fontinfo, cp: u32) c_int {
 /// Pen advance for one codepoint, in pixels. Table lookup + multiply —
 /// cheap enough that measurement needs no cache (G3).
 pub fn advance(e: *const Engine, weight: Weight, cp: u32, px: u32) u32 {
+    // Inline emoji advance as sprites, not glyphs — ONE rule shared with
+    // the draw path (emoji_atlas.advanceFor), so wraps, carets, and
+    // ellipses stay honest around them.
+    if (cp >= 0x2600 and cp <= 0x10FFFF) {
+        if (emoji_atlas.cellOf(@intCast(cp)) != null) return emoji_atlas.advanceFor(px);
+    }
     const info = face(e, weight);
     const gi = glyphIndex(info, cp);
     if (gi == 0) return 0;

@@ -37,6 +37,7 @@ const text = @import("text.zig");
 const raster = @import("raster.zig");
 const lens_socket = @import("lens_socket.zig");
 const kbd_lm = @import("kbd_lm.zig");
+const emoji_atlas = @import("emoji_atlas.zig");
 const create_flow = @import("create_flow.zig");
 const dev_flow = @import("dev_flow.zig");
 const zal_templates = @import("zal_templates.zig");
@@ -224,7 +225,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -389,6 +390,7 @@ fn fadeItems(dl: *raster.DrawList, from: usize, t: f32) void {
             .rect => |*r| r.color = fadeColor(r.color, t),
             .line => |*l| l.color = fadeColor(l.color, t),
             .tri => |*tr| tr.color = fadeColor(tr.color, t),
+            .emoji => {}, // sprites carry their own colors; the fade skips them
         }
         dl.set(i, item);
     }
@@ -842,6 +844,20 @@ fn bubbleTail(gpa: Allocator, dl: *raster.DrawList, mine: bool, bx: i32, by: i32
 
 /// One proportional glyph; returns the pen x after it.
 fn glyph1(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, weight: text.Weight, x: i32, baseline: i32, color: u32, px: u16, cp: u32) !i32 {
+    // Emoji ride the sprite atlas, not the font — same advance rule
+    // text.measure applies, so wrap and caret math already agree.
+    if (cp >= 0x2600 and cp <= 0x10FFFF) {
+        if (emoji_atlas.cellOf(@intCast(cp))) |cell| {
+            const box: i32 = @intCast(emoji_atlas.boxFor(px));
+            try dl.append(gpa, .{ .emoji = .{
+                .x = @intCast(x),
+                .y = @intCast(baseline - box + @divTrunc(box, 6)),
+                .px = @intCast(box),
+                .cell = @intCast(cell),
+            } });
+            return x + @as(i32, @intCast(emoji_atlas.advanceFor(px)));
+        }
+    }
     try dl.append(gpa, .{ .text = .{
         .x = @intCast(x),
         .baseline = @intCast(baseline),
@@ -1225,6 +1241,12 @@ pub fn transformDlRange(dl: *raster.DrawList, start: usize, end: usize, s: f32, 
                 t.y0 = clampI16(cy + (@as(f32, @floatFromInt(t.y0)) - cy) * s + dy);
                 t.y1 = clampI16(cy + (@as(f32, @floatFromInt(t.y1)) - cy) * s + dy);
                 t.y2 = clampI16(cy + (@as(f32, @floatFromInt(t.y2)) - cy) * s + dy);
+            },
+            .emoji => {
+                const em = &data[i].emoji;
+                em.x = clampI16(cx + (@as(f32, @floatFromInt(em.x)) - cx) * s + dx);
+                em.y = clampI16(cy + (@as(f32, @floatFromInt(em.y)) - cy) * s + dy);
+                em.px = clampU16(@as(f32, @floatFromInt(em.px)) * s);
             },
             .cell => {
                 const c = &data[i].cell;
@@ -1865,7 +1887,7 @@ pub fn kbdResolve(regions: []const Region, px: i32, py: i32, ctx: [2]u8) ?Region
     var best_score: f32 = 2.6 + 0.35; // reach bound, prior-inclusive
     for (regions) |r| {
         switch (r.kind) {
-            .kbd_key, .kbd_shift, .kbd_page, .kbd_backspace => {},
+            .kbd_key, .kbd_shift, .kbd_page, .kbd_backspace, .kbd_emoji => {},
             else => continue,
         }
         const cx = @as(f32, @floatFromInt(r.x)) + @as(f32, @floatFromInt(r.w)) * 0.5;
@@ -1972,6 +1994,10 @@ pub fn drawKeyboard(
     pop_on: bool,
     /// The open long-press popup (empty opts = closed).
     popup: KbdPopup,
+    /// The emoji picker: open replaces the key rows with a sprite grid;
+    /// `emoji_page` pages through the atlas 40 at a time.
+    emoji_open: bool,
+    emoji_page: u8,
 ) error{OutOfMemory}!void {
     const top = view_h - keyboard_h - bottom_inset;
     // The panel: opaque (nothing ghosts through chrome) with a faint wash.
@@ -2022,6 +2048,64 @@ pub fn drawKeyboard(
         try rect(gpa, dl, hx - 1 - tail, gy - 1, 3, 3, (0x3A << 24) | (accent & 0x00FFFFFF), 1);
         try rect(gpa, dl, hx - 1 - 2 * tail, gy - 1, 3, 3, (0x1C << 24) | (accent & 0x00FFFFFF), 1);
     };
+
+    // THE EMOJI PICKER: the key rows yield to an 8-wide sprite grid (40 per
+    // page); the bottom row becomes [abc][<][>][space][backspace]. Cells
+    // emit .kbd_emoji with the CELL INDEX (the dispatch maps it to its
+    // codepoint through the atlas — Region.post is u16, emoji aren't).
+    if (emoji_open) {
+        const grid_cols: i32 = 8;
+        const grid_rows: i32 = 5;
+        const cw = @divTrunc(row_w - (grid_cols - 1) * kbd_gap, grid_cols);
+        const ch = @divTrunc(4 * (kbd_key_h + kbd_gap) + kbd_key_h, grid_rows);
+        var gy2 = top + 8;
+        var ri: i32 = 0;
+        while (ri < grid_rows) : (ri += 1) {
+            var ci: i32 = 0;
+            while (ci < grid_cols) : (ci += 1) {
+                const cell_i: u32 = @as(u32, emoji_page) * 40 + @as(u32, @intCast(ri * grid_cols + ci));
+                if (cell_i >= emoji_atlas.count) break;
+                const cx2 = m + ci * (cw + kbd_gap);
+                const ebox: i32 = 34;
+                try dl.append(gpa, .{ .emoji = .{
+                    .x = @intCast(cx2 + @divTrunc(cw - ebox, 2)),
+                    .y = @intCast(gy2 + @divTrunc(ch - ebox, 2)),
+                    .px = @intCast(ebox),
+                    .cell = @intCast(cell_i),
+                } });
+                try emitRegion(gpa, regions, cx2, gy2, cw, @intCast(@min(ch, 32767)), @intCast(cell_i), .kbd_emoji);
+                ci += 0;
+            }
+            gy2 += ch + 2;
+        }
+        // The bottom control row.
+        const bot_y = top + 8 + 4 * (kbd_key_h + kbd_gap);
+        const Btn = struct { lab: []const u8, kind: Action, post: u16, w: i32 };
+        const btns = [_]Btn{
+            .{ .lab = "abc", .kind = .kbd_page, .post = 0, .w = 3 },
+            .{ .lab = "<", .kind = .kbd_page, .post = 10, .w = 2 },
+            .{ .lab = ">", .kind = .kbd_page, .post = 11, .w = 2 },
+            .{ .lab = "", .kind = .kbd_key, .post = ' ', .w = 8 },
+            .{ .lab = "\u{232B}", .kind = .kbd_backspace, .post = 0, .w = 3 },
+        };
+        var units2: i32 = 0;
+        for (btns) |bt| units2 += bt.w;
+        const bw_num = row_w - @as(i32, @intCast(btns.len - 1)) * kbd_gap;
+        var bx2 = m;
+        for (btns) |bt| {
+            const bw2 = @divTrunc(bw_num * bt.w, units2);
+            try rect(gpa, dl, bx2, bot_y, bw2, kbd_key_h + 2, 0x66000000, 9);
+            try rect(gpa, dl, bx2, bot_y, bw2, kbd_key_h, 0x26FFFFFF, 9);
+            if (bt.lab.len > 0) {
+                const gpx2: u16 = if (bt.lab.len > 2) 13 else 18;
+                const gw2: i32 = @intCast(text.measure(e, .regular, bt.lab, gpx2));
+                _ = try str(gpa, dl, e, .regular, bx2 + @divTrunc(bw2 - gw2, 2), bot_y + 33, ink, gpx2, bt.lab);
+            }
+            try emitRegion(gpa, regions, bx2, bot_y, bw2, @intCast(kbd_key_h + kbd_gap), bt.post, bt.kind);
+            bx2 += bw2 + kbd_gap;
+        }
+        return; // the picker replaces the rows entirely
+    }
 
     var pop_x: i32 = std.math.minInt(i32);
     var pop_w: i32 = 0;
@@ -5866,6 +5950,7 @@ pub fn rethemeRetro(gpa: Allocator, dl: *raster.DrawList, w: i32, h: i32, add_cl
     while (i < src.len) : (i += 1) {
         const item = src.get(i);
         switch (item) {
+            .emoji => try dl.append(gpa, item), // sprites pass through every retheme
             .rect => |r| {
                 const rw: i32 = r.w;
                 const rh: i32 = r.h;
