@@ -82,7 +82,118 @@ pub const cps = [_]u21{
     0x1F970, 0x1F971, 0x1F973, 0x1F974, 0x1F975, 0x1F976, 0x1F97A, 0x1F9D0, 0x1F9E1,
 };
 
+/// The picker's CATEGORIES, in display order: faces, hands, hearts,
+/// nature, activities, and everything else (objects/misc). Predicate
+/// ranges may cover codepoints the sheet doesn't carry — the builders
+/// only walk `cps`, so strangers cost nothing.
+fn isFace(cp: u21) bool {
+    return (cp >= 0x1F600 and cp <= 0x1F644) or // smileys + cat faces
+        (cp >= 0x1F910 and cp <= 0x1F917) or // zipper→hug (hands start 1F918)
+        (cp >= 0x1F920 and cp <= 0x1F92F) or // cowboy→exploding head
+        (cp >= 0x1F970 and cp <= 0x1F97A) or // hearts-smile→pleading
+        cp == 0x1F9D0; // monocle
+}
+fn isHand(cp: u21) bool {
+    return cp == 0x261D or (cp >= 0x270A and cp <= 0x270D) or
+        (cp >= 0x1F446 and cp <= 0x1F450) or cp == 0x1F4AA or
+        cp == 0x1F590 or cp == 0x1F595 or cp == 0x1F596 or
+        cp == 0x1F64C or cp == 0x1F64F or cp == 0x1F90C or cp == 0x1F90F or
+        (cp >= 0x1F918 and cp <= 0x1F91F) or cp == 0x1F932;
+}
+fn isHeart(cp: u21) bool {
+    return cp == 0x2763 or cp == 0x2764 or (cp >= 0x1F493 and cp <= 0x1F49E) or
+        cp == 0x1F5A4 or cp == 0x1F90D or cp == 0x1F90E or cp == 0x1F9E1;
+}
+fn isNature(cp: u21) bool {
+    return cp == 0x2600 or cp == 0x26A1 or cp == 0x26C5 or cp == 0x26C8 or
+        cp == 0x2728 or cp == 0x2744 or cp == 0x1F308 or cp == 0x1F30D or
+        cp == 0x1F319 or cp == 0x1F31F or cp == 0x1F327 or cp == 0x1F525;
+}
+fn isActivity(cp: u21) bool {
+    return cp == 0x26BD or cp == 0x26BE or (cp >= 0x1F3A4 and cp <= 0x1F3C8) or
+        cp == 0x1F388 or cp == 0x1F389 or (cp >= 0x1F947 and cp <= 0x1F949);
+}
+
+/// A codepoint's category — the FIRST matching predicate; anything
+/// unmatched is objects/misc (the last tab).
+fn catOf(cp: u21) u8 {
+    if (isFace(cp)) return 0;
+    if (isHand(cp)) return 1;
+    if (isHeart(cp)) return 2;
+    if (isNature(cp)) return 3;
+    if (isActivity(cp)) return 4;
+    return 5;
+}
+
+pub const category_count: usize = 6;
+/// One representative codepoint per category — the nav rollout's icons.
+/// Every entry is IN the sheet (pinned by the test below).
+pub const cat_icons = [category_count]u21{ 0x1F600, 0x1F44D, 0x2764, 0x2600, 0x26BD, 0x1F48E };
+
+/// The PICKER's display order: category-blocked (faces lead), codepoint
+/// order within each block. `display[i]` is the atlas CELL at picker
+/// slot `i`. The `cps` table itself stays sorted — `cellOf`'s binary
+/// search and the render path never see this permutation.
+pub const display: [count]u16 = blk: {
+    @setEvalBranchQuota(20000);
+    var out: [count]u16 = undefined;
+    var n: usize = 0;
+    var cat: u8 = 0;
+    while (cat < category_count) : (cat += 1) {
+        for (cps, 0..) |c, i| {
+            if (catOf(c) == cat) {
+                out[n] = i;
+                n += 1;
+            }
+        }
+    }
+    break :blk out;
+};
+
+/// Where each category starts in `display` — the nav's jump targets.
+pub const cat_starts: [category_count]u16 = blk: {
+    @setEvalBranchQuota(20000);
+    var out: [category_count]u16 = undefined;
+    var n: u16 = 0;
+    var cat: u8 = 0;
+    while (cat < category_count) : (cat += 1) {
+        out[cat] = n;
+        for (cps) |c| {
+            if (catOf(c) == cat) n += 1;
+        }
+    }
+    break :blk out;
+};
+
 const std = @import("std");
+
+test "emoji atlas: display order is a permutation, categories are blocks" {
+    var seen = [_]bool{false} ** count;
+    for (display) |cell| {
+        try std.testing.expect(cell < count);
+        try std.testing.expect(!seen[cell]);
+        seen[cell] = true;
+    }
+    // The first slot is the grinning face, not the codepoint-order sun.
+    try std.testing.expectEqual(@as(u21, 0x1F600), cps[display[0]]);
+    // Categories never interleave: catOf is nondecreasing across display.
+    var prev: u8 = 0;
+    for (display) |cell| {
+        const c = catOf(cps[cell]);
+        try std.testing.expect(c >= prev);
+        prev = c;
+    }
+    // cat_starts point at the first slot of each category (or the end of
+    // the previous block when a category is empty), and every nav icon is
+    // a codepoint the sheet actually carries.
+    try std.testing.expectEqual(@as(u16, 0), cat_starts[0]);
+    for (cat_starts, 0..) |s, cat| {
+        try std.testing.expect(s <= count);
+        if (s < count and catOf(cps[display[s]]) == cat)
+            try std.testing.expect(s == 0 or catOf(cps[display[s - 1]]) < cat);
+    }
+    for (cat_icons) |ic| try std.testing.expect(cellOf(ic) != null);
+}
 
 test "emoji atlas: lookup finds every baked codepoint, misses strangers" {
     for (cps, 0..) |c, i| {

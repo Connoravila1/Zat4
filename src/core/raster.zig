@@ -155,10 +155,17 @@ pub const EmojiItem = struct {
     y: i16,
     px: u16,
     cell: u16,
+    /// Vertical crop in BOX pixels off the top/bottom edge — the emoji
+    /// picker scrolls in sub-row steps, so edge rows render partially
+    /// (a hard viewport clip). Zero for inline text emoji.
+    crop_top: u8 = 0,
+    crop_bot: u8 = 0,
 
     comptime {
-        // Budget: 8 exact — half the union's payload (A7).
-        assert(@sizeOf(EmojiItem) == 8);
+        // Budget: 10 — the 8-byte sprite + the two crop bytes (A7.1: the
+        // scrolling picker needs viewport clipping; still inside the
+        // union's 16-byte payload, so the DrawItem guard is untouched).
+        assert(@sizeOf(EmojiItem) == 10);
     }
 };
 
@@ -410,8 +417,9 @@ fn drawCell(fb: *Framebuffer, px: u32, py: u32, codepoint: u32, fg: u32, bg: u32
 fn drawEmoji(fb: *Framebuffer, it: EmojiItem) void {
     const o = emoji_atlas.cellOrigin(it.cell);
     const box: i32 = it.px;
-    var oy: i32 = 0;
-    while (oy < box) : (oy += 1) {
+    var oy: i32 = @min(@as(i32, it.crop_top), box);
+    const oy_end: i32 = @max(oy, box - @as(i32, it.crop_bot));
+    while (oy < oy_end) : (oy += 1) {
         const py = it.y + oy;
         if (py < 0 or py >= fb.height) continue;
         const sy = o.y + @as(u32, @intCast(@divTrunc(oy * @as(i32, @intCast(emoji_atlas.cell_px)), box)));

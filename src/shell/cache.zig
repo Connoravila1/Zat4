@@ -423,6 +423,32 @@ pub fn saveLibrary(gpa: Allocator, environ: ?*const std.process.Environ.Map, lib
 }
 
 // ---------------------------------------------------------------------------
+// Keyboard prefs — the emoji picker's last SECTION (one byte: '0' emoji /
+// '1' GIFs), so the emoji key reopens where the user lives. Absent or
+// unreadable = the emoji default; a lost write is next tap's problem (E4).
+// ---------------------------------------------------------------------------
+
+const kbd_prefs_file = "kbd_prefs.txt";
+
+pub fn loadKbdSection(gpa: Allocator, environ: ?*const std.process.Environ.Map) u8 {
+    var dir_buf: [512]u8 = undefined;
+    var path_buf: [512]u8 = undefined;
+    const dir = cacheDir(&dir_buf, environ) orelse return 0;
+    const path = joinFile(&path_buf, dir, kbd_prefs_file) orelse return 0;
+    const bytes = readFileAlloc(gpa, path) orelse return 0;
+    defer gpa.free(bytes);
+    return if (bytes.len >= 1 and bytes[0] == '1') 1 else 0;
+}
+
+pub fn saveKbdSection(environ: ?*const std.process.Environ.Map, section: u8) bool {
+    var dir_buf: [512]u8 = undefined;
+    var path_buf: [512]u8 = undefined;
+    const dir = cacheDir(&dir_buf, environ) orelse return false;
+    const path = joinFile(&path_buf, dir, kbd_prefs_file) orelse return false;
+    return writeFileAtomic(path, if (section == 1) "1" else "0", 0o644);
+}
+
+// ---------------------------------------------------------------------------
 // Zone pins — the viewer's kept zones, one tag per line (core/zone_pins.zig
 // owns what the bytes mean; this is only the path + fd work)
 // ---------------------------------------------------------------------------

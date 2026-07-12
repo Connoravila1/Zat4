@@ -877,16 +877,25 @@ pub fn buildVertices(
         .emoji => {
             const it = bare.emoji;
             const o = emoji_atlas.cellOrigin(it.cell);
+            // Vertical crop (the scrolling picker's viewport clip): shave
+            // the quad's top/bottom in box space and the V range with it,
+            // so the visible slice samples exactly its share of the cell.
+            const box: f32 = @floatFromInt(it.px);
+            const ct: f32 = @min(@as(f32, @floatFromInt(it.crop_top)), box);
+            const cb: f32 = @min(@as(f32, @floatFromInt(it.crop_bot)), box - ct);
+            if (box - ct - cb <= 0) continue;
             const dx: f32 = @as(f32, @floatFromInt(it.x)) * scale;
-            const dy: f32 = @as(f32, @floatFromInt(it.y)) * scale;
-            const bw: f32 = @as(f32, @floatFromInt(it.px)) * scale;
+            const dy: f32 = (@as(f32, @floatFromInt(it.y)) + ct) * scale;
+            const bw: f32 = box * scale;
+            const bh: f32 = (box - ct - cb) * scale;
             const ew: f32 = 1.0 / @as(f32, @floatFromInt(emoji_atlas.sheet_w));
             const eh: f32 = 1.0 / @as(f32, @floatFromInt(emoji_atlas.sheet_h));
+            const cell_f: f32 = @floatFromInt(emoji_atlas.cell_px);
             const ua: f32 = @as(f32, @floatFromInt(o.x)) * ew;
-            const va: f32 = @as(f32, @floatFromInt(o.y)) * eh;
+            const va: f32 = (@as(f32, @floatFromInt(o.y)) + ct / box * cell_f) * eh;
             const ub: f32 = @as(f32, @floatFromInt(o.x + emoji_atlas.cell_px)) * ew;
-            const vb: f32 = @as(f32, @floatFromInt(o.y + emoji_atlas.cell_px)) * eh;
-            const p = [4][2]f32{ .{ dx, dy }, .{ dx + bw, dy }, .{ dx + bw, dy + bw }, .{ dx, dy + bw } };
+            const vb: f32 = (@as(f32, @floatFromInt(o.y)) + (box - cb) / box * cell_f) * eh;
+            const p = [4][2]f32{ .{ dx, dy }, .{ dx + bw, dy }, .{ dx + bw, dy + bh }, .{ dx, dy + bh } };
             const uv = [4][2]f32{ .{ ua, va }, .{ ub, va }, .{ ub, vb }, .{ ua, vb } };
             try pushQuad(&verts, gpa, p, uv, zero_local, .{ 0, 0 }, 0, mode_emoji, .{ 1, 1, 1, 1 });
         },

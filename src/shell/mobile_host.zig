@@ -158,8 +158,38 @@ pub const MobileHost = struct {
     /// spends the release tap once that fires.
     input_press: bool = false,
     input_lp: bool = false,
+    /// The press began on a SELECTION HANDLE (0 none / 1 = the start /
+    /// 2 = the end): the gesture is a handle drag for its whole life —
+    /// never a scroll, never a tap. Ends swap mid-drag when they cross.
+    chat_hnd: u8 = 0,
     /// The previous slide sample (velocity for the glide's step tuning).
     kbd_nav_fx: f32 = 0,
+    /// The press began on an emoji-picker CELL — the one keyboard press
+    /// that is NOT press-commit: a vertical slide past the slop scrolls
+    /// the grid, a clean release commits the emoji. `cand` is cell+1
+    /// (0 = none); `drag` latches the press as a scroll; `scroll0` is the
+    /// picker offset at touch-down; `v` is the release fling (logical
+    /// px/frame, the feed's momentum idiom).
+    kbd_emoji_cand: u16 = 0,
+    kbd_emoji_drag: bool = false,
+    kbd_emoji_scroll0: f32 = 0,
+    kbd_emoji_v: f32 = 0,
+    /// The press began on a NAV ROLLOUT entry (cand = post+1, so the GIF
+    /// entry's 255 rides as 256; 0 = none): commit waits for the release —
+    /// a vertical slide past the slop rubber-bands the column instead
+    /// (`raw` = raw finger travel; the shell maps it through the band).
+    kbd_nav_cand: u16 = 0,
+    kbd_nav_drag: bool = false,
+    kbd_nav_raw: f32 = 0,
+    /// TEMPORARY typo-gap instrumentation (2026-07-12): the pressed key's
+    /// codepoint + rect, so the release can log the down/up offset pair
+    /// (finger roll) for the owner's keylog analysis. Strip after the
+    /// verdict, like the latency keylog before it.
+    kt_cp: u16 = 0,
+    kt_kx: i32 = 0,
+    kt_ky: i32 = 0,
+    kt_kw: i32 = 0,
+    kt_kh: i32 = 0,
     /// The char key this press committed at touch-down (0 = none): sliding
     /// off it before lifting UNDOES the char (slide-off cancel).
     kbd_press_cp: u16 = 0,
