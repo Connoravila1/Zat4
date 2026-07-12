@@ -1975,13 +1975,54 @@ pub fn drawKeyboard(
             },
         }
         const keys = keys_buf[0..nk];
-        var units: i32 = 0;
-        for (keys) |k| units += k.w;
-        const kw_num = row_w - @as(i32, @intCast(nk - 1)) * kbd_gap; // total key width
+        // UNIFORM LETTER WIDTH (the muscle-memory fix, owner 2026-07-11):
+        // every char key on rows 0–3 is exactly one tenth of the row — the
+        // 9-key home row and shorter mids INSET and centre instead of
+        // stretching, so each key's centre sits where a standard keyboard
+        // put it. Shift/backspace absorb the row-3 margins; the bottom row
+        // keeps its flex layout.
+        const unit_kw = @divTrunc(row_w - 9 * kbd_gap, 10);
+        var kx_buf: [12]i32 = undefined;
+        var kww_buf: [12]i32 = undefined;
+        if (row_i == 4) {
+            var units: i32 = 0;
+            for (keys) |k| units += k.w;
+            const kw_num = row_w - @as(i32, @intCast(nk - 1)) * kbd_gap;
+            var xx = m;
+            for (keys, 0..) |k, kidx| {
+                kx_buf[kidx] = xx;
+                kww_buf[kidx] = @divTrunc(kw_num * k.w, units);
+                xx += kww_buf[kidx] + kbd_gap;
+            }
+        } else if (row_i == 3) {
+            const n_mid: i32 = @intCast(nk - 2);
+            const mid_total = n_mid * unit_kw + (n_mid - 1) * kbd_gap;
+            const mid_x0 = m + @divTrunc(row_w - mid_total, 2);
+            kx_buf[0] = m;
+            kww_buf[0] = mid_x0 - kbd_gap - m;
+            var xx = mid_x0;
+            var kidx: usize = 1;
+            while (kidx < nk - 1) : (kidx += 1) {
+                kx_buf[kidx] = xx;
+                kww_buf[kidx] = unit_kw;
+                xx += unit_kw + kbd_gap;
+            }
+            kx_buf[nk - 1] = xx;
+            kww_buf[nk - 1] = m + row_w - xx;
+        } else {
+            const nk_i: i32 = @intCast(nk);
+            const total = nk_i * unit_kw + (nk_i - 1) * kbd_gap;
+            var xx = m + @divTrunc(row_w - total, 2);
+            for (0..nk) |kidx| {
+                kx_buf[kidx] = xx;
+                kww_buf[kidx] = unit_kw;
+                xx += unit_kw + kbd_gap;
+            }
+        }
         const hg = @divTrunc(kbd_gap, 2);
-        var x = m;
         for (keys, 0..) |k, ki| {
-            const kw = @divTrunc(kw_num * k.w, units);
+            const x = kx_buf[ki];
+            const kw = kww_buf[ki];
             // Vertical circuit trace in the gutter left of this key.
             if (ki > 0) {
                 const gx = x - @divTrunc(kbd_gap + 1, 2);
@@ -2073,7 +2114,6 @@ pub fn drawKeyboard(
                 _ = try str(gpa, dl, e, .regular, x + @divTrunc(kw - gw, 2), y + 34, ink, 19, gb[0..gn]);
                 try emitRegion(gpa, regions, rx0, ry0, rx1 - rx0, @intCast(@min(ry1 - ry0, 32767)), cp, .kbd_key);
             }
-            x += kw + kbd_gap;
         }
         y += kbd_key_h + kbd_gap;
     }
