@@ -3020,6 +3020,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         // finger — two-thumb typing stops dropping the
                         // second key (the recorded single-pointer limit).
                         if (tev.button == 2) {
+                            m.kbd_multi = true; // renumbering ahead: slides stand down
                             if (if (pix) |gv| gv.kbd_visible else false) {
                                 if (rs.gpu_state) |*gsd| {
                                     const ax: i32 = @intFromFloat(@as(f32, @floatFromInt(tev.x)) / gsd.scale);
@@ -3061,6 +3062,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         m.press_in_kbd = false;
                         m.kbd_bs_repeats = 0;
                         m.kbd_press_cp = 0;
+                        m.kbd_multi = false;
                         if (if (pix) |gv| gv.kbd_visible else false) {
                             if (rs.gpu_state) |*gsd| {
                                 const klx: i32 = @intFromFloat(@as(f32, @floatFromInt(tev.x)) / gsd.scale);
@@ -3077,14 +3079,19 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                     // logical px above the touch centroid.
                                     if (feed_view.hitTest(rs.gregions.items, klx, kly - kbd_touch_bias_y)) |kh| switch (kh.kind) {
                                         .kbd_key => if (kh.post == ' ') {
-                                            // Space commits on RELEASE — a held
-                                            // space is the caret slide (.move).
+                                            // Space commits at DOWN like every
+                                            // key — commit-on-release made it
+                                            // land AFTER the next letter in
+                                            // overlapped typing ("ab " for
+                                            // "a b", the wrong-order report,
+                                            // 2026-07-11). A caret slide that
+                                            // engages UNDOES it (.move).
+                                            kbdAction(rs, gpa, .kbd_key, ' ');
+                                            if (toggleOn(rs.toggle_bits, settings_view.act_kbd_haptic)) m.haptic_pending = 1;
                                             m.kbd_space_down = true;
                                             m.kbd_nav = false;
                                             m.kbd_nav_x = @as(f32, @floatFromInt(tev.x)) / gsd.scale;
                                             m.kbd_nav_fx = m.kbd_nav_x;
-                                            rs.kbd_flash_key = ' ';
-                                            rs.kbd_flash_ns = clock_shell.monotonicNanos();
                                         } else {
                                             kbdAction(rs, gpa, kh.kind, kh.post);
                                             // Arm slide-off cancel + the long-
@@ -3141,7 +3148,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         // backspace), kill its flash. The standard escape
                         // hatch press-commit otherwise loses.
                         if (m.press_in_kbd and m.kbd_press_cp != 0 and rs.kbd_popup_kind == 0 and
-                            (now_ms -% m.down_ms) > 120)
+                            !m.kbd_multi and (now_ms -% m.down_ms) > 120)
                         {
                             const cdx = @abs(@as(f32, @floatFromInt(@as(i32, tev.x) - m.down_x))) / scale;
                             const cdy = @abs(@as(f32, @floatFromInt(@as(i32, tev.y) - m.down_y))) / scale;
@@ -3163,11 +3170,13 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         // walks the caret — arrow escapes ride the same byte
                         // stream typed keys do (~14 logical px per step).
                         // Engaging eats the pending space.
-                        if (m.kbd_space_down) {
+                        if (m.kbd_space_down and !m.kbd_multi) {
                             const fx = @as(f32, @floatFromInt(tev.x)) / scale;
                             if (!m.kbd_nav and @abs(fx - m.kbd_nav_x) > 10) {
                                 m.kbd_nav = true;
                                 m.kbd_nav_x = fx;
+                                // The slide eats the space it pre-committed.
+                                rs.kbd_bytes.append(gpa, 8) catch {};
                             }
                             if (m.kbd_nav) {
                                 // Velocity-tuned: a slow slide steps every
@@ -3338,6 +3347,9 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         }
                     },
                     .button_up => {
+                        // An aux finger lifting is bookkeeping only — its key
+                        // already committed at its down.
+                        if (tev.button == 2) continue;
                         // The long-press popup commits on release: the cell
                         // under the finger types its remainder (the sigil is
                         // already in the draft); off every cell = cancel.
@@ -3356,16 +3368,11 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             rs.kbd_flash_ns = clock_shell.monotonicNanos();
                         }
                         m.kbd_press_cp = 0;
-                        // A space release: a clean tap TYPES the space; an
-                        // engaged caret slide already did its work.
-                        if (m.kbd_space_down) {
-                            if (!m.kbd_nav) {
-                                kbdAction(rs, gpa, .kbd_key, ' ');
-                                if (toggleOn(rs.toggle_bits, settings_view.act_kbd_haptic)) m.haptic_pending = 1;
-                            }
-                            m.kbd_space_down = false;
-                            m.kbd_nav = false;
-                        }
+                        // Space already committed at down; release just ends
+                        // the slide state.
+                        m.kbd_space_down = false;
+                        m.kbd_nav = false;
+                        m.kbd_multi = false; // the gesture fully ended
                         if (m.hold_fired) {
                             // A press-and-hold drag ends. A LIBRARY card drops onto the
                             // socket under the finger (benchDrop hit-tests all three;
@@ -3493,6 +3500,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     m.touch_cancel = false;
                     m.kbd_space_down = false;
                     m.kbd_nav = false;
+                    m.kbd_multi = false;
                     m.kbd_press_cp = 0;
                     rs.kbd_popup_kind = 0;
                     rs.kbd_popup_n = 0;
@@ -8224,6 +8232,12 @@ fn chatStartCompose(
 /// never fires twice). Queues bytes for the next frame's input stream and
 /// stamps the press flash.
 fn kbdAction(rs: *RunState, gpa: Allocator, kind: feed_view.Action, post: u16) void {
+    // TEMPORARY keylog for the fast-typing investigation (owner reads it
+    // via `adb logcat -s zat4`): every commit, in byte-stream order, with
+    // a monotonic stamp. Flip off after the verdict.
+    const debug_keylog = true;
+    if (debug_keylog and kind == .kbd_key and post != 0)
+        mobile_host.logcat("key: {u} +{d}ms", .{ @as(u21, post), clock_shell.monotonicNanos() / 1_000_000 % 100_000 });
     switch (kind) {
         .kbd_key => {
             if (post == 0) { // the dead emoji key: flash only, no byte (yet)

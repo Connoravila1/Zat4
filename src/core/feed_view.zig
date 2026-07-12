@@ -1988,7 +1988,11 @@ pub fn drawKeyboard(
                 try rect(gpa, dl, gx, y, 1, kbd_key_h, (0x1E << 24) | (accent & 0x00FFFFFF), 0);
             }
             const active_ctrl = (k.ctrl == 1 and (shift or caps)) or (k.ctrl == 3 and k.lo == 0 and page != 0);
-            const fill: u32 = if (active_ctrl) (0x50 << 24) | (accent & 0x00FFFFFF) else 0x1CFFFFFF;
+            // The iOS lesson (owner's reference, 2026-07-11): the premium
+            // read is CONTRAST + DEPTH, not size — a lighter key face over
+            // the dark board, seated on a darker under-edge.
+            const fill: u32 = if (active_ctrl) (0x50 << 24) | (accent & 0x00FFFFFF) else 0x26FFFFFF;
+            try rect(gpa, dl, x, y, kw, kbd_key_h + 2, 0x66000000, 9); // the seat: a 2px lip below the face
             try rect(gpa, dl, x, y, kw, kbd_key_h, fill, 9);
             // Press feedback: the last-tapped key glows accent and fades
             // (the shell decays flash_a). Char keys match either case —

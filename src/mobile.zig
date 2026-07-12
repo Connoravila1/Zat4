@@ -262,12 +262,12 @@ fn touch(ctx: *Ctx, kind: u32, x_px: f32, y_px: f32) void {
                 .kind = switch (kind) {
                     0, 5 => .button_down, // 5 = a SECOND finger (aux pointer)
                     1 => .move,
-                    2 => .button_up,
+                    2, 6 => .button_up, // 6 = a non-last finger lifted
                     else => return,
                 },
                 // Button 2 marks the aux pointer: the pump press-commits its
                 // keyboard key and leaves the gesture machine to the primary.
-                .button = if (kind == 5) 2 else 1,
+                .button = if (kind == 5 or kind == 6) 2 else 1,
                 .mods = 0,
                 ._pad = 0,
             };

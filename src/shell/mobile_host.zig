@@ -147,6 +147,12 @@ pub const MobileHost = struct {
     kbd_space_down: bool = false,
     kbd_nav: bool = false,
     kbd_nav_x: f32 = 0,
+    /// A second finger has joined this gesture: Android RENUMBERS pointers
+    /// when one lifts, so the surviving finger's moves get attributed to the
+    /// dead finger's press — a phantom jump. While latched, every slide
+    /// interpretation (slide-off cancel, the space glide) stands down; two
+    /// thumbs typing means no slides. Cleared when the gesture fully ends.
+    kbd_multi: bool = false,
     /// The previous slide sample (velocity for the glide's step tuning).
     kbd_nav_fx: f32 = 0,
     /// The char key this press committed at touch-down (0 = none): sliding
