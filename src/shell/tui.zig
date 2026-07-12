@@ -3161,6 +3161,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                 rs.kbd_bytes.append(gpa, 8) catch {};
                                 rs.kbd_flash_key = 0;
                                 rs.kbd_flash_held = false;
+                                rs.kbd_dirty = true;
                                 m.kbd_press_cp = 0;
                             }
                         }
@@ -3372,10 +3373,14 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             rs.kbd_popup_sel = -1;
                             rs.kbd_dirty = true;
                         }
-                        // Release lets a HELD pop begin its fade.
+                        // Release lets a HELD pop VANISH — backdated past the
+                        // attack window so the fade starts falling now, and
+                        // dirty so the off-edge paints THIS tick (it was one
+                        // frame late; under spam the pop never visibly fell).
                         if (rs.kbd_flash_held) {
                             rs.kbd_flash_held = false;
-                            rs.kbd_flash_ns = clock_shell.monotonicNanos();
+                            rs.kbd_flash_ns = clock_shell.monotonicNanos() -| 25_000_000;
+                            rs.kbd_dirty = true;
                         }
                         m.kbd_press_cp = 0;
                         // Space already committed at down; release just ends
@@ -8409,14 +8414,17 @@ fn kbdFlashAlpha(rs: *const RunState) u8 {
     const age = clock_shell.monotonicNanos() -| rs.kbd_flash_ns;
     // A full-bright ATTACK (~2 frames) then a fast fall — the snap is what
     // reads as crispness; a slow even fade read as lag.
-    const attack: u64 = 35_000_000;
-    const dur: u64 = 120_000_000;
+    // Held = full; release = a ~2-frame vanish. The platform keyboards'
+    // spam test (owner, 2026-07-12): spamming a key must BLINK the pop per
+    // press — a slow fade reads as a frozen pop, i.e. wasted frames.
+    const attack: u64 = 25_000_000;
+    const dur: u64 = 60_000_000;
     if (rs.kbd_flash_held) return 190; // held: the pop stays until release
     if (age < attack) return 190;
     if (age >= dur) return 0;
-    // Quantized to 16 levels: each level is one vert rebuild, not each frame.
+    // Quantized: each level is one vert rebuild, not each frame.
     const a: u8 = @intCast(190 - (age - attack) * 190 / (dur - attack));
-    return a & 0xF0;
+    return a & 0xE0;
 }
 
 /// M2.1: keep the relay subscribed to every mailbox we currently drain —
