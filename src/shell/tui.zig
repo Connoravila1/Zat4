@@ -3030,7 +3030,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                 if (rs.gpu_state) |*gsd| {
                                     const ax: i32 = @intFromFloat(@as(f32, @floatFromInt(tev.x)) / gsd.scale);
                                     const ay: i32 = @intFromFloat(@as(f32, @floatFromInt(tev.y)) / gsd.scale);
-                                    if (feed_view.hitTest(rs.gregions.items, ax, ay - kbd_touch_bias_y)) |kh| switch (kh.kind) {
+                                    if (feed_view.kbdResolve(rs.gregions.items, ax, ay - kbd_touch_bias_y)) |kh| switch (kh.kind) {
                                         // A second-thumb space types plainly
                                         // (no caret slide from an aux finger).
                                         .kbd_key, .kbd_shift, .kbd_page, .kbd_backspace => {
@@ -3083,7 +3083,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                     // a key never fires twice.
                                     // Thumbs land LOW: resolve the key a few
                                     // logical px above the touch centroid.
-                                    if (feed_view.hitTest(rs.gregions.items, klx, kly - kbd_touch_bias_y)) |kh| switch (kh.kind) {
+                                    if (feed_view.kbdResolve(rs.gregions.items, klx, kly - kbd_touch_bias_y)) |kh| switch (kh.kind) {
                                         .kbd_key => if (kh.post == ' ') {
                                             // Space commits at DOWN like every
                                             // key — commit-on-release made it

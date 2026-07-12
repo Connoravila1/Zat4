@@ -1767,6 +1767,35 @@ const kbd_x2_mid = kbdRowStr("$-'\"/:;!", "$-'\"/:;!");
 // wants numbers one tap away while the symbols pages keep their own runs.
 const kbd_num = kbdRowStr("123456789", "123456789");
 
+/// TAP-MODEL v1 (the forgiveness layer, measured 2026-07-12): a touch is
+/// scored against every key's CENTRE, normalised by that key's extents —
+/// not clipped by hard rectangles. A press near a boundary resolves to the
+/// key the finger was closest to at that key's own scale (wide keys are
+/// proportionally tolerant, so space keeps its edges). Pure; the pump
+/// calls this instead of raw hitTest for keyboard presses.
+pub fn kbdResolve(regions: []const Region, px: i32, py: i32) ?Region {
+    var best: ?Region = null;
+    var best_score: f32 = 2.6; // beyond ~1.6 key-radii: no key claimed
+    for (regions) |r| {
+        switch (r.kind) {
+            .kbd_key, .kbd_shift, .kbd_page, .kbd_backspace => {},
+            else => continue,
+        }
+        const cx = @as(f32, @floatFromInt(r.x)) + @as(f32, @floatFromInt(r.w)) * 0.5;
+        const cy = @as(f32, @floatFromInt(r.y)) + @as(f32, @floatFromInt(r.h)) * 0.5;
+        const hw = @max(1.0, @as(f32, @floatFromInt(r.w)) * 0.5);
+        const hh = @max(1.0, @as(f32, @floatFromInt(r.h)) * 0.5);
+        const dx = (@as(f32, @floatFromInt(px)) - cx) / hw;
+        const dy = (@as(f32, @floatFromInt(py)) - cy) / hh;
+        const score = dx * dx + dy * dy;
+        if (score < best_score) {
+            best_score = score;
+            best = r;
+        }
+    }
+    return best;
+}
+
 /// The Zat4 keyboard's LONG-PRESS popup: an option strip riding above its
 /// anchor key (₿ acts directly; @ offers recent conversation handles, #
 /// offers pinned zones — the keyboard IS the app, so app-aware alternates
