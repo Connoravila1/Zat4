@@ -569,6 +569,21 @@ const RunState = struct {
     kbd_shift_ns: u64,
     kbd_flash_key: u16,
     kbd_flash_ns: u64,
+    /// The flash's key is still under a finger: the pop and glow HOLD at
+    /// full until release starts the decay (kbd_flash_ns is re-stamped
+    /// at release).
+    kbd_flash_held: bool,
+    /// The long-press popup: 0 closed / 1 @-handles / 2 #-zones. Options
+    /// are copied into the fixed bufs; `kbd_popup_opts` slices into them
+    /// (RunState never moves). The anchor is the pressed key's region.
+    kbd_popup_kind: u8,
+    kbd_popup_n: usize,
+    kbd_popup_bufs: [4][64]u8,
+    kbd_popup_opts: [4][]const u8,
+    kbd_popup_ax: i32,
+    kbd_popup_ay: i32,
+    kbd_popup_aw: i32,
+    kbd_popup_sel: i32,
     kbd_bytes: std.ArrayList(u8),
     // Double-back-to-exit: the deadline (monotonic ns) until which a second
     // system-back at the root minimizes; the nav tile shows the hint pill.
@@ -1118,6 +1133,15 @@ fn initRunState(
     rs.kbd_shift_ns = 0;
     rs.kbd_flash_key = 0;
     rs.kbd_flash_ns = 0;
+    rs.kbd_flash_held = false;
+    rs.kbd_popup_kind = 0;
+    rs.kbd_popup_n = 0;
+    rs.kbd_popup_bufs = undefined;
+    rs.kbd_popup_opts = undefined;
+    rs.kbd_popup_ax = 0;
+    rs.kbd_popup_ay = 0;
+    rs.kbd_popup_aw = 0;
+    rs.kbd_popup_sel = -1;
     rs.kbd_bytes = .empty;
     rs.gpub_confirm = null;
     rs.gdocs_kind = 0;
@@ -2767,7 +2791,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .market_q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .market_q_focus = rs.gmarket_q_focus, .market_loading = rs.market_loading, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .kbd_visible = toggleOn(rs.toggle_bits, settings_view.act_zat_kbd) and typingOwnsKeyboard(rs), .kbd_shift = rs.kbd_shift, .kbd_page = rs.kbd_page, .kbd_caps = rs.kbd_caps, .kbd_flash_key = rs.kbd_flash_key, .kbd_flash_a = kbdFlashAlpha(rs), .chat_q = rs.gchat_q_buf[0..rs.gchat_q_len], .chat_q_focus = rs.gchat_q_focus, .chat_q_caret = composeBlinkOn(rs.caret_anchor_ns), .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_caret = @min(rs.gchat_caret, rs.gchat_draft_len), .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
+        const pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .market_q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .market_q_focus = rs.gmarket_q_focus, .market_loading = rs.market_loading, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .kbd_visible = toggleOn(rs.toggle_bits, settings_view.act_zat_kbd) and typingOwnsKeyboard(rs), .kbd_shift = rs.kbd_shift, .kbd_page = rs.kbd_page, .kbd_caps = rs.kbd_caps, .kbd_flash_key = rs.kbd_flash_key, .kbd_flash_a = kbdFlashAlpha(rs), .kbd_popup = .{ .opts = rs.kbd_popup_opts[0..rs.kbd_popup_n], .anchor_x = rs.kbd_popup_ax, .anchor_y = rs.kbd_popup_ay, .anchor_w = rs.kbd_popup_aw, .sel = rs.kbd_popup_sel }, .chat_q = rs.gchat_q_buf[0..rs.gchat_q_len], .chat_q_focus = rs.gchat_q_focus, .chat_q_caret = composeBlinkOn(rs.caret_anchor_ns), .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_caret = @min(rs.gchat_caret, rs.gchat_draft_len), .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .confirm = rs.gpay_confirm, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
         switch (rs.mode) {
             .timeline => try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status),
             .compose => {
@@ -3062,9 +3086,14 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                             rs.kbd_flash_ns = clock_shell.monotonicNanos();
                                         } else {
                                             kbdAction(rs, gpa, kh.kind, kh.post);
-                                            // Arm slide-off cancel: leave the key
-                                            // before lifting and the char undoes.
+                                            // Arm slide-off cancel + the long-
+                                            // press anchor: the popup rides
+                                            // this key's region.
                                             m.kbd_press_cp = kh.post;
+                                            m.kbd_press_x = kh.x;
+                                            m.kbd_press_y = kh.y;
+                                            m.kbd_press_w = kh.w;
+                                            rs.kbd_flash_held = true;
                                             if (toggleOn(rs.toggle_bits, settings_view.act_kbd_haptic)) m.haptic_pending = 1;
                                         },
                                         .kbd_shift, .kbd_page, .kbd_backspace => {
@@ -3110,15 +3139,22 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         // committed before lifting — undo the char (one
                         // backspace), kill its flash. The standard escape
                         // hatch press-commit otherwise loses.
-                        if (m.press_in_kbd and m.kbd_press_cp != 0) {
+                        if (m.press_in_kbd and m.kbd_press_cp != 0 and rs.kbd_popup_kind == 0) {
                             const cdx = @abs(@as(f32, @floatFromInt(@as(i32, tev.x) - m.down_x))) / scale;
                             const cdy = @abs(@as(f32, @floatFromInt(@as(i32, tev.y) - m.down_y))) / scale;
                             if (cdx > 30 or cdy > 34) {
                                 rs.kbd_bytes.append(gpa, 8) catch {};
                                 rs.kbd_flash_key = 0;
+                                rs.kbd_flash_held = false;
                                 m.kbd_press_cp = 0;
                             }
                         }
+                        // The open popup tracks the finger: the cell under it
+                        // highlights (same math the draw uses — no drift).
+                        if (rs.kbd_popup_kind != 0) if (rs.engine) |*peng| {
+                            const pfx: i32 = @intFromFloat(@as(f32, @floatFromInt(tev.x)) / scale);
+                            rs.kbd_popup_sel = feed_view.kbdPopupCellAt(peng, if (rs.gpu_state) |*pgs| @intCast(pgs.design_w) else design_w, .{ .opts = rs.kbd_popup_opts[0..rs.kbd_popup_n], .anchor_x = rs.kbd_popup_ax, .anchor_y = rs.kbd_popup_ay, .anchor_w = rs.kbd_popup_aw }, pfx);
+                        };
                         // SPACE-HOLD CARET SLIDE (Zat4 keyboard): with the
                         // press parked on the space bar, horizontal travel
                         // walks the caret — arrow escapes ride the same byte
@@ -3294,6 +3330,24 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         }
                     },
                     .button_up => {
+                        // The long-press popup commits on release: the cell
+                        // under the finger types its remainder (the sigil is
+                        // already in the draft); off every cell = cancel.
+                        if (rs.kbd_popup_kind != 0) {
+                            if (rs.kbd_popup_sel >= 0 and rs.kbd_popup_sel < rs.kbd_popup_n) {
+                                rs.kbd_bytes.appendSlice(gpa, rs.kbd_popup_opts[@intCast(rs.kbd_popup_sel)]) catch {};
+                                if (toggleOn(rs.toggle_bits, settings_view.act_kbd_haptic)) m.haptic_pending = 1;
+                            }
+                            rs.kbd_popup_kind = 0;
+                            rs.kbd_popup_n = 0;
+                            rs.kbd_popup_sel = -1;
+                        }
+                        // Release lets a HELD pop begin its fade.
+                        if (rs.kbd_flash_held) {
+                            rs.kbd_flash_held = false;
+                            rs.kbd_flash_ns = clock_shell.monotonicNanos();
+                        }
+                        m.kbd_press_cp = 0;
                         // A space release: a clean tap TYPES the space; an
                         // engaged caret slide already did its work.
                         if (m.kbd_space_down) {
@@ -3431,6 +3485,11 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     m.touch_cancel = false;
                     m.kbd_space_down = false;
                     m.kbd_nav = false;
+                    m.kbd_press_cp = 0;
+                    rs.kbd_popup_kind = 0;
+                    rs.kbd_popup_n = 0;
+                    rs.kbd_popup_sel = -1;
+                    rs.kbd_flash_held = false;
                     m.down_x = -1;
                     m.down_y = -1;
                     m.scrolling = false;
@@ -3489,6 +3548,59 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     if (burst > 0) {
                         rs.kbd_flash_key = 0xE002;
                         rs.kbd_flash_ns = clock_shell.monotonicNanos();
+                    }
+                }
+                // LONG-PRESS (Zat4 keyboard): ₿ held opens the pay sheet —
+                // the money key; @ / # held open APP-AWARE alternates
+                // (recent conversation handles / pinned zones). The keyboard
+                // IS the app, so these cost no privacy — the very reason it
+                // exists. The sigil itself was press-committed; a selection
+                // types only the remainder.
+                if (m.down_x >= 0 and m.press_in_kbd and rs.kbd_popup_kind == 0 and
+                    m.kbd_press_cp != 0 and (now_ms -% m.down_ms) >= 380)
+                {
+                    switch (m.kbd_press_cp) {
+                        0x20BF => {
+                            m.kbd_press_cp = 0;
+                            rs.kbd_bytes.append(gpa, 8) catch {}; // un-type the ₿
+                            rs.kbd_flash_held = false;
+                            if (dev_chat and rs.gscreen == feed_view.screen_messages and rs.gchat_sel != null) {
+                                rs.gpay_open = true;
+                                m.haptic_pending = 2;
+                            }
+                        },
+                        '@', '#' => {
+                            rs.kbd_popup_n = 0;
+                            if (m.kbd_press_cp == '#') {
+                                for (rs.zone_pins.tags.items) |tag| {
+                                    if (rs.kbd_popup_n >= 4) break;
+                                    const tn = @min(tag.len, 63);
+                                    @memcpy(rs.kbd_popup_bufs[rs.kbd_popup_n][0..tn], tag[0..tn]);
+                                    rs.kbd_popup_opts[rs.kbd_popup_n] = rs.kbd_popup_bufs[rs.kbd_popup_n][0..tn];
+                                    rs.kbd_popup_n += 1;
+                                }
+                            } else if (dev_chat) {
+                                const rows = chat_view_core.buildList(arena, &rs.gchat_store, now) catch &[_]chat_view_core.ListRow{};
+                                for (rows) |row| {
+                                    if (rs.kbd_popup_n >= 4) break;
+                                    if (row.name.len == 0) continue;
+                                    const hn = @min(row.name.len, 63);
+                                    @memcpy(rs.kbd_popup_bufs[rs.kbd_popup_n][0..hn], row.name[0..hn]);
+                                    rs.kbd_popup_opts[rs.kbd_popup_n] = rs.kbd_popup_bufs[rs.kbd_popup_n][0..hn];
+                                    rs.kbd_popup_n += 1;
+                                }
+                            }
+                            if (rs.kbd_popup_n > 0) {
+                                rs.kbd_popup_kind = if (m.kbd_press_cp == '#') 2 else 1;
+                                rs.kbd_popup_ax = m.kbd_press_x;
+                                rs.kbd_popup_ay = m.kbd_press_y;
+                                rs.kbd_popup_aw = m.kbd_press_w;
+                                rs.kbd_popup_sel = -1;
+                                m.haptic_pending = 2;
+                            }
+                            m.kbd_press_cp = 0; // one popup per press
+                        },
+                        else => {},
                     }
                 }
                 // PRESS-AND-HOLD to pick up a draggable (phone loadout): a finger
@@ -8226,6 +8338,7 @@ fn kbdFlashAlpha(rs: *const RunState) u8 {
     // reads as crispness; a slow even fade read as lag.
     const attack: u64 = 35_000_000;
     const dur: u64 = 120_000_000;
+    if (rs.kbd_flash_held) return 190; // held: the pop stays until release
     if (age < attack) return 190;
     if (age >= dur) return 0;
     return @intCast(190 - (age - attack) * 190 / (dur - attack));
@@ -8979,6 +9092,8 @@ const Grid = struct {
     /// fold into feed_sig, so the fade rebuilds the verts while it runs.
     kbd_flash_key: u16 = 0,
     kbd_flash_a: u8 = 0,
+    /// The open long-press popup (empty = closed).
+    kbd_popup: feed_view.KbdPopup = .{},
     /// The chat list-search state (phone): query + focus + caret blink.
     chat_q: []const u8 = "",
     chat_q_focus: bool = false,
@@ -10214,7 +10329,7 @@ fn paintComposeGpu(
     const kbd_lift: u32 = if (g.kbd_visible) @intCast(feed_view.keyboard_h + @as(i32, @intCast(gs.inset_bottom_l))) else 0;
     feed_view.layoutCompose(gpa, g.engine, @intCast(gs.design_w), @intCast(lh - kbd_lift), g.accent, ctx, reply_handle, quoting, draft, caret, sel_start, sel_end, blink_on, status, segments, tag_bar, g.draw, g.regions) catch {};
     if (g.kbd_visible)
-        feed_view.drawKeyboard(gpa, g.draw, g.engine, g.regions, @intCast(gs.design_w), @intCast(lh), @intCast(gs.inset_bottom_l), g.accent, g.kbd_shift, g.kbd_page, g.kbd_caps, g.kbd_flash_key, g.kbd_flash_a, gs.t, toggleOn(g.settings_toggles, settings_view.act_kbd_pulses), toggleOn(g.settings_toggles, settings_view.act_kbd_pop)) catch {};
+        feed_view.drawKeyboard(gpa, g.draw, g.engine, g.regions, @intCast(gs.design_w), @intCast(lh), @intCast(gs.inset_bottom_l), g.accent, g.kbd_shift, g.kbd_page, g.kbd_caps, g.kbd_flash_key, g.kbd_flash_a, gs.t, toggleOn(g.settings_toggles, settings_view.act_kbd_pulses), toggleOn(g.settings_toggles, settings_view.act_kbd_pop), g.kbd_popup) catch {};
     if (g.julia) feed_view.juliaRemapText(g.draw); // light theme: dark text
     if (g.light) feed_view.rethemeLight(gpa, g.draw) catch {};
     gpu.feedBuild(&gs.feed, gpa, g.engine, g.draw.slice(), scale) catch {};
@@ -11032,7 +11147,7 @@ fn paintFrameGpu(
             // input wants keys. Its taps feed the same byte stream the system
             // IME's fallback feeds — one input path (MC.4d).
             if (g.kbd_visible)
-                feed_view.drawKeyboard(gpa, g.draw, g.engine, g.regions, @intCast(gs.design_w), @intCast(lh), @intCast(gs.inset_bottom_l), g.accent, g.kbd_shift, g.kbd_page, g.kbd_caps, g.kbd_flash_key, g.kbd_flash_a, gs.t, toggleOn(g.settings_toggles, settings_view.act_kbd_pulses), toggleOn(g.settings_toggles, settings_view.act_kbd_pop)) catch {};
+                feed_view.drawKeyboard(gpa, g.draw, g.engine, g.regions, @intCast(gs.design_w), @intCast(lh), @intCast(gs.inset_bottom_l), g.accent, g.kbd_shift, g.kbd_page, g.kbd_caps, g.kbd_flash_key, g.kbd_flash_a, gs.t, toggleOn(g.settings_toggles, settings_view.act_kbd_pulses), toggleOn(g.settings_toggles, settings_view.act_kbd_pop), g.kbd_popup) catch {};
             // The cartridge DETAIL sheet (item 5) is chrome-topmost: it lives in
             // THIS tile (drawn after the feed buffer), not the feed buffer, or the
             // tab bar + FAB paint over its scrim (the on-device bleed, 2026-07-09).

@@ -1767,6 +1767,48 @@ const kbd_x2_mid = kbdRowStr("$-'\"/:;!", "$-'\"/:;!");
 // wants numbers one tap away while the symbols pages keep their own runs.
 const kbd_num = kbdRowStr("123456789", "123456789");
 
+/// The Zat4 keyboard's LONG-PRESS popup: an option strip riding above its
+/// anchor key (₿ acts directly; @ offers recent conversation handles, #
+/// offers pinned zones — the keyboard IS the app, so app-aware alternates
+/// cost no privacy). The SHELL owns the state (options, finger-tracked
+/// selection); this module owns geometry + pixels, and `kbdPopupCellAt`
+/// answers "which cell is the finger over" with the same math the draw
+/// uses — the two can never drift. A7.2: cold view struct, transient.
+pub const KbdPopup = struct {
+    opts: []const []const u8 = &.{},
+    anchor_x: i32 = 0,
+    anchor_y: i32 = 0,
+    anchor_w: i32 = 0,
+    sel: i32 = -1,
+};
+
+const kbd_popup_px: u16 = 17;
+const kbd_popup_cell_h: i32 = 46;
+const kbd_popup_gap: i32 = 4;
+
+fn kbdPopupCellW(e: *const text.Engine, opt: []const u8) i32 {
+    return @as(i32, @intCast(text.measure(e, .regular, opt, kbd_popup_px))) + 26;
+}
+
+fn kbdPopupX0(e: *const text.Engine, width: i32, p: KbdPopup) i32 {
+    var total: i32 = 0;
+    for (p.opts) |o| total += kbdPopupCellW(e, o) + kbd_popup_gap;
+    if (total > 0) total -= kbd_popup_gap;
+    return std.math.clamp(p.anchor_x + @divTrunc(p.anchor_w, 2) - @divTrunc(total, 2), 4, @max(4, width - 4 - total));
+}
+
+/// Which option cell logical x `fx` is over (-1 = none). The shell calls
+/// this per move to track the finger; release commits the answer.
+pub fn kbdPopupCellAt(e: *const text.Engine, width: i32, p: KbdPopup, fx: i32) i32 {
+    var x = kbdPopupX0(e, width, p);
+    for (p.opts, 0..) |o, i| {
+        const cw = kbdPopupCellW(e, o);
+        if (fx >= x and fx < x + cw) return @intCast(i);
+        x += cw + kbd_popup_gap;
+    }
+    return -1;
+}
+
 /// The Zat4 keyboard: an opaque panel over the very bottom (it paints the
 /// safe-area inset too), the accent "circuit" lines across its top and
 /// between rows, and one region per key. Shifted codepoints are emitted at
@@ -1795,6 +1837,8 @@ pub fn drawKeyboard(
     /// Settings: the traveling lattice glints, and the key-preview pop.
     pulses_on: bool,
     pop_on: bool,
+    /// The open long-press popup (empty opts = closed).
+    popup: KbdPopup,
 ) error{OutOfMemory}!void {
     const top = view_h - keyboard_h - bottom_inset;
     // The panel: opaque (nothing ghosts through chrome) with a faint wash.
@@ -2042,6 +2086,21 @@ pub fn drawKeyboard(
         const pgn = std.unicode.utf8Encode(@intCast(pop_cp), &pgb) catch 1;
         const pgw: i32 = @intCast(text.measure(e, .regular, pgb[0..pgn], 26));
         _ = try str(gpa, dl, e, .regular, px0 + @divTrunc(pw - pgw, 2), py0 + 34, scaleAlpha(ink, @as(f32, @floatFromInt(pa)) / 255.0), 26, pgb[0..pgn]);
+    }
+    // The long-press popup strip: opaque cells above the anchor key, the
+    // finger-tracked cell accent-filled. Selection is the shell's; release
+    // commits it.
+    if (popup.opts.len > 0) {
+        const sy0 = popup.anchor_y - kbd_popup_cell_h - 10;
+        var sx = kbdPopupX0(e, width, popup);
+        for (popup.opts, 0..) |o, i| {
+            const cw = kbdPopupCellW(e, o);
+            const on = popup.sel == @as(i32, @intCast(i));
+            try rect(gpa, dl, sx - 1, sy0 - 1, cw + 2, kbd_popup_cell_h + 2, (0x86 << 24) | (accent & 0x00FFFFFF), 11);
+            try rect(gpa, dl, sx, sy0, cw, kbd_popup_cell_h, if (on) (0xFF << 24) | (accent & 0x00FFFFFF) else 0xFF23221B, 10);
+            _ = try str(gpa, dl, e, .regular, sx + 13, sy0 + 30, if (on) 0xFF20201A else ink, kbd_popup_px, o);
+            sx += cw + kbd_popup_gap;
+        }
     }
 }
 
