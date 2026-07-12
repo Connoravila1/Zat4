@@ -354,6 +354,45 @@ pub const screen_transparency: u8 = 9;
 pub const screen_algo_detail: u8 = 10; // one marketplace algorithm, full page
 pub const screen_algo_docs: u8 = 11; // the explainer / writing-guide documents
 
+/// The WALLET page — a rail destination, and the first one whose index does NOT
+/// equal its row in the rail.
+///
+/// Note what that costs. The rail used to post its ROW INDEX as the screen id
+/// (`rs.gscreen = hit.post`), which worked only because the first six rows
+/// happened to be screens 0–5. The next free row (6) is `screen_thread`, so a
+/// seventh destination would have navigated to a thread. `nav_rows` below fixes
+/// that at the source: the rows are SCREEN IDS, and the region posts the screen,
+/// not the row. (`drawTabBar` already did this correctly.)
+pub const screen_wallet: u8 = 12;
+
+/// The rail / drawer rows, in VISUAL order, as screen ids. Algorithms sits under
+/// Zones; Zat Chat above Activity; Wallet before Settings — money is a place you
+/// go, not a modal you summon.
+const nav_rows = [_]u8{
+    screen_home,
+    screen_zones_browse,
+    screen_loadout,
+    screen_messages,
+    2, // Activity (no surface yet — a placeholder screen)
+    screen_wallet,
+    screen_settings,
+};
+
+/// The name a rail destination wears. `nav_labels` is indexed by screen for the
+/// first six; anything past them names itself here rather than growing that
+/// array with holes (screens 6–11 are transient sub-pages, not destinations).
+pub fn navLabel(screen: u8) []const u8 {
+    if (screen == screen_wallet) return "Wallet";
+    return if (screen < nav_labels.len) nav_labels[screen] else "";
+}
+
+/// True when the GPU's SDF icon pass has a crisp glyph for this row (its switch
+/// covers screens 0–5 and skips the rest). A row it does NOT cover must draw its
+/// own line-art even on the GPU path, or it would show no icon at all.
+fn navIconIsSdf(screen: u8) bool {
+    return screen <= screen_settings;
+}
+
 /// The profile screen's header band — the viewed account's identity over its
 /// post list. Plain data handed in by the shell (B5); the post count is the
 /// number of posts fetched for the profile. A7.2: cold struct — one per frame,
@@ -1690,6 +1729,7 @@ fn navIcon(idx: usize, gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, s: 
         2 => try iconHeartHollow(gpa, dl, x, y, s, c),
         3 => try iconReply(gpa, dl, x, y, s, c),
         4 => try iconAlgorithms(gpa, dl, x, y, s, c), // the "Algorithms" loadout page
+        screen_wallet => try iconBitcoin(gpa, dl, x, y, s, c),
         else => try iconGear(gpa, dl, x, y, s, c),
     }
 }
@@ -1715,23 +1755,22 @@ fn drawRail(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, rx: i32
     const wm = try str(gpa, dl, e, .semibold, x0 + 8, 58, (accent & 0x00FFFFFF) | ea, 26, "Zat4");
     _ = try str(gpa, dl, e, .semibold, wm, 58, (ink & 0x00FFFFFF) | ea, 26, ".");
 
-    // The nav GROUP box (visible always; just narrower when condensed).
-    try rect(gpa, dl, x0 - 2, 94, box_w, 304, skinPanel(accent), 18);
+    // The nav GROUP box (visible always; just narrower when condensed). Sized to
+    // the row count so a new destination cannot fall out through the bottom.
+    const box_h: i32 = 4 + @as(i32, @intCast(nav_rows.len)) * 50;
+    try rect(gpa, dl, x0 - 2, 94, box_w, box_h, skinPanel(accent), 18);
 
-    // Visual ORDER of the nav rows (each row's `idx` is still its Screen — the
-    // region/icon/active mapping is unchanged; only the on-screen order differs).
-    // Algorithms (4) sits under Zones (1); Zat Chat (3) above Activity (2).
-    const nav_order = [_]usize{ 0, 1, 4, 3, 2, 5 };
     var ny: i32 = 108;
-    for (nav_order) |idx| {
-        const label = nav_labels[idx];
-        const on = idx == active;
+    for (nav_rows) |scr| {
+        const on = scr == active;
         const col = if (on) ink else muted;
         if (on) try rect(gpa, dl, x0 + 2, ny - 8, pill_w, 42, (0x1F << 24) | (accent & 0x00FFFFFF), 12);
-        if (!skip_nav) try navIcon(idx, gpa, dl, x0 + 10, ny, 22, if (on) accent else muted);
-        _ = try str(gpa, dl, e, if (on) .semibold else .regular, x0 + 48, ny + 17, (col & 0x00FFFFFF) | ea, 16, label);
-        // Tap target spans the (condensed) column width so the icon is clickable.
-        try emitRegion(gpa, regions, rx + 14, ny - 8, box_w, 42, @intCast(idx), .nav);
+        // Rows the SDF pass doesn't cover draw their own line-art on the GPU path
+        // too, or they'd be a label with no icon.
+        if (!skip_nav or !navIconIsSdf(scr)) try navIcon(scr, gpa, dl, x0 + 10, ny, 22, if (on) accent else muted);
+        _ = try str(gpa, dl, e, if (on) .semibold else .regular, x0 + 48, ny + 17, (col & 0x00FFFFFF) | ea, 16, navLabel(scr));
+        // The region posts the SCREEN, not the row — see `nav_rows`.
+        try emitRegion(gpa, regions, rx + 14, ny - 8, box_w, 42, scr, .nav);
         ny += 50;
     }
 
@@ -2732,16 +2771,15 @@ pub fn drawDrawer(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, w
     if (open) try emitRegion(gpa, regions, px + 12, 32, drawer_w - 24, 114, screen_profile, .nav);
     try rect(gpa, dl, px + 20, 156, drawer_w - 40, 1, divider, 0);
 
-    // Every top-level screen, the rail's own order (nav_order).
-    const rows = [_]u8{ 0, 1, 4, 3, 2, 5 };
+    // Every top-level destination, the rail's own order (`nav_rows`).
     var ry: i32 = 182;
-    for (rows) |idx| {
-        const on = idx == active;
+    for (nav_rows) |scr| {
+        const on = scr == active;
         if (on) try rect(gpa, dl, px + 12, ry - 8, drawer_w - 24, 42, (0x1F << 24) | (accent & 0x00FFFFFF), 12);
-        if (!skip_nav) try navIcon(idx, gpa, dl, px + 24, ry, 22, if (on) accent else muted);
-        _ = try str(gpa, dl, e, if (on) .semibold else .regular, px + 62, ry + 17, if (on) ink else muted, 16, nav_labels[idx]);
+        if (!skip_nav or !navIconIsSdf(scr)) try navIcon(scr, gpa, dl, px + 24, ry, 22, if (on) accent else muted);
+        _ = try str(gpa, dl, e, if (on) .semibold else .regular, px + 62, ry + 17, if (on) ink else muted, 16, navLabel(scr));
         // Region x sits so the SDF pass's x+21 = the icon centre (px+35).
-        if (open) try emitRegion(gpa, regions, px + 14, ry - 8, drawer_w - 28, 42, idx, .nav);
+        if (open) try emitRegion(gpa, regions, px + 14, ry - 8, drawer_w - 28, 42, scr, .nav);
         ry += 54;
     }
 }
@@ -5795,6 +5833,230 @@ const warn: u32 = 0xFFE5544B;
 /// this rarely shows); every control except Sign out is inert display — taps on
 /// other rows emit a `.settings_row` no-op. On a NARROW window the two panes get
 /// cramped (settings is normally a wide page); a stacked narrow mode is later.
+// ---------------------------------------------------------------------------
+// THE WALLET PAGE (`screen_wallet`) — how you get paid, as a PLACE.
+//
+// It used to be a transient sheet you could only reach from inside a
+// conversation, via a link at the bottom of the pay modal. That is the wrong
+// shape for the one screen a user needs to be able to go back to, check, and
+// trust: "am I actually set up to receive money, and where is it going?" is a
+// question you ask at rest, not mid-payment.
+//
+// The modal still exists — it is the right shape for a first-run prompt caught
+// in the flow of a chat. This is the durable home for the same facts, with room
+// for the ones that never fit: what happens to your money, and who holds it
+// (nobody).
+//
+// Reuses the receive flow's state and actions wholesale (`recv.mode` picks the
+// face; `.recv_have` / `.recv_need` / `.recv_save` / `.recv_remove` are the same
+// verbs the sheet fires), so there is ONE receive state machine, not two.
+// ---------------------------------------------------------------------------
+
+/// The facts about payments that never had room to be stated, and must be. A9
+/// ("honest labeling") — the disclosures belong at the point of sight, and until
+/// now the only point of sight was a 254px strip mid-payment.
+const wallet_facts = [_]struct { head: []const u8, body: []const u8 }{
+    .{
+        .head = "Zat4 never holds your money",
+        .body = "Payments go straight from the sender's wallet to yours. We can't see them, freeze them, or return them \u{2014} there is nothing in the middle.",
+    },
+    .{
+        .head = "Payments are final",
+        .body = "Bitcoin can't be reversed or refunded. There is no chargeback and no support line that can claw one back.",
+    },
+    .{
+        .head = "Your address is pinned to each chat",
+        .body = "It is signed with the anchor a conversation already trusts, so a compromised server can't quietly swap it for its own and reroute your money.",
+    },
+};
+
+/// Dispatched straight from the shell (the `layoutChat` precedent), not through
+/// `layout` — it owns its whole surface and its own scroll, and threading eleven
+/// more params through `layout`'s 29 call sites to reach it would be absurd.
+pub fn layoutWallet(
+    gpa: Allocator,
+    e: *const text.Engine,
+    width: i32,
+    height: i32,
+    dl: *raster.DrawList,
+    regions: ?*Regions,
+    accent: u32,
+    scroll: i32,
+    recv: ChatReceiveSheet,
+    caret_phase: f32,
+    remove_armed: bool,
+    insets: EdgeInsets,
+    /// GPU path: the SDF pass strikes the rail's icons, so skip the line-art.
+    skip_nav: bool,
+    /// GPU path: the rail is the shell's own tile, so this page must not draw it.
+    rail_external: bool,
+) error{OutOfMemory}!i32 {
+    const m = metricsPage(width, screen_wallet);
+    // The rail, on the software path (every page draws its own — the GPU gives it
+    // its own tile so it can slide independently).
+    if (!rail_external) try drawRail(gpa, dl, e, m.rail_x, height, screen_wallet, regions, accent, skip_nav, 1.0);
+    const x0 = m.lx;
+    const w = m.cw;
+    const top: i32 = @as(i32, if (m.wide) 40 else 30) + insets.top;
+    var y = top + scroll;
+
+    _ = try str(gpa, dl, e, .semibold, x0, y + 30, ink, 30, "Wallet");
+    y += 44;
+    _ = try str(gpa, dl, e, .regular, x0, y + 16, muted, 14, "How you get paid in Zat Chat.");
+    y += 44;
+
+    // The column is capped: an address is a short string and a fact is a
+    // paragraph — neither reads well at 1100px.
+    const cw = @min(w, 640);
+    const has_addr = recv.lightning.len > 0 or recv.bitcoin.len > 0;
+
+    switch (recv.mode) {
+        // ── The resting face: what is (or isn't) published, and the way in. ──
+        .onboard => {
+            if (!recv.known) {
+                // Do NOT claim an empty state before the fetch lands — a user
+                // told "you have no wallet" while they in fact have one would
+                // publish a second address over their first.
+                try cardBox(gpa, dl, x0, y, cw, 88, 14, panel);
+                _ = try str(gpa, dl, e, .semibold, x0 + 20, y + 38, muted, 15, "Checking your wallet\u{2026}");
+                _ = try str(gpa, dl, e, .regular, x0 + 20, y + 60, faint, 13, "Reading your published address.");
+                y += 88 + 28;
+            } else if (recv.set and has_addr) {
+                // ── Set up. Lead with the plain verdict, then the addresses. ──
+                const rows: i32 = @as(i32, @intCast(@intFromBool(recv.lightning.len > 0))) +
+                    @as(i32, @intCast(@intFromBool(recv.bitcoin.len > 0)));
+                const card_h: i32 = 62 + rows * 54 + 62;
+                try cardBox(gpa, dl, x0, y, cw, card_h, 14, panel);
+                var cy = y + 22;
+                // The verdict, with the tone dot the payment cards use.
+                try rect(gpa, dl, x0 + 20, cy + 6, 9, 9, boost_c, 4);
+                _ = try str(gpa, dl, e, .semibold, x0 + 36, cy + 15, ink, 16, "You can be paid");
+                cy += 40;
+
+                if (recv.lightning.len > 0) {
+                    cy = try walletAddrRow(gpa, dl, e, x0 + 20, cy, cw - 40, "Lightning", recv.lightning, true);
+                }
+                if (recv.bitcoin.len > 0) {
+                    cy = try walletAddrRow(gpa, dl, e, x0 + 20, cy, cw - 40, "On-chain", recv.bitcoin, false);
+                }
+
+                cy += 8;
+                const btn_w = @divTrunc(cw - 40 - 12, 2);
+                try buttonSecondary(gpa, e, dl, regions, x0 + 20, cy, btn_w, 44, "Replace", 0, .recv_have);
+                // Two-tap destructive: it UNPUBLISHES the record, and someone
+                // mid-payment to you would suddenly be unable to pay.
+                try buttonDestructive(gpa, e, dl, regions, x0 + 20 + btn_w + 12, cy, cw - 40 - btn_w - 12, 44, if (remove_armed) "Tap again to remove" else "Remove", 0, .recv_remove, remove_armed);
+                y += card_h + 28;
+            } else {
+                // ── Not set up. An honest empty state with one obvious door. ──
+                try cardBox(gpa, dl, x0, y, cw, 176, 14, panel);
+                var cy = y + 22;
+                try rect(gpa, dl, x0 + 20, cy + 6, 9, 9, 0xFFE0A868, 4);
+                _ = try str(gpa, dl, e, .semibold, x0 + 36, cy + 15, ink, 16, "You can't be paid yet");
+                cy += 34;
+                cy = try wrapNote(gpa, dl, e, x0 + 20, cy, cw - 40, "Add an address and people in your chats can send you bitcoin. It stays your wallet \u{2014} you keep the keys.");
+                cy += 18;
+                const btn_w = @divTrunc(cw - 40 - 12, 2);
+                try buttonPrimary(gpa, e, dl, regions, x0 + 20, cy, btn_w, 44, "Add an address", accent, 0, .recv_have, true);
+                try buttonSecondary(gpa, e, dl, regions, x0 + 20 + btn_w + 12, cy, cw - 40 - btn_w - 12, 44, "I don't have a wallet", 0, .recv_need);
+                y += 176 + 28;
+            }
+            if (recv.status.len > 0) {
+                const sc: u32 = if (recv.saved) boost_c else 0xFFE0A868;
+                try strEllipsis(gpa, dl, e, .regular, x0 + 2, y + 4, sc, 13, recv.status, cw);
+                y += 28;
+            }
+        },
+
+        // ── The paste form, as a page section rather than a cramped sheet. ──
+        .paste => {
+            try cardBox(gpa, dl, x0, y, cw, 244, 14, panel);
+            var cy = y + 22;
+            _ = try str(gpa, dl, e, .semibold, x0 + 20, cy + 15, ink, 16, "Your receive address");
+            cy += 34;
+            cy = try wrapNote(gpa, dl, e, x0 + 20, cy, cw - 40, recv_paste_note);
+            cy += 14;
+            _ = try payFieldRow(gpa, dl, e, regions, accent, x0 + 20, cy, cw - 40, recv.lightning, "lightning address \u{2014} you@wallet.com", recv.focus == 0, caret_phase, .regular, .recv_ln);
+            cy += 42 + 10;
+            _ = try payFieldRow(gpa, dl, e, regions, accent, x0 + 20, cy, cw - 40, recv.bitcoin, "bitcoin address (optional)", recv.focus == 1, caret_phase, .regular, .recv_btc);
+            cy += 42 + 14;
+            const btn_w: i32 = 120;
+            try buttonSecondary(gpa, e, dl, regions, x0 + 20, cy, btn_w, 44, "Cancel", 0, .recv_back);
+            try buttonPrimary(gpa, e, dl, regions, x0 + 20 + btn_w + 12, cy, cw - 40 - btn_w - 12, 44, "Save", accent, 0, .recv_save, has_addr);
+            y += 244 + 28;
+            if (recv.status.len > 0) {
+                const sc: u32 = if (recv.saved) boost_c else 0xFFE0A868;
+                try strEllipsis(gpa, dl, e, .regular, x0 + 2, y - 20, sc, 13, recv.status, cw);
+                y += 12;
+            }
+        },
+
+        // ── The get-a-wallet list. ──
+        .wallets => {
+            const card_h: i32 = 62 + @as(i32, @intCast(recv_wallets.len)) * 62 + 60;
+            try cardBox(gpa, dl, x0, y, cw, card_h, 14, panel);
+            var cy = y + 22;
+            _ = try str(gpa, dl, e, .semibold, x0 + 20, cy + 15, ink, 16, "Get a wallet \u{2014} about a minute");
+            cy += 38;
+            for (recv_wallets, 0..) |wal, wi| {
+                try cardBox(gpa, dl, x0 + 20, cy, cw - 40, 54, 12, bg);
+                _ = try str(gpa, dl, e, .semibold, x0 + 34, cy + 23, ink, 14, wal.name);
+                try strEllipsis(gpa, dl, e, .regular, x0 + 34, cy + 42, muted, 12, wal.tagline, cw - 100);
+                try iconChevron(gpa, dl, x0 + cw - 48, cy + 20, 14, faint);
+                try emitRegion(gpa, regions, x0 + 20, cy, cw - 40, 54, @intCast(wi), .recv_wallet);
+                cy += 62;
+            }
+            cy += 4;
+            const btn_w: i32 = 120;
+            try buttonSecondary(gpa, e, dl, regions, x0 + 20, cy, btn_w, 44, "Back", 0, .recv_back);
+            try buttonPrimary(gpa, e, dl, regions, x0 + 20 + btn_w + 12, cy, cw - 40 - btn_w - 12, 44, "I've got one \u{2014} paste it", accent, 0, .recv_paste, true);
+            y += card_h + 28;
+        },
+    }
+
+    // ── The facts. This is the whole reason the page exists: A9's honest
+    // labeling finally has somewhere to live that isn't a payment in progress. ──
+    _ = try str(gpa, dl, e, .semibold, x0, y + 16, muted, 13, "HOW PAYMENTS WORK");
+    y += 34;
+    for (wallet_facts) |f| {
+        const body_h = try noteHeight(gpa, dl, e, cw - 40, f.body);
+        const fh = 26 + body_h + 22;
+        try cardBox(gpa, dl, x0, y, cw, fh, 14, panel);
+        _ = try str(gpa, dl, e, .semibold, x0 + 20, y + 26, ink, 14, f.head);
+        _ = try wrapBody(gpa, dl, e, x0 + 20, y + 48, cw - 40, muted, 13, f.body, 18, true, null);
+        y += fh + 12;
+    }
+
+    return y - scroll + 40;
+}
+
+/// One published address: the rail it pays on, the address itself, and the ✓
+/// that says it is live. Returns the y below the row.
+fn walletAddrRow(
+    gpa: Allocator,
+    dl: *raster.DrawList,
+    e: *const text.Engine,
+    x: i32,
+    y: i32,
+    w: i32,
+    rail: []const u8,
+    addr: []const u8,
+    lightning: bool,
+) error{OutOfMemory}!i32 {
+    try cardBox(gpa, dl, x, y, w, 46, 10, bg);
+    if (lightning)
+        try iconLightning(gpa, dl, x + 14, y + 15, 16, muted)
+    else
+        try iconBitcoin(gpa, dl, x + 14, y + 15, 16, muted);
+    _ = try str(gpa, dl, e, .semibold, x + 38, y + 28, muted, 12, rail);
+    const rw: i32 = @intCast(text.measure(e, .semibold, rail, 12));
+    const ax = x + 38 + rw + 14;
+    // The address is the fact; it must not be ellipsised into ambiguity if it
+    // can be helped, so it gets every remaining pixel.
+    try strEllipsis(gpa, dl, e, .regular, ax, y + 28, ink, 13, addr, w - (ax - x) - 16);
+    return y + 54;
+}
+
 fn drawSettings(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Metrics, height: i32, scroll: i32, regions: ?*Regions, accent: u32, sel_section: u8, toggles: u64, account: SettingsAccount, choices: u64, picking: u8) error{OutOfMemory}!i32 {
     const x0 = m.lx;
     const w = m.cw;
@@ -7277,7 +7539,7 @@ fn drawTopBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Me
     var zbuf: [140]u8 = undefined;
     const title: []const u8 = if (is_zone)
         (std.fmt.bufPrint(&zbuf, "#{s}", .{zone_title}) catch "#zone")
-    else if (active_screen < nav_labels.len) nav_labels[active_screen] else "Thread";
+    else if (navLabel(active_screen).len > 0) navLabel(active_screen) else "Thread";
     // Home AND a zone page seat the lens socket → the taller header; both the
     // thread and a zone page get a Back button on the left.
     const seats_socket = is_home or is_zone;
@@ -8034,10 +8296,18 @@ pub const ChatReceiveSheet = struct {
     /// up, so they arrived straight at it and there is no onboarding step behind
     /// it to go back to. Feeds `recvBackEdge`.
     rooted: bool = false,
+    /// True when a receive address is currently PUBLISHED (the record exists on
+    /// the PDS). Distinct from `saved`, which means "a publish succeeded just
+    /// now". The Wallet page needs the standing fact, not the recent event.
+    set: bool = false,
+    /// True once the shell has actually asked the PDS. Until then the Wallet page
+    /// must say "checking…" rather than claim you have no wallet — an empty state
+    /// shown before the fetch lands is a lie that invites a duplicate setup.
+    known: bool = false,
 
     comptime {
-        // Three slices (48) + three bools + a u8, packed into the trailing 8 = 56.
-        // (Unchanged: `rooted` landed in existing padding, so no A7.1 bump.)
+        // Three slices (48) + five bools + a u8, all packed into the trailing 8 = 56.
+        // (Unchanged: `set`/`known` landed in existing padding, so no A7.1 bump.)
         assert(@sizeOf(ChatReceiveSheet) == 56);
     }
 };
@@ -8452,6 +8722,10 @@ fn drawPayCard(
     b: chat_view.BubbleRow,
     card: chat_view.PayCard,
     ordinal: u16,
+    /// A send is already in flight. The card's own action disarms — it would be
+    /// refused anyway, and a live-looking button that refuses is a worse lie than
+    /// a dead-looking one that explains why.
+    busy: bool,
 ) !void {
     const settled_c: u32 = 0xFF9BCE9B; // soft success green
     const warn_c: u32 = 0xFFE0A868; // amber dot
@@ -8517,9 +8791,9 @@ fn drawPayCard(
     const acts = payCardActions(b.mine, b.kind, card.status);
     if (acts.primary) |act| {
         var ax = bx + 14;
-        ax = try drawCardButton(gpa, dl, e, regions, fill, bright, ax, ty, act, ordinal);
+        ax = try drawCardButton(gpa, dl, e, regions, fill, bright, ax, ty, act, ordinal, busy);
         if (acts.secondary) |sec|
-            _ = try drawCardButton(gpa, dl, e, regions, fill, bright, ax + 10, ty, sec, ordinal);
+            _ = try drawCardButton(gpa, dl, e, regions, fill, bright, ax + 10, ty, sec, ordinal, busy);
     }
 }
 
@@ -8538,12 +8812,17 @@ fn drawCardButton(
     ty: i32,
     act: Action,
     ordinal: u16,
+    busy: bool,
 ) !i32 {
     const quiet = act == .pay_card_cancel or act == .pay_card_decline;
-    const label = payActionLabel(act);
+    // Only the money verbs are held back while a send is in flight. Cancel and
+    // Decline move nothing and must stay reachable — a busy worker is exactly
+    // when someone might want out.
+    const held = busy and (act == .pay_card_pay or act == .pay_card_send);
+    const label = if (held) "Preparing\u{2026}" else payActionLabel(act);
     const lw: i32 = @intCast(text.measure(e, .semibold, label, 13));
     const pw = lw + 32;
-    if (quiet) {
+    if (quiet or held) {
         // A ghost chip: a faint wash of the ON-fill ink, with muted text.
         const wash = (0x24 << 24) | (onFill(fill) & 0x00FFFFFF);
         try rect(gpa, dl, x, ty + 4, pw, 34, wash, 12);
@@ -8556,7 +8835,8 @@ fn drawCardButton(
         try rect(gpa, dl, x, ty + 4, pw, 34, chip, 12);
         _ = try str(gpa, dl, e, .semibold, x + 16, ty + 26, chip_fg, 13, label);
     }
-    try emitRegion(gpa, regions, x, ty + 4, pw, 34, ordinal, act);
+    // A held button emits NO region: the tap has nowhere useful to go.
+    if (!held) try emitRegion(gpa, regions, x, ty + 4, pw, 34, ordinal, act);
     return x + pw;
 }
 
@@ -8977,7 +9257,7 @@ pub fn layoutChat(
                 // revisit under judgment).
                 const cw2 = @min(pay_card_w_max, bub_max);
                 const cbx = if (b.mine) detail_x + detail_w - cw2 else detail_x;
-                try drawPayCard(gpa, dl, e, regions, accent, cbx, by, cw2, hh, b, cards[b.pay], @intCast(@min(idx, std.math.maxInt(u16))));
+                try drawPayCard(gpa, dl, e, regions, accent, cbx, by, cw2, hh, b, cards[b.pay], @intCast(@min(idx, std.math.maxInt(u16))), pay.busy);
             } else {
                 // Single-line bubbles shrink-wrap; wrapped ones take the max.
                 const one_w: i32 = @intCast(text.measure(e, .regular, b.body, chat_px));
@@ -10484,6 +10764,32 @@ test "wrapBody honours explicit newlines as hard line breaks" {
     // A blank line (consecutive newlines) is kept as its own line.
     const blank = try wrapBody(gpa, &dl, &engine, 0, 0, wide, ink, 16, "a\n\nb", line_h, false, null);
     try std.testing.expectEqual(@as(i32, line_h * 3), blank);
+}
+
+test "the nav rail posts SCREEN ids, not row indices" {
+    // The trap this pins. The rail used to post its ROW INDEX as the screen
+    // (`rs.gscreen = hit.post`), which worked only by coincidence: the first six
+    // rows happened to be screens 0–5. Wallet is row 5 and screen 12 — if anyone
+    // ever "simplifies" the rail back to posting `idx`, tapping Wallet would
+    // navigate to screen 5 (Settings), and a future row would land on
+    // screen_thread. Every row must be a real destination that names itself.
+    var found_wallet = false;
+    for (nav_rows, 0..) |scr, row| {
+        try std.testing.expect(navLabel(scr).len > 0);
+        if (scr == screen_wallet) {
+            found_wallet = true;
+            try std.testing.expect(row != screen_wallet); // the coincidence is broken
+            try std.testing.expectEqualStrings("Wallet", navLabel(scr));
+        }
+    }
+    try std.testing.expect(found_wallet);
+
+    // A row the GPU's SDF pass does not cover must be flagged, or it renders as a
+    // label with no icon on the GPU path (the pass `continue`s on an id it does
+    // not know).
+    try std.testing.expect(!navIconIsSdf(screen_wallet));
+    try std.testing.expect(navIconIsSdf(screen_home));
+    try std.testing.expect(navIconIsSdf(screen_settings));
 }
 
 test "the money modal's back edges: every face has exactly one step behind it" {

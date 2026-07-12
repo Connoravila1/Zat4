@@ -605,6 +605,29 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("wrote /tmp/zat_zones_browse_wide.ppm ({d}x{d}, {d} items)\n", .{ ww, H, dl.len });
     }
 
+    // THE WALLET PAGE — how you get paid, as a destination. Three faces: set up
+    // (the published addresses + Replace/Remove), the empty state, and the paste
+    // form. Plus the "how payments work" facts, which had nowhere to live before.
+    {
+        const faces = [_]struct { name: []const u8, recv: feed_view.ChatReceiveSheet }{
+            .{ .name = "wallet_set", .recv = .{ .mode = .onboard, .known = true, .set = true, .lightning = "connoravila@strike.me", .bitcoin = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq" } },
+            .{ .name = "wallet_empty", .recv = .{ .mode = .onboard, .known = true, .set = false } },
+            .{ .name = "wallet_paste", .recv = .{ .mode = .paste, .known = true, .set = false, .lightning = "connoravila@strike.me", .focus = 0 } },
+            .{ .name = "wallet_wallets", .recv = .{ .mode = .wallets, .known = true, .set = false } },
+        };
+        for (faces) |face| {
+            @memset(fb.pixels, clear);
+            dl.len = 0;
+            try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
+            _ = try feed_view.layoutWallet(gpa, &engine, @intCast(W), @intCast(H), &dl, null, lens_socket.seatedAccent(home_tray), 0, face.recv, 0, false, .{}, false, false);
+            try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+            var pbuf: [64]u8 = undefined;
+            const path = try std.fmt.bufPrint(&pbuf, "/tmp/zat_{s}.ppm", .{face.name});
+            try writePpm(io, gpa, &fb, path);
+            std.debug.print("wrote {s} ({d} items)\n", .{ path, dl.len });
+        }
+    }
+
     // SETTINGS (master–detail): the section list on the left, the selected
     // section's grouped rows on the right. Two frames prove the section switch
     // and the row archetypes (info / choice / toggle / disclosure / action).

@@ -708,6 +708,8 @@ const RunState = struct {
     /// True while that worker is out: the sheet shows "Preparing…" and its
     /// primary button disarms, so a second tap cannot start a second send.
     gpay_busy: bool,
+    /// The Wallet page's two-tap Remove (see `Grid.wallet_remove_armed`).
+    gwallet_remove_armed: bool,
     /// DIDs whose handle resolution has already been attempted and refused
     /// (no `alsoKnownAs`, or a claim that failed the round-trip check). Kept so
     /// the 60s sweep does not re-ask the network the same unanswerable question
@@ -1316,6 +1318,7 @@ fn initRunState(
     rs.ghandle_tried = .empty;
     rs.gpay_job = .{};
     rs.gpay_busy = false;
+    rs.gwallet_remove_armed = false;
 
     // The real E2EE session (M1): the crypto state (anchor, keyPackage,
     // per-conversation MLS groups) + the relay link that carries encrypted
@@ -1976,7 +1979,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
         // sheet with no stall (loadOwnReceive is a PDS fetch; on the click it
         // blocked the render thread). If the user taps before this lands,
         // `.pay_open` still falls back to the sync fetch.
-        if (dev_chat and rs.gscreen == feed_view.screen_messages and !rs.grecv_known) {
+        if (dev_chat and (rs.gscreen == feed_view.screen_messages or rs.gscreen == feed_view.screen_wallet) and !rs.grecv_known) {
             if (rs.greceive_job.thread == null) {
                 const a = std.heap.page_allocator;
                 if (a.dupe(u8, session.did)) |did_copy| {
@@ -3062,7 +3065,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        var pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = .{ .cards = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .q_focus = rs.gmarket_q_focus, .loading = rs.market_loading, .filter = rs.gmarket_filter, .hover_x = rs.ghover_x, .hover_y = rs.ghover_y }, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .kbd_visible = toggleOn(rs.toggle_bits, settings_view.act_zat_kbd) and typingOwnsKeyboard(rs), .kbd_shift = rs.kbd_shift, .kbd_page = rs.kbd_page, .kbd_caps = rs.kbd_caps, .kbd_flash_key = rs.kbd_flash_key, .kbd_flash_a = kbdFlashAlpha(rs), .kbd_popup = .{ .opts = rs.kbd_popup_opts[0..rs.kbd_popup_n], .anchor_x = rs.kbd_popup_ax, .anchor_y = rs.kbd_popup_ay, .anchor_w = rs.kbd_popup_aw, .sel = rs.kbd_popup_sel }, .kbd_emoji_open = rs.kbd_emoji_open, .kbd_emoji_scroll = @intFromFloat(rs.kbd_emoji_scroll), .kbd_picker_mode = rs.kbd_picker_mode, .kbd_nav_t = rs.kbd_nav_t, .kbd_nav_scroll = @intFromFloat(rs.kbd_nav_scroll), .chat_q = rs.gchat_q_buf[0..rs.gchat_q_len], .chat_q_focus = rs.gchat_q_focus, .chat_q_caret = composeBlinkOn(rs.caret_anchor_ns), .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_edit = .{ .caret = @min(rs.gchat_caret, rs.gchat_draft_len), .sel_a = @min(rs.gchat_sel_a, rs.gchat_draft_len), .sel_b = @min(rs.gchat_sel_b, rs.gchat_draft_len), .bar = rs.gchat_edit_bar }, .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .step = rs.gpay_step, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents, .busy = rs.gpay_busy }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved, .rooted = rs.grecv_set }, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
+        var pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = .{ .cards = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .q_focus = rs.gmarket_q_focus, .loading = rs.market_loading, .filter = rs.gmarket_filter, .hover_x = rs.ghover_x, .hover_y = rs.ghover_y }, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .kbd_visible = toggleOn(rs.toggle_bits, settings_view.act_zat_kbd) and typingOwnsKeyboard(rs), .kbd_shift = rs.kbd_shift, .kbd_page = rs.kbd_page, .kbd_caps = rs.kbd_caps, .kbd_flash_key = rs.kbd_flash_key, .kbd_flash_a = kbdFlashAlpha(rs), .kbd_popup = .{ .opts = rs.kbd_popup_opts[0..rs.kbd_popup_n], .anchor_x = rs.kbd_popup_ax, .anchor_y = rs.kbd_popup_ay, .anchor_w = rs.kbd_popup_aw, .sel = rs.kbd_popup_sel }, .kbd_emoji_open = rs.kbd_emoji_open, .kbd_emoji_scroll = @intFromFloat(rs.kbd_emoji_scroll), .kbd_picker_mode = rs.kbd_picker_mode, .kbd_nav_t = rs.kbd_nav_t, .kbd_nav_scroll = @intFromFloat(rs.kbd_nav_scroll), .chat_q = rs.gchat_q_buf[0..rs.gchat_q_len], .chat_q_focus = rs.gchat_q_focus, .chat_q_caret = composeBlinkOn(rs.caret_anchor_ns), .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_edit = .{ .caret = @min(rs.gchat_caret, rs.gchat_draft_len), .sel_a = @min(rs.gchat_sel_a, rs.gchat_draft_len), .sel_b = @min(rs.gchat_sel_b, rs.gchat_draft_len), .bar = rs.gchat_edit_bar }, .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .step = rs.gpay_step, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents, .busy = rs.gpay_busy }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved, .rooted = rs.grecv_set, .set = rs.grecv_set, .known = rs.grecv_known }, .wallet_remove_armed = rs.gwallet_remove_armed, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
         switch (rs.mode) {
             .timeline => try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status),
             .compose => {
@@ -4924,6 +4927,18 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                                 rs.profile_target_did = session.did;
                                                 rs.profile_dirty = true;
                                             }
+                                            if (rs.gscreen == feed_view.screen_wallet) {
+                                                // Arrive at the page's RESTING face, never
+                                                // mid-edit: the receive state is shared with
+                                                // the chat modal, so a form left open there
+                                                // would otherwise greet you here.
+                                                rs.grecv_open = false;
+                                                rs.grecv_mode = .onboard;
+                                                rs.grecv_status = "";
+                                                rs.grecv_saved = false;
+                                                rs.grecv_focus = 0;
+                                                rs.gwallet_remove_armed = false;
+                                            }
                                             // Each screen starts at the top (scroll is shared).
                                             rs.gscroll_px = 0;
                                             // Navigating dismisses the phone drawer (it is a
@@ -5660,7 +5675,13 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         // picker dismissed the whole flow instead of
                                         // returning to the branch it came from.
                                         .recv_back => if (dev_chat) {
-                                            if (feed_view.recvBackEdge(rs.grecv_mode, rs.grecv_set)) |prev| {
+                                            if (rs.gscreen == feed_view.screen_wallet) {
+                                                // The page's own root is the resting
+                                                // face; back never leaves the page.
+                                                rs.grecv_mode = .onboard;
+                                                rs.grecv_focus = 0;
+                                                rs.grecv_status = "";
+                                            } else if (feed_view.recvBackEdge(rs.grecv_mode, rs.grecv_set)) |prev| {
                                                 rs.grecv_mode = prev;
                                                 rs.grecv_focus = 0;
                                                 rs.grecv_status = "";
@@ -5674,7 +5695,17 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         .recv_btc => if (dev_chat) {
                                             rs.grecv_focus = 1;
                                         },
-                                        .recv_cancel => if (dev_chat) closeRecvSheet(rs),
+                                        // On the Wallet PAGE there is no modal to
+                                        // close — "Cancel"/"Done" returns to the
+                                        // page's resting face instead of trying to
+                                        // dismiss a sheet that isn't there.
+                                        .recv_cancel => if (dev_chat) {
+                                            if (rs.gscreen == feed_view.screen_wallet) {
+                                                rs.grecv_mode = .onboard;
+                                                rs.grecv_status = "";
+                                                rs.gwallet_remove_armed = false;
+                                            } else closeRecvSheet(rs);
+                                        },
                                         .recv_save => if (dev_chat) {
                                             const ln = std.mem.trim(u8, rs.grecv_ln_buf[0..rs.grecv_ln_len], " ");
                                             const btc = std.mem.trim(u8, rs.grecv_btc_buf[0..rs.grecv_btc_len], " ");
@@ -5691,16 +5722,29 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         // again) and clear the fields — one tap, not
                                         // delete-every-char-then-Cancel.
                                         .recv_remove => if (dev_chat) {
-                                            _ = rs.gchat_arena_state.reset(.retain_capacity);
-                                            if (pay_addr.unpublish(gpa, rs.gchat_arena_state.allocator(), io, environ, session)) |_| {
-                                                rs.grecv_ln_len = 0;
-                                                rs.grecv_btc_len = 0;
-                                                rs.grecv_set = false;
-                                                rs.grecv_saved = false;
-                                                rs.grecv_focus = 0;
-                                                rs.grecv_status = "Removed \u{2014} you no longer receive payments here";
-                                            } else |_| {
-                                                rs.grecv_status = "Couldn't remove it \u{2014} try again";
+                                            // On the Wallet page Remove is a TWO-TAP:
+                                            // unpublishing makes you unpayable and
+                                            // would strand anyone mid-send to you, so
+                                            // the first tap only arms it. (The sheet's
+                                            // quiet "Remove wallet" link keeps its
+                                            // single tap — it is already a deliberate
+                                            // reach.)
+                                            if (rs.gscreen == feed_view.screen_wallet and !rs.gwallet_remove_armed) {
+                                                rs.gwallet_remove_armed = true;
+                                                rs.grecv_status = "";
+                                            } else {
+                                                rs.gwallet_remove_armed = false;
+                                                _ = rs.gchat_arena_state.reset(.retain_capacity);
+                                                if (pay_addr.unpublish(gpa, rs.gchat_arena_state.allocator(), io, environ, session)) |_| {
+                                                    rs.grecv_ln_len = 0;
+                                                    rs.grecv_btc_len = 0;
+                                                    rs.grecv_set = false;
+                                                    rs.grecv_saved = false;
+                                                    rs.grecv_focus = 0;
+                                                    rs.grecv_status = "Removed \u{2014} you no longer receive payments here";
+                                                } else |_| {
+                                                    rs.grecv_status = "Couldn't remove it \u{2014} try again";
+                                                }
                                             }
                                         },
                                         // Compose "Send": run the per-action gate
@@ -6434,7 +6478,12 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
             // Escape closes, Tab hops the two address fields, any printable
             // character types into the focused one (addresses are alphanumeric +
             // punctuation, so no digit filter). Consumes the key.
-            if (rs.engine != null and dev_chat and rs.gscreen == feed_view.screen_messages and rs.grecv_open) {
+            // The receive form owns the keyboard on BOTH surfaces it appears on:
+            // the chat modal, and the Wallet page (where it is a page section, so
+            // `grecv_open` is false — the mode is what says it is showing).
+            const recv_typing = (rs.gscreen == feed_view.screen_messages and rs.grecv_open) or
+                (rs.gscreen == feed_view.screen_wallet and rs.grecv_mode == .paste);
+            if (rs.engine != null and dev_chat and recv_typing) {
                 var recv_key = true;
                 switch (decoded.event) {
                     // One step back per press (wallet picker → the branch →
@@ -7294,11 +7343,24 @@ pub fn run(
 /// in the run loop), so every input — present and future — is shielded even
 /// when its own branch forgets to consume a key. Grow this list with every
 /// new text input; that one line is the whole protection.
+/// The caret's blink phase: solid for a beat after the last keystroke, then a
+/// smooth 1.1s breath. One implementation, so the chat composer, the pay modal
+/// and the Wallet page's address fields all blink in step.
+fn caretPhaseOf(clock_ns: u64, key_ns: u64) f32 {
+    const raw: u64 = if (key_ns == 0) clock_ns else clock_ns -| key_ns;
+    var ph: f64 = @as(f64, @floatFromInt(raw)) / 1_000_000_000.0;
+    if (ph > 0.55) ph = 0.55 + @mod(ph - 0.55, 1.1);
+    return @floatCast(ph);
+}
+
 fn typingOwnsKeyboard(rs: *const RunState) bool {
     if (rs.mode == .compose) return true;
     if (rs.engine == null) return false; // terminal: none of the GUI inputs exist
     if (rs.gscreen == feed_view.screen_messages and
         (rs.gchat_composing or rs.gchat_input_focus or rs.gchat_q_focus or rs.gpay_open or rs.grecv_open)) return true;
+    // The Wallet page's address fields (the standing fence law: every new text
+    // input adds itself here, or typing an address fires app shortcuts).
+    if (rs.gscreen == feed_view.screen_wallet and rs.grecv_mode == .paste) return true;
     if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 2 and rs.gcreate_step == .name) return true;
     // The dev submission flow: the Zal source editor and the details fields.
     if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 2 and rs.gdev_active and
@@ -10210,6 +10272,10 @@ const Grid = struct {
     /// The pay sheet's frame state (M5 A4) — closed by default.
     chat_pay: feed_view.ChatPaySheet = .{},
     chat_recv: feed_view.ChatReceiveSheet = .{},
+    /// The Wallet page's Remove button is a two-tap: the first arms it, the
+    /// second unpublishes. Removing your address makes you unpayable, and would
+    /// strand anyone mid-send to you — it does not get a one-tap.
+    wallet_remove_armed: bool = false,
     /// The reader's expanded posts (main-feed Read-more): CIDs stamped onto
     /// PostView.expanded by fromTimeline so a clamped body lays out in full.
     expanded: []const []const u8 = &.{},
@@ -11190,7 +11256,11 @@ fn paintFrame(
             // by the REAL timeline via a pure transform (B5). An empty timeline
             // renders the chrome with no posts — no placeholder content.
             const feed_posts = feed_view.fromTimeline(arena, view_items, now, g.expanded) catch &[_]feed_view.PostView{};
-            if (g.chat_store != null and g.screen.* == feed_view.screen_messages) {
+            if (g.screen.* == feed_view.screen_wallet) {
+                // The Wallet page: how you get paid, as a durable place. Owns its
+                // whole surface and its own scroll (the layoutChat precedent).
+                g.content_h.* = feed_view.layoutWallet(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.chat_recv, 0, g.wallet_remove_armed, .{}, false, false) catch g.content_h.*;
+            } else if (g.chat_store != null and g.screen.* == feed_view.screen_messages) {
                 // Zat Chat (U3, dev-gated): the Messages surface. -scroll maps the
                 // shared ≤0 scroll state onto layoutChat's positive history offset.
                 const cf = buildChatFrame(arena, g.chat_store.?, g.chat_sel, now, g.chat_q);
@@ -11616,6 +11686,26 @@ fn paintFrameGpu(
     // vertices or the screen only updates on re-entry (the caching bug the
     // first live test caught). Fold the chat state in when on the screen.
     var chat_sig: u64 = 0;
+    // The WALLET page renders from the same receive state, on a different screen.
+    // It needs its OWN fold: `chat_sig` below is gated on screen_messages, so
+    // without this the page would build its verts once and then freeze — every
+    // button hit-testing against a stale frame's regions. That is the standing
+    // rebuild law, and it has bitten three times; this is the fourth surface it
+    // would have bitten.
+    if (g.screen.* == feed_view.screen_wallet) {
+        chat_sig = (@as(u64, @intFromEnum(g.chat_recv.mode)) +% 1) *% 0x632B_E5A3_11D9_6F07;
+        chat_sig ^= (@as(u64, g.chat_recv.focus) +% 1) *% 0xC2B2_AE3D_27D4_EB4F;
+        chat_sig ^= @as(u64, @intFromBool(g.chat_recv.saved)) *% 0x1656_67B1_9E37_79F9;
+        chat_sig ^= @as(u64, @intFromBool(g.chat_recv.set)) *% 0x2545_F491_4F6C_DD1D;
+        chat_sig ^= @as(u64, @intFromBool(g.chat_recv.known)) *% 0xACB5_4B6E_3C2F_1D77;
+        chat_sig ^= @as(u64, @intFromBool(g.wallet_remove_armed)) *% 0x8EBC_6AF0_9C88_C6E3;
+        chat_sig ^= std.hash.Wyhash.hash(0x2C1B_3C6D, g.chat_recv.lightning);
+        chat_sig ^= std.hash.Wyhash.hash(0x9E37_79B1, g.chat_recv.bitcoin);
+        chat_sig ^= std.hash.Wyhash.hash(0x7F4A_7C15, g.chat_recv.status);
+        // The caret's blink rides `chat_key_ns` (the same channel the chat inputs
+        // use), so a focused address field breathes instead of sitting frozen.
+        chat_sig ^= g.chat_key_ns *% 0x94D0_49BB_1331_11EB;
+    }
     if (g.screen.* == feed_view.screen_messages) if (g.chat_store) |cs| {
         chat_sig = (@as(u64, cs.msgs.len) *% 0x9E37_79B9_7F4A_7C15) ^
             ((if (g.chat_sel) |sc| @as(u64, @intFromEnum(sc)) +% 1 else 0) *% 0xC2B2_AE3D_27D4_EB4F) ^
@@ -11882,6 +11972,8 @@ fn paintFrameGpu(
             gs.content_x = lg.col_x;
             gs.content_w = lg.col_w;
             g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, true, true, lg, g.market, g.bench_pick, g.bench_drag, g.published, g.create, g.dev, g.bench, .{ .top = @intCast(gs.inset_top_l), .bottom = @intCast(gs.inset_bottom_l), .left = @intCast(gs.inset_left_l), .right = @intCast(gs.inset_right_l) }, g.loadout_lib_y) catch g.content_h.*; // GPU: SDF pass strikes the nav icons crisp
+        } else if (g.screen.* == feed_view.screen_wallet) {
+            g.content_h.* = feed_view.layoutWallet(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, g.chat_recv, caretPhaseOf(gs.chat_clock_ns, g.chat_key_ns), g.wallet_remove_armed, .{ .top = @intCast(gs.inset_top_l), .bottom = @intCast(gs.inset_bottom_l), .left = @intCast(gs.inset_left_l), .right = @intCast(gs.inset_right_l) }, true, true) catch g.content_h.*;
         } else if (g.chat_store != null and g.screen.* == feed_view.screen_messages) {
             // Zat Chat (U3, dev-gated): the Messages surface in the GPU's logical
             // design space; the rail is the shell's own tile (rail_external), and
