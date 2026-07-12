@@ -272,7 +272,7 @@ pub fn main(init: std.process.Init) !void {
         @memset(fb.pixels, clear);
         dl.len = 0;
         try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
-        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread.rows, cthread.cards, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{ .open = true, .confirm = true, .rail = .lightning, .amount = "150000", .note = "rent", .first_send = true }, .{}, &.{}, .{}, .{}, .{});
+        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread.rows, cthread.cards, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{ .open = true, .step = .confirm, .rail = .lightning, .amount = "150000", .note = "rent", .first_send = true }, .{}, &.{}, .{}, .{}, .{});
         try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
         try writePpm(io, gpa, &fb, "/tmp/zat_chat_pay_confirm.ppm");
         std.debug.print("wrote /tmp/zat_chat_pay_confirm.ppm (send confirm + disclosure)\n", .{});
@@ -761,7 +761,11 @@ pub fn main(init: std.process.Init) !void {
     @memset(fb.pixels, clear);
     dl.len = 0;
     try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
-    _ = try feed_view.layoutLoadout(gpa, &engine, @intCast(W), @intCast(H), &dl, null, lens_socket.seatedAccent(feed_t), 0, 0, null, feed_t, .{}, &fh, reply_t, .{}, &rh, zone_t, .{}, &zh, false, false, null, &.{}, "", false, false, null, null, &.{}, .{ .step = .landing, .answers = .{}, .config = discover.DEFAULT_CONFIG, .name = "", .color = 0 }, .{}, .{ .cards = &.{}, .text = "", .seated = 0 }, .{}, null);
+    // The marketplace's four loose args (cards/query/focus/loading) collapsed into
+    // one `MarketView` when the Algorithms page was overhauled; this call was never
+    // updated, so `zig build preview` has been failing to COMPILE ever since — and
+    // silently serving whatever .ppm files happened to be left in /tmp.
+    _ = try feed_view.layoutLoadout(gpa, &engine, @intCast(W), @intCast(H), &dl, null, lens_socket.seatedAccent(feed_t), 0, 0, null, feed_t, .{}, &fh, reply_t, .{}, &rh, zone_t, .{}, &zh, false, false, null, .{}, null, null, &.{}, .{ .step = .landing, .answers = .{}, .config = discover.DEFAULT_CONFIG, .name = "", .color = 0 }, .{}, .{ .cards = &.{}, .text = "", .seated = 0 }, .{}, null);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_loadout.ppm");
     std.debug.print("wrote /tmp/zat_loadout.ppm ({d}x{d}, {d} items)\n", .{ W, H, dl.len });
@@ -774,7 +778,7 @@ pub fn main(init: std.process.Init) !void {
     @memset(fb.pixels, clear);
     dl.len = 0;
     try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
-    _ = try feed_view.layoutLoadout(gpa, &engine, 430, @intCast(H), &dl, null, lens_socket.seatedAccent(feed_t), 0, 0, null, feed_t, .{}, &fh, reply_t, .{}, &rh, zone_t, .{}, &zh, false, false, null, &.{}, "", false, false, null, null, &.{}, .{ .step = .landing, .answers = .{}, .config = discover.DEFAULT_CONFIG, .name = "", .color = 0 }, .{}, feed_t, .{ .top = 48 }, null);
+    _ = try feed_view.layoutLoadout(gpa, &engine, 430, @intCast(H), &dl, null, lens_socket.seatedAccent(feed_t), 0, 0, null, feed_t, .{}, &fh, reply_t, .{}, &rh, zone_t, .{}, &zh, false, false, null, .{}, null, null, &.{}, .{ .step = .landing, .answers = .{}, .config = discover.DEFAULT_CONFIG, .name = "", .color = 0 }, .{}, feed_t, .{ .top = 48 }, null);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_loadout_phone.ppm");
     std.debug.print("wrote /tmp/zat_loadout_phone.ppm (430x{d}, {d} items)\n", .{ H, dl.len });
@@ -784,7 +788,7 @@ pub fn main(init: std.process.Init) !void {
     // 140 used to leave "Your feed, your rules" ghosting under the veil).
     @memset(fb.pixels, clear);
     dl.len = 0;
-    _ = try feed_view.layoutLoadout(gpa, &engine, 430, @intCast(H), &dl, null, lens_socket.seatedAccent(feed_t), 0, 2, null, feed_t, .{}, &fh, reply_t, .{}, &rh, zone_t, .{}, &zh, false, false, null, &.{}, "", false, false, null, null, &.{}, .{ .step = .landing, .answers = .{}, .config = discover.DEFAULT_CONFIG, .name = "", .color = 0 }, .{}, feed_t, .{ .top = 48 }, null);
+    _ = try feed_view.layoutLoadout(gpa, &engine, 430, @intCast(H), &dl, null, lens_socket.seatedAccent(feed_t), 0, 2, null, feed_t, .{}, &fh, reply_t, .{}, &rh, zone_t, .{}, &zh, false, false, null, .{}, null, null, &.{}, .{ .step = .landing, .answers = .{}, .config = discover.DEFAULT_CONFIG, .name = "", .color = 0 }, .{}, feed_t, .{ .top = 48 }, null);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_create_phone.ppm");
     std.debug.print("wrote /tmp/zat_create_phone.ppm (430x{d}, {d} items)\n", .{ H, dl.len });
@@ -820,7 +824,7 @@ pub fn main(init: std.process.Init) !void {
 
     // PHASE 2e — THE ZAT4 KEYBOARD over the chat thread: the in-app keys with
     // the accent circuit lines and the bitcoin key (letters page, shift off).
-    try feed_view.drawKeyboard(gpa, &dl, &engine, null, 430, @intCast(H), 24, lens_socket.seatedAccent(feed_t), false, 0, false, 0, 0, 0.42, true, false, .{}, false, 0);
+    try feed_view.drawKeyboard(gpa, &dl, &engine, null, 430, @intCast(H), 24, lens_socket.seatedAccent(feed_t), false, 0, false, 0, 0, 0.42, true, false, .{}, false, 0, 0, 0, 0);
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_kbd_phone.ppm");
     std.debug.print("wrote /tmp/zat_kbd_phone.ppm (430x{d}, {d} items)\n", .{ H, dl.len });

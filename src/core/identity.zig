@@ -261,6 +261,15 @@ const DidDocJson = struct {
 pub const ParsedDoc = struct {
     signing_key_multibase: []const u8,
     pds_url: []const u8,
+    /// The handle the document CLAIMS (first `at://` entry of `alsoKnownAs`);
+    /// "" when it claims none.
+    ///
+    /// A claim, not a proof. A DID document is written by the DID's own
+    /// controller, so anyone may claim any handle here. It becomes trustworthy
+    /// ONLY when the handle resolves back to this same DID (the bidirectional
+    /// check) — see `identity.handleForDid`, which is the only caller allowed
+    /// to surface it. Never render this field directly.
+    claimed_handle: []const u8 = "",
 };
 
 pub const DocError = error{
@@ -332,7 +341,14 @@ pub fn parseDidDocument(
         return error.MalformedDidDocument;
     }
 
-    return .{ .signing_key_multibase = key, .pds_url = pds };
+    // The document's claimed handle, carried out UNVERIFIED (see the field's
+    // note). `expected_handle`, when given, has already been checked against
+    // this list above; the DID-first path verifies it by resolving back.
+    const claimed = for (doc.alsoKnownAs) |aka| {
+        if (std.ascii.startsWithIgnoreCase(aka, "at://")) break aka["at://".len..];
+    } else "";
+
+    return .{ .signing_key_multibase = key, .pds_url = pds, .claimed_handle = claimed };
 }
 
 // ---------------------------------------------------------------------------

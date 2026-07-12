@@ -122,6 +122,47 @@ pub fn pdsForDid(
     return gpa.dupe(u8, doc.pds_url);
 }
 
+/// Resolve a DID to its VERIFIED handle — the inverse of `resolve`, for the
+/// DID-first paths (a conversation opened by an inbound message knows only the
+/// counterparty's DID).
+///
+///   DID ──> document ──> claimed handle ──(resolve it back)──> DID
+///
+/// The second leg is the whole point. A DID document is authored by its own
+/// controller, so `alsoKnownAs` is a CLAIM: any DID may claim `at://a-bank.com`.
+/// Trusting it directly would let anyone display an arbitrary name — and this
+/// name is rendered beside a Pay button, which makes a forgeable name strictly
+/// WORSE than showing the raw DID, because it looks authoritative. So the
+/// claimed handle is resolved independently (DNS TXT / well-known, the same path
+/// `resolve` uses) and must lead back to the DID we started from. It does not:
+/// `error.HandleNotVerified`, and the caller shows the DID.
+///
+/// Returns the handle (gpa-owned; caller frees). A malformed DID is rejected
+/// locally, before any network (E4 — a bad DID is an ordinary skip).
+pub fn handleForDid(
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    endpoints: Endpoints,
+    did: []const u8,
+) ![]u8 {
+    try core.validateDid(did);
+    var scratch_state = std.heap.ArenaAllocator.init(gpa); // C5: freed at scope end
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+
+    const doc = try verifiedDocForDid(scratch, io, environ, endpoints, did, null);
+    if (doc.claimed_handle.len == 0) return error.HandleNotVerified;
+
+    // Leg two: the claim must survive an independent resolution back to us.
+    const handle = try core.normalizeHandle(scratch, doc.claimed_handle);
+    const round_trip = didForHandle(scratch, io, environ, endpoints, handle) catch
+        return error.HandleNotVerified;
+    if (!std.mem.eql(u8, round_trip, did)) return error.HandleNotVerified;
+
+    return gpa.dupe(u8, handle);
+}
+
 /// Strategy 1: DNS TXT record via DoH. Strategy 2: HTTPS well-known.
 /// A DNS miss — or an unreachable/garbage resolver — is an ordinary,
 /// *expected* condition handled by falling through to the second strategy

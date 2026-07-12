@@ -366,6 +366,26 @@ pub fn conversationHandle(store: *const Store, conv: ConvIndex) []const u8 {
     return sliceSpan(store, store.convs.items(.handle)[@intFromEnum(conv)]);
 }
 
+/// The DIDs of every conversation still wearing no handle — the shell's work
+/// list for handle resolution (a conversation opened by an INBOUND message
+/// knows only the DID, so it would otherwise render as `did:plc:…` forever).
+///
+/// Pure: a query over the store, no clock, no network (B2). The shell resolves
+/// these off-thread and hands each answer back through `openConversation`,
+/// which reconciles the handle in place. `arena` owns the returned slice; the
+/// DIDs inside it borrow the store's text (they outlive the call only as long
+/// as the store does — the shell copies them before crossing the thread seam).
+pub fn unresolvedDids(arena: Allocator, store: *const Store) error{OutOfMemory}![][]const u8 {
+    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    const convs = store.convs.slice();
+    var i: u32 = 0;
+    while (i < store.convs.len) : (i += 1) {
+        if (convs.items(.handle)[i].len != 0) continue;
+        try out.append(arena, sliceSpan(store, convs.items(.did)[i]));
+    }
+    return out.toOwnedSlice(arena);
+}
+
 /// One payment row, by value — the shell reads facts through this, never
 /// the arrays (D3 by convention, same as the accessors above).
 pub fn paymentRow(store: *const Store, pay: PayIndex) PaymentRow {
@@ -1184,6 +1204,31 @@ pub fn deserializeStore(gpa: Allocator, bytes: []const u8) DeserializeError!Stor
 // ---------------------------------------------------------------------------
 // Tests (C6: leak-checked by std.testing.allocator)
 // ---------------------------------------------------------------------------
+
+test "unresolvedDids lists exactly the conversations still wearing no name" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+
+    _ = try openConversation(gpa, &store, "did:plc:named", "maya.zat4.com");
+    _ = try openConversation(gpa, &store, "did:plc:nameless", ""); // inbound: DID only
+    _ = try openConversation(gpa, &store, "did:plc:alsonameless", "");
+
+    const todo = try unresolvedDids(arena, &store);
+    try std.testing.expectEqual(@as(usize, 2), todo.len);
+    try std.testing.expectEqualStrings("did:plc:nameless", todo[0]);
+    try std.testing.expectEqualStrings("did:plc:alsonameless", todo[1]);
+
+    // Once the shell hands a resolved handle back, the conversation drops off
+    // the work list — this is what stops the sweep re-asking forever.
+    _ = try openConversation(gpa, &store, "did:plc:nameless", "oko.zat4.com");
+    const todo2 = try unresolvedDids(arena, &store);
+    try std.testing.expectEqual(@as(usize, 1), todo2.len);
+    try std.testing.expectEqualStrings("did:plc:alsonameless", todo2[0]);
+}
 
 test "openConversation dedupes by DID and reconciles the handle" {
     const gpa = std.testing.allocator;

@@ -302,7 +302,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, recv_back, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -1603,6 +1603,60 @@ fn iconFlask(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, s: i32, c: u3
     try line(gpa, dl, x + fxi(f * 0.60), y + fxi(f * 0.40), x + fxi(f * 0.82), y + fxi(f * 0.86), c, 2); // body right
     try line(gpa, dl, x + fxi(f * 0.18), y + fxi(f * 0.86), x + fxi(f * 0.82), y + fxi(f * 0.86), c, 2); // base
     try rect(gpa, dl, x + fxi(f * 0.30), y + fxi(f * 0.66), fxi(f * 0.40), fxi(f * 0.18), c, 2); // liquid
+}
+
+/// The bitcoin mark: a "B" with the two vertical strokes through it. The
+/// embedded fonts carry no ₿ glyph, so it is drawn — the composer used to spell
+/// it as a text "B" plus two loose ticks, which drifted apart at every size.
+/// Built from the same `line`/`rect` vocabulary as its siblings, so it scales.
+fn iconBitcoin(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, s: i32, c: u32) !void {
+    const f: f32 = @floatFromInt(s);
+    const st: u8 = @intCast(@max(2, @min(255, fxi(f * 0.09)))); // stroke
+    const l = x + fxi(f * 0.30); // the B's spine
+    const r = x + fxi(f * 0.72);
+    const top = y + fxi(f * 0.20);
+    const mid = y + fxi(f * 0.50);
+    const bot = y + fxi(f * 0.80);
+    try line(gpa, dl, l, top, l, bot, c, st); // spine
+    // The two bowls, squared off — a round bowl reads as a blob at 16px.
+    try line(gpa, dl, l, top, r - fxi(f * 0.06), top, c, st);
+    try line(gpa, dl, r, top + st, r, mid - st, c, st);
+    try line(gpa, dl, l, mid, r - fxi(f * 0.02), mid, c, st);
+    try line(gpa, dl, r + fxi(f * 0.04), mid + st, r + fxi(f * 0.04), bot - st, c, st);
+    try line(gpa, dl, l, bot, r + fxi(f * 0.02), bot, c, st);
+    // The two ticks that make it a currency and not a letter.
+    try line(gpa, dl, x + fxi(f * 0.42), y + fxi(f * 0.08), x + fxi(f * 0.42), top, c, st);
+    try line(gpa, dl, x + fxi(f * 0.58), y + fxi(f * 0.08), x + fxi(f * 0.58), top, c, st);
+    try line(gpa, dl, x + fxi(f * 0.42), bot, x + fxi(f * 0.42), y + fxi(f * 0.92), c, st);
+    try line(gpa, dl, x + fxi(f * 0.58), bot, x + fxi(f * 0.58), y + fxi(f * 0.92), c, st);
+}
+
+/// The lightning bolt — the rail mark. Two triangles: a bolt is a zigzag, and
+/// a stroked polyline reads as a scribble at icon sizes.
+fn iconLightning(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, s: i32, c: u32) !void {
+    const f: f32 = @floatFromInt(s);
+    try tri(
+        gpa,
+        dl,
+        x + fxi(f * 0.62),
+        y + fxi(f * 0.06),
+        x + fxi(f * 0.26),
+        y + fxi(f * 0.56),
+        x + fxi(f * 0.54),
+        y + fxi(f * 0.50),
+        c,
+    );
+    try tri(
+        gpa,
+        dl,
+        x + fxi(f * 0.38),
+        y + fxi(f * 0.94),
+        x + fxi(f * 0.74),
+        y + fxi(f * 0.44),
+        x + fxi(f * 0.46),
+        y + fxi(f * 0.50),
+        c,
+    );
 }
 
 /// An info mark — a circle with an "i" (a dot over a stem).
@@ -7742,12 +7796,18 @@ pub const ChatMotion = struct {
     /// Driven by its own shell spring, independent of any one bubble's morph.
     /// Default 1 = at rest (static previews, the software path).
     reflow_t: f32 = 1,
+    /// The money-modal entrance: 0 = fully out, 1 = seated. The scrim fades and
+    /// the panel rises on this one scalar (a shell spring). Default 1 = at rest,
+    /// so static previews and the software path draw the seated modal.
+    sheet_t: f32 = 1,
 
     comptime {
-        // A7.1: four f32 knobs, no padding. The per-bubble send/arrive scalars
-        // moved OUT to `BubbleXform` (U6b); the thread-reflow settle stayed as
-        // its own channel here.
-        assert(@sizeOf(ChatMotion) == 16);
+        // A7.1: budget 20 (was 16). `sheet_t` is a fifth f32 knob — the money
+        // modal's entrance spring — and f32s pack flush, so the growth is
+        // exactly the one field and no padding. Justified: without a motion
+        // channel the modal pops into existence, which is the "cheap" feel the
+        // payments overhaul exists to remove.
+        assert(@sizeOf(ChatMotion) == 20);
     }
 };
 
@@ -7808,6 +7868,44 @@ fn scaleAlpha(color: u32, a: f32) u32 {
 /// satoshis; BTC is a decimal-entry convenience for larger numbers.
 pub const PayUnit = enum(u8) { sats, btc };
 
+/// Which face of the pay flow is showing. An ENUM, not the old `open` ×
+/// `confirm` boolean pair: two booleans encode four states, two of which were
+/// nonsense, and nothing owned the question "what is one step back from here?"
+/// See `payBackEdge` — the single answer, which the keyboard, the back chevron,
+/// the system back gesture and the scrim all now consult.
+pub const PayStep = enum(u8) {
+    /// Compose: amount, note, rail — no money can move from this face.
+    compose,
+    /// The last money-hasn't-moved beat before the wallet hand-off (§8.2).
+    confirm,
+};
+
+/// One step back from `step`. `null` = there is no step behind this one, so
+/// back CLOSES the sheet.
+///
+/// This function exists because "back" was broken in four different places at
+/// once: the chevron popped the conversation out from under the open sheet
+/// (leaving its buttons visible but inert), the system back blurred a focus bit
+/// and consumed the press, Escape was wired only to the confirm face, and the
+/// receive flow had no back edge at all. One table, consulted by all of them.
+pub fn payBackEdge(step: PayStep) ?PayStep {
+    return switch (step) {
+        .compose => null, // → close
+        .confirm => .compose,
+    };
+}
+
+/// One step back from a receive-flow face (`null` = close). `rooted` is true
+/// when the paste form is where this user's flow BEGINS (they are already set
+/// up, so they came straight here and there is no onboarding behind it).
+pub fn recvBackEdge(mode: RecvMode, rooted: bool) ?RecvMode {
+    return switch (mode) {
+        .onboard => null, // → close
+        .paste => if (rooted) null else .onboard,
+        .wallets => .onboard,
+    };
+}
+
 /// The pay sheet's per-frame state — shell values in, pixels out.
 /// A7.2: cold struct, size guard waived — one transient parameter carrier.
 pub const ChatPaySheet = struct {
@@ -7821,10 +7919,9 @@ pub const ChatPaySheet = struct {
     focus: u8 = 0,
     /// One short amber line ("" = none): why the last attempt refused.
     status: []const u8 = "",
-    /// True while the send-confirm face is showing — the last money-hasn't-moved
-    /// moment before the wallet hand-off (PAYMENT_UX_SPEC §8.2). Requests never
-    /// confirm (they move no money); only sends.
-    confirm: bool = false,
+    /// Which face is showing (PAYMENT_UX_SPEC §8.2). Requests never reach
+    /// `.confirm` — they move no money; only sends do.
+    step: PayStep = .compose,
     /// True until the first-time irreversibility disclosure has been
     /// acknowledged this session — the confirm face shows the full warning
     /// (§8.1) the first time, then the short line after.
@@ -7834,6 +7931,11 @@ pub const ChatPaySheet = struct {
     /// Live USD-cents per 1 BTC for the ≈$ readout (0 = unknown → hidden). A
     /// plain price the shell refreshes off-thread; the view only formats it.
     usd_cents_per_btc: u64 = 0,
+    /// True while the shell's send worker is resolving the peer's address (and,
+    /// on Lightning, fetching the exact-amount invoice). The primary button
+    /// disarms and wears "Preparing…" — the honest state, and the one that stops
+    /// an impatient second tap from starting a second hand-off.
+    busy: bool = false,
 };
 
 /// Parse the amount draft to SATOSHIS for the entry unit — the ONE place
@@ -7928,9 +8030,14 @@ pub const ChatReceiveSheet = struct {
     /// True once a publish succeeded this session: the status reads as the green
     /// "you can receive" confirmation rather than an amber refusal.
     saved: bool = false,
+    /// True when the paste form is this user's ROOT face — they are already set
+    /// up, so they arrived straight at it and there is no onboarding step behind
+    /// it to go back to. Feeds `recvBackEdge`.
+    rooted: bool = false,
 
     comptime {
-        // Three slices (48) + two bools + a u8, packed into the trailing 8 = 56.
+        // Three slices (48) + three bools + a u8, packed into the trailing 8 = 56.
+        // (Unchanged: `rooted` landed in existing padding, so no A7.1 bump.)
         assert(@sizeOf(ChatReceiveSheet) == 56);
     }
 };
@@ -7957,6 +8064,239 @@ fn groupSats(buf: *[27]u8, v: u64) []const u8 {
         n += 1;
     }
     return buf[0..n];
+}
+
+// ---------------------------------------------------------------------------
+// The money modal — the chrome every payment surface wears.
+//
+// What was here before: a 254px strip wedged between the last bubble and the
+// composer, drawn as a bespoke brown slab (`0xFF201F18`) with four hand-placed
+// 1px border rects, its controls made of translucent grey washes. It read as a
+// debug panel, and it did not occlude or disarm the conversation behind it — a
+// stray tap while a sheet about MONEY was open still landed on the thread.
+//
+// What it is now: a centred panel in the app's own card vocabulary, over a
+// scrim that both dims the conversation and SWALLOWS its taps (the `.blocker`
+// grammar the nav bar and the keyboard have always used, and the payment sheets
+// never did). It rises on a spring instead of appearing.
+// ---------------------------------------------------------------------------
+
+/// Where a money modal's panel sits. A7.2: cold transient, waived.
+const ModalGeom = struct { x: i32, y: i32, w: i32, h: i32 };
+
+/// The widest a money modal grows. Wide enough for an address on one line,
+/// narrow enough that the eye still takes the amount in as one object.
+const modal_w_max: i32 = 460;
+
+/// Draw the scrim + panel and hand back the panel's rect.
+///
+/// `band_top`/`band_bot` bound where the panel may sit — the caller passes the
+/// region between the thread header and the bottom inset, so on a phone the
+/// modal centres in the space ABOVE the on-screen keyboard rather than being
+/// painted over by it.
+///
+/// `t` is the entrance spring (0 → 1): the scrim fades in and the panel rises
+/// the last few pixels into place.
+///
+/// `dismiss` is the modal's back edge (from `payBackEdge`/`recvBackEdge`), so a
+/// tap on the scrim does exactly what Escape and the back chevron do — one step
+/// back, never a silent no-op and never a stranded sheet.
+fn payModal(
+    gpa: Allocator,
+    dl: *raster.DrawList,
+    regions: ?*Regions,
+    area_x: i32,
+    area_w: i32,
+    band_top: i32,
+    band_bot: i32,
+    pane_h: i32,
+    sheet_h: i32,
+    t: f32,
+    dismiss: Action,
+) error{OutOfMemory}!ModalGeom {
+    const tc = std.math.clamp(t, 0, 1);
+
+    // The scrim. Its region is emitted FIRST so that every control drawn after
+    // it shadows it (hitTest is last-wins) — the panel's own buttons still win,
+    // but nothing behind the modal is reachable.
+    try rect(gpa, dl, area_x, 0, area_w, pane_h, scaleAlpha(0xC8000000, tc), 0);
+    try emitRegion(gpa, regions, area_x, 0, area_w, @intCast(@max(0, @min(32767, pane_h))), 0, dismiss);
+
+    const pw = @min(area_w - 32, modal_w_max);
+    const px = area_x + @divTrunc(area_w - pw, 2);
+    const band_h = band_bot - band_top;
+    // Centre in the band, but never above it — a tall sheet on a short phone
+    // pins to the top and simply runs long rather than sliding under the header.
+    const centred = band_top + @divTrunc(band_h - sheet_h, 2);
+    const rise: i32 = @intFromFloat((1 - tc) * 18);
+    const py = @max(band_top + 8, centred) + rise;
+
+    try cardBox(gpa, dl, px, py, pw, sheet_h, 16, panel);
+    return .{ .x = px, .y = py, .w = pw, .h = sheet_h };
+}
+
+/// One text field in a money modal: a solid card, an accent focus ring, the
+/// draft (or its placeholder) and the breathing caret. The composer's focus
+/// vocabulary, factored out of the four copies that had drifted apart.
+/// Returns the y below the field.
+fn payFieldRow(
+    gpa: Allocator,
+    dl: *raster.DrawList,
+    e: *const text.Engine,
+    regions: ?*Regions,
+    accent: u32,
+    x: i32,
+    y: i32,
+    w: i32,
+    draft: []const u8,
+    placeholder: []const u8,
+    focused: bool,
+    caret_phase: f32,
+    weight: text.Weight,
+    act: Action,
+) error{OutOfMemory}!i32 {
+    const h: i32 = 42;
+    try cardBox(gpa, dl, x, y, w, h, 12, if (focused) panel_hover else panel);
+    if (focused) {
+        const fr = (0xE0 << 24) | (accent & 0x00FFFFFF);
+        try rect(gpa, dl, x - 1, y - 1, w + 2, h + 2, fr, 13);
+        try rect(gpa, dl, x, y, w, h, panel_hover, 12);
+    }
+    const maxw = w - 28;
+    var pen: i32 = x + 14;
+    if (draft.len > 0) {
+        try strEllipsis(gpa, dl, e, weight, x + 14, y + 27, ink, 15, draft, maxw);
+        const tw: i32 = @intCast(text.measure(e, weight, draft, 15));
+        pen = x + 14 + @min(tw, maxw);
+    } else {
+        try strEllipsis(gpa, dl, e, .regular, x + 14, y + 27, faint, 15, placeholder, maxw);
+    }
+    if (focused) {
+        const ca = caretAlpha(caret_phase);
+        try rect(gpa, dl, pen + 2, y + 11, 2, 20, scaleAlpha((0xE0 << 24) | (accent & 0x00FFFFFF), ca), 0);
+    }
+    try emitRegion(gpa, regions, x, y, w, @intCast(h), 0, act);
+    return y + h;
+}
+
+/// WHO you are paying — row one of the trust spine (PAYMENT_UX_SPEC §2), and the
+/// thing the old sheet got most wrong: it addressed people as
+/// `did:plc:uelpy3ug6lkvisqcxt5ovva2`.
+///
+/// `verified` claims the ✓ mark, and it is a real claim, not decoration: it says
+/// the peer's receive address was resolved and its signature checked against the
+/// anchor PINNED to this conversation — which is why a compromised server cannot
+/// silently reroute the money. Pass it only where that check has actually run
+/// (the confirm face). The compose face has not run it and does not claim it.
+///
+/// Returns the y below the block.
+fn payWhoBlock(
+    gpa: Allocator,
+    dl: *raster.DrawList,
+    e: *const text.Engine,
+    x: i32,
+    y: i32,
+    w: i32,
+    name: []const u8,
+    key: []const u8,
+    verified: bool,
+) error{OutOfMemory}!i32 {
+    const av: i32 = 40;
+    try rect(gpa, dl, x, y, av, av, tintFor(key), @intCast(@divTrunc(av, 2)));
+    const ini = [1]u8{initialOf(key)};
+    const inw: i32 = @intCast(text.measure(e, .semibold, &ini, 17));
+    _ = try str(gpa, dl, e, .semibold, x + @divTrunc(av - inw, 2), y + 26, 0xFF0B0B0F, 17, &ini);
+    const tx = x + av + 12;
+    const tw = w - av - 12;
+    if (verified) {
+        try strEllipsis(gpa, dl, e, .semibold, tx, y + 18, ink, 15, name, tw);
+        try strEllipsis(gpa, dl, e, .semibold, tx, y + 36, boost_c, 11, "\u{2713} verified \u{00B7} address pinned to this chat", tw);
+    } else {
+        try strEllipsis(gpa, dl, e, .semibold, tx, y + 27, ink, 15, name, tw);
+    }
+    return y + 56;
+}
+
+/// How tall a modal's wrapped note will be. Measured, not guessed, so the panel
+/// can be sized to fit it before it is drawn — a note that wraps to three lines
+/// on a phone must not push the buttons out through the bottom of the panel.
+///
+/// NOTE on `wrapBody`: it returns the final BASELINE, not a height. Its other
+/// callers only get away with reading it as a height because they measure from
+/// baseline 0. Measuring from 0 here keeps that contract explicit.
+fn noteHeight(
+    gpa: Allocator,
+    dl: *raster.DrawList,
+    e: *const text.Engine,
+    w: i32,
+    s: []const u8,
+) error{OutOfMemory}!i32 {
+    return wrapBody(gpa, dl, e, 0, 0, w, 0, 13, s, 18, false, null);
+}
+
+/// Draw a modal's wrapped muted note. Returns the y below it — consistent with
+/// `noteHeight`, so the measure and the paint can never disagree.
+fn wrapNote(
+    gpa: Allocator,
+    dl: *raster.DrawList,
+    e: *const text.Engine,
+    x: i32,
+    y: i32,
+    w: i32,
+    s: []const u8,
+) error{OutOfMemory}!i32 {
+    const h = try noteHeight(gpa, dl, e, w, s);
+    _ = try wrapBody(gpa, dl, e, x, y + 14, w, muted, 13, s, 18, true, null);
+    return y + h;
+}
+
+/// The two fixed notes the receive flow wraps. Named so the height measured for
+/// the panel and the string drawn into it are provably the same text.
+const recv_onboard_note = "People in your chats can send you bitcoin once you add a wallet address. You keep the keys.";
+const recv_paste_note = "Paste an address so people can pay you. A Lightning address (you@wallet.com) is easiest.";
+
+/// The trust line every money surface repeats, because non-custody is the one
+/// thing a user cannot infer and must never assume (PAYMENT_UX_SPEC §2).
+const non_custody_line = "Zat4 never holds your money \u{2014} it goes straight from your wallet to theirs.";
+
+/// The width of a `shortDid` result — `did:plc:` + 5 + "…" + 5, with room to
+/// spare for a longer method (`did:web:`). Callers stack-allocate this.
+pub const short_did_len: usize = 48;
+
+/// A DID is not a name. Render one SHORT — `did:plc:uelpy…5ovva2` — wherever a
+/// person must be addressed before their handle is known (or when it never will
+/// be: an `alsoKnownAs` claim that fails the round-trip check is refused by
+/// `identity.handleForDid`, and refusing to name someone is the honest outcome,
+/// not a bug).
+///
+/// It stays visibly a DID on purpose. The alternative — inventing a friendly
+/// name from an unverified claim — is exactly the impersonation vector we
+/// refuse, and this string sits next to a Pay button. Anything that is not a
+/// DID passes through untouched.
+///
+/// The part of an identity that actually VARIES between people — a DID's
+/// method-specific id (`uelpy3ug…` of `did:plc:uelpy3ug…`), or the whole string
+/// when it is already a handle.
+///
+/// This exists because `initialOf` and `tintFor` key off the first character,
+/// and every DID on earth begins "did:" — so an unresolved chat list rendered a
+/// column of identically-coloured discs all wearing the letter "d". Keying off
+/// the id instead gives each unnamed person a distinct letter and tint.
+pub fn didKey(s: []const u8) []const u8 {
+    if (!std.mem.startsWith(u8, s, "did:")) return s;
+    const colon = std.mem.lastIndexOfScalar(u8, s, ':') orelse return s;
+    return s[colon + 1 ..];
+}
+
+/// Pure, no allocation: writes into `buf`, returns a slice of `buf` or of `s`.
+pub fn shortDid(buf: []u8, s: []const u8) []const u8 {
+    if (!std.mem.startsWith(u8, s, "did:")) return s;
+    const colon = std.mem.lastIndexOfScalar(u8, s, ':') orelse return s;
+    const id = s[colon + 1 ..];
+    if (id.len <= 12) return s; // already short — eliding would not pay
+    return std.fmt.bufPrint(buf, "{s}{s}\u{2026}{s}", .{
+        s[0 .. colon + 1], id[0..5], id[id.len - 5 ..],
+    }) catch s;
 }
 
 /// The actions a payment card offers in its current state. A card shows a
@@ -8348,6 +8688,13 @@ pub fn layoutChat(
     // the system back returns to the list. ──
     const phone = width <= phone_max;
     const phone_thread = phone and peer.len > 0;
+    // How this person is NAMED on screen. `peer` is the conversation's identity
+    // (the handle when one has been verified, else the raw DID); everything the
+    // eye sees goes through here instead, so an unresolved counterparty reads as
+    // `did:plc:uelpy…5ovva2` rather than a 32-char hex wall — and, critically,
+    // so the avatar's initial is not the letter "d" for every unnamed person.
+    var peer_disp_buf: [short_did_len]u8 = undefined;
+    const peer_disp = shortDid(&peer_disp_buf, peer);
     const top: i32 = if (phone) insets.top + 18 else if (m.wide) 40 else 30;
     const list_w: i32 = if (phone) w else std.math.clamp(@divTrunc(w * 34, 100), 220, 320);
     const split_gap: i32 = 28;
@@ -8464,8 +8811,12 @@ pub fn layoutChat(
         if (on) try rect(gpa, dl, x0, ly, list_w, row_h - 6, (0x1F << 24) | (accent & 0x00FFFFFF), 12);
         const av: i32 = if (phone) 50 else 40;
         const av_y = ly + @divTrunc(row_h - 6 - av, 2);
-        try rect(gpa, dl, x0 + 10, av_y, av, av, tintFor(row.name), @intCast(@divTrunc(av, 2)));
-        const ini = [1]u8{initialOf(row.name)};
+        // Key the disc off the identity, not the literal label: every DID
+        // begins "did:", so tinting/lettering the raw name painted the whole
+        // list as identical "d" discs.
+        const rkey = didKey(row.name);
+        try rect(gpa, dl, x0 + 10, av_y, av, av, tintFor(rkey), @intCast(@divTrunc(av, 2)));
+        const ini = [1]u8{initialOf(rkey)};
         const ini_px: u16 = if (phone) 21 else 18;
         const iw: i32 = @intCast(text.measure(e, .semibold, &ini, ini_px));
         _ = try str(gpa, dl, e, .semibold, x0 + 10 + @divTrunc(av - iw, 2), av_y + @divTrunc(av, 2) + 7, 0xFF20201A, ini_px, &ini);
@@ -8484,7 +8835,9 @@ pub fn layoutChat(
         }
         const tx = x0 + 10 + av + 14;
         const tw = right - 46 - tx; // clear of the age column
-        try strEllipsis(gpa, dl, e, .semibold, tx, ly + @as(i32, if (phone) 30 else 26), if (on) ink else body_c, @as(u16, if (phone) 16 else 15), row.name, tw);
+        var rname_buf: [short_did_len]u8 = undefined;
+        const rname = shortDid(&rname_buf, row.name);
+        try strEllipsis(gpa, dl, e, .semibold, tx, ly + @as(i32, if (phone) 30 else 26), if (on) ink else body_c, @as(u16, if (phone) 16 else 15), rname, tw);
         if (row.preview.len > 0) {
             // Unread conversations keep their preview bright (the classic cue).
             const pw: text.Weight = if (row.unread > 0) .semibold else .regular;
@@ -8728,18 +9081,19 @@ pub fn layoutChat(
         _ = try str(gpa, dl, e, .semibold, x0 + 2, bar_cy + 10, ink, 27, "\u{2039}");
         try emitRegion(gpa, regions, x0 - 12, bar_cy - 22, 60, 52, 0, .back);
         const pav: i32 = 30;
-        const pnw: i32 = @intCast(text.measure(e, .semibold, peer, 16));
+        const pkey = didKey(peer);
+        const pnw: i32 = @intCast(text.measure(e, .semibold, peer_disp, 16));
         const block_w = pav + 10 + @min(pnw, w - 140);
         const bx0 = x0 + @divTrunc(w - block_w, 2);
-        try rect(gpa, dl, bx0, bar_cy - @divTrunc(pav, 2) - 3, pav, pav, tintFor(peer), @intCast(@divTrunc(pav, 2)));
-        const pini = [1]u8{initialOf(peer)};
+        try rect(gpa, dl, bx0, bar_cy - @divTrunc(pav, 2) - 3, pav, pav, tintFor(pkey), @intCast(@divTrunc(pav, 2)));
+        const pini = [1]u8{initialOf(pkey)};
         const piw: i32 = @intCast(text.measure(e, .semibold, &pini, 14));
         _ = try str(gpa, dl, e, .semibold, bx0 + @divTrunc(pav - piw, 2), bar_cy + 8, 0xFF20201A, 14, &pini);
-        try strEllipsis(gpa, dl, e, .semibold, bx0 + pav + 10, bar_cy + 8, ink, 16, peer, w - 140);
+        try strEllipsis(gpa, dl, e, .semibold, bx0 + pav + 10, bar_cy + 8, ink, 16, peer_disp, w - 140);
     } else {
         const hdr_x = detail_x - @divTrunc(split_gap, 2) + 1;
         try rect(gpa, dl, hdr_x, 0, x0 + w - hdr_x, thread_top, skinHeaderVeil(accent), 0);
-        _ = try str(gpa, dl, e, .semibold, detail_x, top + 26, ink, 16, peer);
+        _ = try str(gpa, dl, e, .semibold, detail_x, top + 26, ink, 16, peer_disp);
         try rect(gpa, dl, detail_x, top + 40, detail_w, 1, divider, 0);
     }
 
@@ -8786,7 +9140,7 @@ pub fn layoutChat(
     } else {
         var pbuf: [96]u8 = undefined;
         // Phone: plain "Message" — the peer already heads the app bar.
-        const ph = if (phone) "Message" else std.fmt.bufPrint(&pbuf, "Message {s}", .{peer}) catch "Message";
+        const ph = if (phone) "Message" else std.fmt.bufPrint(&pbuf, "Message {s}", .{peer_disp}) catch "Message";
         try strEllipsis(gpa, dl, e, .regular, input_x + 14, comp_y + 31, faint, chat_px, ph, input_w - 28);
     }
     if (input_focus) {
@@ -8863,393 +9217,334 @@ pub fn layoutChat(
     }
     try emitRegion(gpa, regions, sx, sy, send_w, 46, 0, .chat_send);
 
-    // ── The pay sheet (M5 A4): compose a request or a send. Sits above the
-    // composer; drawn (and its regions emitted) LAST, so it shadows anything
-    // beneath it (hitTest is last-wins). Near-opaque — the thread must not
-    // bleed through a surface that talks about money. ──
+    // ── The money modal. One chrome (`payModal`), four faces: the send-confirm,
+    // the pay compose sheet, and the receive-setup flow's three modes. Drawn and
+    // emitted LAST, so their regions shadow the thread (hitTest is last-wins),
+    // and the scrim disarms everything they do not themselves cover. ──
+    //
+    // The band a modal may occupy: below the thread header, above the bottom
+    // inset. That inset already carries the on-screen keyboard's height, so a
+    // phone modal centres in the space the keyboard LEAVES rather than being
+    // painted over by it (the keyboard draws in a later tile).
+    const modal_top = thread_top;
+    const modal_bot = height - insets.bottom;
+
     // The send-confirm face (§8.2): the last money-hasn't-moved beat before the
-    // wallet hand-off. Who + ✓ verified, the amount, and the irreversibility
-    // warning — the full first-time disclosure (§8.1) once, the short line after.
-    if (pay.open and pay.confirm) {
+    // wallet hand-off. Who + ✓ verified, the amount as the hero, and the
+    // irreversibility warning — the full first-time disclosure (§8.1) once, the
+    // short line every time after.
+    if (pay.open and pay.step == .confirm) {
         const amt_val = payAmountToSats(pay.amount, pay.unit) orelse 0;
         const large = amt_val >= pay_large_sat;
         const has_note = pay.note.len > 0;
-        var sheet_h: i32 = 16 + 30 + 26 + 34; // pad + title + paying + amount
-        if (has_note) sheet_h += 20;
-        sheet_h += if (pay.first_send) 62 else 22; // disclosure
-        if (large) sheet_h += 22;
-        sheet_h += 54; // buttons + pad
-        const sy0 = comp_y - sheet_h - 12;
-        try rect(gpa, dl, detail_x, sy0, detail_w, sheet_h, 0xFF201F18, 16);
-        const ring_c = (0x90 << 24) | (accent & 0x00FFFFFF);
-        try rect(gpa, dl, detail_x, sy0, detail_w, 1, ring_c, 0);
-        try rect(gpa, dl, detail_x, sy0 + sheet_h - 1, detail_w, 1, ring_c, 0);
-        try rect(gpa, dl, detail_x, sy0, 1, sheet_h, ring_c, 0);
-        try rect(gpa, dl, detail_x + detail_w - 1, sy0, 1, sheet_h, ring_c, 0);
 
-        var py = sy0 + 16;
-        _ = try str(gpa, dl, e, .semibold, detail_x + 18, py + 14, ink, 15, "Confirm payment");
+        var sheet_h: i32 = 20 + 30 + 56 + 74 + 14;
+        if (has_note) sheet_h += 22;
+        sheet_h += if (pay.first_send) 66 else 24;
+        if (large) sheet_h += 26;
+        sheet_h += 46 + 20;
+
+        const mg = try payModal(gpa, dl, regions, x0, w, modal_top, modal_bot, height, sheet_h, motion.sheet_t, .pay_confirm_back);
+        const ix = mg.x + 20;
+        const iw = mg.w - 40;
+        var py = mg.y + 20;
+
+        _ = try str(gpa, dl, e, .semibold, ix, py + 18, ink, 17, "Confirm payment");
         py += 30;
+
+        // WHO, and the ✓ mark. Verified is claimed HERE and only here: this face
+        // is reached after the peer's address was resolved and validated against
+        // the anchor pinned to this conversation. The compose face below has done
+        // no such check and therefore makes no such claim.
+        py = try payWhoBlock(gpa, dl, e, ix, py, iw, peer_disp, didKey(peer), true);
+
+        // The amount, as the hero. It used to be a 22px line lost among labels.
         {
-            var hb: [96]u8 = undefined;
-            const s = std.fmt.bufPrint(&hb, "Paying {s}", .{peer}) catch "Payment";
-            try strEllipsis(gpa, dl, e, .semibold, detail_x + 18, py + 14, ink, 13, s, detail_w - 130);
-            const vl = "\u{2713} verified";
-            const vw: i32 = @intCast(text.measure(e, .semibold, vl, 11));
-            _ = try str(gpa, dl, e, .semibold, detail_x + detail_w - 18 - vw, py + 14, 0xFF9BCE9B, 11, vl);
-        }
-        py += 26;
-        {
+            const amt_h: i32 = 74;
+            try cardBox(gpa, dl, ix, py, iw, amt_h, 12, bg);
             var gb: [27]u8 = undefined;
             const amt = groupSats(&gb, amt_val);
-            const pen = try str(gpa, dl, e, .semibold, detail_x + 18, py + 22, ink, 22, amt);
-            const pen2 = try str(gpa, dl, e, .regular, pen + 6, py + 22, muted, 13, "sats");
-            // The ≈$ value at the confirm moment too — the amount is fixed now.
+            const pen = try str(gpa, dl, e, .semibold, ix + 16, py + 44, ink, 30, amt);
+            _ = try str(gpa, dl, e, .regular, pen + 8, py + 44, muted, 14, "sats");
             if (pay.usd_cents_per_btc > 0) {
                 var fbuf: [40]u8 = undefined;
                 const fs = formatFiat(&fbuf, amt_val, pay.usd_cents_per_btc);
-                if (fs.len > 0) _ = try str(gpa, dl, e, .regular, pen2 + 10, py + 22, faint, 12, fs);
+                if (fs.len > 0) _ = try str(gpa, dl, e, .regular, ix + 16, py + 64, faint, 13, fs);
             }
-            const rl = if (pay.rail == .lightning) "LIGHTNING" else "ON-CHAIN";
-            const rw: i32 = @intCast(text.measure(e, .semibold, rl, 11));
-            _ = try str(gpa, dl, e, .semibold, detail_x + detail_w - 18 - rw, py + 18, faint, 11, rl);
+            const rl = if (pay.rail == .lightning) "Lightning" else "On-chain";
+            const rw: i32 = @intCast(text.measure(e, .semibold, rl, 12));
+            const rx = ix + iw - 16 - rw;
+            _ = try str(gpa, dl, e, .semibold, rx, py + 28, muted, 12, rl);
+            if (pay.rail == .lightning)
+                try iconLightning(gpa, dl, rx - 20, py + 16, 15, muted)
+            else
+                try iconBitcoin(gpa, dl, rx - 20, py + 16, 15, muted);
         }
-        py += 34;
+        py += 74 + 14;
+
         if (has_note) {
-            try strEllipsis(gpa, dl, e, .regular, detail_x + 18, py + 12, muted, 12, pay.note, detail_w - 36);
-            py += 20;
+            try strEllipsis(gpa, dl, e, .regular, ix, py + 12, muted, 13, pay.note, iw);
+            py += 22;
         }
         if (pay.first_send) {
-            _ = try strEllipsis(gpa, dl, e, .regular, detail_x + 18, py + 12, body_c, 11, "Payments are final \u{2014} they can't be reversed or refunded.", detail_w - 36);
-            py += 18;
-            _ = try strEllipsis(gpa, dl, e, .regular, detail_x + 18, py + 12, body_c, 11, "Only send to people you know and trust completely.", detail_w - 36);
-            py += 18;
-            _ = try strEllipsis(gpa, dl, e, .regular, detail_x + 18, py + 12, body_c, 11, "Zat4 never holds your money \u{2014} it goes straight to them.", detail_w - 36);
+            _ = try strEllipsis(gpa, dl, e, .regular, ix, py + 12, body_c, 12, "Payments are final \u{2014} they can't be reversed or refunded.", iw);
+            py += 20;
+            _ = try strEllipsis(gpa, dl, e, .regular, ix, py + 12, body_c, 12, "Only send to people you know and trust completely.", iw);
+            py += 20;
+            _ = try strEllipsis(gpa, dl, e, .regular, ix, py + 12, body_c, 12, non_custody_line, iw);
             py += 26;
         } else {
-            _ = try strEllipsis(gpa, dl, e, .regular, detail_x + 18, py + 12, muted, 11, "Payments can't be undone. Only send to people you trust.", detail_w - 36);
-            py += 22;
+            _ = try strEllipsis(gpa, dl, e, .regular, ix, py + 12, muted, 12, "Payments can't be undone. Only send to people you trust.", iw);
+            py += 24;
         }
         if (large) {
-            _ = try str(gpa, dl, e, .semibold, detail_x + 18, py + 12, 0xFFE0A868, 12, "This is a large amount \u{2014} double-check it.");
-            py += 22;
+            _ = try str(gpa, dl, e, .semibold, ix, py + 12, 0xFFE0A868, 13, "This is a large amount \u{2014} double-check it.");
+            py += 26;
         }
         {
-            const back_w: i32 = 92;
-            var bx3 = detail_x + 18;
-            try rect(gpa, dl, bx3, py, back_w, 42, 0x2AEDEAE0, 14);
-            const blw: i32 = @intCast(text.measure(e, .semibold, "Back", 13));
-            _ = try str(gpa, dl, e, .semibold, bx3 + @divTrunc(back_w - blw, 2), py + 27, body_c, 13, "Back");
-            try emitRegion(gpa, regions, bx3, py, back_w, 42, 0, .pay_confirm_back);
-            bx3 += back_w + 8;
-            const conf_w = detail_x + detail_w - 18 - bx3;
-            try rect(gpa, dl, bx3, py, conf_w, 42, accent, 14);
-            const cl = "Confirm \u{2014} open wallet";
-            const clw2: i32 = @intCast(text.measure(e, .semibold, cl, 13));
-            _ = try str(gpa, dl, e, .semibold, bx3 + @divTrunc(conf_w - clw2, 2), py + 27, 0xFF20201A, 13, cl);
-            try emitRegion(gpa, regions, bx3, py, conf_w, 42, 0, .pay_send);
+            const back_w: i32 = 104;
+            try buttonSecondary(gpa, e, dl, regions, ix, py, back_w, 46, "Back", 0, .pay_confirm_back);
+            const cx2 = ix + back_w + 10;
+            // While the worker is resolving the address + invoice, the button says
+            // so and refuses a second tap. It cannot lie about progress, because
+            // the wallet only opens when the result actually lands.
+            const label: []const u8 = if (pay.busy) "Preparing\u{2026}" else "Confirm \u{2014} open wallet";
+            try buttonPrimary(gpa, e, dl, regions, cx2, py, iw - back_w - 10, 46, label, accent, 0, .pay_send, !pay.busy);
         }
     }
 
-    if (pay.open and !pay.confirm) {
-        const status_extra: i32 = if (pay.status.len > 0) 24 else 0;
-        // The ≈$ line shows only when a price is known and the amount parses.
+    // The compose face: amount, note, rail. No money can move from here — the
+    // Send button ARMS the confirm face above; only Request fires directly
+    // (a request moves nothing).
+    if (pay.open and pay.step == .compose) {
         const sheet_sats = payAmountToSats(pay.amount, pay.unit);
         const show_fiat = pay.usd_cents_per_btc > 0 and sheet_sats != null;
-        const fiat_extra: i32 = if (show_fiat) 20 else 0;
-        // +30 for the "set up how you get paid" link row at the foot.
-        const sheet_h: i32 = 254 + 30 + status_extra + fiat_extra;
-        const sy0 = comp_y - sheet_h - 12;
-        try rect(gpa, dl, detail_x, sy0, detail_w, sheet_h, 0xFF201F18, 16);
-        const ring_c = (0x90 << 24) | (accent & 0x00FFFFFF);
-        try rect(gpa, dl, detail_x, sy0, detail_w, 1, ring_c, 0);
-        try rect(gpa, dl, detail_x, sy0 + sheet_h - 1, detail_w, 1, ring_c, 0);
-        try rect(gpa, dl, detail_x, sy0, 1, sheet_h, ring_c, 0);
-        try rect(gpa, dl, detail_x + detail_w - 1, sy0, 1, sheet_h, ring_c, 0);
+        const status_extra: i32 = if (pay.status.len > 0) 26 else 0;
+        const fiat_extra: i32 = if (show_fiat) 22 else 0;
+        const sheet_h: i32 = 20 + 30 + 56 + 44 + 38 + 42 + fiat_extra + 12 + 42 + 12 +
+            status_extra + 46 + 34 + 16;
 
-        var py = sy0 + 16;
-        // Header: who, and the rail toggle (two pills, selected = accent).
+        const mg = try payModal(gpa, dl, regions, x0, w, modal_top, modal_bot, height, sheet_h, motion.sheet_t, .pay_cancel);
+        const ix = mg.x + 20;
+        const iw = mg.w - 40;
+        var py = mg.y + 20;
+
+        _ = try str(gpa, dl, e, .semibold, ix, py + 18, ink, 17, "Send bitcoin");
+        // A modal must be dismissible without hunting for the scrim. Same back
+        // edge as Escape and the chevron — `payBackEdge(.compose)` = close.
         {
-            var hbuf: [96]u8 = undefined;
-            const hs = std.fmt.bufPrint(&hbuf, "Pay {s}", .{peer}) catch "Pay";
-            try strEllipsis(gpa, dl, e, .semibold, detail_x + 18, py + 14, ink, 14, hs, detail_w - 260);
-            var rx = detail_x + detail_w - 18;
-            const rails = [2][]const u8{ "On-chain", "Lightning" }; // drawn right-to-left
-            for (rails, 0..) |label, ri| {
-                const rail_val: chat_msg.Rail = if (ri == 0) .onchain else .lightning;
-                const on = pay.rail == rail_val;
-                const lw: i32 = @intCast(text.measure(e, .semibold, label, 12));
-                const pw = lw + 22;
-                rx -= pw;
-                try rect(gpa, dl, rx, py - 3, pw, 28, if (on) accent else 0x2AEDEAE0, 14);
-                _ = try str(gpa, dl, e, .semibold, rx + 11, py + 15, if (on) 0xFF20201A else body_c, 12, label);
-                try emitRegion(gpa, regions, rx, py - 3, pw, 28, @intFromEnum(rail_val), .pay_rail);
-                rx -= 8;
+            const qx = mg.x + mg.w - 40;
+            const qy = mg.y + 14;
+            _ = try str(gpa, dl, e, .regular, qx + 8, qy + 21, muted, 19, "\u{00D7}");
+            try emitRegion(gpa, regions, qx, qy, 32, 32, 0, .pay_cancel);
+        }
+        py += 30;
+
+        // WHO. No ✓ here: nothing has been resolved yet, so nothing is claimed.
+        py = try payWhoBlock(gpa, dl, e, ix, py, iw, peer_disp, didKey(peer), false);
+
+        // The rail: a segmented control. It used to be two floating pills, one of
+        // which always looked disabled.
+        {
+            const seg_h: i32 = 36;
+            try cardBox(gpa, dl, ix, py, iw, seg_h, 10, bg);
+            const half = @divTrunc(iw - 8, 2);
+            const rails = [2]struct { label: []const u8, val: chat_msg.Rail }{
+                .{ .label = "Lightning", .val = .lightning },
+                .{ .label = "On-chain", .val = .onchain },
+            };
+            for (rails, 0..) |r, ri| {
+                const seg_x = ix + 4 + @as(i32, @intCast(ri)) * half;
+                const on = pay.rail == r.val;
+                if (on) try rect(gpa, dl, seg_x, py + 4, half, seg_h - 8, accent, 8);
+                const lw: i32 = @intCast(text.measure(e, .semibold, r.label, 13));
+                _ = try str(gpa, dl, e, .semibold, seg_x + @divTrunc(half - lw, 2), py + 23, if (on) 0xFF0B0B0F else body_c, 13, r.label);
+                try emitRegion(gpa, regions, seg_x, py + 4, half, @intCast(seg_h - 8), @intFromEnum(r.val), .pay_rail);
             }
         }
-        py += 38;
-        // Amount chips: one tap fills the amount.
+        py += 44;
+
+        // Preset amounts. The seated one lights, so the chips and the field agree.
         {
-            var cx = detail_x + 18;
+            var cx = ix;
+            const chip_h: i32 = 30;
             for (pay_chips, 0..) |chip, ci| {
                 var gb: [27]u8 = undefined;
                 const cs = groupSats(&gb, chip);
-                const lw: i32 = @intCast(text.measure(e, .regular, cs, 13));
-                const pw = lw + 24;
-                try rect(gpa, dl, cx, py, pw, 30, 0x2AEDEAE0, 12);
-                _ = try str(gpa, dl, e, .regular, cx + 12, py + 20, body_c, 13, cs);
-                try emitRegion(gpa, regions, cx, py, pw, 30, @intCast(ci), .pay_chip);
-                cx += pw + 8;
-            }
-        }
-        py += 40;
-        // The two inputs: amount (digits) and note. The focused one wears
-        // the ring + caret — the composer's focus vocabulary.
-        const unit_label = if (pay.unit == .btc) "BTC" else "sats";
-        const amount_ph = if (pay.unit == .btc) "amount in BTC" else "amount in sats";
-        const fields = [2]struct { draft: []const u8, ph: []const u8, act: Action }{
-            .{ .draft = pay.amount, .ph = amount_ph, .act = .pay_amount },
-            .{ .draft = pay.note, .ph = "note (optional)", .act = .pay_note },
-        };
-        for (fields, 0..) |fld, fi| {
-            const focused = pay.focus == fi;
-            try rect(gpa, dl, detail_x + 18, py, detail_w - 36, 38, 0x22EDEAE0, 12);
-            if (focused) {
-                const fr = (0xC0 << 24) | (accent & 0x00FFFFFF);
-                try rect(gpa, dl, detail_x + 18, py, detail_w - 36, 1, fr, 0);
-                try rect(gpa, dl, detail_x + 18, py + 37, detail_w - 36, 1, fr, 0);
-                try rect(gpa, dl, detail_x + 18, py, 1, 38, fr, 0);
-                try rect(gpa, dl, detail_x + detail_w - 19, py, 1, 38, fr, 0);
-            }
-            var fpen: i32 = detail_x + 32;
-            if (fld.draft.len > 0) {
-                fpen = try str(gpa, dl, e, if (fi == 0) .semibold else .regular, detail_x + 32, py + 25, ink, 14, fld.draft);
-            } else {
-                _ = try str(gpa, dl, e, .regular, detail_x + 32, py + 25, faint, 14, fld.ph);
-            }
-            if (focused) {
-                const ca = caretAlpha(motion.caret_phase);
-                try rect(gpa, dl, fpen + 2, py + 10, 2, 18, scaleAlpha((0xE0 << 24) | (accent & 0x00FFFFFF), ca), 0);
-            }
-            try emitRegion(gpa, regions, detail_x + 18, py, detail_w - 36, 38, 0, fld.act);
-            // The amount row carries a tappable UNIT toggle (sats ⇄ BTC),
-            // right-aligned inside the field.
-            if (fi == 0) {
-                const ulw: i32 = @intCast(text.measure(e, .semibold, unit_label, 12));
-                const upw = ulw + 22;
-                const ux = detail_x + detail_w - 19 - upw - 3;
-                try rect(gpa, dl, ux, py + 4, upw, 30, 0x33EDEAE0, 10);
-                _ = try str(gpa, dl, e, .semibold, ux + 11, py + 25, body_c, 12, unit_label);
-                try emitRegion(gpa, regions, ux, py + 4, upw, 30, 0, .pay_unit);
-            }
-            py += 46;
-            // The ≈$ readout under the amount (a price we know, an amount we can read).
-            if (fi == 0 and show_fiat) {
-                var fbuf: [40]u8 = undefined;
-                const fs = formatFiat(&fbuf, sheet_sats.?, pay.usd_cents_per_btc);
-                if (fs.len > 0) {
-                    _ = try str(gpa, dl, e, .regular, detail_x + 20, py + 2, muted, 12, fs);
-                    py += 20;
+                const lw: i32 = @intCast(text.measure(e, .semibold, cs, 12));
+                const cw3 = lw + 22;
+                const on = sheet_sats != null and sheet_sats.? == chip;
+                if (on) {
+                    try rect(gpa, dl, cx, py, cw3, chip_h, (0x30 << 24) | (accent & 0x00FFFFFF), 9);
+                } else {
+                    try cardBox(gpa, dl, cx, py, cw3, chip_h, 9, panel);
                 }
+                _ = try str(gpa, dl, e, .semibold, cx + 11, py + 20, if (on) accent else body_c, 12, cs);
+                try emitRegion(gpa, regions, cx, py, cw3, @intCast(chip_h), @intCast(ci), .pay_chip);
+                cx += cw3 + 8;
             }
         }
-        if (pay.status.len > 0) {
-            _ = try str(gpa, dl, e, .regular, detail_x + 20, py + 12, 0xFFE0A868, 13, pay.status);
-            py += 24;
-        }
-        // The verbs: Cancel | Request | Send. Request asks the peer for
-        // this amount; Send resolves their published address and hands off
-        // to YOUR wallet (§0 — approval happens there).
+        py += 38;
+
+        const amount_ph = if (pay.unit == .btc) "amount in BTC" else "amount in sats";
+        _ = try payFieldRow(gpa, dl, e, regions, accent, ix, py, iw, pay.amount, amount_ph, pay.focus == 0, motion.caret_phase, .semibold, .pay_amount);
+        // The unit toggle rides INSIDE the amount field, emitted after it so it
+        // wins the tap.
         {
-            const armed2 = pay.amount.len > 0;
-            const cancel_w: i32 = 92;
-            const rest = detail_w - 36 - cancel_w - 16;
-            const req_w = @divTrunc(rest, 2);
-            const send_w2 = rest - req_w;
-            var bx3 = detail_x + 18;
-            try rect(gpa, dl, bx3, py, cancel_w, 42, 0x2AEDEAE0, 14);
-            const clw: i32 = @intCast(text.measure(e, .semibold, "Cancel", 13));
-            _ = try str(gpa, dl, e, .semibold, bx3 + @divTrunc(cancel_w - clw, 2), py + 27, body_c, 13, "Cancel");
-            try emitRegion(gpa, regions, bx3, py, cancel_w, 42, 0, .pay_cancel);
-            bx3 += cancel_w + 8;
-            try rect(gpa, dl, bx3, py, req_w, 42, 0x2AEDEAE0, 14);
-            const rlw: i32 = @intCast(text.measure(e, .semibold, "Request", 13));
-            _ = try str(gpa, dl, e, .semibold, bx3 + @divTrunc(req_w - rlw, 2), py + 27, if (armed2) ink else faint, 13, "Request");
-            try emitRegion(gpa, regions, bx3, py, req_w, 42, 0, .pay_request);
-            bx3 += req_w + 8;
-            try rect(gpa, dl, bx3, py, send_w2, 42, if (armed2) accent else skinPanel(accent), 14);
-            const slw: i32 = @intCast(text.measure(e, .semibold, "Send", 13));
-            _ = try str(gpa, dl, e, .semibold, bx3 + @divTrunc(send_w2 - slw, 2), py + 27, if (armed2) 0xFF20201A else faint, 13, "Send");
-            // Send ARMS the confirm face (§8.2) — the actual hand-off happens on
-            // the confirm's "Confirm & open wallet". Request moves no money, so it
-            // fires directly with no confirm.
-            try emitRegion(gpa, regions, bx3, py, send_w2, 42, 0, .pay_arm);
+            const ul = if (pay.unit == .btc) "BTC" else "sats";
+            const ulw: i32 = @intCast(text.measure(e, .semibold, ul, 12));
+            const upw = ulw + 22;
+            const ux = ix + iw - upw - 6;
+            try rect(gpa, dl, ux, py + 6, upw, 30, panel_hover, 8);
+            _ = try str(gpa, dl, e, .semibold, ux + 11, py + 26, body_c, 12, ul);
+            try emitRegion(gpa, regions, ux, py + 6, upw, 30, 0, .pay_unit);
         }
-        // The way IN to setting up how YOU get paid — the answer to "where do
-        // I set my own address?" lives right where money is discussed.
-        py += 50;
+        py += 42;
+        if (show_fiat) {
+            var fbuf: [40]u8 = undefined;
+            const fs = formatFiat(&fbuf, sheet_sats.?, pay.usd_cents_per_btc);
+            if (fs.len > 0) _ = try str(gpa, dl, e, .regular, ix + 2, py + 14, muted, 13, fs);
+            py += 22;
+        }
+        py += 12;
+
+        _ = try payFieldRow(gpa, dl, e, regions, accent, ix, py, iw, pay.note, "note (optional)", pay.focus == 1, motion.caret_phase, .regular, .pay_note);
+        py += 42 + 12;
+
+        if (pay.status.len > 0) {
+            try strEllipsis(gpa, dl, e, .regular, ix, py + 14, 0xFFE0A868, 13, pay.status, iw);
+            py += 26;
+        }
+
+        // The two verbs. Send is the PRIMARY — it used to be a grey wash that
+        // read as disabled while Cancel sat next to it as a solid chip.
+        {
+            const can_send = sheet_sats != null and !pay.busy;
+            const half = @divTrunc(iw - 10, 2);
+            try buttonSecondary(gpa, e, dl, regions, ix, py, half, 46, "Request", 0, .pay_request);
+            const send_lbl: []const u8 = if (pay.busy) "Checking\u{2026}" else "Send";
+            try buttonPrimary(gpa, e, dl, regions, ix + half + 10, py, iw - half - 10, 46, send_lbl, accent, 0, .pay_arm, can_send);
+        }
+        py += 46;
+
+        // The way IN to setting up how YOU get paid — the answer to "where do I
+        // set my own address?" belongs where money is discussed.
         {
             const link = "Set up how you get paid \u{203A}";
-            const lw: i32 = @intCast(text.measure(e, .semibold, link, 12));
-            const lx = detail_x + @divTrunc(detail_w - lw, 2);
-            _ = try str(gpa, dl, e, .semibold, lx, py + 6, (0xC0 << 24) | (accent & 0x00FFFFFF), 12, link);
-            try emitRegion(gpa, regions, detail_x + 18, py - 8, detail_w - 36, 28, 0, .recv_open);
+            const lw: i32 = @intCast(text.measure(e, .semibold, link, 13));
+            _ = try str(gpa, dl, e, .semibold, mg.x + @divTrunc(mg.w - lw, 2), py + 22, (0xC0 << 24) | (accent & 0x00FFFFFF), 13, link);
+            try emitRegion(gpa, regions, ix, py + 4, iw, 30, 0, .recv_open);
         }
     }
 
-    // ── The receive-setup sheet: paste YOUR address so people in your chats
-    // can pay you. Same chrome as the pay sheet; mutually exclusive with it. ──
+    // ── The receive-setup flow: publish YOUR address so people in your chats can
+    // pay you. Same modal chrome; mutually exclusive with the pay faces. Each
+    // mode's back edge comes from `recvBackEdge` — Cancel on the wallet picker
+    // now RETURNS to the branch instead of dismissing the whole flow. ──
     if (recv.open) {
-        const status_extra: i32 = if (recv.status.len > 0) 24 else 0;
-        // The paste form grows by one line when the Remove link shows (an
-        // address is present and we're not on the just-saved confirmation).
-        const remove_extra: i32 = if (recv.mode == .paste and !recv.saved and (recv.lightning.len > 0 or recv.bitcoin.len > 0)) 26 else 0;
+        const has_addr = recv.lightning.len > 0 or recv.bitcoin.len > 0;
+        const status_extra: i32 = if (recv.status.len > 0) 26 else 0;
+        const remove_extra: i32 = if (recv.mode == .paste and !recv.saved and has_addr) 30 else 0;
+        // MEASURE the note against the panel's real inner width before sizing the
+        // panel around it. Guessing its height is how the onboarding face ended up
+        // with its buttons pushed out through the bottom of the modal.
+        const inner_w = @min(w - 32, modal_w_max) - 40;
+        const onboard_note_h = try noteHeight(gpa, dl, e, inner_w, recv_onboard_note);
+        const paste_note_h = try noteHeight(gpa, dl, e, inner_w, recv_paste_note);
+        const custody_h = try noteHeight(gpa, dl, e, inner_w, non_custody_line);
         const sheet_h: i32 = switch (recv.mode) {
-            .onboard => 224,
-            .paste => 236 + status_extra + remove_extra,
-            .wallets => 24 + 28 + 30 + @as(i32, @intCast(recv_wallets.len)) * 56 + 54,
+            .onboard => 20 + 30 + onboard_note_h + 24 + 46 + 12 + 46 + 14 + custody_h + 16,
+            .paste => 20 + 30 + paste_note_h + 24 + 42 + 12 + 42 + 16 + remove_extra + status_extra + 46 + 16,
+            .wallets => 20 + 30 + 30 + 20 + @as(i32, @intCast(recv_wallets.len)) * 60 + 12 + 46 + 16,
         };
-        const sy0 = comp_y - sheet_h - 12;
-        try rect(gpa, dl, detail_x, sy0, detail_w, sheet_h, 0xFF201F18, 16);
-        const ring_c = (0x90 << 24) | (accent & 0x00FFFFFF);
-        try rect(gpa, dl, detail_x, sy0, detail_w, 1, ring_c, 0);
-        try rect(gpa, dl, detail_x, sy0 + sheet_h - 1, detail_w, 1, ring_c, 0);
-        try rect(gpa, dl, detail_x, sy0, 1, sheet_h, ring_c, 0);
-        try rect(gpa, dl, detail_x + detail_w - 1, sy0, 1, sheet_h, ring_c, 0);
+        const back = recvBackEdge(recv.mode, recv.rooted);
+        const dismiss: Action = if (back == null) .recv_cancel else .recv_back;
 
-        var py = sy0 + 16;
+        const mg = try payModal(gpa, dl, regions, x0, w, modal_top, modal_bot, height, sheet_h, motion.sheet_t, dismiss);
+        const ix = mg.x + 20;
+        const iw = mg.w - 40;
+        var py = mg.y + 20;
+
+        // The close affordance, always present: a modal you cannot leave is the
+        // trap this flow used to be.
+        {
+            const qx = mg.x + mg.w - 40;
+            const qy = mg.y + 14;
+            _ = try str(gpa, dl, e, .regular, qx + 8, qy + 21, muted, 19, "\u{00D7}");
+            try emitRegion(gpa, regions, qx, qy, 32, 32, 0, .recv_cancel);
+        }
+
         switch (recv.mode) {
             // First run: the branch. Don't dump a wallet-less user into a form.
             .onboard => {
-                _ = try str(gpa, dl, e, .semibold, detail_x + 18, py + 16, ink, 16, "Get paid in Zat Chat");
-                py += 34;
-                _ = try strEllipsis(gpa, dl, e, .regular, detail_x + 18, py + 12, muted, 12, "People in your chats can send you bitcoin once you add a wallet address.", detail_w - 36);
-                py += 40;
-                // Primary: I have a wallet -> the paste form.
-                try rect(gpa, dl, detail_x + 18, py, detail_w - 36, 44, accent, 14);
-                const l1 = "I have a wallet \u{2014} paste it";
-                const w1: i32 = @intCast(text.measure(e, .semibold, l1, 13));
-                _ = try str(gpa, dl, e, .semibold, detail_x + @divTrunc(detail_w - w1, 2), py + 28, 0xFF20201A, 13, l1);
-                try emitRegion(gpa, regions, detail_x + 18, py, detail_w - 36, 44, 0, .recv_have);
-                py += 52;
-                // Secondary: I don't have one -> the get-a-wallet list.
-                try rect(gpa, dl, detail_x + 18, py, detail_w - 36, 44, 0x2AEDEAE0, 14);
-                const l2 = "I don't have one yet";
-                const w2: i32 = @intCast(text.measure(e, .semibold, l2, 13));
-                _ = try str(gpa, dl, e, .semibold, detail_x + @divTrunc(detail_w - w2, 2), py + 28, body_c, 13, l2);
-                try emitRegion(gpa, regions, detail_x + 18, py, detail_w - 36, 44, 0, .recv_need);
-                py += 50;
-                const later = "Maybe later";
-                const wl: i32 = @intCast(text.measure(e, .regular, later, 12));
-                _ = try str(gpa, dl, e, .regular, detail_x + @divTrunc(detail_w - wl, 2), py + 6, faint, 12, later);
-                try emitRegion(gpa, regions, detail_x + 18, py - 6, detail_w - 36, 24, 0, .recv_cancel);
-            },
-            // The paste form (for users who have an address).
-            .paste => {
-                _ = try str(gpa, dl, e, .semibold, detail_x + 18, py + 14, ink, 15, "Receive payments in chat");
+                _ = try str(gpa, dl, e, .semibold, ix, py + 18, ink, 17, "Get paid in Zat Chat");
                 py += 30;
-                _ = try strEllipsis(gpa, dl, e, .regular, detail_x + 18, py + 12, muted, 12, "Paste an address so people can pay you. A Lightning address (you@wallet.com) is easiest.", detail_w - 36);
-                py += 34;
-                const rfields = [2]struct { draft: []const u8, ph: []const u8, act: Action }{
-                    .{ .draft = recv.lightning, .ph = "lightning address  \u{2014}  you@wallet.com", .act = .recv_ln },
-                    .{ .draft = recv.bitcoin, .ph = "bitcoin address (optional)", .act = .recv_btc },
-                };
-                for (rfields, 0..) |fld, fi| {
-                    const focused = recv.focus == fi;
-                    try rect(gpa, dl, detail_x + 18, py, detail_w - 36, 38, 0x22EDEAE0, 12);
-                    if (focused) {
-                        const fr = (0xC0 << 24) | (accent & 0x00FFFFFF);
-                        try rect(gpa, dl, detail_x + 18, py, detail_w - 36, 1, fr, 0);
-                        try rect(gpa, dl, detail_x + 18, py + 37, detail_w - 36, 1, fr, 0);
-                        try rect(gpa, dl, detail_x + 18, py, 1, 38, fr, 0);
-                        try rect(gpa, dl, detail_x + detail_w - 19, py, 1, 38, fr, 0);
-                    }
-                    const fmaxw = detail_w - 64;
-                    var fpen: i32 = detail_x + 32;
-                    if (fld.draft.len > 0) {
-                        try strEllipsis(gpa, dl, e, .regular, detail_x + 32, py + 25, ink, 14, fld.draft, fmaxw);
-                        const tw: i32 = @intCast(text.measure(e, .regular, fld.draft, 14));
-                        fpen = detail_x + 32 + @min(tw, fmaxw);
-                    } else {
-                        try strEllipsis(gpa, dl, e, .regular, detail_x + 32, py + 25, faint, 14, fld.ph, fmaxw);
-                    }
-                    if (focused) {
-                        const ca = caretAlpha(motion.caret_phase);
-                        try rect(gpa, dl, fpen + 2, py + 10, 2, 18, scaleAlpha((0xE0 << 24) | (accent & 0x00FFFFFF), ca), 0);
-                    }
-                    try emitRegion(gpa, regions, detail_x + 18, py, detail_w - 36, 38, 0, fld.act);
-                    py += 46;
-                }
-                // A one-tap Remove when an address is present (was: clear every
-                // char, then Cancel — unintuitive). It unpublishes the record so
-                // you read as walletless again. Right-aligned, quiet red.
-                if (!recv.saved and (recv.lightning.len > 0 or recv.bitcoin.len > 0)) {
+                py = try wrapNote(gpa, dl, e, ix, py, iw, recv_onboard_note);
+                py += 24;
+                try buttonPrimary(gpa, e, dl, regions, ix, py, iw, 46, "I have a wallet \u{2014} paste it", accent, 0, .recv_have, true);
+                py += 46 + 12;
+                try buttonSecondary(gpa, e, dl, regions, ix, py, iw, 46, "I don't have one yet", 0, .recv_need);
+                py += 46 + 14;
+                // Non-custody, stated at the moment someone first commits to being
+                // paid here — the one place it cannot be inferred and must not be
+                // assumed. It WRAPS; it used to be ellipsised into half a promise.
+                _ = try wrapBody(gpa, dl, e, ix, py + 14, iw, faint, 13, non_custody_line, 18, true, null);
+            },
+            // The paste form.
+            .paste => {
+                _ = try str(gpa, dl, e, .semibold, ix, py + 18, ink, 17, "Receive payments in chat");
+                py += 30;
+                py = try wrapNote(gpa, dl, e, ix, py, iw, recv_paste_note);
+                py += 24;
+                _ = try payFieldRow(gpa, dl, e, regions, accent, ix, py, iw, recv.lightning, "lightning address \u{2014} you@wallet.com", recv.focus == 0, motion.caret_phase, .regular, .recv_ln);
+                py += 42 + 12;
+                _ = try payFieldRow(gpa, dl, e, regions, accent, ix, py, iw, recv.bitcoin, "bitcoin address (optional)", recv.focus == 1, motion.caret_phase, .regular, .recv_btc);
+                py += 42 + 16;
+                if (remove_extra > 0) {
+                    // Unpublishes the record, so you read as walletless again.
                     const rl = "Remove wallet";
                     const rw: i32 = @intCast(text.measure(e, .semibold, rl, 12));
-                    _ = try str(gpa, dl, e, .semibold, detail_x + detail_w - 18 - rw, py + 10, 0xFFD98A7A, 12, rl);
-                    try emitRegion(gpa, regions, detail_x + detail_w - 26 - rw, py - 2, rw + 16, 26, 0, .recv_remove);
-                    py += 26;
+                    _ = try str(gpa, dl, e, .semibold, ix + iw - rw, py + 8, like_c, 12, rl);
+                    try emitRegion(gpa, regions, ix + iw - rw - 10, py - 6, rw + 20, 28, 0, .recv_remove);
+                    py += 30;
                 }
                 if (recv.status.len > 0) {
-                    const sc: u32 = if (recv.saved) 0xFF9BCE9B else 0xFFE0A868;
-                    _ = try str(gpa, dl, e, .regular, detail_x + 20, py + 12, sc, 13, recv.status);
-                    py += 24;
+                    const sc: u32 = if (recv.saved) boost_c else 0xFFE0A868;
+                    try strEllipsis(gpa, dl, e, .regular, ix, py + 14, sc, 13, recv.status, iw);
+                    py += 26;
                 }
                 if (recv.saved) {
-                    // Once saved there is nothing left to do here — the footer
-                    // collapses to a single Done that closes the sheet (reusing
-                    // recv_cancel, which dismisses). No more lone "Cancel".
-                    const done_w = detail_w - 36;
-                    const dx = detail_x + 18;
-                    try rect(gpa, dl, dx, py, done_w, 42, accent, 14);
-                    const dlw: i32 = @intCast(text.measure(e, .semibold, "Done", 13));
-                    _ = try str(gpa, dl, e, .semibold, dx + @divTrunc(done_w - dlw, 2), py + 27, 0xFF20201A, 13, "Done");
-                    try emitRegion(gpa, regions, dx, py, done_w, 42, 0, .recv_cancel);
+                    // Nothing left to do here: one Done, which closes.
+                    try buttonPrimary(gpa, e, dl, regions, ix, py, iw, 46, "Done", accent, 0, .recv_cancel, true);
                 } else {
-                    const cancel_w: i32 = 92;
-                    var bx3 = detail_x + 18;
-                    try rect(gpa, dl, bx3, py, cancel_w, 42, 0x2AEDEAE0, 14);
-                    const clw: i32 = @intCast(text.measure(e, .semibold, "Cancel", 13));
-                    _ = try str(gpa, dl, e, .semibold, bx3 + @divTrunc(cancel_w - clw, 2), py + 27, body_c, 13, "Cancel");
-                    try emitRegion(gpa, regions, bx3, py, cancel_w, 42, 0, .recv_cancel);
-                    bx3 += cancel_w + 8;
-                    const save_w = detail_x + detail_w - 18 - bx3;
-                    const has_addr = recv.lightning.len > 0 or recv.bitcoin.len > 0;
-                    try rect(gpa, dl, bx3, py, save_w, 42, if (has_addr) accent else skinPanel(accent), 14);
-                    const slw: i32 = @intCast(text.measure(e, .semibold, "Save", 13));
-                    _ = try str(gpa, dl, e, .semibold, bx3 + @divTrunc(save_w - slw, 2), py + 27, if (has_addr) 0xFF20201A else faint, 13, "Save");
-                    try emitRegion(gpa, regions, bx3, py, save_w, 42, 0, .recv_save);
+                    const back_w: i32 = 104;
+                    const back_act: Action = if (back == null) .recv_cancel else .recv_back;
+                    const back_lbl: []const u8 = if (back == null) "Cancel" else "Back";
+                    try buttonSecondary(gpa, e, dl, regions, ix, py, back_w, 46, back_lbl, 0, back_act);
+                    try buttonPrimary(gpa, e, dl, regions, ix + back_w + 10, py, iw - back_w - 10, 46, "Save", accent, 0, .recv_save, has_addr);
                 }
             },
-            // The get-a-wallet list (for users who have none). Each row opens the
-            // wallet's site; you grab an address there and come back to paste.
+            // The get-a-wallet list. Each row opens the wallet's site; you grab an
+            // address there and come back to paste it.
             .wallets => {
-                _ = try str(gpa, dl, e, .semibold, detail_x + 18, py + 14, ink, 15, "Get a wallet \u{2014} about a minute");
-                py += 28;
-                _ = try strEllipsis(gpa, dl, e, .regular, detail_x + 18, py + 12, muted, 12, "Grab one, then come back and paste your address.", detail_w - 36);
+                _ = try str(gpa, dl, e, .semibold, ix, py + 18, ink, 17, "Get a wallet \u{2014} about a minute");
+                py += 30;
+                _ = try strEllipsis(gpa, dl, e, .regular, ix, py + 14, muted, 13, "Grab one, then come back and paste your address.", iw);
                 py += 30;
                 for (recv_wallets, 0..) |wal, wi| {
-                    try rect(gpa, dl, detail_x + 18, py, detail_w - 36, 48, 0x22EDEAE0, 12);
-                    _ = try str(gpa, dl, e, .semibold, detail_x + 32, py + 20, ink, 13, wal.name);
-                    _ = try strEllipsis(gpa, dl, e, .regular, detail_x + 32, py + 38, muted, 11, wal.tagline, detail_w - 64);
-                    // A subtle arrow to read as "opens out".
-                    _ = try str(gpa, dl, e, .semibold, detail_x + detail_w - 40, py + 29, faint, 15, "\u{203A}");
-                    try emitRegion(gpa, regions, detail_x + 18, py, detail_w - 36, 48, @intCast(wi), .recv_wallet);
-                    py += 56;
+                    try cardBox(gpa, dl, ix, py, iw, 52, 12, panel);
+                    _ = try str(gpa, dl, e, .semibold, ix + 14, py + 22, ink, 14, wal.name);
+                    try strEllipsis(gpa, dl, e, .regular, ix + 14, py + 40, muted, 12, wal.tagline, iw - 50);
+                    try iconChevron(gpa, dl, ix + iw - 26, py + 19, 14, faint);
+                    try emitRegion(gpa, regions, ix, py, iw, 52, @intCast(wi), .recv_wallet);
+                    py += 60;
                 }
-                const cancel_w: i32 = 92;
-                var bx3 = detail_x + 18;
-                try rect(gpa, dl, bx3, py, cancel_w, 42, 0x2AEDEAE0, 14);
-                const clw: i32 = @intCast(text.measure(e, .semibold, "Cancel", 13));
-                _ = try str(gpa, dl, e, .semibold, bx3 + @divTrunc(cancel_w - clw, 2), py + 27, body_c, 13, "Cancel");
-                try emitRegion(gpa, regions, bx3, py, cancel_w, 42, 0, .recv_cancel);
-                bx3 += cancel_w + 8;
-                const paste_w = detail_x + detail_w - 18 - bx3;
-                try rect(gpa, dl, bx3, py, paste_w, 42, accent, 14);
-                const pl = "I've got one \u{2014} paste";
-                const plw: i32 = @intCast(text.measure(e, .semibold, pl, 13));
-                _ = try str(gpa, dl, e, .semibold, bx3 + @divTrunc(paste_w - plw, 2), py + 27, 0xFF20201A, 13, pl);
-                try emitRegion(gpa, regions, bx3, py, paste_w, 42, 0, .recv_paste);
+                py += 12;
+                {
+                    const back_w: i32 = 104;
+                    try buttonSecondary(gpa, e, dl, regions, ix, py, back_w, 46, "Back", 0, .recv_back);
+                    try buttonPrimary(gpa, e, dl, regions, ix + back_w + 10, py, iw - back_w - 10, 46, "I've got one \u{2014} paste", accent, 0, .recv_paste, true);
+                }
             },
         }
     }
@@ -10028,7 +10323,12 @@ test "messages screen: payment cards and the pay sheet emit their regions (M5 A4
     try std.testing.expectEqual(@as(usize, 1), n_note);
     try std.testing.expectEqual(@as(usize, 1), n_req);
     try std.testing.expectEqual(@as(usize, 1), n_sendv);
-    try std.testing.expectEqual(@as(usize, 1), n_cancel);
+    // TWO dismiss targets, deliberately: the modal's × and the SCRIM behind it.
+    // The scrim's region is the thing that makes this a real modal — it both
+    // dims the conversation and swallows its taps, so a stray press while a
+    // sheet about money is open can no longer land on a bubble underneath.
+    // (`payBackEdge(.compose)` is null, so both resolve to "close".)
+    try std.testing.expectEqual(@as(usize, 2), n_cancel);
 }
 
 test "zones browse: each catalog entry emits one .zone_open card region carrying its index" {
@@ -10184,6 +10484,60 @@ test "wrapBody honours explicit newlines as hard line breaks" {
     // A blank line (consecutive newlines) is kept as its own line.
     const blank = try wrapBody(gpa, &dl, &engine, 0, 0, wide, ink, 16, "a\n\nb", line_h, false, null);
     try std.testing.expectEqual(@as(i32, line_h * 3), blank);
+}
+
+test "the money modal's back edges: every face has exactly one step behind it" {
+    // The regression this pins: "back" used to mean four different things
+    // depending on which code path ran it, and on the wallet picker it meant
+    // "throw the whole flow away". One table now answers it, and the ×, the
+    // scrim, Escape, the chevron and the system back gesture all read it.
+
+    // Pay: compose is the root (back closes); confirm steps back to compose —
+    // it must NEVER close outright, because that would silently abandon a send
+    // the user is one tap from making.
+    try std.testing.expectEqual(@as(?PayStep, null), payBackEdge(.compose));
+    try std.testing.expectEqual(@as(?PayStep, .compose), payBackEdge(.confirm));
+
+    // Receive, for someone NOT yet set up: onboard is the root, and both the
+    // paste form and the wallet picker step back to it.
+    try std.testing.expectEqual(@as(?RecvMode, null), recvBackEdge(.onboard, false));
+    try std.testing.expectEqual(@as(?RecvMode, .onboard), recvBackEdge(.paste, false));
+    try std.testing.expectEqual(@as(?RecvMode, .onboard), recvBackEdge(.wallets, false));
+
+    // Receive, for someone ALREADY set up: they arrive straight at the paste
+    // form, so that IS their root and back closes — stepping "back" to an
+    // onboarding branch they never saw would be a dead end.
+    try std.testing.expectEqual(@as(?RecvMode, null), recvBackEdge(.paste, true));
+    // The wallet picker is always reached from somewhere, so it always returns.
+    try std.testing.expectEqual(@as(?RecvMode, .onboard), recvBackEdge(.wallets, true));
+}
+
+test "shortDid elides a DID but leaves a handle alone" {
+    var buf: [short_did_len]u8 = undefined;
+    // A handle is already a name — untouched.
+    try std.testing.expectEqualStrings("maya.zat4.com", shortDid(&buf, "maya.zat4.com"));
+    // A DID is elided, but stays visibly a DID: we do not invent a friendly
+    // name for someone whose handle we could not verify.
+    try std.testing.expectEqualStrings(
+        "did:plc:uelpy\u{2026}ovva2",
+        shortDid(&buf, "did:plc:uelpy3ug6lkvisqcxt5ovva2"),
+    );
+    // Short enough that eliding would not pay: left whole.
+    try std.testing.expectEqualStrings("did:plc:abc", shortDid(&buf, "did:plc:abc"));
+    try std.testing.expectEqualStrings("", shortDid(&buf, ""));
+}
+
+test "didKey keys avatars off the part of an identity that actually varies" {
+    // The bug this exists to prevent: every DID starts "did:", so keying the
+    // avatar off the raw string letters and tints EVERY unnamed person
+    // identically — a chat list of identical "d" discs.
+    const a = didKey("did:plc:uelpy3ug6lkvisqcxt5ovva2");
+    const b = didKey("did:plc:zzzz3ug6lkvisqcxt5ovva2");
+    try std.testing.expectEqualStrings("uelpy3ug6lkvisqcxt5ovva2", a);
+    try std.testing.expect(initialOf(a) != initialOf(b));
+    try std.testing.expect(tintFor(a) != tintFor(b));
+    // A handle has no method prefix to strip.
+    try std.testing.expectEqualStrings("maya.zat4.com", didKey("maya.zat4.com"));
 }
 
 test "inline #tags emit tappable .tag_inline regions, resolved case-insensitively to the post's tags" {
