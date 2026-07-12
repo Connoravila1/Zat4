@@ -1725,7 +1725,11 @@ pub fn drawBackHint(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine,
 /// bottom inset it also paints over. The chat composer lifts by this.
 /// FIVE rows since the owner's pass 2 (2026-07-11): a number row (1–9 +
 /// emoji) rides on top of the letters, and keys grew a touch taller.
-pub const keyboard_h: i32 = 5 * (kbd_key_h + kbd_gap) + 14;
+/// The 8 is the top pad; the 24 is BOTTOM pad — the key block floats a
+/// few notches above the inset like the platform keyboard's (the owner's
+/// side-by-side, 2026-07-12: ours ran nearly flush to the screen bottom,
+/// which also parks the bottom row under the thumb's least accurate zone).
+pub const keyboard_h: i32 = 5 * (kbd_key_h + kbd_gap) + 8 + 24;
 const kbd_key_h: i32 = 52;
 const kbd_gap: i32 = 7;
 
