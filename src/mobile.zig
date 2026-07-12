@@ -260,12 +260,14 @@ fn touch(ctx: *Ctx, kind: u32, x_px: f32, y_px: f32) void {
                 .x = @intFromFloat(std.math.clamp(x_px, 0, 65535)),
                 .y = @intFromFloat(std.math.clamp(y_px, 0, 65535)),
                 .kind = switch (kind) {
-                    0 => .button_down,
+                    0, 5 => .button_down, // 5 = a SECOND finger (aux pointer)
                     1 => .move,
                     2 => .button_up,
                     else => return,
                 },
-                .button = 1,
+                // Button 2 marks the aux pointer: the pump press-commits its
+                // keyboard key and leaves the gesture machine to the primary.
+                .button = if (kind == 5) 2 else 1,
                 .mods = 0,
                 ._pad = 0,
             };

@@ -75,6 +75,16 @@ pub const act_ripples: u8 = 3; // Toy Box: the field ripple + red dye on a like
 pub const act_crt: u8 = 4; // Toy Box: CRT scanline overlay
 pub const act_frametiming: u8 = 5; // Toy Box: fps/frame-time overlay
 pub const act_field: u8 = 6; // Appearance: the living glyph field on/off
+
+/// Rows that DO NOTHING on the phone (the glyph field is compiled off
+/// mobile for battery, and the like-ripple rides it): the phone's list
+/// hides them; desktop keeps them. Pure table logic, used by the renderer.
+pub fn rowOnPhone(r: Row) bool {
+    return switch (r.action) {
+        act_field, act_field_intensity, act_ripples => false,
+        else => true,
+    };
+}
 // Account info rows whose value is the REAL session identity (not the table's
 // placeholder); the renderer substitutes the live value for these.
 pub const act_show_handle: u8 = 7;

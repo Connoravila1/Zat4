@@ -128,6 +128,8 @@ const action_down: i32 = 0;
 const action_up: i32 = 1;
 const action_move: i32 = 2;
 const action_cancel: i32 = 3; // the system claimed the gesture (back edge, shade)
+const action_pointer_down: i32 = 5; // a SECOND finger landed (two-thumb typing)
+const action_pointer_index_shift: u5 = 8; // its index rides the action's high byte
 const key_action_down: i32 = 0;
 const akeycode_back: i32 = 4; // AKEYCODE_BACK — the system back gesture/button
 const meta_shift_on: i32 = 0x1;
@@ -789,7 +791,17 @@ fn renderThread() void {
                 if (AInputQueue_preDispatchEvent(q, e) != 0) continue; // IME took it
                 var handled: c_int = 0;
                 if (AInputEvent_getType(e) == input_event_type_motion) {
-                    const action = AMotionEvent_getAction(e) & action_mask;
+                    const action_raw = AMotionEvent_getAction(e);
+                    const action = action_raw & action_mask;
+                    // A SECOND finger landing (two-thumb typing): forward it
+                    // as its own kind with ITS pointer's coordinates — the
+                    // pump press-commits the key and otherwise ignores it.
+                    if (action == action_pointer_down) {
+                        const pidx: usize = @intCast((action_raw >> action_pointer_index_shift) & 0xff);
+                        seam.zat_touch(ctx, 5, AMotionEvent_getX(e, pidx), AMotionEvent_getY(e, pidx));
+                        AInputQueue_finishEvent(q, e, 1);
+                        continue;
+                    }
                     const kind: u32 = switch (action) {
                         action_down => 0,
                         action_move => 1,

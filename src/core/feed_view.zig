@@ -1757,8 +1757,14 @@ const kbd_r2_mid = kbdRowStr("zxcvbnm", "ZXCVBNM");
 const kbd_s0 = kbdRowStr("1234567890", "1234567890");
 const kbd_s1 = kbdRowStr("@#$%&-+()", "@#$%&-+()");
 const kbd_s2_mid = kbdRowStr("*\"':;!?/", "*\"':;!?/");
-// The standing number row (both pages): 1–9 + the emoji key — the owner
-// wants numbers one tap away while the symbols page keeps its full 0-run.
+// The SECOND symbols page (the standard keyboard's "=\\<" layer): the
+// less-common set, ASCII-safe — the embedded face is curated, so exotic
+// glyphs stay out until they're proven in.
+const kbd_x0 = kbdRowStr("[]{}<>^_~|", "[]{}<>^_~|");
+const kbd_x1 = kbdRowStr("`\\=*#%+&@", "`\\=*#%+&@");
+const kbd_x2_mid = kbdRowStr("$-'\"/:;!", "$-'\"/:;!");
+// The standing number row (every page): 1–9 + the emoji key — the owner
+// wants numbers one tap away while the symbols pages keep their own runs.
 const kbd_num = kbdRowStr("123456789", "123456789");
 
 /// The Zat4 keyboard: an opaque panel over the very bottom (it paints the
@@ -1784,6 +1790,8 @@ pub fn drawKeyboard(
     caps: bool,
     flash_key: u16,
     flash_a: u8,
+    /// The shell's running clock (seconds) — drives the lattice pulses.
+    t: f32,
 ) error{OutOfMemory}!void {
     const top = view_h - keyboard_h - bottom_inset;
     // The panel: opaque (nothing ghosts through chrome) with a faint wash.
@@ -1807,8 +1815,32 @@ pub fn drawKeyboard(
     var gr: usize = 1;
     while (gr < n_rows) : (gr += 1) {
         const gy = top + 8 + @as(i32, @intCast(gr)) * (kbd_key_h + kbd_gap) - @divTrunc(kbd_gap + 1, 2);
-        try rect(gpa, dl, m, gy - 1, row_w, 3, (0x16 << 24) | (accent & 0x00FFFFFF), 0);
-        try rect(gpa, dl, m, gy, row_w, 1, (0x48 << 24) | (accent & 0x00FFFFFF), 0);
+        try rect(gpa, dl, m, gy, row_w, 1, (0x30 << 24) | (accent & 0x00FFFFFF), 0);
+    }
+
+    // THE PULSES (owner: whispy glints riding the lines): two travel row
+    // gutters in opposite directions, one rides the lit top rail — each a
+    // bright head trailing two fading glints. Speeds are unequal so the
+    // pattern never visibly repeats; subtle by alpha, not size.
+    const rw_f: f32 = @floatFromInt(row_w);
+    const Pulse = struct { row: i32, speed: f32, phase: f32, dirn: f32 };
+    const pulses = [_]Pulse{
+        .{ .row = 1, .speed = 0.071, .phase = 0.00, .dirn = 1 },
+        .{ .row = 3, .speed = 0.047, .phase = 0.45, .dirn = -1 },
+        .{ .row = -1, .speed = 0.113, .phase = 0.20, .dirn = 1 }, // the top rail
+    };
+    for (pulses) |p| {
+        const gy = if (p.row < 0)
+            top + 1
+        else
+            top + 8 + p.row * (kbd_key_h + kbd_gap) - @divTrunc(kbd_gap + 1, 2);
+        const u = @mod(t * p.speed + p.phase, 1.0);
+        const ux = if (p.dirn > 0) u else 1.0 - u;
+        const hx: i32 = m + @as(i32, @intFromFloat(ux * rw_f));
+        const tail: i32 = @intFromFloat(8.0 * p.dirn);
+        try rect(gpa, dl, hx - 2, gy - 2, 5, 5, (0x6E << 24) | (accent & 0x00FFFFFF), 2);
+        try rect(gpa, dl, hx - 1 - tail, gy - 1, 3, 3, (0x3A << 24) | (accent & 0x00FFFFFF), 1);
+        try rect(gpa, dl, hx - 1 - 2 * tail, gy - 1, 3, 3, (0x1C << 24) | (accent & 0x00FFFFFF), 1);
     }
 
     var y = top + 8;
@@ -1829,23 +1861,43 @@ pub fn drawKeyboard(
                 nk += 1;
             },
             1 => {
-                const src = if (page == 0) kbd_r0[0..] else kbd_s0[0..];
+                const src = switch (page) {
+                    0 => kbd_r0[0..],
+                    1 => kbd_s0[0..],
+                    else => kbd_x0[0..],
+                };
                 for (src) |k| {
                     keys_buf[nk] = k;
                     nk += 1;
                 }
             },
             2 => {
-                const src = if (page == 0) kbd_r1[0..] else kbd_s1[0..];
+                const src = switch (page) {
+                    0 => kbd_r1[0..],
+                    1 => kbd_s1[0..],
+                    else => kbd_x1[0..],
+                };
                 for (src) |k| {
                     keys_buf[nk] = k;
                     nk += 1;
                 }
             },
             3 => {
-                keys_buf[nk] = .{ .lo = 0, .ctrl = 1, .w = 3 }; // shift
+                // Page 0 keeps shift here; the symbols pages use the slot the
+                // standard way — a layer hop ("=\\<" deeper, "?123" back).
+                // A ctrl-3 key carries its TARGET page in `lo`.
+                keys_buf[nk] = if (page == 0)
+                    .{ .lo = 0, .ctrl = 1, .w = 3 } // shift
+                else if (page == 1)
+                    .{ .lo = 2, .ctrl = 3, .w = 3 } // "=\\<" -> symbols 2
+                else
+                    .{ .lo = 1, .ctrl = 3, .w = 3 }; // "?123" -> symbols 1
                 nk += 1;
-                const src = if (page == 0) kbd_r2_mid[0..] else kbd_s2_mid[0..];
+                const src = switch (page) {
+                    0 => kbd_r2_mid[0..],
+                    1 => kbd_s2_mid[0..],
+                    else => kbd_x2_mid[0..],
+                };
                 for (src) |k| {
                     keys_buf[nk] = k;
                     nk += 1;
@@ -1854,11 +1906,18 @@ pub fn drawKeyboard(
                 nk += 1;
             },
             else => {
-                keys_buf[nk] = .{ .lo = 0, .ctrl = 3, .w = 3 }; // ?123 / abc
+                // Every page: [layer][₿][,][space][.][enter] — comma and
+                // period flank the space bar, the standard seats (they were
+                // simply MISSING in v1; owner, 2026-07-11).
+                keys_buf[nk] = .{ .lo = if (page == 0) 1 else 0, .ctrl = 3, .w = 3 }; // ?123 / abc
                 nk += 1;
-                keys_buf[nk] = .{ .lo = 0x20BF, .hi = 0x20BF, .w = 2 }; // the bitcoin key
+                keys_buf[nk] = .{ .lo = ',', .hi = ',', .w = 2 };
                 nk += 1;
-                keys_buf[nk] = .{ .lo = ' ', .hi = ' ', .w = 10 }; // space
+                keys_buf[nk] = .{ .lo = 0x20BF, .hi = 0x20BF, .w = 2 }; // ₿ — the emoji's Gboard seat, ours
+                nk += 1;
+                keys_buf[nk] = .{ .lo = ' ', .hi = ' ', .w = 7 }; // space
+                nk += 1;
+                keys_buf[nk] = .{ .lo = '.', .hi = '.', .w = 2 };
                 nk += 1;
                 keys_buf[nk] = .{ .lo = 0, .ctrl = 4, .w = 3 }; // enter
                 nk += 1;
@@ -1875,10 +1934,9 @@ pub fn drawKeyboard(
             // Vertical circuit trace in the gutter left of this key.
             if (ki > 0) {
                 const gx = x - @divTrunc(kbd_gap + 1, 2);
-                try rect(gpa, dl, gx - 1, y, 3, kbd_key_h, (0x16 << 24) | (accent & 0x00FFFFFF), 0);
-                try rect(gpa, dl, gx, y, 1, kbd_key_h, (0x48 << 24) | (accent & 0x00FFFFFF), 0);
+                try rect(gpa, dl, gx, y, 1, kbd_key_h, (0x30 << 24) | (accent & 0x00FFFFFF), 0);
             }
-            const active_ctrl = (k.ctrl == 1 and (shift or caps)) or (k.ctrl == 3 and page == 1);
+            const active_ctrl = (k.ctrl == 1 and (shift or caps)) or (k.ctrl == 3 and k.lo == 0 and page != 0);
             const fill: u32 = if (active_ctrl) (0x50 << 24) | (accent & 0x00FFFFFF) else 0x1CFFFFFF;
             try rect(gpa, dl, x, y, kw, kbd_key_h, fill, 9);
             // Press feedback: the last-tapped key glows accent and fades
@@ -1920,7 +1978,11 @@ pub fn drawKeyboard(
                     const glyph: []const u8 = switch (k.ctrl) {
                         1 => "\u{21E7}", // shift
                         2 => "\u{232B}", // backspace
-                        3 => if (page == 0) "?123" else "abc",
+                        3 => switch (k.lo) { // the layer key names its TARGET
+                            0 => "abc",
+                            1 => "?123",
+                            else => "=\\<",
+                        },
                         else => "\u{23CE}", // enter
                     };
                     const gpx: u16 = if (k.ctrl == 3) 13 else 18;
@@ -1933,7 +1995,11 @@ pub fn drawKeyboard(
                     3 => .kbd_page,
                     else => .kbd_key, // enter emits '\r'; the dead emoji key emits 0
                 };
-                try emitRegion(gpa, regions, rx0, ry0, rx1 - rx0, @intCast(@min(ry1 - ry0, 32767)), if (k.ctrl == 4) '\r' else 0, kind);
+                try emitRegion(gpa, regions, rx0, ry0, rx1 - rx0, @intCast(@min(ry1 - ry0, 32767)), switch (k.ctrl) {
+                    4 => '\r',
+                    3 => k.lo, // the layer key's target page
+                    else => 0,
+                }, kind);
             } else {
                 const cp: u16 = if ((shift or caps) and k.hi != 0) k.hi else k.lo;
                 var gb: [4]u8 = undefined;
@@ -4972,6 +5038,7 @@ fn drawSettings(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: 
     var ng: usize = 0;
     for (settings_view.rows) |r| {
         if (r.section != ss) continue;
+        if (phone and !settings_view.rowOnPhone(r)) continue; // dead on mobile
         if (ng == 0 or group_ids[ng - 1] != r.group) {
             if (ng == group_ids.len) break; // table guard (more than 32 groups: unreached)
             group_ids[ng] = r.group;
@@ -4998,6 +5065,8 @@ fn drawSettings(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: 
             var k: i32 = 0;
             for (settings_view.rows, 0..) |r, ridx| {
                 if (r.section != ss or r.group != gid) continue;
+                if (phone and !settings_view.rowOnPhone(r)) continue; // dead on mobile
+
                 const ry = dy + k * row_h;
                 if (k > 0) try rect(gpa, dl, detail_x + 18, ry, detail_w - 36, 1, divider, 0);
                 try drawSettingsRow(gpa, dl, e, regions, r, @intCast(ridx), detail_x, ry, detail_w, row_h, accent, toggles, account, choices);

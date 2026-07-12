@@ -2989,6 +2989,27 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 var frame_dy: f32 = 0;
                 for (touch_events.items) |tev| switch (tev.kind) {
                     .button_down => {
+                        // AUX POINTER (a second thumb — the seam forwards
+                        // ACTION_POINTER_DOWN as button 2): it exists only to
+                        // TYPE. Press-commit its key and leave the whole
+                        // single-pointer gesture machine to the primary
+                        // finger — two-thumb typing stops dropping the
+                        // second key (the recorded single-pointer limit).
+                        if (tev.button == 2) {
+                            if (if (pix) |gv| gv.kbd_visible else false) {
+                                if (rs.gpu_state) |*gsd| {
+                                    const ax: i32 = @intFromFloat(@as(f32, @floatFromInt(tev.x)) / gsd.scale);
+                                    const ay: i32 = @intFromFloat(@as(f32, @floatFromInt(tev.y)) / gsd.scale);
+                                    if (feed_view.hitTest(rs.gregions.items, ax, ay)) |kh| switch (kh.kind) {
+                                        // A second-thumb space types plainly
+                                        // (no caret slide from an aux finger).
+                                        .kbd_key, .kbd_shift, .kbd_page, .kbd_backspace => kbdAction(rs, gpa, kh.kind, kh.post),
+                                        else => {},
+                                    };
+                                }
+                            }
+                            continue;
+                        }
                         m.down_x = tev.x;
                         m.down_y = tev.y;
                         m.down_ms = now_ms; // the long-press clock starts
@@ -3083,10 +3104,15 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             }
                             if (m.kbd_nav) {
                                 const nav_step: f32 = 14;
+                                const nav_x0 = m.kbd_nav_x;
                                 while (fx - m.kbd_nav_x >= nav_step) : (m.kbd_nav_x += nav_step)
                                     rs.kbd_bytes.appendSlice(gpa, "\x1b[C") catch break;
                                 while (m.kbd_nav_x - fx >= nav_step) : (m.kbd_nav_x -= nav_step)
                                     rs.kbd_bytes.appendSlice(gpa, "\x1b[D") catch break;
+                                // The caret RATCHETS under the finger: one
+                                // soft tick per step (the drag-threshold
+                                // haptic channel; lands mid-gesture, §3).
+                                if (m.kbd_nav_x != nav_x0) m.haptic_pending = 1;
                             }
                         }
                         // The dominant axis at the slop threshold commits the
@@ -8077,8 +8103,10 @@ fn kbdAction(rs: *RunState, gpa: Allocator, kind: feed_view.Action, post: u16) v
             rs.kbd_flash_key = 0xE001;
             rs.kbd_flash_ns = tns;
         },
+        // The layer key carries its TARGET page (0 letters / 1 symbols /
+        // 2 the "=\\<" less-common layer) in the region payload.
         .kbd_page => {
-            rs.kbd_page ^= 1;
+            rs.kbd_page = @intCast(@min(post, 2));
             rs.kbd_flash_key = 0xE003;
             rs.kbd_flash_ns = clock_shell.monotonicNanos();
         },
@@ -10146,7 +10174,7 @@ fn paintComposeGpu(
     const kbd_lift: u32 = if (g.kbd_visible) @intCast(feed_view.keyboard_h + @as(i32, @intCast(gs.inset_bottom_l))) else 0;
     feed_view.layoutCompose(gpa, g.engine, @intCast(gs.design_w), @intCast(lh - kbd_lift), g.accent, ctx, reply_handle, quoting, draft, caret, sel_start, sel_end, blink_on, status, segments, tag_bar, g.draw, g.regions) catch {};
     if (g.kbd_visible)
-        feed_view.drawKeyboard(gpa, g.draw, g.engine, g.regions, @intCast(gs.design_w), @intCast(lh), @intCast(gs.inset_bottom_l), g.accent, g.kbd_shift, g.kbd_page, g.kbd_caps, g.kbd_flash_key, g.kbd_flash_a) catch {};
+        feed_view.drawKeyboard(gpa, g.draw, g.engine, g.regions, @intCast(gs.design_w), @intCast(lh), @intCast(gs.inset_bottom_l), g.accent, g.kbd_shift, g.kbd_page, g.kbd_caps, g.kbd_flash_key, g.kbd_flash_a, gs.t) catch {};
     if (g.julia) feed_view.juliaRemapText(g.draw); // light theme: dark text
     if (g.light) feed_view.rethemeLight(gpa, g.draw) catch {};
     gpu.feedBuild(&gs.feed, gpa, g.engine, g.draw.slice(), scale) catch {};
@@ -10518,7 +10546,10 @@ fn paintFrameGpu(
     // bypass the feed cache while it runs — a brief interaction, and the field
     // already rebuilds every frame anyway.
     const feed_animating = g.toys.feed_toy == .zero_g or g.toys.feed_toy == .liquid;
-    if (sig != gs.feed_sig or gs.feed.verts.items.len == 0 or g.socket_ui.drag_active != null or search_animating or zones_animating or drawer_animating or rail_hover_animating or algo_animating or chat_animating or g.screen.* == feed_view.screen_loadout or g.frametiming_on or gs.shatter_active or g.pet or feed_animating) {
+    // The Zat4 keyboard animates while up (lattice pulses + press-flash
+    // decay) — bypass the cache like any other live interaction.
+    const kbd_animating = g.kbd_visible;
+    if (sig != gs.feed_sig or gs.feed.verts.items.len == 0 or g.socket_ui.drag_active != null or search_animating or zones_animating or drawer_animating or rail_hover_animating or algo_animating or chat_animating or g.screen.* == feed_view.screen_loadout or g.frametiming_on or gs.shatter_active or g.pet or feed_animating or kbd_animating) {
         gs.feed_sig = sig;
         // An empty timeline renders the chrome with no posts (no placeholders).
         const feed_posts = feed_view.fromTimeline(arena, items, now, g.expanded) catch &[_]feed_view.PostView{};
@@ -10961,7 +10992,7 @@ fn paintFrameGpu(
             // input wants keys. Its taps feed the same byte stream the system
             // IME's fallback feeds — one input path (MC.4d).
             if (g.kbd_visible)
-                feed_view.drawKeyboard(gpa, g.draw, g.engine, g.regions, @intCast(gs.design_w), @intCast(lh), @intCast(gs.inset_bottom_l), g.accent, g.kbd_shift, g.kbd_page, g.kbd_caps, g.kbd_flash_key, g.kbd_flash_a) catch {};
+                feed_view.drawKeyboard(gpa, g.draw, g.engine, g.regions, @intCast(gs.design_w), @intCast(lh), @intCast(gs.inset_bottom_l), g.accent, g.kbd_shift, g.kbd_page, g.kbd_caps, g.kbd_flash_key, g.kbd_flash_a, gs.t) catch {};
             // The cartridge DETAIL sheet (item 5) is chrome-topmost: it lives in
             // THIS tile (drawn after the feed buffer), not the feed buffer, or the
             // tab bar + FAB paint over its scrim (the on-device bleed, 2026-07-09).
