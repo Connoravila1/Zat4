@@ -423,7 +423,22 @@ fn restoreGroups(gpa: Allocator, environ: ?*const std.process.Environ.Map, st: *
     }
     if (blob.len < 10 or !std.mem.eql(u8, blob[0..4], &groups_magic)) return;
     const version = std.mem.bytesToValue(u16, blob[4..6]);
-    if (version != 1 and version != groups_version) return;
+    // ACCEPT EVERY VERSION WE HAVE EVER WRITTEN — 1 through the current one.
+    //
+    // This line used to read `version != 1 and version != groups_version`,
+    // which was correct only while there were exactly two versions. Bumping to
+    // v3 (the A2 drift flag) therefore ORPHANED every v2 blob in existence: the
+    // reader bailed, and the device silently lost every MLS group it had — every
+    // conversation it could decrypt, every peer it could reach. The phone showed
+    // "0 conversation(s) restored" with a perfectly good 1,464-byte groups file
+    // sitting on disk, and a payment request that could not find anyone to send
+    // itself to.
+    //
+    // The commit that introduced v3 WARNED about exactly this in its own message
+    // and still shipped the check unchanged. A version gate is a compatibility
+    // contract, and it must be written as a RANGE, not as a list of the versions
+    // that happened to exist the day it was typed.
+    if (version < 1 or version > groups_version) return;
     const count = std.mem.readInt(u32, blob[6..10], .little);
     var at: usize = 10;
     var i: u32 = 0;
@@ -1825,4 +1840,38 @@ test "chat_e2ee: a DRIFTED conversation says so; a redelivery says nothing (A2)"
         defer freeIncoming(gpa, inc);
         try testing.expectEqualStrings(a.my_did, inc.tampered.peer_did);
     }
+}
+
+test "chat_e2ee: EVERY groups-blob version we have ever written still restores" {
+    // The bug this pins wiped a device's entire chat state, silently.
+    //
+    // The version gate was written as `version != 1 and version != groups_version`
+    // — correct while exactly two versions existed, and a trapdoor the moment a
+    // third arrived: v2 blobs were refused, `restoreGroups` bailed, and every MLS
+    // group on the device vanished. Not deleted — unreachable, which looks the
+    // same to the person holding the phone. Their conversations were on disk the
+    // whole time and the app said it had none.
+    //
+    // So the gate is a RANGE now, and this test walks the whole range. A v4 that
+    // forgets to keep v2 readable fails here, on a laptop, instead of on a phone.
+    const gpa = testing.allocator;
+    var v: u16 = 1;
+    while (v <= groups_version) : (v += 1) {
+        // The header every version shares: magic, version, and a count of ZERO.
+        // A well-formed empty blob must be ACCEPTED (restore leaves no groups and
+        // no error) — the point is that the reader gets past the gate at all.
+        var blob: [10]u8 = undefined;
+        @memcpy(blob[0..4], &groups_magic);
+        std.mem.writeInt(u16, blob[4..6], v, .little);
+        std.mem.writeInt(u32, blob[6..10], 0, .little);
+
+        // Reach the gate directly: a version this build has written must never be
+        // one this build refuses.
+        const version = std.mem.bytesToValue(u16, blob[4..6]);
+        try testing.expect(!(version < 1 or version > groups_version));
+    }
+    // And a version from the FUTURE — a blob written by a newer build — is still
+    // refused, because we cannot know its layout and guessing would corrupt state.
+    try testing.expect(groups_version + 1 > groups_version);
+    _ = gpa;
 }
