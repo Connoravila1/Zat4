@@ -37,6 +37,7 @@ const transparency = @import("core/transparency.zig");
 const rules = @import("core/rules.zig");
 const algo_vm = @import("core/algo_vm.zig");
 const enroll_view = @import("core/enroll_view.zig");
+const boot_intro = @import("core/boot_intro.zig");
 const tiling = @import("core/tiling.zig");
 const chat = @import("core/chat.zig");
 const chat_view = @import("core/chat_view.zig");
@@ -947,6 +948,19 @@ pub fn main(init: std.process.Init) !void {
         const path = try std.fmt.bufPrint(&epath_buf, "/tmp/zat_{s}.ppm", .{es.name});
         try writePpm(io, gpa, &fb, path);
         std.debug.print("wrote {s} ({d} items)\n", .{ path, dl.len });
+    }
+
+    // THE BOOT ENTRANCE (§5), sampled across its two movements: the log typing
+    // itself outward from the centre, then the wordmark precipitating out of noise.
+    const boot_ts = [_]f32{ 0.35, 1.6, 3.4, 4.5, 4.62, 4.9, 5.4 };
+    for (boot_ts, 0..) |bt, i| {
+        @memset(fb.pixels, clear);
+        dl.len = 0;
+        try boot_intro.layout(gpa, &engine, @intCast(W), @intCast(H), bt, &dl);
+        try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+        const path = try std.fmt.bufPrint(&epath_buf, "/tmp/zat_boot_{d}.ppm", .{i});
+        try writePpm(io, gpa, &fb, path);
+        std.debug.print("wrote {s} (t={d:.2}s, {d} items)\n", .{ path, bt, dl.len });
     }
 }
 

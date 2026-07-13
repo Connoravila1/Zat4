@@ -1287,6 +1287,7 @@ test {
     _ = @import("shell/membership.zig");
     _ = @import("shell/membership_record.zig");
     _ = @import("core/enroll_view.zig");
+    _ = @import("core/boot_intro.zig");
     _ = @import("shell/enroll_run.zig");
     _ = @import("shell/feed.zig");
     _ = @import("shell/tui.zig");
