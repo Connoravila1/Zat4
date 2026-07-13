@@ -73,6 +73,56 @@ pub fn isPaymentKind(kind: Kind) bool {
 /// a typing ping that somehow reached a history blob is damage, not data.
 pub const kind_typing_wire: u8 = 2;
 
+/// The group-ACK's WIRE kind byte (also from the reserved 2..15 range). The
+/// joiner sends one the moment it accepts a Welcome, over the group it just
+/// joined — so the ack is MLS-authenticated end to end, not a relay receipt
+/// (the relay never learns that a delivery happened, which is what the
+/// standing no-auto-receipt rule requires). Wire-only, like the typing ping:
+/// it is consumed at the session layer and never enters the store, so
+/// `parseKind` keeps rejecting it.
+///
+/// Why it exists: a Welcome used to be a single unacknowledged shot. Lose it
+/// — a relay restart (the store is in-memory by design), a momentary
+/// disconnect, a recipient offline past the TTL — and the STARTER still
+/// believes a group exists while every message after it vanishes silently.
+/// The ack is the one bit that tells the starter the conversation is real.
+pub const kind_group_ack_wire: u8 = 3;
+
+/// How many times an unacknowledged Welcome is re-sent before the client
+/// stops and says so. With the ladder below this is ~1 hour of trying; a
+/// relaunch starts the ladder over (`restoreGroups`), so a peer who comes
+/// back tomorrow still gets the Welcome without anyone touching a button.
+pub const welcome_retry_max: u8 = 12;
+
+/// The floor between two acks for the SAME conversation. A Welcome bucket is
+/// public bytes on a public mailbox, so anyone can replay one at us; without
+/// this floor each replay would make us encrypt + deposit another ack.
+pub const welcome_ack_min_gap_s: i64 = 5;
+
+/// Seconds to wait after `attempts` sends before trying again: 5s, 10, 20,
+/// 40 … capped at 10 minutes. Fast enough that a peer who opens the app a
+/// few seconds later gets the Welcome immediately; slow enough that an
+/// offline peer costs a handful of deposits an hour.
+pub fn welcomeRetryDelay(attempts: u8) i64 {
+    if (attempts == 0) return 0; // never sent: send now
+    const shift: u6 = @intCast(@min(attempts - 1, 8));
+    return @min(@as(i64, 5) << shift, 600);
+}
+
+/// Whether an unacknowledged Welcome is due for another send. Pure policy —
+/// the shell supplies the clock (B3).
+pub fn welcomeRetryDue(attempts: u8, last_sent: i64, now: i64) bool {
+    if (attempts >= welcome_retry_max) return false;
+    return now - last_sent >= welcomeRetryDelay(attempts);
+}
+
+/// What the OTHER side knows about this conversation, as the thread must say
+/// it. `confirmed` = they acked; the channel is real. `waiting` = the Welcome
+/// is out and unanswered (we are still retrying) — an honest "waiting for
+/// them to receive this", never a dead thread that looks alive. `undelivered`
+/// = the retries are spent; the repair is one tap away.
+pub const Delivery = enum(u8) { confirmed = 0, waiting = 1, undelivered = 2 };
+
 /// The settlement-event WIRE bytes (the reserved 18/19). Like the typing
 /// ping they never enter the store as messages — `parseKind` keeps
 /// rejecting them — but unlike it they are not ephemeral: the session layer
@@ -1824,4 +1874,31 @@ test "store codec v2: duplicate rows and duplicate correlation keys are refused"
     // Two cards sharing (conversation, payment_id) — the correlation key.
     @memcpy(bad[row1_at..][0..8], bad[row0_at..][0..8]);
     try std.testing.expectError(error.Malformed, deserializeStore(gpa, bad));
+}
+
+test "welcome retry: the ladder climbs, caps, and gives up" {
+    const t = std.testing;
+    // Never sent → due immediately, whatever the clock says.
+    try t.expect(welcomeRetryDue(0, 0, 0));
+    try t.expectEqual(@as(i64, 0), welcomeRetryDelay(0));
+
+    // 5s, 10, 20, 40 … doubling.
+    try t.expectEqual(@as(i64, 5), welcomeRetryDelay(1));
+    try t.expectEqual(@as(i64, 10), welcomeRetryDelay(2));
+    try t.expectEqual(@as(i64, 40), welcomeRetryDelay(4));
+    // …then flat at the 10-minute cap, and it never overflows the shift.
+    try t.expectEqual(@as(i64, 600), welcomeRetryDelay(8));
+    try t.expectEqual(@as(i64, 600), welcomeRetryDelay(welcome_retry_max));
+    try t.expectEqual(@as(i64, 600), welcomeRetryDelay(255));
+
+    // One attempt at t=1000: not due at t=1004, due at t=1005.
+    try t.expect(!welcomeRetryDue(1, 1000, 1004));
+    try t.expect(welcomeRetryDue(1, 1000, 1005));
+
+    // The ceiling is a real stop — the thread says "undelivered" instead of
+    // retrying forever behind the user's back.
+    try t.expect(!welcomeRetryDue(welcome_retry_max, 0, std.math.maxInt(i32)));
+
+    // The ack byte stays wire-only: it must never parse as a stored kind.
+    try t.expectError(error.UnknownKind, parseKind(kind_group_ack_wire));
 }

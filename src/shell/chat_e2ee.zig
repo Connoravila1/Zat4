@@ -98,7 +98,45 @@ pub fn bucketUnpack(blob: []const u8) ?[]const u8 {
 // ---------------------------------------------------------------------------
 
 const groups_magic = [4]u8{ 'Z', 'A', 'T', 'C' };
-const groups_version: u16 = 1;
+/// Version 2 (A1) appends the per-conversation Welcome-delivery record. A
+/// version-1 blob still restores — its conversations are simply treated as
+/// CONFIRMED, which is the honest reading: they were established under the
+/// old single-shot rule and are either working or already broken, and
+/// re-Welcoming every one of them on upgrade would reset live ratchets to
+/// fix a problem those conversations may not have.
+const groups_version: u16 = 2;
+
+/// What the far side knows about a conversation WE opened. A Welcome used to
+/// be a single unacknowledged shot: if it was lost, the sender kept believing
+/// a group existed while every message after it vanished. This row is the
+/// difference — it holds the Welcome bytes until the peer's ack comes back,
+/// and the shell re-sends on a backoff until it does.
+///
+/// `bucket.len == 0` IS "confirmed" (A6: no bool to drift out of step with
+/// the bytes) — either the peer acked, or the conversation came to us as
+/// THEIR Welcome and there was never anything of ours to deliver.
+pub const WelcomeState = struct {
+    /// The exact Welcome bucket we sent (gpa-owned), kept for the resend.
+    /// Empty once the peer acks.
+    bucket: []u8,
+    /// When the Welcome last went out — the backoff's origin.
+    last_sent: i64,
+    /// When we last ACKED this peer. A Welcome bucket rides a public mailbox,
+    /// so anyone can replay one at us; this is the floor that keeps a replay
+    /// from making us encrypt and deposit an ack per copy.
+    last_ack: i64,
+    /// How many times the Welcome has gone out. At `chat.welcome_retry_max`
+    /// we stop and the thread says so, rather than retrying behind the user.
+    attempts: u8,
+
+    comptime {
+        // Budget 40: 16 (slice) + 8 + 8 + 1 = 33 bytes of payload, padded to
+        // pointer alignment. One row per conversation. (A7)
+        assert(@sizeOf(WelcomeState) == 40);
+    }
+};
+
+pub const welcome_confirmed: WelcomeState = .{ .bucket = &.{}, .last_sent = 0, .last_ack = 0, .attempts = 0 };
 
 /// One account's E2EE chat state: identity + the open conversations'
 /// groups, parallel arrays keyed by peer DID (A3; the DID is the one
@@ -114,6 +152,8 @@ pub const State = struct {
     peer_dids: std.ArrayList([]u8) = .empty,
     peer_anchors: std.ArrayList([32]u8) = .empty,
     groups: std.ArrayList(mls.Group) = .empty,
+    /// Welcome delivery, parallel to `groups` (A1).
+    welcomes: std.ArrayList(WelcomeState) = .empty,
 };
 
 pub const InitError = error{ NoAnchor, NoCacheDir, PublishFailed, OutOfMemory };
@@ -178,6 +218,8 @@ pub fn deinit(gpa: Allocator, st: *State) void {
     st.peer_anchors.deinit(gpa);
     for (st.groups.items) |*g| g.deinit(gpa);
     st.groups.deinit(gpa);
+    for (st.welcomes.items) |w| gpa.free(w.bucket);
+    st.welcomes.deinit(gpa);
 }
 
 /// Every mailbox this account drains right now: the bootstrap inbox
@@ -269,7 +311,7 @@ pub fn persist(gpa: Allocator, environ: ?*const std.process.Environ.Map, st: *co
     var count4: [4]u8 = undefined;
     std.mem.writeInt(u32, &count4, @intCast(st.groups.items.len), .little);
     blob.appendSlice(gpa, &count4) catch return;
-    for (st.peer_dids.items, st.peer_anchors.items, st.groups.items) |did, apub, *g| {
+    for (st.peer_dids.items, st.peer_anchors.items, st.groups.items, st.welcomes.items) |did, apub, *g, w| {
         var len4: [4]u8 = undefined;
         std.mem.writeInt(u32, &len4, @intCast(did.len), .little);
         blob.appendSlice(gpa, &len4) catch return;
@@ -283,6 +325,17 @@ pub fn persist(gpa: Allocator, environ: ?*const std.process.Environ.Map, st: *co
         std.mem.writeInt(u32, &len4, @intCast(gb.len), .little);
         blob.appendSlice(gpa, &len4) catch return;
         blob.appendSlice(gpa, gb) catch return;
+        // v2: the pending Welcome. It has to outlive the process — the peer
+        // this is waiting on may not open their app until tomorrow, and a
+        // relaunch that forgot the bucket would leave the conversation
+        // permanently half-open with nothing left to retry.
+        std.mem.writeInt(u32, &len4, @intCast(w.bucket.len), .little);
+        blob.appendSlice(gpa, &len4) catch return;
+        blob.appendSlice(gpa, w.bucket) catch return;
+        var at8: [8]u8 = undefined;
+        std.mem.writeInt(i64, &at8, w.last_sent, .little);
+        blob.appendSlice(gpa, &at8) catch return;
+        blob.append(gpa, w.attempts) catch return;
     }
     var path_buf: [512]u8 = undefined;
     const path = groupsPath(&path_buf, environ, st.my_did) orelse return;
@@ -298,7 +351,8 @@ fn restoreGroups(gpa: Allocator, environ: ?*const std.process.Environ.Map, st: *
         gpa.free(blob);
     }
     if (blob.len < 10 or !std.mem.eql(u8, blob[0..4], &groups_magic)) return;
-    if (std.mem.bytesToValue(u16, blob[4..6]) != groups_version) return;
+    const version = std.mem.bytesToValue(u16, blob[4..6]);
+    if (version != 1 and version != groups_version) return;
     const count = std.mem.readInt(u32, blob[6..10], .little);
     var at: usize = 10;
     var i: u32 = 0;
@@ -317,27 +371,87 @@ fn restoreGroups(gpa: Allocator, environ: ?*const std.process.Environ.Map, st: *
         const group = mls.deserializeGroup(gpa, blob[at .. at + glen]) catch return;
         at += glen;
 
+        // v2: the pending Welcome. A v1 blob has none — those conversations
+        // predate the ack and are taken as confirmed (see `groups_version`).
+        var welcome: WelcomeState = welcome_confirmed;
+        if (version >= 2) {
+            if (blob.len - at < 4) return;
+            const wlen = std.mem.readInt(u32, blob[at..][0..4], .little);
+            at += 4;
+            if (blob.len - at < @as(usize, wlen) + 8 + 1) return;
+            if (wlen > 0) {
+                welcome.bucket = gpa.dupe(u8, blob[at .. at + wlen]) catch return;
+                welcome.last_sent = std.mem.readInt(i64, blob[at + wlen ..][0..8], .little);
+                // The ladder starts over on every launch. A peer who was
+                // offline for a week comes back to a Welcome that is still
+                // trying — without anyone learning the word "Welcome", and
+                // without the client hammering the relay in between.
+                welcome.attempts = 0;
+            }
+            at += @as(usize, wlen) + 8 + 1;
+        }
+
         const did_copy = gpa.dupe(u8, did) catch {
             var g = group;
             g.deinit(gpa);
+            gpa.free(welcome.bucket);
             return;
         };
-        appendConversation(gpa, st, did_copy, apub, group) catch {
+        appendConversation(gpa, st, did_copy, apub, group, welcome) catch {
             var g = group;
             g.deinit(gpa);
             gpa.free(did_copy);
+            gpa.free(welcome.bucket);
             return;
         };
     }
 }
 
-fn appendConversation(gpa: Allocator, st: *State, did_owned: []u8, apub: [32]u8, group: mls.Group) error{OutOfMemory}!void {
+/// Append one conversation across every parallel array at once. `welcome`
+/// owns its bucket (empty = confirmed / nothing of ours to deliver); on the
+/// OOM path the caller still owns everything it passed, so nothing is freed
+/// here — capacity is reserved for all four arrays before any of them grows,
+/// so a partial append is not reachable.
+fn appendConversation(gpa: Allocator, st: *State, did_owned: []u8, apub: [32]u8, group: mls.Group, welcome: WelcomeState) error{OutOfMemory}!void {
     try st.peer_dids.ensureUnusedCapacity(gpa, 1);
     try st.peer_anchors.ensureUnusedCapacity(gpa, 1);
     try st.groups.ensureUnusedCapacity(gpa, 1);
+    try st.welcomes.ensureUnusedCapacity(gpa, 1);
     st.peer_dids.appendAssumeCapacity(did_owned);
     st.peer_anchors.appendAssumeCapacity(apub);
     st.groups.appendAssumeCapacity(group);
+    st.welcomes.appendAssumeCapacity(welcome);
+}
+
+/// The peer has acknowledged our Welcome: the channel is real. Drop the
+/// retained bucket — there is nothing left to re-send, and the conversation
+/// stops reading as "waiting".
+fn confirmWelcome(gpa: Allocator, st: *State, idx: usize) bool {
+    const w = &st.welcomes.items[idx];
+    if (w.bucket.len == 0) return false; // already confirmed; a duplicate ack is a no-op (E4)
+    gpa.free(w.bucket);
+    w.* = welcome_confirmed;
+    return true;
+}
+
+/// Retain the Welcome we just deposited so it can be re-sent until acked.
+/// Replaces any bucket already held for this conversation (a re-establish
+/// supersedes the Welcome it retries).
+fn armWelcome(gpa: Allocator, st: *State, idx: usize, bucket: []const u8, now: i64) void {
+    const copy = gpa.dupe(u8, bucket) catch return; // out of memory: the Welcome still went, we just can't retry it
+    const w = &st.welcomes.items[idx];
+    gpa.free(w.bucket);
+    w.* = .{ .bucket = copy, .last_sent = now, .last_ack = w.last_ack, .attempts = 1 };
+}
+
+/// What the far side knows about this conversation (A1) — what the thread
+/// must say. No conversation at all reads as `confirmed`: the caller has
+/// nothing to show a delivery state for.
+pub fn deliveryState(st: *const State, peer_did: []const u8) chat.Delivery {
+    const idx = conversationIndex(st, peer_did) orelse return .confirmed;
+    const w = st.welcomes.items[idx];
+    if (w.bucket.len == 0) return .confirmed;
+    return if (w.attempts >= chat.welcome_retry_max) .undelivered else .waiting;
 }
 
 // ---------------------------------------------------------------------------
@@ -382,7 +496,18 @@ pub fn startConversation(
 
     const did_copy = try gpa.dupe(u8, peer_did);
     errdefer gpa.free(did_copy);
-    try appendConversation(gpa, st, did_copy, peer.anchor_pub, group);
+    // The Welcome is OUT, not DELIVERED. Retain the bucket and wait for their
+    // ack (A1): until it comes back the conversation reads as "waiting", and
+    // `retryWelcomes` keeps re-sending. One unacknowledged shot is how a
+    // conversation ends up alive on one side and absent on the other.
+    const retained = try gpa.dupe(u8, &bucket);
+    errdefer gpa.free(retained);
+    try appendConversation(gpa, st, did_copy, peer.anchor_pub, group, .{
+        .bucket = retained,
+        .last_sent = clock.unixSeconds(),
+        .last_ack = 0,
+        .attempts = 1,
+    });
     persist(gpa, environ, st);
 }
 
@@ -439,7 +564,59 @@ pub fn restartConversation(
     st.groups.items[idx].deinit(gpa);
     st.groups.items[idx] = group;
     st.peer_anchors.items[idx] = peer.anchor_pub;
+    // This Welcome is unacknowledged like any other — retry it, and say
+    // "waiting" until they answer (A1). It supersedes whatever bucket the
+    // conversation was already retrying.
+    armWelcome(gpa, st, idx, &bucket, clock.unixSeconds());
     persist(gpa, environ, st);
+}
+
+/// Re-send every Welcome the peer has not acknowledged and that the backoff
+/// says is due (A1). Cheap and idempotent: called on the chat tick, walks a
+/// handful of rows, and deposits only what the pure policy
+/// (`chat.welcomeRetryDue`) admits. A relay that refuses the deposit is not
+/// an error here — the next tick tries again.
+pub fn retryWelcomes(
+    gpa: Allocator,
+    environ: ?*const std.process.Environ.Map,
+    st: *State,
+    link: *chat_relay.ChatRelay,
+    now: i64,
+) void {
+    var sent = false;
+    for (st.welcomes.items, 0..) |*w, i| {
+        if (w.bucket.len != relay.bucket_len) continue; // acked (empty), or damage we will not deposit
+        if (!chat.welcomeRetryDue(w.attempts, w.last_sent, now)) continue;
+        const target = keydir.bootstrapMailbox(st.peer_anchors.items[i]);
+        chat_relay.deposit(link, target, w.bucket[0..relay.bucket_len]) catch continue;
+        w.attempts +|= 1;
+        w.last_sent = now;
+        sent = true;
+        logMailbox("welcome RETRY ->", target);
+    }
+    if (sent) persist(gpa, environ, st);
+}
+
+/// Tell the peer their Welcome landed and we joined (A1): one MLS-encrypted
+/// byte over the group we just joined — end-to-end authenticated, invisible
+/// to the relay, and indistinguishable from any other bucket. Throttled per
+/// conversation, because a Welcome rides a public mailbox and anyone can
+/// replay one at us.
+pub fn sendGroupAck(
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    st: *State,
+    link: *chat_relay.ChatRelay,
+    peer_did: []const u8,
+    now: i64,
+) SendError!void {
+    const idx = conversationIndex(st, peer_did) orelse return error.NoConversation;
+    const w = &st.welcomes.items[idx];
+    if (w.last_ack != 0 and now - w.last_ack < chat.welcome_ack_min_gap_s) return;
+    const ack = [1]u8{chat.kind_group_ack_wire};
+    try depositPlain(gpa, io, environ, st, link, idx, &ack);
+    st.welcomes.items[idx].last_ack = now; // only on success: a failed ack must be retryable
 }
 
 pub const SendError = error{ NoConversation, TooLong, CryptoFailed, RelayDown, OutOfMemory };
@@ -604,6 +781,15 @@ pub const Incoming = union(enum) {
     /// The peer is typing right now — ephemeral; the shell shows the
     /// indicator for a few seconds and lets it lapse. Never stored.
     typing: struct { peer_did: []u8 },
+    /// A Welcome we ALREADY joined, arriving again (A1) — the peer's retry,
+    /// because our ack never reached them. Nothing changes on our side (the
+    /// group is the one we are already using; rebuilding it would reset a
+    /// live ratchet). The shell simply acks again.
+    welcome_again: struct { peer_did: []u8 },
+    /// The peer ACKED our Welcome: the conversation is real on both sides
+    /// (A1). Nothing enters the store — this only retires the retry and the
+    /// thread's "waiting for them to receive this" line.
+    confirmed: struct { peer_did: []u8 },
     /// A payment CARD (kind 16/17), frame already parsed by the pure core.
     /// The store creates the card — or, when the id names one this
     /// conversation already has, advances it (one card per payment,
@@ -643,6 +829,8 @@ pub fn freeIncoming(gpa: Allocator, inc: Incoming) void {
         .started => |s| gpa.free(s.peer_did),
         .restarted => |s| gpa.free(s.peer_did),
         .typing => |t| gpa.free(t.peer_did),
+        .welcome_again => |s| gpa.free(s.peer_did),
+        .confirmed => |s| gpa.free(s.peer_did),
         .payment => |p| {
             gpa.free(p.peer_did);
             gpa.free(p.note);
@@ -669,6 +857,12 @@ pub const PendingWelcome = struct {
     /// Once it happened there was no way out of it from the UI, and no message
     /// anywhere saying so. See `acceptWelcome`.
     replaces: ?usize = null,
+    /// This Welcome opens the group we are ALREADY in — the peer re-sent it
+    /// because our ack never reached them (A1), or someone replayed the
+    /// bucket. Not a re-establishment: the group id matches, so rebuilding it
+    /// would throw away a live ratchet to arrive back where we started.
+    /// Answer with an ack and change nothing.
+    again: bool = false,
 };
 
 /// Phase 1 (no network): try to join a Welcome with our stored package.
@@ -691,11 +885,17 @@ pub fn openWelcome(gpa: Allocator, st: *State, payload: []const u8) ?PendingWelc
     // `acceptWelcome` checks it against the directory exactly as it does a first
     // contact, so a stranger cannot reset your conversation by shouting at you.
     const existing = conversationIndex(st, peer_did_view);
+    // The same group we are already in? Then this is the peer's RETRY of a
+    // Welcome we already accepted (our ack was lost), not a new channel.
+    const again = if (existing) |i|
+        std.mem.eql(u8, st.groups.items[i].group_id, group.group_id)
+    else
+        false;
     const did_copy = gpa.dupe(u8, peer_did_view) catch {
         group.deinit(gpa);
         return null;
     };
-    return .{ .group = group, .peer_did = did_copy, .replaces = existing };
+    return .{ .group = group, .peer_did = did_copy, .replaces = existing, .again = again };
 }
 
 /// Phase 2: believe the Welcome ONLY if the claimed DID's published record
@@ -738,12 +938,17 @@ pub fn acceptWelcome(
         st.groups.items[idx].deinit(gpa);
         st.groups.items[idx] = group;
         st.peer_anchors.items[idx] = expected;
+        // Their Welcome supersedes any Welcome of OURS still waiting for an
+        // ack: the channel we are keeping alive is the one they just built,
+        // and they are plainly reachable — resending ours would only hand
+        // them a second group to choose between.
+        _ = confirmWelcome(gpa, st, idx);
         gpa.free(pw.peer_did); // the DID at `idx` is already ours and unchanged
         persist(gpa, environ, st);
         return .{ .restarted = .{ .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]) } };
     }
 
-    appendConversation(gpa, st, pw.peer_did, expected, group) catch {
+    appendConversation(gpa, st, pw.peer_did, expected, group, welcome_confirmed) catch {
         group.deinit(gpa);
         gpa.free(pw.peer_did);
         return error.OutOfMemory;
@@ -773,7 +978,19 @@ pub fn onBucket(
     switch (mls.messageKind(payload)) {
         .welcome => {
             if (!std.mem.eql(u8, &from, &st.inbox)) return null; // M2.3: Welcomes ride the bootstrap inbox only
-            const pw = openWelcome(gpa, st, payload) orelse return null;
+            var pw = openWelcome(gpa, st, payload) orelse return null;
+            // A Welcome for the group we are already in (A1). Their retry, or
+            // a replayed bucket — either way there is nothing to build and
+            // nothing to verify against the directory: only the peer whose
+            // Welcome we already accepted could have produced these bytes,
+            // and the answer is the same in both cases. Ack and change
+            // nothing. (Skipping the fetch here is deliberate: a replayed
+            // bucket must not turn into a directory lookup we perform on
+            // demand for a stranger.)
+            if (pw.again) {
+                pw.group.deinit(gpa);
+                return .{ .welcome_again = .{ .peer_did = pw.peer_did } };
+            }
             const fetched = chat_keys.fetchPeer(gpa, arena, io, environ, pw.peer_did) catch null;
             return acceptWelcome(gpa, environ, st, pw, if (fetched) |p| p.anchor_pub else null);
         },
@@ -805,6 +1022,15 @@ pub fn onBucket(
                     // never a stored message (chat.kind_typing_wire).
                     if (data[0] == chat.kind_typing_wire) {
                         return .{ .typing = .{ .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]) } };
+                    }
+                    // The group ACK (A1): the peer joined the group our
+                    // Welcome carried, and only they could have — this frame
+                    // decrypted under that group's own ratchet. The Welcome is
+                    // delivered; stop retrying it and let the thread say the
+                    // conversation is real. Wire-only, never a message.
+                    if (data[0] == chat.kind_group_ack_wire) {
+                        if (confirmWelcome(gpa, st, idx)) persist(gpa, environ, st);
+                        return .{ .confirmed = .{ .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]) } };
                     }
                     // Card-FLIP events (settlement 18/19, S2 ready/cancel/
                     // decline 21/22/23): wire-only, like the ping — but their
@@ -946,10 +1172,19 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
     });
     defer gpa.free(welcome);
     const b_anchor_pub = try anchor.publicKey(seed_b);
-    try appendConversation(gpa, &a, try gpa.dupe(u8, b.my_did), b_anchor_pub, group_a);
 
     var welcome_bucket: [relay.bucket_len]u8 = undefined;
     try bucketPack(&welcome_bucket, welcome);
+
+    // A's side of startConversation: the Welcome is OUT, not delivered — the
+    // bucket is retained and the conversation reads as `waiting` (A1).
+    try appendConversation(gpa, &a, try gpa.dupe(u8, b.my_did), b_anchor_pub, group_a, .{
+        .bucket = try gpa.dupe(u8, &welcome_bucket),
+        .last_sent = 1000,
+        .last_ack = 0,
+        .attempts = 1,
+    });
+    try testing.expectEqual(chat.Delivery.waiting, deliveryState(&a, b.my_did));
 
     // An impostor first: same Welcome, but the directory pins a DIFFERENT
     // anchor key for the claimed DID → refused, no conversation.
@@ -994,6 +1229,42 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
     // M2.3: the same Welcome bucket arriving on a TRAFFIC mailbox is
     // refused before any crypto runs.
     try testing.expect((try onBucket(gpa, gpa, io, &env, &b, b_traffic, &welcome_bucket)) == null);
+
+    // A1 — THE ACK. B (the joiner) answers the Welcome over the group it just
+    // joined; A stops believing in a conversation it cannot prove and starts
+    // knowing it has one. Until this arrives A is `waiting`, and its retry
+    // pump keeps the Welcome going out.
+    {
+        try testing.expectEqual(chat.Delivery.waiting, deliveryState(&a, b.my_did));
+        const ack = [1]u8{chat.kind_group_ack_wire};
+        const msg = try mls.encrypt(gpa, &b.groups.items[0], &ack, 0, .{ 3, 1, 4, 1 });
+        defer gpa.free(msg);
+        var bucket: [relay.bucket_len]u8 = undefined;
+        try bucketPack(&bucket, msg);
+        const inc = (try onBucket(gpa, gpa, io, &env, &a, a_traffic, &bucket)) orelse return error.TestUnexpectedResult;
+        defer freeIncoming(gpa, inc);
+        try testing.expectEqualStrings(b.my_did, inc.confirmed.peer_did);
+        try testing.expectEqual(chat.Delivery.confirmed, deliveryState(&a, b.my_did));
+        // The ack is wire-only: it never became a bubble, and the retry is
+        // retired — the bucket is gone, not merely flagged.
+        try testing.expectEqual(@as(usize, 0), a.welcomes.items[0].bucket.len);
+    }
+
+    // A1 — THE RETRY, from the receiving end. A's Welcome going out a second
+    // time (its ack was lost in the first round) must NOT rebuild B's group:
+    // the group id already matches, and a rebuild would throw away the live
+    // ratchet. B recognises it, answers with another ack, and changes nothing.
+    {
+        const gid_before = try gpa.dupe(u8, b.groups.items[0].group_id);
+        defer gpa.free(gid_before);
+        const epoch_before = b.groups.items[0].epoch;
+        const inc = (try onBucket(gpa, gpa, io, &env, &b, b.inbox, &welcome_bucket)) orelse return error.TestUnexpectedResult;
+        defer freeIncoming(gpa, inc);
+        try testing.expectEqualStrings(a.my_did, inc.welcome_again.peer_did);
+        try testing.expectEqual(@as(usize, 1), b.groups.items.len);
+        try testing.expectEqualSlices(u8, gid_before, b.groups.items[0].group_id);
+        try testing.expectEqual(epoch_before, b.groups.items[0].epoch);
+    }
 
     // A → B: encrypt with the kind byte, bucket it, route it through
     // onBucket's private-message path (no network there).
