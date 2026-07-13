@@ -255,6 +255,243 @@ pub fn fetchPeer(
 }
 
 // ---------------------------------------------------------------------------
+// THE DEVICE RECORD (CHAT_MULTIDEVICE slice 0) — one record PER DEVICE, at the
+// device's own rkey, in `app.zat4.chat.device`.
+//
+// The singleton at rkey "self" is why we are here: putRecord overwrites, so a
+// second device could only ever REPLACE the first. Give each device its own
+// rkey and that clobber stops being possible rather than being guarded against.
+//
+// A record's existence still proves nothing (anybody with the account password
+// can write to the repo) — a device is real only if an already-trusted device
+// SIGNED for it. That check is pure and lives in `core/keydir.resolveDevices`;
+// this file only carries JSON and base64 across the wire (D3).
+// ---------------------------------------------------------------------------
+
+/// A stable, self-derived id for a device: the rkey its record lives at. Derived
+/// from the device's own anchor PUBLIC key, so a device can compute its own rkey
+/// with nothing but its keys — and cannot claim another device's slot.
+pub fn deviceId(buf: *[32]u8, anchor_pub: [anchor.pk_len]u8) []const u8 {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update("Zat4 Chat 1.0 DeviceId");
+    h.update(&anchor_pub);
+    var digest: [32]u8 = undefined;
+    h.final(&digest);
+    // Lowercase base32 (no padding) — an rkey must be URL-safe; 16 chars of it is
+    // 80 bits, far past collision territory for a set that is capped at 8.
+    const alphabet = "abcdefghijklmnopqrstuvwxyz234567";
+    for (0..16) |i| buf[i] = alphabet[digest[i] & 31];
+    return buf[0..16];
+}
+
+/// The WRITE shape. A7.2: cold record struct, size guard waived.
+const DeviceRecordOut = struct {
+    @"$type": []const u8 = lexicon.collection.chat_device,
+    did: []const u8,
+    cipherSuite: u16,
+    keyPackage: []const u8, // base64(MLSMessage(KeyPackage)) — this device's own
+    anchorKeySig: []const u8, // base64(this device's anchor signature over the DID)
+    /// The first device of the account. A root self-attests; every other device
+    /// must show an approval.
+    root: bool,
+    /// base64(an already-trusted device's signature over this device's key + the
+    /// DID). Empty on the root. We do NOT say WHO signed: the reader tests it
+    /// against every device it already trusts, so the record carries no claim it
+    /// could lie about.
+    approvalSig: []const u8 = "",
+    /// A human name for the approval prompt ("Pixel 10 Pro"). Cosmetic, and
+    /// treated as such — it is unsigned, so it may be a lie, and nothing but the
+    /// wording of a prompt may ever depend on it.
+    deviceName: []const u8 = "",
+    notAfter: []const u8,
+    createdAt: []const u8,
+};
+
+/// The READ shape. A7.2: cold parse target, size guard waived.
+const DeviceRecordIn = struct {
+    did: []const u8 = "",
+    cipherSuite: u16 = 0,
+    keyPackage: []const u8 = "",
+    anchorKeySig: []const u8 = "",
+    root: bool = false,
+    approvalSig: []const u8 = "",
+    deviceName: []const u8 = "",
+    notAfter: []const u8 = "",
+    createdAt: []const u8 = "",
+};
+
+fn ListingOf(comptime Value: type) type {
+    return struct {
+        const Rec = struct {
+            uri: []const u8 = "",
+            cid: []const u8 = "",
+            value: Value = .{},
+        };
+        records: []const Rec = &.{},
+        cursor: ?[]const u8 = null,
+    };
+}
+
+/// Publish THIS device's record. `approval_sig` is empty for the root device (the
+/// first ever to use chat on this account) and otherwise carries the signature an
+/// already-approved device made over this device's key.
+///
+/// Unlike `ensurePublished`, this cannot clobber anybody: the rkey is derived from
+/// our own key, so we write only our own slot. There is no A3 gate here because
+/// there is nothing left for it to defend — that is the point of the slice.
+pub fn publishDevice(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    session: *auth.Session,
+    device_name: []const u8,
+    is_root: bool,
+    approval_sig: []const u8,
+) !Published {
+    const did = session.did;
+    var anchor_load = cache.loadOrCreateAnchorSeed(gpa, io, environ, did) orelse return error.NoAnchor;
+    defer std.crypto.secureZero(u8, &anchor_load.seed);
+
+    const now = clock.unixSeconds();
+    var kp_path_buf: [512]u8 = undefined;
+    const kp_path = cache.chatKeyPackagePath(&kp_path_buf, environ, did) orelse return error.NoCacheDir;
+
+    var minted = false;
+    var stored = cache.loadChatKeyPackageAt(gpa, kp_path, did) orelse blk: {
+        var ep: mls.KeyPackageEntropy = undefined;
+        try io.randomSecure(&ep.init_seed);
+        try io.randomSecure(&ep.enc_seed);
+        defer {
+            std.crypto.secureZero(u8, &ep.init_seed);
+            std.crypto.secureZero(u8, &ep.enc_seed);
+        }
+        var bundle = try mls.generateKeyPackage(gpa, did, anchor_load.seed, @intCast(@max(0, now - 300)), @intCast(now + lifetime_seconds), ep);
+        var fresh: cache.ChatKeyPackage = .{
+            .init_priv = bundle.init_priv,
+            .enc_priv = bundle.enc_priv,
+            .kp_bytes = bundle.bytes,
+        };
+        std.crypto.secureZero(u8, &bundle.init_priv);
+        std.crypto.secureZero(u8, &bundle.enc_priv);
+        if (!cache.saveChatKeyPackageAt(gpa, kp_path, did, &fresh)) {
+            cache.freeChatKeyPackage(gpa, &fresh);
+            return error.PersistFailed; // never publish a package we could lose
+        }
+        minted = true;
+        break :blk fresh;
+    };
+    defer cache.freeChatKeyPackage(gpa, &stored);
+
+    const info = try mls.checkKeyPackage(arena, stored.kp_bytes, @intCast(@max(0, now)));
+    const sig = try anchor.signDidBinding(anchor_load.seed, did);
+    const my_pub = try anchor.publicKey(anchor_load.seed);
+
+    const Enc = std.base64.standard.Encoder;
+    const kp_b64 = try arena.alloc(u8, Enc.calcSize(stored.kp_bytes.len));
+    _ = Enc.encode(kp_b64, stored.kp_bytes);
+    const sig_b64 = try arena.alloc(u8, Enc.calcSize(sig.len));
+    _ = Enc.encode(sig_b64, &sig);
+    const appr_b64 = if (approval_sig.len == 0) "" else blk: {
+        const b = try arena.alloc(u8, Enc.calcSize(approval_sig.len));
+        _ = Enc.encode(b, approval_sig);
+        break :blk b;
+    };
+
+    var rkey_buf: [32]u8 = undefined;
+    var na_buf: [24]u8 = undefined;
+    var ca_buf: [24]u8 = undefined;
+    const record = DeviceRecordOut{
+        .did = did,
+        .cipherSuite = mls.cipher_suite_id,
+        .keyPackage = kp_b64,
+        .anchorKeySig = sig_b64,
+        .root = is_root,
+        .approvalSig = appr_b64,
+        .deviceName = device_name,
+        .notAfter = feed_core.formatTimestamp(&na_buf, @intCast(info.not_after)),
+        .createdAt = feed_core.formatTimestamp(&ca_buf, now),
+    };
+    const input = lexicon.PutRecordInput(@TypeOf(record)){
+        .repo = did,
+        .collection = lexicon.collection.chat_device,
+        .rkey = deviceId(&rkey_buf, my_pub),
+        .record = record,
+    };
+    const outcome = try auth.procedure(gpa, arena, io, environ, session, lexicon.method.put_record, input, lexicon.RecordRef);
+    return switch (outcome) {
+        .ok => |r| .{ .uri = try arena.dupe(u8, r.uri), .cid = try arena.dupe(u8, r.cid), .minted = minted },
+        .failed => error.PublishFailed,
+    };
+}
+
+/// Every device of `did` that the account's own devices vouch for, plus the root
+/// key that identifies its chat identity. An account with no device records is not
+/// an error — it simply has not moved to the device model yet (E4: the caller
+/// falls back to the legacy singleton).
+pub fn fetchPeerDevices(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    did: []const u8,
+) !?keydir.DeviceSet {
+    const pds_url = try identity.pdsForDid(gpa, io, environ, .{}, did);
+    defer gpa.free(pds_url);
+
+    const params = [_]xrpc.Param{
+        .{ .name = "repo", .value = did },
+        .{ .name = "collection", .value = lexicon.collection.chat_device },
+        .{ .name = "limit", .value = "20" }, // the set is capped at 8; 20 leaves room for junk
+    };
+    const outcome = try net.query(arena, io, environ, pds_url, lexicon.method.list_records, &params, ListingOf(DeviceRecordIn), .{ .guard = .untrusted });
+    const listing = switch (outcome) {
+        .ok => |r| r,
+        .failed => return null, // no such collection = not on the device model (E4)
+    };
+    if (listing.records.len == 0) return null;
+
+    const Dec = std.base64.standard.Decoder;
+    var decoded = try std.ArrayListUnmanaged(keydir.DeviceRecord).initCapacity(arena, listing.records.len);
+    for (listing.records) |r| {
+        const v = r.value;
+        // A record we cannot even decode is DROPPED, not fatal: one piece of junk
+        // in the repo must not take an account's whole chat identity offline.
+        const kp_len = Dec.calcSizeForSlice(v.keyPackage) catch continue;
+        const kp_bytes = try arena.alloc(u8, kp_len);
+        Dec.decode(kp_bytes, v.keyPackage) catch continue;
+        const sig_len = Dec.calcSizeForSlice(v.anchorKeySig) catch continue;
+        const sig_bytes = try arena.alloc(u8, sig_len);
+        Dec.decode(sig_bytes, v.anchorKeySig) catch continue;
+        var appr: []const u8 = "";
+        if (v.approvalSig.len > 0) {
+            const a_len = Dec.calcSizeForSlice(v.approvalSig) catch continue;
+            const a_bytes = try arena.alloc(u8, a_len);
+            Dec.decode(a_bytes, v.approvalSig) catch continue;
+            appr = a_bytes;
+        }
+        const not_after = feed_core.parseTimestamp(v.notAfter) catch continue;
+        const created_at = feed_core.parseTimestamp(v.createdAt) catch 0;
+
+        decoded.appendAssumeCapacity(.{
+            .did = v.did,
+            .cipher_suite = v.cipherSuite,
+            .key_package = kp_bytes,
+            .anchor_sig = sig_bytes,
+            .not_after = not_after,
+            .root = v.root,
+            .approval_sig = appr,
+            .created_at = created_at,
+        });
+    }
+
+    // The verdict is the CORE's (D3): who is vouched for, and by whom.
+    const set = try keydir.resolveDevices(arena, did, decoded.items, clock.unixSeconds());
+    if (set.devices.len == 0) return null;
+    return set;
+}
+
+// ---------------------------------------------------------------------------
 // Tests (C6) — the record wire mapping round-trips through the same JSON +
 // base64 + validation gate a real fetch uses; the network legs are typed
 // through semantic analysis by the harness (main-reachable).
@@ -308,4 +545,106 @@ test "chat_keys: the record round-trips JSON+base64 into keydir's gate" {
     }, 1_751_400_000);
     try testing.expectEqualSlices(u8, &(try anchor.publicKey(seed)), &peer.anchor_pub);
     try testing.expect(back.lastResort);
+}
+
+test "chat_keys: a device record round-trips the wire and its approval survives it" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const did = "did:plc:deviceroundtripaaaaaaaa";
+    const root_seed: [anchor.seed_len]u8 = [_]u8{0x21} ** 32;
+    const phone_seed: [anchor.seed_len]u8 = [_]u8{0x32} ** 32;
+    const phone_pub = try anchor.publicKey(phone_seed);
+
+    const bundle = try mls.generateKeyPackage(arena, did, phone_seed, 0, 4102444800, .{
+        .init_seed = [_]u8{0x40} ** 32,
+        .enc_seed = [_]u8{0x50} ** 32,
+    });
+    const binding = try anchor.signDidBinding(phone_seed, did);
+    // The desktop vouches for the phone — the signature this whole slice turns on.
+    const approval = try anchor.signDeviceApproval(root_seed, did, phone_pub);
+
+    const Enc = std.base64.standard.Encoder;
+    const kp_b64 = try arena.alloc(u8, Enc.calcSize(bundle.bytes.len));
+    _ = Enc.encode(kp_b64, bundle.bytes);
+    const sig_b64 = try arena.alloc(u8, Enc.calcSize(binding.len));
+    _ = Enc.encode(sig_b64, &binding);
+    const appr_b64 = try arena.alloc(u8, Enc.calcSize(approval.len));
+    _ = Enc.encode(appr_b64, &approval);
+
+    const out = DeviceRecordOut{
+        .did = did,
+        .cipherSuite = mls.cipher_suite_id,
+        .keyPackage = kp_b64,
+        .anchorKeySig = sig_b64,
+        .root = false,
+        .approvalSig = appr_b64,
+        .deviceName = "Pixel 10 Pro",
+        .notAfter = "2099-12-31T00:00:00Z",
+        .createdAt = "2026-07-13T00:00:00Z",
+    };
+    const json = try std.json.Stringify.valueAlloc(arena, out, .{ .emit_null_optional_fields = false });
+    const back = try std.json.parseFromSliceLeaky(DeviceRecordIn, arena, json, .{ .ignore_unknown_fields = true });
+
+    // Decode exactly as fetchPeerDevices does, then let the CORE decide who is real.
+    const Dec = std.base64.standard.Decoder;
+    const kp_bytes = try arena.alloc(u8, try Dec.calcSizeForSlice(back.keyPackage));
+    try Dec.decode(kp_bytes, back.keyPackage);
+    const sig_bytes = try arena.alloc(u8, try Dec.calcSizeForSlice(back.anchorKeySig));
+    try Dec.decode(sig_bytes, back.anchorKeySig);
+    const appr_bytes = try arena.alloc(u8, try Dec.calcSizeForSlice(back.approvalSig));
+    try Dec.decode(appr_bytes, back.approvalSig);
+
+    // The root's own record, so the phone has somebody to be vouched for BY.
+    const root_bundle = try mls.generateKeyPackage(arena, did, root_seed, 0, 4102444800, .{
+        .init_seed = [_]u8{0x60} ** 32,
+        .enc_seed = [_]u8{0x70} ** 32,
+    });
+    const root_binding = try anchor.signDidBinding(root_seed, did);
+
+    const set = try keydir.resolveDevices(arena, did, &.{
+        .{
+            .did = did,
+            .cipher_suite = mls.cipher_suite_id,
+            .key_package = root_bundle.bytes,
+            .anchor_sig = &root_binding,
+            .not_after = 4_102_444_800,
+            .root = true,
+            .approval_sig = "",
+            .created_at = 100,
+        },
+        .{
+            .did = back.did,
+            .cipher_suite = back.cipherSuite,
+            .key_package = kp_bytes,
+            .anchor_sig = sig_bytes,
+            .not_after = try feed_core.parseTimestamp(back.notAfter),
+            .root = back.root,
+            .approval_sig = appr_bytes,
+            .created_at = try feed_core.parseTimestamp(back.createdAt),
+        },
+    }, 1_751_400_000);
+
+    // Both devices survive the wire: the account has a desktop AND a phone.
+    try testing.expectEqual(@as(usize, 2), set.devices.len);
+    try testing.expectEqualSlices(u8, &(try anchor.publicKey(root_seed)), &set.root_pub);
+    try testing.expectEqualStrings("Pixel 10 Pro", back.deviceName);
+}
+
+test "chat_keys: a device's rkey is derived from its own key, and is its own" {
+    // A device can compute its own rkey from nothing but its keys — and cannot
+    // land on another device's slot, which is what makes "no device overwrites
+    // another" a property of the addressing rather than a promise.
+    var a_buf: [32]u8 = undefined;
+    var b_buf: [32]u8 = undefined;
+    const a = deviceId(&a_buf, try anchor.publicKey([_]u8{0x11} ** 32));
+    const b = deviceId(&b_buf, try anchor.publicKey([_]u8{0x12} ** 32));
+    try testing.expectEqual(@as(usize, 16), a.len);
+    try testing.expect(!std.mem.eql(u8, a, b));
+
+    var again: [32]u8 = undefined;
+    try testing.expectEqualStrings(a, deviceId(&again, try anchor.publicKey([_]u8{0x11} ** 32)));
+    for (a) |c| try testing.expect(std.ascii.isLower(c) or std.ascii.isDigit(c)); // URL-safe rkey
 }

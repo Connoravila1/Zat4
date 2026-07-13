@@ -165,6 +165,11 @@ pub const collection = struct {
     /// keyPackage — the key-directory entry, a singleton (rkey "self").
     /// Messages themselves never enter the repo.
     pub const chat_key_package = "app.zat4.chat.keyPackage";
+    /// device — ONE RECORD PER DEVICE (rkey = the device's own id), not a
+    /// singleton. That is the whole point: no device can overwrite another's
+    /// record, so a phone can no longer take chat away from a desktop simply by
+    /// existing (CHAT_MULTIDEVICE slice 0).
+    pub const chat_device = "app.zat4.chat.device";
     /// The payment-address directory entry (PART II §3, slice A2): where
     /// this DID accepts Bitcoin — lightning and/or on-chain — anchor-signed
     /// so a PDS can't swap addresses. A singleton (rkey "self"). Payment

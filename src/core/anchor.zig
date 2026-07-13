@@ -131,6 +131,69 @@ pub fn verifyRelayAuth(
 }
 
 // ---------------------------------------------------------------------------
+// DEVICE APPROVAL (CHAT_MULTIDEVICE slice 0). An account may hold several
+// devices, and each keeps its OWN keys — nothing is ever copied. So a second
+// device is not admitted by possessing a secret; it is admitted by an EXISTING
+// device SAYING SO, in a signature.
+//
+// This is the whole security of the feature. Anyone holding the account's
+// credentials can write records into its repo (that is what a password IS), so
+// repo-write authority cannot be what gates a new device — a credential thief
+// would simply publish themselves and be fanned into every future conversation.
+// What a thief does NOT have is an approved device's anchor PRIVATE key, and
+// that is what signs this. A device nobody approved is a device peers ignore.
+//
+// (What a thief CAN still do is a loud "start fresh" — mint a new root and take
+// chat over. That is visible by construction — the peer sees the root change and
+// SAYS SO — and it is bounded by the credential layer, not by this one. The line
+// this draws is the one that matters: no SILENT join.)
+//
+// Domain-separated, like every other signature here: an approval must never be
+// replayable as a DID binding or a relay login, nor either of those as an
+// approval.
+// ---------------------------------------------------------------------------
+
+const approval_label = "Zat4 Chat 1.0 DeviceApproval";
+
+fn approvalMessage(
+    buf: *[approval_label.len + pk_len + max_did_len]u8,
+    did: []const u8,
+    device_pub: [pk_len]u8,
+) AnchorError![]const u8 {
+    if (did.len > max_did_len) return error.DidTooLong;
+    @memcpy(buf[0..approval_label.len], approval_label);
+    @memcpy(buf[approval_label.len..][0..pk_len], &device_pub);
+    @memcpy(buf[approval_label.len + pk_len ..][0..did.len], did);
+    return buf[0 .. approval_label.len + pk_len + did.len];
+}
+
+/// An approved device says: "this other device belongs to this account too."
+/// The DID is signed alongside the key, so an approval minted for one account
+/// cannot be lifted onto another.
+pub fn signDeviceApproval(seed: [seed_len]u8, did: []const u8, device_pub: [pk_len]u8) AnchorError![sig_len]u8 {
+    var buf: [approval_label.len + pk_len + max_did_len]u8 = undefined;
+    const msg = try approvalMessage(&buf, did, device_pub);
+    const kp = Ed25519.KeyPair.generateDeterministic(seed) catch return error.BadKey;
+    const sig = kp.sign(msg, null) catch return error.BadKey;
+    return sig.toBytes();
+}
+
+/// The peer's half: does an ALREADY-TRUSTED device of this account vouch for
+/// this one? Untrusted wire bytes throughout (E3).
+pub fn verifyDeviceApproval(
+    approver_pub: [pk_len]u8,
+    did: []const u8,
+    device_pub: [pk_len]u8,
+    sig: []const u8,
+) AnchorError!void {
+    if (sig.len != sig_len) return error.BadSignature;
+    var buf: [approval_label.len + pk_len + max_did_len]u8 = undefined;
+    const msg = try approvalMessage(&buf, did, device_pub);
+    const pk = Ed25519.PublicKey.fromBytes(approver_pub) catch return error.BadKey;
+    Ed25519.Signature.fromBytes(sig[0..sig_len].*).verify(msg, pk) catch return error.BadSignature;
+}
+
+// ---------------------------------------------------------------------------
 // Tests. Deterministic Ed25519 means these are all fixed-vector tests (C6:
 // nothing allocates, so the leak allocator has nothing to see).
 // ---------------------------------------------------------------------------
@@ -240,4 +303,53 @@ test "anchor: relay auth binds the challenge, the DID, and the key — and nothi
 
     // A truncated signature is an explicit error, not a panic (E3).
     try testing.expectError(error.BadSignature, verifyRelayAuth(anchor_pub, challenge, test_did, sig[0 .. sig_len - 1]));
+}
+
+test "anchor: a device approval verifies, and every substitution fails" {
+    const approver_seed = test_seed;
+    const approver_pub = try publicKey(approver_seed);
+
+    // The device being approved (its own keys — nothing is copied to it).
+    const device_seed: [seed_len]u8 = [_]u8{0x5c} ** 32;
+    const device_pub = try publicKey(device_seed);
+
+    const sig = try signDeviceApproval(approver_seed, test_did, device_pub);
+    try verifyDeviceApproval(approver_pub, test_did, device_pub, &sig);
+
+    // A DIFFERENT device key: this is the attack the signature exists to stop —
+    // a thief who can write to the repo swapping their own key into an approval
+    // an honest device made for a device the owner actually approved.
+    const thief_pub = try publicKey([_]u8{0x9e} ** 32);
+    try testing.expectError(error.BadSignature, verifyDeviceApproval(approver_pub, test_did, thief_pub, &sig));
+
+    // Another account's DID: an approval cannot be lifted between accounts.
+    try testing.expectError(error.BadSignature, verifyDeviceApproval(approver_pub, "did:plc:someoneelseaaaaaaaaaaaaaaaa", device_pub, &sig));
+
+    // A key nobody approved with: an unapproved device is simply not approved.
+    try testing.expectError(error.BadSignature, verifyDeviceApproval(thief_pub, test_did, device_pub, &sig));
+
+    // A tampered signature.
+    var bad = sig;
+    bad[0] ^= 0x01;
+    try testing.expectError(error.BadSignature, verifyDeviceApproval(approver_pub, test_did, device_pub, &bad));
+    try testing.expectError(error.BadSignature, verifyDeviceApproval(approver_pub, test_did, device_pub, sig[0 .. sig_len - 1]));
+}
+
+test "anchor: the three signatures are domain-separated — none is replayable as another" {
+    // The security of every one of them rests on this. An approval presented as a
+    // relay login, or a published DID binding presented as an approval, must not
+    // verify — which is what the distinct labels buy.
+    const seed = test_seed;
+    const pub_key = try publicKey(seed);
+    const device_pub = try publicKey([_]u8{0x33} ** 32);
+    const challenge: [challenge_len]u8 = [_]u8{0x44} ** challenge_len;
+
+    const binding = try signDidBinding(seed, test_did);
+    const relay = try signRelayAuth(seed, challenge, test_did);
+    const approval = try signDeviceApproval(seed, test_did, device_pub);
+
+    try testing.expectError(error.BadSignature, verifyDeviceApproval(pub_key, test_did, device_pub, &binding));
+    try testing.expectError(error.BadSignature, verifyDeviceApproval(pub_key, test_did, device_pub, &relay));
+    try testing.expectError(error.BadSignature, verifyDidBinding(pub_key, test_did, &approval));
+    try testing.expectError(error.BadSignature, verifyRelayAuth(pub_key, challenge, test_did, &approval));
 }
