@@ -1917,6 +1917,18 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                     _ = chat_core.openConversation(gpa, &rs.gchat_store, s.peer_did, "") catch null;
                                     chat_mutated = true;
                                     rs.status = "chat: new conversation";
+                                    chatLog("[chat] started <- {s}", .{s.peer_did});
+                                },
+                                // The peer RE-ESTABLISHED this conversation (their
+                                // side had been lost, or never completed). Verified
+                                // against their published anchor, same bar as first
+                                // contact. Say so — from here messages will actually
+                                // arrive, and before now they silently did not.
+                                .restarted => |s| {
+                                    _ = chat_core.openConversation(gpa, &rs.gchat_store, s.peer_did, "") catch null;
+                                    chat_mutated = true;
+                                    rs.status = "chat: conversation re-established";
+                                    chatLog("[chat] RE-ESTABLISHED <- {s} (their keys verified)", .{s.peer_did});
                                 },
                                 // Ephemeral: arm the indicator's deadline;
                                 // nothing enters the store (M2 never sees it).
@@ -5700,6 +5712,11 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         // Handles act by DRAG (the pump owns
                                         // them); a stationary tap is inert.
                                         .chat_handle => {},
+                                        // Repair a conversation whose two halves have
+                                        // drifted apart (see chatRestart).
+                                        .chat_restart => if (dev_chat) {
+                                            if (rs.gchat_sel) |sc| chatRestart(rs, gpa, io, environ, sc);
+                                        },
                                         .chat_send => if (dev_chat) {
                                             const body = std.mem.trimEnd(u8, rs.gchat_draft_buf[0..rs.gchat_draft_len], " \n");
                                             if (body.len > 0) if (rs.gchat_sel) |sc| {
@@ -8511,8 +8528,47 @@ const ChatFrame = struct {
 fn chatSend(gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, st: ?*chat_e2ee.State, link: ?*chat_relay.ChatRelay, cs: *const chat_core.Store, conv: chat_core.ConvIndex, text: []const u8) void {
     const state = st orelse return;
     const l = link orelse return;
+    chatLog("[chat] send -> {s} ({d} bytes)", .{ chat_core.conversationDid(cs, conv), text.len });
     const peer_did = chat_core.conversationDid(cs, conv);
-    chat_e2ee.send(gpa, io, env, state, l, peer_did, .text, text) catch {};
+    // A swallowed send error is how a message "disappears": the bubble appears,
+    // nothing leaves, and nobody is told. Say it.
+    chat_e2ee.send(gpa, io, env, state, l, peer_did, .text, text) catch |err|
+        chatLog("[chat] SEND FAILED -> {s}: {s}", .{ peer_did, @errorName(err) });
+}
+
+/// Re-establish a conversation whose two halves have drifted apart: fetch the
+/// peer's CURRENT keys, build a new group, send them a Welcome, replace ours.
+///
+/// A conversation can be alive on one side and absent on the other — the Welcome
+/// that opened it may never have arrived (a relay outage, or a client pointed at
+/// the wrong relay), or the peer reinstalled. Until now that state was terminal
+/// AND invisible: the sender's bubbles appeared and went nowhere, and the peer's
+/// client silently discarded every attempt to start over.
+///
+/// Costs nothing to use: history is local (the Signal model), and a group the
+/// peer never joined cannot decrypt anything anyway.
+fn chatRestart(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, conv: chat_core.ConvIndex) void {
+    const state = if (rs.gchat_e2ee) |*p| p else {
+        rs.status = "chat: offline";
+        return;
+    };
+    const l = rs.gchat_link orelse {
+        rs.status = "chat: offline";
+        return;
+    };
+    const peer_did = chat_core.conversationDid(&rs.gchat_store, conv);
+    _ = rs.gchat_arena_state.reset(.retain_capacity);
+    chat_e2ee.restartConversation(gpa, rs.gchat_arena_state.allocator(), io, env, state, l, peer_did) catch |err| {
+        chatLog("[chat] re-establish FAILED -> {s}: {s}", .{ peer_did, @errorName(err) });
+        rs.status = switch (err) {
+            error.NoKeyPackage => "They haven't set up chat on this account yet",
+            error.RelayDown => "Chat relay unreachable — try again",
+            else => "Couldn't re-establish — try again",
+        };
+        return;
+    };
+    chatLog("[chat] re-established -> {s} (new Welcome sent)", .{peer_did});
+    rs.status = "chat: re-established — they'll get your next message";
 }
 
 // ---------------------------------------------------------------------------
@@ -9580,6 +9636,7 @@ fn chatStartCompose(
     if (!chat_e2ee.hasConversation(state, did)) {
         chat_e2ee.startConversation(gpa, arena, io, env, state, l, did) catch |err| switch (err) {
             error.AlreadyOpen => {}, // raced ourselves; the view opens below
+            error.NoConversation => {}, // unreachable on the start path
             error.NoKeyPackage => return "No chat keys published for that account",
             error.RelayDown => return "Relay unreachable — try again",
             error.CryptoFailed, error.OutOfMemory => return "Couldn't start the conversation",

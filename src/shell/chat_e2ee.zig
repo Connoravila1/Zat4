@@ -306,7 +306,7 @@ fn appendConversation(gpa: Allocator, st: *State, did_owned: []u8, apub: [32]u8,
 // The three verbs
 // ---------------------------------------------------------------------------
 
-pub const StartError = error{ NoKeyPackage, AlreadyOpen, CryptoFailed, RelayDown, OutOfMemory };
+pub const StartError = error{ NoKeyPackage, AlreadyOpen, NoConversation, CryptoFailed, RelayDown, OutOfMemory };
 
 /// First contact: fetch + validate the peer's directory entry, build the
 /// two-member group, send the Welcome to THEIR bootstrap mailbox.
@@ -343,6 +343,60 @@ pub fn startConversation(
     const did_copy = try gpa.dupe(u8, peer_did);
     errdefer gpa.free(did_copy);
     try appendConversation(gpa, st, did_copy, peer.anchor_pub, group);
+    persist(gpa, environ, st);
+}
+
+/// RE-ESTABLISH a conversation we already have: fetch the peer's CURRENT
+/// published keys, build a fresh group, send them a new Welcome, and replace our
+/// stale group with it.
+///
+/// This is the sender's half of the recovery `acceptWelcome` performs on the
+/// receiving side, and without it a desynchronised conversation could only be
+/// fixed by the OTHER person — which, when neither side can message the other,
+/// is not a repair path at all.
+///
+/// Conversations desynchronise for ordinary reasons: a Welcome that never landed
+/// (a relay outage, or a client pointed at the wrong relay), a reinstall, a lost
+/// cache. Nothing is lost by doing this — history is local (the Signal model),
+/// and a group the peer has moved on from could not decrypt anything anyway.
+pub fn restartConversation(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    st: *State,
+    link: *chat_relay.ChatRelay,
+    peer_did: []const u8,
+) StartError!void {
+    const idx = conversationIndex(st, peer_did) orelse return error.NoConversation;
+    // Their CURRENT keys — not the ones we pinned. If they reinstalled, this is
+    // where we learn it.
+    const peer = (chat_keys.fetchPeer(gpa, arena, io, environ, peer_did) catch return error.NoKeyPackage) orelse
+        return error.NoKeyPackage;
+
+    var ce: mls.CreateEntropy = undefined;
+    var ae: mls.AddEntropy = undefined;
+    io.randomSecure(std.mem.asBytes(&ce)) catch return error.CryptoFailed;
+    io.randomSecure(std.mem.asBytes(&ae)) catch return error.CryptoFailed;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&ce));
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&ae));
+
+    var group = mls.createGroup(gpa, st.my_did, st.anchor_seed, ce) catch return error.CryptoFailed;
+    errdefer group.deinit(gpa);
+    const welcome = mls.addPeer(gpa, &group, peer.kp_bytes, @intCast(@max(0, clock.unixSeconds())), ae) catch
+        return error.CryptoFailed;
+    defer gpa.free(welcome);
+
+    var bucket: [relay.bucket_len]u8 = undefined;
+    bucketPack(&bucket, welcome) catch return error.CryptoFailed;
+    chat_relay.deposit(link, keydir.bootstrapMailbox(peer.anchor_pub), &bucket) catch return error.RelayDown;
+
+    // Swap in the new group only once the Welcome is away: if the deposit fails
+    // we keep the old one and the user can try again, rather than being left with
+    // a group the peer has never heard of.
+    st.groups.items[idx].deinit(gpa);
+    st.groups.items[idx] = group;
+    st.peer_anchors.items[idx] = peer.anchor_pub;
     persist(gpa, environ, st);
 }
 
@@ -500,6 +554,11 @@ fn sendPaymentBytes(
 pub const Incoming = union(enum) {
     message: struct { peer_did: []u8, kind: chat.Kind, text: []u8 },
     started: struct { peer_did: []u8 },
+    /// The peer RE-ESTABLISHED an existing conversation (their side had been
+    /// lost or was never completed). Their keys are verified — this is not a
+    /// warning, it is a fact worth stating in the thread, because from here on
+    /// messages will actually arrive, and before now they silently did not.
+    restarted: struct { peer_did: []u8 },
     /// The peer is typing right now — ephemeral; the shell shows the
     /// indicator for a few seconds and lets it lapse. Never stored.
     typing: struct { peer_did: []u8 },
@@ -540,6 +599,7 @@ pub fn freeIncoming(gpa: Allocator, inc: Incoming) void {
             gpa.free(m.text);
         },
         .started => |s| gpa.free(s.peer_did),
+        .restarted => |s| gpa.free(s.peer_did),
         .typing => |t| gpa.free(t.peer_did),
         .payment => |p| {
             gpa.free(p.peer_did);
@@ -556,6 +616,17 @@ pub const PendingWelcome = struct {
     group: mls.Group,
     /// The DID the Welcome CLAIMS (gpa-owned) — unverified until accept.
     peer_did: []u8,
+    /// The conversation this Welcome RE-ESTABLISHES, if we already had one with
+    /// this DID. `null` = genuinely first contact.
+    ///
+    /// This used to be impossible: a Welcome from a peer we already knew was
+    /// dropped on the floor, silently, which made a desynchronised conversation
+    /// PERMANENTLY dead. And they desynchronise for entirely ordinary reasons —
+    /// a Welcome that never reached the other side (a relay outage, or, in our
+    /// case, a client pointed at the wrong relay), a reinstall, a cleared cache.
+    /// Once it happened there was no way out of it from the UI, and no message
+    /// anywhere saying so. See `acceptWelcome`.
+    replaces: ?usize = null,
 };
 
 /// Phase 1 (no network): try to join a Welcome with our stored package.
@@ -568,15 +639,21 @@ pub fn openWelcome(gpa: Allocator, st: *State, payload: []const u8) ?PendingWelc
         .sig_seed = st.anchor_seed,
     }) catch return null;
     const peer_did_view = mls.peerIdentity(&group);
-    if (peer_did_view.len == 0 or conversationIndex(st, peer_did_view) != null) {
+    if (peer_did_view.len == 0) {
         group.deinit(gpa);
         return null;
     }
+    // A Welcome from someone we ALREADY have a conversation with is not an
+    // error — it is a re-establishment, and refusing it (as we used to) is what
+    // made a broken conversation unfixable. It is still not BELIEVED here:
+    // `acceptWelcome` checks it against the directory exactly as it does a first
+    // contact, so a stranger cannot reset your conversation by shouting at you.
+    const existing = conversationIndex(st, peer_did_view);
     const did_copy = gpa.dupe(u8, peer_did_view) catch {
         group.deinit(gpa);
         return null;
     };
-    return .{ .group = group, .peer_did = did_copy };
+    return .{ .group = group, .peer_did = did_copy, .replaces = existing };
 }
 
 /// Phase 2: believe the Welcome ONLY if the claimed DID's published record
@@ -601,6 +678,29 @@ pub fn acceptWelcome(
         gpa.free(pw.peer_did);
         return null; // an impostor's Welcome (M4 surfaces these refusals)
     }
+
+    // RE-ESTABLISHMENT. The peer is starting the conversation over — because
+    // their side of it never completed, or their device was reinstalled, or
+    // their cache was lost. Replace the stale group with the new one.
+    //
+    // This is safe precisely BECAUSE of the check above: the Welcome's leaf had
+    // to be signed by the anchor key the peer's own published record pins. A
+    // stranger cannot produce one, so a stranger cannot reset your conversation.
+    // It is the same bar first contact must clear — we are not lowering it, we
+    // are stopping it from being applied only once.
+    //
+    // We lose the old ratchet, and with it nothing: history is local (the Signal
+    // model), and a group whose peer has moved on could not decrypt anything
+    // anyway. Losing a dead ratchet costs us a ratchet that was already dead.
+    if (pw.replaces) |idx| {
+        st.groups.items[idx].deinit(gpa);
+        st.groups.items[idx] = group;
+        st.peer_anchors.items[idx] = expected;
+        gpa.free(pw.peer_did); // the DID at `idx` is already ours and unchanged
+        persist(gpa, environ, st);
+        return .{ .restarted = .{ .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]) } };
+    }
+
     appendConversation(gpa, st, pw.peer_did, expected, group) catch {
         group.deinit(gpa);
         gpa.free(pw.peer_did);
@@ -1045,4 +1145,131 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
     // A stranger's random bucket is dropped without a mark.
     var junk: [relay.bucket_len]u8 = @splat(0x5A);
     try testing.expect((try onBucket(gpa, gpa, io, &env, &a, a.inbox, &junk)) == null);
+}
+
+test "chat_e2ee: a VERIFIED re-Welcome re-establishes a desynchronised conversation" {
+    // ── The bug this pins was severe, and it was silent. ──
+    //
+    // A Welcome from a peer we ALREADY had a conversation row for was dropped on
+    // the floor without a word. So a conversation whose two halves had drifted
+    // apart was PERMANENTLY dead: unrepairable from either side, with nothing
+    // anywhere saying so. The owner's messages appeared as bubbles and went
+    // nowhere, for days.
+    //
+    // And halves drift apart for entirely ordinary reasons — the Welcome that
+    // opened the conversation never landed (a relay outage; or, as happened here,
+    // a client pointed at a different relay than its peer), or the peer
+    // reinstalled and their cache, which holds the device-bound anchor, was gone.
+    //
+    // A second Welcome must now REPLACE the stale group — held to exactly the same
+    // bar as first contact, so a stranger still cannot reset your conversation.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    _ = io;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    const tmp = "/tmp/zat-e2ee-restart-test";
+    try env.put("ZAT_CACHE_DIR", tmp);
+    _ = std.os.linux.mkdir(tmp, 0o700);
+    defer {
+        var z: [512]u8 = undefined;
+        if (std.fmt.bufPrintZ(&z, "{s}", .{tmp})) |zp| _ = std.os.linux.rmdir(zp) else |_| {}
+    }
+
+    const seed_a: [32]u8 = @splat(0xA1);
+    const seed_b: [32]u8 = @splat(0xB1);
+    var a = try testState(gpa, "did:plc:restart-alice", seed_a, 0x31, 0x32);
+    defer deinit(gpa, &a);
+    var b = try testState(gpa, "did:plc:restart-bob", seed_b, 0x33, 0x34);
+    defer deinit(gpa, &b);
+
+    // First contact: A welcomes B. This one lands.
+    var g1 = try mls.createGroup(gpa, a.my_did, a.anchor_seed, .{
+        .group_id = @splat(0x40),
+        .enc_seed = @splat(0x41),
+        .epoch_secret = @splat(0x42),
+    });
+    defer g1.deinit(gpa);
+    const w1 = try mls.addPeer(gpa, &g1, b.kp.kp_bytes, 1_000_000, .{
+        .path_secret = @splat(0x43),
+        .enc_seed = @splat(0x44),
+        .welcome_seed = @splat(0x45),
+    });
+    defer gpa.free(w1);
+    var wb1: [relay.bucket_len]u8 = undefined;
+    try bucketPack(&wb1, w1);
+    {
+        const pw = openWelcome(gpa, &b, bucketUnpack(&wb1).?) orelse return error.TestUnexpectedResult;
+        try testing.expect(pw.replaces == null); // genuinely first contact
+        const inc = (try acceptWelcome(gpa, &env, &b, pw, try anchor.publicKey(seed_a))) orelse
+            return error.TestUnexpectedResult;
+        defer freeIncoming(gpa, inc);
+        try testing.expectEqualStrings(a.my_did, inc.started.peer_did);
+    }
+
+    // Now A starts over — a new device, a lost cache, or a Welcome that never
+    // reached them the first time. A brand-new group, a brand-new Welcome.
+    var g2 = try mls.createGroup(gpa, a.my_did, a.anchor_seed, .{
+        .group_id = @splat(0x50),
+        .enc_seed = @splat(0x51),
+        .epoch_secret = @splat(0x52),
+    });
+    defer g2.deinit(gpa);
+    const w2 = try mls.addPeer(gpa, &g2, b.kp.kp_bytes, 1_000_001, .{
+        .path_secret = @splat(0x53),
+        .enc_seed = @splat(0x54),
+        .welcome_seed = @splat(0x55),
+    });
+    defer gpa.free(w2);
+    var wb2: [relay.bucket_len]u8 = undefined;
+    try bucketPack(&wb2, w2);
+
+    // An IMPOSTOR cannot use this to reset the conversation: the re-Welcome is
+    // held to the same directory check as first contact.
+    {
+        const pw = openWelcome(gpa, &b, bucketUnpack(&wb2).?) orelse return error.TestUnexpectedResult;
+        try testing.expect(pw.replaces != null);
+        const wrong: [32]u8 = @splat(0xEE);
+        try testing.expect((try acceptWelcome(gpa, &env, &b, pw, wrong)) == null);
+    }
+    // …and the refusal left B's ORIGINAL conversation intact.
+    try testing.expect(hasConversation(&b, a.my_did));
+    try testing.expectEqual(@as(usize, 1), b.groups.items.len);
+
+    // The genuine re-establishment: A's real anchor, from the directory.
+    {
+        const pw = openWelcome(gpa, &b, bucketUnpack(&wb2).?) orelse return error.TestUnexpectedResult;
+        const inc = (try acceptWelcome(gpa, &env, &b, pw, try anchor.publicKey(seed_a))) orelse
+            return error.TestUnexpectedResult;
+        defer freeIncoming(gpa, inc);
+        // It reports itself as a RESTART, not a new conversation — the thread can
+        // say so, where before it said nothing at all.
+        try testing.expectEqualStrings(a.my_did, inc.restarted.peer_did);
+    }
+
+    // Replaced, not duplicated.
+    try testing.expectEqual(@as(usize, 1), b.groups.items.len);
+    try testing.expectEqual(@as(usize, 1), b.peer_dids.items.len);
+
+    // And B now speaks to A's NEW group: the traffic mailboxes agree, which is
+    // the whole point — before this, every message A sent went to a mailbox B was
+    // not listening on, forever.
+    try testing.expectEqualSlices(u8, &mls.mailboxId(&g2, .peers), &mls.mailboxId(&b.groups.items[0], .mine));
+    try testing.expectEqualSlices(u8, &mls.mailboxId(&g2, .mine), &mls.mailboxId(&b.groups.items[0], .peers));
+
+    // A message on the NEW group decrypts. The old one is gone and unmourned:
+    // history is local (the Signal model), and a group your peer never joined
+    // could not decrypt anything anyway.
+    {
+        const msg = try mls.encrypt(gpa, &g2, "it works now", 0, .{ 9, 9, 9, 9 });
+        defer gpa.free(msg);
+        const got = try mls.receive(gpa, &b.groups.items[0], msg);
+        switch (got) {
+            .application => |pt| {
+                defer gpa.free(pt);
+                try testing.expectEqualStrings("it works now", pt);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
 }

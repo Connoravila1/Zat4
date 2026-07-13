@@ -303,7 +303,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, recv_back, recv_use, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_restart, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, recv_back, recv_use, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -9625,6 +9625,19 @@ pub fn layoutChat(
         const hdr_x = detail_x - @divTrunc(split_gap, 2) + 1;
         try rect(gpa, dl, hdr_x, 0, x0 + w - hdr_x, thread_top, skinHeaderVeil(accent), 0);
         _ = try str(gpa, dl, e, .semibold, detail_x, top + 26, ink, 16, peer_disp);
+        // The repair. Quiet, but always reachable: a conversation can be alive on
+        // your side and absent on theirs (the Welcome that opened it never landed,
+        // or they reinstalled), and until now that state was both terminal and
+        // invisible — your messages appeared and went nowhere. One tap rebuilds
+        // the channel. It costs nothing: history is local, and a group they never
+        // joined could not decrypt anything anyway.
+        if (peer.len > 0) {
+            const rl = "Re-establish";
+            const rw: i32 = @intCast(text.measure(e, .semibold, rl, 12));
+            const rx2 = detail_x + detail_w - rw;
+            _ = try str(gpa, dl, e, .semibold, rx2, top + 26, faint, 12, rl);
+            try emitRegion(gpa, regions, rx2 - 10, top + 8, rw + 16, 28, 0, .chat_restart);
+        }
         try rect(gpa, dl, detail_x, top + 40, detail_w, 1, divider, 0);
     }
 
@@ -10717,7 +10730,9 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     var n_send: usize = 0;
     var n_new: usize = 0;
     var n_pay: usize = 0;
+    var n_restart: usize = 0;
     for (regions.items) |r| {
+        if (r.kind == .chat_restart) n_restart += 1;
         if (r.kind == .chat_conv) n_conv += 1;
         if (r.kind == .chat_input) n_input += 1;
         if (r.kind == .chat_send) n_send += 1;
@@ -10729,7 +10744,12 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     try std.testing.expectEqual(@as(usize, 1), n_send);
     try std.testing.expectEqual(@as(usize, 1), n_new);
     try std.testing.expectEqual(@as(usize, 1), n_pay); // the pay button (M5 A4)
-    try std.testing.expectEqual(regions.items.len, n_conv + n_input + n_send + n_new + n_pay);
+    // The REPAIR. A conversation can be alive on your side and absent on theirs
+    // (the Welcome that opened it never landed, or they reinstalled), and that
+    // state used to be terminal AND invisible — your bubbles appeared and went
+    // nowhere. It must always be reachable from an open thread.
+    try std.testing.expectEqual(@as(usize, 1), n_restart);
+    try std.testing.expectEqual(regions.items.len, n_conv + n_input + n_send + n_new + n_pay + n_restart);
     try std.testing.expect(h >= 940); // viewport + any thread overflow
     try std.testing.expect(dl.len > 0);
 
