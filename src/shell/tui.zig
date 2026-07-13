@@ -1662,6 +1662,11 @@ fn initRunState(
 /// frame body mutates — live_stream, gpu_state, socket_cards … — read
 /// their exit-time values).
 fn deinitRunState(rs: *RunState) void {
+    // The front door's hit list is gpa-owned (enroll_view.pushHit appends into
+    // it every layout). The leak checker caught it on the very first run-through,
+    // which is exactly what it is for.
+    rs.genroll_hits.deinit(rs.gpa);
+    membership_shell.deinit(&rs.genroll_mstore);
     const gpa = rs.gpa;
     const backend = rs.backend;
     if (rs.gpu_state) |*gs| deinitGpuState(gpa, gs);
@@ -13544,7 +13549,15 @@ fn paintFrameGpu(
         // crossfade no longer dissolves it — it stays solid, which is correct.
         // Built for EVERY screen (incl. the loadout/Algorithms page, which now
         // skips its own rail via rail_external) with the active nav = the screen.
-        if (gs.shatter_active and gs.design_w > feed_view.phone_max) {
+        if (g.screen.* == feed_view.screen_enroll) {
+            // THE FRONT DOOR WEARS NO CHROME. A person who is not signed in must
+            // not see a nav rail, a tab bar, a composer or a profile chip — let
+            // alone be able to USE them to walk into an app they have no account
+            // for. The rail tile is built for every screen, which is right for
+            // every screen but this one: here the chrome is furniture belonging to
+            // a room the visitor has not been let into yet.
+            gs.rail.verts.items.len = 0;
+        } else if (gs.shatter_active and gs.design_w > feed_view.phone_max) {
             // The desktop rail was folded INTO the shattered feed buffer above, so
             // clear its separate tile — otherwise an intact rail would draw on top
             // of the debris.
