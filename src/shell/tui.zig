@@ -785,6 +785,12 @@ const RunState = struct {
     /// INLINE — survivable in a window with nothing else to do, and NOT survivable
     /// here, where the same thread has to keep drawing (the standing law).
     genroll_create: CreateJob,
+    /// THE PHONE ASKS THE SEAM FOR THE BROWSER. A phone cannot use the desktop's
+    /// OAuth leg — that one opens a browser and waits on a LOOPBACK LISTENER, and
+    /// on Android the redirect comes back as an OS intent to a trampoline, not to
+    /// a socket. So the front door does not run the flow itself there: it raises
+    /// this, and the seam (which owns the intent plumbing) does the hop.
+    glogin_want: bool,
     /// The existing-account browser sign-in ("I already have an account"), on a
     /// worker: it resolves a handle, opens a browser, and waits on a loopback
     /// listener — none of which may happen on the thread that draws.
@@ -1444,6 +1450,7 @@ fn initRunState(
     rs.genroll_hits = .empty;
     rs.genroll_mstore = membership_shell.init(std.heap.page_allocator);
     rs.genroll_memjob = .{};
+    rs.glogin_want = false;
     rs.genroll_oauth = .{};
     rs.genroll_pending = null;
     rs.genroll_pow = .{};
@@ -7674,6 +7681,23 @@ pub fn mobileOpenUrlTake(mr: *MobileRun, out: []u8) ?[:0]const u8 {
     return out[0..n :0];
 }
 
+/// The front door wants the OS browser (the "I already have an account" branch on
+/// a phone). Read-and-clear: the seam opens it once, not every frame.
+pub fn mobileLoginWant(mr: *MobileRun) bool {
+    const w = mr.rs.glogin_want;
+    mr.rs.glogin_want = false;
+    return w;
+}
+
+/// Enrollment produced a session. The seam persists it and restarts the app AS
+/// that person — the loop cannot hot-swap an identity mid-frame. Ownership passes
+/// to the caller.
+pub fn mobileEnrolledTake(mr: *MobileRun) ?auth.Session {
+    const s = mr.rs.genroll_session;
+    mr.rs.genroll_session = null;
+    return s;
+}
+
 pub fn mobileHapticTake(mr: *MobileRun) u8 {
     const tag = mr.host.haptic_pending;
     mr.host.haptic_pending = 0;
@@ -9150,6 +9174,17 @@ fn enrollVerify(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.proc
 fn enrollConnect(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, frame_ns: u64) void {
     const s = &rs.genroll_state;
     if (s.step != .connecting) return;
+
+    // THE PHONE TAKES A DIFFERENT ROAD. The desktop leg opens a browser and waits
+    // on a loopback listener; Android delivers the redirect as an OS intent to a
+    // trampoline instead, and the seam owns that plumbing. So on mobile we ASK,
+    // and the seam does the hop — the app then restarts as the person it signed
+    // in (the same "hand the session up" shape the new-account branch uses).
+    if (rs.backend == .mobile) {
+        if (!s.connect_failed) rs.glogin_want = true;
+        return;
+    }
+
     if (!rs.genroll_oauth.active and !s.connect_failed)
         enroll_run.startOAuth(&rs.genroll_oauth, s, io, env);
     if (!rs.genroll_oauth.active or !rs.genroll_oauth.done.load(.acquire)) return;

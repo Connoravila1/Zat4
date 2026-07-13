@@ -109,7 +109,9 @@ const Gfx = if (mobile_config.have_gpu) struct {
 const Feed = if (mobile_config.have_gpu) struct {
     io_backend: *std.Io.Threaded,
     env: *std.process.Environ.Map,
-    session: auth.Session,
+    /// NULL = the pre-auth app: the front door, on the ONE run loop (a phone has
+    /// no window, so it could never reach enrollment before).
+    session: ?auth.Session,
     store: feed_core.Store,
     run: *tui.MobileRun,
 } else void;
@@ -355,7 +357,7 @@ fn feedStart(ctx: *Ctx, files_dir: []const u8) bool {
     // Pixel, 2026-07-05). No Threaded is created until a session is in
     // hand; the login leg owns its own for the flow's lifetime.
     var sp_buf: [512]u8 = undefined;
-    const session: auth.Session = blk: {
+    const session: ?auth.Session = blk: {
         if (cache_shell.oauthSessionPath(&sp_buf, env)) |sp| {
             if (cache_shell.loadOAuthSessionAt(gpa, sp)) |s| {
                 logcat("feed: resumed OAuth session ({s})", .{s.handle});
@@ -368,15 +370,16 @@ fn feedStart(ctx: *Ctx, files_dir: []const u8) bool {
                 break :blk s;
             }
         }
-        // No session on this device: arm the on-device sign-in (M-And.5).
-        // The shim ferries the browser hop; when the flow lands a session
-        // it saves to the cache and the shim re-tries this front door.
-        logcat("feed: NO cached session under {s}/.cache/zat — arming sign-in", .{files_dir});
-        loginStart(ctx, files_dir);
-        return false; // no session on this device yet
+        // NO SESSION: the FRONT DOOR (FRONT_DOOR_ROADMAP phase 4). This used to
+        // be a dead end — it armed a browser hop and returned false, because
+        // enrollment lived in a run loop that owns a WINDOW and a phone has none.
+        // So a phone could not create an account AT ALL. Now the app simply runs
+        // with no session and shows the door, on the same loop as everything else.
+        logcat("feed: NO cached session under {s}/.cache/zat — opening the front door", .{files_dir});
+        break :blk null;
     };
     var ok_session = false;
-    defer if (!ok_session) auth.freeSession(gpa, session);
+    defer if (!ok_session) if (session) |sx| auth.freeSession(gpa, sx);
 
     const io_backend = gpa.create(std.Io.Threaded) catch return false;
     io_backend.* = std.Io.Threaded.init(gpa, .{});
@@ -421,7 +424,7 @@ fn feedStart(ctx: *Ctx, files_dir: []const u8) bool {
         .run = undefined,
     };
     const f = &ctx.feed.?;
-    f.run = tui.mobileStart(gpa, io, env, &f.session, eps.appview_url, &f.store, stolen, w, h) catch |err| {
+    f.run = tui.mobileStart(gpa, io, env, if (f.session) |*sx| sx else null, eps.appview_url, &f.store, stolen, w, h) catch |err| {
         // mobileStart owned the context from the call (deinits on its own
         // failure); unwind the rest through the flags above.
         logcat("feed: driver bring-up FAILED ({s}) — field lost too (context consumed); relaunch to retry", .{@errorName(err)});
@@ -554,10 +557,12 @@ fn loginEnd(ctx: *Ctx) void {
 fn feedPersist(gpa: std.mem.Allocator, f: *Feed) void {
     _ = cache_shell.saveStore(gpa, f.env, &f.store);
     var sp_buf: [512]u8 = undefined;
-    if (f.session.mode == .oauth) {
-        if (cache_shell.oauthSessionPath(&sp_buf, f.env)) |sp| _ = cache_shell.saveOAuthSessionAt(gpa, sp, &f.session);
-    } else if (cache_shell.sessionPath(&sp_buf, f.env)) |sp| {
-        _ = cache_shell.saveSessionAt(gpa, sp, &f.session);
+    if (f.session) |*sx| {
+        if (sx.mode == .oauth) {
+            if (cache_shell.oauthSessionPath(&sp_buf, f.env)) |sp| _ = cache_shell.saveOAuthSessionAt(gpa, sp, sx);
+        } else if (cache_shell.sessionPath(&sp_buf, f.env)) |sp| {
+            _ = cache_shell.saveSessionAt(gpa, sp, sx);
+        }
     }
 }
 
@@ -609,7 +614,7 @@ fn feedEnd(ctx: *Ctx) void {
     feedPersist(gpa, f);
     tui.mobileEnd(f.run);
     feed_core.deinitStore(gpa, &f.store);
-    auth.freeSession(gpa, f.session);
+    if (f.session) |sx| auth.freeSession(gpa, sx);
     f.env.deinit();
     gpa.destroy(f.env);
     f.io_backend.deinit();
@@ -823,6 +828,52 @@ pub export fn zat_feed_step(ctx_ptr: ?*anyopaque) u32 {
             logcat("feed: frame error {s}", .{@errorName(err)});
             return 3;
         };
+
+        // THE FRONT DOOR ASKED FOR THE BROWSER ("I already have an account"). The
+        // phone cannot use the desktop's OAuth leg — that one waits on a loopback
+        // listener, and Android delivers the redirect as an OS intent instead. The
+        // seam owns that plumbing, so the door asks and we do the hop.
+        if (tui.mobileLoginWant(f.run)) {
+            logcat("front door: browser sign-in requested", .{});
+            var dir_buf: [512]u8 = undefined;
+            const dir = f.env.get("HOME") orelse "";
+            const n = @min(dir.len, dir_buf.len - 1);
+            @memcpy(dir_buf[0..n], dir[0..n]);
+            dir_buf[n] = 0;
+            loginStart(ctx, dir_buf[0..n]);
+        }
+
+        // ENROLLMENT LANDED A SESSION. Persist it and end this run: the activity
+        // restarts the feed, which now finds a session and comes up AS that
+        // person. The loop cannot hot-swap an identity mid-frame — every worker,
+        // cache and store in it was built for "nobody".
+        if (tui.mobileEnrolledTake(f.run)) |new_session| {
+            var sess = new_session;
+            var sp_buf: [512]u8 = undefined;
+            if (sess.mode == .oauth) {
+                if (cache_shell.oauthSessionPath(&sp_buf, f.env)) |sp| _ = cache_shell.saveOAuthSessionAt(ctx.gpa, sp, &sess);
+            } else if (cache_shell.sessionPath(&sp_buf, f.env)) |sp| {
+                _ = cache_shell.saveSessionAt(ctx.gpa, sp, &sess);
+            }
+            logcat("front door: ENROLLED as {s} — restarting as that person", .{sess.handle});
+            auth.freeSession(ctx.gpa, sess);
+            return 1; // quit → the activity re-enters zat_feed_start with a session
+        }
+
+        // THE BROWSER SIGN-IN LANDED while the front door was up. The activity only
+        // re-enters zat_feed_start when the feed is DEAD, and the front door is a
+        // live feed — so nothing would have restarted it and the person would have
+        // sat on the door with a perfectly good session sitting in the cache. End
+        // this run; the restart finds it.
+        if (f.session == null) {
+            if (ctx.login) |job| {
+                if (job.done.load(.acquire) and job.ok.load(.acquire)) {
+                    logcat("front door: browser sign-in landed — restarting as that person", .{});
+                    return 1;
+                }
+            }
+        }
+
         return switch (outcome) {
             .again => 0,
             .quit => 1,

@@ -75,6 +75,28 @@ fn appPassword(env: ?*const std.process.Environ.Map) ?[]const u8 {
 /// (no cache) is sent to enrollment; a returning user (cache present) falls
 /// through to the normal cached-session run path. Loads and frees the tiny 0600
 /// file once — negligible, and it runs at most once per launch.
+/// The pre-auth front door: the SHELL with no session. Returns the session
+/// enrollment produced, or null if the person closed the window.
+///
+/// This replaces `enroll_run.run`, which owned a window — the thing a phone does
+/// not have, and the reason a phone could not create an account at all. Same
+/// flow, same card, one loop.
+fn frontDoor(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map) !?auth.Session {
+    var store = feed_core.Store{};
+    defer feed_core.deinitStore(gpa, &store);
+    const eps = config.fromEnv(env);
+    const win = window_shell.open(gpa, env, "Zat4", 110, 32) catch |err| {
+        std.debug.print("Zat4: could not open a native window ({s})\n", .{@errorName(err)});
+        return null;
+    };
+    defer window_shell.close(win);
+    var enrolled: ?auth.Session = null;
+    _ = shell_tui.run(gpa, io, env, null, eps.appview_url, &store, .{ .window = win }, &enrolled) catch |err| {
+        std.debug.print("Zat4: the front door ended on an error ({s})\n", .{@errorName(err)});
+    };
+    return enrolled;
+}
+
 fn hasCachedSession(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) bool {
     var buf: [512]u8 = undefined;
     const sp = cache_shell.sessionPath(&buf, env) orelse return false;
@@ -412,7 +434,12 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        if (try enroll_run.run(gpa, io, env)) |new_session| {
+        // THE FRONT DOOR IS THE SHELL NOW (FRONT_DOOR_ROADMAP phase 4). `enroll_run`
+        // opened its own X11 window, brought up its own GPU context and ran its own
+        // input loop — which is exactly why a phone could never reach it. The flow
+        // it drove is unchanged (same State, same steps, same card); only the loop
+        // driving it is, and that loop is one both platforms have.
+        if (try frontDoor(gpa, io, env)) |new_session| {
             var session = new_session;
             var signed_out = false;
             defer auth.freeSession(gpa, session);
