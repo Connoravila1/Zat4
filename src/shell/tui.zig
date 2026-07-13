@@ -9517,19 +9517,9 @@ fn enrollStep(rs: *RunState, frame_ns: u64, t: f32) void {
     } else s.bar_t = 0.0;
     s.bar_phase = t;
 
-    // A step change restarts the slide and closes any open info bubble.
-    if (s.step != s.prev_step or s.confirm_stage != s.prev_confirm_stage) {
-        s.trans_t = 0.0;
-        s.prev_step = s.step;
-        s.prev_confirm_stage = s.confirm_stage;
-        s.info = .none;
-    }
-    s.trans_t += (1.0 - s.trans_t) * 0.22;
-    const target_h: f32 = @floatFromInt(if (s.step == .confirm)
-        enroll_view.confirmHeight(s.confirm_stage)
-    else
-        enroll_view.cardHeight(s.step, s.branch));
-    s.card_h = if (s.card_h < 1.0) target_h else s.card_h + (target_h - s.card_h) * 0.28;
+    // The step transition: the content slides in from the side you came from while
+    // the card grows under it. One routine, shared with the dev harness.
+    enroll_run.stepMotion(s, frame_ns);
 
     // The "Copied" toast decays on its own clock.
     if (s.copied_ns != 0) {

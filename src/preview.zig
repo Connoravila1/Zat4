@@ -932,6 +932,10 @@ pub fn main(init: std.process.Init) !void {
         .{ .name = "enroll_8_signin_shown", .view = .{ .step = .signin, .branch = .existing, .handle = "connor.zat4.com", .host = "pds.zat4.com", .pw = "River-Anchor-Velvet-Tide", .pw_show = true, .focus = .pw, .caret = 24 } },
         .{ .name = "enroll_8_signin_error", .view = .{ .step = .signin, .branch = .existing, .handle = "connor.zat4.com", .host = "pds.zat4.com", .pw = "River-Anchor-Velvet", .sign_error = .refused } },
         .{ .name = "enroll_8_signin_busy", .view = .{ .step = .signin, .branch = .existing, .handle = "connor.zat4.com", .host = "pds.zat4.com", .pw = "River-Anchor-Velvet-Tide", .signin_busy = true } },
+        // Mid-transition: the body is still travelling (forward = in from the
+        // right, Back = in from the left) while the card sits where it belongs.
+        .{ .name = "enroll_9_slide_forward", .view = .{ .step = .membership, .branch = .new, .body_dx = 28 } },
+        .{ .name = "enroll_9_slide_back", .view = .{ .step = .identity, .branch = .existing, .handle = "connor.bsky.social", .body_dx = -28 } },
     };
     var epath_buf: [64]u8 = undefined;
     for (esteps) |es| {

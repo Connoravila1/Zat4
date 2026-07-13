@@ -160,11 +160,13 @@ pub const EnrollView = struct {
     bar_phase: f32 = 0.0,
     did: []const u8 = "", // done-screen pills
     final_handle: []const u8 = "",
-    /// Transition (A): the shell eases the card height between steps (`card_h`,
-    /// 0 = use the step's natural height) and slides the step BODY in by
-    /// `body_dy` (settles to 0). Pure — just an override + an offset.
+    /// Transition: the shell eases the card height between steps (`card_h`, 0 =
+    /// use the step's natural height) and slides the step BODY in horizontally by
+    /// `body_dx` (settles to 0). The SIGN carries the meaning — a forward step
+    /// arrives from the right (+), a Back arrives from the left (−) — so the
+    /// motion says which way you just went. Pure: an override and an offset.
     card_h: i32 = 0,
-    body_dy: i32 = 0,
+    body_dx: i32 = 0,
     info: Info = .none, // which info bubble is open
     /// REHEARSAL (dev builds): the flow was walked but NO ACCOUNT WAS MINTED. The
     /// done card must say so — "You're in" would be a lie, and a screen that lies
@@ -298,19 +300,21 @@ pub fn layout(
     try stepDots(gpa, dl, ix, y, iw, view.step);
     y += 4 + 22;
 
-    // ── the step body (slides in by body_dy during a transition) ──
-    const by = y + view.body_dy;
+    // ── the step body (slides in HORIZONTALLY during a transition; the card,
+    // drawn above, is meanwhile growing under it) ──
+    const by = y;
+    const bx = ix + view.body_dx;
     switch (view.step) {
-        .provenance => try stepProvenance(gpa, dl, e, ix, iw, by, hits),
-        .identity => try stepIdentity(gpa, dl, e, ix, iw, by, view, hits),
-        .membership => try stepMembership(gpa, dl, e, ix, iw, by, view, hits),
-        .password => try stepPassword(gpa, dl, e, ix, iw, by, view, hits),
-        .confirm => try stepConfirm(gpa, dl, e, ix, iw, by, view, hits),
-        .recovery => try stepRecovery(gpa, dl, e, ix, iw, by, view, hits),
-        .done => try stepDone(gpa, dl, e, ix, iw, by, view, hits),
-        .verifying => try stepVerifying(gpa, dl, e, ix, iw, by, view),
-        .connecting => try stepConnecting(gpa, dl, e, ix, iw, by, view, hits),
-        .signin => try stepSignin(gpa, dl, e, ix, iw, by, view, hits),
+        .provenance => try stepProvenance(gpa, dl, e, bx, iw, by, hits),
+        .identity => try stepIdentity(gpa, dl, e, bx, iw, by, view, hits),
+        .membership => try stepMembership(gpa, dl, e, bx, iw, by, view, hits),
+        .password => try stepPassword(gpa, dl, e, bx, iw, by, view, hits),
+        .confirm => try stepConfirm(gpa, dl, e, bx, iw, by, view, hits),
+        .recovery => try stepRecovery(gpa, dl, e, bx, iw, by, view, hits),
+        .done => try stepDone(gpa, dl, e, bx, iw, by, view, hits),
+        .verifying => try stepVerifying(gpa, dl, e, bx, iw, by, view),
+        .connecting => try stepConnecting(gpa, dl, e, bx, iw, by, view, hits),
+        .signin => try stepSignin(gpa, dl, e, bx, iw, by, view, hits),
     }
 
     // Hover lift: one overlay over whatever control the cursor is on, eased so
@@ -1523,6 +1527,34 @@ fn infoBubble(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x: i3
 
 // ───────────────────────── primitive helpers ─────────────────────────
 
+/// HOW FAR INTO THE JOURNEY a step is — the thing that tells a forward step from
+/// a Back, and therefore which way the content should come from. PURE.
+///
+/// It is not the enum's ordinal: `connecting`/`signin` were appended LAST (so the
+/// progress dots would not renumber), and `verifying` comes after `done` on the
+/// new-account road but straight after a sign-in on the existing one. So depth is
+/// stated outright, in steps of two, leaving room for the confirm step's two
+/// sub-stages to be a half-step apart — moving from the spot-check to the full
+/// entry is a forward move, and the motion should say so.
+///
+/// Branch-independent on purpose: `Back` sets the branch to `undecided` in the
+/// same frame it changes the step, so a depth that needed the branch would be
+/// reading the wrong one exactly when the direction matters most.
+pub fn depth(step: Step, stage: ConfirmStage) u8 {
+    return switch (step) {
+        .provenance => 0,
+        .identity => 2,
+        .membership => 4,
+        .connecting => 4, // the existing branch's step 2, alongside membership
+        .password => 6,
+        .signin => 6,
+        .confirm => if (stage == .full) 9 else 8,
+        .recovery => 10,
+        .done => 12,
+        .verifying => 14,
+    };
+}
+
 pub fn cardHeight(step: Step, branch: Branch) i32 {
     return switch (step) {
         .provenance => 402,
@@ -1858,4 +1890,33 @@ test "confirm step: spot stage shows three positioned fields, full stage one" {
     }
     try std.testing.expectEqual(@as(usize, 0), spots);
     try std.testing.expect(saw_full);
+}
+
+test "depth: forward is deeper, Back is shallower — on BOTH roads" {
+    const t = std.testing;
+    // The new-account ritual, in order.
+    try t.expect(depth(.identity, .spot) > depth(.provenance, .spot));
+    try t.expect(depth(.membership, .spot) > depth(.identity, .spot));
+    try t.expect(depth(.password, .spot) > depth(.membership, .spot));
+    try t.expect(depth(.confirm, .spot) > depth(.password, .spot));
+    try t.expect(depth(.recovery, .spot) > depth(.confirm, .full));
+    try t.expect(depth(.done, .spot) > depth(.recovery, .spot));
+    try t.expect(depth(.verifying, .spot) > depth(.done, .spot));
+
+    // The existing-account road: identity → who hosts it → (our PDS) sign in →
+    // the proof gate. Every leg forward.
+    try t.expect(depth(.connecting, .spot) > depth(.identity, .spot));
+    try t.expect(depth(.signin, .spot) > depth(.connecting, .spot));
+    try t.expect(depth(.verifying, .spot) > depth(.signin, .spot));
+
+    // The confirm step's two sub-stages are a half-step apart, and forward.
+    try t.expect(depth(.confirm, .full) > depth(.confirm, .spot));
+
+    // The moves that are genuinely BACKWARD must read as backward — this is the
+    // whole point of the sign, and getting it wrong would slide the content in
+    // from the wrong side on exactly the screens where a person is already lost.
+    try t.expect(depth(.provenance, .spot) < depth(.signin, .spot)); // Back, off the sign-in card
+    try t.expect(depth(.provenance, .spot) < depth(.connecting, .spot)); // Back, off the browser wait
+    try t.expect(depth(.identity, .spot) < depth(.connecting, .spot)); // "Edit handle", off the not-found card
+    try t.expect(depth(.password, .spot) < depth(.confirm, .spot)); // "get a new one", back to the password
 }

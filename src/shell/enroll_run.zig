@@ -140,9 +140,18 @@ pub const State = struct {
     copied_t: f32 = 0.0, // toast strength 0→1 (computed in the loop from copied_ns)
     final_handle: [80]u8 = undefined,
     final_handle_len: usize = 0,
-    // Transition (A): ease the card height + slide the body in on step change.
+    // Transition: ease the card height + slide the body in on a step change.
     prev_step: enroll_view.Step = .provenance,
     trans_t: f32 = 1.0, // 0 right after a step change → 1 settled
+    trans_start_ns: u64 = 0, // when the current transition began (0 = none yet)
+    /// WHICH WAY we just went: +1 deeper into the flow, −1 back out of it. The
+    /// content slides in from the side you came from, so the motion is an answer
+    /// to "where am I going", not decoration.
+    trans_dir: i8 = 1,
+    /// The card height the current transition STARTED from, so the growth is a
+    /// pure function of the transition clock rather than a per-frame chase of a
+    /// moving target (which runs at a different speed on a 120 Hz screen).
+    trans_from_h: f32 = 0.0,
     card_h: f32 = 0.0, // eased card height (0 = not yet initialised)
     info: enroll_view.Info = .none, // which info bubble is open
     connect_failed: bool = false, // .connecting: the browser OAuth flow failed → retry card
@@ -368,20 +377,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         }
         state.bar_phase = t;
 
-        // Transition (A): on a step change, restart the slide; ease the card
-        // height + body offset toward rest every frame.
-        if (state.step != state.prev_step or state.confirm_stage != state.prev_confirm_stage) {
-            state.trans_t = 0.0;
-            state.prev_step = state.step;
-            state.prev_confirm_stage = state.confirm_stage; // a confirm sub-stage slide counts too
-            state.info = .none; // close any open bubble when the step changes
-        }
-        state.trans_t += (1.0 - state.trans_t) * 0.22;
-        const target_h: f32 = @floatFromInt(if (state.step == .confirm)
-            enroll_view.confirmHeight(state.confirm_stage)
-        else
-            enroll_view.cardHeight(state.step, state.branch));
-        state.card_h = if (state.card_h < 1.0) target_h else state.card_h + (target_h - state.card_h) * 0.28;
+        // The step transition (slide + card growth) — the SAME routine the live run
+        // loop drives it with, so the two cannot drift apart.
+        stepMotion(&state, frame_ns);
 
         // Proof-of-work gate (REAL): a background worker runs pow.solve. The ring
         // CREEPS (a decelerating exponential of elapsed time) the whole way — the
@@ -664,7 +662,9 @@ pub fn snapshot(s: *const State, blink_on: bool) enroll_view.EnrollView {
         .did = if (s.step == .done) "did:plc:7mock4example" else "",
         .final_handle = s.final_handle[0..s.final_handle_len],
         .card_h = @intFromFloat(s.card_h),
-        .body_dy = @intFromFloat((1.0 - s.trans_t) * 30.0),
+        // The incoming body starts one slide-length to the side you came FROM and
+        // settles to 0: forward from the right, Back from the left.
+        .body_dx = @intFromFloat((1.0 - s.trans_t) * trans_slide_px * @as(f32, @floatFromInt(s.trans_dir))),
         .info = s.info,
         .connect_failed = s.connect_failed,
         .rehearsal = dist_config.enroll_rehearsal,
@@ -678,6 +678,67 @@ pub fn snapshot(s: *const State, blink_on: bool) enroll_view.EnrollView {
         .signin_busy = s.signin_busy,
         .sign_error = s.sign_error,
     };
+}
+
+// How long a step transition takes, and how far the incoming body travels. Short
+// enough that it never stands between a person and the next field; long enough to
+// be read as motion rather than a jump.
+const trans_dur_ns: f32 = 260_000_000;
+/// STRICTLY LESS THAN THE CARD'S INNER PADDING (28). The draw list is not clipped
+/// to the card — nothing clips it but the framebuffer — so a body offset larger
+/// than the padding would push the incoming content out THROUGH the card's edge
+/// and onto the field for the first frames of every forward step. Travel far
+/// enough to be read as motion, never far enough to escape the card.
+const trans_slide_px: f32 = 26.0;
+
+/// The natural height of the card the state is currently showing.
+fn cardTargetH(s: *const State) f32 {
+    return @floatFromInt(if (s.step == .confirm)
+        enroll_view.confirmHeight(s.confirm_stage)
+    else
+        enroll_view.cardHeight(s.step, s.branch));
+}
+
+/// THE STEP TRANSITION — one clock, driving both halves of it, shared by both
+/// drivers (the live run loop and the dev harness) so the flow cannot animate two
+/// different ways depending on who is running it.
+///
+/// The content SLIDES IN FROM THE SIDE YOU CAME FROM (forward → from the right,
+/// Back → from the left) while the card GROWS UNDER IT toward the new step's
+/// height. The two share `trans_t`, so the card is still settling as the content
+/// arrives on top of it — the card reads as the thing the content lives in, not as
+/// a second animation that happens to run alongside.
+///
+/// Time-based, not a per-frame lerp: `t += (1-t) * 0.22` settles in half the time
+/// on a 120 Hz screen as on a 60 Hz one, which means the phone and the laptop were
+/// running different animations. Elapsed nanoseconds, eased out cubic — fast off
+/// the mark, gently arriving — is the same motion everywhere.
+pub fn stepMotion(s: *State, frame_ns: u64) void {
+    if (s.step != s.prev_step or s.confirm_stage != s.prev_confirm_stage) {
+        const from = enroll_view.depth(s.prev_step, s.prev_confirm_stage);
+        const to = enroll_view.depth(s.step, s.confirm_stage);
+        s.trans_dir = if (to >= from) 1 else -1;
+        s.trans_from_h = if (s.card_h < 1.0) cardTargetH(s) else s.card_h;
+        s.trans_start_ns = frame_ns;
+        s.prev_step = s.step;
+        s.prev_confirm_stage = s.confirm_stage;
+        s.info = .none; // a step change closes any open bubble
+    }
+
+    const lin: f32 = if (s.trans_start_ns == 0)
+        1.0
+    else
+        @min(1.0, @as(f32, @floatFromInt(frame_ns -| s.trans_start_ns)) / trans_dur_ns);
+    const inv = 1.0 - lin;
+    s.trans_t = 1.0 - inv * inv * inv; // easeOutCubic
+
+    const target = cardTargetH(s);
+    if (s.card_h < 1.0) {
+        s.card_h = target; // first frame: no growth from nothing
+        s.trans_from_h = target;
+    } else {
+        s.card_h = s.trans_from_h + (target - s.trans_from_h) * s.trans_t;
+    }
 }
 
 /// Scrub the typed sign-in password and forget it was ever typed. Called whenever
