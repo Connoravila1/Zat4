@@ -156,6 +156,7 @@ pub fn main(init: std.process.Init) !void {
     const windowed_os = builtin.os.tag == .windows or builtin.os.tag.isDarwin();
     var tui_mode = windowed_os;
     var window_mode = windowed_os;
+    var front_door = false;
     // Headless write-path test (STANDALONE write leg): `--post "text"` publishes
     // one app.zat4.feed.post and exits, bypassing the GUI composer. The value is
     // the next argument.
@@ -300,6 +301,14 @@ pub fn main(init: std.process.Init) !void {
             }
         } else if (std.mem.eql(u8, arg, "--tui")) {
             tui_mode = true;
+        } else if (std.mem.eql(u8, arg, "--front-door")) {
+            // FRONT_DOOR_ROADMAP phase 1: run the SHELL with no session, so the
+            // pre-auth app can be exercised on the real run loop (the one a phone
+            // also reaches) before the flow is wired and enroll_run's private
+            // window is retired.
+            front_door = true;
+            tui_mode = true;
+            window_mode = true;
         } else if (std.mem.eql(u8, arg, "--window")) {
             // The same screens in an X11 window; --window implies the
             // interactive run, so it sets tui_mode too.
@@ -335,6 +344,25 @@ pub fn main(init: std.process.Init) !void {
     // password supplied) falls through to the normal login/run paths below.
     // On a completed sign-up, the flow hands back a session: cache it (so the
     // next launch goes straight to the feed) and drop into the feed now.
+    // FRONT_DOOR_ROADMAP phase 1. Checked BEFORE the cached-session gate on
+    // purpose: the whole point of the flag is to exercise the pre-auth app on a
+    // machine that already HAS a session, without wiping it.
+    if (front_door) {
+        var store = feed_core.Store{};
+        defer feed_core.deinitStore(gpa, &store);
+        const eps = config.fromEnv(env);
+        const win = window_shell.open(gpa, env, "Zat4", 110, 32) catch |err| {
+            std.debug.print("Zat4: could not open a native window ({s})\n", .{@errorName(err)});
+            return;
+        };
+        defer window_shell.close(win);
+        std.debug.print("[front-door] running the shell with NO session — the pre-auth app.\n", .{});
+        _ = shell_tui.run(gpa, io, env, null, eps.appview_url, &store, .{ .window = win }) catch |err| {
+            std.debug.print("Zat4: the front door ended on an error ({s})\n", .{@errorName(err)});
+        };
+        return;
+    }
+
     if (window_mode and appPassword(env) == null and !hasCachedSession(gpa, env)) {
         // Returning OAuth user (6.3): a persisted DPoP session means we skip the
         // Join flow and drop straight into the feed, exactly as a cached app-

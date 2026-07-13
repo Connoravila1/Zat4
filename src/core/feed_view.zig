@@ -365,6 +365,12 @@ pub const screen_algo_docs: u8 = 11; // the explainer / writing-guide documents
 /// that at the source: the rows are SCREEN IDS, and the region posts the screen,
 /// not the row. (`drawTabBar` already did this correctly.)
 pub const screen_wallet: u8 = 12;
+/// THE FRONT DOOR (FRONT_DOOR_ROADMAP). The pre-auth screen: no session, no feed,
+/// no rail — the boot entrance and then enrollment. It is a screen in the ONE run
+/// loop rather than a run loop of its own, which is the whole point: enrollment
+/// used to live in `enroll_run.zig`, which owns a WINDOW, and a phone has no
+/// window to own — so a phone could not create an account at all.
+pub const screen_enroll: u8 = 13;
 
 /// The rail / drawer rows, in VISUAL order, as screen ids. Algorithms sits under
 /// Zones; Zat Chat above Activity; Wallet before Settings — money is a place you
