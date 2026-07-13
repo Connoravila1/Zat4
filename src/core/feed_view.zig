@@ -916,7 +916,7 @@ pub fn contentColumn(width: i32, active_screen: u8) struct { x: i32, w: i32 } {
     return .{ .x = m.col_x, .w = m.col_w };
 }
 
-fn rect(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, w: i32, h: i32, color: u32, radius: u8) !void {
+pub fn rect(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, w: i32, h: i32, color: u32, radius: u8) !void {
     try dl.append(gpa, .{ .rect = .{
         .x = @intCast(x),
         .y = @intCast(y),
@@ -987,7 +987,7 @@ fn glyph1(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, weight: t
 }
 
 /// A UTF-8 run; returns the pen x after it.
-fn str(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, weight: text.Weight, x0: i32, baseline: i32, color: u32, px: u16, s: []const u8) !i32 {
+pub fn str(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, weight: text.Weight, x0: i32, baseline: i32, color: u32, px: u16, s: []const u8) !i32 {
     var x = x0;
     var it = (std.unicode.Utf8View.init(s) catch return x).iterator();
     while (it.nextCodepoint()) |cp| x = try glyph1(gpa, dl, e, weight, x, baseline, color, px, cp);
@@ -8362,6 +8362,10 @@ pub const recv_wallets = [_]WalletRec{
 /// list. The shell owns the drafts and the publish; this is the plain view (B5).
 pub const ChatReceiveSheet = struct {
     open: bool = false,
+    /// The publish is out on a worker (the no-blocking-IO law). The button says
+    /// so and disarms — a control that is working must LOOK like it is working,
+    /// or the user taps it again, and again, and concludes the app is broken.
+    saving: bool = false,
     /// Which face is showing (the shell picks `onboard` when you're not set up).
     mode: RecvMode = .paste,
     /// The two receive-address drafts. A Lightning address (LUD-16, like
@@ -8406,10 +8410,15 @@ pub const ChatReceiveSheet = struct {
         //   +24  `caps` — what the wallet actually answered when asked. This is
         //        the whole point: the app renders its unavailable features FROM
         //        this, attributably, instead of guessing or going quiet.
-        // The rest is the existing three slices (48) + six bools + a u8, packed.
-        // This struct is ONE per frame, never in a collection — the budget buys a
-        // fact the UI would otherwise have to invent.
-        assert(@sizeOf(ChatReceiveSheet) == 96);
+        // A7.1: 96 → 104. `saving` (the publish is out on a worker) is one BIT,
+        // and it costs 8 bytes: the bool cluster was exactly filling its word, so
+        // the next flag pays a whole word of padding. Measured, not assumed — the
+        // guard is what forced the number to be looked at instead of guessed.
+        // Accepted: this struct is ONE per frame, never in a collection, and the
+        // bit buys the difference between a button that says it is working and a
+        // button the user concludes is broken and taps again.
+        // The rest is the existing three slices (48) + the bools + a u8, packed.
+        assert(@sizeOf(ChatReceiveSheet) == 104);
     }
 };
 
@@ -10351,7 +10360,7 @@ pub fn layoutChat(
                     py = try wrapNote(gpa, dl, e, ix, py, iw, recv.status);
                     py += 8;
                 }
-                try buttonPrimary(gpa, e, dl, regions, ix, py, iw, 46, "Use this wallet", accent, 0, .recv_use, true);
+                try buttonPrimary(gpa, e, dl, regions, ix, py, iw, 46, if (recv.saving) "Saving\u{2026}" else "Use this wallet", accent, 0, .recv_use, !recv.saving);
                 py += 46 + 10;
                 try buttonSecondary(gpa, e, dl, regions, ix, py, iw, 44, "Use a different wallet", 0, .recv_back);
             },

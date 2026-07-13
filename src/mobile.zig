@@ -44,6 +44,8 @@ const glyph_field = @import("core/glyph_field.zig");
 // comptime-gates every use below, so these imports cost it nothing.
 const mobile_config = @import("mobile_config");
 const gpu = @import("shell/gpu.zig");
+const raster = @import("core/raster.zig");
+const boot_view = @import("core/boot_view.zig");
 const text = @import("core/text.zig");
 const tui = @import("shell/tui.zig");
 const auth = @import("shell/auth.zig");
@@ -91,6 +93,11 @@ const Gfx = if (mobile_config.have_gpu) struct {
     grid: gpu.FieldGrid,
     width_px: u32,
     height_px: u32,
+    /// The pre-session HUD (boot_view): a renderer + atlas, built on first use.
+    /// Before this the pre-feed frame could draw only the FIELD — so a phone with
+    /// no session showed a beautiful animated nothing, and a person waiting on a
+    /// browser hop had no way to tell working from hung.
+    hud: ?gpu.Feed = null,
 } else void;
 
 /// The FEED leg (M_CORE_INVERSION MC.4c): everything zat_feed_start owns —
@@ -661,8 +668,40 @@ fn renderFrame(ctx: *Ctx) void {
         // Full-bleed field: no dimmed content pillar yet (that arrives with
         // the feed, M-Core.1) — the band is zero-width at the left edge.
         gpu.drawFieldGrid(&gfx.grid, &gfx.ramp, -100, -100, ctx.t, @intCast(gfx.width_px), @intCast(gfx.height_px), 0, 0, 0xFFA6ACBA, false, false);
+        drawBootHud(ctx, gfx);
         gpu.swap(&gfx.g);
     }
+}
+
+/// THE PRE-SESSION SURFACE. This frame is only reached when there is no feed —
+/// i.e. no session — and it used to draw the field and nothing else. That is the
+/// screen the owner photographed and asked "why is the field on?", because a
+/// field with no words on it does not read as a screen; it reads as a bug.
+///
+/// Now it says which app this is and what it is doing. Failure to build the HUD
+/// is a no-op, never a crash: the worst case is the screen we already had (E2).
+fn drawBootHud(ctx: *Ctx, gfx: *Gfx) void {
+    if (comptime !mobile_config.have_gpu) return;
+    const gpa = ctx.gpa;
+    if (gfx.hud == null) gfx.hud = gpu.initFeed(gpa) catch return;
+    const hud = &gfx.hud.?;
+
+    // What is actually happening, said once, truthfully.
+    const phase: boot_view.Phase = if (ctx.login) |job| blk: {
+        if (job.done.load(.acquire)) break :blk if (job.ok.load(.acquire)) .signing_in else .failed;
+        break :blk if (job.url_handed) .waiting_for_browser else .opening_browser;
+    } else .starting;
+
+    // The HUD is laid out in the SAME logical space the feed uses, so the type is
+    // the size the rest of the app is (design_w wide, scaled to the screen).
+    const scale: f32 = @as(f32, @floatFromInt(gfx.width_px)) / @as(f32, @floatFromInt(tui.design_w_phone));
+    const logical_h: i32 = @intFromFloat(@as(f32, @floatFromInt(gfx.height_px)) / scale);
+
+    var dl: raster.DrawList = .{};
+    defer dl.deinit(gpa);
+    boot_view.layout(gpa, &gfx.engine, tui.design_w_phone, logical_h, phase, ctx.t, &dl) catch return;
+    gpu.feedBuild(hud, gpa, &gfx.engine, dl.slice(), scale) catch return;
+    gpu.feedDraw(hud, @intCast(gfx.width_px), @intCast(gfx.height_px));
 }
 
 // ---------------------------------------------------------------------------
