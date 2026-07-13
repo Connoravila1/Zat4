@@ -54,6 +54,7 @@ const chat_e2ee = @import("chat_e2ee.zig");
 const enroll_view = @import("../core/enroll_view.zig");
 const enroll_run = @import("enroll_run.zig");
 const membership_shell = @import("membership.zig");
+const membership_record = @import("membership_record.zig");
 const pay_addr = @import("pay_addr.zig");
 const lnurl = @import("lnurl.zig");
 const wallet_caps = @import("../core/wallet_caps.zig");
@@ -777,6 +778,24 @@ const RunState = struct {
     /// Release-activation: the target a press armed (the front door has its own
     /// hit list, so it arms separately from the feed's regions).
     genroll_armed: ?enroll_view.HitTarget,
+    /// The proof-of-work solve, on a worker: it is memory-hard Argon2id, and on
+    /// the render thread it would freeze the app for seconds.
+    genroll_pow: enroll_run.PowJob,
+    /// The account creation, on a worker. `enroll_run` calls createZatAccount
+    /// INLINE — survivable in a window with nothing else to do, and NOT survivable
+    /// here, where the same thread has to keep drawing (the standing law).
+    genroll_create: CreateJob,
+    /// The existing-account browser sign-in ("I already have an account"), on a
+    /// worker: it resolves a handle, opens a browser, and waits on a loopback
+    /// listener — none of which may happen on the thread that draws.
+    genroll_oauth: enroll_run.OAuthJob,
+    /// A signed-in DID carried through the membership gate: an existing account
+    /// still has to MINT its Zat4 membership before it is a member here.
+    genroll_pending: ?auth.Session,
+    /// The session enrollment produced. Non-null = we are somebody now, and the
+    /// loop asks to be restarted with it: the app cannot hot-swap an identity
+    /// mid-frame, because every worker, cache and store was built for "nobody".
+    genroll_session: ?auth.Session,
     /// A3: this account's chat identity is published from ANOTHER device and we
     /// refused to overwrite it. Messages says so, plainly, and offers the only
     /// honest way forward — never a silently re-minted identity.
@@ -1425,6 +1444,11 @@ fn initRunState(
     rs.genroll_hits = .empty;
     rs.genroll_mstore = membership_shell.init(std.heap.page_allocator);
     rs.genroll_memjob = .{};
+    rs.genroll_oauth = .{};
+    rs.genroll_pending = null;
+    rs.genroll_pow = .{};
+    rs.genroll_create = .{};
+    rs.genroll_session = null;
     rs.genroll_armed = null;
     rs.gchat_identity_elsewhere = false;
     // Chat needs an account: an anchor key, a published keyPackage, a relay
@@ -1667,6 +1691,15 @@ fn deinitRunState(rs: *RunState) void {
     // which is exactly what it is for.
     rs.genroll_hits.deinit(rs.gpa);
     membership_shell.deinit(&rs.genroll_mstore);
+    // Its two workers must be off the road before the state they point at dies.
+    // The PoW solve is cooperative (it checks `cancel` each attempt); the create
+    // worker is a network call we simply wait out — it is seconds at worst, and a
+    // detached thread writing into a freed RunState is not a trade worth making.
+    enroll_run.stopPow(&rs.genroll_pow);
+    if (rs.genroll_create.thread) |th| {
+        th.join();
+        rs.genroll_create.thread = null;
+    }
     const gpa = rs.gpa;
     const backend = rs.backend;
     if (rs.gpu_state) |*gs| deinitGpuState(gpa, gs);
@@ -1943,9 +1976,17 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
             }
         }
 
-        // The front door's motion, every frame it is up (FRONT_DOOR_ROADMAP §2).
-        if (rs.gscreen == feed_view.screen_enroll)
-            enrollStep(rs, clock_shell.monotonicNanos(), @as(f32, @floatFromInt(@mod(clock_shell.monotonicNanos() / 1_000_000, 1_000_000))) / 1000.0);
+        // The front door: its motion, its proof-of-work, its account creation —
+        // every frame it is up (FRONT_DOOR_ROADMAP §2/§3).
+        if (rs.gscreen == feed_view.screen_enroll) {
+            const fns = clock_shell.monotonicNanos();
+            enrollStep(rs, fns, @as(f32, @floatFromInt(@mod(fns / 1_000_000, 1_000_000))) / 1000.0);
+            enrollConnect(rs, gpa, io, environ, fns);
+            enrollVerify(rs, gpa, io, environ, fns);
+            // Enrollment landed a session: end the pre-auth loop and hand it up.
+            // The caller restarts the app AS that person (main.zig / the seam).
+            if (rs.genroll_session != null) return .quit;
+        }
 
         // THE ROTATED TOKENS REACH DISK THE FRAME THEY ROTATE.
         //
@@ -7786,6 +7827,11 @@ pub fn run(
     appview_url: []const u8,
     store: *feed_core.Store,
     backend: Backend,
+    /// OUT: the session enrollment produced, when the pre-auth app completed a
+    /// sign-up. The caller restarts the app AS that person — the loop cannot
+    /// hot-swap an identity mid-flight, because every worker, cache and store in
+    /// it was built for "nobody". Ownership passes to the caller.
+    enrolled_out: ?*?auth.Session,
 ) !bool {
     // MC.1 (M_CORE_INVERSION): all cross-frame state lives in RunState,
     // built in place (workers capture field addresses) and torn down by
@@ -7815,6 +7861,12 @@ pub fn run(
     try initRunState(&rs, gpa, io, environ, session, appview_url, store, backend, session_opt != null);
     defer deinitRunState(&rs);
     if (!rs.signed_in) rs.gscreen = feed_view.screen_enroll;
+    // The enrolled session outlives this loop (the caller runs the app as that
+    // person); hand it over before the RunState is torn down.
+    defer if (enrolled_out) |out| {
+        out.* = rs.genroll_session;
+        rs.genroll_session = null;
+    };
 
     while (true) {
         // The inter-frame wait is the DRIVER's business (MC.4) — the step
@@ -8965,6 +9017,166 @@ fn chatBringUp(
     } else {
         chatLog("[chat] keys ready but the relay link did NOT start", .{});
     }
+}
+
+/// Account creation, off the render thread. `enroll_run` runs this INLINE on its
+/// loop — which is fine in a window whose only job is the card, and is not fine
+/// here, where the same thread is drawing the app. A createAccount is a PDS
+/// round-trip plus a membership-record write; on a phone that is seconds.
+/// A7.2: cold struct, size guard waived — one in flight, ever.
+const CreateJob = struct {
+    thread: ?std.Thread = null,
+    done: std.atomic.Value(bool) = .init(false),
+    active: bool = false,
+    /// The result. Null = it failed, and the card says so rather than hanging.
+    session: ?auth.Session = null,
+};
+
+fn createWorker(job: *CreateJob, gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, st: *enroll_run.State) void {
+    job.session = enroll_run.createZatAccount(gpa, io, env, st);
+    job.done.store(true, .release);
+}
+
+/// The EXISTING branch's other half: an imported DID mints its Zat4 membership
+/// record. It already has a session; what it does not yet have is membership
+/// here, and that is a network write like any other — off the render thread.
+fn memberWorker(job: *CreateJob, gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, sess: *auth.Session, age_ok: bool) void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    _ = membership_record.put(gpa, arena_state.allocator(), io, env, sess, lexicon.membership_via.imported, enroll_run.tos_version_placeholder, age_ok, clock_shell.unixSeconds()) catch |err| {
+        // A failed membership write must not cost the person their session — they
+        // ARE signed in; they simply are not a member yet, and can retry.
+        std.debug.print("[enroll] membership write failed: {s}\n", .{@errorName(err)});
+    };
+    job.session = sess.*;
+    job.done.store(true, .release);
+}
+
+/// The verifying step: the proof-of-work ring, then the account. Both on workers;
+/// the ring's motion is a pure function of elapsed time, so the UI stays honest
+/// about an unknowable duration (it creeps, decelerating, and only completes when
+/// the real solution lands — never a fast fill and a dead stall).
+fn enrollVerify(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, frame_ns: u64) void {
+    const s = &rs.genroll_state;
+    if (s.step != .verifying) {
+        // Left the step: cancel the solve and re-arm, so a Back-then-forward does
+        // not inherit a half-finished proof.
+        if (rs.genroll_pow.active) {
+            enroll_run.stopPow(&rs.genroll_pow);
+            rs.genroll_pow.active = false;
+        }
+        s.pow_t = 0.0;
+        s.seal_t = 0.0;
+        s.seal_start_ns = 0;
+        return;
+    }
+
+    if (!rs.genroll_pow.active) {
+        enroll_run.startPow(&rs.genroll_pow, s, io);
+        s.pow_start_ns = frame_ns;
+    }
+    const el: f32 = @floatFromInt(frame_ns -| s.pow_start_ns);
+    const floor_ns: f32 = 3_200_000_000.0; // a minimum, so the proof never flickers past
+    const solved = rs.genroll_pow.done.load(.acquire);
+    if (solved and el >= floor_ns) {
+        s.pow_t += (1.0 - s.pow_t) * 0.16;
+        if (s.pow_t > 0.999) s.pow_t = 1.0;
+    } else {
+        // A DECELERATING CREEP across the whole unknown solve: always moving,
+        // slowing as it climbs, never reaching the top until the real solution
+        // lands. The motion IS the work.
+        const creep = 1.0 - @exp(-el / 2_800_000_000.0);
+        s.pow_t = @min(0.97, creep);
+    }
+    if (s.pow_t >= 0.999) {
+        if (s.seal_start_ns == 0) s.seal_start_ns = frame_ns;
+        const sel: f32 = @floatFromInt(frame_ns -| s.seal_start_ns);
+        s.seal_t = @min(1.0, sel / 800_000_000.0);
+    } else {
+        s.seal_t = 0.0;
+        s.seal_start_ns = 0;
+    }
+
+    // Sealed, EXISTING branch: the DID is already on the network but is not a
+    // member HERE yet. Write the Zat4 membership record (via=imported, no
+    // password) and become that person. The write is a PDS round-trip — the same
+    // no-blocking-IO law applies, so it rides the CreateJob worker too.
+    if (s.seal_t >= 1.0 and s.branch == .existing and rs.genroll_pending != null and
+        !rs.genroll_create.active and rs.genroll_create.thread == null)
+    {
+        rs.genroll_create.done.store(false, .monotonic);
+        rs.genroll_create.session = null;
+        rs.genroll_create.thread = std.Thread.spawn(.{}, memberWorker, .{ &rs.genroll_create, gpa, io, env, &rs.genroll_pending.?, s.age_ok }) catch null;
+        rs.genroll_create.active = rs.genroll_create.thread != null;
+        if (!rs.genroll_create.active) s.step = .done;
+    }
+
+    // Sealed → make the account. ON A WORKER (see CreateJob).
+    if (s.seal_t >= 1.0 and !rs.genroll_create.active and rs.genroll_create.thread == null and s.branch == .new) {
+        rs.genroll_create.done.store(false, .monotonic);
+        rs.genroll_create.session = null;
+        rs.genroll_create.thread = std.Thread.spawn(.{}, createWorker, .{ &rs.genroll_create, gpa, io, env, s }) catch null;
+        rs.genroll_create.active = rs.genroll_create.thread != null;
+        if (!rs.genroll_create.active) s.step = .done; // could not even start: say so
+    }
+    if (rs.genroll_create.thread) |th| {
+        if (rs.genroll_create.done.load(.acquire)) {
+            th.join();
+            rs.genroll_create.thread = null;
+            rs.genroll_create.active = false;
+            rs.genroll_pending = null; // its ownership moved into the job's result
+            if (rs.genroll_create.session) |sess| {
+                // WE ARE SOMEBODY NOW. The loop asks to be restarted with this
+                // session — it cannot hot-swap an identity mid-frame, because
+                // every worker, cache and store in it was built for "nobody".
+                rs.genroll_session = sess;
+                enroll_run.stopPow(&rs.genroll_pow);
+                rs.genroll_pow.active = false;
+            } else {
+                // It failed. SAY SO — do not sit on a sealed ring forever.
+                s.step = .done;
+                s.pow_t = 0;
+                s.seal_t = 0;
+                enroll_run.stopPow(&rs.genroll_pow);
+                rs.genroll_pow.active = false;
+            }
+        }
+    }
+}
+
+/// "I already have an account": the browser OAuth hop, on a worker. A returning
+/// MEMBER drops straight into the feed; a first-time imported DID still has to
+/// mint its Zat4 membership, so it carries its session through the PoW gate.
+fn enrollConnect(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, frame_ns: u64) void {
+    const s = &rs.genroll_state;
+    if (s.step != .connecting) return;
+    if (!rs.genroll_oauth.active and !s.connect_failed)
+        enroll_run.startOAuth(&rs.genroll_oauth, s, io, env);
+    if (!rs.genroll_oauth.active or !rs.genroll_oauth.done.load(.acquire)) return;
+
+    enroll_run.joinOAuth(&rs.genroll_oauth);
+    if (!rs.genroll_oauth.ok) {
+        // It failed. The spinner becomes a retry card — never an endless spinner,
+        // which is the same lie as a dead button.
+        s.connect_failed = true;
+        return;
+    }
+    // Re-home the worker's session into the render allocator (the worker is
+    // joined, so there is no concurrency here).
+    const sess = auth.reownSession(gpa, std.heap.page_allocator, rs.genroll_oauth.session) catch {
+        auth.freeSession(std.heap.page_allocator, rs.genroll_oauth.session);
+        s.connect_failed = true;
+        return;
+    };
+    if (rs.genroll_oauth.is_member) {
+        rs.genroll_session = sess; // returning member → straight to the feed
+        return;
+    }
+    // First-time imported DID: it is on the network, but it is not a member HERE
+    // yet. Through the proof-of-work gate, carrying its session.
+    rs.genroll_pending = sess;
+    s.step = .verifying;
+    s.pow_start_ns = frame_ns;
 }
 
 /// The front door's per-frame motion. The window loop in `enroll_run` interleaves

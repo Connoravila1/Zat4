@@ -1038,7 +1038,7 @@ const enroll_pow_hard: pow.Difficulty = .{ .mem_kib = 32 * 1024, .iters = 1, .la
 
 /// The background PoW job. Lives in `run` (NOT in `State`, which gets reset),
 /// so the worker thread + its atomics outlive a state reset cleanly.
-const PowJob = struct {
+pub const PowJob = struct {
     // A7.2: cold struct (one live instance, holds a thread + lifecycle), size guard waived.
     thread: ?std.Thread = null,
     cancel: std.atomic.Value(bool) = .init(false),
@@ -1067,7 +1067,7 @@ fn powWorker(job: *PowJob, io: std.Io) void {
 
 /// Spawn the solve for this verifying session. The challenge seed binds to the
 /// account (the would-be handle) so the work proves effort for THIS entry.
-fn startPow(job: *PowJob, s: *State, io: std.Io) void {
+pub fn startPow(job: *PowJob, s: *State, io: std.Io) void {
     const who = if (s.final_handle_len > 0) s.final_handle[0..s.final_handle_len] else "zat4-enroll";
     const seed = pow.seedForPost(who, 0);
     job.challenge = pow.challengeFor(seed, .heavy);
@@ -1082,7 +1082,7 @@ fn startPow(job: *PowJob, s: *State, io: std.Io) void {
 
 /// Cancel + join any in-flight solve (cooperative; the worker checks `cancel`
 /// each attempt). Safe to call when idle.
-fn stopPow(job: *PowJob) void {
+pub fn stopPow(job: *PowJob) void {
     if (job.thread) |th| {
         job.cancel.store(true, .release);
         th.join();
@@ -1189,7 +1189,7 @@ fn startVerify(job: *MemJob, s: *State, io: std.Io, mstore: *membership_shell.St
 // that point) so the caller frees it like any other session.
 
 /// The background OAuth job (one live instance — A7.2 cold, guard waived).
-const OAuthJob = struct {
+pub const OAuthJob = struct {
     // A7.2: cold struct (one live instance, holds a thread + lifecycle), size guard waived.
     thread: ?std.Thread = null,
     /// Set by the main thread to abort the loopback wait (window closed mid-flow);
@@ -1248,7 +1248,7 @@ fn runOAuth(gpa: std.mem.Allocator, scratch: std.mem.Allocator, job: *OAuthJob, 
 /// field. The handle is COPIED into the job so the worker never reads `State`
 /// (which the UI thread mutates). A spawn failure completes the job as a clean
 /// failure rather than hanging.
-fn startOAuth(job: *OAuthJob, s: *State, io: std.Io, env: ?*const std.process.Environ.Map) void {
+pub fn startOAuth(job: *OAuthJob, s: *State, io: std.Io, env: ?*const std.process.Environ.Map) void {
     const h = tfView(&s.handle);
     const n = @min(h.len, job.handle.len);
     @memcpy(job.handle[0..n], h[0..n]);
@@ -1267,7 +1267,7 @@ fn startOAuth(job: *OAuthJob, s: *State, io: std.Io, env: ?*const std.process.En
 /// once it sees `done`, because it's about to CONSUME `session` (re-home it into
 /// `gpa`). Leaves `thread == null`, which tells the shutdown `stopOAuth` the
 /// result was already taken.
-fn joinOAuth(job: *OAuthJob) void {
+pub fn joinOAuth(job: *OAuthJob) void {
     if (job.thread) |th| {
         th.join();
         job.thread = null;
@@ -1325,9 +1325,9 @@ fn reset(s: *State) void {
 /// The Terms-of-Service version recorded in the consent at enrollment. PLACEHOLDER
 /// until real Terms exist (ENROLLMENT_BUILD §9 A) — it just needs to be a stable
 /// string so the membership record can pin which version was agreed to.
-const tos_version_placeholder = "draft-2026-06";
+pub const tos_version_placeholder = "draft-2026-06";
 
-fn createZatAccount(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, s: *State) ?auth.Session {
+pub fn createZatAccount(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, s: *State) ?auth.Session {
     if (!s.has_pw) return null;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();

@@ -357,9 +357,22 @@ pub fn main(init: std.process.Init) !void {
         };
         defer window_shell.close(win);
         std.debug.print("[front-door] running the shell with NO session — the pre-auth app.\n", .{});
-        _ = shell_tui.run(gpa, io, env, null, eps.appview_url, &store, .{ .window = win }) catch |err| {
+        var enrolled: ?auth.Session = null;
+        _ = shell_tui.run(gpa, io, env, null, eps.appview_url, &store, .{ .window = win }, &enrolled) catch |err| {
             std.debug.print("Zat4: the front door ended on an error ({s})\n", .{@errorName(err)});
         };
+        // ENROLLED. Become that person: persist the session (so the next launch
+        // goes straight to the feed) and run the app as them, on the same window.
+        if (enrolled) |new_session| {
+            var session = new_session;
+            defer auth.freeSession(gpa, session);
+            var sp_buf: [512]u8 = undefined;
+            if (cache_shell.sessionPath(&sp_buf, env)) |sp| _ = cache_shell.saveSessionAt(gpa, sp, &session);
+            std.debug.print("[front-door] enrolled as {s} — starting the app.\n", .{session.handle});
+            _ = shell_tui.run(gpa, io, env, &session, eps.appview_url, &store, .{ .window = win }, null) catch |err| {
+                std.debug.print("Zat4: the session ended on an error ({s})\n", .{@errorName(err)});
+            };
+        }
         return;
     }
 
@@ -391,7 +404,7 @@ pub fn main(init: std.process.Init) !void {
                     return;
                 };
                 defer window_shell.close(win);
-                signed_out = shell_tui.run(gpa, io, env, &session, eps.appview_url, &store, .{ .window = win }) catch |err| blk: {
+                signed_out = shell_tui.run(gpa, io, env, &session, eps.appview_url, &store, .{ .window = win }, null) catch |err| blk: {
                     std.debug.print("Zat4: the session ended on an error ({s})\n", .{@errorName(err)});
                     break :blk false;
                 };
@@ -418,7 +431,7 @@ pub fn main(init: std.process.Init) !void {
                     return;
                 };
             defer window_shell.close(win);
-            signed_out = shell_tui.run(gpa, io, env, &session, eps.appview_url, &store, .{ .window = win }) catch |err| blk: {
+            signed_out = shell_tui.run(gpa, io, env, &session, eps.appview_url, &store, .{ .window = win }, null) catch |err| blk: {
                     std.debug.print("Zat4: the session ended on an error ({s})\n", .{@errorName(err)});
                     break :blk false;
                 };
@@ -999,7 +1012,7 @@ pub fn main(init: std.process.Init) !void {
                 defer _ = cache_shell.saveStore(gpa, env, &store); // E4
                 const opened = try openBackend(gpa, env, out, window_mode);
                 defer if (opened.win) |w| window_shell.close(w);
-                signed_out = shell_tui.run(gpa, io, env, &session, endpoints.appview_url, &store, opened.backend) catch |err| switch (err) {
+                signed_out = shell_tui.run(gpa, io, env, &session, endpoints.appview_url, &store, opened.backend, null) catch |err| switch (err) {
                     error.NotATerminal => {
                         try out.print("--tui needs an interactive terminal (a real stdin/stdout tty)\n", .{});
                         try out.flush();
@@ -1041,7 +1054,7 @@ pub fn main(init: std.process.Init) !void {
                     };
                     const opened = try openBackend(gpa, env, out, window_mode);
                     defer if (opened.win) |w| window_shell.close(w);
-                    signed_out = shell_tui.run(gpa, io, env, &session, endpoints.appview_url, &store, opened.backend) catch |err| switch (err) {
+                    signed_out = shell_tui.run(gpa, io, env, &session, endpoints.appview_url, &store, opened.backend, null) catch |err| switch (err) {
                         error.NotATerminal => {
                             try out.print("--tui needs an interactive terminal (a real stdin/stdout tty)\n", .{});
                             try out.flush();
