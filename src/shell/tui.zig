@@ -2030,7 +2030,19 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             }
                         }
                     },
-                    .refused => rs.status = "chat: relay refused the send",
+                    // NAME the refusal — "refused" alone hides whether it's
+                    // retryable. Rate-limited is transient (back off, resend);
+                    // full is the relay under pressure. A generic message is how
+                    // a lost send looks like nothing.
+                    .refused => |r| {
+                        rs.status = switch (r) {
+                            .rate_limited => "chat: sending too fast — wait a moment and resend",
+                            .mailbox_full => "chat: their inbox is full right now — try again shortly",
+                            .store_full => "chat: relay is at capacity — try again shortly",
+                            .ok => "chat: sent",
+                        };
+                        chatLog("[chat] deposit refused: {s}", .{@tagName(r)});
+                    },
                     .status => {},
                     .failure => {},
                 }

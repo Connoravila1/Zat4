@@ -53,6 +53,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const assert = std.debug.assert;
 
 pub const mailbox_id_len = 32;
 
@@ -83,7 +84,70 @@ pub const DepositResult = enum(u8) {
     ok = 0,
     mailbox_full = 1,
     store_full = 2,
+    /// This connection is depositing faster than the rate limit allows. The
+    /// blob is NOT stored; the sender may retry after a beat. This is the first
+    /// line against the shared-token flood: without it, one connection can fill
+    /// the entire store (`max_total`) as fast as it can write, denying every
+    /// other user — a trivial DoS for anyone who extracts the relay token from a
+    /// client. See `TokenBucket`. (New reason: older clients that don't know it
+    /// treat any nonzero reason as "refused, don't crash", so it's wire-safe.)
+    rate_limited = 3,
 };
+
+/// A per-connection deposit rate limiter — pure, so it's testable and lives with
+/// the policy it enforces, not buried in the serve loop.
+///
+/// The relay is deliberately dumb and identity-blind, which is a privacy virtue
+/// and an abuse liability: it cannot tell a flooder from a friend. It CAN,
+/// though, bound how fast any ONE connection consumes the shared store, and that
+/// alone converts "instantly nuke the relay for everyone" into "trickle, heavily
+/// throttled, every refusal logged, legitimate traffic interleaving the whole
+/// time." Identity-based limits (per-DID auth) are the deeper layer and need a
+/// coordinated client+relay change; this needs neither and ships to the relay
+/// alone, breaking nothing.
+///
+/// A steady rate of `refill_per_sec` deposits, burstable up to `capacity`.
+/// A7: hot-ish (one per live connection), guarded.
+pub const TokenBucket = struct {
+    /// Whole tokens available now.
+    tokens: f64,
+    capacity: f64,
+    refill_per_sec: f64,
+    /// Monotonic seconds of the last refill (the caller's clock; B4).
+    last: f64,
+
+    comptime {
+        assert(@sizeOf(TokenBucket) == 32);
+    }
+
+    pub fn init(capacity: f64, refill_per_sec: f64, now_s: f64) TokenBucket {
+        return .{ .tokens = capacity, .capacity = capacity, .refill_per_sec = refill_per_sec, .last = now_s };
+    }
+
+    /// Try to spend one token at time `now_s`. Refills for elapsed time first,
+    /// clamped to `capacity`. Returns true if a token was available (allow), false
+    /// if the connection is over its rate (refuse). Time going backwards is
+    /// treated as no elapsed time — a clock is not a weapon we hand the caller.
+    pub fn take(b: *TokenBucket, now_s: f64) bool {
+        const dt = @max(0, now_s - b.last);
+        b.last = now_s;
+        b.tokens = @min(b.capacity, b.tokens + dt * b.refill_per_sec);
+        if (b.tokens >= 1.0) {
+            b.tokens -= 1.0;
+            return true;
+        }
+        return false;
+    }
+};
+
+/// The per-connection deposit rate: a steady 5/sec, burstable to 20. A human in
+/// a fast conversation sends a handful of messages a minute; 5/sec is orders of
+/// beyond that and still caps a flooder to 5 blobs/sec, so filling `max_total`
+/// (8192) takes ~27 minutes of sustained, refused, logged flooding per
+/// connection instead of an instant. Tune with real load; deliberately generous
+/// so it never touches a real user.
+pub const deposit_rate_capacity: f64 = 20;
+pub const deposit_rate_per_sec: f64 = 5;
 
 /// Service limits, all enforced in `deposit`. Defaults sized for the v1
 /// deployment (a handful of users on one box): 8192 blobs × 4 KiB = 32 MiB
@@ -284,6 +348,7 @@ pub fn parseServerOp(frame: []const u8) ParseError!ServerOp {
             return .{ .refused = switch (frame[1]) {
                 1 => .mailbox_full,
                 2 => .store_full,
+                3 => .rate_limited,
                 else => return error.BadOp,
             } };
         },
@@ -440,6 +505,47 @@ test "relay store: the caps refuse, explicitly, and nothing leaks" {
     try testing.expectEqual(DepositResult.store_full, try deposit(gpa, &store, limits, testId(2), &blob, 0));
 }
 
+test "TokenBucket: bounds a flooder to its rate, never touches a real user" {
+    // A steady 5/sec, burst 20.
+    var b = TokenBucket.init(20, 5, 100.0);
+
+    // The opening burst — 20 deposits at once — is allowed (a real client's
+    // connect + first message must never be throttled).
+    var allowed: u32 = 0;
+    for (0..20) |_| if (b.take(100.0)) {
+        allowed += 1;
+    };
+    try testing.expectEqual(@as(u32, 20), allowed);
+
+    // The 21st in the same instant is refused — the bucket is empty.
+    try testing.expect(!b.take(100.0));
+
+    // A flooder hammering at one instant gets nothing more, no matter how hard.
+    for (0..10_000) |_| _ = b.take(100.0);
+    try testing.expect(!b.take(100.0));
+
+    // One second later, exactly 5 tokens refilled → 5 allowed, 6th refused.
+    var after: u32 = 0;
+    for (0..10) |_| if (b.take(101.0)) {
+        after += 1;
+    };
+    try testing.expectEqual(@as(u32, 5), after);
+
+    // A long idle refills only up to capacity (no unbounded credit hoarding —
+    // the burst is bounded whether you have been quiet for a second or a week).
+    for (0..100) |_| _ = b.take(101.0); // drain
+    var burst: u32 = 0;
+    for (0..1000) |_| if (b.take(1_000_000.0)) {
+        burst += 1;
+    };
+    try testing.expectEqual(@as(u32, 20), burst); // capacity, not 1000
+
+    // A clock that jumps BACKWARDS grants no free tokens (not a weapon).
+    var b2 = TokenBucket.init(1, 1, 500.0);
+    try testing.expect(b2.take(500.0)); // spend the one token
+    try testing.expect(!b2.take(400.0)); // time went back → still empty
+}
+
 test "relay codec: every op round-trips; malformed frames are explicit errors" {
     const id = testId(0x5A);
     const blob = testBlob(0xC3);
@@ -481,6 +587,11 @@ test "relay codec: every op round-trips; malformed frames are explicit errors" {
     var ref_buf: [2]u8 = undefined;
     switch (try parseServerOp(buildRefused(&ref_buf, .mailbox_full))) {
         .refused => |r| try testing.expectEqual(DepositResult.mailbox_full, r),
+        else => return error.TestUnexpectedResult,
+    }
+    // The rate-limit reason round-trips too (added after the wire was minted).
+    switch (try parseServerOp(buildRefused(&ref_buf, .rate_limited))) {
+        .refused => |r| try testing.expectEqual(DepositResult.rate_limited, r),
         else => return error.TestUnexpectedResult,
     }
 

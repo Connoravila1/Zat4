@@ -43,6 +43,7 @@
 //! and proxies the WebSocket route to this port. `zig build relay`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const relay = @import("../core/relay.zig");
 const websocket = @import("../core/websocket.zig");
@@ -222,6 +223,13 @@ fn serveConn(gpa: Allocator, io: std.Io, stream: std.Io.net.Stream, store: *rela
     // being drained. Days of "why can't I message my other account" ended here.
     var acc: [16 * 1024]u8 = undefined;
     var acc_len: usize = 0;
+    // This connection's deposit rate limiter. Full at connect so a legitimate
+    // burst (subscribing + a first message) is never throttled.
+    var bucket = relay.TokenBucket.init(
+        relay.deposit_rate_capacity,
+        relay.deposit_rate_per_sec,
+        @as(f64, @floatFromInt(clock.monotonicNanos())) / 1_000_000_000.0,
+    );
     var subs: [max_subs][relay.mailbox_id_len]u8 = undefined;
     // Per-subscription: how many queued blobs this connection has already pushed
     // (unacked). Reset on (re)subscribe; an ack pops that mailbox's store head,
@@ -247,7 +255,7 @@ fn serveConn(gpa: Allocator, io: std.Io, stream: std.Io.net.Stream, store: *rela
             const decoded = got orelse break;
             at += decoded.consumed;
             switch (decoded.frame.opcode) {
-                .binary => try handleOp(gpa, decoded.frame.payload, store, cfg, lock, writer, &subs, &sent, &subs_n),
+                .binary => try handleOp(gpa, decoded.frame.payload, store, cfg, lock, &bucket, writer, &subs, &sent, &subs_n),
                 .ping => {
                     var pong_buf: [256]u8 = undefined;
                     if (decoded.frame.payload.len <= 125) {
@@ -302,6 +310,7 @@ fn handleOp(
     store: *relay.Store,
     cfg: ServeConfig,
     lock: *StoreLock,
+    bucket: *relay.TokenBucket,
     writer: *std.Io.Writer,
     subs: *[max_subs][relay.mailbox_id_len]u8,
     sent: *[max_subs]u32,
@@ -311,12 +320,23 @@ fn handleOp(
     switch (op) {
         .deposit => |d| {
             const now = clock.unixSeconds();
-            lock.lock();
-            const result = relay.deposit(gpa, store, cfg.limits, d.id, d.blob, now) catch {
+            // RATE LIMIT FIRST, before the store is touched at all. One connection
+            // must not be able to consume the shared store faster than its fair
+            // rate — the first, cheapest defense against a flood from anyone
+            // holding the (shared) relay token.
+            const mono_s = @as(f64, @floatFromInt(clock.monotonicNanos())) / 1_000_000_000.0;
+            const result: relay.DepositResult = if (!bucket.take(mono_s)) blk: {
+                if (!builtin.is_test) std.debug.print("[relay] deposit REFUSED (rate limit)\n", .{});
+                break :blk .rate_limited;
+            } else res: {
+                lock.lock();
+                const r = relay.deposit(gpa, store, cfg.limits, d.id, d.blob, now) catch {
+                    lock.unlock();
+                    return error.BadRequest; // OOM: shed this connection, keep the store
+                };
                 lock.unlock();
-                return error.BadRequest; // OOM: shed this connection, keep the store
+                break :res r;
             };
-            lock.unlock();
             var out_buf: [16]u8 = undefined;
             var ok_buf: [1]u8 = undefined;
             var ref_buf: [2]u8 = undefined;
