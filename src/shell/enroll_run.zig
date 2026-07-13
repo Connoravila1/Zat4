@@ -68,7 +68,7 @@ const clear_b: f32 = @as(f32, 0x16) / 255.0;
 /// confirmation, with slack. Plain data (A1) — all editing goes through the
 /// shared `textedit` model via the helpers below, so the fields get caret-aware
 /// editing (←/→, Home/End, mid-text insert/delete) for free.
-const TextField = struct {
+pub const TextField = struct {
     // A7.2: cold struct (a few single-instance enrollment fields), size guard waived.
     buf: [80]u8 = undefined,
     len: u32 = 0,
@@ -93,7 +93,7 @@ fn tfApply(tf: *TextField, f: textedit.Field) void {
 }
 
 /// The mutable shell-side state the pure view is a snapshot of.
-const State = struct {
+pub const State = struct {
     // A7.2: cold struct (the single enrollment state instance), size guard waived.
     step: enroll_view.Step = .provenance,
     branch: enroll_view.Branch = .undecided,
@@ -596,7 +596,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
 }
 
 /// Build the pure snapshot the view renders from the mutable state.
-fn snapshot(s: *const State, blink_on: bool) enroll_view.EnrollView {
+pub fn snapshot(s: *const State, blink_on: bool) enroll_view.EnrollView {
     return .{
         .step = s.step,
         .branch = s.branch,
@@ -643,7 +643,7 @@ fn snapshot(s: *const State, blink_on: bool) enroll_view.EnrollView {
 /// caret motion (←/→, Home/End), and Tab/Shift+Tab/Enter focus traversal. All
 /// editing runs through the shared `textedit` model (caret-aware). Returns true
 /// to quit (bare Esc).
-fn handleText(s: *State, bytes: []const u8) bool {
+pub fn handleText(s: *State, bytes: []const u8) bool {
     var off: usize = 0;
     while (off < bytes.len) {
         const d = tui.decodeInput(bytes[off..]);
@@ -772,7 +772,7 @@ fn focusStep(s: *State, backward: bool) void {
     if (focusedField(s)) |fld| fld.caret = fld.len;
 }
 
-fn apply(s: *State, target: enroll_view.HitTarget, io: std.Io, now_ns: u64, mstore: *membership_shell.Store, memjob: *MemJob) void {
+pub fn apply(s: *State, target: enroll_view.HitTarget, io: std.Io, now_ns: u64, mstore: *membership_shell.Store, memjob: *MemJob) void {
     switch (target) {
         .choose_existing => {
             s.branch = .existing;
@@ -1099,7 +1099,7 @@ fn stopPow(job: *PowJob) void {
 // any in-flight enroll first, guaranteeing the verifier is stored before it's read.
 
 /// The background membership job (one live instance — A7.2 cold, guard waived).
-const MemJob = struct {
+pub const MemJob = struct {
     // A7.2: cold struct (one live instance, holds a thread + lifecycle), size guard waived.
     thread: ?std.Thread = null,
     done: std.atomic.Value(bool) = .init(false),

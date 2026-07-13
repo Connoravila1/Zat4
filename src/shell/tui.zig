@@ -52,6 +52,8 @@ const gesture = @import("../core/gesture.zig");
 const chat_relay = @import("chat_relay.zig");
 const chat_e2ee = @import("chat_e2ee.zig");
 const enroll_view = @import("../core/enroll_view.zig");
+const enroll_run = @import("enroll_run.zig");
+const membership_shell = @import("membership.zig");
 const pay_addr = @import("pay_addr.zig");
 const lnurl = @import("lnurl.zig");
 const wallet_caps = @import("../core/wallet_caps.zig");
@@ -764,8 +766,17 @@ const RunState = struct {
     /// reach, and this is it: the ONE run loop, which already owns the GPU path,
     /// the input pump, the soft keyboard, the gestures and the insets on BOTH
     /// platforms.
-    genroll: enroll_view.EnrollView,
+    /// The flow's REAL state — the same `enroll_run.State` the desktop window
+    /// loop has always driven. Not a copy of it: the same type, the same
+    /// `snapshot`, the same `apply`, the same `handleText`. One implementation,
+    /// two callers, and this time the second caller is a phone.
+    genroll_state: enroll_run.State,
     genroll_hits: enroll_view.HitList,
+    genroll_mstore: membership_shell.Store,
+    genroll_memjob: enroll_run.MemJob,
+    /// Release-activation: the target a press armed (the front door has its own
+    /// hit list, so it arms separately from the feed's regions).
+    genroll_armed: ?enroll_view.HitTarget,
     /// A3: this account's chat identity is published from ANOTHER device and we
     /// refused to overwrite it. Messages says so, plainly, and offers the only
     /// honest way forward — never a silently re-minted identity.
@@ -1410,8 +1421,11 @@ fn initRunState(
     rs.gchat_use_tls = false;
     rs.gopen_url_buf = undefined;
     rs.gopen_url_len = 0;
-    rs.genroll = .{};
+    rs.genroll_state = .{};
     rs.genroll_hits = .empty;
+    rs.genroll_mstore = membership_shell.init(std.heap.page_allocator);
+    rs.genroll_memjob = .{};
+    rs.genroll_armed = null;
     rs.gchat_identity_elsewhere = false;
     // Chat needs an account: an anchor key, a published keyPackage, a relay
     // identity. None of that exists before the front door is walked through.
@@ -1923,6 +1937,10 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 },
             }
         }
+
+        // The front door's motion, every frame it is up (FRONT_DOOR_ROADMAP §2).
+        if (rs.gscreen == feed_view.screen_enroll)
+            enrollStep(rs, clock_shell.monotonicNanos(), @as(f32, @floatFromInt(@mod(clock_shell.monotonicNanos() / 1_000_000, 1_000_000))) / 1000.0);
 
         // THE ROTATED TOKENS REACH DISK THE FRAME THEY ROTATE.
         //
@@ -3384,7 +3402,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        var pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = .{ .cards = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .q_focus = rs.gmarket_q_focus, .loading = rs.market_loading, .filter = rs.gmarket_filter, .hover_x = rs.ghover_x, .hover_y = rs.ghover_y }, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_delivery = chatDeliveryOf(rs), .chat_identity_elsewhere = rs.gchat_identity_elsewhere, .chat_link = chatLinkOf(rs), .enroll = rs.genroll, .enroll_hits = &rs.genroll_hits, .kbd_visible = softKeyboardWanted(rs), .kbd_shift = rs.kbd_shift, .kbd_page = rs.kbd_page, .kbd_caps = rs.kbd_caps, .kbd_flash_key = rs.kbd_flash_key, .kbd_flash_a = kbdFlashAlpha(rs), .kbd_popup = .{ .opts = rs.kbd_popup_opts[0..rs.kbd_popup_n], .anchor_x = rs.kbd_popup_ax, .anchor_y = rs.kbd_popup_ay, .anchor_w = rs.kbd_popup_aw, .sel = rs.kbd_popup_sel }, .kbd_emoji_open = rs.kbd_emoji_open, .kbd_emoji_scroll = @intFromFloat(rs.kbd_emoji_scroll), .kbd_picker_mode = rs.kbd_picker_mode, .kbd_nav_t = rs.kbd_nav_t, .kbd_nav_scroll = @intFromFloat(rs.kbd_nav_scroll), .chat_q = rs.gchat_q_buf[0..rs.gchat_q_len], .chat_q_focus = rs.gchat_q_focus, .chat_q_caret = composeBlinkOn(rs.caret_anchor_ns), .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_edit = .{ .caret = @min(rs.gchat_caret, rs.gchat_draft_len), .sel_a = @min(rs.gchat_sel_a, rs.gchat_draft_len), .sel_b = @min(rs.gchat_sel_b, rs.gchat_draft_len), .bar = rs.gchat_edit_bar }, .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .step = rs.gpay_step, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents, .busy = rs.gpay_busy }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved, .rooted = rs.grecv_set, .set = rs.grecv_set, .known = rs.grecv_known, .probing = rs.grecv_probing, .caps = rs.gcaps, .saving = rs.gpublish_busy }, .wallet_remove_armed = rs.gwallet_remove_armed, .verify_ids = verifyIdsOf(arena, rs), .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
+        var pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = .{ .cards = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .q_focus = rs.gmarket_q_focus, .loading = rs.market_loading, .filter = rs.gmarket_filter, .hover_x = rs.ghover_x, .hover_y = rs.ghover_y }, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_delivery = chatDeliveryOf(rs), .chat_identity_elsewhere = rs.gchat_identity_elsewhere, .chat_link = chatLinkOf(rs), .enroll = enroll_run.snapshot(&rs.genroll_state, composeBlinkOn(rs.caret_anchor_ns)), .enroll_hits = &rs.genroll_hits, .kbd_visible = softKeyboardWanted(rs), .kbd_shift = rs.kbd_shift, .kbd_page = rs.kbd_page, .kbd_caps = rs.kbd_caps, .kbd_flash_key = rs.kbd_flash_key, .kbd_flash_a = kbdFlashAlpha(rs), .kbd_popup = .{ .opts = rs.kbd_popup_opts[0..rs.kbd_popup_n], .anchor_x = rs.kbd_popup_ax, .anchor_y = rs.kbd_popup_ay, .anchor_w = rs.kbd_popup_aw, .sel = rs.kbd_popup_sel }, .kbd_emoji_open = rs.kbd_emoji_open, .kbd_emoji_scroll = @intFromFloat(rs.kbd_emoji_scroll), .kbd_picker_mode = rs.kbd_picker_mode, .kbd_nav_t = rs.kbd_nav_t, .kbd_nav_scroll = @intFromFloat(rs.kbd_nav_scroll), .chat_q = rs.gchat_q_buf[0..rs.gchat_q_len], .chat_q_focus = rs.gchat_q_focus, .chat_q_caret = composeBlinkOn(rs.caret_anchor_ns), .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_edit = .{ .caret = @min(rs.gchat_caret, rs.gchat_draft_len), .sel_a = @min(rs.gchat_sel_a, rs.gchat_draft_len), .sel_b = @min(rs.gchat_sel_b, rs.gchat_draft_len), .bar = rs.gchat_edit_bar }, .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .step = rs.gpay_step, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents, .busy = rs.gpay_busy }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved, .rooted = rs.grecv_set, .set = rs.grecv_set, .known = rs.grecv_known, .probing = rs.grecv_probing, .caps = rs.gcaps, .saving = rs.gpublish_busy }, .wallet_remove_armed = rs.gwallet_remove_armed, .verify_ids = verifyIdsOf(arena, rs), .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
         switch (rs.mode) {
             .timeline => try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status),
             .compose => {
@@ -5115,6 +5133,13 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                     .close_detail, .noop_detail => {},
                                 }
                             }
+                            // THE FRONT DOOR owns the pointer when it is up: it has
+                            // its own hit list (enroll_view.HitList), so it arms and
+                            // fires on its own, and nothing behind it is reachable.
+                            if (rs.gscreen == feed_view.screen_enroll) {
+                                rs.genroll_armed = enroll_view.hitTest(rs.genroll_hits.items, rx, ry);
+                                continue;
+                            }
                             if (!socket_handled) {
                                 // Release-activation: ARM the tap (don't fire). It
                                 // fires on button_up only if the release lands on
@@ -5152,6 +5177,20 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     // button_down arm). Placed after the drag-drop handling so
                     // a drag never also triggers a tap.
                     .button_up => if (pev.button == 1) {
+                        // The front door commits on release over the SAME target —
+                        // the same release-activation the feed uses, so a press that
+                        // slides off cancels rather than firing something else.
+                        if (rs.gscreen == feed_view.screen_enroll) {
+                            if (rs.genroll_armed) |at| {
+                                if (enroll_view.hitTest(rs.genroll_hits.items, rx, ry)) |rel| if (rel == at) {
+                                    if (at == .copy) enrollCopy(rs);
+                                    enroll_run.apply(&rs.genroll_state, at, io, clock_shell.monotonicNanos(), &rs.genroll_mstore, &rs.genroll_memjob);
+                                    rs.caret_anchor_ns = clock_shell.monotonicNanos();
+                                };
+                            }
+                            rs.genroll_armed = null;
+                            continue;
+                        }
                         // End a text-selection drag (the selection itself
                         // persists until the next press; a no-drag press left
                         // anchor==focus, i.e. an empty selection = cleared).
@@ -6743,6 +6782,17 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
             rs.last_input_nanos = clock_shell.monotonicNanos();
         }
 
+        // THE FRONT DOOR owns the keyboard while it is up. It takes the RAW byte
+        // stream — the same stream the Zat4 soft keyboard feeds on the phone, so
+        // enrollment gets phone typing for free, with no second input path and no
+        // second text model (`enroll_run.handleText` runs the shared `textedit`).
+        // This is the entire dividend of hosting the front door in this loop.
+        if (rs.gscreen == feed_view.screen_enroll and n > 0) {
+            if (enroll_run.handleText(&rs.genroll_state, in_buf[0..n])) return .quit; // bare Esc
+            rs.caret_anchor_ns = clock_shell.monotonicNanos();
+            n = 0; // consumed: nothing behind the front door may see these keys
+        }
+
         var offset: usize = 0;
         while (offset < n) {
             const decoded = tui.decodeInput(in_buf[offset..n]);
@@ -7823,6 +7873,12 @@ fn caretPhaseOf(clock_ns: u64, key_ns: u64) f32 {
 fn typingOwnsKeyboard(rs: *const RunState) bool {
     if (rs.mode == .compose) return true;
     if (rs.engine == null) return false; // terminal: none of the GUI inputs exist
+    // THE FRONT DOOR (the standing fence law: every new text input adds itself
+    // here, or the keys fire app shortcuts instead of typing). It has five
+    // fields — handle, username, email, the spot-checks, the full confirm — and
+    // one of them is a PASSWORD being typed back. Nothing else on this screen
+    // exists to be shortcut TO.
+    if (rs.gscreen == feed_view.screen_enroll) return rs.genroll_state.focus != .none;
     if (rs.gscreen == feed_view.screen_messages and
         (rs.gchat_composing or rs.gchat_input_focus or rs.gchat_q_focus or rs.gpay_open or
             // The receive flow only TYPES on its paste face (the address
@@ -8904,6 +8960,86 @@ fn chatBringUp(
     } else {
         chatLog("[chat] keys ready but the relay link did NOT start", .{});
     }
+}
+
+/// The front door's per-frame motion. The window loop in `enroll_run` interleaves
+/// these with its own field splashes; the eased values themselves are plain
+/// arithmetic over the state, so they live here and the two callers agree on what
+/// the card is DOING without agreeing on what the field is doing.
+///
+/// The verifying step's proof-of-work ring is deliberately NOT here: it is a
+/// worker + a network leg, and it lands in phase 3 with the rest of them.
+fn enrollStep(rs: *RunState, frame_ns: u64, t: f32) void {
+    const s = &rs.genroll_state;
+
+    // Hover (desktop pointer; the phone simply never sets it).
+    const hovered = enroll_view.hitTest(rs.genroll_hits.items, rs.ghover_x, rs.ghover_y);
+    s.hover_on = hovered != null;
+    if (hovered) |hv| s.hover = hv;
+    s.hover_t += ((if (s.hover_on) @as(f32, 1.0) else 0.0) - s.hover_t) * 0.28;
+
+    // The password's "crafting" decode: eased 0→1, then it sits at 1.
+    if (s.step == .password and s.has_pw and s.craft_start_ns != 0) {
+        const el: f32 = @floatFromInt(frame_ns -| s.craft_start_ns);
+        const lin = @min(1.0, el / 1_900_000_000.0);
+        const inv = 1.0 - lin;
+        s.craft_t = 1.0 - inv * inv * inv; // easeOutCubic
+    } else s.craft_t = 1.0;
+
+    // The strength bar fills in after a tier is picked; the phase free-runs.
+    if (s.tier_chosen) {
+        const el: f32 = @floatFromInt(frame_ns -| s.bar_sel_ns);
+        s.bar_t = @min(1.0, el / 600_000_000.0);
+    } else s.bar_t = 0.0;
+    s.bar_phase = t;
+
+    // A step change restarts the slide and closes any open info bubble.
+    if (s.step != s.prev_step or s.confirm_stage != s.prev_confirm_stage) {
+        s.trans_t = 0.0;
+        s.prev_step = s.step;
+        s.prev_confirm_stage = s.confirm_stage;
+        s.info = .none;
+    }
+    s.trans_t += (1.0 - s.trans_t) * 0.22;
+    const target_h: f32 = @floatFromInt(if (s.step == .confirm)
+        enroll_view.confirmHeight(s.confirm_stage)
+    else
+        enroll_view.cardHeight(s.step, s.branch));
+    s.card_h = if (s.card_h < 1.0) target_h else s.card_h + (target_h - s.card_h) * 0.28;
+
+    // The "Copied" toast decays on its own clock.
+    if (s.copied_ns != 0) {
+        const el: f32 = @floatFromInt(frame_ns -| s.copied_ns);
+        s.copied_t = @max(0.0, 1.0 - el / 1_400_000_000.0);
+        if (s.copied_t <= 0.001) s.copied_ns = 0;
+    } else s.copied_t = 0.0;
+}
+
+/// The front door's Copy button: the password (password step) or the recovery
+/// key (recovery step) onto the system clipboard. On the phone that is the seam's
+/// ClipboardManager bridge, on desktop the X11 selection — the SAME clipboard the
+/// composer uses, which is the point of hosting the front door in this loop: it
+/// inherits everything instead of reimplementing it.
+fn enrollCopy(rs: *RunState) void {
+    const s = &rs.genroll_state;
+    const clip: []const u8 = if (s.step == .recovery)
+        s.recovery_key[0..s.recovery_len]
+    else if (s.has_pw)
+        s.cred.bytes[0..s.cred.len]
+    else
+        "";
+    if (clip.len == 0) return;
+    // Desktop: the X11 selection. Phone: the seam's clip_out buffer, which the
+    // activity drains into ClipboardManager (the same road the chat composer's
+    // Copy takes — inherited, not reimplemented).
+    switch (rs.backend) {
+        .window => |w| window_shell.setClipboard(w, clip),
+        else => {},
+    }
+    const n = @min(clip.len, rs.clip_out_buf.len);
+    @memcpy(rs.clip_out_buf[0..n], clip[0..n]);
+    rs.clip_out_len = n;
+    s.copied_ns = clock_shell.monotonicNanos();
 }
 
 /// The relay link's live state (A5) — what the connection dot renders from.
@@ -11250,7 +11386,8 @@ const Grid = struct {
     chat_identity_elsewhere: bool = false,
     /// A5: what the relay link is doing right now — the connection dot.
     chat_link: feed_view.ChatLink = .off,
-    /// The front door (FRONT_DOOR_ROADMAP): the enrollment view + its hit list.
+    /// The front door (FRONT_DOOR_ROADMAP): the enrollment view (a pure snapshot
+    /// of the flow state) + its hit list.
     enroll: enroll_view.EnrollView = .{},
     enroll_hits: ?*enroll_view.HitList = null,
     /// The payment ids the LUD-21 settlement watcher currently has an eye on.
