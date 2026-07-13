@@ -13107,7 +13107,19 @@ fn paintFrameGpu(
     // made TYPING mushy (the owner's "something isn't right", 2026-07-11).
     // The pulse clock folds in at 50 ms buckets (~20 fps motion) and the
     // flash alpha is quantized — rebuilds now track change, not refresh.
-    if (sig != gs.feed_sig or gs.feed.verts.items.len == 0 or g.socket_ui.drag_active != null or search_animating or zones_animating or drawer_animating or rail_hover_animating or algo_animating or chat_animating or g.screen.* == feed_view.screen_loadout or g.frametiming_on or gs.shatter_active or g.pet or feed_animating) {
+    // THE FRONT DOOR IS ALWAYS ANIMATING. Its card height, its step slide, its
+    // hover, the password's decode, the strength bar and the Copied toast are all
+    // EASED — and an eased value cannot live in a signature (it changes every
+    // frame by definition, which is the same as having no signature at all).
+    //
+    // Without this the tile rebuilt on the step CHANGE, while `card_h` was still
+    // easing up from the previous step's smaller height, and then never rebuilt
+    // again: the panel froze mid-animation, short, while the content was laid out
+    // at its true size — so "Create & continue" and "Back" were drawn OUTSIDE the
+    // card, on the field. Fifth surface the rebuild law has bitten, and I wrote
+    // the warning about it two commits ago.
+    const enroll_animating = g.screen.* == feed_view.screen_enroll;
+    if (sig != gs.feed_sig or gs.feed.verts.items.len == 0 or g.socket_ui.drag_active != null or search_animating or zones_animating or drawer_animating or rail_hover_animating or algo_animating or chat_animating or enroll_animating or g.screen.* == feed_view.screen_loadout or g.frametiming_on or gs.shatter_active or g.pet or feed_animating) {
         gs.feed_sig = sig;
         // An empty timeline renders the chrome with no posts (no placeholders).
         const feed_posts = feed_view.fromTimeline(arena, items, now, g.expanded) catch &[_]feed_view.PostView{};
