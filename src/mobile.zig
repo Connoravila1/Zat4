@@ -817,6 +817,21 @@ pub export fn zat_set_ime_inset(ctx_ptr: ?*anyopaque, bottom_px: i32) void {
     if (ctx.feed) |*f| tui.mobileSetImeInset(f.run, bottom_px);
 }
 
+/// A URL the APP wants opened in the OS (a wallet's site, a Lightning
+/// hand-off). Non-null exactly ONCE per request — the activity fires an
+/// ACTION_VIEW intent for it. Distinct from `zat_login_url`, which is the
+/// OAuth flow's own one-shot; this is the general road, and without it every
+/// link on the phone went to `xdg-open`, which does not exist on Android, and
+/// died in silence — including the payment hand-off.
+var open_url_z: [1025]u8 = undefined;
+pub export fn zat_open_url(ctx_ptr: ?*anyopaque) ?[*:0]const u8 {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return null));
+    if (comptime !mobile_config.have_gpu) return null;
+    const f = if (ctx.feed) |*ff| ff else return null;
+    const url = tui.mobileOpenUrlTake(f.run, &open_url_z) orelse return null;
+    return url.ptr;
+}
+
 /// M-And.5: the authorize URL for the shim to open in the OS browser —
 /// non-null exactly ONCE per armed flow (the shim must not reopen the
 /// browser every frame). NUL-terminated; the bytes live until zat_shutdown.

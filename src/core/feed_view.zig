@@ -303,7 +303,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_restart, chat_identity_reset, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, recv_back, recv_use, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_restart, chat_identity_reset, recv_clip, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, recv_back, recv_use, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -6005,6 +6005,7 @@ pub fn layoutWallet(
             cy = try wrapNote(gpa, dl, e, x0 + 20, cy, cw - 40, recv_paste_note);
             cy += 14;
             _ = try payFieldRow(gpa, dl, e, regions, accent, x0 + 20, cy, cw - 40, recv.lightning, "lightning address \u{2014} you@wallet.com", recv.focus == 0, caret_phase, .regular, .recv_ln);
+            if (recv.lightning.len == 0) try pasteChip(gpa, dl, e, regions, x0 + 20, cy, cw - 40, accent);
             cy += 42 + 10;
             _ = try payFieldRow(gpa, dl, e, regions, accent, x0 + 20, cy, cw - 40, recv.bitcoin, "bitcoin address (optional)", recv.focus == 1, caret_phase, .regular, .recv_btc);
             cy += 42 + 14;
@@ -8331,14 +8332,28 @@ pub const WalletRec = struct {
     /// Opened by the shell's OS-handler seam on tap (the address itself is got
     /// on the wallet's own site, then pasted back).
     url: []const u8,
+    /// This wallet does EVERYTHING Zat Chat can do — specifically LUD-21, which
+    /// is what lets a payment confirm itself instead of making you tell us it
+    /// landed. Proven by our own probe (`wallet_caps`), not by a marketing page.
+    full: bool = false,
 };
 
-/// The curated shortlist. Simplest-first: a custodial one-tap address, a
-/// self-custodial-but-easy option, then a web wallet. Honest one-liners.
+/// The curated shortlist, ordered BY WHAT THEY CAN DO — most capable first.
+///
+/// It used to be "simplest first", which put Wallet of Satoshi at the top: the
+/// wallet we recommend before any other, and the one that CANNOT self-confirm a
+/// payment. So the very first suggestion handed people the most degraded
+/// experience we offer, and then the capability sheet had to apologise for it.
+/// If we are going to recommend one wallet above the rest, it had better be one
+/// where everything works.
+///
+/// `full` is not a claim off a website — it is what our own probe found (LUD-21
+/// `verify`, which `wallet_caps` reads from the wallet's own LNURLp document).
 pub const recv_wallets = [_]WalletRec{
-    .{ .name = "Wallet of Satoshi", .tagline = "Simplest \u{2014} you get an address instantly.", .url = "https://www.walletofsatoshi.com" },
+    .{ .name = "Alby", .tagline = "Everything works \u{2014} payments confirm themselves.", .url = "https://getalby.com", .full = true },
+    .{ .name = "Coinos", .tagline = "Everything works \u{2014} nothing to install.", .url = "https://coinos.io", .full = true },
+    .{ .name = "Wallet of Satoshi", .tagline = "Quickest to start \u{2014} but you confirm payments yourself.", .url = "https://www.walletofsatoshi.com" },
     .{ .name = "Phoenix", .tagline = "Your own keys, still easy to use.", .url = "https://phoenix.acinq.co" },
-    .{ .name = "Alby", .tagline = "Web wallet with a lightning address.", .url = "https://getalby.com" },
 };
 
 /// The "set up your CHAT receive address" sheet (the private-chat wallet — the
@@ -8495,6 +8510,33 @@ fn payModal(
 /// draft (or its placeholder) and the breathing caret. The composer's focus
 /// vocabulary, factored out of the four copies that had drifted apart.
 /// Returns the y below the field.
+/// A "Paste" chip on an address field. The phone has no Ctrl+V and no long-press
+/// menu of ours, so without this a wallet address — a string nobody types by
+/// hand, and which you have just copied from the wallet's own app — had to be
+/// typed in, character by character, off another screen. The clipboard bridge
+/// existed the whole time (the chat composer uses it); this field simply had no
+/// way to ask for it.
+fn pasteChip(
+    gpa: Allocator,
+    dl: *raster.DrawList,
+    e: *const text.Engine,
+    regions: ?*Regions,
+    x: i32,
+    y: i32,
+    w: i32,
+    accent: u32,
+) error{OutOfMemory}!void {
+    const lbl = "Paste";
+    const tw: i32 = @intCast(text.measure(e, .semibold, lbl, 12));
+    const cw2: i32 = tw + 22;
+    const ch: i32 = 26;
+    const cx2 = x + w - cw2 - 8;
+    const cy2 = y + 8;
+    try rect(gpa, dl, cx2, cy2, cw2, ch, (0x30 << 24) | (accent & 0x00FFFFFF), 8);
+    _ = try str(gpa, dl, e, .semibold, cx2 + 11, cy2 + 18, (0xF0 << 24) | (accent & 0x00FFFFFF), 12, lbl);
+    try emitRegion(gpa, regions, cx2 - 4, cy2 - 6, cw2 + 12, ch + 12, 0, .recv_clip);
+}
+
 fn payFieldRow(
     gpa: Allocator,
     dl: *raster.DrawList,
@@ -8717,8 +8759,14 @@ fn drawCapsTable(
         const ease = 1 - (1 - rt) * (1 - rt); // ease-out
         const slide: i32 = @intFromFloat((1 - ease) * 10);
         const alpha: f32 = ease;
+        // The "why" line WRAPS. It used to be a single ellipsized line, which on
+        // a phone read "Wallet of Satoshi can't tell us when a payment lands, so
+        // yo…" — the sentence cut off exactly where it was about to say the one
+        // thing that mattered. A row that has to explain itself must be allowed
+        // the words to do it.
         const two_line = !r.ok and r.because.len > 0;
-        const rh: i32 = if (two_line) 52 else 38;
+        const why_h: i32 = if (two_line) try noteHeight(gpa, dl, e, w - 24, r.because) else 0;
+        const rh: i32 = if (two_line) 30 + why_h else 38;
 
         const mark_c: u32 = if (r.ok) boost_c else like_c; // green tick / red cross
         const lab_c: u32 = if (r.ok) ink else muted;
@@ -8738,17 +8786,39 @@ fn drawCapsTable(
             try line(gpa, dl, rx + 4, cy + 13, rx + 14, cy + 23, scaleAlpha(mark_c, alpha), 2);
             try line(gpa, dl, rx + 14, cy + 13, rx + 4, cy + 23, scaleAlpha(mark_c, alpha), 2);
         }
-        try strEllipsis(gpa, dl, e, .semibold, rx + 24, cy + 22, scaleAlpha(lab_c, alpha), 13, r.label, w - 140);
-        if (r.detail.len > 0) {
-            const dw: i32 = @intCast(text.measure(e, .regular, r.detail, 13));
+        // The value column takes what it needs; the label gets what is LEFT.
+        // A fixed 140px reserve meant a long value ("1 – 100,000,000 sats") and
+        // a long label overlapped on a narrow phone — two strings printed on top
+        // of each other, which is worse than either one being short.
+        const dw: i32 = if (r.detail.len > 0) @intCast(text.measure(e, .regular, r.detail, 13)) else 0;
+        try strEllipsis(gpa, dl, e, .semibold, rx + 24, cy + 22, scaleAlpha(lab_c, alpha), 13, r.label, w - 24 - dw - 12);
+        if (r.detail.len > 0)
             _ = try str(gpa, dl, e, .regular, x + w - dw, cy + 22, scaleAlpha(if (r.ok) body_c else muted, alpha), 13, r.detail);
-        }
         if (two_line) {
-            try strEllipsis(gpa, dl, e, .regular, rx + 24, cy + 40, scaleAlpha(faint, alpha), 12, r.because, w - 30);
+            _ = try wrapBody(gpa, dl, e, rx + 24, cy + 40, w - 24, scaleAlpha(faint, alpha), 13, r.because, 18, true, null);
         }
         cy += rh;
     }
     return cy;
+}
+
+/// The caps table's height, measured the SAME way `drawCapsTable` lays it out —
+/// so the panel that must contain it can never be guessed too small. Guessing is
+/// exactly how the review face ended up with a sentence sliced in half and the
+/// buttons crowding it.
+fn capsTableHeight(
+    gpa: Allocator,
+    dl: *raster.DrawList,
+    e: *const text.Engine,
+    w: i32,
+    rows: []const CapRow,
+) error{OutOfMemory}!i32 {
+    var h: i32 = 0;
+    for (rows) |r| {
+        const two_line = !r.ok and r.because.len > 0;
+        h += if (two_line) 30 + try noteHeight(gpa, dl, e, w - 24, r.because) else 38;
+    }
+    return h;
 }
 
 /// The trust line every money surface repeats, because non-custody is the one
@@ -10139,14 +10209,27 @@ pub fn layoutChat(
         const paste_note_h = try noteHeight(gpa, dl, e, inner_w, recv_paste_note);
         const custody_h = try noteHeight(gpa, dl, e, inner_w, non_custody_line);
         // The review face grows by the "why" line under a capability the wallet
-        // lacks, and by the reassurance under the table.
-        const caps_why_h: i32 = if (recv.caps.auto_confirm) 0 else 14;
+        // lacks, and by the reassurance under the table. MEASURED, not guessed:
+        // the "why" wraps, and on a phone it wraps to more than one line.
+        var caps_rows_m: [3]CapRow = undefined;
+        var caps_rbuf_m: [72]u8 = undefined;
+        var caps_wbuf_m: [160]u8 = undefined;
+        var caps_nbuf_m: [64]u8 = undefined;
+        const caps_table_h: i32 = try capsTableHeight(gpa, dl, e, inner_w, capsTable(
+            &caps_rows_m,
+            &caps_rbuf_m,
+            &caps_wbuf_m,
+            recv.caps,
+            wallet_caps.providerName(&caps_nbuf_m, recv.lightning),
+            recv.bitcoin.len > 0,
+        ));
+        const caps_status_h: i32 = if (recv.status.len > 0) (try noteHeight(gpa, dl, e, inner_w, recv.status)) + 8 else 0;
         const caps_note_h: i32 = if (recv.caps.auto_confirm) 0 else (try noteHeight(gpa, dl, e, inner_w, "You can still be paid normally. Zat Chat just can't watch the payment land, so you'll confirm it yourself \u{2014} the same way a cash handoff works.")) + 12;
         const sheet_h: i32 = switch (recv.mode) {
             .onboard => 20 + 30 + onboard_note_h + 24 + 46 + 12 + 46 + 14 + custody_h + 16,
             .paste => 20 + 30 + paste_note_h + 24 + 42 + 12 + 42 + 16 + remove_extra + status_extra + 46 + 16,
             .wallets => 20 + 30 + 30 + 20 + @as(i32, @intCast(recv_wallets.len)) * 60 + 12 + 46 + 16,
-            .caps => 20 + 30 + 30 + (38 * 3 + caps_why_h) + 10 + caps_note_h + 46 + 10 + 44 + 16,
+            .caps => 20 + 30 + 30 + caps_table_h + 10 + caps_note_h + caps_status_h + 46 + 10 + 44 + 16,
         };
         const back = recvBackEdge(recv.mode, recv.rooted);
         const dismiss: Action = if (back == null) .recv_cancel else .recv_back;
@@ -10188,6 +10271,7 @@ pub fn layoutChat(
                 py = try wrapNote(gpa, dl, e, ix, py, iw, recv_paste_note);
                 py += 24;
                 _ = try payFieldRow(gpa, dl, e, regions, accent, ix, py, iw, recv.lightning, "lightning address \u{2014} you@wallet.com", recv.focus == 0, motion.caret_phase, .regular, .recv_ln);
+                if (recv.lightning.len == 0) try pasteChip(gpa, dl, e, regions, ix, py, iw, accent);
                 py += 42 + 12;
                 _ = try payFieldRow(gpa, dl, e, regions, accent, ix, py, iw, recv.bitcoin, "bitcoin address (optional)", recv.focus == 1, motion.caret_phase, .regular, .recv_btc);
                 py += 42 + 16;
@@ -10256,6 +10340,17 @@ pub fn layoutChat(
                     py += 12;
                 }
 
+                // THE FAILURE HAD NOWHERE TO GO. "Use this wallet" publishes your
+                // address, and when that publish failed it set a status line that
+                // THIS FACE NEVER DREW — only the paste face did. So the button
+                // did, from the user's side, nothing at all: no change, no error,
+                // no clue. A control whose failure is invisible is worse than one
+                // that is disabled, because it teaches the user that the app is
+                // broken rather than that something went wrong.
+                if (recv.status.len > 0) {
+                    py = try wrapNote(gpa, dl, e, ix, py, iw, recv.status);
+                    py += 8;
+                }
                 try buttonPrimary(gpa, e, dl, regions, ix, py, iw, 46, "Use this wallet", accent, 0, .recv_use, true);
                 py += 46 + 10;
                 try buttonSecondary(gpa, e, dl, regions, ix, py, iw, 44, "Use a different wallet", 0, .recv_back);

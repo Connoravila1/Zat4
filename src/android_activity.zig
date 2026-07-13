@@ -923,6 +923,13 @@ fn renderThread() void {
             if (seam.zat_haptic(ctx) != 0) {
                 if (app.activity) |act| hapticTick(act);
             }
+            // A URL the app asked the OS to open — a wallet's page, or the
+            // Lightning hand-off that pays somebody. On the phone there is no
+            // `xdg-open`, so before this poll existed every one of those links
+            // did nothing at all, silently.
+            if (seam.zat_open_url(ctx)) |u| {
+                if (app.activity) |act| openUrlViaOs(act, u);
+            }
             // Back popped at the ROOT (Home, nothing open): step the task
             // back to the launcher — the Android convention. Never finish():
             // the process + feed stay hot for an instant return.

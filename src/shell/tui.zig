@@ -748,6 +748,12 @@ const RunState = struct {
     /// refused to overwrite it. Messages says so, plainly, and offers the only
     /// honest way forward — never a silently re-minted identity.
     gchat_identity_elsewhere: bool,
+    /// A URL this frame asked the OS to open. On the phone there is no
+    /// `xdg-open` — the seam hands it to the activity, which fires an
+    /// ACTION_VIEW intent (the same road the OAuth browser already takes).
+    /// Empty = none pending; read-and-cleared by `mobileOpenUrlTake`.
+    gopen_url_buf: [1024]u8,
+    gopen_url_len: usize,
     gcreate_prepare_frames: u32,
     algo_lib: algo_library.Library,
     algo_uid: u32,
@@ -1372,6 +1378,8 @@ fn initRunState(
     rs.gchat_port = 0;
     rs.gchat_token = "";
     rs.gchat_use_tls = false;
+    rs.gopen_url_buf = undefined;
+    rs.gopen_url_len = 0;
     rs.gchat_identity_elsewhere = false;
     if (dev_chat) {
         if (environ) |env| {
@@ -2210,7 +2218,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     } else {
                         // The hand-off. The URI is built and exact.
                         var minted: u64 = 0;
-                        const verdict = payCommit(gpa, io, environ, e2ee, rs.gchat_link, &rs.gchat_store, conv, job.rail, job.amount_sat, job.note, job.paying, now, job.uri_buf[0..job.uri_len], &minted);
+                        const verdict = payCommit(rs, gpa, io, environ, e2ee, rs.gchat_link, &rs.gchat_store, conv, job.rail, job.amount_sat, job.note, job.paying, now, job.uri_buf[0..job.uri_len], &minted);
                         // THE WATCH. The payee's provider handed us a verify URL
                         // with the invoice, so this payment can confirm ITSELF —
                         // no custody, no wallet connection, nobody trusted. Where
@@ -5054,6 +5062,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                     } else {
                                         rs.armed_kind = hit.kind;
                                         rs.armed_post = hit.post;
+                                        chatLog("[tap] ARM {s} post={d} at ({d},{d})", .{ @tagName(hit.kind), hit.post, rx, ry });
                                     }
                                 } else if (field_ui.hitTest(cx, cy, g.hr.slice())) |_| {
                                     rs.armed_legacy = true;
@@ -5145,6 +5154,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         // fires one.
                         if (rs.armed_kind) |ak| {
                             if (feed_view.hitTest(g.regions.items, rx, ry)) |hit| {
+                                chatLog("[tap] UP armed={s} hit={s} (post {d} vs {d}) at ({d},{d})", .{ @tagName(ak), @tagName(hit.kind), rs.armed_post, hit.post, rx, ry });
                                 if (hit.kind == ak and hit.post == rs.armed_post) {
                                     // An open Repost/Quote menu is dismissed by any tap
                                     // outside its rows (and the repost button that toggles
@@ -5910,13 +5920,26 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         .recv_wallet => if (dev_chat) {
                                             // Open the wallet's own site; you get an address there,
                                             // then come back and paste it. No return channel needed.
-                                            if (hit.post < feed_view.recv_wallets.len)
-                                                launch.openUri(io, feed_view.recv_wallets[hit.post].url) catch {};
+                                            if (hit.post < feed_view.recv_wallets.len) {
+                                                // The phone has no xdg-open: this takes
+                                                // the seam's ACTION_VIEW road instead.
+                                                if (!openUri(rs, io, feed_view.recv_wallets[hit.post].url))
+                                                    rs.grecv_status = "Couldn't open that wallet's page";
+                                            }
                                         },
                                         .recv_paste => if (dev_chat) {
                                             rs.grecv_mode = .paste;
                                             rs.grecv_focus = 0;
                                             rs.grecv_status = "";
+                                        },
+                                        // A wallet address is a string nobody types by
+                                        // hand — you copy it out of your wallet's app.
+                                        // The phone has no Ctrl+V, so without this the
+                                        // only way in was to retype it off another
+                                        // screen. The clipboard arrives next lap.
+                                        .recv_clip => if (dev_chat) {
+                                            rs.clip_want = true;
+                                            rs.grecv_focus = 0; // the lightning field is what it fills
                                         },
                                         // ONE step back. `recvBackEdge` is the only
                                         // place that answers "what is behind this
@@ -6549,7 +6572,26 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
         // it replaces the selection / lands at the caret, like typing does.
         if (rs.clip_in_ready) {
             rs.clip_in_ready = false;
-            if (rs.gchat_input_focus and rs.gscreen == feed_view.screen_messages) {
+            // The RECEIVE fields take it first when they are the thing on screen
+            // asking for it (the wallet page, or the sheet's paste face). An
+            // address is pasted whole — it replaces the field rather than
+            // inserting at a caret, because that is what "paste your address"
+            // means and a half-merged address is worse than none.
+            const recv_asking = rs.grecv_open or rs.gscreen == feed_view.screen_wallet;
+            if (recv_asking) {
+                const raw = rs.clip_in_buf[0..rs.clip_in_len];
+                const addr = std.mem.trim(u8, raw, " \t\r\n");
+                const dst_len = if (rs.grecv_focus == 1) &rs.grecv_btc_len else &rs.grecv_ln_len;
+                const dst: []u8 = if (rs.grecv_focus == 1) &rs.grecv_btc_buf else &rs.grecv_ln_buf;
+                if (addr.len > 0 and addr.len <= dst.len) {
+                    @memcpy(dst[0..addr.len], addr);
+                    dst_len.* = addr.len;
+                    rs.grecv_status = "";
+                    rs.gchat_key_ns = clock_shell.monotonicNanos();
+                } else if (addr.len > dst.len) {
+                    rs.grecv_status = "That doesn't look like an address";
+                }
+            } else if (rs.gchat_input_focus and rs.gscreen == feed_view.screen_messages) {
                 _ = chatDeleteSelection(rs);
                 const room = rs.gchat_draft_buf.len - rs.gchat_draft_len;
                 const pn = @min(rs.clip_in_len, room);
@@ -7416,6 +7458,37 @@ pub fn mobilePushByte(mr: *MobileRun, b: u8) bool {
 /// pull-to-refresh arm; 2 = the drawer latch crossing. The pump detects the
 /// edge the frame it happens; the activity performs the actual taptic
 /// (GESTURE_SYSTEM_ROADMAP §3 — the shell fires, the detection is data).
+/// Hand a URL to the OS. On the desktop this is `xdg-open`/`open`/ShellExecute
+/// straight away. ON THE PHONE THERE IS NO SUCH BINARY — `launch.openUri` was
+/// spawning `xdg-open` on Android, which does not exist there, so EVERY link
+/// died in silence: the wallet suggestions did nothing, and, far worse, so did
+/// the PAYMENT HAND-OFF — `payOpenWallet` reported "no wallet answered" when in
+/// truth nothing had ever been asked. The phone route is the one the OAuth
+/// browser already takes: park the URL, let the activity fire an ACTION_VIEW
+/// intent. False only when the URL is too long to carry.
+fn openUri(rs: *RunState, io: std.Io, uri: []const u8) bool {
+    if (comptime builtin.abi.isAndroid()) {
+        if (uri.len == 0 or uri.len > rs.gopen_url_buf.len) return false;
+        @memcpy(rs.gopen_url_buf[0..uri.len], uri);
+        rs.gopen_url_len = uri.len;
+        return true;
+    }
+    launch.openUri(io, uri) catch return false;
+    return true;
+}
+
+/// The URL the app wants opened, handed to the activity ONCE (read-and-clear —
+/// a URL re-offered every frame would relaunch the browser every frame).
+/// NUL-terminated into the caller's buffer; null = nothing pending.
+pub fn mobileOpenUrlTake(mr: *MobileRun, out: []u8) ?[:0]const u8 {
+    const n = mr.rs.gopen_url_len;
+    if (n == 0 or n + 1 > out.len) return null;
+    mr.rs.gopen_url_len = 0;
+    @memcpy(out[0..n], mr.rs.gopen_url_buf[0..n]);
+    out[n] = 0;
+    return out[0..n :0];
+}
+
 pub fn mobileHapticTake(mr: *MobileRun) u8 {
     const tag = mr.host.haptic_pending;
     mr.host.haptic_pending = 0;
@@ -7636,7 +7709,13 @@ fn typingOwnsKeyboard(rs: *const RunState) bool {
     if (rs.mode == .compose) return true;
     if (rs.engine == null) return false; // terminal: none of the GUI inputs exist
     if (rs.gscreen == feed_view.screen_messages and
-        (rs.gchat_composing or rs.gchat_input_focus or rs.gchat_q_focus or rs.gpay_open or rs.grecv_open)) return true;
+        (rs.gchat_composing or rs.gchat_input_focus or rs.gchat_q_focus or rs.gpay_open or
+            // The receive flow only TYPES on its paste face (the address
+            // field). Its other faces — the branch, the wallet list, the
+            // capability review — have no text input at all, and raising the
+            // keyboard over them shoved the sheet up the screen and made the
+            // phone look broken. The keyboard belongs where the caret is.
+            (rs.grecv_open and rs.grecv_mode == .paste))) return true;
     // The Wallet page's address fields (the standing fence law: every new text
     // input adds itself here, or typing an address fires app shortcuts).
     if (rs.gscreen == feed_view.screen_wallet and rs.grecv_mode == .paste) return true;
@@ -9052,6 +9131,7 @@ fn payRequest(
 /// Split out of the old `paySend`, which resolved the peer's address and (for
 /// Lightning) fetched an invoice INLINE, on the click, on the render thread.
 fn payCommit(
+    rs: *RunState,
     gpa: Allocator,
     io: std.Io,
     env: ?*const std.process.Environ.Map,
@@ -9073,7 +9153,12 @@ fn payCommit(
     const l = link orelse return "Chat is offline \u{2014} no relay configured";
     const peer_did = chat_core.conversationDid(cs, conv);
 
-    launch.openUri(io, uri) catch return "No wallet answered the hand-off";
+    // THE HAND-OFF. On Android this used to spawn `xdg-open` — a binary that
+    // does not exist on a phone — so the send died here every single time, and
+    // said "No wallet answered", which was not true: no wallet had ever been
+    // asked. Paying from the phone could not work, and the message blamed the
+    // wallet for it.
+    if (!openUri(rs, io, uri)) return "No wallet answered the hand-off";
     // The card: a fresh sent-card, or the paid request advancing — both to
     // `pending` (initiated, unobserved; §6 honesty).
     var id: u64 = undefined;
