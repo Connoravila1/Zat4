@@ -23,6 +23,7 @@
 //! detuned (bigger cells, low ambient) so it stays wispy.
 
 const std = @import("std");
+const dist_config = @import("dist_config");
 const window_shell = @import("native.zig");
 const gpu = @import("gpu.zig");
 const layout_core = @import("../core/layout.zig"); // pointer InputEvent
@@ -636,6 +637,7 @@ pub fn snapshot(s: *const State, blink_on: bool) enroll_view.EnrollView {
         .body_dy = @intFromFloat((1.0 - s.trans_t) * 30.0),
         .info = s.info,
         .connect_failed = s.connect_failed,
+        .rehearsal = dist_config.enroll_rehearsal,
     };
 }
 

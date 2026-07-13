@@ -1988,6 +1988,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
         if (rs.gscreen == feed_view.screen_enroll) {
             const fns = clock_shell.monotonicNanos();
             enrollStep(rs, fns, @as(f32, @floatFromInt(@mod(fns / 1_000_000, 1_000_000))) / 1000.0);
+            enrollRehearse(rs);
             enrollConnect(rs, gpa, io, environ, fns);
             enrollVerify(rs, gpa, io, environ, fns);
             // Enrollment landed a session: end the pre-auth loop and hand it up.
@@ -9135,6 +9136,18 @@ fn enrollVerify(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.proc
         if (!rs.genroll_create.active) s.step = .done;
     }
 
+    // REHEARSAL: the proof is real, the screens are real, and the account is NOT.
+    // Stop at the finish line and say so, rather than minting something on a
+    // production PDS that somebody then has to go and delete.
+    if (comptime dist_config.enroll_rehearsal) {
+        if (s.seal_t >= 1.0 and s.step == .verifying) {
+            s.step = .done;
+            enroll_run.stopPow(&rs.genroll_pow);
+            rs.genroll_pow.active = false;
+        }
+        return;
+    }
+
     // Sealed → make the account. ON A WORKER (see CreateJob).
     if (s.seal_t >= 1.0 and !rs.genroll_create.active and rs.genroll_create.thread == null and s.branch == .new) {
         rs.genroll_create.done.store(false, .monotonic);
@@ -9212,6 +9225,36 @@ fn enrollConnect(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.pro
     rs.genroll_pending = sess;
     s.step = .verifying;
     s.pow_start_ns = frame_ns;
+}
+
+/// REHEARSAL (dev builds, `-Denroll-rehearsal`). The password gates exist to make
+/// a person prove they SAVED their password — which is exactly right for a real
+/// sign-up and pure friction when the same person is walking the flow for the
+/// tenth time to look at the screens. So here they arrive pre-filled: every
+/// screen still renders, the real proof-of-work still runs, and the only thing
+/// that does not happen is the one thing you cannot undo — minting an account.
+fn enrollRehearse(rs: *RunState) void {
+    if (comptime !dist_config.enroll_rehearsal) return;
+    const s = &rs.genroll_state;
+    if (s.step != .confirm or !s.has_pw) return;
+    const pw = s.cred.bytes[0..s.cred.len];
+    // The spot-checks want the word at each challenged position; the full entry
+    // wants the whole thing. Fill what is empty, and leave anything the tester
+    // has typed alone (so it can still be exercised deliberately).
+    for (0..3) |i| {
+        if (s.spot[i].len != 0) continue;
+        const want = enroll_view.wordAt(pw, s.spot_positions[i]);
+        const n = @min(want.len, s.spot[i].buf.len);
+        @memcpy(s.spot[i].buf[0..n], want[0..n]);
+        s.spot[i].len = @intCast(n);
+        s.spot[i].caret = @intCast(n);
+    }
+    if (s.full.len == 0) {
+        const n = @min(pw.len, s.full.buf.len);
+        @memcpy(s.full.buf[0..n], pw[0..n]);
+        s.full.len = @intCast(n);
+        s.full.caret = @intCast(n);
+    }
 }
 
 /// The front door's per-frame motion. The window loop in `enroll_run` interleaves

@@ -153,6 +153,10 @@ pub const EnrollView = struct {
     card_h: i32 = 0,
     body_dy: i32 = 0,
     info: Info = .none, // which info bubble is open
+    /// REHEARSAL (dev builds): the flow was walked but NO ACCOUNT WAS MINTED. The
+    /// done card must say so — "You're in" would be a lie, and a screen that lies
+    /// in a test build is a screen that will eventually lie in a real one.
+    rehearsal: bool = false,
     /// `.connecting` only: the browser OAuth flow failed (or was abandoned), so
     /// the spinner becomes a "couldn't sign in" card with a retry. False while the
     /// wait is still live.
@@ -619,8 +623,12 @@ fn stepDone(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, ix: i32
     try rect(gpa, dl, mx, y, d, d, soft(0x6FCF97, 0x26), @intCast(d / 2));
     try centerStr(gpa, dl, e, ix, iw, y + 38, ok_c, 30, "✓");
     y += d + 18;
-    try centerStr(gpa, dl, e, ix, iw, y, ink, 21, "You're in");
+    try centerStr(gpa, dl, e, ix, iw, y, ink, 21, if (view.rehearsal) "Rehearsal complete" else "You're in");
     y += 28;
+    if (view.rehearsal) {
+        try centerStr(gpa, dl, e, ix, iw, y, muted, 14, "You walked the whole flow. No account was created.");
+        return;
+    }
     const sub = if (view.branch == .existing)
         "Your existing identity now has a Zat4 membership."
     else

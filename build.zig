@@ -72,6 +72,14 @@ pub fn build(b: *std.Build) void {
     const relay_token = b.option([]const u8, "relay-token", "Compiled-in chat relay service token (default: empty = env-only)") orelse "";
     dist_opts.addOption([]const u8, "relay_url", relay_url);
     dist_opts.addOption([]const u8, "relay_token", relay_token);
+    // REHEARSAL (front door). Walk the whole enrollment flow — every screen, the
+    // REAL proof-of-work — without minting an account, and with the password
+    // confirm gates pre-filled. Those gates exist to make a person prove they
+    // saved their password; re-typing them on every test run is friction with no
+    // signal. Dev builds only: a rehearsal that could mint nothing is the point.
+    //   zig build -Denroll-rehearsal ...
+    const enroll_rehearsal = b.option(bool, "enroll-rehearsal", "Front door: walk the flow without minting an account (dev)") orelse false;
+    dist_opts.addOption(bool, "enroll_rehearsal", enroll_rehearsal);
     dist_opts.addOption(bool, "dist", dist);
     exe_mod.addOptions("dist_config", dist_opts);
 

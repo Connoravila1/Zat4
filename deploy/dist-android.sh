@@ -25,7 +25,13 @@ KEYTOOL="${KEYTOOL:-$HOME/jre/bin/keytool}"
 # chat stays offline on the phone (the honest empty surface).
 RELAY_ARGS=""
 if [ -n "${ZAT_RELAY_URL:-}" ]; then RELAY_ARGS="-Drelay-url=$ZAT_RELAY_URL -Drelay-token=${ZAT_RELAY_TOKEN:?ZAT_RELAY_URL set but ZAT_RELAY_TOKEN missing}"; fi
-"$ZIG" build libzat -Doptimize=ReleaseSafe -Dandroid-ndk="$NDK" -Dappview-token="$ZAT_APPVIEW_TOKEN" $RELAY_ARGS
+# REHEARSAL (front door): ZAT_ENROLL_REHEARSAL=1 builds an APK that walks the whole
+# enrollment flow — every screen, the real proof-of-work — but MINTS NOTHING, and
+# arrives at the password gates pre-filled. For looking at the screens without
+# leaving a real account on the PDS every time.
+REHEARSE_ARGS=""
+if [ "${ZAT_ENROLL_REHEARSAL:-0}" = "1" ]; then REHEARSE_ARGS="-Denroll-rehearsal"; echo "[apk] REHEARSAL build — no account will be minted"; fi
+"$ZIG" build libzat -Doptimize=ReleaseSafe -Dandroid-ndk="$NDK" -Dappview-token="$ZAT_APPVIEW_TOKEN" $RELAY_ARGS $REHEARSE_ARGS
 
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
