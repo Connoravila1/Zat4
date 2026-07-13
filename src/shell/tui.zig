@@ -11658,6 +11658,10 @@ fn paintFrame(
                 .ambient = 0.30, // dim so the field recedes and pools at the light — dark cells
                 // starve so the light pools through the material (mockup look)
             };
+            // Same rule as the GPU path: the hit-region list starts each frame
+            // clean, or it accumulates forever and every pass that walks it sees
+            // the ghosts of screens gone by.
+            g.regions.clearRetainingCapacity();
             try field_core.compose(gpa, g.field, g.particles.slice(), light, cell.w, cell.h, g.draw);
             // The animating heart burst still composes (when an effect is
             // live); the OLD resting heart sprites are gone — the premium
@@ -12372,6 +12376,21 @@ fn paintFrameGpu(
         }
         const lh = logicalHFor(w, h, gs.design_w);
         g.draw.len = 0;
+        // START THE HIT-REGION LIST CLEAN. It never was.
+        //
+        // Regions were appended for the life of the process and truncated nowhere,
+        // so the list carried every region from every frame of every screen the
+        // user had ever visited. Taps still worked — `hitTest` is last-wins, so
+        // the newest region won — which is why this survived so long. But the GPU
+        // SDF icon pass walks the WHOLE list, and so it cheerfully drew the feed's
+        // hearts and reposts on top of the Wallet page, and redrew the rail's nav
+        // icons once per rebuild at drifting positions while the rail animated
+        // (the "smear"). It was also an unbounded leak.
+        //
+        // Every emitter — the content layouts AND the chrome (rail, tab bar,
+        // drawer, keyboard) — runs inside this rebuild block, so one clear here
+        // covers all of them.
+        g.regions.clearRetainingCapacity();
         var chain_info: feed_view.ChainSticky = .{};
         if (g.screen.* == feed_view.screen_loadout) {
             // The loadout page: three stacked sockets, its own render path.

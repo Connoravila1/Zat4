@@ -8716,17 +8716,23 @@ fn drawCapsTable(
         const two_line = !r.ok and r.because.len > 0;
         const rh: i32 = if (two_line) 52 else 38;
 
-        const mark_c: u32 = if (r.ok) boost_c else 0xFF7A756A; // green tick / grey dash
+        const mark_c: u32 = if (r.ok) boost_c else like_c; // green tick / red cross
         const lab_c: u32 = if (r.ok) ink else muted;
         const rx = x + slide;
 
-        // The mark: a tick when the wallet can, a dash when it cannot. A dash,
-        // not a cross — the wallet is not FAILING, it simply doesn't do this.
+        // A tick when the wallet can, a RED CROSS when it cannot. It began life as
+        // a grey dash — the reasoning being that the wallet is not "failing", it
+        // simply doesn't do this — but a dash is a weak signal, and the owner read
+        // it as ambiguous rather than as tactful. He is right: at a glance the user
+        // must know instantly which rows are yes and which are no. The tact belongs
+        // in the WORDS underneath ("Strike can't tell us when a payment lands"),
+        // not in a mark so soft it fails to say anything.
         if (r.ok) {
             try line(gpa, dl, rx + 3, cy + 18, rx + 7, cy + 22, scaleAlpha(mark_c, alpha), 2);
             try line(gpa, dl, rx + 7, cy + 22, rx + 14, cy + 12, scaleAlpha(mark_c, alpha), 2);
         } else {
-            try rect(gpa, dl, rx + 3, cy + 17, 11, 2, scaleAlpha(mark_c, alpha), 1);
+            try line(gpa, dl, rx + 4, cy + 13, rx + 14, cy + 23, scaleAlpha(mark_c, alpha), 2);
+            try line(gpa, dl, rx + 14, cy + 13, rx + 4, cy + 23, scaleAlpha(mark_c, alpha), 2);
         }
         try strEllipsis(gpa, dl, e, .semibold, rx + 24, cy + 22, scaleAlpha(lab_c, alpha), 13, r.label, w - 140);
         if (r.detail.len > 0) {

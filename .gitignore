@@ -26,3 +26,4 @@ chat-test-b.sh
 transparency-preview.png
 deploy/angle-win64/*.dll
 deploy/android-debug.keystore
+chat-live.sh
