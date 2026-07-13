@@ -956,6 +956,17 @@ fn renderThread() void {
             if (rc == 1 or rc == 2) {
                 seam.zat_feed_end(ctx);
                 feed_live = false;
+                // AND RESTART IT. The feed is only (re)started when the SURFACE is
+                // attached — and after a teardown the surface is still attached, so
+                // nothing re-entered and the app sat on a dead screen. That is what
+                // signing out looked like: a freeze, and a force-quit to escape it.
+                //
+                // The teardown consumes the GL context (the feed steals it on
+                // start), so the restart genuinely needs a fresh attach: dropping
+                // `attached_gen` re-runs the attach path above, which brings the
+                // context back up and starts the feed — with a session if one
+                // remains, and on the FRONT DOOR if the person just signed out.
+                attached_gen = 0;
             } else if (rc == 3) {
                 feed_errs += 1;
                 if (feed_errs > 120) {

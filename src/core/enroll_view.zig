@@ -213,6 +213,10 @@ pub const HitList = std.ArrayListUnmanaged(Hit);
 
 // Card geometry (logical px; the GPU scales the whole canvas to the window).
 const card_w: i32 = 460;
+/// The breathing room a card keeps from the screen edge when the screen is
+/// narrower than the card wants to be (a phone). Without it the card is not a
+/// card — it is a slab with its corners cut off by the display.
+const side_margin: i32 = 18;
 const pad: i32 = 28; // inner padding
 const radius: u8 = 16;
 
@@ -231,17 +235,23 @@ pub fn layout(
     if (hits) |hl| hl.clearRetainingCapacity();
 
     const card_h = if (view.card_h > 0) view.card_h else cardHeight(view.step, view.branch);
-    const cx = @divTrunc(w - card_w, 2);
+    // THE CARD FITS THE SCREEN. `card_w` is 460 and a phone's design width is 430,
+    // so the card was WIDER than the display: it hung off both edges, its rounded
+    // corners and its shadow fell outside the glass, and what was left read as a
+    // full-bleed grey slab rather than a card floating on the field. It is a CARD;
+    // it must look like one on the smallest screen we ship to.
+    const cw = @min(card_w, w - side_margin * 2);
+    const cx = @divTrunc(w - cw, 2);
     const cy = @divTrunc(h - card_h, 2);
 
     // ── the card: layered soft shadow, fill, top lit edge ──
-    try rect(gpa, dl, cx - 2, cy + 14, card_w + 4, card_h, soft(0x000000, 0x18), radius);
-    try rect(gpa, dl, cx, cy + 7, card_w, card_h, soft(0x000000, 0x22), radius);
-    try rect(gpa, dl, cx, cy, card_w, card_h, card_fill, radius);
-    try rect(gpa, dl, cx, cy, card_w, 2, card_edge, radius);
+    try rect(gpa, dl, cx - 2, cy + 14, cw + 4, card_h, soft(0x000000, 0x18), radius);
+    try rect(gpa, dl, cx, cy + 7, cw, card_h, soft(0x000000, 0x22), radius);
+    try rect(gpa, dl, cx, cy, cw, card_h, card_fill, radius);
+    try rect(gpa, dl, cx, cy, cw, 2, card_edge, radius);
 
     const ix = cx + pad; // inner left
-    const iw = card_w - pad * 2; // inner width
+    const iw = cw - pad * 2; // inner width
     var y = cy + pad;
 
     // ── brand row (accent mark + wordmark) ──
@@ -760,6 +770,14 @@ fn stepConnecting(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, i
     const cy = y + r + 8;
     try drawConnectingSpinner(gpa, dl, cx, cy, r, view.bar_phase);
     try centerStr(gpa, dl, e, ix, iw, cy + r + 30, faint, 13, "Waiting for your browser\u{2026}");
+
+    // A WAY OUT. This card used to offer Back only when the sign-in had already
+    // FAILED — so while it was waiting (which is most of the time it is on
+    // screen, and all of the time if the browser never opened, or the person
+    // changed their mind, or they tapped the wrong card) there was no way off it
+    // at all. The owner tapped "I already have an account" by accident and was
+    // stuck. A screen a person cannot leave is a trap, not a step.
+    try ghostButton(gpa, dl, e, ix, iw, cy + r + 52, "Back", hits);
 }
 
 /// An INDETERMINATE spinner for the OAuth browser wait — the duration is unknown
@@ -1361,7 +1379,7 @@ pub fn cardHeight(step: Step, branch: Branch) i32 {
         .recovery => 484,
         .done => 380,
         .verifying => 402,
-        .connecting => 402,
+        .connecting => 402 + 58, // + the Back that must always be there
     };
 }
 

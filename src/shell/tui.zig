@@ -8375,6 +8375,17 @@ fn composeBlinkOn(anchor_ns: u64) bool {
 /// the caller minimizes the task (back-at-root never kills the process).
 fn backNavigate(rs: *RunState) bool {
     const gpa = rs.gpa;
+    // THE FRONT DOOR answers the system back button. On a phone, back is how a
+    // person expects to undo a wrong tap — and on the pre-auth screen there is no
+    // nav rail to escape through, so if back does nothing there, nothing does.
+    // At the first step it falls through: back-at-root minimizes, as everywhere.
+    if (rs.gscreen == feed_view.screen_enroll) {
+        if (rs.genroll_state.step != .provenance) {
+            enroll_run.apply(&rs.genroll_state, .back, rs.io, clock_shell.monotonicNanos(), &rs.genroll_mstore, &rs.genroll_memjob);
+            return true;
+        }
+        return false;
+    }
     if (rs.gpu_state) |*gsd| {
         if (gsd.drawer_want or gsd.drawer_t > 0.3) {
             gsd.drawer_want = false;
@@ -9186,7 +9197,13 @@ fn enrollVerify(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.proc
 /// mint its Zat4 membership, so it carries its session through the PoW gate.
 fn enrollConnect(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, frame_ns: u64) void {
     const s = &rs.genroll_state;
-    if (s.step != .connecting) return;
+    if (s.step != .connecting) {
+        // They left. Cancel the browser leg — a sign-in that lands after somebody
+        // has walked away from the screen that asked for it is not a gift.
+        s.connect_failed = false;
+        rs.glogin_want = false;
+        return;
+    }
 
     // THE PHONE TAKES A DIFFERENT ROAD. The desktop leg opens a browser and waits
     // on a loopback listener; Android delivers the redirect as an OS intent to a
@@ -12939,7 +12956,11 @@ fn paintComposeGpu(
 
     advanceField(gpa, gs, g.active);
 
-    const field_mobile_off = gs.design_w <= feed_view.phone_max; // field OFF on phone (battery)
+    // The field is OFF on a phone — it costs battery and the feed covers most of
+    // it anyway. THE FRONT DOOR IS THE EXCEPTION: it is one card on an otherwise
+    // empty screen, so the field is the entire backdrop there, and it is the first
+    // thing a new person ever sees of this app. That is worth the milliamps.
+    const field_mobile_off = gs.design_w <= feed_view.phone_max and g.screen.* != feed_view.screen_enroll;
     if (!field_mobile_off) gpu.uploadField(&gs.grid, gs.field.height, gs.field.dye, gs.field.cols, gs.field.rows);
     if (g.xp) gpu.clear(retro_clear_r, retro_clear_g, retro_clear_b) else if (g.julia) gpu.clear(julia_clear_r, julia_clear_g, julia_clear_b) else if (g.light) gpu.clear(light_clear_r, light_clear_g, light_clear_b) else gpu.clear(gpu_clear_r, gpu_clear_g, gpu_clear_b);
     // Field glyph ink: cool grey-white normally; pink under Julia mode (the glow
@@ -13959,7 +13980,11 @@ fn paintFrameGpu(
     // shader is real battery/GPU cost for ~no payoff on a handheld. The CPU sim
     // (advanceField, tens of µs) stays so effects/dye accounting are intact; only
     // the GPU upload + draw are skipped. Desktop is unchanged.
-    const field_mobile_off = gs.design_w <= feed_view.phone_max;
+    // The field is OFF on a phone — it costs battery and the feed covers most of
+    // it anyway. THE FRONT DOOR IS THE EXCEPTION: it is one card on an otherwise
+    // empty screen, so the field is the entire backdrop there, and it is the first
+    // thing a new person ever sees of this app. That is worth the milliamps.
+    const field_mobile_off = gs.design_w <= feed_view.phone_max and g.screen.* != feed_view.screen_enroll;
 
     // Render: the living field behind, the feed on top, then swap.
     if (!field_mobile_off) gpu.uploadField(&gs.grid, gs.field.height, gs.field.dye, gs.field.cols, gs.field.rows);
