@@ -40,6 +40,8 @@
 //! many of them.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const mobile_host = @import("mobile_host.zig");
 // Build-time distribution config (build.zig addOptions): the closed-wave
 // AppView token default. An options module, not a dependency (F1 n/a).
 const dist_config = @import("dist_config");
@@ -121,6 +123,21 @@ pub const Session = struct {
     /// (see SessionLock). Inert and uncontended for a single-threaded session.
     /// Not persisted (cache.zig serializes named fields, never the whole struct).
     cred_lock: SessionLock = .{},
+    /// THE TOKENS ROTATED AND ARE NOT YET ON DISK.
+    ///
+    /// An OAuth refresh token is SINGLE-USE: the refresh grant hands back a new
+    /// one and burns the old. So if we rotate in memory and the process dies
+    /// before the new pair is written, the token on disk is already spent — and
+    /// every future refresh fails with a 401 that no retry can fix. The device
+    /// can still READ (public records need no token), so it looks alive: chat
+    /// connects, the feed loads, and only WRITES fail, forever, with "check your
+    /// connection". That is exactly what the owner's phone was doing.
+    ///
+    /// Persisting only at teardown was the bug: a kill (`am force-stop`, an OOM
+    /// reap, a crash) never reaches teardown. The run loop watches this flag and
+    /// writes the moment it is set. `cache` imports `auth`, so `auth` cannot
+    /// import `cache` — hence a flag rather than a call.
+    rotated: bool = false,
 };
 
 /// Login resolves to a session or the server's stated refusal (wrong
@@ -437,6 +454,7 @@ fn refreshInPlace(
             freeSecret(gpa, session.refresh_jwt);
             session.access_jwt = new_access;
             session.refresh_jwt = new_refresh;
+            session.rotated = true; // the app-password refresh token rotates too
             return .{ .ok = {} };
         },
     }
@@ -506,6 +524,13 @@ fn dpopOutcome(
 /// 401-refresh, retry. Returns the final status + body (`arena`-owned). `htu`
 /// is the URL minus its query (RFC 9449). Mutates the session's nonce (and, on
 /// refresh, the tokens) in place.
+/// The desktop's stderr and the phone's only window (logcat), one call.
+fn authLog(comptime fmt: []const u8, args: anytype) void {
+    if (comptime builtin.is_test) return;
+    std.debug.print(fmt ++ "\n", args);
+    mobile_host.logcat(fmt, args);
+}
+
 fn dpopSend(
     gpa: Allocator,
     arena: Allocator,
@@ -548,9 +573,16 @@ fn dpopSend(
         // Expired access token: refresh once, then retry. A failed refresh means
         // the session is dead — surface the 401 for the caller to re-auth on.
         if (resp.status == 401 and !refreshed) {
-            refreshOAuth(gpa, arena, io, environ, session) catch {
+            refreshOAuth(gpa, arena, io, environ, session) catch |err| {
+                // SAY WHY. A dead refresh is the difference between "the token
+                // aged out, we renewed it, carry on" and "this device can never
+                // write again" — and until now both looked like a bare 401 to
+                // every caller above.
+                authLog("[auth] OAuth refresh FAILED: {s} — this session can no longer write", .{@errorName(err)});
                 return .{ .status = resp.status, .body = resp.body };
             };
+            authLog("[auth] OAuth access token refreshed", .{});
+            session.rotated = true; // single-use refresh token: get it on disk NOW
             refreshed = true;
             continue;
         }

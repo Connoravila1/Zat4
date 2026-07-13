@@ -34,6 +34,8 @@
 //! own repo is never asked to vouch for itself.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const mobile_host = @import("mobile_host.zig");
 const Allocator = std.mem.Allocator;
 const auth = @import("auth.zig");
 const cache = @import("cache.zig");
@@ -165,8 +167,22 @@ pub fn publish(
     const outcome = try auth.procedure(gpa, arena, io, environ, session, lexicon.method.put_record, input, lexicon.RecordRef);
     return switch (outcome) {
         .ok => |r| .{ .uri = try arena.dupe(u8, r.uri), .cid = try arena.dupe(u8, r.cid) },
-        .failed => error.PublishFailed,
+        // The server TOLD us why and we were throwing it away — collapsing a
+        // status, an error code and a human-readable message into one bare
+        // `PublishFailed`, which the UI then rendered as "check your
+        // connection". The connection was fine. Say what the PDS said.
+        .failed => |f| {
+            log("[wallet] putRecord REFUSED: HTTP {d} {s}: {s}", .{ f.status, f.code, f.message });
+            return error.PublishFailed;
+        },
     };
+}
+
+/// The phone's only window (logcat) and the desktop's stderr, one call.
+fn log(comptime fmt: []const u8, args: anytype) void {
+    if (comptime builtin.is_test) return;
+    std.debug.print(fmt ++ "\n", args);
+    mobile_host.logcat(fmt, args);
 }
 
 /// Remove the session account's published receive record — deleting the

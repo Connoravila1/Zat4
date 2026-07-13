@@ -387,6 +387,16 @@ fn fillRandom(io: std.Io, buf: []u8) void {
     };
 }
 
+/// How long we wait for the relay's challenge before deciding it does not speak
+/// auth at all. Deliberately GENEROUS: the first guess (2s) expired while the
+/// challenge was still in flight behind Cloudflare, and we proceeded unauthed
+/// 200ms before it landed — so the gate fired and refused us anyway. A timeout
+/// is a guess about somebody else's latency, and this one only exists for the
+/// case that should never happen (a relay too old to speak auth). The REAL
+/// safety net is `armSubscriptions` on auth_ok, which re-arms whatever this
+/// guess got wrong.
+const auth_grace_ms: u64 = 10_000;
+
 fn runConnection(cr: *ChatRelay, healthy: *bool) !void {
     const gpa = cr.gpa;
     const io = cr.io;
@@ -467,26 +477,27 @@ fn runConnection(cr: *ChatRelay, healthy: *bool) !void {
     @memcpy(acc[0..leftover.len], leftover);
     var acc_len: usize = leftover.len;
 
-    // Subscribe to EVERY mailbox we drain (re-armed on every reconnect; the
-    // server re-delivers unacked). Snapshot under the outbox lock — the
-    // render thread appends via `subscribe`; an ID added mid-snapshot still
-    // reaches the wire through its queued outbox op (a duplicate subscribe
-    // frame is harmless).
+    // NOTHING GOES OUT BEFORE THE RELAY HAS ADMITTED US.
+    //
+    // We used to subscribe and flush the outbox the instant the socket upgraded.
+    // But a relay that requires identity (A4/A6) refuses every op until the auth
+    // handshake — which is a round-trip LATER — completes. On the phone that
+    // showed up as `deposit refused: unauthenticated` half a second before
+    // `AUTHENTICATED`, and, far more quietly, as SUBSCRIBES that were refused
+    // too: subscribe has no reply, so the client believed it was listening on
+    // mailboxes the relay had never registered. It would have received nothing,
+    // forever, and said it was connected the whole time. That is the same shape
+    // as the bug that cost us the week.
+    //
+    // So: if we hold credentials, we wait for `auth_ok` before speaking. If the
+    // relay never challenges us (an older deployment that does not know auth),
+    // we wait a beat and then proceed exactly as we always did — an unauthed
+    // relay serves us fine, and hanging forever waiting for a challenge that is
+    // never coming would be a worse bug than the one we are fixing.
     var subs_snap: std.ArrayList([relay.mailbox_id_len]u8) = .empty;
     defer subs_snap.deinit(gpa);
-    {
-        while (cr.out_locked.swap(true, .acquire)) std.atomic.spinLoopHint();
-        defer cr.out_locked.store(false, .release);
-        try subs_snap.appendSlice(gpa, cr.subs.items);
-    }
-    for (subs_snap.items) |sub_id| {
-        var sub_op: [relay.subscribe_frame_len]u8 = undefined;
-        try sendFrame(cr, &conn, .binary, relay.buildSubscribe(&sub_op, sub_id));
-        var hb: [16]u8 = undefined;
-        relayLog("subscribed {s}", .{mailboxHexLocal(&hb, sub_id)});
-    }
-    relayLog("CONNECTED ({d} subscription(s))", .{subs_snap.items.len});
-    cr.mailbox.push(gpa, .{ .status = "relay: connected" });
+    var armed = false;
+
     setState(cr, .connected);
     healthy.* = true;
 
@@ -498,10 +509,32 @@ fn runConnection(cr: *ChatRelay, healthy: *bool) !void {
 
     var idle_ms: u64 = 0;
     var sent_ping = false;
+    var waited_ms: u64 = 0;
     while (!cr.stop.load(.acquire)) {
-        // Flush queued deposits first — a send should not wait on quiet RX.
-        try takeOutbox(cr, &pending_out);
-        while (pending_out.items.len > 0) {
+        // THE GATE. Speak only once the relay has admitted us — either because
+        // it authenticated us, or because it plainly does not speak auth (no
+        // challenge inside the grace window; or we hold no credentials to offer).
+        if (!armed) {
+            const no_creds = cr.did.len == 0;
+            const gave_up = waited_ms >= auth_grace_ms;
+            if (no_creds or gave_up or linkState(cr) == .authenticated) {
+                if (gave_up and !no_creds)
+                    relayLog("no challenge in {d}ms — this relay doesn't speak auth; proceeding", .{auth_grace_ms});
+                // Snapshot under the outbox lock — the render thread appends via
+                // `subscribe`; an ID added mid-snapshot still reaches the wire
+                // through its queued outbox op (a duplicate subscribe is harmless).
+                try armSubscriptions(cr, &conn, &subs_snap);
+                relayLog("CONNECTED ({d} subscription(s))", .{subs_snap.items.len});
+                cr.mailbox.push(gpa, .{ .status = "relay: connected" });
+                armed = true;
+            }
+        }
+
+        // Flush queued deposits ONLY once armed — a deposit sent before the
+        // relay knows us is refused and LOST (the bucket is gone from the
+        // outbox). Held here, it goes out intact a beat later.
+        if (armed) try takeOutbox(cr, &pending_out);
+        while (armed and pending_out.items.len > 0) {
             const out = pending_out.items[0];
             switch (out) {
                 .deposit => |d| {
@@ -567,6 +600,19 @@ fn runConnection(cr: *ChatRelay, healthy: *bool) !void {
                         relayLog("AUTHENTICATED — the relay knows this device", .{});
                         cr.mailbox.push(gpa, .{ .status = "relay: authenticated" });
                         setState(cr, .authenticated);
+                        // RE-ARM, unconditionally. If we spoke before the relay
+                        // knew us — because the grace above guessed wrong about
+                        // somebody else's latency — every subscribe we sent was
+                        // refused, and subscribe has NO REPLY, so we would have
+                        // sat here believing we were listening on mailboxes the
+                        // relay had never registered. Receiving nothing. Forever.
+                        // Saying "connected" the whole time. Re-subscribing is
+                        // idempotent and costs one frame per mailbox, so it is
+                        // simply not worth being clever about.
+                        if (armed) {
+                            subs_snap.clearRetainingCapacity();
+                            try armSubscriptions(cr, &conn, &subs_snap);
+                        }
                     },
                 },
                 .ping => try sendFrame(cr, &conn, .pong, decoded.frame.payload),
@@ -592,6 +638,9 @@ fn runConnection(cr: *ChatRelay, healthy: *bool) !void {
                 // Liveness is probed, not assumed (the stream.zig clock):
                 // 30 s quiet → ping; 30 s more without ANY frame → dead.
                 idle_ms += 250;
+                // The auth grace ticks here: a relay that never challenges us
+                // (an older deployment) must not leave us mute forever.
+                waited_ms += 250;
                 if (sent_ping and idle_ms >= 60_000) return error.PingUnanswered;
                 if (!sent_ping and idle_ms >= 30_000) {
                     try sendFrame(cr, &conn, .ping, "");
@@ -602,6 +651,28 @@ fn runConnection(cr: *ChatRelay, healthy: *bool) !void {
         }
         const n = try readAvailable(reader, acc[acc_len..]) orelse return error.ConnectionClosed;
         acc_len += n;
+    }
+}
+
+/// Subscribe to every mailbox we drain. Snapshot under the outbox lock — the
+/// render thread appends via `subscribe`; an ID added mid-snapshot still reaches
+/// the wire through its queued outbox op (a duplicate subscribe is harmless, and
+/// that harmlessness is what lets us re-run this the moment we are authenticated).
+fn armSubscriptions(
+    cr: *ChatRelay,
+    conn: *stream_shell.Conn,
+    subs_snap: *std.ArrayList([relay.mailbox_id_len]u8),
+) !void {
+    {
+        while (cr.out_locked.swap(true, .acquire)) std.atomic.spinLoopHint();
+        defer cr.out_locked.store(false, .release);
+        try subs_snap.appendSlice(cr.gpa, cr.subs.items);
+    }
+    for (subs_snap.items) |sub_id| {
+        var sub_op: [relay.subscribe_frame_len]u8 = undefined;
+        try sendFrame(cr, conn, .binary, relay.buildSubscribe(&sub_op, sub_id));
+        var hb: [16]u8 = undefined;
+        relayLog("subscribed {s}", .{mailboxHexLocal(&hb, sub_id)});
     }
 }
 

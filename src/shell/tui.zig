@@ -1890,6 +1890,28 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
             }
         }
 
+        // THE ROTATED TOKENS REACH DISK THE FRAME THEY ROTATE.
+        //
+        // An OAuth refresh token is single-use: the grant hands back a new one
+        // and burns the old. We persisted only at teardown — and a kill never
+        // reaches teardown. So a rotate-then-die left a SPENT refresh token on
+        // disk, and from that moment the device could never write again: every
+        // refresh 401s, and the app says "check your connection" while the
+        // connection is perfectly fine. Reads keep working (public records need
+        // no token), which is what made it look alive. This was the owner's
+        // phone, and it would have been every user's phone eventually.
+        if (session.rotated) {
+            session.rotated = false;
+            var sp_buf: [512]u8 = undefined;
+            if (session.mode == .oauth) {
+                if (cache_shell.oauthSessionPath(&sp_buf, environ)) |sp|
+                    _ = cache_shell.saveOAuthSessionAt(gpa, sp, session);
+            } else if (cache_shell.sessionPath(&sp_buf, environ)) |sp| {
+                _ = cache_shell.saveSessionAt(gpa, sp, session);
+            }
+            chatLog("[auth] rotated tokens persisted", .{});
+        }
+
         // Drain the chat relay's mailbox (M1): each delivered bucket is an
         // MLS message the E2EE session routes — a decrypted application
         // message becomes a counterparty bubble in the one shared store; a
@@ -9056,6 +9078,11 @@ fn saveReceiveAddress(
         return "Saved \u{2014} you can now receive payments in chats";
     } else |err| {
         saved.* = false;
+        // NAME IT. "Check your connection" is what this said for every failure it
+        // did not have a case for — including failures that have nothing to do
+        // with the connection — which sent the owner looking at his wifi while
+        // the real fault sat in the log, unlogged.
+        chatLog("[wallet] publish FAILED: {s}", .{@errorName(err)});
         return switch (err) {
             error.NoAddresses => "Add a Lightning or Bitcoin address first",
             error.BadLightning => "That Lightning address isn't valid",
