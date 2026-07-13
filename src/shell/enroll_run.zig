@@ -40,6 +40,7 @@ const oauth = @import("oauth.zig"); // existing-account browser sign-in (OAuth/D
 const identity = @import("identity.zig"); // handle → PDS resolution for the OAuth flow
 const membership_record = @import("membership_record.zig"); // the on-network Zat4 membership record
 const config = @import("config.zig"); // the PDS host new accounts are minted on
+const netguard = @import("../core/netguard.zig"); // pure hostOf() — is this PDS ours?
 const lexicon = @import("../core/lexicon.zig");
 const pow = @import("../core/pow.zig");
 const pow_shell = @import("pow.zig");
@@ -145,6 +146,32 @@ pub const State = struct {
     card_h: f32 = 0.0, // eased card height (0 = not yet initialised)
     info: enroll_view.Info = .none, // which info bubble is open
     connect_failed: bool = false, // .connecting: the browser OAuth flow failed → retry card
+    // ── the existing-account fork: WHO HOSTS THIS HANDLE? (FRONT_DOOR_ROADMAP §2b) ──
+    /// The handle→PDS lookup is in flight. Until it lands we do not know whether
+    /// this person types a password here or goes to their provider's website.
+    resolving: bool = false,
+    /// The lookup has ANSWERED (this attempt): the fork below is decided, and the
+    /// run loop must not resolve again — it is what stops the browser road from
+    /// re-asking the network every frame while it waits.
+    resolved: bool = false,
+    /// The resolved PDS: its host (named on the browser card) and its full URL
+    /// (what `createSession` is aimed at). Written on the main thread from the
+    /// resolve worker's result, so the worker never touches this struct.
+    host: [96]u8 = undefined,
+    host_len: u8 = 0,
+    pds: [160]u8 = undefined,
+    pds_len: u8 = 0,
+    host_ours: bool = false, // the PDS is the one WE run → the in-app password road
+    /// `.signin`: the typed password for an account we host, and its reveal toggle.
+    /// Scrubbed the moment the step is left (`wipePw`) — a password has no business
+    /// outliving the screen that asked for it.
+    pw: TextField = .{},
+    pw_show: bool = false,
+    /// `.signin`: the `createSession` round-trip is in flight. `apply` raises it on
+    /// the tap; the run loop is what actually starts the worker (C1/B3 — `apply`
+    /// has no allocator and no business doing I/O).
+    signin_busy: bool = false,
+    sign_error: enroll_view.SignInError = .none,
     /// Enter means "done, hide the keyboard" (a phone) rather than "next field"
     /// (a mouse). Set by the driver each time it hands over keys.
     phone_enter: bool = false,
@@ -641,7 +668,27 @@ pub fn snapshot(s: *const State, blink_on: bool) enroll_view.EnrollView {
         .info = s.info,
         .connect_failed = s.connect_failed,
         .rehearsal = dist_config.enroll_rehearsal,
+        // The card asks "do we KNOW yet?", not "is a worker running?" — the gap
+        // between the two (a stale lookup still being reaped) must not flash the
+        // browser copy at somebody we have not looked up.
+        .resolving = !s.resolved,
+        .host = s.host[0..s.host_len],
+        .pw = tfView(&s.pw),
+        .pw_show = s.pw_show,
+        .signin_busy = s.signin_busy,
+        .sign_error = s.sign_error,
     };
+}
+
+/// Scrub the typed sign-in password and forget it was ever typed. Called whenever
+/// the `.signin` step is left, by any road (Back, a landed session, a reset) — the
+/// bytes are erased with `secureZero`, which the optimizer is not allowed to drop.
+pub fn wipePw(s: *State) void {
+    std.crypto.secureZero(u8, &s.pw.buf);
+    s.pw.len = 0;
+    s.pw.caret = 0;
+    s.pw_show = false;
+    s.signin_busy = false;
 }
 
 /// Route decoded keys into the focused field: text insert, Backspace/Delete,
@@ -668,6 +715,15 @@ pub fn handleText(s: *State, bytes: []const u8) bool {
             .escape => return true, // bare Esc quits
             .enter => if (s.phone_enter) {
                 s.focus = .none; // phone: Enter means "done" — put the keyboard away
+            } else if (s.step == .signin and s.pw.len > 0 and !s.signin_busy) {
+                // A SIGN-IN FORM SUBMITS ON ENTER. Everywhere else in the flow Enter
+                // means "next field"; on a one-field password card the next field is
+                // itself, so the key would do nothing at all — and every person alive
+                // types a password and presses Enter. (Same effect as tapping the
+                // button: raise the flag, let the run loop do the network.)
+                s.sign_error = .none;
+                s.signin_busy = true;
+                s.focus = .none;
             } else focusStep(s, false), // desktop: advance to the next field
             .back_tab => focusStep(s, true), // Shift+Tab → previous field
             .char => |c| {
@@ -714,6 +770,7 @@ fn focusedField(s: *State) ?*TextField {
         .spot1 => &s.spot[1],
         .spot2 => &s.spot[2],
         .full => &s.full,
+        .pw => &s.pw,
         .none => null,
     };
 }
@@ -729,6 +786,7 @@ fn focusedCaret(s: *const State) u32 {
         .spot1 => s.spot[1].caret,
         .spot2 => s.spot[2].caret,
         .full => s.full.caret,
+        .pw => s.pw.caret,
         .none => 0,
     };
 }
@@ -762,6 +820,10 @@ fn focusOrder(s: *const State, out: *[4]enroll_view.Focus) usize {
                 out[0] = .full;
                 break :blk 1;
             },
+        },
+        .signin => blk: {
+            out[0] = .pw;
+            break :blk 1;
         },
         else => 0,
     };
@@ -802,6 +864,8 @@ pub fn apply(s: *State, target: enroll_view.HitTarget, io: std.Io, now_ns: u64, 
             s.focus = .username;
         },
         .back => {
+            wipePw(s);
+            forgetHost(s);
             s.step = .provenance;
             s.branch = .undecided;
             s.focus = .none;
@@ -809,11 +873,13 @@ pub fn apply(s: *State, target: enroll_view.HitTarget, io: std.Io, now_ns: u64, 
         .primary => switch (s.step) {
             .provenance => {},
             .identity => {
-                // EXISTING identity → hand off to the browser OAuth sign-in (the
-                // run loop starts the worker on this step). NEW identity continues
+                // EXISTING identity → find out WHO HOSTS IT first (the run loop
+                // starts the resolve worker on this step). Ours ⇒ an in-app
+                // password; anyone else's ⇒ their browser. NEW identity continues
                 // the create-account ritual through membership.
                 if (s.branch == .existing) {
                     s.connect_failed = false;
+                    forgetHost(s);
                     s.step = .connecting;
                 } else {
                     s.step = .membership;
@@ -847,9 +913,29 @@ pub fn apply(s: *State, target: enroll_view.HitTarget, io: std.Io, now_ns: u64, 
                 s.pow_start_ns = now_ns;
             },
             .verifying => {},
-            // The connecting card's "Try again" after a failed sign-in: clear the
-            // failure so the run loop re-launches the OAuth worker.
-            .connecting => s.connect_failed = false,
+            .connecting => {
+                if (s.sign_error == .not_found) {
+                    // "Edit handle" — a handle that resolves to nothing is a TYPO,
+                    // not a failed sign-in. Retrying the same bytes would fail the
+                    // same way; the only useful move is back to the field.
+                    forgetHost(s);
+                    s.step = .identity;
+                    s.focus = .handle;
+                } else {
+                    // "Try again" after a failed browser sign-in: clear the failure
+                    // so the run loop re-launches the OAuth worker.
+                    s.connect_failed = false;
+                }
+            },
+            // "Sign in" on an account WE host. The tap only raises the flag; the run
+            // loop owns the network (B3) and starts the createSession worker.
+            .signin => {
+                if (s.pw.len > 0 and !s.signin_busy) {
+                    s.sign_error = .none;
+                    s.signin_busy = true;
+                    s.focus = .none;
+                }
+            },
         },
         .tier_secure => selectTier(s, .secure, now_ns),
         .tier_super => selectTier(s, .super_secure, now_ns),
@@ -897,6 +983,11 @@ pub fn apply(s: *State, target: enroll_view.HitTarget, io: std.Io, now_ns: u64, 
             s.focus = .full;
             s.full.caret = s.full.len;
         },
+        .field_pw => {
+            s.focus = .pw;
+            s.pw.caret = s.pw.len;
+        },
+        .toggle_pw_show => s.pw_show = !s.pw_show,
         .regen_password => {
             // Didn't save it → mint a fresh password and go back to copy it.
             mint(s, io, mstore, memjob);
@@ -915,6 +1006,18 @@ pub fn apply(s: *State, target: enroll_view.HitTarget, io: std.Io, now_ns: u64, 
         .deposit => {}, // hover-only (rationale popup); no click action
         .restart => reset(s),
     }
+}
+
+/// Forget everything the lookup told us, so the next attempt asks the network
+/// again rather than acting on a stale answer about a handle that has since been
+/// retyped.
+fn forgetHost(s: *State) void {
+    s.resolving = false;
+    s.resolved = false;
+    s.host_len = 0;
+    s.pds_len = 0;
+    s.host_ours = false;
+    s.sign_error = .none;
 }
 
 /// Pick a tier: mark it chosen and (re)start the strength-bar fill animation.
@@ -1308,6 +1411,215 @@ fn stopOAuth(job: *OAuthJob) void {
     job.active = false;
 }
 
+// ─────────────── the existing-account fork: resolve, then sign in ───────────────
+//
+// A returning person types a handle. WHO HOSTS IT decides the whole road:
+//
+//   pds.zat4.com  → an in-app password field + `com.atproto.server.createSession`.
+//                   We run that server and already hold the Argon2id hash of that
+//                   password; typing it into our app crosses no boundary that
+//                   typing it into our website would not.
+//   anywhere else → the browser (OAuth). Collecting another provider's password
+//                   in our app is exactly what OAuth exists to prevent, and no
+//                   promise on a screen makes it acceptable.
+//
+// Both legs are network, so both are workers: the render thread never blocks
+// (UI-thread law), and neither worker ever reads `State` — the inputs are COPIED
+// in, the answers are copied out.
+
+/// The handle → PDS lookup. Answers with plain bytes in the job (the worker's
+/// arena dies with it, so nothing it allocated escapes).
+pub const ResolveJob = struct {
+    // A7.2: cold struct (one live instance, holds a thread + lifecycle), size guard waived.
+    thread: ?std.Thread = null,
+    done: std.atomic.Value(bool) = .init(false),
+    ok: bool = false, // the handle resolved (read after done-acquire / join)
+    ours: bool = false, // …to the PDS we run
+    handle: [256]u8 = undefined, // in: the typed handle, copied
+    handle_len: u16 = 0,
+    host: [96]u8 = undefined, // out: the PDS host ("bsky.network")
+    host_len: u8 = 0,
+    pds: [160]u8 = undefined, // out: the PDS URL (the createSession target)
+    pds_len: u8 = 0,
+    io: std.Io = undefined,
+    env: ?*const std.process.Environ.Map = null,
+};
+
+fn resolveWorker(job: *ResolveJob) void {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const scratch = arena_state.allocator();
+    const id = identity.resolve(scratch, job.io, job.env, .{}, job.handle[0..job.handle_len]) catch |err| {
+        std.debug.print("[enroll] handle didn't resolve: {s}\n", .{@errorName(err)});
+        job.done.store(true, .release);
+        return;
+    };
+    const their_host = netguard.hostOf(id.pds_url) orelse "";
+    const our_host = netguard.hostOf(config.fromEnv(job.env).pds_url) orelse "";
+    const hn = @min(their_host.len, job.host.len);
+    @memcpy(job.host[0..hn], their_host[0..hn]);
+    job.host_len = @intCast(hn);
+    const pn = @min(id.pds_url.len, job.pds.len);
+    @memcpy(job.pds[0..pn], id.pds_url[0..pn]);
+    job.pds_len = @intCast(pn);
+    // Host equality, not URL equality: the same server reached as `https://x/` and
+    // `https://x` is the same server, and case never was significant in a hostname.
+    job.ours = their_host.len > 0 and our_host.len > 0 and std.ascii.eqlIgnoreCase(their_host, our_host);
+    job.ok = true;
+    job.done.store(true, .release);
+}
+
+/// Start the lookup for the handle currently typed into the existing-branch field
+/// (COPIED in, so the worker never reads `State`). A spawn failure completes the
+/// job as a clean failure rather than hanging.
+pub fn startResolve(job: *ResolveJob, s: *State, io: std.Io, env: ?*const std.process.Environ.Map) void {
+    const h = tfView(&s.handle);
+    const n = @min(h.len, job.handle.len);
+    @memcpy(job.handle[0..n], h[0..n]);
+    job.handle_len = @intCast(n);
+    job.io = io;
+    job.env = env;
+    job.done.store(false, .monotonic);
+    job.ok = false;
+    job.ours = false;
+    job.host_len = 0;
+    job.pds_len = 0;
+    job.thread = std.Thread.spawn(.{}, resolveWorker, .{job}) catch null;
+    if (job.thread == null) job.done.store(true, .release); // couldn't even start → "done" (ok=false)
+}
+
+/// Join a finished lookup and COPY its answer into `s` (main thread; the worker is
+/// joined first, so there is no concurrency here). Returns true if the handle
+/// resolved. Nothing here allocates: the answer is bytes in fixed buffers.
+pub fn takeResolve(job: *ResolveJob, s: *State) bool {
+    if (job.thread) |th| {
+        th.join();
+        job.thread = null;
+    }
+    s.resolving = false;
+    s.resolved = true;
+    if (!job.ok) {
+        s.sign_error = .not_found;
+        return false;
+    }
+    @memcpy(s.host[0..job.host_len], job.host[0..job.host_len]);
+    s.host_len = job.host_len;
+    @memcpy(s.pds[0..job.pds_len], job.pds[0..job.pds_len]);
+    s.pds_len = job.pds_len;
+    s.host_ours = job.ours;
+    return true;
+}
+
+/// Shutdown / walked-away cleanup: join an in-flight lookup (it is a short HTTPS
+/// round-trip, so it is waited out rather than cancelled) and drop its answer.
+pub fn stopResolve(job: *ResolveJob) void {
+    if (job.thread) |th| {
+        th.join();
+        job.thread = null;
+    }
+}
+
+/// The in-app sign-in: `createSession` against OUR PDS with the typed password,
+/// then the same membership fork the OAuth leg makes (§13.1) — a returning MEMBER
+/// drops into the feed; a DID that is on our PDS but has no Zat4 membership record
+/// still goes through the proof-of-work gate.
+pub const PwLoginJob = struct {
+    // A7.2: cold struct (one live instance, holds a thread + lifecycle), size guard waived.
+    thread: ?std.Thread = null,
+    done: std.atomic.Value(bool) = .init(false),
+    ok: bool = false, // a session was produced
+    refused: bool = false, // the SERVER said no (wrong password) — not a transport failure
+    is_member: bool = false, // the DID already holds a Zat4 membership record
+    session: auth.Session = undefined, // page_allocator-owned on success
+    handle: [256]u8 = undefined,
+    handle_len: u16 = 0,
+    pds: [160]u8 = undefined,
+    pds_len: u8 = 0,
+    /// The secret, copied in and scrubbed the moment the job is joined.
+    pw: [96]u8 = undefined,
+    pw_len: u8 = 0,
+    io: std.Io = undefined,
+    env: ?*const std.process.Environ.Map = null,
+};
+
+fn pwLoginWorker(job: *PwLoginJob) void {
+    const a = std.heap.page_allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const scratch = arena_state.allocator();
+    const outcome = auth.login(a, scratch, job.io, job.env, job.pds[0..job.pds_len], job.handle[0..job.handle_len], job.pw[0..job.pw_len]) catch |err| {
+        // Transport: we could not reach the server at all. That is NOT "wrong
+        // password", and telling somebody their password is wrong when the truth is
+        // that their train went into a tunnel is how you get them to change it.
+        std.debug.print("[enroll] sign-in transport error: {s}\n", .{@errorName(err)});
+        job.done.store(true, .release);
+        return;
+    };
+    switch (outcome) {
+        .refused => |f| {
+            std.debug.print("[enroll] sign-in refused: {d} {s}\n", .{ f.status, f.code });
+            job.refused = true;
+        },
+        .ok => |sess| {
+            job.session = sess;
+            job.ok = true;
+            const m = membership_record.fetch(a, scratch, job.io, job.env, &job.session, job.session.did) catch null;
+            job.is_member = (m != null);
+        },
+    }
+    job.done.store(true, .release);
+}
+
+/// Start the sign-in with what is on the `.signin` card (handle + PDS from the
+/// lookup, password from the field) — all COPIED into the job.
+pub fn startPwLogin(job: *PwLoginJob, s: *State, io: std.Io, env: ?*const std.process.Environ.Map) void {
+    const h = tfView(&s.handle);
+    const hn = @min(h.len, job.handle.len);
+    @memcpy(job.handle[0..hn], h[0..hn]);
+    job.handle_len = @intCast(hn);
+    const pn = @min(@as(usize, s.pds_len), job.pds.len);
+    @memcpy(job.pds[0..pn], s.pds[0..pn]);
+    job.pds_len = @intCast(pn);
+    const pw = tfView(&s.pw);
+    const wn = @min(pw.len, job.pw.len);
+    @memcpy(job.pw[0..wn], pw[0..wn]);
+    job.pw_len = @intCast(wn);
+    job.io = io;
+    job.env = env;
+    job.done.store(false, .monotonic);
+    job.ok = false;
+    job.refused = false;
+    job.is_member = false;
+    job.thread = std.Thread.spawn(.{}, pwLoginWorker, .{job}) catch null;
+    if (job.thread == null) job.done.store(true, .release); // couldn't start → "done" (ok=false)
+}
+
+/// Join a finished sign-in WITHOUT freeing its result — the caller is about to
+/// consume `session`. The copied password is scrubbed here, at the point the job
+/// stops needing it (C5).
+pub fn joinPwLogin(job: *PwLoginJob) void {
+    if (job.thread) |th| {
+        th.join();
+        job.thread = null;
+    }
+    std.crypto.secureZero(u8, &job.pw);
+    job.pw_len = 0;
+}
+
+/// Shutdown cleanup: join an in-flight sign-in AND release a successful result
+/// nobody consumed (the flow landing in the very frame the app is torn down). If
+/// the loop already took it, `joinPwLogin` left `thread == null` and this is a
+/// no-op — so it never double-frees.
+pub fn stopPwLogin(job: *PwLoginJob) void {
+    if (job.thread) |th| {
+        th.join();
+        job.thread = null;
+        if (job.ok) auth.freeSession(std.heap.page_allocator, job.session);
+    }
+    std.crypto.secureZero(u8, &job.pw);
+    job.pw_len = 0;
+}
+
 /// Compose the final handle for the done screen from the branch + inputs.
 fn finalize(s: *State) void {
     var n: usize = 0;
@@ -1330,6 +1642,7 @@ fn finalize(s: *State) void {
 
 fn reset(s: *State) void {
     if (s.has_pw) credential_shell.wipe(&s.cred);
+    wipePw(s); // the typed sign-in password never survives a restart of the flow
     s.* = .{};
 }
 

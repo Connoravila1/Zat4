@@ -794,10 +794,21 @@ const RunState = struct {
     /// The browser has already been asked for, this visit to the step. Without it
     /// the request fired every frame.
     glogin_asked: bool,
+    /// The in-app sign-in worker has been started for the tap that is in flight.
+    /// `signin_busy` is what the CARD shows; this is what stops the loop starting a
+    /// second `createSession` on the very next frame.
+    genroll_signin_started: bool,
     /// The existing-account browser sign-in ("I already have an account"), on a
     /// worker: it resolves a handle, opens a browser, and waits on a loopback
     /// listener — none of which may happen on the thread that draws.
     genroll_oauth: enroll_run.OAuthJob,
+    /// WHO HOSTS THIS HANDLE — the lookup that forks the existing-account road:
+    /// our own PDS ⇒ an in-app password field; anyone else's ⇒ their browser.
+    /// Network, so: a worker.
+    genroll_resolve: enroll_run.ResolveJob,
+    /// The in-app `createSession` for an account we host — the other side of that
+    /// fork, also on a worker.
+    genroll_pwlogin: enroll_run.PwLoginJob,
     /// A signed-in DID carried through the membership gate: an existing account
     /// still has to MINT its Zat4 membership before it is a member here.
     genroll_pending: ?auth.Session,
@@ -1455,7 +1466,10 @@ fn initRunState(
     rs.genroll_memjob = .{};
     rs.glogin_want = false;
     rs.glogin_asked = false;
+    rs.genroll_signin_started = false;
     rs.genroll_oauth = .{};
+    rs.genroll_resolve = .{};
+    rs.genroll_pwlogin = .{};
     rs.genroll_pending = null;
     rs.genroll_pow = .{};
     rs.genroll_create = .{};
@@ -1717,6 +1731,11 @@ fn deinitRunState(rs: *RunState) void {
         th.join();
         rs.genroll_oauth.thread = null;
     }
+    // Same law for the fork's two workers: waited out, never abandoned. The
+    // sign-in one may also be holding a session nobody consumed (it landed in the
+    // frame we shut down) — `stopPwLogin` releases it and scrubs the password.
+    enroll_run.stopResolve(&rs.genroll_resolve);
+    enroll_run.stopPwLogin(&rs.genroll_pwlogin);
     const gpa = rs.gpa;
     const backend = rs.backend;
     if (rs.gpu_state) |*gs| deinitGpuState(gpa, gs);
@@ -9257,19 +9276,74 @@ fn enrollVerify(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.proc
     }
 }
 
-/// "I already have an account": the browser OAuth hop, on a worker. A returning
-/// MEMBER drops straight into the feed; a first-time imported DID still has to
-/// mint its Zat4 membership, so it carries its session through the PoW gate.
+/// "I already have an account" — THE FORK. Who hosts the handle decides the road:
+/// an account on OUR PDS signs in with a password, in the app, no browser (we run
+/// that server and hold the hash — there is no third party to protect them from);
+/// an account anywhere else goes to its own provider's website, because collecting
+/// somebody else's provider password in our app is the thing OAuth exists to
+/// prevent. Both legs are network, so both are workers.
+///
+/// Downstream both roads converge: a returning MEMBER drops straight into the
+/// feed; a DID that is on the network but holds no Zat4 membership record carries
+/// its session through the proof-of-work gate and mints one.
 fn enrollConnect(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, frame_ns: u64) void {
     const s = &rs.genroll_state;
-    if (s.step != .connecting) {
+    if (s.step != .connecting and s.step != .signin) {
         // They left. Cancel the browser leg — a sign-in that lands after somebody
         // has walked away from the screen that asked for it is not a gift.
         s.connect_failed = false;
         rs.glogin_want = false;
         rs.glogin_asked = false;
+        // Reap whatever the fork left running, once it lands: a lookup nobody is
+        // waiting for, or a session nobody asked for any more (freed, not leaked).
+        // Only when it is DONE — the render thread does not wait on the network.
+        if (rs.genroll_resolve.thread != null and rs.genroll_resolve.done.load(.acquire))
+            enroll_run.stopResolve(&rs.genroll_resolve);
+        if (rs.genroll_pwlogin.thread != null and rs.genroll_pwlogin.done.load(.acquire)) {
+            enroll_run.stopPwLogin(&rs.genroll_pwlogin);
+            rs.genroll_signin_started = false;
+        }
         return;
     }
+
+    if (s.step == .signin) {
+        enrollSignin(rs, gpa, io, env, frame_ns);
+        return;
+    }
+
+    // ── who hosts it? (before any browser is opened, and before any password is
+    // asked for) ──
+    if (!s.resolved) {
+        // A lookup left over from an earlier visit to this step answers about a
+        // handle that may since have been retyped: joined and DROPPED, and only
+        // once it is done. Until then we do not start a second one.
+        if (!s.resolving and rs.genroll_resolve.thread != null and rs.genroll_resolve.done.load(.acquire))
+            enroll_run.stopResolve(&rs.genroll_resolve);
+        if (!s.resolving and rs.genroll_resolve.thread == null) {
+            s.resolving = true;
+            enroll_run.startResolve(&rs.genroll_resolve, s, io, env);
+        }
+        if (!s.resolving or !rs.genroll_resolve.done.load(.acquire)) return;
+        if (!enroll_run.takeResolve(&rs.genroll_resolve, s)) return; // → "we couldn't find that handle"
+        if (s.host_ours) {
+            // OUR account. No browser: a password field, right here.
+            s.step = .signin;
+            s.sign_error = .none;
+            // A STEP DOES NOT SUMMON THE KEYBOARD (the standing phone rule): with a
+            // mouse the caret is simply ready; with a thumb an auto-focus throws a
+            // keyboard over half the screen nobody asked for.
+            if (rs.backend != .mobile) s.focus = .pw;
+            return;
+        }
+        // Hosted elsewhere → the browser road below, and the card now NAMES the host.
+    }
+
+    // A HANDLE THAT RESOLVED TO NOTHING GETS NO BROWSER. The lookup has answered
+    // (`resolved`), so the block above is skipped from here on — without this the
+    // very next frame would sail into the OAuth leg and open a browser to sign in
+    // to an account we just established does not exist. The card is showing "we
+    // couldn't find that handle"; the only way forward is the one it offers.
+    if (s.sign_error == .not_found) return;
 
     // THE PHONE TAKES A DIFFERENT ROAD. The desktop leg opens a browser and waits
     // on a loopback listener; Android delivers the redirect as an OS intent to a
@@ -9312,6 +9386,53 @@ fn enrollConnect(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.pro
     }
     // First-time imported DID: it is on the network, but it is not a member HERE
     // yet. Through the proof-of-work gate, carrying its session.
+    rs.genroll_pending = sess;
+    s.step = .verifying;
+    s.pow_start_ns = frame_ns;
+}
+
+/// THE IN-APP SIGN-IN (the fork's other road): `createSession` against our own
+/// PDS, on a worker. The tap raised `signin_busy`; this starts the work, drains
+/// the result, and lands in exactly the same two places the browser road lands —
+/// straight to the feed for a member, the proof-of-work gate for a DID that has
+/// no Zat4 membership record yet.
+fn enrollSignin(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, frame_ns: u64) void {
+    const s = &rs.genroll_state;
+    const job = &rs.genroll_pwlogin;
+
+    // A sign-in abandoned on an earlier visit: reaped (its session freed) the
+    // moment it lands, so it can never be mistaken for the answer to THIS tap.
+    if (!rs.genroll_signin_started and job.thread != null and job.done.load(.acquire))
+        enroll_run.stopPwLogin(job);
+
+    if (s.signin_busy and !rs.genroll_signin_started and job.thread == null) {
+        rs.genroll_signin_started = true;
+        enroll_run.startPwLogin(job, s, io, env);
+    }
+    if (!rs.genroll_signin_started or !job.done.load(.acquire)) return;
+
+    rs.genroll_signin_started = false;
+    enroll_run.joinPwLogin(job); // joins + scrubs the job's copy of the password
+    s.signin_busy = false;
+    if (!job.ok) {
+        // Say WHICH failure it was. "Wrong password" when the truth is "we couldn't
+        // reach the server" is how you get someone to change a password that was
+        // never wrong.
+        s.sign_error = if (job.refused) .refused else .network;
+        return;
+    }
+    const sess = auth.reownSession(gpa, std.heap.page_allocator, job.session) catch {
+        auth.freeSession(std.heap.page_allocator, job.session);
+        s.sign_error = .network;
+        return;
+    };
+    enroll_run.wipePw(s); // it did its job; it does not linger on the screen or in RAM
+    if (job.is_member) {
+        rs.genroll_session = sess; // returning member → straight to the feed
+        return;
+    }
+    // On our PDS but holding no membership record (an account minted before the
+    // record existed, or by hand): the same gate everyone else walks.
     rs.genroll_pending = sess;
     s.step = .verifying;
     s.pow_start_ns = frame_ns;
@@ -9422,7 +9543,7 @@ fn enrollStep(rs: *RunState, frame_ns: u64, t: f32) void {
 /// raise a keyboard on a phone.
 fn isEnrollField(t: enroll_view.HitTarget) bool {
     return switch (t) {
-        .field_handle, .field_username, .field_email, .field_spot0, .field_spot1, .field_spot2, .field_full => true,
+        .field_handle, .field_username, .field_email, .field_spot0, .field_spot1, .field_spot2, .field_full, .field_pw => true,
         else => false,
     };
 }

@@ -60,14 +60,27 @@ const privacy_placeholder =
 /// OAuth flow and spin here until it lands. It is appended LAST on purpose — the
 /// new-account ritual's step indices (which the progress dots count) must not
 /// shift.
-pub const Step = enum(u8) { provenance, identity, membership, password, confirm, recovery, done, verifying, connecting };
+/// `signin` is the EXISTING branch's OTHER terminal: a handle that resolves to
+/// OUR PDS gets an in-app password field and `createSession` — no browser. We run
+/// that server and already hold the password's hash, so a person typing it into
+/// our app crosses no new trust boundary. A handle hosted ANYWHERE ELSE keeps the
+/// browser (`connecting`): collecting someone else's provider password in our app
+/// is precisely what OAuth exists to prevent. Appended last, like `connecting`,
+/// so the new-account step indices the progress dots count do not shift.
+pub const Step = enum(u8) { provenance, identity, membership, password, confirm, recovery, done, verifying, connecting, signin };
 
 /// How the person is coming in (the top-level branch). `undecided` only before
 /// step 0 is answered; the identity step renders differently per branch.
 pub const Branch = enum(u8) { undecided, existing, new };
 
 /// The currently-focused text field (caret + focus ring). `none` = no field.
-pub const Focus = enum(u8) { none, handle, username, email, spot0, spot1, spot2, full };
+pub const Focus = enum(u8) { none, handle, username, email, spot0, spot1, spot2, full, pw };
+
+/// What went wrong on the existing-account road, as plain data the card renders
+/// (E4: a refusal is an ordinary result, not an error path). `not_found` = the
+/// handle didn't resolve, so we never learned who hosts it; `refused` = the
+/// server said the password is wrong; `network` = we could not reach it at all.
+pub const SignInError = enum(u8) { none, not_found, refused, network };
 
 /// The confirm step runs in two stages: a random spot-check (type a few words
 /// at CSPRNG-chosen positions — minor anti-form-fill friction), then a full
@@ -161,6 +174,25 @@ pub const EnrollView = struct {
     /// the spinner becomes a "couldn't sign in" card with a retry. False while the
     /// wait is still live.
     connect_failed: bool = false,
+    // ── the existing-account fork (who hosts this handle?) ──
+    /// `.connecting`: the handle is being resolved to its PDS. Until that lands we
+    /// do not know which road we are on, so the card says so ("Checking your
+    /// handle") rather than claiming a browser we have not opened.
+    resolving: bool = false,
+    /// The host that turned out to own the handle ("bsky.network") — named on the
+    /// browser card, because a person about to be handed to another company's site
+    /// deserves to be told whose site it is.
+    host: []const u8 = "",
+    /// `.signin` (our own PDS): the password typed into the in-app field, and
+    /// whether it is currently revealed. The bytes are the shell's; the view only
+    /// draws them (masked to bullets unless `pw_show`).
+    pw: []const u8 = "",
+    pw_show: bool = false,
+    /// `.signin`: the `createSession` round-trip is in flight (button disabled,
+    /// label reads "Signing in…"). No spinner-forever: it resolves to a session or
+    /// to `sign_error`.
+    signin_busy: bool = false,
+    sign_error: SignInError = .none,
 };
 
 /// One tap target. HOT (iterated in `hitTest`); guarded (A7). No payload — the
@@ -189,6 +221,8 @@ pub const HitTarget = enum(u8) {
     field_spot1,
     field_spot2,
     field_full,
+    field_pw, // .signin: the in-app password field (our own PDS only)
+    toggle_pw_show, // .signin: reveal / hide the typed password
     regen_password, // "didn't save it? get a new one" — back to the password step
     info_membership, // "i" dot → why-this-is-secure bubble
     info_password, // "i" dot → how-it's-generated bubble
@@ -276,6 +310,7 @@ pub fn layout(
         .done => try stepDone(gpa, dl, e, ix, iw, by, view, hits),
         .verifying => try stepVerifying(gpa, dl, e, ix, iw, by, view),
         .connecting => try stepConnecting(gpa, dl, e, ix, iw, by, view, hits),
+        .signin => try stepSignin(gpa, dl, e, ix, iw, by, view, hits),
     }
 
     // Hover lift: one overlay over whatever control the cursor is on, eased so
@@ -742,13 +777,32 @@ fn drawRing(gpa: Allocator, dl: *raster.DrawList, cx: i32, cy: i32, r: i32, pow_
     }
 }
 
-/// The EXISTING-branch "finish in your browser" wait. While the worker runs the
-/// OAuth flow (unknown duration) this shows an indeterminate orbiting spinner;
-/// if the flow fails or is abandoned (`connect_failed`) it becomes a calm
-/// retry card. Branded in the same accent + radial-tick language as the proof
-/// ring so the wait feels native to the flow.
+/// The EXISTING-branch wait, in three faces:
+///
+///   1. RESOLVING — we are asking the network who hosts this handle. We have not
+///      opened a browser yet, so the card does not say we have.
+///   2. NOT FOUND — the handle resolved to nothing. That is a typo, not a failed
+///      sign-in, so it sends them back to the field rather than offering a retry
+///      of something that was never attempted.
+///   3. BROWSER — the handle is hosted elsewhere, so the sign-in happens on that
+///      provider's site, and the card NAMES the provider. Indeterminate orbiting
+///      spinner (the duration is the human's, not ours); `connect_failed` turns
+///      it into a calm retry card.
+///
+/// Branded in the same accent + radial-tick language as the proof ring so the
+/// wait feels native to the flow.
 fn stepConnecting(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, ix: i32, iw: i32, y0: i32, view: EnrollView, hits: ?*HitList) !void {
     var y = y0 + 4;
+    if (view.sign_error == .not_found) {
+        try centerStr(gpa, dl, e, ix, iw, y + 16, ink, 21, "We couldn't find that handle");
+        y += 36;
+        y = try wrapCenter(gpa, dl, e, ix, y, iw, muted, 14, "Nothing on the network answers to it. Check the spelling — a handle looks like connor.bsky.social.");
+        y += 26;
+        try primaryButton(gpa, dl, e, ix, iw, y, "Edit handle", true, hits);
+        y += 46 + 12;
+        try ghostButton(gpa, dl, e, ix, iw, y, "Back", hits);
+        return;
+    }
     if (view.connect_failed) {
         try centerStr(gpa, dl, e, ix, iw, y + 16, ink, 21, "Couldn't sign in");
         y += 36;
@@ -760,16 +814,31 @@ fn stepConnecting(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, i
         return;
     }
 
-    try centerStr(gpa, dl, e, ix, iw, y + 16, ink, 21, "Finish in your browser");
-    y += 36;
-    y = try wrapCenter(gpa, dl, e, ix, y, iw, muted, 14, "We opened your browser to sign in securely at your own server. Complete it there and you'll land right back here.");
-    y += 20;
+    if (view.resolving) {
+        try centerStr(gpa, dl, e, ix, iw, y + 16, ink, 21, "Checking your handle");
+        y += 36;
+        y = try wrapCenter(gpa, dl, e, ix, y, iw, muted, 14, "Finding out who hosts it. If that's us, you'll just type your password here.");
+        y += 20;
+    } else {
+        try centerStr(gpa, dl, e, ix, iw, y + 16, ink, 21, "Finish in your browser");
+        y += 36;
+        // NAME THE HOST. They are being handed to somebody else's website; being
+        // told whose is the difference between a redirect and a hijack.
+        var hb: [160]u8 = undefined;
+        const body: []const u8 = if (view.host.len > 0)
+            std.fmt.bufPrint(&hb, "{s} is hosted by {s}. We opened your browser to sign in there — we never see your password. Finish it and you'll land right back here.", .{ view.handle, view.host }) catch
+                "We opened your browser to sign in securely at your own server. Complete it there and you'll land right back here."
+        else
+            "We opened your browser to sign in securely at your own server. Complete it there and you'll land right back here.";
+        y = try wrapCenter(gpa, dl, e, ix, y, iw, muted, 14, body);
+        y += 20;
+    }
 
     const cx = ix + @divTrunc(iw, 2);
     const r: i32 = 60;
     const cy = y + r + 8;
     try drawConnectingSpinner(gpa, dl, cx, cy, r, view.bar_phase);
-    try centerStr(gpa, dl, e, ix, iw, cy + r + 30, faint, 13, "Waiting for your browser\u{2026}");
+    try centerStr(gpa, dl, e, ix, iw, cy + r + 30, faint, 13, if (view.resolving) "Looking you up\u{2026}" else "Waiting for your browser\u{2026}");
 
     // A WAY OUT. This card used to offer Back only when the sign-in had already
     // FAILED — so while it was waiting (which is most of the time it is on
@@ -778,6 +847,91 @@ fn stepConnecting(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, i
     // at all. The owner tapped "I already have an account" by accident and was
     // stuck. A screen a person cannot leave is a trap, not a step.
     try ghostButton(gpa, dl, e, ix, iw, cy + r + 52, "Back", hits);
+}
+
+/// THE IN-APP SIGN-IN — the other end of the fork. The handle resolved to OUR
+/// PDS, so there is no third party in this transaction and no browser: a password
+/// field and `com.atproto.server.createSession`. It says whose server it is out
+/// loud, because "type your password" is a sentence that has to earn itself.
+fn stepSignin(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, ix: i32, iw: i32, y0: i32, view: EnrollView, hits: ?*HitList) !void {
+    var y = y0;
+    _ = try str(gpa, dl, e, .semibold, ix, y + 16, ink, 21, "Welcome back");
+    y += 36;
+
+    var hb: [160]u8 = undefined;
+    const body = std.fmt.bufPrint(&hb, "{s} is hosted here on Zat4, so you sign in right here — no browser trip.", .{view.handle}) catch
+        "This account is hosted here on Zat4, so you sign in right here — no browser trip.";
+    y = try wrap(gpa, dl, e, ix, y, iw, muted, 14, body);
+    y += 14;
+
+    y = try secretField(gpa, dl, e, ix, iw, y, "Your password", view.pw, view.pw_show, view.focus == .pw, view.caret, view.blink_on, hits);
+    y += 10;
+    y = try revealRow(gpa, dl, e, ix, y, view.pw_show, hits);
+
+    // The refusal, said plainly and in the one place a person is looking.
+    y += 12;
+    switch (view.sign_error) {
+        .refused => {
+            _ = try str(gpa, dl, e, .regular, ix, y + 12, warn_c, 13, "That password didn't match. Try again.");
+            y += 20;
+        },
+        .network => {
+            _ = try str(gpa, dl, e, .regular, ix, y + 12, warn_c, 13, "Couldn't reach the server. Check your connection.");
+            y += 20;
+        },
+        else => y += 20,
+    }
+
+    y += 8;
+    const can_submit = view.pw.len > 0 and !view.signin_busy;
+    try primaryButton(gpa, dl, e, ix, iw, y, if (view.signin_busy) "Signing in\u{2026}" else "Sign in", can_submit, hits);
+    try ghostButton(gpa, dl, e, ix, iw, y + 52, "Back", hits);
+}
+
+/// A password field: the same field furniture, drawn as bullets unless the person
+/// asked to see it. The caret measures the DRAWN text (the mask), so it sits where
+/// the eye expects — a caret aligned to invisible glyphs is a bug you feel and
+/// cannot name.
+fn secretField(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, ix: i32, iw: i32, y: i32, label: []const u8, value: []const u8, show: bool, focused: bool, caret: usize, blink_on: bool, hits: ?*HitList) !i32 {
+    var yy = y;
+    _ = try str(gpa, dl, e, .regular, ix, yy + 12, muted, 13, label);
+    yy += 20;
+    const fh: i32 = 44;
+    const off: i32 = if (focused) 2 else 1;
+    try rect(gpa, dl, ix - off, yy - off, iw + off * 2, fh + off * 2, if (focused) accent else line_c, @intCast(10 + off));
+    try rect(gpa, dl, ix, yy, iw, fh, field_fill, 10);
+
+    // The mask: one bullet per BYTE of the typed password (it is ASCII — the
+    // credential words and anything a keyboard puts in this field), so the caret
+    // offset indexes the mask directly.
+    var mask_buf: [3 * 96]u8 = undefined;
+    const dots: usize = @min(value.len, mask_buf.len / 3);
+    var i: usize = 0;
+    while (i < dots) : (i += 1) {
+        mask_buf[i * 3] = 0xE2; // U+2022 BULLET
+        mask_buf[i * 3 + 1] = 0x80;
+        mask_buf[i * 3 + 2] = 0xA2;
+    }
+    const masked = mask_buf[0 .. dots * 3];
+    const drawn: []const u8 = if (value.len == 0) "Your Zat4 password" else if (show) value else masked;
+    const col = if (value.len > 0) ink else faint;
+    const tx = ix + 14;
+    _ = try str(gpa, dl, e, .regular, tx, yy + 28, col, 15, drawn);
+
+    if (focused and blink_on) {
+        const upto = @min(caret, value.len);
+        const pre: []const u8 = if (value.len == 0) "" else if (show) value[0..upto] else masked[0 .. @min(upto, dots) * 3];
+        const cx = tx + @as(i32, @intCast(text.measure(e, .regular, pre, 15)));
+        try line(gpa, dl, cx + 1, yy + 13, cx + 1, yy + 31, accent, 2);
+    }
+    try pushHit(hits, gpa, ix, yy, iw, fh, .field_pw);
+    return yy + fh;
+}
+
+/// "Show password" — a checkbox, not a cute eye glyph: the same control the rest
+/// of the flow uses to mean "this is on now."
+fn revealRow(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, ix: i32, y: i32, on: bool, hits: ?*HitList) !i32 {
+    return checkbox(gpa, dl, e, ix, y, "Show password", on, hits, .toggle_pw_show);
 }
 
 /// An INDETERMINATE spinner for the OAuth browser wait — the duration is unknown
@@ -1380,6 +1534,7 @@ pub fn cardHeight(step: Step, branch: Branch) i32 {
         .done => 380,
         .verifying => 402,
         .connecting => 402 + 58, // + the Back that must always be there
+        .signin => 470,
     };
 }
 
