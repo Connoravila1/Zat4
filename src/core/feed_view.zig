@@ -51,6 +51,7 @@ const transp = @import("transparency.zig");
 const algo_docs = @import("algo_docs.zig");
 const chat_view = @import("chat_view.zig");
 const chat_msg = @import("chat.zig");
+const wallet_caps = @import("wallet_caps.zig");
 
 /// Safe-area insets in LOGICAL (design-space) pixels — the shell converts the
 /// OS's physical-px insets by the ui scale before handing them in (B5). Zero on
@@ -302,7 +303,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, recv_back, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, recv_back, recv_use, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -5925,7 +5926,13 @@ pub fn layoutWallet(
                 // ── Set up. Lead with the plain verdict, then the addresses. ──
                 const rows: i32 = @as(i32, @intCast(@intFromBool(recv.lightning.len > 0))) +
                     @as(i32, @intCast(@intFromBool(recv.bitcoin.len > 0)));
-                const card_h: i32 = 62 + rows * 54 + 62;
+                // + the capability table (three rows, plus a "why" line under any
+                // the wallet cannot do), when we have a probed Lightning wallet.
+                const caps_h: i32 = if (recv.lightning.len > 0 and recv.caps.receivable)
+                    (20 + 38 * 3 + @as(i32, if (recv.caps.auto_confirm) 0 else 14) + 4)
+                else
+                    0;
+                const card_h: i32 = 62 + rows * 54 + caps_h + 62;
                 try cardBox(gpa, dl, x0, y, cw, card_h, 14, panel);
                 var cy = y + 22;
                 // The verdict, with the tone dot the payment cards use.
@@ -5938,6 +5945,23 @@ pub fn layoutWallet(
                 }
                 if (recv.bitcoin.len > 0) {
                     cy = try walletAddrRow(gpa, dl, e, x0 + 20, cy, cw - 40, "On-chain", recv.bitcoin, false);
+                }
+
+                // WHAT THIS WALLET CAN DO — permanently, not just at setup. When a
+                // control elsewhere in the app is greyed out, this is the page that
+                // says why, and names the wallet responsible.
+                if (recv.lightning.len > 0 and recv.caps.receivable) {
+                    cy += 6;
+                    try rect(gpa, dl, x0 + 20, cy, cw - 40, 1, card_line, 0);
+                    cy += 14;
+                    var nb: [64]u8 = undefined;
+                    const nm = wallet_caps.providerName(&nb, recv.lightning);
+                    var rows2: [3]CapRow = undefined;
+                    var rb2: [72]u8 = undefined;
+                    var wb2: [160]u8 = undefined;
+                    const tbl = capsTable(&rows2, &rb2, &wb2, recv.caps, nm, recv.bitcoin.len > 0);
+                    cy = try drawCapsTable(gpa, dl, e, x0 + 20, cy, cw - 40, tbl, 1.0);
+                    cy += 4;
                 }
 
                 cy += 8;
@@ -5989,6 +6013,34 @@ pub fn layoutWallet(
                 try strEllipsis(gpa, dl, e, .regular, x0 + 2, y - 20, sc, 13, recv.status, cw);
                 y += 12;
             }
+        },
+
+        // The capability review, on the PAGE. Same table, same sign-off — the
+        // page and the modal share one receive state machine, so a wallet added
+        // from either place is interrogated the same way.
+        .caps => {
+            var nb: [64]u8 = undefined;
+            const nm = wallet_caps.providerName(&nb, recv.lightning);
+            var hb: [96]u8 = undefined;
+            const head = std.fmt.bufPrint(&hb, "{s} \u{2014} here's what it can do", .{nm}) catch "Your wallet";
+            const why_extra: i32 = if (recv.caps.auto_confirm) 0 else 14;
+            const card_h: i32 = 20 + 30 + 26 + (38 * 3 + why_extra) + 18 + 46 + 12 + 44 + 20;
+            try cardBox(gpa, dl, x0, y, cw, card_h, 14, panel);
+            var cy = y + 20;
+            _ = try str(gpa, dl, e, .semibold, x0 + 20, cy + 18, ink, 16, head);
+            cy += 30;
+            try strEllipsis(gpa, dl, e, .regular, x0 + 20, cy + 14, muted, 13, recv.lightning, cw - 40);
+            cy += 26;
+            var rows3: [3]CapRow = undefined;
+            var rb3: [72]u8 = undefined;
+            var wb3: [160]u8 = undefined;
+            const tbl3 = capsTable(&rows3, &rb3, &wb3, recv.caps, nm, recv.bitcoin.len > 0);
+            cy = try drawCapsTable(gpa, dl, e, x0 + 20, cy, cw - 40, tbl3, 1.0);
+            cy += 18;
+            try buttonPrimary(gpa, e, dl, regions, x0 + 20, cy, cw - 40, 46, "Use this wallet", accent, 0, .recv_use, true);
+            cy += 46 + 12;
+            try buttonSecondary(gpa, e, dl, regions, x0 + 20, cy, cw - 40, 44, "Use a different wallet", 0, .recv_back);
+            y += card_h + 28;
         },
 
         // ── The get-a-wallet list. ──
@@ -8165,6 +8217,9 @@ pub fn recvBackEdge(mode: RecvMode, rooted: bool) ?RecvMode {
         .onboard => null, // → close
         .paste => if (rooted) null else .onboard,
         .wallets => .onboard,
+        // Back from the capability review returns to the FORM, not out of the
+        // flow: "use a different wallet" means edit the address you just typed.
+        .caps => .paste,
     };
 }
 
@@ -8251,7 +8306,17 @@ fn formatFiat(buf: []u8, amount_sat: u64, cents_per_btc: u64) []const u8 {
 /// - `onboard`: the first-run empty state — "I have a wallet" vs "I don't yet".
 /// - `paste`:   the two address fields + Save (for users who have an address).
 /// - `wallets`: the "get a wallet" list for users who have none (routes out).
-pub const RecvMode = enum(u8) { onboard, paste, wallets };
+pub const RecvMode = enum(u8) {
+    onboard,
+    paste,
+    wallets,
+    /// The capability REVIEW: we asked the wallet what it can do, and here is its
+    /// answer, in full, before anything is published. The user signs off on a
+    /// wallet knowing exactly what it will and will not do inside Zat Chat —
+    /// rather than discovering months later that a button is greyed out and not
+    /// knowing whether that is their wallet's doing or ours.
+    caps,
+};
 
 /// A recommended wallet for the walletless (the "I don't have one yet" path).
 /// A7.2: cold const table, size guard waived — three entries, never in a loop
@@ -8304,11 +8369,28 @@ pub const ChatReceiveSheet = struct {
     /// must say "checking…" rather than claim you have no wallet — an empty state
     /// shown before the fetch lands is a lie that invites a duplicate setup.
     known: bool = false,
+    /// True while the capability probe is out — we are asking the wallet what it
+    /// can do. The user sees the question being asked, not a spinner-less pause.
+    probing: bool = false,
+    /// What the wallet answered. Only meaningful on the `.caps` face and once a
+    /// wallet is published.
+    caps: wallet_caps.Caps = .{},
+    /// The wallet's NAME ("Strike", "Alby") — derived from its domain by
+    /// `wallet_caps.providerName`, so the user reads a name and never a string
+    /// they have to proofread. Frame-arena owned.
+    provider: []const u8 = "",
 
     comptime {
-        // Three slices (48) + five bools + a u8, all packed into the trailing 8 = 56.
-        // (Unchanged: `set`/`known` landed in existing padding, so no A7.1 bump.)
-        assert(@sizeOf(ChatReceiveSheet) == 56);
+        // A7.1: budget 56 → 96. Two deliberate additions, both load-bearing:
+        //   +16  `provider` — the wallet's NAME, so the user reads "Strike" and
+        //        never a string they must proofread.
+        //   +24  `caps` — what the wallet actually answered when asked. This is
+        //        the whole point: the app renders its unavailable features FROM
+        //        this, attributably, instead of guessing or going quiet.
+        // The rest is the existing three slices (48) + six bools + a u8, packed.
+        // This struct is ONE per frame, never in a collection — the budget buys a
+        // fact the UI would otherwise have to invent.
+        assert(@sizeOf(ChatReceiveSheet) == 96);
     }
 };
 
@@ -8525,6 +8607,140 @@ fn wrapNote(
 const recv_onboard_note = "People in your chats can send you bitcoin once you add a wallet address. You keep the keys.";
 const recv_paste_note = "Paste an address so people can pay you. A Lightning address (you@wallet.com) is easiest.";
 
+/// Build the capability table for a probed wallet. ONE place decides what a
+/// wallet's answer MEANS, so the review sheet, the Wallet page and the greyed-out
+/// controls elsewhere can never tell the user three different stories.
+///
+/// `name` is the provider ("Strike"); `bufs` is caller-owned scratch for the two
+/// formatted details. Returns a slice of `out`.
+fn capsTable(
+    out: *[3]CapRow,
+    range_buf: []u8,
+    why_buf: []u8,
+    caps: wallet_caps.Caps,
+    name: []const u8,
+    has_onchain: bool,
+) []const CapRow {
+    var n: usize = 0;
+
+    // 1. The floor. If this is false nothing else matters and we do not publish.
+    out[n] = .{ .label = "Receive bitcoin in chat", .ok = caps.receivable };
+    n += 1;
+
+    // 2. THE one that changes how the app behaves — and the reason the "Mark
+    // received" button has always existed without explaining itself.
+    if (caps.auto_confirm) {
+        out[n] = .{
+            .label = "Payments confirm themselves",
+            .detail = "automatic",
+            .ok = true,
+        };
+    } else {
+        const why = std.fmt.bufPrint(
+            why_buf,
+            "{s} can't tell us when a payment lands, so you'll tap \u{201C}Mark received\u{201D}.",
+            .{name},
+        ) catch "Your wallet can't tell us when a payment lands.";
+        out[n] = .{
+            .label = "Payments confirm themselves",
+            .detail = if (has_onchain) "on-chain only" else "you confirm",
+            .ok = false,
+            .because = why,
+        };
+    }
+    n += 1;
+
+    // 3. The limits others must pay within. (A "notes reach your wallet" row is
+    //    deliberately ABSENT: the provider reports a `comment_max`, but we do not
+    //    yet forward the note as an LNURL comment, so the row would be a claim we
+    //    have not earned. It arrives with the feature, not before it.)
+    // Grouped, like every other amount in the app — "16,000,000" is a number a
+    // person can read; "16000000" is a number they have to count.
+    var lo: [27]u8 = undefined;
+    var hi: [27]u8 = undefined;
+    const rng = std.fmt.bufPrint(range_buf, "{s} \u{2013} {s} sats", .{
+        groupSats(&lo, caps.min_sat), groupSats(&hi, caps.max_sat),
+    }) catch "";
+    out[n] = .{ .label = "Amounts it accepts", .detail = rng, .ok = true };
+    n += 1;
+
+    return out[0..n];
+}
+
+/// One row of the capability table: a thing the app does, and whether THIS
+/// wallet can do it. A7.2: cold transient, waived — five per render.
+const CapRow = struct {
+    label: []const u8,
+    /// "" when the row is a plain fact rather than a yes/no (the amount range).
+    detail: []const u8 = "",
+    ok: bool,
+    /// Shown under the label when `ok` is false: WHY, naming the wallet. A greyed
+    /// feature with no reason is indistinguishable from a broken one.
+    because: []const u8 = "",
+};
+
+/// The capability table — the answer to "what will this wallet actually do?"
+///
+/// This exists because Zat4 refuses to pick your wallet for you, and the honest
+/// cost of that is that different wallets support different things. Rather than
+/// letting the app quietly behave differently and leaving the user to wonder
+/// whether Zat4 is broken, we ask the wallet, print its answer, and make the
+/// user sign off. Afterwards, anything unavailable is drawn unavailable and
+/// SAYS WHOSE FAULT IT IS.
+///
+/// `t` staggers the rows in (0 → 1): each ticks into place a beat after the last,
+/// so the table reads as an interrogation being answered rather than a block of
+/// text appearing. Pass 1 for a settled table.
+///
+/// Returns the y below the table.
+fn drawCapsTable(
+    gpa: Allocator,
+    dl: *raster.DrawList,
+    e: *const text.Engine,
+    x: i32,
+    y: i32,
+    w: i32,
+    rows: []const CapRow,
+    t: f32,
+) error{OutOfMemory}!i32 {
+    var cy = y;
+    const tc = std.math.clamp(t, 0, 1);
+    for (rows, 0..) |r, i| {
+        // Each row's own progress: row i starts at i*0.14 and takes 0.4.
+        const start = @as(f32, @floatFromInt(i)) * 0.14;
+        const rt = std.math.clamp((tc - start) / 0.4, 0, 1);
+        if (rt <= 0.001) continue; // not yet its turn
+        const ease = 1 - (1 - rt) * (1 - rt); // ease-out
+        const slide: i32 = @intFromFloat((1 - ease) * 10);
+        const alpha: f32 = ease;
+        const two_line = !r.ok and r.because.len > 0;
+        const rh: i32 = if (two_line) 52 else 38;
+
+        const mark_c: u32 = if (r.ok) boost_c else 0xFF7A756A; // green tick / grey dash
+        const lab_c: u32 = if (r.ok) ink else muted;
+        const rx = x + slide;
+
+        // The mark: a tick when the wallet can, a dash when it cannot. A dash,
+        // not a cross — the wallet is not FAILING, it simply doesn't do this.
+        if (r.ok) {
+            try line(gpa, dl, rx + 3, cy + 18, rx + 7, cy + 22, scaleAlpha(mark_c, alpha), 2);
+            try line(gpa, dl, rx + 7, cy + 22, rx + 14, cy + 12, scaleAlpha(mark_c, alpha), 2);
+        } else {
+            try rect(gpa, dl, rx + 3, cy + 17, 11, 2, scaleAlpha(mark_c, alpha), 1);
+        }
+        try strEllipsis(gpa, dl, e, .semibold, rx + 24, cy + 22, scaleAlpha(lab_c, alpha), 13, r.label, w - 140);
+        if (r.detail.len > 0) {
+            const dw: i32 = @intCast(text.measure(e, .regular, r.detail, 13));
+            _ = try str(gpa, dl, e, .regular, x + w - dw, cy + 22, scaleAlpha(if (r.ok) body_c else muted, alpha), 13, r.detail);
+        }
+        if (two_line) {
+            try strEllipsis(gpa, dl, e, .regular, rx + 24, cy + 40, scaleAlpha(faint, alpha), 12, r.because, w - 30);
+        }
+        cy += rh;
+    }
+    return cy;
+}
+
 /// The trust line every money surface repeats, because non-custody is the one
 /// thing a user cannot infer and must never assume (PAYMENT_UX_SPEC §2).
 const non_custody_line = "Zat4 never holds your money \u{2014} it goes straight from your wallet to theirs.";
@@ -8587,8 +8803,22 @@ const CardActions = struct { primary: ?Action = null, secondary: ?Action = null 
 ///   - own send handed to the wallet (`pending`) → **Cancel**.
 fn payCardActions(mine: bool, kind: chat_msg.Kind, status: chat_msg.PayStatus) CardActions {
     if (kind == .payment_request) {
-        if (!mine and status == .requested) return .{ .primary = .pay_card_pay };
-        if (mine and !chat_msg.isTerminalStatus(status)) return .{ .primary = .pay_card_received };
+        // They asked me: Pay, or turn it down.
+        if (!mine and status == .requested) return .{ .primary = .pay_card_pay, .secondary = .pay_card_decline };
+        if (mine and !chat_msg.isTerminalStatus(status)) {
+            // MY request, still open. Two things I might want, and until now the
+            // card offered only one of them: I could ask someone for money and
+            // then have no way to take the ask back.
+            //
+            // While it is merely `requested` no money has moved, so Cancel is the
+            // honest, primary thing — "Mark received" is for AFTER they have paid,
+            // and offering it first invites a false confirmation of a payment that
+            // never happened.
+            if (status == .requested) return .{ .primary = .pay_card_received, .secondary = .pay_card_cancel };
+            // Past `requested` the payer is committing; withdrawing is no longer
+            // meaningful, but confirming receipt still is.
+            return .{ .primary = .pay_card_received };
+        }
         return .{};
     }
     // payment_sent (a send / send-offer card).
@@ -9732,10 +9962,15 @@ pub fn layoutChat(
         const onboard_note_h = try noteHeight(gpa, dl, e, inner_w, recv_onboard_note);
         const paste_note_h = try noteHeight(gpa, dl, e, inner_w, recv_paste_note);
         const custody_h = try noteHeight(gpa, dl, e, inner_w, non_custody_line);
+        // The review face grows by the "why" line under a capability the wallet
+        // lacks, and by the reassurance under the table.
+        const caps_why_h: i32 = if (recv.caps.auto_confirm) 0 else 14;
+        const caps_note_h: i32 = if (recv.caps.auto_confirm) 0 else (try noteHeight(gpa, dl, e, inner_w, "You can still be paid normally. Zat Chat just can't watch the payment land, so you'll confirm it yourself \u{2014} the same way a cash handoff works.")) + 12;
         const sheet_h: i32 = switch (recv.mode) {
             .onboard => 20 + 30 + onboard_note_h + 24 + 46 + 12 + 46 + 14 + custody_h + 16,
             .paste => 20 + 30 + paste_note_h + 24 + 42 + 12 + 42 + 16 + remove_extra + status_extra + 46 + 16,
             .wallets => 20 + 30 + 30 + 20 + @as(i32, @intCast(recv_wallets.len)) * 60 + 12 + 46 + 16,
+            .caps => 20 + 30 + 30 + (38 * 3 + caps_why_h) + 10 + caps_note_h + 46 + 10 + 44 + 16,
         };
         const back = recvBackEdge(recv.mode, recv.rooted);
         const dismiss: Action = if (back == null) .recv_cancel else .recv_back;
@@ -9801,8 +10036,53 @@ pub fn layoutChat(
                     const back_act: Action = if (back == null) .recv_cancel else .recv_back;
                     const back_lbl: []const u8 = if (back == null) "Cancel" else "Back";
                     try buttonSecondary(gpa, e, dl, regions, ix, py, back_w, 46, back_lbl, 0, back_act);
-                    try buttonPrimary(gpa, e, dl, regions, ix + back_w + 10, py, iw - back_w - 10, 46, "Save", accent, 0, .recv_save, has_addr);
+                    // Save no longer means "publish". It means "go ask this wallet
+                    // what it can do" — and the button says so while it asks.
+                    var pbuf2: [64]u8 = undefined;
+                    const pname = wallet_caps.providerName(&pbuf2, recv.lightning);
+                    var chk: [96]u8 = undefined;
+                    const save_lbl: []const u8 = if (recv.probing)
+                        (if (recv.lightning.len > 0)
+                            (std.fmt.bufPrint(&chk, "Checking with {s}\u{2026}", .{pname}) catch "Checking\u{2026}")
+                        else
+                            "Checking\u{2026}")
+                    else
+                        "Check this wallet";
+                    try buttonPrimary(gpa, e, dl, regions, ix + back_w + 10, py, iw - back_w - 10, 46, save_lbl, accent, 0, .recv_save, has_addr and !recv.probing);
                 }
+            },
+            // ── THE CAPABILITY REVIEW. We asked the wallet what it can do; this
+            // is its answer, in full, BEFORE anything is published. You are not
+            // agreeing to "a wallet" — you are agreeing to this specific set of
+            // behaviours, with the trade-offs named. ──
+            .caps => {
+                var nbuf: [64]u8 = undefined;
+                const name = wallet_caps.providerName(&nbuf, recv.lightning);
+                var hb: [96]u8 = undefined;
+                const head = std.fmt.bufPrint(&hb, "{s} \u{2014} here's what it can do", .{name}) catch "Your wallet";
+                _ = try str(gpa, dl, e, .semibold, ix, py + 18, ink, 17, head);
+                py += 30;
+                try strEllipsis(gpa, dl, e, .regular, ix, py + 14, muted, 13, recv.lightning, iw);
+                py += 30;
+
+                var rows: [3]CapRow = undefined;
+                var rbuf: [72]u8 = undefined;
+                var wbuf: [160]u8 = undefined;
+                const table = capsTable(&rows, &rbuf, &wbuf, recv.caps, name, recv.bitcoin.len > 0);
+                py = try drawCapsTable(gpa, dl, e, ix, py, iw, table, motion.sheet_t);
+                py += 10;
+
+                // The honesty note. A wallet that cannot self-confirm is not a
+                // BAD wallet and we do not shame it — we simply say what will
+                // differ, so a greyed control later is never a mystery.
+                if (!recv.caps.auto_confirm) {
+                    py = try wrapNote(gpa, dl, e, ix, py, iw, "You can still be paid normally. Zat Chat just can't watch the payment land, so you'll confirm it yourself \u{2014} the same way a cash handoff works.");
+                    py += 12;
+                }
+
+                try buttonPrimary(gpa, e, dl, regions, ix, py, iw, 46, "Use this wallet", accent, 0, .recv_use, true);
+                py += 46 + 10;
+                try buttonSecondary(gpa, e, dl, regions, ix, py, iw, 44, "Use a different wallet", 0, .recv_back);
             },
             // The get-a-wallet list. Each row opens the wallet's site; you grab an
             // address there and come back to paste it.
@@ -10562,16 +10842,28 @@ test "messages screen: payment cards and the pay sheet emit their regions (M5 A4
     // Sheet closed: the card buttons carry their thread ordinals.
     _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{});
     var pay_at: u16 = 999;
-    var cancel_at: u16 = 999;
     var received_at: u16 = 999;
+    var decline_at: u16 = 999;
+    var cancel_send: bool = false;
+    var cancel_request: bool = false;
     for (regions.items) |r| {
         if (r.kind == .pay_card_pay) pay_at = r.post;
-        if (r.kind == .pay_card_cancel) cancel_at = r.post;
         if (r.kind == .pay_card_received) received_at = r.post;
+        if (r.kind == .pay_card_decline) decline_at = r.post;
+        if (r.kind == .pay_card_cancel and r.post == 1) cancel_send = true;
+        if (r.kind == .pay_card_cancel and r.post == 2) cancel_request = true;
     }
+    // Row 0 — their open request: I can Pay it, or turn it down.
     try std.testing.expectEqual(@as(u16, 0), pay_at);
-    try std.testing.expectEqual(@as(u16, 1), cancel_at);
+    try std.testing.expectEqual(@as(u16, 0), decline_at);
+    // Row 1 — my in-flight send: I can withdraw it.
+    try std.testing.expect(cancel_send);
+    // Row 2 — MY OWN open request. It must offer BOTH: confirm receipt, and
+    // CANCEL. Until now it offered only "Mark received", so you could ask
+    // someone for money and then have no way to take the ask back — and the only
+    // button on screen invited you to confirm a payment that had never happened.
     try std.testing.expectEqual(@as(u16, 2), received_at);
+    try std.testing.expect(cancel_request);
 
     // Sheet open: rail toggle ×2, chips ×4, the two inputs, three verbs —
     // and the amber status line renders without disturbing the regions.

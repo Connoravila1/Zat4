@@ -254,6 +254,15 @@ pub fn main(init: std.process.Init) !void {
         dl.len = 0;
         try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
         _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread.rows, cthread.cards, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{ .open = true, .mode = .wallets }, .{}, .{});
+        // The CAPABILITY REVIEW — the wallet's own answer, before anything is
+        // published. Strike: receivable, but cannot confirm itself.
+        @memset(fb.pixels, clear);
+        dl.len = 0;
+        try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
+        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread.rows, cthread.cards, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{ .open = true, .mode = .caps, .lightning = "connoravila@strike.me", .caps = .{ .receivable = true, .auto_confirm = false, .min_sat = 1, .max_sat = 16_000_000, .comment_max = 200 } }, .{}, .{});
+        try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+        try writePpm(io, gpa, &fb, "/tmp/zat_chat_caps.ppm");
+        std.debug.print("wrote /tmp/zat_chat_caps.ppm (wallet capability review)\n", .{});
         try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
         try writePpm(io, gpa, &fb, "/tmp/zat_chat_recv_wallets.ppm");
         std.debug.print("wrote /tmp/zat_chat_recv_wallets.ppm (get-a-wallet list)\n", .{});
@@ -614,6 +623,10 @@ pub fn main(init: std.process.Init) !void {
             .{ .name = "wallet_empty", .recv = .{ .mode = .onboard, .known = true, .set = false } },
             .{ .name = "wallet_paste", .recv = .{ .mode = .paste, .known = true, .set = false, .lightning = "connoravila@strike.me", .focus = 0 } },
             .{ .name = "wallet_wallets", .recv = .{ .mode = .wallets, .known = true, .set = false } },
+            // The capability table, live on the page: Strike (no auto-confirm).
+            .{ .name = "wallet_caps_strike", .recv = .{ .mode = .onboard, .known = true, .set = true, .lightning = "connoravila@strike.me", .caps = .{ .receivable = true, .auto_confirm = false, .min_sat = 1, .max_sat = 16_000_000, .comment_max = 200 } } },
+            // …and Alby, which CAN confirm itself.
+            .{ .name = "wallet_caps_alby", .recv = .{ .mode = .onboard, .known = true, .set = true, .lightning = "hello@getalby.com", .caps = .{ .receivable = true, .auto_confirm = true, .min_sat = 1, .max_sat = 10_000_000, .comment_max = 255 } } },
         };
         for (faces) |face| {
             @memset(fb.pixels, clear);

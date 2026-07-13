@@ -53,6 +53,7 @@ const chat_relay = @import("chat_relay.zig");
 const chat_e2ee = @import("chat_e2ee.zig");
 const pay_addr = @import("pay_addr.zig");
 const lnurl = @import("lnurl.zig");
+const wallet_caps = @import("../core/wallet_caps.zig");
 const http = @import("http.zig");
 const payuri = @import("../core/payuri.zig");
 const launch = @import("launch.zig");
@@ -710,6 +711,13 @@ const RunState = struct {
     gpay_busy: bool,
     /// The Wallet page's two-tap Remove (see `Grid.wallet_remove_armed`).
     gwallet_remove_armed: bool,
+    /// The capability probe: what can the wallet the user just typed actually do?
+    gcaps_job: WalletProbeJob,
+    /// True while the probe is out — the form shows "Checking with Strike…".
+    grecv_probing: bool,
+    /// The answer, held so the app can render its unavailable features FROM it —
+    /// attributably, naming the wallet — instead of guessing or going quiet.
+    gcaps: wallet_caps.Caps,
     /// DIDs whose handle resolution has already been attempted and refused
     /// (no `alsoKnownAs`, or a claim that failed the round-trip check). Kept so
     /// the 60s sweep does not re-ask the network the same unanswerable question
@@ -1319,6 +1327,9 @@ fn initRunState(
     rs.gpay_job = .{};
     rs.gpay_busy = false;
     rs.gwallet_remove_armed = false;
+    rs.gcaps_job = .{};
+    rs.gcaps = .{};
+    rs.grecv_probing = false;
 
     // The real E2EE session (M1): the crypto state (anchor, keyPackage,
     // per-conversation MLS groups) + the relay link that carries encrypted
@@ -1665,6 +1676,11 @@ fn deinitRunState(rs: *RunState) void {
         t.join();
         rs.gpay_job.thread = null;
         paySendJobFree(&rs.gpay_job);
+    }
+    if (rs.gcaps_job.thread) |t| {
+        t.join();
+        rs.gcaps_job.thread = null;
+        walletProbeJobFree(&rs.gcaps_job);
     }
     {
         var it = rs.ghandle_tried.keyIterator();
@@ -2108,6 +2124,34 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         }
                     }
                     paySendJobFree(&rs.gpay_job);
+                }
+            }
+        }
+
+        // The wallet probe's answer. Nothing is published yet: the user is taken
+        // to the capability review to sign off on what this wallet will and will
+        // not do — or told, plainly, that the address does not exist.
+        if (dev_chat) {
+            if (rs.gcaps_job.thread) |t| {
+                if (rs.gcaps_job.done.load(.acquire)) {
+                    t.join();
+                    rs.gcaps_job.thread = null;
+                    rs.grecv_probing = false;
+                    if (rs.gcaps_job.err.len > 0) {
+                        rs.grecv_status = rs.gcaps_job.err;
+                        rs.grecv_mode = .paste; // stay on the form, with the reason
+                    } else {
+                        rs.gcaps = rs.gcaps_job.caps;
+                        rs.grecv_status = "";
+                        rs.grecv_mode = .caps; // → the review
+                        // Re-run the table's stagger from the top: the rows should
+                        // tick in as ANSWERS arriving, not appear pre-filled.
+                        if (rs.gpu_state) |*gsp| {
+                            gsp.sheet_t = 0;
+                            gsp.sheet_v = 0;
+                        }
+                    }
+                    walletProbeJobFree(&rs.gcaps_job);
                 }
             }
         }
@@ -3065,7 +3109,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        var pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = .{ .cards = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .q_focus = rs.gmarket_q_focus, .loading = rs.market_loading, .filter = rs.gmarket_filter, .hover_x = rs.ghover_x, .hover_y = rs.ghover_y }, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .kbd_visible = toggleOn(rs.toggle_bits, settings_view.act_zat_kbd) and typingOwnsKeyboard(rs), .kbd_shift = rs.kbd_shift, .kbd_page = rs.kbd_page, .kbd_caps = rs.kbd_caps, .kbd_flash_key = rs.kbd_flash_key, .kbd_flash_a = kbdFlashAlpha(rs), .kbd_popup = .{ .opts = rs.kbd_popup_opts[0..rs.kbd_popup_n], .anchor_x = rs.kbd_popup_ax, .anchor_y = rs.kbd_popup_ay, .anchor_w = rs.kbd_popup_aw, .sel = rs.kbd_popup_sel }, .kbd_emoji_open = rs.kbd_emoji_open, .kbd_emoji_scroll = @intFromFloat(rs.kbd_emoji_scroll), .kbd_picker_mode = rs.kbd_picker_mode, .kbd_nav_t = rs.kbd_nav_t, .kbd_nav_scroll = @intFromFloat(rs.kbd_nav_scroll), .chat_q = rs.gchat_q_buf[0..rs.gchat_q_len], .chat_q_focus = rs.gchat_q_focus, .chat_q_caret = composeBlinkOn(rs.caret_anchor_ns), .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_edit = .{ .caret = @min(rs.gchat_caret, rs.gchat_draft_len), .sel_a = @min(rs.gchat_sel_a, rs.gchat_draft_len), .sel_b = @min(rs.gchat_sel_b, rs.gchat_draft_len), .bar = rs.gchat_edit_bar }, .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .step = rs.gpay_step, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents, .busy = rs.gpay_busy }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved, .rooted = rs.grecv_set, .set = rs.grecv_set, .known = rs.grecv_known }, .wallet_remove_armed = rs.gwallet_remove_armed, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
+        var pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = .{ .cards = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .q_focus = rs.gmarket_q_focus, .loading = rs.market_loading, .filter = rs.gmarket_filter, .hover_x = rs.ghover_x, .hover_y = rs.ghover_y }, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .kbd_visible = toggleOn(rs.toggle_bits, settings_view.act_zat_kbd) and typingOwnsKeyboard(rs), .kbd_shift = rs.kbd_shift, .kbd_page = rs.kbd_page, .kbd_caps = rs.kbd_caps, .kbd_flash_key = rs.kbd_flash_key, .kbd_flash_a = kbdFlashAlpha(rs), .kbd_popup = .{ .opts = rs.kbd_popup_opts[0..rs.kbd_popup_n], .anchor_x = rs.kbd_popup_ax, .anchor_y = rs.kbd_popup_ay, .anchor_w = rs.kbd_popup_aw, .sel = rs.kbd_popup_sel }, .kbd_emoji_open = rs.kbd_emoji_open, .kbd_emoji_scroll = @intFromFloat(rs.kbd_emoji_scroll), .kbd_picker_mode = rs.kbd_picker_mode, .kbd_nav_t = rs.kbd_nav_t, .kbd_nav_scroll = @intFromFloat(rs.kbd_nav_scroll), .chat_q = rs.gchat_q_buf[0..rs.gchat_q_len], .chat_q_focus = rs.gchat_q_focus, .chat_q_caret = composeBlinkOn(rs.caret_anchor_ns), .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_edit = .{ .caret = @min(rs.gchat_caret, rs.gchat_draft_len), .sel_a = @min(rs.gchat_sel_a, rs.gchat_draft_len), .sel_b = @min(rs.gchat_sel_b, rs.gchat_draft_len), .bar = rs.gchat_edit_bar }, .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .step = rs.gpay_step, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents, .busy = rs.gpay_busy }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved, .rooted = rs.grecv_set, .set = rs.grecv_set, .known = rs.grecv_known, .probing = rs.grecv_probing, .caps = rs.gcaps }, .wallet_remove_armed = rs.gwallet_remove_armed, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
         switch (rs.mode) {
             .timeline => try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status),
             .compose => {
@@ -5706,17 +5750,32 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                                 rs.gwallet_remove_armed = false;
                                             } else closeRecvSheet(rs);
                                         },
+                                        // SAVE no longer publishes. It ASKS the wallet
+                                        // what it can do, off-thread, and routes to the
+                                        // capability review. The old path published a
+                                        // string it had never once tried to use and told
+                                        // the user their wallet was good — which is how
+                                        // `connor@strike.me` (an address belonging to
+                                        // nobody) sailed through.
                                         .recv_save => if (dev_chat) {
                                             const ln = std.mem.trim(u8, rs.grecv_ln_buf[0..rs.grecv_ln_len], " ");
-                                            const btc = std.mem.trim(u8, rs.grecv_btc_buf[0..rs.grecv_btc_len], " ");
-                                            _ = rs.gchat_arena_state.reset(.retain_capacity);
-                                            rs.grecv_status = saveReceiveAddress(gpa, rs.gchat_arena_state.allocator(), io, environ, session, ln, btc, &rs.grecv_saved);
-                                            if (rs.grecv_saved) {
-                                                rs.grecv_set = true;
-                                                // Now that I can receive, every offer
-                                                // waiting on me can proceed (S2).
-                                                announceReceiveReady(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, rs.gchat_link, &rs.gchat_store);
+                                            if (ln.len == 0) {
+                                                // No Lightning address to interrogate: an
+                                                // on-chain-only setup publishes directly.
+                                                // (On-chain needs no probe — the chain
+                                                // watcher already confirms it, always.)
+                                                rs.grecv_status = publishReceive(rs, gpa, io, environ, session);
+                                            } else {
+                                                rs.grecv_status = spawnWalletProbe(rs, io, environ, ln);
+                                                if (rs.grecv_status.len == 0) rs.grecv_probing = true;
                                             }
+                                        },
+                                        // The sign-off: the user has SEEN what this wallet
+                                        // will and won't do, and accepts it. Only now do we
+                                        // publish.
+                                        .recv_use => if (dev_chat) {
+                                            rs.grecv_status = publishReceive(rs, gpa, io, environ, session);
+                                            if (rs.grecv_saved) rs.grecv_mode = .paste; // → the saved/Done face
                                         },
                                         // Remove wallet: unpublish the record (walletless
                                         // again) and clear the fields — one tap, not
@@ -8350,6 +8409,48 @@ fn chatSend(gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, st
 // the recorded first-contact posture: rare, user-initiated events.
 // ---------------------------------------------------------------------------
 
+/// Ask the wallet what it can do. Returns a static refusal ("" = launched).
+fn spawnWalletProbe(
+    rs: *RunState,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    lnaddr: []const u8,
+) []const u8 {
+    if (rs.gcaps_job.thread != null) return "Still checking that wallet\u{2026}";
+    const a = std.heap.page_allocator;
+    const copy = a.dupe(u8, lnaddr) catch return "Out of memory";
+    rs.gcaps_job = .{ .addr = copy };
+    rs.gcaps_job.thread = std.Thread.spawn(.{}, walletProbeWorker, .{ &rs.gcaps_job, io, environ }) catch {
+        walletProbeJobFree(&rs.gcaps_job);
+        return "Couldn't check that wallet \u{2014} try again";
+    };
+    return "";
+}
+
+/// Publish the receive record. Reached ONLY after the user has seen the wallet's
+/// capability table and accepted it (or for an on-chain-only address, which needs
+/// no interrogation — the chain watcher confirms those unconditionally).
+fn publishReceive(
+    rs: *RunState,
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    /// By POINTER: publishing may refresh the session's tokens, and the refreshed
+    /// ones must survive the call.
+    session: *auth.Session,
+) []const u8 {
+    const ln = std.mem.trim(u8, rs.grecv_ln_buf[0..rs.grecv_ln_len], " ");
+    const btc = std.mem.trim(u8, rs.grecv_btc_buf[0..rs.grecv_btc_len], " ");
+    _ = rs.gchat_arena_state.reset(.retain_capacity);
+    const status = saveReceiveAddress(gpa, rs.gchat_arena_state.allocator(), io, environ, session, ln, btc, &rs.grecv_saved);
+    if (rs.grecv_saved) {
+        rs.grecv_set = true;
+        // Now that I can receive, every offer waiting on me can proceed (S2).
+        announceReceiveReady(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, rs.gchat_link, &rs.gchat_store);
+    }
+    return status;
+}
+
 /// Close the pay modal. ONE routine, so every dismissal path — the × , the
 /// scrim, Escape, the back chevron, the system back gesture, and leaving the
 /// conversation — leaves exactly the same state behind. They did not before:
@@ -9078,6 +9179,48 @@ fn paySendWorker(job: *PaySendJob, io: std.Io, environ: ?*const std.process.Envi
     // `buildBitcoinUri` / `buildLightningInvoiceUri` wrote into `uri_buf`; record
     // how much of it is real.
     job.uri_len = uri.len;
+    job.done.store(true, .release);
+}
+
+/// Asking a wallet what it can do, off the render thread.
+///
+/// Two network legs (the provider's well-known document, then its invoice
+/// callback), so this is emphatically not click work. It runs when an address is
+/// SAVED — the moment the old code published a string it had never once tried to
+/// use, and cheerfully reported "your wallet is good."
+/// A7.2: cold struct, size guard waived — one at a time.
+const WalletProbeJob = struct {
+    thread: ?std.Thread = null,
+    done: std.atomic.Value(bool) = .init(false),
+    /// The address being interrogated (page-alloc'd copy; freed on join).
+    addr: []u8 = &.{},
+    /// What it answered. `receivable == false` ⇒ do not publish.
+    caps: wallet_caps.Caps = .{},
+    /// "" = the wallet answered. Otherwise the honest refusal to show.
+    err: []const u8 = "",
+};
+
+fn walletProbeJobFree(job: *WalletProbeJob) void {
+    const a = std.heap.page_allocator;
+    if (job.addr.len > 0) a.free(job.addr);
+    job.addr = &.{};
+}
+
+fn walletProbeWorker(job: *WalletProbeJob, io: std.Io, environ: ?*const std.process.Environ.Map) void {
+    const a = std.heap.page_allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    job.caps = lnurl.probe(arena_state.allocator(), io, environ, job.addr) catch |err| {
+        job.err = switch (err) {
+            // The headline case: a well-formed address that belongs to nobody.
+            error.NotPayEndpoint => "That address doesn't exist \u{2014} check it and try again",
+            error.BadAddress => "That's not a Lightning address (it should look like you@wallet.com)",
+            error.ProviderDown => "Couldn't reach that wallet \u{2014} try again",
+            else => "Couldn't check that wallet \u{2014} try again",
+        };
+        job.done.store(true, .release);
+        return;
+    };
     job.done.store(true, .release);
 }
 
