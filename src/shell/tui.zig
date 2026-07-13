@@ -1369,6 +1369,19 @@ fn initRunState(
                 } else if (std.mem.startsWith(u8, raw_ep, "ws://")) {
                     hostport = raw_ep["ws://".len..];
                 }
+                // STRIP THE PATH. The websocket handshake hardcodes `GET /relay`
+                // (chat_relay), so the endpoint is a HOST — but the natural thing
+                // to configure, and what the phone's APK was baked with, is the
+                // full URL `wss://pds.zat4.com/relay`. Without this, `/relay` was
+                // glued into the hostname and every dial died with
+                // `InvalidHostName`, forever, on a silent 30s-capped retry loop.
+                //
+                // That is the whole reason cross-device chat never worked: the
+                // clients were not "failing to deliver" — they had never once
+                // CONNECTED. Deposits queued into an outbox that never drained, and
+                // the UI cheerfully reported the message as sent.
+                if (std.mem.indexOfScalar(u8, hostport, '/')) |slash|
+                    hostport = hostport[0..slash];
                 const colon = std.mem.lastIndexOfScalar(u8, hostport, ':');
                 const rhost = if (colon) |c| hostport[0..c] else hostport;
                 const rport: u16 = if (colon) |c|
@@ -1424,6 +1437,19 @@ fn initRunState(
                             chatPersistHistory(gpa, io, env, &st, &rs.gchat_store);
                         if (rs.gchat_link != null) {
                             chatLog("[chat] E2EE up -> {s} ({d} conversation(s) restored)", .{ hostport, st.peer_dids.items.len });
+                            // THE mailboxes. A Welcome deposited into an address
+                            // the peer is not draining is delivered nowhere,
+                            // forever, and says nothing. Print both ends.
+                            {
+                                var hb: [16]u8 = undefined;
+                                chatLog("[chat]   my inbox  = {s}  (Welcomes to me land here)", .{chat_e2ee.mailboxHex(&hb, chat_e2ee.inbox(&st))});
+                                for (st.peer_dids.items) |pd| {
+                                    if (chat_e2ee.peerBootstrap(&st, pd)) |pb| {
+                                        var hb2: [16]u8 = undefined;
+                                        chatLog("[chat]   peer {s} bootstrap = {s}", .{ pd, chat_e2ee.mailboxHex(&hb2, pb) });
+                                    }
+                                }
+                            }
                         } else {
                             chatLog("[chat] keys ready but the relay link did NOT start", .{});
                         }
@@ -1929,6 +1955,13 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                     chat_mutated = true;
                                     rs.status = "chat: conversation re-established";
                                     chatLog("[chat] RE-ESTABLISHED <- {s} (their keys verified)", .{s.peer_did});
+                                    // The replacement group has a NEW traffic mailbox.
+                                    // Subscribe it NOW rather than relying on the
+                                    // post-drain re-walk: "we happen to re-walk after
+                                    // a bucket" is not a guarantee, and the failure it
+                                    // hides — replies landing in an unwatched address —
+                                    // is invisible.
+                                    if (rs.gchat_link) |lnk| chatEnsureSubs(gpa, st, lnk);
                                 },
                                 // Ephemeral: arm the indicator's deadline;
                                 // nothing enters the store (M2 never sees it).
@@ -8567,7 +8600,13 @@ fn chatRestart(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.proce
         };
         return;
     };
-    chatLog("[chat] re-established -> {s} (new Welcome sent)", .{peer_did});
+    // RE-SUBSCRIBE. The new group has a NEW traffic mailbox, and traffic mailboxes
+    // are only walked at startup and after a drained batch. Without this the peer's
+    // replies land in an address we are not listening on — which is precisely the
+    // shape of the bug we just spent the evening on, one layer up: everything looks
+    // sent, nothing arrives, and nothing says why.
+    chatEnsureSubs(gpa, state, l);
+    chatLog("[chat] re-established -> {s} (new Welcome sent, re-subscribed)", .{peer_did});
     rs.status = "chat: re-established — they'll get your next message";
 }
 

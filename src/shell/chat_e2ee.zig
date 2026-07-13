@@ -57,6 +57,7 @@
 //! rare by nature; a worker is the recorded upgrade if they ever jank.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 const cache = @import("cache.zig");
@@ -68,6 +69,7 @@ const anchor = @import("../core/anchor.zig");
 const keydir = @import("../core/keydir.zig");
 const relay = @import("../core/relay.zig");
 const chat = @import("../core/chat.zig");
+const mobile_host = @import("mobile_host.zig");
 
 // ---------------------------------------------------------------------------
 // Bucket framing (pure): [u32 LE payload len][payload][zero pad] in exactly
@@ -184,6 +186,42 @@ pub fn deinit(gpa: Allocator, st: *State) void {
 /// them (chat_relay.subscribe is idempotent) after every drained batch, so
 /// epoch advances and newly opened conversations pick up their rotated IDs.
 /// Caller owns the slice.
+/// Log a mailbox we are about to use. The one fact that has to agree between two
+/// clients, and the one nobody could see.
+fn logMailbox(what: []const u8, id: [relay.mailbox_id_len]u8) void {
+    if (comptime builtin.is_test) return; // see chat_relay.relayLog
+    var hb: [16]u8 = undefined;
+    const h = mailboxHex(&hb, id);
+    std.debug.print("[chat] {s} mailbox {s}\n", .{ what, h });
+    mobile_host.logcat("[chat] {s} mailbox {s}", .{ what, h });
+}
+
+/// A short hex of a mailbox id, for logs. The mailbox is the ONE thing that has
+/// to agree between two clients — a Welcome deposited into an address the peer is
+/// not draining is delivered nowhere, forever, and says nothing. Being able to see
+/// both ends of that at a glance is the difference between a five-minute diagnosis
+/// and a five-day one.
+pub fn mailboxHex(out: *[16]u8, id: [relay.mailbox_id_len]u8) []const u8 {
+    const hex = "0123456789abcdef";
+    for (0..8) |i| {
+        out[i * 2] = hex[id[i] >> 4];
+        out[i * 2 + 1] = hex[id[i] & 0xF];
+    }
+    return out[0..16];
+}
+
+/// This account's bootstrap inbox — where Welcomes are delivered to US.
+pub fn inbox(st: *const State) [relay.mailbox_id_len]u8 {
+    return st.inbox;
+}
+
+/// The peer's bootstrap mailbox, as derived from the anchor we have PINNED for
+/// them. Where a Welcome to them would go.
+pub fn peerBootstrap(st: *const State, peer_did: []const u8) ?[relay.mailbox_id_len]u8 {
+    const idx = conversationIndex(st, peer_did) orelse return null;
+    return keydir.bootstrapMailbox(st.peer_anchors.items[idx]);
+}
+
 pub fn subscriptions(gpa: Allocator, st: *const State) error{OutOfMemory}![][relay.mailbox_id_len]u8 {
     const out = try gpa.alloc([relay.mailbox_id_len]u8, 1 + st.groups.items.len);
     out[0] = st.inbox;
@@ -338,7 +376,9 @@ pub fn startConversation(
 
     var bucket: [relay.bucket_len]u8 = undefined;
     bucketPack(&bucket, welcome) catch return error.CryptoFailed;
-    chat_relay.deposit(link, keydir.bootstrapMailbox(peer.anchor_pub), &bucket) catch return error.RelayDown;
+    const target = keydir.bootstrapMailbox(peer.anchor_pub);
+    logMailbox("welcome ->", target);
+    chat_relay.deposit(link, target, &bucket) catch return error.RelayDown;
 
     const did_copy = try gpa.dupe(u8, peer_did);
     errdefer gpa.free(did_copy);
@@ -389,7 +429,9 @@ pub fn restartConversation(
 
     var bucket: [relay.bucket_len]u8 = undefined;
     bucketPack(&bucket, welcome) catch return error.CryptoFailed;
-    chat_relay.deposit(link, keydir.bootstrapMailbox(peer.anchor_pub), &bucket) catch return error.RelayDown;
+    const target = keydir.bootstrapMailbox(peer.anchor_pub);
+    logMailbox("re-welcome ->", target);
+    chat_relay.deposit(link, target, &bucket) catch return error.RelayDown;
 
     // Swap in the new group only once the Welcome is away: if the deposit fails
     // we keep the old one and the user can try again, rather than being left with

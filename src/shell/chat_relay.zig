@@ -59,6 +59,7 @@ const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const clock = @import("clock.zig");
 const stream_shell = @import("stream.zig");
+const mobile_host = @import("mobile_host.zig");
 const relay = @import("../core/relay.zig");
 const websocket = @import("../core/websocket.zig");
 
@@ -261,12 +262,41 @@ pub fn shutdown(cr: *ChatRelay) void {
 // The worker
 // ---------------------------------------------------------------------------
 
+/// The relay link had NO logging at all — not a dial, not a failure, not a
+/// retry. A phone whose socket never came up looked exactly like a phone that was
+/// connected and simply had no mail: silent, in both cases. That ambiguity is
+/// what made this take days.
+fn mailboxHexLocal(out: *[16]u8, id: [relay.mailbox_id_len]u8) []const u8 {
+    const hex = "0123456789abcdef";
+    for (0..8) |i| {
+        out[i * 2] = hex[id[i] >> 4];
+        out[i * 2 + 1] = hex[id[i] & 0xF];
+    }
+    return out[0..16];
+}
+
+fn relayLog(comptime fmt: []const u8, args: anytype) void {
+    // Silent under `zig build test`: the test runner speaks a protocol on the same
+    // stream, and the relay worker is a THREAD that would write into the middle of
+    // it. (The loopback tests exercise this very worker.)
+    if (comptime builtin.is_test) return;
+    std.debug.print("[relay] " ++ fmt ++ "\n", args);
+    mobile_host.logcat("[relay] " ++ fmt, args);
+}
+
 fn threadMain(cr: *ChatRelay) void {
     var attempt: u32 = 0;
     while (!cr.stop.load(.acquire)) {
         var healthy = false;
+        // The FIRST dial of a run is logged, and every FAILURE — but not each
+        // retry. A silent link was what hid `InvalidHostName` for so long; a link
+        // that shouts on every backoff tick is just a different way of hiding it.
+        if (attempt == 0) relayLog("dialing {s}:{d} (tls={})", .{ cr.host, cr.port, cr.use_tls });
         runConnection(cr, &healthy) catch |err| {
-            if (!cr.stop.load(.acquire)) cr.mailbox.push(cr.gpa, .{ .failure = err });
+            if (!cr.stop.load(.acquire)) {
+                if (attempt == 0) relayLog("connection FAILED: {s} (retrying with backoff)", .{@errorName(err)});
+                cr.mailbox.push(cr.gpa, .{ .failure = err });
+            }
         };
         if (cr.stop.load(.acquire)) return;
         if (healthy) attempt = 0;
@@ -383,7 +413,10 @@ fn runConnection(cr: *ChatRelay, healthy: *bool) !void {
     for (subs_snap.items) |sub_id| {
         var sub_op: [relay.subscribe_frame_len]u8 = undefined;
         try sendFrame(cr, &conn, .binary, relay.buildSubscribe(&sub_op, sub_id));
+        var hb: [16]u8 = undefined;
+        relayLog("subscribed {s}", .{mailboxHexLocal(&hb, sub_id)});
     }
+    relayLog("CONNECTED ({d} subscription(s))", .{subs_snap.items.len});
     cr.mailbox.push(gpa, .{ .status = "relay: connected" });
     healthy.* = true;
 
@@ -423,6 +456,10 @@ fn runConnection(cr: *ChatRelay, healthy: *bool) !void {
             switch (decoded.frame.opcode) {
                 .binary => switch (relay.parseServerOp(decoded.frame.payload) catch return error.ProtocolViolation) {
                     .deliver => |d| {
+                        {
+                            var hb: [16]u8 = undefined;
+                            relayLog("DELIVERED from mailbox {s}", .{mailboxHexLocal(&hb, d.id)});
+                        }
                         // STANDING INVARIANT (metadata privacy M1): Zat Chat
                         // emits NO automatic, machine-speed, non-disableable
                         // per-message acknowledgment. The relay ack below is
