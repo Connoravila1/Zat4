@@ -197,6 +197,13 @@ const ConnAuth = struct {
     /// letting a connection retry it in a loop would hand an attacker a fetch
     /// amplifier that the cache alone cannot bound (each miss is a new DID).
     spent: bool = false,
+    /// This connection MUST prove a DID before it does anything (A6). True
+    /// when the operator requires auth — and ALSO when the connection was
+    /// admitted WITHOUT the shared service token, on the strength of its
+    /// promise to authenticate. A proof of identity is strictly stronger than
+    /// a shared secret every client carries, so it is accepted in the token's
+    /// place — but then it is not optional, and nothing happens until it lands.
+    must_auth: bool = false,
 
     fn did(a: *const ConnAuth) []const u8 {
         return a.did_buf[0..a.did_len];
@@ -373,26 +380,43 @@ fn serveConn(gpa: Allocator, io: std.Io, stream: std.Io.net.Stream, store: *rela
     }
     const head_str = head[0..head_len];
 
-    // Service gate first (fail closed), before the route is even looked at.
-    if (!relay.tokenMatches(cfg.token, headerValue(head_str, "Authorization: "))) {
+    // THE GATE. Two ways in, and the second is the stronger one.
+    //
+    // (1) The shared service token — a SERVICE gate ("is this a Zat4 client?"),
+    //     which is all it ever was: it is baked into every build, so it says
+    //     nothing about WHO is calling.
+    // (2) A promise to prove a DID (A4 slice 2 + A6). A signature over this
+    //     connection's nonce, under the key the directory publishes for that
+    //     account, is strictly STRONGER than a secret every client carries. So
+    //     it is accepted in the token's place — and a client admitted that way
+    //     does NOTHING until the proof lands (`must_auth`).
+    //
+    // That second door is what lets a desktop user just... use chat, with no
+    // token to fetch and no flags to set, exactly like the phone. The secret
+    // stops being the thing that gets you in; being someone does.
+    var conn_auth: ConnAuth = .{ .challenge = @splat(0) };
+    conn_auth.offered = headerValue(head_str, auth_offer_header) != null;
+    const token_ok = relay.tokenMatches(cfg.token, headerValue(head_str, "Authorization: "));
+    // Identity can only stand in for the token where the relay can actually
+    // CHECK an identity. With no directory, an unverifiable promise is not a
+    // credential, and we fail closed exactly as before.
+    const may_auth_instead = conn_auth.offered and cfg.verify_did != null;
+    if (!token_ok and !may_auth_instead) {
         writer.writeAll("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n") catch {};
         writer.flush() catch {};
         return error.BadRequest;
     }
-    if (!std.mem.startsWith(u8, head_str, "GET /relay")) return error.BadRequest;
-
-    // IDENTITY (A4 slice 2). A client that speaks auth SAYS SO here; only such
-    // a client is ever sent a `challenge` op, so an old client never meets a
-    // byte it cannot parse. Once `require_auth` is on, a client that does not
-    // say so is refused right here — before a socket is upgraded, let alone a
-    // blob stored.
-    var conn_auth: ConnAuth = .{ .challenge = @splat(0) };
-    conn_auth.offered = headerValue(head_str, auth_offer_header) != null;
+    // Once the operator requires auth, a client that never offered it is
+    // refused right here — before a socket is upgraded, let alone a blob stored.
     if (cfg.require_auth and !conn_auth.offered) {
         writer.writeAll("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n") catch {};
         writer.flush() catch {};
         return error.BadRequest;
     }
+    // Tokenless ⇒ the promise is now a requirement.
+    conn_auth.must_auth = cfg.require_auth or !token_ok;
+
+    if (!std.mem.startsWith(u8, head_str, "GET /relay")) return error.BadRequest;
 
     const key = headerValue(head_str, "Sec-WebSocket-Key: ") orelse return error.BadRequest;
     var accept_buf: [websocket.accept_len]u8 = undefined;
@@ -537,7 +561,7 @@ fn handleOp(
     // else never receives, so reading is as much a capability as writing).
     // Before the flip this is dead code, and the relay behaves exactly as it
     // did — that is the transition window, and it is deliberate.
-    if (cfg.require_auth and op != .auth and !conn_auth.authed()) {
+    if (conn_auth.must_auth and op != .auth and !conn_auth.authed()) {
         if (!builtin.is_test) std.debug.print("[relay] op REFUSED (unauthenticated)\n", .{});
         var ref_buf: [2]u8 = undefined;
         var out_buf: [16]u8 = undefined;
@@ -570,7 +594,7 @@ fn handleOp(
                 // Once auth is REQUIRED, the same failure is fatal: a socket
                 // that cannot prove who it is has no business staying open, and
                 // pretending otherwise is how a gate becomes decoration.
-                if (cfg.require_auth) return error.BadRequest;
+                if (conn_auth.must_auth) return error.BadRequest;
                 return;
             }
             if (!builtin.is_test) std.debug.print("[relay] authenticated {s}\n", .{conn_auth.did()});
@@ -1090,6 +1114,83 @@ test "relay loopback: a connection PROVES who it is, or (once required) does not
         const got = (try impostor.nextBinary(&reply)) orelse return error.TestUnexpectedResult;
         try testing.expectEqual(relay.ServerOp.deposit_ok, try relay.parseServerOp(got));
     }
+}
+
+test "relay: identity gets you in WITHOUT the shared token (A6), and nothing else does" {
+    // A6. The desktop needed a script only because it needed the shared TOKEN —
+    // a secret baked into every build, which says nothing about who is calling.
+    // A signature over this connection's nonce, under the key the directory
+    // publishes for that account, is strictly stronger. So it is accepted in the
+    // token's place, and chat works with no flags and no secret to fetch.
+    //
+    // But a connection admitted on that promise does NOTHING until the promise
+    // is kept — otherwise "no token needed" would just mean "no gate."
+    const gpa = testing.allocator;
+    const io = std.testing.io;
+
+    var store: relay.Store = .{};
+    defer relay.deinit(gpa, &store);
+    var lock: StoreLock = .{};
+    var cache: AuthCache = .{};
+    defer cache.deinit(gpa);
+    var stop: std.atomic.Value(bool) = .init(false);
+
+    var bound = try fixture.listenLoopback(io, 25899);
+    const port = bound.port;
+    const cfg: ServeConfig = .{
+        .port = port,
+        .token = "relay-test-token",
+        .stop = &stop,
+        .verify_did = testVerifyDid,
+        .auth_cache = &cache,
+    };
+    const server_thread = try std.Thread.spawn(.{}, runBoundForTest, .{ gpa, io, &bound.server, &store, cfg, &lock });
+    defer {
+        stop.store(true, .release);
+        server_thread.join();
+        bound.server.deinit(io);
+    }
+
+    // No token, no offer of identity: refused at the upgrade, as always.
+    {
+        var nobody: TestClient = undefined;
+        try testing.expectError(error.BadRequest, connectClient(&nobody, io, port, ""));
+        nobody.stream.close(io);
+    }
+
+    // No token, but it offers to prove a DID: admitted — and BLOCKED until it
+    // does. A deposit before the proof is refused `unauthenticated`, so the open
+    // door is not an open relay.
+    var client: TestClient = undefined;
+    try connectClientAuth(&client, io, port, "", true);
+    defer client.stream.close(io);
+    var reply: [relay.deliver_frame_len]u8 = undefined;
+    const chal_frame = (try client.nextBinary(&reply)) orelse return error.TestUnexpectedResult;
+    const challenge = switch (try relay.parseServerOp(chal_frame)) {
+        .challenge => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+
+    const mailbox: [relay.mailbox_id_len]u8 = @splat(0x51);
+    const blob: [relay.bucket_len]u8 = @splat(0x15);
+    var dep_buf: [relay.deposit_frame_len]u8 = undefined;
+    try client.sendFrame(.binary, relay.buildDeposit(&dep_buf, mailbox, &blob));
+    switch (try relay.parseServerOp((try client.nextBinary(&reply)) orelse return error.TestUnexpectedResult)) {
+        .refused => |r| try testing.expectEqual(relay.DepositResult.unauthenticated, r),
+        else => return error.TestUnexpectedResult,
+    }
+    lock.lock();
+    try testing.expectEqual(@as(u32, 0), relay.pendingCount(&store, mailbox)); // nothing stored
+    lock.unlock();
+
+    // Now it keeps the promise — and is served, with no token anywhere.
+    const anchor_pub = try anchor_core.publicKey(auth_test_seed);
+    const sig = try anchor_core.signRelayAuth(auth_test_seed, challenge, auth_test_did);
+    var auth_buf: [relay.auth_frame_max]u8 = undefined;
+    try client.sendFrame(.binary, try relay.buildAuth(&auth_buf, anchor_pub, sig, auth_test_did));
+    try testing.expectEqual(relay.ServerOp.auth_ok, try relay.parseServerOp((try client.nextBinary(&reply)) orelse return error.TestUnexpectedResult));
+    try client.sendFrame(.binary, relay.buildDeposit(&dep_buf, mailbox, &blob));
+    try testing.expectEqual(relay.ServerOp.deposit_ok, try relay.parseServerOp((try client.nextBinary(&reply)) orelse return error.TestUnexpectedResult));
 }
 
 test "relay: the flip — with auth REQUIRED, an anonymous connection deposits nothing" {

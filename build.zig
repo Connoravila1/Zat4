@@ -61,7 +61,14 @@ pub fn build(b: *std.Build) void {
     // env vars). Same posture as the AppView token: default empty = env-only;
     // the env always wins when present. "wss://host[/…]" = TLS via the public
     // Caddy route; "host:port" = the plaintext SSH-tunnel dev posture.
-    const relay_url = b.option([]const u8, "relay-url", "Compiled-in chat relay endpoint (default: empty = env-only)") orelse "";
+    // A6: the DEFAULT is the public relay. Chat should work out of the box —
+    // the phone already got this via the baked dist value, while a desktop
+    // build pointed at nothing and needed a script to hand it an endpoint.
+    // The URL is public infrastructure, not a secret; the TOKEN below stays
+    // empty by default and is no longer needed at all now that a client can
+    // prove WHO it is (CHAT_HARDENING A4 slice 2 + A6). `ZAT4_RELAY` still
+    // wins when set — that is how chat-test.sh points at a local loopback relay.
+    const relay_url = b.option([]const u8, "relay-url", "Compiled-in chat relay endpoint (default: the public relay)") orelse "wss://pds.zat4.com/relay";
     const relay_token = b.option([]const u8, "relay-token", "Compiled-in chat relay service token (default: empty = env-only)") orelse "";
     dist_opts.addOption([]const u8, "relay_url", relay_url);
     dist_opts.addOption([]const u8, "relay_token", relay_token);

@@ -1413,7 +1413,13 @@ fn initRunState(
                     443
                 else
                     0;
-                if (rport != 0 and token.len > 0 and rhost.len > 0 and rhost.len <= rs.gchat_host_buf.len) {
+                // A6: NO TOKEN REQUIRED. The client proves who it is (A4 slice 2),
+                // and a proof of identity is strictly stronger than a shared secret
+                // baked into every build — so the relay takes it in the token's
+                // place. A desktop user gets chat with no flags and no secret to
+                // fetch, exactly like the phone. A token, when present (the local
+                // dev relay, or a relay that hasn't been upgraded), is still sent.
+                if (rport != 0 and rhost.len > 0 and rhost.len <= rs.gchat_host_buf.len) {
                     // Remember the endpoint: A3's "set up chat fresh here" has to
                     // be able to bring the whole thing up again later, from a
                     // click, long after this env parse is out of scope.
@@ -1424,7 +1430,7 @@ fn initRunState(
                     rs.gchat_use_tls = use_tls;
                     chatBringUp(rs, gpa, io, env, session, false);
                 } else {
-                    chatLog("[chat] ZAT4_RELAY malformed (need host:port) or ZAT_RELAY_TOKEN unset", .{});
+                    chatLog("[chat] relay endpoint malformed (need host[:port])", .{});
                 }
                 // Starting a conversation is a UI verb now — the "+ New"
                 // pill on the Messages screen (the ZAT4_CHAT_PEER env
