@@ -62,6 +62,17 @@ pub const ServeConfig = struct {
     stop: ?*std.atomic.Value(bool) = null,
 };
 
+/// How many mailboxes one connection may drain.
+///
+/// A client needs its bootstrap inbox plus one traffic mailbox per open
+/// conversation, and the traffic IDs rotate with the MLS epoch — so a busy
+/// client re-subscribes as its groups advance. 64 is far above any real client
+/// and still a hard bound on per-connection memory (64 × 32 bytes + counters).
+/// Over the cap we simply stop adding: a client that needs more than 64 live
+/// mailboxes is not a client we have, and silently dropping the 65th is better
+/// than growing an attacker-steerable allocation on the serving thread.
+const max_subs: usize = 64;
+
 /// Guards the store (and every gpa call that touches it) across the accept
 /// loop's sweep and all connection threads. Spinlock, the codebase's
 /// cross-thread pattern (stream.zig Mailbox / appview IndexLock: brief
@@ -198,13 +209,26 @@ fn serveConn(gpa: Allocator, io: std.Io, stream: std.Io.net.Stream, store: *rela
 
     // --- The frame loop -----------------------------------------------------
     // Connection-local state: the accumulation buffer (frames can split and
-    // coalesce arbitrarily on TCP) and the one subscription.
+    // coalesce arbitrarily on TCP) and the connection's SUBSCRIPTIONS.
+    //
+    // Plural, and that plurality is load-bearing. This used to be a single
+    // mailbox that each `subscribe` OVERWROTE — while the client subscribes to
+    // several: its bootstrap inbox (where Welcomes are delivered) AND every open
+    // conversation's per-epoch traffic mailbox. So the moment a client had even
+    // one conversation, its traffic subscription clobbered its bootstrap one, and
+    // it could never receive another Welcome. Not "rarely" — NEVER. A
+    // conversation whose two halves drifted apart could not be repaired, because
+    // the repair travels by Welcome, and the mailbox it arrives in was no longer
+    // being drained. Days of "why can't I message my other account" ended here.
     var acc: [16 * 1024]u8 = undefined;
     var acc_len: usize = 0;
-    var sub: ?[relay.mailbox_id_len]u8 = null;
-    // How many queued blobs this connection has already pushed (unacked).
-    // Reset on (re)subscribe; an ack pops the store head, so it decrements.
-    var sent: u32 = 0;
+    var subs: [max_subs][relay.mailbox_id_len]u8 = undefined;
+    // Per-subscription: how many queued blobs this connection has already pushed
+    // (unacked). Reset on (re)subscribe; an ack pops that mailbox's store head,
+    // so it decrements. Parallel to `subs` — one counter per mailbox, because a
+    // shared counter across mailboxes would skip mail.
+    var sent: [max_subs]u32 = @splat(0);
+    var subs_n: usize = 0;
 
     while (true) {
         if (cfg.stop) |s| {
@@ -223,7 +247,7 @@ fn serveConn(gpa: Allocator, io: std.Io, stream: std.Io.net.Stream, store: *rela
             const decoded = got orelse break;
             at += decoded.consumed;
             switch (decoded.frame.opcode) {
-                .binary => try handleOp(gpa, decoded.frame.payload, store, cfg, lock, writer, &sub, &sent),
+                .binary => try handleOp(gpa, decoded.frame.payload, store, cfg, lock, writer, &subs, &sent, &subs_n),
                 .ping => {
                     var pong_buf: [256]u8 = undefined;
                     if (decoded.frame.payload.len <= 125) {
@@ -249,14 +273,14 @@ fn serveConn(gpa: Allocator, io: std.Io, stream: std.Io.net.Stream, store: *rela
         }
         if (acc_len == acc.len) return error.BadRequest; // a frame larger than the vocabulary allows
 
-        // Push undelivered blobs for the subscription. Copy each blob out
-        // under the lock, write it outside (the socket is slow; the sweep
-        // could free the borrowed pointer mid-write otherwise).
-        if (sub) |id| {
+        // Push undelivered blobs for EVERY subscription this connection holds.
+        // Copy each blob out under the lock, write it outside (the socket is slow;
+        // the sweep could free the borrowed pointer mid-write otherwise).
+        for (subs[0..subs_n], sent[0..subs_n]) |id, *n| {
             while (true) {
                 var blob: [relay.bucket_len]u8 = undefined;
                 lock.lock();
-                const have = relay.nthFor(store, id, sent);
+                const have = relay.nthFor(store, id, n.*);
                 if (have) |b| blob = b.*;
                 lock.unlock();
                 if (have == null) break;
@@ -266,7 +290,7 @@ fn serveConn(gpa: Allocator, io: std.Io, stream: std.Io.net.Stream, store: *rela
                 const frame = websocket.encodeFrame(&frame_buf, .binary, op, null) catch return error.BadRequest;
                 writer.writeAll(frame) catch return error.WriteFailed;
                 writer.flush() catch return error.WriteFailed;
-                sent += 1;
+                n.* += 1;
             }
         }
     }
@@ -279,8 +303,9 @@ fn handleOp(
     cfg: ServeConfig,
     lock: *StoreLock,
     writer: *std.Io.Writer,
-    sub: *?[relay.mailbox_id_len]u8,
-    sent: *u32,
+    subs: *[max_subs][relay.mailbox_id_len]u8,
+    sent: *[max_subs]u32,
+    subs_n: *usize,
 ) ConnError!void {
     const op = relay.parseClientOp(payload) catch return error.BadRequest;
     switch (op) {
@@ -300,15 +325,35 @@ fn handleOp(
             writer.writeAll(frame) catch return error.WriteFailed;
             writer.flush() catch return error.WriteFailed;
         },
+        // ADD a mailbox to this connection's set — never replace the set. A
+        // client legitimately drains several: its bootstrap inbox (Welcomes) and
+        // one traffic mailbox per open conversation, whose IDs rotate every epoch.
         .subscribe => |s| {
-            sub.* = s.id;
-            sent.* = 0; // re-deliver anything unacked (at-least-once)
+            for (subs[0..subs_n.*], 0..) |have, i| {
+                if (std.mem.eql(u8, &have, &s.id)) {
+                    sent[i] = 0; // re-arm: re-deliver anything unacked (at-least-once)
+                    return;
+                }
+            }
+            if (subs_n.* >= max_subs) return; // the cap; see `max_subs`
+            subs[subs_n.*] = s.id;
+            sent[subs_n.*] = 0;
+            subs_n.* += 1;
         },
         .ack => |a| {
             lock.lock();
             const popped = relay.ackOldest(gpa, store, a.id);
             lock.unlock();
-            if (popped and sent.* > 0) sent.* -= 1;
+            if (!popped) return;
+            // Decrement the counter for the mailbox that was actually acked —
+            // one counter per subscription, or an ack on one would let another's
+            // mail be skipped.
+            for (subs[0..subs_n.*], 0..) |have, i| {
+                if (std.mem.eql(u8, &have, &a.id)) {
+                    if (sent[i] > 0) sent[i] -= 1;
+                    return;
+                }
+            }
         },
     }
 }
@@ -433,6 +478,107 @@ fn connectClient(c: *TestClient, io: std.Io, port: u16, token: []const u8) !void
     const tail = head[body_at..head_len];
     @memcpy(c.acc[0..tail.len], tail);
     c.acc_len = tail.len;
+}
+
+test "relay loopback: ONE connection drains MANY mailboxes (the bootstrap + traffic bug)" {
+    // ── The bug this pins cost days. ──
+    //
+    // The server kept ONE subscription per connection and each `subscribe`
+    // OVERWROTE it. But a client legitimately drains several: its BOOTSTRAP inbox
+    // — where Welcomes, i.e. every first contact and every repair, are delivered —
+    // AND one traffic mailbox per open conversation.
+    //
+    // So the instant a client had a single conversation, its traffic subscription
+    // clobbered its bootstrap one. It could then never receive another Welcome.
+    // Not rarely: NEVER. And because a broken conversation is repaired BY a
+    // Welcome, a conversation that fell out of sync could not be fixed either. The
+    // client showed no error; the mail simply sat in a mailbox nobody drained.
+    const gpa = testing.allocator;
+    const io = std.testing.io;
+
+    var store: relay.Store = .{};
+    defer relay.deinit(gpa, &store);
+    var lock: StoreLock = .{};
+    var stop: std.atomic.Value(bool) = .init(false);
+
+    var bound = try fixture.listenLoopback(io, 25893);
+    const port = bound.port;
+    const cfg: ServeConfig = .{ .port = port, .token = "relay-test-token", .stop = &stop };
+    const server_thread = try std.Thread.spawn(.{}, runBoundForTest, .{ gpa, io, &bound.server, &store, cfg, &lock });
+    defer {
+        stop.store(true, .release);
+        server_thread.join();
+        bound.server.deinit(io);
+    }
+
+    var alice: TestClient = undefined;
+    try connectClient(&alice, io, port, "relay-test-token");
+    defer alice.stream.close(io);
+    var bob: TestClient = undefined;
+    try connectClient(&bob, io, port, "relay-test-token");
+    defer bob.stream.close(io);
+
+    // Bob's two mailboxes: his bootstrap inbox, and one conversation's traffic box.
+    const bootstrap: [relay.mailbox_id_len]u8 = @splat(0xB0);
+    const traffic: [relay.mailbox_id_len]u8 = @splat(0x77);
+
+    var blob_w: [relay.bucket_len]u8 = @splat(0xAA); // a Welcome
+    var blob_m: [relay.bucket_len]u8 = @splat(0xCC); // an ordinary message
+
+    var dep_buf: [relay.deposit_frame_len]u8 = undefined;
+    var reply_buf: [relay.deliver_frame_len]u8 = undefined;
+    try alice.sendFrame(.binary, relay.buildDeposit(&dep_buf, bootstrap, &blob_w));
+    _ = (try alice.nextBinary(&reply_buf)) orelse return error.TestUnexpectedResult;
+    try alice.sendFrame(.binary, relay.buildDeposit(&dep_buf, traffic, &blob_m));
+    _ = (try alice.nextBinary(&reply_buf)) orelse return error.TestUnexpectedResult;
+
+    // Bob subscribes to BOTH — bootstrap first, then traffic, exactly as a real
+    // client does (`chat_e2ee.subscriptions` returns the inbox, then each group).
+    // Under the old server the second frame would silently discard the first.
+    var sub_buf: [relay.subscribe_frame_len]u8 = undefined;
+    try bob.sendFrame(.binary, relay.buildSubscribe(&sub_buf, bootstrap));
+    try bob.sendFrame(.binary, relay.buildSubscribe(&sub_buf, traffic));
+
+    // BOTH must arrive. Order is not guaranteed; presence is the assertion.
+    var got_welcome = false;
+    var got_message = false;
+    var tries: usize = 0;
+    while ((!got_welcome or !got_message) and tries < 40) : (tries += 1) {
+        const d = (try bob.nextBinary(&reply_buf)) orelse continue;
+        switch (try relay.parseServerOp(d)) {
+            .deliver => |dv| {
+                if (std.mem.eql(u8, &dv.id, &bootstrap)) {
+                    try testing.expectEqualSlices(u8, &blob_w, dv.blob);
+                    got_welcome = true;
+                } else if (std.mem.eql(u8, &dv.id, &traffic)) {
+                    try testing.expectEqualSlices(u8, &blob_m, dv.blob);
+                    got_message = true;
+                }
+            },
+            else => {},
+        }
+    }
+    // The Welcome is the one that used to vanish, and with it every first contact
+    // and every repair a client with an existing conversation could ever make.
+    try testing.expect(got_welcome);
+    try testing.expect(got_message);
+
+    // An ack on ONE mailbox must not disturb the other's delivery accounting.
+    var ack_buf: [relay.ack_frame_len]u8 = undefined;
+    try bob.sendFrame(.binary, relay.buildAck(&ack_buf, bootstrap));
+    var waited: u64 = 0;
+    while (waited < 5_000) {
+        lock.lock();
+        const b_left = relay.pendingCount(&store, bootstrap);
+        lock.unlock();
+        if (b_left == 0) break;
+        clock.sleepMillis(10);
+        waited += 10;
+    }
+    lock.lock();
+    try testing.expectEqual(@as(u32, 0), relay.pendingCount(&store, bootstrap));
+    try testing.expectEqual(@as(u32, 1), relay.pendingCount(&store, traffic)); // untouched
+    lock.unlock();
 }
 
 test "relay loopback: deposit -> subscribe -> deliver -> ack deletes; the gate holds" {
