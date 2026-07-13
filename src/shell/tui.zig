@@ -5084,7 +5084,6 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                     } else {
                                         rs.armed_kind = hit.kind;
                                         rs.armed_post = hit.post;
-                                        chatLog("[tap] ARM {s} post={d} at ({d},{d})", .{ @tagName(hit.kind), hit.post, rx, ry });
                                     }
                                 } else if (field_ui.hitTest(cx, cy, g.hr.slice())) |_| {
                                     rs.armed_legacy = true;
@@ -5176,7 +5175,6 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         // fires one.
                         if (rs.armed_kind) |ak| {
                             if (feed_view.hitTest(g.regions.items, rx, ry)) |hit| {
-                                chatLog("[tap] UP armed={s} hit={s} (post {d} vs {d}) at ({d},{d})", .{ @tagName(ak), @tagName(hit.kind), rs.armed_post, hit.post, rx, ry });
                                 if (hit.kind == ak and hit.post == rs.armed_post) {
                                     // An open Repost/Quote menu is dismissed by any tap
                                     // outside its rows (and the repost button that toggles
