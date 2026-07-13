@@ -50,6 +50,7 @@ const text = @import("core/text.zig");
 const tui = @import("shell/tui.zig");
 const auth = @import("shell/auth.zig");
 const oauth_shell = @import("shell/oauth.zig");
+const identity_shell = @import("shell/identity.zig");
 const cache_shell = @import("shell/cache.zig");
 const config = @import("shell/config.zig");
 const feed_core = @import("core/feed.zig");
@@ -140,6 +141,11 @@ const LoginJob = if (mobile_config.have_gpu) struct {
     consumed: bool,
     /// The authorize URL, NUL-terminated for the C ABI hand-off.
     url_z: [2048:0]u8,
+    /// The handle the person typed on the front door (empty = our own PDS). The
+    /// worker resolves it to ITS OWN server: an account can wear a zat4.com handle
+    /// and be hosted on somebody else's PDS entirely.
+    handle: [256]u8,
+    handle_len: usize,
 } else void;
 
 /// The active login flow's redirect mailbox. A process global by necessity:
@@ -460,8 +466,24 @@ fn loginWorker(job: *LoginJob) void {
     const scratch = arena_state.allocator();
     const io = android_dns.wrap(job.io_backend.io());
     const eps = config.fromEnv(job.env);
-    logcat("login: flow starting against {s}", .{eps.pds_url});
-    var session = oauth_shell.loginMobile(job.gpa, io, job.env, scratch, eps.pds_url, null, &job.cancel, &job.flow) catch |err| {
+    // RESOLVE THE HANDLE TO ITS OWN SERVER. The phone used to authorize against our
+    // PDS unconditionally and throw the typed handle away — which works only for
+    // accounts that live here. `connor.zat4.com` wears a zat4.com handle and is
+    // hosted on Bluesky's PDS, so the phone asked the wrong server to sign him in
+    // and the redirect never came back. The desktop has always resolved first.
+    const typed = job.handle[0..job.handle_len];
+    var pds_url: []const u8 = eps.pds_url;
+    var who: ?[]const u8 = null;
+    if (typed.len > 0) {
+        if (identity_shell.resolve(scratch, io, job.env, .{}, typed)) |id| {
+            pds_url = id.pds_url;
+            who = id.handle;
+        } else |err| {
+            logcat("login: couldn't resolve {s} ({s}) — falling back to our PDS", .{ typed, @errorName(err) });
+        }
+    }
+    logcat("login: flow starting against {s} (handle: {s})", .{ pds_url, typed });
+    var session = oauth_shell.loginMobile(job.gpa, io, job.env, scratch, pds_url, who, &job.cancel, &job.flow) catch |err| {
         logcat("login: flow FAILED ({s}) — field stays; relaunch to retry", .{@errorName(err)});
         job.done.store(true, .release);
         return;
@@ -485,6 +507,15 @@ fn loginWorker(job: *LoginJob) void {
 /// must not require process death. Owns its own Io + environ
 /// (HOME = files_dir), freed by loginEnd at replacement or shutdown.
 fn loginStart(ctx: *Ctx, files_dir: []const u8) void {
+    loginStartFor(ctx, files_dir, "");
+}
+
+/// `handle` = what the person typed on the front door (empty = the old behaviour:
+/// authorize against our own PDS). A handle is resolved to ITS OWN server on the
+/// worker — an account can wear a zat4.com handle and live on somebody else's PDS,
+/// and asking the wrong server to sign somebody in is a redirect that never
+/// returns.
+fn loginStartFor(ctx: *Ctx, files_dir: []const u8, handle: []const u8) void {
     if (comptime !mobile_config.have_gpu) return;
     if (ctx.login) |old| {
         if (!(old.done.load(.acquire) and old.consumed)) return; // in flight
@@ -524,6 +555,8 @@ fn loginStart(ctx: *Ctx, files_dir: []const u8) void {
         .done = .init(false),
         .ok = .init(false),
         .url_handed = false,
+        .handle = undefined,
+        .handle_len = 0,
         .consumed = false,
         .url_z = undefined,
     };
@@ -532,6 +565,9 @@ fn loginStart(ctx: *Ctx, files_dir: []const u8) void {
         return; // the ok flags unwind io/env/job (E2)
     };
     ctx.login = job;
+    const hn = @min(handle.len, job.handle.len);
+    @memcpy(job.handle[0..hn], handle[0..hn]);
+    job.handle_len = hn;
     g_login_flow.store(&job.flow, .release);
     ok = true;
     ok_io = true;
@@ -839,13 +875,14 @@ pub export fn zat_feed_step(ctx_ptr: ?*anyopaque) u32 {
         // listener, and Android delivers the redirect as an OS intent instead. The
         // seam owns that plumbing, so the door asks and we do the hop.
         if (tui.mobileLoginWant(f.run)) {
-            logcat("front door: browser sign-in requested", .{});
+            const typed = tui.mobileLoginHandle(f.run);
+            logcat("front door: browser sign-in requested for '{s}'", .{typed});
             var dir_buf: [512]u8 = undefined;
             const dir = f.env.get("HOME") orelse "";
             const n = @min(dir.len, dir_buf.len - 1);
             @memcpy(dir_buf[0..n], dir[0..n]);
             dir_buf[n] = 0;
-            loginStart(ctx, dir_buf[0..n]);
+            loginStartFor(ctx, dir_buf[0..n], typed);
         }
 
         // ENROLLMENT LANDED A SESSION. Persist it and end this run: the activity

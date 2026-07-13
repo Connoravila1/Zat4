@@ -314,11 +314,50 @@ fn openUrlViaOs(activity: *Activity, url: [*:0]const u8) void {
     const intent = jniFn(env, jni_new_object_a, NewObjectAFn)(env, intent_cls, ctor, &[_]jvalue{ .{ .l = action_j }, .{ .l = uri } });
     if (jniFailed(env) or intent == null) return seam.logcat("login: Intent construction failed", .{});
 
+    // ── MAKE IT A CUSTOM TAB ────────────────────────────────────────────────
+    //
+    // Most Zat4 users will arrive FROM BLUESKY, and a Bluesky account is hosted on
+    // somebody else's PDS — so for most people the browser hop is not an edge
+    // case, it IS the sign-in. Kicking them out to a full browser app and hoping
+    // they find their way home is the worst version of that.
+    //
+    // A Custom Tab opens OVER the app (it stays in the same task), wears our
+    // colours, and — the part that matters — CLOSES ITSELF the moment the redirect
+    // fires, dropping the person straight back where they were. It needs no
+    // support library: Chrome and every other Custom-Tabs-capable browser reads
+    // these extras off a plain ACTION_VIEW intent, and one that does not simply
+    // ignores them and opens normally. So this is a free upgrade with a built-in
+    // fallback.
+    //
+    // EXTRA_SESSION (a null binder) is the flag that says "treat me as a tab".
+    // NEW_TASK is deliberately NOT set: it would break the return trip.
+    {
+        const put_extra = jniFn(env, jni_get_method_id, GetMethodIdFn)(env, intent_cls, "putExtra", "(Ljava/lang/String;Landroid/os/IBinder;)Landroid/content/Intent;");
+        if (put_extra != null and !jniFailed(env)) {
+            const key = new_string(env, "android.support.customtabs.extra.SESSION");
+            if (key != null and !jniFailed(env)) {
+                _ = jniFn(env, jni_call_object_method_a, CallObjectMethodAFn)(env, intent, put_extra, &[_]jvalue{ .{ .l = key }, .{ .l = null } });
+                _ = jniFailed(env); // an older browser may not take the extra — fine, it opens normally
+            }
+        }
+        // Show the page title, so a person can see WHOSE server they are on. That
+        // is not decoration on a sign-in page: it is the one thing that tells them
+        // they are typing their Bluesky password into Bluesky and not into us.
+        const put_bool = jniFn(env, jni_get_method_id, GetMethodIdFn)(env, intent_cls, "putExtra", "(Ljava/lang/String;Z)Landroid/content/Intent;");
+        if (put_bool != null and !jniFailed(env)) {
+            const tkey = new_string(env, "android.support.customtabs.extra.TITLE_VISIBILITY");
+            if (tkey != null and !jniFailed(env)) {
+                _ = jniFn(env, jni_call_object_method_a, CallObjectMethodAFn)(env, intent, put_bool, &[_]jvalue{ .{ .l = tkey }, .{ .z = 1 } });
+                _ = jniFailed(env);
+            }
+        }
+    }
+
     const start_mid = jniMethod(env, activity.clazz, "startActivity", "(Landroid/content/Intent;)V");
     if (start_mid == null) return seam.logcat("login: startActivity lookup failed", .{});
     jniFn(env, jni_call_void_method_a, CallVoidMethodAFn)(env, activity.clazz, start_mid, &[_]jvalue{.{ .l = intent }});
     if (jniFailed(env)) return seam.logcat("login: startActivity threw", .{});
-    seam.logcat("login: browser opened for the authorize URL", .{});
+    seam.logcat("login: browser opened for the authorize URL (custom tab if supported)", .{});
 }
 
 /// Read the launching intent's data URI and, when it is the OAuth scheme,
@@ -809,6 +848,17 @@ fn renderThread() void {
                 if (seam.zat_surface(ctx, @ptrCast(win.?), w, h)) {
                     _ = seam.zat_resize(ctx, w, h);
                     attached_gen = gen;
+                    // PAINT SOMETHING BEFORE THE LONG WAIT. zat_feed_start is
+                    // SYNCHRONOUS and slow (fonts, GPU program links, the store) —
+                    // seconds on a cold start. Until now nothing was drawn across
+                    // it, so the screen simply FROZE on whatever was last there and
+                    // then blipped into the app right as you concluded it had hung.
+                    // One pre-feed frame first: the field + the boot line, which
+                    // already knows how to say "Signing you in…" (boot_view reads
+                    // the login state). It is not a transition — it is the app
+                    // admitting it is busy, which is the least it owes anyone.
+                    seam.zat_step(ctx, 16_000_000);
+                    seam.zat_render(ctx);
                     feed_live = seam.zat_feed_start(ctx, &app.files_dir);
                     feed_errs = 0;
                 }
@@ -928,6 +978,17 @@ fn renderThread() void {
             // `xdg-open`, so before this poll existed every one of those links
             // did nothing at all, silently.
             if (seam.zat_open_url(ctx)) |u| {
+                if (app.activity) |act| openUrlViaOs(act, u);
+            }
+            // AND THE AUTHORIZE URL. This poll used to live ONLY in the
+            // `!feed_live` branch below — which was correct when "no session"
+            // meant "no feed": the sign-in happened before the app existed. The
+            // FRONT DOOR is a live feed with no session, so the authorize URL was
+            // produced and NOBODY EVER COLLECTED IT: the card said "Finish in your
+            // browser" and no browser ever opened. Same shape as the sign-out
+            // freeze — a gate written for a world where the app could not be
+            // running and signed-out at the same time.
+            if (seam.zat_login_url(ctx)) |u| {
                 if (app.activity) |act| openUrlViaOs(act, u);
             }
             // Back popped at the ROOT (Home, nothing open): step the task

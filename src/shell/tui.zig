@@ -791,6 +791,9 @@ const RunState = struct {
     /// a socket. So the front door does not run the flow itself there: it raises
     /// this, and the seam (which owns the intent plumbing) does the hop.
     glogin_want: bool,
+    /// The browser has already been asked for, this visit to the step. Without it
+    /// the request fired every frame.
+    glogin_asked: bool,
     /// The existing-account browser sign-in ("I already have an account"), on a
     /// worker: it resolves a handle, opens a browser, and waits on a loopback
     /// listener — none of which may happen on the thread that draws.
@@ -1451,6 +1454,7 @@ fn initRunState(
     rs.genroll_mstore = membership_shell.init(std.heap.page_allocator);
     rs.genroll_memjob = .{};
     rs.glogin_want = false;
+    rs.glogin_asked = false;
     rs.genroll_oauth = .{};
     rs.genroll_pending = null;
     rs.genroll_pow = .{};
@@ -1703,9 +1707,15 @@ fn deinitRunState(rs: *RunState) void {
     // worker is a network call we simply wait out — it is seconds at worst, and a
     // detached thread writing into a freed RunState is not a trade worth making.
     enroll_run.stopPow(&rs.genroll_pow);
+    enroll_run.joinMem(&rs.genroll_memjob);
     if (rs.genroll_create.thread) |th| {
         th.join();
         rs.genroll_create.thread = null;
+    }
+    if (rs.genroll_oauth.thread) |th| {
+        rs.genroll_oauth.cancel.store(true, .release);
+        th.join();
+        rs.genroll_oauth.thread = null;
     }
     const gpa = rs.gpa;
     const backend = rs.backend;
@@ -1988,6 +1998,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
         if (rs.gscreen == feed_view.screen_enroll) {
             const fns = clock_shell.monotonicNanos();
             enrollStep(rs, fns, @as(f32, @floatFromInt(@mod(fns / 1_000_000, 1_000_000))) / 1000.0);
+            enrollConfirm(rs, io);
             enrollRehearse(rs);
             enrollConnect(rs, gpa, io, environ, fns);
             enrollVerify(rs, gpa, io, environ, fns);
@@ -3725,6 +3736,15 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         // lands, exactly like catching a glide.
                         // A press that lands ON the Zat4 keyboard types; it must
                         // never commit to a scroll or drawer swipe underneath.
+                        // A PRESS RIPPLES THE FIELD: the tactile answer to a tap,
+                        // the same one the desktop's press gives.
+                        if (rs.gpu_state) |*gsf| {
+                            if (gsf.cols > 0 and gsf.rows > 0) {
+                                const fx: u32 = @min(@as(u32, @intFromFloat(@max(0.0, @as(f32, @floatFromInt(tev.x)) / @as(f32, @floatFromInt(field_cell_w))))), gsf.cols - 1);
+                                const fy: u32 = @min(@as(u32, @intFromFloat(@max(0.0, @as(f32, @floatFromInt(tev.y)) / @as(f32, @floatFromInt(field_cell_h))))), gsf.rows - 1);
+                                gsf.splashes.append(gpa, .{ .x = fx, .y = fy, .radius = 3, .amp = 0.9 }) catch {};
+                            }
+                        }
                         m.press_in_kbd = false;
                         m.kbd_bs_repeats = 0;
                         m.kbd_press_cp = 0;
@@ -3831,6 +3851,22 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         }
                     },
                     .move => if (m.down_x >= 0) {
+                        // THE FINGER LIGHTS THE FIELD. On the desktop the pointer
+                        // does this on every mouse-move; a phone emits no move
+                        // events into that path, so the field has never once felt a
+                        // touch. It should — it is a MEDIUM, and on the front door
+                        // (the one phone screen where the field is the whole
+                        // backdrop) it is the difference between a picture and a
+                        // place.
+                        if (rs.gpu_state) |*gsf| {
+                            gsf.mcx = @as(f32, @floatFromInt(tev.x)) / @as(f32, @floatFromInt(field_cell_w));
+                            gsf.mcy = @as(f32, @floatFromInt(tev.y)) / @as(f32, @floatFromInt(field_cell_h));
+                            if (gsf.cols > 0 and gsf.rows > 0) {
+                                const fx: u32 = @min(@as(u32, @intFromFloat(@max(0.0, gsf.mcx))), gsf.cols - 1);
+                                const fy: u32 = @min(@as(u32, @intFromFloat(@max(0.0, gsf.mcy))), gsf.rows - 1);
+                                gsf.splashes.append(gpa, .{ .x = fx, .y = fy, .radius = 3, .amp = 0.5 }) catch {};
+                            }
+                        }
                         // A live press-and-hold drag owns the finger: the picked-up
                         // card's ghost tracks it (logical px), and nothing scrolls or
                         // swipes underneath (the edge auto-scroll below is the one
@@ -5239,6 +5275,15 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                 if (enroll_view.hitTest(rs.genroll_hits.items, rx, ry)) |rel| if (rel == at) {
                                     if (at == .copy) enrollCopy(rs);
                                     enroll_run.apply(&rs.genroll_state, at, io, clock_shell.monotonicNanos(), &rs.genroll_mstore, &rs.genroll_memjob);
+                                    // A STEP DOES NOT SUMMON THE KEYBOARD. `apply`
+                                    // auto-focuses the first field when a step opens
+                                    // — which is right with a mouse (the caret is
+                                    // simply ready) and wrong with a thumb, where it
+                                    // throws a keyboard over half the screen that
+                                    // nobody asked for and cannot easily dismiss.
+                                    // On a phone the keyboard comes up when, and only
+                                    // when, a FIELD is tapped.
+                                    if (rs.backend == .mobile and !isEnrollField(at)) rs.genroll_state.focus = .none;
                                     rs.caret_anchor_ns = clock_shell.monotonicNanos();
                                 };
                             }
@@ -6842,7 +6887,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
         // second text model (`enroll_run.handleText` runs the shared `textedit`).
         // This is the entire dividend of hosting the front door in this loop.
         if (rs.gscreen == feed_view.screen_enroll and n > 0) {
-            if (enroll_run.handleText(&rs.genroll_state, in_buf[0..n])) return .quit; // bare Esc
+            if (enroll_run.handleTextFor(&rs.genroll_state, in_buf[0..n], rs.backend == .mobile)) return .quit; // bare Esc
             rs.caret_anchor_ns = clock_shell.monotonicNanos();
             n = 0; // consumed: nothing behind the front door may see these keys
         }
@@ -7690,6 +7735,17 @@ pub fn mobileLoginWant(mr: *MobileRun) bool {
     return w;
 }
 
+/// The handle the person TYPED. The phone's sign-in used to ignore it entirely and
+/// authorize against our own PDS unconditionally — which works only for accounts
+/// that live there. `connor.zat4.com` wears a zat4.com handle but is HOSTED on
+/// Bluesky's PDS, so the phone was asking the wrong server to sign him in, and the
+/// redirect never came back. A handle must be resolved to ITS OWN server, exactly
+/// as the desktop has always done.
+pub fn mobileLoginHandle(mr: *MobileRun) []const u8 {
+    const s = &mr.rs.genroll_state;
+    return s.handle.buf[0..s.handle.len];
+}
+
 /// Enrollment produced a session. The seam persists it and restarts the app AS
 /// that person — the loop cannot hot-swap an identity mid-frame. Ownership passes
 /// to the caller.
@@ -8380,6 +8436,15 @@ fn backNavigate(rs: *RunState) bool {
     // nav rail to escape through, so if back does nothing there, nothing does.
     // At the first step it falls through: back-at-root minimizes, as everywhere.
     if (rs.gscreen == feed_view.screen_enroll) {
+        // BACK PUTS THE KEYBOARD AWAY FIRST. That is what back MEANS on a phone
+        // when a keyboard is up, and anything else is a trap: the owner swiped
+        // back to dismiss it and got thrown to the previous step instead, over and
+        // over, which is why the flow "kept resetting". Only with no keyboard up
+        // does back mean "the step before this one".
+        if (rs.genroll_state.focus != .none) {
+            rs.genroll_state.focus = .none;
+            return true;
+        }
         if (rs.genroll_state.step != .provenance) {
             enroll_run.apply(&rs.genroll_state, .back, rs.io, clock_shell.monotonicNanos(), &rs.genroll_mstore, &rs.genroll_memjob);
             return true;
@@ -9202,6 +9267,7 @@ fn enrollConnect(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.pro
         // has walked away from the screen that asked for it is not a gift.
         s.connect_failed = false;
         rs.glogin_want = false;
+        rs.glogin_asked = false;
         return;
     }
 
@@ -9211,7 +9277,14 @@ fn enrollConnect(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.pro
     // and the seam does the hop — the app then restarts as the person it signed
     // in (the same "hand the session up" shape the new-account branch uses).
     if (rs.backend == .mobile) {
-        if (!s.connect_failed) rs.glogin_want = true;
+        // ONCE. The seam's request is read-and-clear, so raising it every frame
+        // asked for a browser a hundred times a second — harmless only because
+        // `loginStart` refuses to start a second flow, which is not a thing to
+        // rely on. A latch: cleared when the step is left (above).
+        if (!s.connect_failed and !rs.glogin_asked) {
+            rs.glogin_want = true;
+            rs.glogin_asked = true;
+        }
         return;
     }
 
@@ -9274,6 +9347,24 @@ fn enrollRehearse(rs: *RunState) void {
     }
 }
 
+/// The CONFIRM step's off-thread membership verify (Argon2id — memory-hard, so it
+/// cannot run on the thread that draws). `enroll_run`'s own loop drained this;
+/// nothing in THIS loop did, so the worker finished, nobody joined it, and the
+/// button said "Checking…" for ever. A job with no drain is a hang with a
+/// friendly label on it.
+fn enrollConfirm(rs: *RunState, io: std.Io) void {
+    const s = &rs.genroll_state;
+    if (s.step != .confirm or !s.mem_verifying) return;
+    if (!rs.genroll_memjob.done.load(.acquire)) return;
+    enroll_run.joinMem(&rs.genroll_memjob);
+    s.mem_verifying = false;
+    if (rs.genroll_memjob.verify_ok) {
+        enroll_run.confirmSucceed(s, io, &rs.genroll_mstore);
+    } else {
+        s.confirm_error = true; // say so; never sit on a spinner
+    }
+}
+
 /// The front door's per-frame motion. The window loop in `enroll_run` interleaves
 /// these with its own field splashes; the eased values themselves are plain
 /// arithmetic over the state, so they live here and the two callers agree on what
@@ -9325,6 +9416,15 @@ fn enrollStep(rs: *RunState, frame_ns: u64, t: f32) void {
         s.copied_t = @max(0.0, 1.0 - el / 1_400_000_000.0);
         if (s.copied_t <= 0.001) s.copied_ns = 0;
     } else s.copied_t = 0.0;
+}
+
+/// True for the hit targets that ARE a text field — the only things that may
+/// raise a keyboard on a phone.
+fn isEnrollField(t: enroll_view.HitTarget) bool {
+    return switch (t) {
+        .field_handle, .field_username, .field_email, .field_spot0, .field_spot1, .field_spot2, .field_full => true,
+        else => false,
+    };
 }
 
 /// The front door's Copy button: the password (password step) or the recovery
@@ -13873,13 +13973,21 @@ fn paintFrameGpu(
         // Built for EVERY screen (incl. the loadout/Algorithms page, which now
         // skips its own rail via rail_external) with the active nav = the screen.
         if (g.screen.* == feed_view.screen_enroll) {
-            // THE FRONT DOOR WEARS NO CHROME. A person who is not signed in must
-            // not see a nav rail, a tab bar, a composer or a profile chip — let
-            // alone be able to USE them to walk into an app they have no account
-            // for. The rail tile is built for every screen, which is right for
-            // every screen but this one: here the chrome is furniture belonging to
-            // a room the visitor has not been let into yet.
-            gs.rail.verts.items.len = 0;
+            // THE FRONT DOOR WEARS NO CHROME — but it DOES need the keyboard.
+            //
+            // A person who is not signed in must not see a nav rail, a tab bar, a
+            // composer or a profile chip, let alone be able to USE them to walk
+            // into an app they have no account for. So this tile is emptied.
+            //
+            // But the Zat4 KEYBOARD lives in this same tile (chrome above content),
+            // and emptying it took the keyboard with it — so the front door had
+            // five text fields and no way on earth to type into any of them. The
+            // person was shown a form they could not fill in. Draw the keyboard,
+            // and nothing else.
+            g.draw.len = 0;
+            if (g.kbd_visible)
+                feed_view.drawKeyboard(gpa, g.draw, g.engine, g.regions, @intCast(gs.design_w), @intCast(lh), @intCast(gs.inset_bottom_l), g.accent, g.kbd_shift, g.kbd_page, g.kbd_caps, g.kbd_flash_key, g.kbd_flash_a, gs.t, toggleOn(g.settings_toggles, settings_view.act_kbd_pulses), toggleOn(g.settings_toggles, settings_view.act_kbd_pop), g.kbd_popup, g.kbd_emoji_open, g.kbd_emoji_scroll, g.kbd_picker_mode, g.kbd_nav_t, g.kbd_nav_scroll) catch {};
+            gpu.feedBuild(&gs.rail, gpa, g.engine, g.draw.slice(), scale) catch {};
         } else if (gs.shatter_active and gs.design_w > feed_view.phone_max) {
             // The desktop rail was folded INTO the shattered feed buffer above, so
             // clear its separate tile — otherwise an intact rail would draw on top

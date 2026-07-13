@@ -145,6 +145,9 @@ pub const State = struct {
     card_h: f32 = 0.0, // eased card height (0 = not yet initialised)
     info: enroll_view.Info = .none, // which info bubble is open
     connect_failed: bool = false, // .connecting: the browser OAuth flow failed → retry card
+    /// Enter means "done, hide the keyboard" (a phone) rather than "next field"
+    /// (a mouse). Set by the driver each time it hands over keys.
+    phone_enter: bool = false,
 };
 
 // How long the password "crafting" decode plays (≈1.9 s — long enough to enjoy).
@@ -645,6 +648,16 @@ pub fn snapshot(s: *const State, blink_on: bool) enroll_view.EnrollView {
 /// caret motion (←/→, Home/End), and Tab/Shift+Tab/Enter focus traversal. All
 /// editing runs through the shared `textedit` model (caret-aware). Returns true
 /// to quit (bare Esc).
+/// `phone` = Enter DISMISSES the keyboard instead of hopping to the next field.
+/// With a mouse, Enter-advances-focus is a convenience; with a thumb, the keyboard
+/// is covering half the screen and "done" is what the key means — you press it to
+/// get the keyboard OUT OF THE WAY so you can see what you typed and reach the
+/// button underneath. Tab still traverses (a phone has no Tab).
+pub fn handleTextFor(s: *State, bytes: []const u8, phone: bool) bool {
+    s.phone_enter = phone;
+    return handleText(s, bytes);
+}
+
 pub fn handleText(s: *State, bytes: []const u8) bool {
     var off: usize = 0;
     while (off < bytes.len) {
@@ -653,7 +666,9 @@ pub fn handleText(s: *State, bytes: []const u8) bool {
         off += d.consumed;
         switch (d.event) {
             .escape => return true, // bare Esc quits
-            .enter => focusStep(s, false), // advance to the next field
+            .enter => if (s.phone_enter) {
+                s.focus = .none; // phone: Enter means "done" — put the keyboard away
+            } else focusStep(s, false), // desktop: advance to the next field
             .back_tab => focusStep(s, true), // Shift+Tab → previous field
             .char => |c| {
                 if (c == '\t') {
@@ -985,7 +1000,7 @@ fn confirmSubmit(s: *State, io: std.Io, mstore: *membership_shell.Store, memjob:
 
 /// Called from the render loop when the off-thread Stage-B verify PASSES:
 /// activate the membership (fast, main-thread) and advance the flow.
-fn confirmSucceed(s: *State, io: std.Io, mstore: *membership_shell.Store) void {
+pub fn confirmSucceed(s: *State, io: std.Io, mstore: *membership_shell.Store) void {
     membership_shell.activate(mstore, local_did) catch {}; // real → active member
     finalize(s);
     // A new, no-email account gets its recovery key revealed before finishing.
@@ -1135,7 +1150,7 @@ fn memWorker(job: *MemJob) void {
 
 /// Join any in-flight membership job (cooperative end — these are short hashes,
 /// not a cancellable loop, so we just wait). Safe to call when idle.
-fn joinMem(job: *MemJob) void {
+pub fn joinMem(job: *MemJob) void {
     if (job.thread) |th| {
         th.join();
         job.thread = null;
