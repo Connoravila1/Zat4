@@ -1406,7 +1406,12 @@ fn initRunState(
                         // conversation's current-epoch traffic mailbox.
                         if (chat_e2ee.subscriptions(gpa, &st)) |subs| {
                             defer gpa.free(subs);
-                            rs.gchat_link = chat_relay.start(gpa, io, &rs.gchat_box, rhost, rport, token, use_tls, subs) catch null;
+                            // A4 slice 2: the link carries THIS DEVICE'S identity —
+                            // the DID and the anchor seed that proves it. The relay
+                            // challenges us and we sign; a relay that has flipped to
+                            // require_auth admits nothing else. The seed is the same
+                            // key the directory already publishes for us.
+                            rs.gchat_link = chat_relay.start(gpa, io, &rs.gchat_box, rhost, rport, token, use_tls, subs, st.my_did, st.anchor_seed) catch null;
                         } else |_| {}
                         // Restore the displayed history (M2) first. A missing
                         // or corrupt blob is a cold start, never a half-restore
@@ -2068,6 +2073,10 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             .rate_limited => "chat: sending too fast — wait a moment and resend",
                             .mailbox_full => "chat: their inbox is full right now — try again shortly",
                             .store_full => "chat: relay is at capacity — try again shortly",
+                            // A4 slice 2: the relay requires a proven identity and
+                            // this device has none it accepts. Not retryable by
+                            // waiting — say what it is, don't imply patience helps.
+                            .unauthenticated => "chat: the relay didn't recognize this device",
                             .ok => "chat: sent",
                         };
                         chatLog("[chat] deposit refused: {s}", .{@tagName(r)});

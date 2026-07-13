@@ -69,14 +69,45 @@ pub const bucket_len = 4096;
 pub const op_deposit: u8 = 0x01;
 pub const op_subscribe: u8 = 0x02;
 pub const op_ack: u8 = 0x03;
+/// Client → server: the answer to a challenge (A4 slice 2).
+pub const op_auth: u8 = 0x04;
 pub const op_deliver: u8 = 0x11;
 pub const op_deposit_ok: u8 = 0x12;
 pub const op_refused: u8 = 0x13;
+/// Server → client: this connection's login nonce (A4 slice 2).
+pub const op_challenge: u8 = 0x14;
+/// Server → client: the anchor key signed the nonce AND the directory binds
+/// that key to the claimed DID. The relay now knows WHO is connected.
+pub const op_auth_ok: u8 = 0x15;
 
 pub const deposit_frame_len = 1 + mailbox_id_len + bucket_len;
 pub const subscribe_frame_len = 1 + mailbox_id_len;
 pub const ack_frame_len = 1 + mailbox_id_len;
 pub const deliver_frame_len = 1 + mailbox_id_len + bucket_len;
+
+// --- Auth frames (A4 slice 2) ---------------------------------------------
+//
+// A NOTE ON THE FLAG DAY, because it is the whole reason these are shaped this
+// way. A client that meets an op byte it does not know tears its connection
+// down (`parseServerOp` → BadOp → ProtocolViolation) and reconnects forever.
+// So the relay must NOT send `challenge` to a client that has not asked for
+// it: the upgrade carries an opt-in header, and only a client that sent it is
+// challenged. Old clients see the protocol they have always seen. When every
+// client speaks auth, the relay flips `require_auth` and the old ones are
+// locked out on purpose — but not by accident, and not before.
+
+pub const challenge_len = 32;
+pub const anchor_pub_len = 32;
+pub const auth_sig_len = 64;
+/// The wire cap on a claimed DID. Generous against real DIDs (~32 bytes) and
+/// small enough that the auth frame is a bounded, stack-sized thing.
+pub const max_auth_did_len = 256;
+
+pub const challenge_frame_len = 1 + challenge_len;
+pub const auth_ok_frame_len = 1;
+/// [1 op][32 anchor_pub][64 sig][1 did_len][did …]
+pub const auth_frame_head = 1 + anchor_pub_len + auth_sig_len + 1;
+pub const auth_frame_max = auth_frame_head + max_auth_did_len;
 
 /// Why a deposit was refused. The numeric values ride the wire in the
 /// `refused` op, so they are pinned (E3: the sender learns why, explicitly).
@@ -92,6 +123,11 @@ pub const DepositResult = enum(u8) {
     /// client. See `TokenBucket`. (New reason: older clients that don't know it
     /// treat any nonzero reason as "refused, don't crash", so it's wire-safe.)
     rate_limited = 3,
+    /// The relay requires an authenticated identity (A4 slice 2) and this
+    /// connection has none. Only reachable once the operator flips
+    /// `require_auth`; before that an unauthenticated connection is served
+    /// exactly as it always was (the transition window).
+    unauthenticated = 4,
 };
 
 /// A per-connection deposit rate limiter — pure, so it's testable and lives with
@@ -297,6 +333,12 @@ pub const ClientOp = union(enum) {
     deposit: struct { id: [mailbox_id_len]u8, blob: *const [bucket_len]u8 },
     subscribe: struct { id: [mailbox_id_len]u8 },
     ack: struct { id: [mailbox_id_len]u8 },
+    /// "I am `did`, here is my anchor key, and here is that key's signature
+    /// over the nonce you just sent me." The DID is BORROWED from the frame
+    /// and is a CLAIM until the relay checks it against the directory —
+    /// signing proves key custody, the directory proves the key is this
+    /// account's (A4 slice 2).
+    auth: struct { anchor_pub: [anchor_pub_len]u8, sig: [auth_sig_len]u8, did: []const u8 },
 };
 
 pub fn parseClientOp(frame: []const u8) ParseError!ClientOp {
@@ -317,6 +359,20 @@ pub fn parseClientOp(frame: []const u8) ParseError!ClientOp {
             if (frame.len != ack_frame_len) return error.BadLength;
             return .{ .ack = .{ .id = frame[1..][0..mailbox_id_len].* } };
         },
+        op_auth => {
+            if (frame.len < auth_frame_head) return error.BadLength;
+            const did_len = frame[auth_frame_head - 1];
+            // The declared length must be EXACTLY the bytes that follow — no
+            // slack, no truncation. A hostile frame gets an error, never a
+            // silently shortened DID that then fails to match a real account.
+            if (frame.len != auth_frame_head + @as(usize, did_len)) return error.BadLength;
+            if (did_len == 0) return error.BadLength;
+            return .{ .auth = .{
+                .anchor_pub = frame[1..][0..anchor_pub_len].*,
+                .sig = frame[1 + anchor_pub_len ..][0..auth_sig_len].*,
+                .did = frame[auth_frame_head..],
+            } };
+        },
         else => return error.BadOp,
     }
 }
@@ -327,6 +383,10 @@ pub const ServerOp = union(enum) {
     deliver: struct { id: [mailbox_id_len]u8, blob: *const [bucket_len]u8 },
     deposit_ok,
     refused: DepositResult,
+    /// This connection's login nonce (A4 slice 2). Sent ONLY to a client that
+    /// asked for it on the upgrade — see the flag-day note above.
+    challenge: [challenge_len]u8,
+    auth_ok,
 };
 
 pub fn parseServerOp(frame: []const u8) ParseError!ServerOp {
@@ -349,8 +409,17 @@ pub fn parseServerOp(frame: []const u8) ParseError!ServerOp {
                 1 => .mailbox_full,
                 2 => .store_full,
                 3 => .rate_limited,
+                4 => .unauthenticated,
                 else => return error.BadOp,
             } };
+        },
+        op_challenge => {
+            if (frame.len != challenge_frame_len) return error.BadLength;
+            return .{ .challenge = frame[1..][0..challenge_len].* };
+        },
+        op_auth_ok => {
+            if (frame.len != auth_ok_frame_len) return error.BadLength;
+            return .auth_ok;
         },
         else => return error.BadOp,
     }
@@ -391,6 +460,35 @@ pub fn buildRefused(out: *[2]u8, reason: DepositResult) []const u8 {
     out[0] = op_refused;
     out[1] = @intFromEnum(reason);
     return out;
+}
+
+pub fn buildChallenge(out: *[challenge_frame_len]u8, nonce: [challenge_len]u8) []const u8 {
+    out[0] = op_challenge;
+    out[1..][0..challenge_len].* = nonce;
+    return out;
+}
+
+pub fn buildAuthOk(out: *[auth_ok_frame_len]u8) []const u8 {
+    out[0] = op_auth_ok;
+    return out;
+}
+
+/// Build the auth answer. `did` longer than the wire cap is an explicit
+/// error — the DID is the caller's own, so this is a contract check, not a
+/// hostile-input path (those live in `parseClientOp`).
+pub fn buildAuth(
+    out: *[auth_frame_max]u8,
+    anchor_pub: [anchor_pub_len]u8,
+    sig: [auth_sig_len]u8,
+    did: []const u8,
+) error{BadLength}![]const u8 {
+    if (did.len == 0 or did.len > max_auth_did_len) return error.BadLength;
+    out[0] = op_auth;
+    out[1..][0..anchor_pub_len].* = anchor_pub;
+    out[1 + anchor_pub_len ..][0..auth_sig_len].* = sig;
+    out[auth_frame_head - 1] = @intCast(did.len);
+    @memcpy(out[auth_frame_head..][0..did.len], did);
+    return out[0 .. auth_frame_head + did.len];
 }
 
 /// Constant-time shared-bearer check for the relay's HTTP upgrade gate —
@@ -604,6 +702,60 @@ test "relay codec: every op round-trips; malformed frames are explicit errors" {
     // A server op is not a client op and vice versa.
     try testing.expectError(error.BadOp, parseClientOp(del_buf[0..deliver_frame_len]));
     try testing.expectError(error.BadOp, parseServerOp(dep));
+}
+
+test "relay codec: the auth handshake round-trips; a hostile auth frame is refused" {
+    // Challenge (server → client).
+    const nonce: [challenge_len]u8 = @splat(0x9E);
+    var ch_buf: [challenge_frame_len]u8 = undefined;
+    switch (try parseServerOp(buildChallenge(&ch_buf, nonce))) {
+        .challenge => |c| try testing.expectEqualSlices(u8, &nonce, &c),
+        else => return error.TestUnexpectedResult,
+    }
+    var ok_buf: [auth_ok_frame_len]u8 = undefined;
+    try testing.expectEqual(ServerOp.auth_ok, try parseServerOp(buildAuthOk(&ok_buf)));
+
+    // The answer (client → server), with its variable-length DID.
+    const anchor_pub: [anchor_pub_len]u8 = @splat(0x11);
+    const sig: [auth_sig_len]u8 = @splat(0x22);
+    const did = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
+    var auth_buf: [auth_frame_max]u8 = undefined;
+    const frame = try buildAuth(&auth_buf, anchor_pub, sig, did);
+    switch (try parseClientOp(frame)) {
+        .auth => |a| {
+            try testing.expectEqualSlices(u8, &anchor_pub, &a.anchor_pub);
+            try testing.expectEqualSlices(u8, &sig, &a.sig);
+            try testing.expectEqualStrings(did, a.did);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // A declared DID length that DISAGREES with the bytes present is an error,
+    // both ways. This is the one variable-length frame in the vocabulary, so it
+    // is the one place a length can lie — a frame that claimed 200 bytes and
+    // carried 20 must not parse as a 20-byte DID, and one that claimed 20 while
+    // carrying 200 must not silently truncate to a DID that isn't what was signed.
+    var bad = auth_buf;
+    bad[auth_frame_head - 1] = 200;
+    try testing.expectError(error.BadLength, parseClientOp(bad[0..frame.len]));
+    bad[auth_frame_head - 1] = @intCast(did.len - 1);
+    try testing.expectError(error.BadLength, parseClientOp(bad[0..frame.len]));
+    // A zero-length DID is nobody.
+    bad[auth_frame_head - 1] = 0;
+    try testing.expectError(error.BadLength, parseClientOp(bad[0..auth_frame_head]));
+    // Truncated below the fixed head at all.
+    try testing.expectError(error.BadLength, parseClientOp(frame[0 .. auth_frame_head - 1]));
+    // The builder refuses a DID the wire cannot carry (a contract check).
+    const huge = [_]u8{'x'} ** (max_auth_did_len + 1);
+    try testing.expectError(error.BadLength, buildAuth(&auth_buf, anchor_pub, sig, &huge));
+    try testing.expectError(error.BadLength, buildAuth(&auth_buf, anchor_pub, sig, ""));
+
+    // The new refusal reason rides the wire like the others.
+    var ref_buf: [2]u8 = undefined;
+    switch (try parseServerOp(buildRefused(&ref_buf, .unauthenticated))) {
+        .refused => |r| try testing.expectEqual(DepositResult.unauthenticated, r),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "relay: the service gate fails closed and matches exactly" {

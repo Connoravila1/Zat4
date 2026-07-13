@@ -62,6 +62,7 @@ const stream_shell = @import("stream.zig");
 const mobile_host = @import("mobile_host.zig");
 const relay = @import("../core/relay.zig");
 const websocket = @import("../core/websocket.zig");
+const anchor = @import("../core/anchor.zig");
 
 /// Re-exported so callers size their buckets without importing the relay
 /// core (D3: the wire module stays behind this client's interface).
@@ -159,6 +160,17 @@ pub const ChatRelay = struct {
     token: []const u8,
     /// TLS to the public Caddy route; false = the loopback/tunnel dev dial.
     use_tls: bool,
+    /// THIS DEVICE'S IDENTITY on the relay (A4 slice 2). The DID we claim, and
+    /// the anchor seed that proves it — the same key the directory publishes
+    /// and that our bootstrap mailbox is derived from, so this leaks nothing to
+    /// the relay it could not already correlate.
+    ///
+    /// Empty DID = no credentials: the client does not offer auth and the relay
+    /// treats it as it always has (until the operator flips `require_auth`, at
+    /// which point an anonymous connection deposits nothing). The seed is
+    /// SECRET — it is scrubbed on shutdown and never logged.
+    did: []const u8,
+    anchor_seed: [32]u8,
     /// The mailboxes this client drains (ours): the bootstrap inbox + every
     /// open conversation's current-epoch traffic mailbox (metadata privacy
     /// M2.1). Grows via `subscribe` as conversations open and epochs
@@ -171,7 +183,9 @@ pub const ChatRelay = struct {
     outbox: std.ArrayList(Out),
 };
 
-/// Spawn the link. `host`/`token` are copied (E1).
+/// Spawn the link. `host`/`token`/`did` are copied (E1). An empty `did` (with
+/// a zero seed) starts an ANONYMOUS link — the pre-A4 behaviour, kept so the
+/// loopback tests and any credential-less caller still work.
 pub fn start(
     gpa: Allocator,
     io: std.Io,
@@ -181,6 +195,8 @@ pub fn start(
     token: []const u8,
     use_tls: bool,
     subs: []const [relay.mailbox_id_len]u8,
+    did: []const u8,
+    anchor_seed: [32]u8,
 ) !*ChatRelay {
     const cr = try gpa.create(ChatRelay);
     errdefer gpa.destroy(cr);
@@ -188,6 +204,8 @@ pub fn start(
     errdefer gpa.free(host_copy);
     const token_copy = try gpa.dupe(u8, token);
     errdefer gpa.free(token_copy);
+    const did_copy = try gpa.dupe(u8, did);
+    errdefer gpa.free(did_copy);
     var subs_list: std.ArrayList([relay.mailbox_id_len]u8) = .empty;
     errdefer subs_list.deinit(gpa);
     try subs_list.appendSlice(gpa, subs);
@@ -202,6 +220,8 @@ pub fn start(
         .port = port,
         .token = token_copy,
         .use_tls = use_tls,
+        .did = did_copy,
+        .anchor_seed = anchor_seed,
         .subs = subs_list,
         .out_locked = .init(false),
         .outbox = .empty,
@@ -254,6 +274,8 @@ pub fn shutdown(cr: *ChatRelay) void {
     cr.outbox.deinit(cr.gpa);
     cr.gpa.free(cr.host);
     cr.gpa.free(cr.token);
+    cr.gpa.free(cr.did);
+    std.crypto.secureZero(u8, &cr.anchor_seed); // the chat identity: never left lying in freed memory
     cr.subs.deinit(cr.gpa);
     cr.gpa.destroy(cr);
 }
@@ -362,7 +384,23 @@ fn runConnection(cr: *ChatRelay, healthy: *bool) !void {
     var key_buf: [websocket.key_len]u8 = undefined;
     const key = websocket.encodeKey(nonce, &key_buf);
     var req_buf: [1024]u8 = undefined;
-    const request = std.fmt.bufPrint(
+    // `X-Zat-Auth: 1` OFFERS identity (A4 slice 2): it tells the relay to
+    // challenge us. We send it only when we hold credentials, and the relay
+    // challenges only clients that sent it — which is exactly what lets auth
+    // ship without a flag day (a client that met an unknown op would tear the
+    // connection down and reconnect forever).
+    const request = if (cr.did.len > 0) std.fmt.bufPrint(
+        &req_buf,
+        "GET /relay HTTP/1.1\r\n" ++
+            "Host: {s}\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Key: {s}\r\n" ++
+            "Sec-WebSocket-Version: 13\r\n" ++
+            "X-Zat-Auth: 1\r\n" ++
+            "Authorization: Bearer {s}\r\n\r\n",
+        .{ cr.host, key, cr.token },
+    ) catch return error.HandshakeRefused else std.fmt.bufPrint(
         &req_buf,
         "GET /relay HTTP/1.1\r\n" ++
             "Host: {s}\r\n" ++
@@ -481,6 +519,22 @@ fn runConnection(cr: *ChatRelay, healthy: *bool) !void {
                     },
                     .deposit_ok => {},
                     .refused => |r| cr.mailbox.push(gpa, .{ .refused = r }),
+                    // The relay's login nonce (A4 slice 2). Sign it with the
+                    // anchor key — the same key the directory publishes for
+                    // this DID — and send it straight back. The signature is
+                    // bound to THIS nonce, so it is worthless anywhere else.
+                    .challenge => |chal| {
+                        const anchor_pub = anchor.publicKey(cr.anchor_seed) catch return error.ProtocolViolation;
+                        const sig = anchor.signRelayAuth(cr.anchor_seed, chal, cr.did) catch return error.ProtocolViolation;
+                        var auth_op: [relay.auth_frame_max]u8 = undefined;
+                        const auth_frame = relay.buildAuth(&auth_op, anchor_pub, sig, cr.did) catch return error.ProtocolViolation;
+                        try sendFrame(cr, &conn, .binary, auth_frame);
+                        relayLog("auth: answering the relay's challenge as {s}", .{cr.did});
+                    },
+                    .auth_ok => {
+                        relayLog("AUTHENTICATED — the relay knows this device", .{});
+                        cr.mailbox.push(gpa, .{ .status = "relay: authenticated" });
+                    },
                 },
                 .ping => try sendFrame(cr, &conn, .pong, decoded.frame.payload),
                 .close => return error.ConnectionClosed,
@@ -596,9 +650,9 @@ test "chat_relay loopback: two clients exchange an opaque bucket through the rea
     // Bob drains TWO mailboxes (the M2 rotation shape: current + window);
     // the deposit goes to his SECOND, proving the multi-subscription leg.
     const bob_box_id2: [relay.mailbox_id_len]u8 = @splat(0xB3);
-    const alice = try start(gpa, io, &alice_box, "127.0.0.1", port, "u5-test-token", false, &.{alice_box_id});
+    const alice = try start(gpa, io, &alice_box, "127.0.0.1", port, "u5-test-token", false, &.{alice_box_id}, "", @splat(0));
     defer shutdown(alice);
-    const bob = try start(gpa, io, &bob_box, "127.0.0.1", port, "u5-test-token", false, &.{ bob_box_id, bob_box_id2 });
+    const bob = try start(gpa, io, &bob_box, "127.0.0.1", port, "u5-test-token", false, &.{ bob_box_id, bob_box_id2 }, "", @splat(0));
     defer shutdown(bob);
 
     // Alice → Bob: deposit the bucket to Bob's SECOND mailbox.

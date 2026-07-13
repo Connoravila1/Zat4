@@ -74,6 +74,63 @@ pub fn verifyDidBinding(anchor_pub: [pk_len]u8, did: []const u8, sig: []const u8
 }
 
 // ---------------------------------------------------------------------------
+// Relay auth (CHAT_HARDENING A4 slice 2). The relay used to know no one: one
+// shared bearer token, baked into every client, and any connection could
+// deposit anything anywhere. Identity is what makes abuse ATTRIBUTABLE and
+// scarce, and the anchor key is the identity we already have — the directory
+// binds it to the DID, and the peer's bootstrap mailbox is derived from it.
+//
+// The proof is a signature over a nonce the SERVER chose, so it cannot be
+// replayed onto another connection; and it is domain-separated from the DID
+// binding above, so neither signature can ever be presented as the other.
+// ---------------------------------------------------------------------------
+
+pub const challenge_len = 32;
+
+/// A distinct label — the whole point of domain separation. A published
+/// `anchorKeySig` must not be replayable as a relay login, and a relay login
+/// must not be replayable as a published binding.
+const relay_auth_label = "Zat4 Chat 1.0 RelayAuth";
+
+fn relayAuthMessage(
+    buf: *[relay_auth_label.len + challenge_len + max_did_len]u8,
+    challenge: [challenge_len]u8,
+    did: []const u8,
+) AnchorError![]const u8 {
+    if (did.len > max_did_len) return error.DidTooLong;
+    @memcpy(buf[0..relay_auth_label.len], relay_auth_label);
+    @memcpy(buf[relay_auth_label.len..][0..challenge_len], &challenge);
+    @memcpy(buf[relay_auth_label.len + challenge_len ..][0..did.len], did);
+    return buf[0 .. relay_auth_label.len + challenge_len + did.len];
+}
+
+/// Sign the relay's connect challenge: "I hold the anchor key that the
+/// directory binds to this DID."
+pub fn signRelayAuth(seed: [seed_len]u8, challenge: [challenge_len]u8, did: []const u8) AnchorError![sig_len]u8 {
+    var buf: [relay_auth_label.len + challenge_len + max_did_len]u8 = undefined;
+    const msg = try relayAuthMessage(&buf, challenge, did);
+    const kp = Ed25519.KeyPair.generateDeterministic(seed) catch return error.BadKey;
+    const sig = kp.sign(msg, null) catch return error.BadKey;
+    return sig.toBytes();
+}
+
+/// The relay's half: the signature must be over THIS connection's challenge
+/// and the claimed DID, under the anchor key the caller resolved from the
+/// directory. Untrusted wire bytes throughout (E3).
+pub fn verifyRelayAuth(
+    anchor_pub: [pk_len]u8,
+    challenge: [challenge_len]u8,
+    did: []const u8,
+    sig: []const u8,
+) AnchorError!void {
+    if (sig.len != sig_len) return error.BadSignature;
+    var buf: [relay_auth_label.len + challenge_len + max_did_len]u8 = undefined;
+    const msg = try relayAuthMessage(&buf, challenge, did);
+    const pk = Ed25519.PublicKey.fromBytes(anchor_pub) catch return error.BadKey;
+    Ed25519.Signature.fromBytes(sig[0..sig_len].*).verify(msg, pk) catch return error.BadSignature;
+}
+
+// ---------------------------------------------------------------------------
 // Tests. Deterministic Ed25519 means these are all fixed-vector tests (C6:
 // nothing allocates, so the leak allocator has nothing to see).
 // ---------------------------------------------------------------------------
@@ -153,4 +210,34 @@ test "anchor: the MLS keyPackage publishes this anchor key (the C6 chain)" {
 
     const sig = try signDidBinding(test_seed, test_did);
     try verifyDidBinding(leaf.signature_key[0..pk_len].*, test_did, &sig);
+}
+
+test "anchor: relay auth binds the challenge, the DID, and the key — and nothing else" {
+    const anchor_pub = try publicKey(test_seed);
+    const challenge: [challenge_len]u8 = @splat(0x5C);
+    const sig = try signRelayAuth(test_seed, challenge, test_did);
+    try verifyRelayAuth(anchor_pub, challenge, test_did, &sig);
+
+    // A DIFFERENT challenge does not verify — this is the whole point: a
+    // signature lifted off one connection cannot log in on another.
+    var other = challenge;
+    other[0] ^= 1;
+    try testing.expectError(error.BadSignature, verifyRelayAuth(anchor_pub, other, test_did, &sig));
+
+    // A different DID, and a different key, are both refused.
+    try testing.expectError(error.BadSignature, verifyRelayAuth(anchor_pub, challenge, "did:plc:someoneelse", &sig));
+    var wrong_key = anchor_pub;
+    wrong_key[0] ^= 1;
+    try testing.expect(std.meta.isError(verifyRelayAuth(wrong_key, challenge, test_did, &sig)));
+
+    // DOMAIN SEPARATION. The published anchorKeySig (a DID binding) must not
+    // be usable as a relay login, and a relay login must not be publishable as
+    // a binding. Two labels, two message shapes — neither verifies as the
+    // other, and that is enforced here so no refactor can quietly merge them.
+    const binding = try signDidBinding(test_seed, test_did);
+    try testing.expectError(error.BadSignature, verifyRelayAuth(anchor_pub, challenge, test_did, &binding));
+    try testing.expectError(error.BadSignature, verifyDidBinding(anchor_pub, test_did, &sig));
+
+    // A truncated signature is an explicit error, not a panic (E3).
+    try testing.expectError(error.BadSignature, verifyRelayAuth(anchor_pub, challenge, test_did, sig[0 .. sig_len - 1]));
 }

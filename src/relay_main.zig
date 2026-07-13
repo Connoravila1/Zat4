@@ -37,6 +37,25 @@
 const std = @import("std");
 const relay = @import("core/relay.zig");
 const serve = @import("shell/relay_serve.zig");
+const chat_keys = @import("shell/chat_keys.zig");
+
+/// The directory leg of per-DID auth (CHAT_HARDENING A4 slice 2): what anchor
+/// key does this DID PUBLISH? Resolves the DID to its own PDS (never a guessed
+/// host — `identity.pdsForDid`, SSRF-guarded) and reads the public keyPackage
+/// record through the same validation gate the client uses for a counterparty.
+/// The network lives HERE, in the binary; the serve loop takes this as a
+/// function pointer and stays offline and testable (B3).
+///
+/// False = we do not know this DID, so the relay will not admit it. An
+/// unreachable PDS reads the same as a missing account, deliberately: an
+/// identity we cannot check is one we cannot enforce a limit against.
+fn verifyDid(gpa: std.mem.Allocator, io: std.Io, did: []const u8, out: *[relay.anchor_pub_len]u8) bool {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const peer = (chat_keys.fetchPeer(gpa, arena_state.allocator(), io, null, did) catch return false) orelse return false;
+    out.* = peer.anchor_pub;
+    return true;
+}
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -64,14 +83,36 @@ pub fn main(init: std.process.Init) !void {
     if (token.len == 0) {
         try out.print("zat4-relay: WARNING — ZAT_RELAY_TOKEN unset; the gate is fail-closed, ALL connections will be refused. Set it to serve.\n", .{});
     }
+
+    // THE FLIP (A4 slice 2). Unset/0 = the transition window: clients that
+    // speak auth are challenged and verified; clients that don't are served as
+    // they always were. Set it to 1 ONLY once every client in the wild speaks
+    // auth — it locks the rest out, which is the point, but on purpose.
+    const require_auth = blk: {
+        const v = env.get("ZAT_RELAY_REQUIRE_AUTH") orelse break :blk false;
+        break :blk std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
+    };
+
     try out.print("zat4-relay: serving ws on http://127.0.0.1:{d}/relay  (ctrl-c to stop)\n", .{port});
+    if (require_auth)
+        try out.print("zat4-relay: per-DID auth REQUIRED — an unauthenticated connection deposits nothing.\n", .{})
+    else
+        try out.print("zat4-relay: per-DID auth OFFERED (transition window) — clients that speak it are verified; the rest are served as before. Set ZAT_RELAY_REQUIRE_AUTH=1 to enforce.\n", .{});
     try out.flush();
 
     var store: relay.Store = .{};
     defer relay.deinit(gpa, &store);
     var lock: serve.StoreLock = .{};
+    var auth_cache: serve.AuthCache = .{};
+    defer auth_cache.deinit(gpa);
 
-    try serve.run(gpa, io, &store, .{ .port = port, .token = token }, &lock);
+    try serve.run(gpa, io, &store, .{
+        .port = port,
+        .token = token,
+        .require_auth = require_auth,
+        .verify_did = verifyDid,
+        .auth_cache = &auth_cache,
+    }, &lock);
 }
 
 test {
