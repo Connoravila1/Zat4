@@ -303,7 +303,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_restart, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, recv_back, recv_use, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_restart, chat_identity_reset, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, recv_back, recv_use, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -9197,6 +9197,11 @@ pub fn layoutChat(
     /// `undelivered` draw an honest line under the header; `confirmed` draws
     /// nothing — a working conversation says nothing about its plumbing.
     delivery: chat_msg.Delivery,
+    /// A3: this account's chat keys are published from ANOTHER device, and this
+    /// one refused to overwrite them. The surface says so and offers the only
+    /// honest way forward, instead of silently re-minting an identity and
+    /// orphaning every conversation the account has.
+    identity_elsewhere: bool,
 ) error{OutOfMemory}!i32 {
     const m: Metrics = if (pane_geom) |g|
         .{ .rail_x = g.rail_x, .col_x = g.col_x, .col_w = g.col_w, .lx = g.lx, .cw = g.cw, .side_x = g.side_x, .wide = g.wide }
@@ -9215,6 +9220,62 @@ pub fn layoutChat(
 
     const x0 = m.lx;
     const w = m.cw;
+
+    // ── A3 — CHAT LIVES ON ANOTHER DEVICE. ──
+    //
+    // The account already publishes a chat key, and it is not this device's.
+    // The old behaviour was to mint a new one and overwrite it, silently: a
+    // reinstall, a cleared cache, or a single run with a different cache dir
+    // would take over the account's chat identity and orphan every conversation
+    // it had — with no warning, and no way back, because the anchor key is
+    // device-bound and unrecoverable.
+    //
+    // So this surface stops and SAYS SO. There is no list to show and no thread
+    // to open: without an identity, none of it would mean anything. The one
+    // action is the real one, and it is named honestly — because it does have a
+    // cost, and the person paying it should know that before they tap.
+    if (identity_elsewhere) {
+        const cx = x0 + @divTrunc(w, 2);
+        var y = if (phone_max >= width) insets.top + 120 else 140;
+        const title = "Chat is set up on another device";
+        const tw: i32 = @intCast(text.measure(e, .semibold, title, 22));
+        _ = try str(gpa, dl, e, .semibold, cx - @divTrunc(tw, 2), y, ink, 22, title);
+        y += 40;
+        const body = [_][]const u8{
+            "Your chat keys live on the device where you first used chat.",
+            "They can't be copied here \u{2014} that is exactly what keeps your",
+            "messages readable only by you and the person you're talking to.",
+        };
+        for (body) |ln| {
+            const lw: i32 = @intCast(text.measure(e, .regular, ln, 14));
+            _ = try str(gpa, dl, e, .regular, cx - @divTrunc(lw, 2), y, muted, 14, ln);
+            y += 22;
+        }
+        y += 18;
+        const cost = [_][]const u8{
+            "You can start chat fresh on this device instead. If you do, this",
+            "device becomes the one that owns chat for your account, and your",
+            "existing conversations can't come with you \u{2014} you and the people",
+            "you were talking to will each need to start them again.",
+        };
+        for (cost) |ln| {
+            const lw: i32 = @intCast(text.measure(e, .regular, ln, 13));
+            _ = try str(gpa, dl, e, .regular, cx - @divTrunc(lw, 2), y, faint, 13, ln);
+            y += 20;
+        }
+        y += 22;
+        const btn = "Set up chat fresh on this device";
+        const btw: i32 = @intCast(text.measure(e, .semibold, btn, 14));
+        const bw: i32 = btw + 40;
+        const bh: i32 = 40;
+        const bx = cx - @divTrunc(bw, 2);
+        try rect(gpa, dl, bx, y, bw, bh, skinPanel(accent), 10);
+        try rect(gpa, dl, bx, y, bw, 1, 0x24EDEAE0, 10);
+        _ = try str(gpa, dl, e, .semibold, cx - @divTrunc(btw, 2), y + 26, ink, 14, btn);
+        try emitRegion(gpa, regions, bx, y, bw, bh, 0, .chat_identity_reset);
+        return y + bh + 40;
+    }
+
     // ── THE PHONE SHAPE: single-pane (this surface must carry a standalone
     // app one day — the desktop master–detail squeezed into 430px read as
     // half-broken). No conversation open → the LIST fills the column, a
@@ -10757,7 +10818,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // rail regions, so the counts are exactly the surface's own — one region
     // per conversation row + the composer pair + the "+ New" pill. (460 now
     // exercises the PHONE single-pane shape — its own test below.)
-    const h = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed);
+    const h = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, false);
     var n_conv: usize = 0;
     var n_input: usize = 0;
     var n_send: usize = 0;
@@ -10790,7 +10851,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // no thread pane and no composer to arm. The "+ New" pill is always there.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h2 = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed);
+    const h2 = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, false);
     try std.testing.expectEqual(@as(i32, 940), h2);
     var n2_conv: usize = 0;
     var n2_new: usize = 0;
@@ -10806,7 +10867,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // line draws when the shell hands one over.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", .{}, false, true, "chattest.zat4.com", "Couldn't resolve that handle", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed);
+    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", .{}, false, true, "chattest.zat4.com", "Couldn't resolve that handle", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, false);
     var n3_compose: usize = 0;
     for (regions.items) |r| {
         if (r.kind == .chat_compose_input) n3_compose += 1;
@@ -10819,12 +10880,12 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // (motion never moves a tap target).
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed);
+    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, false);
     const rest_items = dl.len;
     const rest_regions = regions.items.len;
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{ .typing_t = 1, .typing_phase = 0.7 }, &.{}, .{}, .{}, .{}, .confirmed);
+    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{ .typing_t = 1, .typing_phase = 0.7 }, &.{}, .{}, .{}, .{}, .confirmed, false);
     try std.testing.expect(dl.len > rest_items);
     try std.testing.expectEqual(rest_regions, regions.items.len);
 
@@ -10834,15 +10895,64 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // Neither moves a tap target — the strip is a statement, not a control.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .waiting);
+    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .waiting, false);
     const waiting_items = dl.len;
     try std.testing.expect(waiting_items > rest_items);
     try std.testing.expectEqual(rest_regions, regions.items.len);
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .undelivered);
+    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .undelivered, false);
     try std.testing.expect(dl.len > rest_items);
     try std.testing.expectEqual(rest_regions, regions.items.len);
+}
+
+test "messages screen: chat published from another device says so, and offers ONE way forward (A3)" {
+    // The old behaviour was to mint a fresh chat key and overwrite the
+    // account's published one — silently. A reinstall, a cleared cache, or one
+    // run with a different cache dir took over the account's chat identity and
+    // orphaned every conversation it had, with no warning and no way back (the
+    // anchor key is device-bound and unrecoverable). Now the surface stops.
+    const gpa = std.testing.allocator;
+    var engine = try text.initEngine();
+    defer text.deinitEngine(gpa, &engine);
+    var dl: raster.DrawList = .{};
+    defer dl.deinit(gpa);
+    var regions: Regions = .empty;
+    defer regions.deinit(gpa);
+
+    // A populated list + thread, so the assertion is that the panel REPLACES a
+    // surface that had plenty to draw — not that it fills an empty one.
+    const lrows = [_]chat_view.ListRow{
+        .{ .name = "maya.zat4.com", .preview = "You: hey", .age = "2h", .unread = 0 },
+    };
+    const brows = [_]chat_view.BubbleRow{
+        .{ .body = "hey", .age = "2h", .mine = true, .stamp = true, .kind = .text, .tail = true },
+    };
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, true);
+
+    // Exactly one tap target on the whole surface: the choice. No conversation
+    // rows, no composer, no send — none of them mean anything without an
+    // identity, and offering them would be a lie about what this device can do.
+    var resets: usize = 0;
+    for (regions.items) |r| {
+        if (r.kind == .chat_identity_reset) resets += 1;
+        try std.testing.expect(r.kind != .chat_conv);
+        try std.testing.expect(r.kind != .chat_send);
+        try std.testing.expect(r.kind != .chat_input);
+        try std.testing.expect(r.kind != .chat_new);
+    }
+    try std.testing.expectEqual(@as(usize, 1), resets);
+
+    // And with a normal identity the panel is gone and the list is back.
+    dl.len = 0;
+    regions.clearRetainingCapacity();
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, false);
+    var convs: usize = 0;
+    for (regions.items) |r| {
+        try std.testing.expect(r.kind != .chat_identity_reset);
+        if (r.kind == .chat_conv) convs += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), convs);
 }
 
 test "messages screen: the phone shape — list page, then an immersive thread with back" {
@@ -10864,7 +10974,7 @@ test "messages screen: the phone shape — list page, then an immersive thread w
 
     // LIST page (no peer): full-width rows + the new-conversation button; no
     // composer, no thread chrome, no back — the tab bar is the way out.
-    _ = try layoutChat(gpa, &engine, 430, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{ .top = 48 }, .{}, .confirmed);
+    _ = try layoutChat(gpa, &engine, 430, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{ .top = 48 }, .{}, .confirmed, false);
     var l_conv: usize = 0;
     var l_new: usize = 0;
     var l_back: usize = 0;
@@ -10881,7 +10991,7 @@ test "messages screen: the phone shape — list page, then an immersive thread w
     // app-bar's back region + the composer trio are the page's controls.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 430, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{ .top = 48, .bottom = 34 }, .{}, .confirmed);
+    _ = try layoutChat(gpa, &engine, 430, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{ .top = 48, .bottom = 34 }, .{}, .confirmed, false);
     var t_conv: usize = 0;
     var t_new: usize = 0;
     var t_back: usize = 0;
@@ -10930,7 +11040,7 @@ test "messages screen: payment cards and the pay sheet emit their regions (M5 A4
     };
 
     // Sheet closed: the card buttons carry their thread ordinals.
-    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed);
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, false);
     var pay_at: u16 = 999;
     var received_at: u16 = 999;
     var decline_at: u16 = 999;
@@ -10959,7 +11069,7 @@ test "messages screen: payment cards and the pay sheet emit their regions (M5 A4
     // and the amber status line renders without disturbing the regions.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{ .open = true, .rail = .onchain, .amount = "5000", .note = "dinner", .status = "They haven't set up payments" }, .{}, &.{}, .{}, .{}, .{}, .confirmed);
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{ .open = true, .rail = .onchain, .amount = "5000", .note = "dinner", .status = "They haven't set up payments" }, .{}, &.{}, .{}, .{}, .{}, .confirmed, false);
     var n_rail: usize = 0;
     var n_chip: usize = 0;
     var n_amount: usize = 0;
@@ -11169,7 +11279,7 @@ test "a WATCHED card says it is being watched, and stops asking for a confirmati
     const watched = [_]chat_view.PayCard{
         .{ .payment_id = 7, .amount_sat = 5000, .rail = .lightning, .status = .pending, .confirmations = 0, .watching = true },
     };
-    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &watched, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed);
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &watched, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, false);
 
     // The card is still cancellable — a payment you have not approved yet is
     // still yours to abandon.

@@ -83,16 +83,46 @@ pub const Published = struct {
 
 /// Make sure our key-directory entry exists: load (or mint + persist) the
 /// last-resort package + anchor, then put the record at rkey "self".
+///
+/// `replace_foreign` is the A3 gate. The record is a SINGLETON at rkey "self"
+/// and putRecord overwrites, so publishing a freshly-minted anchor over an
+/// existing one silently REPLACES the account's chat identity — which is what
+/// a reinstall, a cleared cache, or one run with a different `ZAT_CACHE_DIR`
+/// used to do, orphaning every conversation the account had, with no warning
+/// and no way back (the anchor seed is device-bound and unrecoverable).
+///
+/// So the write is refused by default when the published record pins an anchor
+/// that ISN'T this device's: `error.IdentityElsewhere`. The caller surfaces
+/// that as a choice the user makes on purpose, and passes `replace_foreign`
+/// only when they have made it.
 pub fn ensurePublished(
     gpa: Allocator,
     arena: Allocator,
     io: std.Io,
     environ: ?*const std.process.Environ.Map,
     session: *auth.Session,
+    replace_foreign: bool,
 ) !Published {
     const did = session.did;
     var anchor_load = cache.loadOrCreateAnchorSeed(gpa, io, environ, did) orelse return error.NoAnchor;
     defer std.crypto.secureZero(u8, &anchor_load.seed);
+
+    // A3 — DO NOT HIJACK AN IDENTITY THAT LIVES SOMEWHERE ELSE.
+    //
+    // The check is on the KEYS, not on `AnchorLoad.created`: a device that
+    // minted a fresh anchor on a previous launch and failed to publish would
+    // look "not new" the next time round and clobber the record then instead.
+    // What matters is only ever the question this asks — does the account
+    // already publish a chat key that is not ours?
+    //
+    // A record we cannot read or that fails validation is NOT a foreign
+    // identity: it is a broken one, and publishing over it is the repair.
+    if (!replace_foreign) {
+        const mine = try anchor.publicKey(anchor_load.seed);
+        if (fetchPeer(gpa, arena, io, environ, did) catch null) |published| {
+            if (!std.mem.eql(u8, &published.anchor_pub, &mine)) return error.IdentityElsewhere;
+        }
+    }
 
     const now = clock.unixSeconds();
     var kp_path_buf: [512]u8 = undefined;

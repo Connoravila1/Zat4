@@ -736,6 +736,18 @@ const RunState = struct {
     /// pump itself is a walk of a handful of rows against a pure backoff, but
     /// there is no reason to do it 60 times a second.
     gchat_retry_at: i64,
+    /// The relay endpoint, kept so chat can be brought up AGAIN from a click —
+    /// A3's "set up chat fresh here" (`chatBringUp`).
+    gchat_host_buf: [128]u8,
+    gchat_host_len: usize,
+    gchat_port: u16,
+    /// An env/dist slice: lives as long as the process, so it is not copied.
+    gchat_token: []const u8,
+    gchat_use_tls: bool,
+    /// A3: this account's chat identity is published from ANOTHER device and we
+    /// refused to overwrite it. Messages says so, plainly, and offers the only
+    /// honest way forward — never a silently re-minted identity.
+    gchat_identity_elsewhere: bool,
     gcreate_prepare_frames: u32,
     algo_lib: algo_library.Library,
     algo_uid: u32,
@@ -1355,6 +1367,12 @@ fn initRunState(
     rs.gchat_e2ee = null;
     rs.gchat_mail = .empty;
     rs.gchat_retry_at = 0;
+    rs.gchat_host_buf = undefined;
+    rs.gchat_host_len = 0;
+    rs.gchat_port = 0;
+    rs.gchat_token = "";
+    rs.gchat_use_tls = false;
+    rs.gchat_identity_elsewhere = false;
     if (dev_chat) {
         if (environ) |env| {
             // The endpoint + token: env wins; the compiled-in dist values are
@@ -1395,77 +1413,16 @@ fn initRunState(
                     443
                 else
                     0;
-                if (rport != 0 and token.len > 0 and rhost.len > 0) {
-                    // Bring up the crypto (publishes our keyPackage, restores
-                    // saved conversations), then the relay link subscribed to
-                    // our own inbox mailbox.
-                    _ = rs.gchat_arena_state.reset(.retain_capacity);
-                    if (chat_e2ee.init(gpa, rs.gchat_arena_state.allocator(), io, env, session)) |st| {
-                        rs.gchat_e2ee = st;
-                        // M2.1: bootstrap inbox (Welcomes) + every restored
-                        // conversation's current-epoch traffic mailbox.
-                        if (chat_e2ee.subscriptions(gpa, &st)) |subs| {
-                            defer gpa.free(subs);
-                            // A4 slice 2: the link carries THIS DEVICE'S identity —
-                            // the DID and the anchor seed that proves it. The relay
-                            // challenges us and we sign; a relay that has flipped to
-                            // require_auth admits nothing else. The seed is the same
-                            // key the directory already publishes for us.
-                            rs.gchat_link = chat_relay.start(gpa, io, &rs.gchat_box, rhost, rport, token, use_tls, subs, st.my_did, st.anchor_seed) catch null;
-                        } else |_| {}
-                        // Restore the displayed history (M2) first. A missing
-                        // or corrupt blob is a cold start, never a half-restore
-                        // (the codec is strict) — the mirror below still
-                        // recovers the conversation LIST from the MLS groups;
-                        // only the transcript would be gone.
-                        var hist_path_buf: [512]u8 = undefined;
-                        if (cache_shell.chatHistoryPath(&hist_path_buf, env, st.my_did)) |hist_path| {
-                            if (cache_shell.loadChatHistoryAt(gpa, hist_path, st.my_did)) |blob| {
-                                defer {
-                                    std.crypto.secureZero(u8, blob);
-                                    gpa.free(blob);
-                                }
-                                if (chat_core.deserializeStore(gpa, blob)) |restored| {
-                                    chat_core.deinitStore(gpa, &rs.gchat_store);
-                                    rs.gchat_store = restored;
-                                } else |_| {}
-                            }
-                        }
-                        // Mirror restored conversations into the view store so
-                        // they show on launch (openConversation dedupes by DID,
-                        // so ones already in the history blob are found, not
-                        // doubled), then persist once to heal any divergence.
-                        for (st.peer_dids.items) |did| {
-                            _ = chat_core.openConversation(gpa, &rs.gchat_store, did, "") catch {};
-                        }
-                        // HEAL-GUARD (final-product law: chats are never lost
-                        // by machinery, only by the user): persist at init
-                        // ONLY when something was actually restored — a
-                        // failed restore writing the empty store would
-                        // DESTROY the very blob it failed to read.
-                        if (st.peer_dids.items.len > 0 or rs.gchat_store.convs.len > 0)
-                            chatPersistHistory(gpa, io, env, &st, &rs.gchat_store);
-                        if (rs.gchat_link != null) {
-                            chatLog("[chat] E2EE up -> {s} ({d} conversation(s) restored)", .{ hostport, st.peer_dids.items.len });
-                            // THE mailboxes. A Welcome deposited into an address
-                            // the peer is not draining is delivered nowhere,
-                            // forever, and says nothing. Print both ends.
-                            {
-                                var hb: [16]u8 = undefined;
-                                chatLog("[chat]   my inbox  = {s}  (Welcomes to me land here)", .{chat_e2ee.mailboxHex(&hb, chat_e2ee.inbox(&st))});
-                                for (st.peer_dids.items) |pd| {
-                                    if (chat_e2ee.peerBootstrap(&st, pd)) |pb| {
-                                        var hb2: [16]u8 = undefined;
-                                        chatLog("[chat]   peer {s} bootstrap = {s}", .{ pd, chat_e2ee.mailboxHex(&hb2, pb) });
-                                    }
-                                }
-                            }
-                        } else {
-                            chatLog("[chat] keys ready but the relay link did NOT start", .{});
-                        }
-                    } else |err| {
-                        chatLog("[chat] E2EE init failed: {s}", .{@errorName(err)});
-                    }
+                if (rport != 0 and token.len > 0 and rhost.len > 0 and rhost.len <= rs.gchat_host_buf.len) {
+                    // Remember the endpoint: A3's "set up chat fresh here" has to
+                    // be able to bring the whole thing up again later, from a
+                    // click, long after this env parse is out of scope.
+                    @memcpy(rs.gchat_host_buf[0..rhost.len], rhost);
+                    rs.gchat_host_len = rhost.len;
+                    rs.gchat_port = rport;
+                    rs.gchat_token = token; // an env slice: lives as long as the process
+                    rs.gchat_use_tls = use_tls;
+                    chatBringUp(rs, gpa, io, env, session, false);
                 } else {
                     chatLog("[chat] ZAT4_RELAY malformed (need host:port) or ZAT_RELAY_TOKEN unset", .{});
                 }
@@ -3318,7 +3275,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        var pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = .{ .cards = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .q_focus = rs.gmarket_q_focus, .loading = rs.market_loading, .filter = rs.gmarket_filter, .hover_x = rs.ghover_x, .hover_y = rs.ghover_y }, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_delivery = chatDeliveryOf(rs), .kbd_visible = softKeyboardWanted(rs), .kbd_shift = rs.kbd_shift, .kbd_page = rs.kbd_page, .kbd_caps = rs.kbd_caps, .kbd_flash_key = rs.kbd_flash_key, .kbd_flash_a = kbdFlashAlpha(rs), .kbd_popup = .{ .opts = rs.kbd_popup_opts[0..rs.kbd_popup_n], .anchor_x = rs.kbd_popup_ax, .anchor_y = rs.kbd_popup_ay, .anchor_w = rs.kbd_popup_aw, .sel = rs.kbd_popup_sel }, .kbd_emoji_open = rs.kbd_emoji_open, .kbd_emoji_scroll = @intFromFloat(rs.kbd_emoji_scroll), .kbd_picker_mode = rs.kbd_picker_mode, .kbd_nav_t = rs.kbd_nav_t, .kbd_nav_scroll = @intFromFloat(rs.kbd_nav_scroll), .chat_q = rs.gchat_q_buf[0..rs.gchat_q_len], .chat_q_focus = rs.gchat_q_focus, .chat_q_caret = composeBlinkOn(rs.caret_anchor_ns), .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_edit = .{ .caret = @min(rs.gchat_caret, rs.gchat_draft_len), .sel_a = @min(rs.gchat_sel_a, rs.gchat_draft_len), .sel_b = @min(rs.gchat_sel_b, rs.gchat_draft_len), .bar = rs.gchat_edit_bar }, .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .step = rs.gpay_step, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents, .busy = rs.gpay_busy }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved, .rooted = rs.grecv_set, .set = rs.grecv_set, .known = rs.grecv_known, .probing = rs.grecv_probing, .caps = rs.gcaps }, .wallet_remove_armed = rs.gwallet_remove_armed, .verify_ids = verifyIdsOf(arena, rs), .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
+        var pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = .{ .cards = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .q_focus = rs.gmarket_q_focus, .loading = rs.market_loading, .filter = rs.gmarket_filter, .hover_x = rs.ghover_x, .hover_y = rs.ghover_y }, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_delivery = chatDeliveryOf(rs), .chat_identity_elsewhere = rs.gchat_identity_elsewhere, .kbd_visible = softKeyboardWanted(rs), .kbd_shift = rs.kbd_shift, .kbd_page = rs.kbd_page, .kbd_caps = rs.kbd_caps, .kbd_flash_key = rs.kbd_flash_key, .kbd_flash_a = kbdFlashAlpha(rs), .kbd_popup = .{ .opts = rs.kbd_popup_opts[0..rs.kbd_popup_n], .anchor_x = rs.kbd_popup_ax, .anchor_y = rs.kbd_popup_ay, .anchor_w = rs.kbd_popup_aw, .sel = rs.kbd_popup_sel }, .kbd_emoji_open = rs.kbd_emoji_open, .kbd_emoji_scroll = @intFromFloat(rs.kbd_emoji_scroll), .kbd_picker_mode = rs.kbd_picker_mode, .kbd_nav_t = rs.kbd_nav_t, .kbd_nav_scroll = @intFromFloat(rs.kbd_nav_scroll), .chat_q = rs.gchat_q_buf[0..rs.gchat_q_len], .chat_q_focus = rs.gchat_q_focus, .chat_q_caret = composeBlinkOn(rs.caret_anchor_ns), .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_edit = .{ .caret = @min(rs.gchat_caret, rs.gchat_draft_len), .sel_a = @min(rs.gchat_sel_a, rs.gchat_draft_len), .sel_b = @min(rs.gchat_sel_b, rs.gchat_draft_len), .bar = rs.gchat_edit_bar }, .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .step = rs.gpay_step, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents, .busy = rs.gpay_busy }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved, .rooted = rs.grecv_set, .set = rs.grecv_set, .known = rs.grecv_known, .probing = rs.grecv_probing, .caps = rs.gcaps }, .wallet_remove_armed = rs.gwallet_remove_armed, .verify_ids = verifyIdsOf(arena, rs), .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
         switch (rs.mode) {
             .timeline => try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status),
             .compose => {
@@ -5811,6 +5768,18 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         // drifted apart (see chatRestart).
                                         .chat_restart => if (dev_chat) {
                                             if (rs.gchat_sel) |sc| chatRestart(rs, gpa, io, environ, sc);
+                                        },
+                                        // A3: the user has read what it costs and
+                                        // chosen to make THIS device the one that owns
+                                        // chat for the account. Only now do we replace
+                                        // the published key — never on our own.
+                                        .chat_identity_reset => if (dev_chat) {
+                                            chatLog("[chat] A3: user chose to set chat up fresh on this device (replacing the published key)", .{});
+                                            chatBringUp(rs, gpa, io, environ, session, true);
+                                            rs.status = if (rs.gchat_identity_elsewhere)
+                                                "chat: couldn't set up on this device — try again"
+                                            else
+                                                "chat: set up on this device";
                                         },
                                         .chat_send => if (dev_chat) {
                                             const body = std.mem.trimEnd(u8, rs.gchat_draft_buf[0..rs.gchat_draft_len], " \n");
@@ -8631,6 +8600,94 @@ fn chatSend(gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, st
         chatLog("[chat] SEND FAILED -> {s}: {s}", .{ peer_did, @errorName(err) });
 }
 
+/// Bring the whole chat stack up: the E2EE session (anchor + keyPackage +
+/// restored MLS groups), the relay link, the restored transcript. Called once
+/// at startup, and AGAIN if the user chooses "set up chat fresh here" (A3) —
+/// which is the entire reason it is a function rather than an inline block.
+///
+/// `adopt` (A3) is the user's explicit answer to "your chat identity lives on
+/// another device": true means replace the published key and start over here.
+/// It is never true unless a human clicked it.
+fn chatBringUp(
+    rs: *RunState,
+    gpa: Allocator,
+    io: std.Io,
+    env: ?*const std.process.Environ.Map,
+    session: *auth.Session,
+    adopt: bool,
+) void {
+    const rhost = rs.gchat_host_buf[0..rs.gchat_host_len];
+    _ = rs.gchat_arena_state.reset(.retain_capacity);
+    var st = chat_e2ee.init(gpa, rs.gchat_arena_state.allocator(), io, env, session, adopt) catch |err| {
+        chatLog("[chat] E2EE init failed: {s}", .{@errorName(err)});
+        // A3 — the one failure that is not a failure but a FACT the user has to
+        // be told. Chat was set up on another device, and the key that owns it
+        // cannot be copied here; that is exactly what makes it worth having.
+        // The Messages screen says so, and offers the only honest way forward.
+        rs.gchat_identity_elsewhere = (err == error.IdentityElsewhere);
+        return;
+    };
+    rs.gchat_identity_elsewhere = false;
+    rs.gchat_e2ee = st;
+
+    // M2.1: bootstrap inbox (Welcomes) + every restored conversation's
+    // current-epoch traffic mailbox.
+    if (chat_e2ee.subscriptions(gpa, &st)) |subs| {
+        defer gpa.free(subs);
+        // A4 slice 2: the link carries THIS DEVICE'S identity — the DID and the
+        // anchor seed that proves it. The relay challenges us and we sign; a
+        // relay that has flipped to require_auth admits nothing else. The seed
+        // is the same key the directory already publishes for us.
+        rs.gchat_link = chat_relay.start(gpa, io, &rs.gchat_box, rhost, rs.gchat_port, rs.gchat_token, rs.gchat_use_tls, subs, st.my_did, st.anchor_seed) catch null;
+    } else |_| {}
+
+    // Restore the displayed history (M2) first. A missing or corrupt blob is a
+    // cold start, never a half-restore (the codec is strict) — the mirror below
+    // still recovers the conversation LIST from the MLS groups; only the
+    // transcript would be gone.
+    var hist_path_buf: [512]u8 = undefined;
+    if (cache_shell.chatHistoryPath(&hist_path_buf, env, st.my_did)) |hist_path| {
+        if (cache_shell.loadChatHistoryAt(gpa, hist_path, st.my_did)) |blob| {
+            defer {
+                std.crypto.secureZero(u8, blob);
+                gpa.free(blob);
+            }
+            if (chat_core.deserializeStore(gpa, blob)) |restored| {
+                chat_core.deinitStore(gpa, &rs.gchat_store);
+                rs.gchat_store = restored;
+            } else |_| {}
+        }
+    }
+    // Mirror restored conversations into the view store so they show on launch
+    // (openConversation dedupes by DID, so ones already in the history blob are
+    // found, not doubled), then persist once to heal any divergence.
+    for (st.peer_dids.items) |did| {
+        _ = chat_core.openConversation(gpa, &rs.gchat_store, did, "") catch {};
+    }
+    // HEAL-GUARD (final-product law: chats are never lost by machinery, only by
+    // the user): persist at init ONLY when something was actually restored — a
+    // failed restore writing the empty store would DESTROY the very blob it
+    // failed to read.
+    if (st.peer_dids.items.len > 0 or rs.gchat_store.convs.len > 0)
+        chatPersistHistory(gpa, io, env, &st, &rs.gchat_store);
+
+    if (rs.gchat_link != null) {
+        chatLog("[chat] E2EE up -> {s} ({d} conversation(s) restored)", .{ rhost, st.peer_dids.items.len });
+        // THE mailboxes. A Welcome deposited into an address the peer is not
+        // draining is delivered nowhere, forever, and says nothing. Print both ends.
+        var hb: [16]u8 = undefined;
+        chatLog("[chat]   my inbox  = {s}  (Welcomes to me land here)", .{chat_e2ee.mailboxHex(&hb, chat_e2ee.inbox(&st))});
+        for (st.peer_dids.items) |pd| {
+            if (chat_e2ee.peerBootstrap(&st, pd)) |pb| {
+                var hb2: [16]u8 = undefined;
+                chatLog("[chat]   peer {s} bootstrap = {s}", .{ pd, chat_e2ee.mailboxHex(&hb2, pb) });
+            }
+        }
+    } else {
+        chatLog("[chat] keys ready but the relay link did NOT start", .{});
+    }
+}
+
 /// What the open conversation's peer knows about it (A1) — the fact the
 /// thread's delivery line renders. No conversation open, or chat offline:
 /// nothing to say.
@@ -10876,6 +10933,10 @@ const Grid = struct {
     /// they ack our Welcome, `waiting` while it is still going out,
     /// `undelivered` once the retries are spent. The thread says so.
     chat_delivery: chat_core.Delivery = .confirmed,
+    /// A3: chat is published from another device and this one refused to
+    /// overwrite it. The Messages surface says so instead of showing a list
+    /// that cannot work.
+    chat_identity_elsewhere: bool = false,
     /// The payment ids the LUD-21 settlement watcher currently has an eye on.
     /// A network fact, folded onto the cards so they can say "watching for it".
     verify_ids: []const u64 = &.{},
@@ -11875,7 +11936,7 @@ fn paintFrame(
                 // Zat Chat (U3, dev-gated): the Messages surface. -scroll maps the
                 // shared ≤0 scroll state onto layoutChat's positive history offset.
                 const cf = buildChatFrame(arena, g.chat_store.?, g.chat_sel, now, g.chat_q, g.verify_ids);
-                g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_edit, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{}, &.{}, g.chat_recv, .{}, .{}, g.chat_delivery) catch g.content_h.*;
+                g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_edit, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{}, &.{}, g.chat_recv, .{}, .{}, g.chat_delivery, g.chat_identity_elsewhere) catch g.content_h.*;
             } else if (g.screen.* == feed_view.screen_loadout) {
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
                 g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market, g.bench_pick, g.bench_drag, g.published, g.create, g.dev, g.bench, .{}, g.loadout_lib_y) catch g.content_h.*; // software: draw line-art nav
@@ -12333,6 +12394,10 @@ fn paintFrameGpu(
         // ack lands — a stale line here is the exact dishonesty the ack exists
         // to end (the rebuild law).
         chat_sig ^= (@as(u64, @intFromEnum(g.chat_delivery)) +% 1) *% 0xB4F6_1E27_9D3A_5C81;
+        // A3: the identity panel replaces the whole surface — it must appear the
+        // frame chat init refuses, and vanish the frame the user adopts (and its
+        // one button must be hit-testable against THIS frame's regions).
+        chat_sig ^= @as(u64, @intFromBool(g.chat_identity_elsewhere)) *% 0x6C8E_9CF5_7703_11A5;
         // The composer focus ring must appear the frame the input is tapped.
         chat_sig ^= @as(u64, @intFromBool(g.chat_input_focus)) *% 0x8A91_7F2B_4D3E_61C7;
         // Caret/selection/bar changes rebuild the strip (the rebuild law).
@@ -12673,7 +12738,7 @@ fn paintFrameGpu(
                 }
             } else |_| {}
             const reflow_t: f32 = if (gs.chat_reflow) |rh| (gs.chat_world.position(rh) orelse 1.0) else 1.0;
-            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_edit, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t, .sheet_t = gs.sheet_t }, xforms, g.chat_recv, .{ .top = @intCast(gs.inset_top_l), .bottom = @intCast(@max(gs.inset_bottom_l, @max(gs.ime_bottom_l, if (g.kbd_visible) feed_view.keyboard_h + gs.inset_bottom_l else 0))), .left = @intCast(gs.inset_left_l), .right = @intCast(gs.inset_right_l) }, .{ .q = g.chat_q, .focus = g.chat_q_focus, .caret_on = g.chat_q_caret }, g.chat_delivery) catch g.content_h.*;
+            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_edit, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t, .sheet_t = gs.sheet_t }, xforms, g.chat_recv, .{ .top = @intCast(gs.inset_top_l), .bottom = @intCast(@max(gs.inset_bottom_l, @max(gs.ime_bottom_l, if (g.kbd_visible) feed_view.keyboard_h + gs.inset_bottom_l else 0))), .left = @intCast(gs.inset_left_l), .right = @intCast(gs.inset_right_l) }, .{ .q = g.chat_q, .focus = g.chat_q_focus, .caret_on = g.chat_q_caret }, g.chat_delivery, g.chat_identity_elsewhere) catch g.content_h.*;
         } else if (g.screen.* == feed_view.screen_algo_docs) {
             g.content_h.* = feed_view.layoutAlgoDocs(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, if (g.docs_kind == 1) algo_docs.dev_doc else algo_docs.user_doc) catch g.content_h.*;
         } else if (g.screen.* == feed_view.screen_algo_detail) {

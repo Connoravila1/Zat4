@@ -788,7 +788,17 @@ pub fn main(init: std.process.Init) !void {
         // keyPackage, then fetch it back the way a COUNTERPARTY would (public
         // getRecord on the DID's own PDS) and validate the whole chain.
         if (chat_publish) {
-            const pub_result = chat_keys.ensurePublished(gpa, arena, io, env, &session) catch |err| {
+            // replace_foreign = false (A3): even a dev tool does not get to
+            // silently overwrite an account's chat identity. If the keys live on
+            // another device this refuses and says so, which is the whole point.
+            const pub_result = chat_keys.ensurePublished(gpa, arena, io, env, &session, false) catch |err| {
+                if (err == error.IdentityElsewhere) {
+                    try out.print("--chat-publish refused: this account's chat keys are published from ANOTHER device.\n" ++
+                        "  Publishing here would replace them and orphan every conversation the account has.\n" ++
+                        "  Do it from the app (Messages → \"Set up chat fresh on this device\") if that is really what you want.\n", .{});
+                    try out.flush();
+                    return err;
+                }
                 try out.print("--chat-publish failed: {s}\n", .{@errorName(err)});
                 try out.flush();
                 return err;

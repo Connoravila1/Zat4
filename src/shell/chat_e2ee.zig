@@ -156,17 +156,34 @@ pub const State = struct {
     welcomes: std.ArrayList(WelcomeState) = .empty,
 };
 
-pub const InitError = error{ NoAnchor, NoCacheDir, PublishFailed, OutOfMemory };
+pub const InitError = error{
+    NoAnchor,
+    NoCacheDir,
+    PublishFailed,
+    OutOfMemory,
+    /// A3: this account already publishes a chat key, and it is not this
+    /// device's. Chat was set up somewhere else, and the anchor key that owns
+    /// it cannot be copied here (that is what makes it worth anything). We
+    /// refuse to overwrite it silently — the user is told, and may choose to
+    /// set chat up fresh here, which is a real choice with a real cost.
+    IdentityElsewhere,
+};
 
 /// Bring the account's chat crypto up: publish-or-refresh our directory
 /// entry (idempotent — also mints the package + anchor on first use),
 /// restore persisted conversations. One network round-trip at startup.
+/// `adopt` (A3): the user has been told this account's chat identity lives on
+/// another device and has chosen to set chat up FRESH here anyway — replacing
+/// the published key. Their existing conversations cannot move with them, and
+/// the peers on the other side will have to re-establish. Never true unless a
+/// human said so.
 pub fn init(
     gpa: Allocator,
     arena: Allocator,
     io: std.Io,
     environ: ?*const std.process.Environ.Map,
     session: *@import("auth.zig").Session,
+    adopt: bool,
 ) !State {
     // LOCAL-FIRST. The old order ran the keyPackage PUBLISH (a network
     // write) before anything else, so ANY auth/network failure aborted
@@ -183,10 +200,13 @@ pub fn init(
     var minted_now = false;
     var kp = cache.loadChatKeyPackageAt(gpa, kp_path, session.did) orelse blk: {
         minted_now = true;
-        _ = chat_keys.ensurePublished(gpa, arena, io, environ, session) catch |err| switch (err) {
+        _ = chat_keys.ensurePublished(gpa, arena, io, environ, session, adopt) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.NoAnchor => return error.NoAnchor,
             error.NoCacheDir => return error.NoCacheDir,
+            // A3: the account's chat identity is on another device. Do not
+            // publish, do not mint over it, do not pretend chat is up.
+            error.IdentityElsewhere => return error.IdentityElsewhere,
             else => return error.PublishFailed,
         };
         break :blk cache.loadChatKeyPackageAt(gpa, kp_path, session.did) orelse return error.NoCacheDir;
@@ -204,8 +224,12 @@ pub fn init(
     restoreGroups(gpa, environ, &st);
     // Re-assert the published record (heals a wiped/expired PDS record) —
     // best-effort on a returning device: a failed network leg must never
-    // hide the local conversations again.
-    if (!minted_now) _ = chat_keys.ensurePublished(gpa, arena, io, environ, session) catch {};
+    // hide the local conversations again. The A3 gate applies here too: if the
+    // record now pins ANOTHER device's key, this re-assert would silently
+    // steal the identity back, and two devices trading it every launch is the
+    // same footgun wearing a different hat. Refused, quietly — our local
+    // conversations still load, which is what this best-effort call is for.
+    if (!minted_now) _ = chat_keys.ensurePublished(gpa, arena, io, environ, session, adopt) catch {};
     return st;
 }
 
