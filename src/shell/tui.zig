@@ -713,6 +713,10 @@ const RunState = struct {
     gwallet_remove_armed: bool,
     /// The capability probe: what can the wallet the user just typed actually do?
     gcaps_job: WalletProbeJob,
+    /// Lightning payments we are watching settle (LUD-21). The payoff moment.
+    gverify: [verify_watch_max]VerifyWatch,
+    gverify_n: usize,
+    gverify_job: VerifyJob,
     /// True while the probe is out — the form shows "Checking with Strike…".
     grecv_probing: bool,
     /// The answer, held so the app can render its unavailable features FROM it —
@@ -1330,6 +1334,9 @@ fn initRunState(
     rs.gcaps_job = .{};
     rs.gcaps = .{};
     rs.grecv_probing = false;
+    rs.gverify = undefined;
+    rs.gverify_n = 0;
+    rs.gverify_job = .{};
 
     // The real E2EE session (M1): the crypto state (anchor, keyPackage,
     // per-conversation MLS groups) + the relay link that carries encrypted
@@ -1681,6 +1688,11 @@ fn deinitRunState(rs: *RunState) void {
         t.join();
         rs.gcaps_job.thread = null;
         walletProbeJobFree(&rs.gcaps_job);
+    }
+    if (rs.gverify_job.thread) |t| {
+        t.join();
+        rs.gverify_job.thread = null;
+        verifyJobFree(&rs.gverify_job);
     }
     {
         var it = rs.ghandle_tried.keyIterator();
@@ -2109,7 +2121,17 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         }
                     } else {
                         // The hand-off. The URI is built and exact.
-                        const verdict = payCommit(gpa, io, environ, e2ee, rs.gchat_link, &rs.gchat_store, conv, job.rail, job.amount_sat, job.note, job.paying, now, job.uri_buf[0..job.uri_len]);
+                        var minted: u64 = 0;
+                        const verdict = payCommit(gpa, io, environ, e2ee, rs.gchat_link, &rs.gchat_store, conv, job.rail, job.amount_sat, job.note, job.paying, now, job.uri_buf[0..job.uri_len], &minted);
+                        // THE WATCH. The payee's provider handed us a verify URL
+                        // with the invoice, so this payment can confirm ITSELF —
+                        // no custody, no wallet connection, nobody trusted. Where
+                        // it did not (Strike, Wallet of Satoshi), there is nothing
+                        // to watch and the card waits for a human, as their
+                        // capability table said it would.
+                        if (verdict.len == 0 and minted != 0 and job.verify_len > 0) {
+                            verifyWatchAdd(rs, minted, job.conv, job.verify_buf[0..job.verify_len], clock_shell.monotonicNanos());
+                        }
                         if (verdict.len > 0) {
                             if (sheet_is_theirs) rs.gpay_status = verdict else rs.status = verdict;
                         } else {
@@ -2127,6 +2149,86 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 }
             }
         }
+
+        // ── THE SETTLEMENT WATCH (LUD-21). Poll the payee's provider and ask the
+        // one question that used to have no answer: has it landed? When it has,
+        // the card flips ITSELF to Sent ✓ and the peer is signalled — nobody
+        // tapped anything, and nobody had to be trusted. ──
+        if (dev_chat) if (rs.gchat_e2ee) |*st| {
+            const now_ns = clock_shell.monotonicNanos();
+
+            // Retire watches nobody is coming back for. The card does NOT fail —
+            // we simply stop knowing, which is honest, and it falls back to the
+            // manual confirm. Silence is never read as settlement.
+            {
+                var i: usize = 0;
+                while (i < rs.gverify_n) {
+                    if (now_ns -| rs.gverify[i].started_ns > verify_giveup_ns) {
+                        rs.gverify[i] = rs.gverify[rs.gverify_n - 1];
+                        rs.gverify_n -= 1;
+                        continue;
+                    }
+                    i += 1;
+                }
+            }
+
+            if (rs.gverify_job.thread == null and rs.gverify_n > 0) spawn_v: {
+                const a = std.heap.page_allocator;
+                var items: std.ArrayList(VerifyItem) = .empty;
+                for (rs.gverify[0..rs.gverify_n]) |*w| {
+                    if (now_ns < w.next_ns) continue;
+                    // Brisk while the payer is plausibly still looking at their
+                    // wallet; lazy once they have plainly wandered off.
+                    const age = now_ns -| w.started_ns;
+                    w.next_ns = now_ns + (if (age < verify_fast_window_ns) verify_fast_ns else verify_slow_ns);
+                    const u = a.dupe(u8, w.url_buf[0..w.url_len]) catch continue;
+                    items.append(a, .{ .payment_id = w.payment_id, .conv = w.conv, .url = u }) catch {
+                        a.free(u);
+                        break;
+                    };
+                }
+                if (items.items.len == 0) {
+                    items.deinit(a);
+                    break :spawn_v;
+                }
+                const owned = items.toOwnedSlice(a) catch {
+                    for (items.items) |it| a.free(it.url);
+                    items.deinit(a);
+                    break :spawn_v;
+                };
+                rs.gverify_job = .{ .items = owned };
+                rs.gverify_job.thread = std.Thread.spawn(.{}, verifyWorker, .{ &rs.gverify_job, io, environ }) catch {
+                    verifyJobFree(&rs.gverify_job);
+                    break :spawn_v;
+                };
+            }
+
+            if (rs.gverify_job.thread) |t| {
+                if (rs.gverify_job.done.load(.acquire)) {
+                    t.join();
+                    rs.gverify_job.thread = null;
+                    var settled_any = false;
+                    for (rs.gverify_job.items) |it| {
+                        if (!it.settled) continue; // merely unpaid, or unanswered
+                        const conv: chat_core.ConvIndex = @enumFromInt(it.conv);
+                        const pay = chat_core.findPayment(&rs.gchat_store, conv, it.payment_id) orelse {
+                            verifyWatchDrop(rs, it.payment_id);
+                            continue;
+                        };
+                        if (chat_core.advancePayment(gpa, &rs.gchat_store, pay, .settled, null) catch false) {
+                            settled_any = true;
+                            // Tell the other side, over the wire byte that has
+                            // existed all along and never had anything to say.
+                            payCardEvent(gpa, io, environ, st, rs.gchat_link, &rs.gchat_store, conv, it.payment_id, true);
+                            rs.status = "pay: settled \u{2014} it landed";
+                        }
+                        verifyWatchDrop(rs, it.payment_id);
+                    }
+                    if (settled_any) chatPersistHistory(gpa, io, environ, st, &rs.gchat_store);
+                    verifyJobFree(&rs.gverify_job);
+                }
+            }
+        };
 
         // The wallet probe's answer. Nothing is published yet: the user is taken
         // to the capability review to sign off on what this wallet will and will
@@ -3109,7 +3211,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        var pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = .{ .cards = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .q_focus = rs.gmarket_q_focus, .loading = rs.market_loading, .filter = rs.gmarket_filter, .hover_x = rs.ghover_x, .hover_y = rs.ghover_y }, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .kbd_visible = toggleOn(rs.toggle_bits, settings_view.act_zat_kbd) and typingOwnsKeyboard(rs), .kbd_shift = rs.kbd_shift, .kbd_page = rs.kbd_page, .kbd_caps = rs.kbd_caps, .kbd_flash_key = rs.kbd_flash_key, .kbd_flash_a = kbdFlashAlpha(rs), .kbd_popup = .{ .opts = rs.kbd_popup_opts[0..rs.kbd_popup_n], .anchor_x = rs.kbd_popup_ax, .anchor_y = rs.kbd_popup_ay, .anchor_w = rs.kbd_popup_aw, .sel = rs.kbd_popup_sel }, .kbd_emoji_open = rs.kbd_emoji_open, .kbd_emoji_scroll = @intFromFloat(rs.kbd_emoji_scroll), .kbd_picker_mode = rs.kbd_picker_mode, .kbd_nav_t = rs.kbd_nav_t, .kbd_nav_scroll = @intFromFloat(rs.kbd_nav_scroll), .chat_q = rs.gchat_q_buf[0..rs.gchat_q_len], .chat_q_focus = rs.gchat_q_focus, .chat_q_caret = composeBlinkOn(rs.caret_anchor_ns), .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_edit = .{ .caret = @min(rs.gchat_caret, rs.gchat_draft_len), .sel_a = @min(rs.gchat_sel_a, rs.gchat_draft_len), .sel_b = @min(rs.gchat_sel_b, rs.gchat_draft_len), .bar = rs.gchat_edit_bar }, .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .step = rs.gpay_step, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents, .busy = rs.gpay_busy }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved, .rooted = rs.grecv_set, .set = rs.grecv_set, .known = rs.grecv_known, .probing = rs.grecv_probing, .caps = rs.gcaps }, .wallet_remove_armed = rs.gwallet_remove_armed, .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
+        var pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = .{ .cards = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .q_focus = rs.gmarket_q_focus, .loading = rs.market_loading, .filter = rs.gmarket_filter, .hover_x = rs.ghover_x, .hover_y = rs.ghover_y }, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .kbd_visible = toggleOn(rs.toggle_bits, settings_view.act_zat_kbd) and typingOwnsKeyboard(rs), .kbd_shift = rs.kbd_shift, .kbd_page = rs.kbd_page, .kbd_caps = rs.kbd_caps, .kbd_flash_key = rs.kbd_flash_key, .kbd_flash_a = kbdFlashAlpha(rs), .kbd_popup = .{ .opts = rs.kbd_popup_opts[0..rs.kbd_popup_n], .anchor_x = rs.kbd_popup_ax, .anchor_y = rs.kbd_popup_ay, .anchor_w = rs.kbd_popup_aw, .sel = rs.kbd_popup_sel }, .kbd_emoji_open = rs.kbd_emoji_open, .kbd_emoji_scroll = @intFromFloat(rs.kbd_emoji_scroll), .kbd_picker_mode = rs.kbd_picker_mode, .kbd_nav_t = rs.kbd_nav_t, .kbd_nav_scroll = @intFromFloat(rs.kbd_nav_scroll), .chat_q = rs.gchat_q_buf[0..rs.gchat_q_len], .chat_q_focus = rs.gchat_q_focus, .chat_q_caret = composeBlinkOn(rs.caret_anchor_ns), .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_edit = .{ .caret = @min(rs.gchat_caret, rs.gchat_draft_len), .sel_a = @min(rs.gchat_sel_a, rs.gchat_draft_len), .sel_b = @min(rs.gchat_sel_b, rs.gchat_draft_len), .bar = rs.gchat_edit_bar }, .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .step = rs.gpay_step, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents, .busy = rs.gpay_busy }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved, .rooted = rs.grecv_set, .set = rs.grecv_set, .known = rs.grecv_known, .probing = rs.grecv_probing, .caps = rs.gcaps }, .wallet_remove_armed = rs.gwallet_remove_armed, .verify_ids = verifyIdsOf(arena, rs), .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
         switch (rs.mode) {
             .timeline => try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status),
             .compose => {
@@ -8375,7 +8477,7 @@ const ChatFrame = struct {
     list: []const chat_view_core.ListRow = &.{},
     thread: []const chat_view_core.BubbleRow = &.{},
     /// The thread's payment cards, addressed by `BubbleRow.pay` (M5 A4).
-    cards: []const chat_view_core.PayCard = &.{},
+    cards: []chat_view_core.PayCard = &.{},
     sel: u16 = std.math.maxInt(u16),
     peer: []const u8 = "",
     /// The open thread's stable message keys, parallel to `thread` (U6b): the
@@ -8681,6 +8783,9 @@ fn payCommit(
     paying: ?u64,
     now: i64,
     uri: []const u8,
+    /// Out: the payment id this send is carried by, so the caller can start
+    /// WATCHING it settle. Zero when nothing was written.
+    id_out: *u64,
 ) []const u8 {
     const state = st orelse return "Chat is offline \u{2014} no relay configured";
     const l = link orelse return "Chat is offline \u{2014} no relay configured";
@@ -8701,6 +8806,7 @@ fn payCommit(
         _ = chat_core.appendPayment(gpa, cs, conv, .payment_sent, id, rail, amount_sat, note, now, true) catch
             return "Out of memory";
     }
+    id_out.* = id;
     chatPersistHistory(gpa, io, env, state, cs);
     chat_e2ee.sendPayment(gpa, io, env, state, l, peer_did, .payment_sent, .{
         .payment_id = id,
@@ -9096,6 +9202,12 @@ const PaySendJob = struct {
     resolved: bool = false,
     uri_buf: [payuri.max_uri_len]u8 = undefined,
     uri_len: usize = 0,
+    /// LUD-21: where THIS invoice can be watched. Empty when the payee's provider
+    /// does not offer it — Strike and Wallet of Satoshi do not; Alby and Coinos
+    /// do. Its presence is what decides whether this payment confirms itself or
+    /// waits for someone to tap "Mark received".
+    verify_buf: [512]u8 = undefined,
+    verify_len: usize = 0,
     /// "" = no failure. Always a static literal, so it crosses the seam freely.
     err: []const u8 = "",
 };
@@ -9159,7 +9271,7 @@ fn paySendWorker(job: *PaySendJob, io: std.Io, environ: ?*const std.process.Envi
         // invoice for THIS amount, so the wallet cannot send a different number
         // than the card shows. This is the leg that could hang a frame.
         .lightning => ln: {
-            const bolt11 = lnurl.resolveInvoice(arena, io, environ, addr, job.amount_sat) catch |err| {
+            const res = lnurl.resolveInvoice(arena, io, environ, addr, job.amount_sat) catch |err| {
                 job.err = switch (err) {
                     error.AmountOutOfRange => "That amount is outside their wallet's limits",
                     error.NotPayEndpoint, error.BadAddress => "Their Lightning address didn't resolve",
@@ -9169,7 +9281,11 @@ fn paySendWorker(job: *PaySendJob, io: std.Io, environ: ?*const std.process.Envi
                 job.done.store(true, .release);
                 return;
             };
-            break :ln payuri.buildLightningInvoiceUri(&job.uri_buf, bolt11) catch {
+            if (res.verify.len > 0 and res.verify.len <= job.verify_buf.len) {
+                @memcpy(job.verify_buf[0..res.verify.len], res.verify);
+                job.verify_len = res.verify.len;
+            }
+            break :ln payuri.buildLightningInvoiceUri(&job.uri_buf, res.bolt11) catch {
                 job.err = "Their wallet returned a bad invoice";
                 job.done.store(true, .release);
                 return;
@@ -9180,6 +9296,142 @@ fn paySendWorker(job: *PaySendJob, io: std.Io, environ: ?*const std.process.Envi
     // how much of it is real.
     job.uri_len = uri.len;
     job.done.store(true, .release);
+}
+
+// ---------------------------------------------------------------------------
+// THE LIGHTNING SETTLEMENT WATCHER (LUD-21)
+//
+// The moment this whole subsystem was missing. A Lightning payment is approved
+// inside the payer's own wallet — an app we hand off to and cannot see into —
+// and settles on a rail we do not touch. So nobody outside the payee's wallet
+// observed it, and the card sat at "Approve in your wallet" forever until a
+// human tapped "Mark received". That button was a confession.
+//
+// LUD-21 closes it WITHOUT custody and without connecting a wallet: the invoice
+// the payer fetched comes with a `verify` URL, and polling it answers exactly one
+// question — has this landed? When it has, the card flips itself to Sent ✓ and
+// the peer is signalled over the existing wire byte. Nobody had to be trusted and
+// nobody had to be asked.
+//
+// It is not universal, and we never pretend it is: Alby and Coinos offer `verify`,
+// Strike and Wallet of Satoshi do not (live-probed 2026-07-12). Which one you get
+// is a property of the PAYEE's provider — precisely what their capability table
+// told them when they set the wallet up. Where it is absent, "Mark received"
+// stays, and it now says whose wallet made that necessary.
+// ---------------------------------------------------------------------------
+
+/// How many payments we watch at once. More than a couple in flight is already
+/// unusual; the cap keeps this an inline array with no allocation churn.
+const verify_watch_max: usize = 4;
+
+/// A payment settles in seconds, so the first minute is polled BRISKLY — this is
+/// the payoff moment and a lazy cadence would squander it. After that the payer
+/// has plainly wandered off, and we back away.
+const verify_fast_ns: u64 = 2 * std.time.ns_per_s;
+const verify_slow_ns: u64 = 10 * std.time.ns_per_s;
+const verify_fast_window_ns: u64 = 90 * std.time.ns_per_s;
+/// Give up watching after this long. The card does NOT become "failed" — we
+/// simply stop knowing, which is the honest outcome, and it falls back to the
+/// manual confirm. We never infer a settlement from silence.
+const verify_giveup_ns: u64 = 10 * std.time.ns_per_min;
+
+/// One Lightning payment we are watching settle.
+/// A7.2: cold struct, size guard waived — at most `verify_watch_max` exist.
+const VerifyWatch = struct {
+    payment_id: u64 = 0,
+    conv: u32 = 0,
+    url_buf: [512]u8 = undefined,
+    url_len: usize = 0,
+    started_ns: u64 = 0,
+    /// Monotonic ns of the next due poll.
+    next_ns: u64 = 0,
+};
+
+/// One watch handed to the worker, and its answer.
+/// A7.2: cold struct, size guard waived.
+const VerifyItem = struct {
+    payment_id: u64,
+    conv: u32,
+    /// page-alloc'd copy — the render thread's watch array must not be borrowed
+    /// across the seam.
+    url: []u8,
+    settled: bool = false,
+};
+
+/// A7.2: cold struct, size guard waived — a singleton.
+const VerifyJob = struct {
+    thread: ?std.Thread = null,
+    done: std.atomic.Value(bool) = .init(false),
+    items: []VerifyItem = &.{},
+};
+
+fn verifyJobFree(job: *VerifyJob) void {
+    const a = std.heap.page_allocator;
+    for (job.items) |it| a.free(it.url);
+    if (job.items.len > 0) a.free(job.items);
+    job.items = &.{};
+}
+
+/// Poll each due verify URL. Pure network; the drain applies the outcome.
+fn verifyWorker(job: *VerifyJob, io: std.Io, environ: ?*const std.process.Environ.Map) void {
+    const a = std.heap.page_allocator;
+    for (job.items) |*it| {
+        var arena_state = std.heap.ArenaAllocator.init(a);
+        defer arena_state.deinit();
+        it.settled = lnurl.verifySettled(arena_state.allocator(), io, environ, it.url);
+    }
+    job.done.store(true, .release);
+}
+
+/// Begin watching a payment we just handed to a wallet. A no-op when the payee's
+/// provider offers no `verify` URL — in which case nothing can be watched, and
+/// the card will wait for a human.
+fn verifyWatchAdd(rs: *RunState, payment_id: u64, conv: u32, url: []const u8, now_ns: u64) void {
+    if (url.len == 0 or url.len > 512) return;
+    if (rs.gverify_n >= verify_watch_max) return;
+    var w: VerifyWatch = .{
+        .payment_id = payment_id,
+        .conv = conv,
+        .url_len = url.len,
+        .started_ns = now_ns,
+        // Poll almost immediately: a Lightning payment can land before the user
+        // has finished putting their phone down.
+        .next_ns = now_ns + std.time.ns_per_s,
+    };
+    @memcpy(w.url_buf[0..url.len], url);
+    rs.gverify[rs.gverify_n] = w;
+    rs.gverify_n += 1;
+}
+
+/// Drop the watch on `payment_id` (it settled, or it was withdrawn).
+fn verifyWatchDrop(rs: *RunState, payment_id: u64) void {
+    var i: usize = 0;
+    while (i < rs.gverify_n) {
+        if (rs.gverify[i].payment_id == payment_id) {
+            rs.gverify[i] = rs.gverify[rs.gverify_n - 1];
+            rs.gverify_n -= 1;
+            continue;
+        }
+        i += 1;
+    }
+}
+
+/// The watched payment ids, for the frame. Frame-arena owned.
+fn verifyIdsOf(arena: Allocator, rs: *const RunState) []const u64 {
+    if (rs.gverify_n == 0) return &.{};
+    const out = arena.alloc(u64, rs.gverify_n) catch return &.{};
+    for (out, 0..) |*o, i| o.* = rs.gverify[i].payment_id;
+    return out;
+}
+
+/// True while any payment is being watched — the card shows it, and the shell
+/// keeps animating.
+fn verifyWatching(rs: *const RunState, payment_id: u64) bool {
+    var i: usize = 0;
+    while (i < rs.gverify_n) : (i += 1) {
+        if (rs.gverify[i].payment_id == payment_id) return true;
+    }
+    return false;
 }
 
 /// Asking a wallet what it can do, off the render thread.
@@ -9692,7 +9944,10 @@ fn chatConvAt(arena: Allocator, cs: *const chat_core.Store, now: i64, query: []c
     return null;
 }
 
-fn buildChatFrame(arena: Allocator, cs: *const chat_core.Store, sel: ?chat_core.ConvIndex, now: i64, query: []const u8) ChatFrame {
+/// `watching` carries the payment ids the settlement watcher currently has an
+/// eye on (LUD-21) — a NETWORK fact the store cannot know, so the shell folds it
+/// onto the cards here rather than teaching the pure view about providers.
+fn buildChatFrame(arena: Allocator, cs: *const chat_core.Store, sel: ?chat_core.ConvIndex, now: i64, query: []const u8, watching: []const u64) ChatFrame {
     const full = chat_view_core.buildList(arena, cs, now) catch return .{};
     // The list-search filter (phone): rows and the selected ordinal both live
     // in FILTERED space, in lockstep with chatConvAt's tap mapping.
@@ -9723,6 +9978,18 @@ fn buildChatFrame(arena: Allocator, cs: *const chat_core.Store, sel: ?chat_core.
         const th = chat_view_core.buildThread(arena, cs, sc, now) catch chat_view_core.Thread{};
         out.thread = th.rows;
         out.cards = th.cards;
+        // Fold on what the settlement watcher knows. `th.cards` is arena-owned
+        // and ours to mark.
+        if (watching.len > 0) {
+            for (out.cards) |*c| {
+                for (watching) |wid| {
+                    if (c.payment_id == wid) {
+                        c.watching = true;
+                        break;
+                    }
+                }
+            }
+        }
         // The same message order `buildThread` iterated, exposed so the shell can
         // bind its per-bubble springs to rows by key (U6b). 1:1 with `th.rows`.
         out.order = chat_core.threadSlice(arena, cs, sc) catch &.{};
@@ -10415,6 +10682,9 @@ const Grid = struct {
     /// The pay sheet's frame state (M5 A4) — closed by default.
     chat_pay: feed_view.ChatPaySheet = .{},
     chat_recv: feed_view.ChatReceiveSheet = .{},
+    /// The payment ids the LUD-21 settlement watcher currently has an eye on.
+    /// A network fact, folded onto the cards so they can say "watching for it".
+    verify_ids: []const u64 = &.{},
     /// The Wallet page's Remove button is a two-tap: the first arms it, the
     /// second unpublishes. Removing your address makes you unpayable, and would
     /// strand anyone mid-send to you — it does not get a one-tap.
@@ -11406,7 +11676,7 @@ fn paintFrame(
             } else if (g.chat_store != null and g.screen.* == feed_view.screen_messages) {
                 // Zat Chat (U3, dev-gated): the Messages surface. -scroll maps the
                 // shared ≤0 scroll state onto layoutChat's positive history offset.
-                const cf = buildChatFrame(arena, g.chat_store.?, g.chat_sel, now, g.chat_q);
+                const cf = buildChatFrame(arena, g.chat_store.?, g.chat_sel, now, g.chat_q, g.verify_ids);
                 g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_edit, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{}, &.{}, g.chat_recv, .{}, .{}) catch g.content_h.*;
             } else if (g.screen.* == feed_view.screen_loadout) {
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
@@ -11919,6 +12189,17 @@ fn paintFrameGpu(
             pay_sum +%= ((@as(u64, @intFromEnum(s)) << 8) +% @as(u64, c) +% 1) *% (i + 2);
         }
         chat_sig ^= (@as(u64, cs.payments.len) << 32) ^ (pay_sum *% 0x2545_F491_4F6C_DD1D);
+        // A WATCHED card breathes while we poll for its settlement, so it must
+        // rebuild as it breathes — otherwise the GPU path caches the first frame
+        // and the "waiting for it to land" dot sits frozen, which is the exact
+        // opposite of the reassurance it exists to give. (The rebuild law: fifth
+        // surface it would have bitten.) Quantised to ~30 steps a second, so it
+        // is a pulse and not a busy-loop.
+        for (g.verify_ids) |vid| chat_sig ^= vid *% 0xC2B2_AE3D_27D4_EB4F;
+        if (g.verify_ids.len > 0) {
+            const tick: u64 = gs.chat_clock_ns / (33 * std.time.ns_per_ms);
+            chat_sig ^= tick *% 0x9E37_79B9_7F4A_7C15;
+        }
     };
 
     // Zat Chat motion (U6b). The trigger is DERIVED, in this one place, from the
@@ -12142,7 +12423,7 @@ fn paintFrameGpu(
             }
             gs.content_x = lg.col_x;
             gs.content_w = lg.col_w;
-            const cf = buildChatFrame(arena, g.chat_store.?, g.chat_sel, now, g.chat_q);
+            const cf = buildChatFrame(arena, g.chat_store.?, g.chat_sel, now, g.chat_q, g.verify_ids);
             // Seconds since the last chat keystroke, wrapped onto one blink
             // period past the solid window — f32-precise forever, and a
             // never-touched input still breathes (clock-since-launch).

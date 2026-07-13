@@ -74,9 +74,19 @@ pub const PayCard = struct {
     rail: chat.Rail,
     status: chat.PayStatus,
     confirmations: u8,
+    /// The shell is WATCHING this payment settle (LUD-21): the payee's provider
+    /// gave us a URL that answers "has it landed?", and we are asking. The card
+    /// says so, and pulses, instead of sitting at "approve in your wallet" with
+    /// no sign that anything is happening.
+    ///
+    /// Shell-supplied, not derived from the store — whether a payment can be
+    /// watched depends on the payee's provider, which is a network fact, not a
+    /// stored one. Defaults false, so previews and the software path are honest.
+    watching: bool = false,
 
     comptime {
-        // Budget 24: 2×8 (u64) + 3×1 = 19, padded to u64 alignment. (A7)
+        // Budget 24 (unchanged): 2×8 (u64) + 3×1 + the `watching` bool = 20,
+        // padded to u64 alignment. It landed in existing padding — no A7.1 bump.
         assert(@sizeOf(PayCard) == 24);
     }
 };

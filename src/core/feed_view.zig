@@ -8956,6 +8956,8 @@ fn drawPayCard(
     /// refused anyway, and a live-looking button that refuses is a worse lie than
     /// a dead-looking one that explains why.
     busy: bool,
+    /// The breathing clock, for a card we are actively watching settle.
+    phase: f32,
 ) !void {
     const settled_c: u32 = 0xFF9BCE9B; // soft success green
     const warn_c: u32 = 0xFFE0A868; // amber dot
@@ -9009,13 +9011,26 @@ fn drawPayCard(
         // where coloured TEXT would not.
         const pl = payStatusLine(card.status, b.kind, b.mine);
         var hx = bx + 14;
-        if (pl.tone == .good or pl.tone == .warn) {
-            try rect(gpa, dl, bx + 14, ty + 8, 8, 8, if (pl.tone == .good) settled_c else warn_c, 4);
+        if (card.watching) {
+            // WE ARE WATCHING IT LAND. The payee's provider gave us a URL that
+            // answers "has it settled?", and we are asking, right now, every
+            // couple of seconds. A breathing dot says so — the card used to sit
+            // at "approve in your wallet" with no sign that anything was
+            // happening, which is exactly when a user decides an app is dead.
+            const pulse = 0.45 + 0.55 * @abs(@sin(phase * 2.2));
+            try rect(gpa, dl, bx + 14, ty + 8, 8, 8, scaleAlpha(text_c, pulse), 4);
             hx = bx + 28;
+            _ = try str(gpa, dl, e, .semibold, hx, ty + 16, text_c, 13, "Waiting for it to land");
+            _ = try str(gpa, dl, e, .regular, bx + 14, ty + 32, sub_c, 11, "We'll know the moment it does \u{2014} no need to confirm");
+        } else {
+            if (pl.tone == .good or pl.tone == .warn) {
+                try rect(gpa, dl, bx + 14, ty + 8, 8, 8, if (pl.tone == .good) settled_c else warn_c, 4);
+                hx = bx + 28;
+            }
+            _ = try str(gpa, dl, e, .semibold, hx, ty + 16, text_c, 13, pl.head);
+            if (pl.sub.len > 0)
+                _ = try str(gpa, dl, e, .regular, bx + 14, ty + 32, sub_c, 11, pl.sub);
         }
-        _ = try str(gpa, dl, e, .semibold, hx, ty + 16, text_c, 13, pl.head);
-        if (pl.sub.len > 0)
-            _ = try str(gpa, dl, e, .regular, bx + 14, ty + 32, sub_c, 11, pl.sub);
     }
     ty += 38;
     const acts = payCardActions(b.mine, b.kind, card.status);
@@ -9487,7 +9502,7 @@ pub fn layoutChat(
                 // revisit under judgment).
                 const cw2 = @min(pay_card_w_max, bub_max);
                 const cbx = if (b.mine) detail_x + detail_w - cw2 else detail_x;
-                try drawPayCard(gpa, dl, e, regions, accent, cbx, by, cw2, hh, b, cards[b.pay], @intCast(@min(idx, std.math.maxInt(u16))), pay.busy);
+                try drawPayCard(gpa, dl, e, regions, accent, cbx, by, cw2, hh, b, cards[b.pay], @intCast(@min(idx, std.math.maxInt(u16))), pay.busy, motion.caret_phase);
             } else {
                 // Single-line bubbles shrink-wrap; wrapped ones take the max.
                 const one_w: i32 = @intCast(text.measure(e, .regular, b.body, chat_px));
@@ -11056,6 +11071,41 @@ test "wrapBody honours explicit newlines as hard line breaks" {
     // A blank line (consecutive newlines) is kept as its own line.
     const blank = try wrapBody(gpa, &dl, &engine, 0, 0, wide, ink, 16, "a\n\nb", line_h, false, null);
     try std.testing.expectEqual(@as(i32, line_h * 3), blank);
+}
+
+test "a WATCHED card says it is being watched, and stops asking for a confirmation" {
+    const gpa = std.testing.allocator;
+    var engine = try text.initEngine();
+    defer text.deinitEngine(gpa, &engine);
+    var dl: raster.DrawList = .{};
+    defer dl.deinit(gpa);
+    var regions: Regions = .empty;
+    defer regions.deinit(gpa);
+
+    const lrows = [_]chat_view.ListRow{
+        .{ .name = "maya.zat4.com", .preview = "Payment", .age = "1m", .unread = 0 },
+    };
+    // My send, handed to my wallet, with the payee's provider offering LUD-21 —
+    // so the shell is polling and the card should SAY so rather than sitting at
+    // "approve in your wallet" with no sign of life.
+    const brows = [_]chat_view.BubbleRow{
+        .{ .body = "", .age = "1m", .mine = true, .stamp = true, .kind = .payment_sent, .tail = true, .pay = 0 },
+    };
+    const watched = [_]chat_view.PayCard{
+        .{ .payment_id = 7, .amount_sat = 5000, .rail = .lightning, .status = .pending, .confirmations = 0, .watching = true },
+    };
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &watched, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{});
+
+    // The card is still cancellable — a payment you have not approved yet is
+    // still yours to abandon.
+    var has_cancel = false;
+    for (regions.items) |r| {
+        if (r.kind == .pay_card_cancel) has_cancel = true;
+        // …but nothing on a watched card should be inviting a MANUAL confirmation:
+        // the whole point is that it confirms itself.
+        try std.testing.expect(r.kind != .pay_card_received);
+    }
+    try std.testing.expect(has_cancel);
 }
 
 test "the nav rail posts SCREEN ids, not row indices" {

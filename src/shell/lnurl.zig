@@ -52,10 +52,31 @@ const PayParams = struct {
     tag: []const u8 = "",
 };
 
-/// LUD-06 callback response: `pr` is the BOLT11 invoice.
+/// LUD-06 callback response: `pr` is the BOLT11 invoice. `verify` is LUD-21 —
+/// present only if the payee's provider offers it.
 /// A7.2: cold struct, size guard waived — one per resolve.
 const InvoiceResponse = struct {
     pr: []const u8 = "",
+    verify: []const u8 = "",
+};
+
+/// What a resolve hands back: the invoice to pay, and — when the payee's
+/// provider supports LUD-21 — the URL at which THIS invoice can be watched.
+///
+/// The `verify` URL is the whole reason a Lightning payment can be confirmed by
+/// anyone other than its recipient. Without it, nobody outside the payee's own
+/// wallet observes the settlement, which is why "Mark received" exists. With it,
+/// the PAYER's client polls and learns the moment the money lands — no custody,
+/// no wallet connection, no trust in us.
+///
+/// Note whose provider decides: the payer fetches the invoice from the PAYEE's
+/// provider, so auto-confirmation is a property of the person being paid. That
+/// is exactly what their capability table told them when they set the wallet up.
+/// A7.2: cold struct, size guard waived — one per resolve; arena-owned strings.
+pub const Resolved = struct {
+    bolt11: []const u8,
+    /// "" = this payee's provider cannot be watched.
+    verify: []const u8 = "",
 };
 
 pub const Error = error{
@@ -83,19 +104,9 @@ pub fn resolveInvoice(
     environ: ?*const std.process.Environ.Map,
     lnaddr: []const u8,
     amount_sat: u64,
-) Error![]const u8 {
-    const at = std.mem.indexOfScalar(u8, lnaddr, '@') orelse return error.BadAddress;
-    const user = lnaddr[0..at];
-    const domain = lnaddr[at + 1 ..];
-    if (user.len == 0 or domain.len == 0) return error.BadAddress;
-    // Defensively reject a domain that itself carries a slash or scheme — the
-    // address gate already forbids it, but this string is about to become a URL.
-    for (domain) |c| if (c == '/' or c == ':' or c == '?' or c == '#' or c == '@') return error.BadAddress;
-
-    // LUD-16: local@domain → https://domain/.well-known/lnurlp/local
+) Error!Resolved {
     var url_buf: [512]u8 = undefined;
-    const well_known = std.fmt.bufPrint(&url_buf, "https://{s}/.well-known/lnurlp/{s}", .{ domain, user }) catch
-        return error.BadAddress;
+    const well_known = try wellKnownUrl(&url_buf, lnaddr);
     const params = try fetchJson(PayParams, arena, io, environ, well_known);
     if (!std.mem.eql(u8, params.tag, "payRequest") or params.callback.len == 0)
         return error.NotPayEndpoint;
@@ -112,8 +123,69 @@ pub fn resolveInvoice(
     if (inv.pr.len == 0) return error.NoInvoice;
     // The caller (`payuri.buildLightningInvoiceUri`) re-gates the charset and
     // the mainnet prefix before the invoice touches a URI — here we only need
-    // an owned copy that outlives the parse arena's inner frees.
-    return arena.dupe(u8, inv.pr) catch return error.OutOfMemory;
+    // owned copies that outlive the parse arena's inner frees.
+    //
+    // The verify URL is only kept when it points at the SAME HOST that issued the
+    // invoice. A provider that hands back a `verify` somewhere else is either
+    // broken or steering us at a third party, and we are about to poll this URL
+    // repeatedly on the user's behalf; it does not get to redirect us. (It is
+    // also fetched `.untrusted`, so the SSRF guard still applies on top.)
+    const verify: []const u8 = if (inv.verify.len > 0 and sameHost(inv.verify, params.callback))
+        arena.dupe(u8, inv.verify) catch return error.OutOfMemory
+    else
+        "";
+    return .{
+        .bolt11 = arena.dupe(u8, inv.pr) catch return error.OutOfMemory,
+        .verify = verify,
+    };
+}
+
+/// Do two https URLs share an origin? A cheap scheme+authority compare — enough
+/// to refuse a `verify` that wanders off the provider that issued the invoice.
+fn sameHost(a: []const u8, b: []const u8) bool {
+    const pre = "https://";
+    if (!std.mem.startsWith(u8, a, pre) or !std.mem.startsWith(u8, b, pre)) return false;
+    const ha = a[pre.len..];
+    const hb = b[pre.len..];
+    const ea = std.mem.indexOfScalar(u8, ha, '/') orelse ha.len;
+    const eb = std.mem.indexOfScalar(u8, hb, '/') orelse hb.len;
+    return std.ascii.eqlIgnoreCase(ha[0..ea], hb[0..eb]);
+}
+
+/// LUD-21 verify response. `settled` is the only field we act on.
+/// A7.2: cold struct, size guard waived.
+const VerifyResponse = struct {
+    settled: bool = false,
+    preimage: ?[]const u8 = null,
+};
+
+/// HAS IT LANDED? Poll a LUD-21 verify URL.
+///
+/// This is the leg that lets a payment confirm ITSELF. After the payer approves
+/// the invoice in their own wallet — an act we cannot see, on a rail we do not
+/// touch — the payee's provider knows. This asks it.
+///
+/// Returns true only on an explicit `settled: true`. Every other outcome (the
+/// provider is down, the body is junk, the invoice is merely unpaid) is `false`,
+/// not an error: an unanswered poll is an ordinary condition, and the caller
+/// simply asks again. We NEVER infer settlement from silence — claiming money
+/// arrived when we do not know is the one lie this whole subsystem exists to
+/// avoid.
+pub fn verifySettled(
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    verify_url: []const u8,
+) bool {
+    const resp = http.request(arena, io, environ, verify_url, .{
+        .guard = .untrusted,
+        .max_response_bytes = max_lnurl_bytes,
+    }) catch return false;
+    if (resp.status != 200) return false;
+    const doc = std.json.parseFromSliceLeaky(VerifyResponse, arena, resp.body, .{
+        .ignore_unknown_fields = true,
+    }) catch return false;
+    return doc.settled;
 }
 
 /// Build the LUD-16 well-known URL for `lnaddr`. Shared by the invoice leg and
@@ -221,6 +293,34 @@ fn fetchJson(
     if (resp.status != 200) return error.ProviderDown;
     return std.json.parseFromSliceLeaky(T, arena, resp.body, .{ .ignore_unknown_fields = true }) catch
         error.ProviderDown;
+}
+
+test "a provider cannot redirect our settlement polling off its own host" {
+    // We are about to poll the `verify` URL repeatedly, on the user's behalf,
+    // for minutes. A provider that hands back a verify pointing SOMEWHERE ELSE is
+    // either broken or steering us at a third party — and a third party is
+    // exactly who would like to tell us a payment settled when it did not.
+    // Same host: kept.
+    try std.testing.expect(sameHost(
+        "https://getalby.com/lnurlp/hello/verify/abc",
+        "https://getalby.com/lnurlp/hello/callback",
+    ));
+    // Different host: refused, and the payment falls back to a manual confirm —
+    // which is merely inconvenient, where believing a stranger would not be.
+    try std.testing.expect(!sameHost(
+        "https://evil.example/verify/abc",
+        "https://getalby.com/lnurlp/hello/callback",
+    ));
+    // A near-miss subdomain is a different host, and is treated as one.
+    try std.testing.expect(!sameHost(
+        "https://getalby.com.evil.example/v/1",
+        "https://getalby.com/lnurlp/hello/callback",
+    ));
+    // Non-https anywhere: refused.
+    try std.testing.expect(!sameHost(
+        "http://getalby.com/v/1",
+        "https://getalby.com/lnurlp/hello/callback",
+    ));
 }
 
 test {

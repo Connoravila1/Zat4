@@ -696,13 +696,13 @@ pub fn main(init: std.process.Init) !void {
             try out.flush();
             return;
         }
-        const bolt11 = lnurl.resolveInvoice(arena, io, init.environ_map, addr, sats) catch |err| {
+        const resolved = lnurl.resolveInvoice(arena, io, init.environ_map, addr, sats) catch |err| {
             try out.print("[pay] LNURL resolve failed: {s}\n", .{@errorName(err)});
             try out.flush();
             return;
         };
         var uri_buf: [payuri.max_uri_len]u8 = undefined;
-        const uri = payuri.buildLightningInvoiceUri(&uri_buf, bolt11) catch |err| {
+        const uri = payuri.buildLightningInvoiceUri(&uri_buf, resolved.bolt11) catch |err| {
             try out.print("[pay] invoice rejected by the URI gate: {s}\n", .{@errorName(err)});
             try out.flush();
             return;
