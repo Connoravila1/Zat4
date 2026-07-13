@@ -48,6 +48,7 @@ const chat_keys = @import("shell/chat_keys.zig");
 const pay_addr = @import("shell/pay_addr.zig");
 const payuri = @import("core/payuri.zig");
 const lnurl = @import("shell/lnurl.zig");
+const wallet_caps = @import("core/wallet_caps.zig");
 const chat_core = @import("core/chat.zig");
 const launch = @import("shell/launch.zig");
 const chainwatch_core = @import("core/chainwatch.zig");
@@ -228,6 +229,7 @@ pub fn main(init: std.process.Init) !void {
     // hand-off URI the wallet would receive. Read-only, no session.
     var invoice_addr: ?[]const u8 = null;
     var invoice_sats: ?[]const u8 = null;
+    var probe_addr: ?[]const u8 = null;
     var ai: usize = 1;
     while (ai < args.len) : (ai += 1) {
         const arg = args[ai];
@@ -278,6 +280,11 @@ pub fn main(init: std.process.Init) !void {
                 pay_handoff_sats = args[ai + 2];
                 pay_handoff_note = args[ai + 3];
                 ai += 3;
+            }
+        } else if (std.mem.eql(u8, arg, "--wallet-probe")) {
+            if (ai + 1 < args.len) {
+                probe_addr = args[ai + 1];
+                ai += 1;
             }
         } else if (std.mem.eql(u8, arg, "--pay-invoice")) {
             if (ai + 2 < args.len) {
@@ -642,6 +649,37 @@ pub fn main(init: std.process.Init) !void {
             return;
         };
         try out.print("[pay] handed to the OS default handler\n", .{});
+        try out.flush();
+        return;
+    }
+
+    // The capability probe, against a live provider: ask a wallet what it can do
+    // and print the table the user will be shown. `--wallet-probe <address>`.
+    if (probe_addr) |addr| {
+        const caps = lnurl.probe(arena, io, init.environ_map, addr) catch |err| {
+            try out.print("[wallet] {s} \u{2014} CANNOT be used: {s}\n", .{ addr, @errorName(err) });
+            try out.flush();
+            return;
+        };
+        var nbuf: [64]u8 = undefined;
+        const name = wallet_caps.providerName(&nbuf, addr);
+        try out.print(
+            \\[wallet] {s} ({s})
+            \\[wallet]   receive in chat      : {s}
+            \\[wallet]   confirms automatically: {s}
+            \\[wallet]   notes reach the wallet: {s} ({d} chars)
+            \\[wallet]   amount range          : {d} - {d} sats
+            \\
+        , .{
+            name,
+            addr,
+            if (caps.receivable) "yes" else "no",
+            if (caps.auto_confirm) "yes (LUD-21)" else "NO - you'll mark payments received yourself",
+            if (caps.comment_max > 0) "yes" else "no",
+            caps.comment_max,
+            caps.min_sat,
+            caps.max_sat,
+        });
         try out.flush();
         return;
     }
@@ -1070,6 +1108,7 @@ test {
     _ = @import("shell/chat_relay.zig");
     _ = @import("shell/chat_keys.zig");
     _ = @import("shell/pay_addr.zig");
+    _ = @import("core/wallet_caps.zig");
     _ = @import("shell/chat_e2ee.zig");
     _ = @import("core/oauth.zig");
     _ = @import("core/oauth_flow.zig");

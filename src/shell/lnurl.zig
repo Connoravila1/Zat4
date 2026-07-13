@@ -36,6 +36,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const http = @import("http.zig");
+const wallet_caps = @import("../core/wallet_caps.zig");
 
 /// The LN provider's replies are small JSON documents; a tight ceiling keeps a
 /// hostile or broken provider from ballooning memory (E2 at the process edge).
@@ -113,6 +114,94 @@ pub fn resolveInvoice(
     // the mainnet prefix before the invoice touches a URI — here we only need
     // an owned copy that outlives the parse arena's inner frees.
     return arena.dupe(u8, inv.pr) catch return error.OutOfMemory;
+}
+
+/// Build the LUD-16 well-known URL for `lnaddr`. Shared by the invoice leg and
+/// the capability probe, so the two can never disagree about where a wallet
+/// lives. `buf` must outlive the returned slice.
+fn wellKnownUrl(buf: []u8, lnaddr: []const u8) Error![]const u8 {
+    const at = std.mem.indexOfScalar(u8, lnaddr, '@') orelse return error.BadAddress;
+    const user = lnaddr[0..at];
+    const domain = lnaddr[at + 1 ..];
+    if (user.len == 0 or domain.len == 0) return error.BadAddress;
+    // This string is about to become a URL; the address gate already forbids
+    // these, but never trust that twice.
+    for (domain) |c| if (c == '/' or c == ':' or c == '?' or c == '#' or c == '@') return error.BadAddress;
+    return std.fmt.bufPrint(buf, "https://{s}/.well-known/lnurlp/{s}", .{ domain, user }) catch
+        error.BadAddress;
+}
+
+/// ASK THE WALLET WHAT IT CAN DO — the probe behind the capability table.
+///
+/// Zat4 keeps wallets open: any provider, no allow-list, no blessed few. The
+/// price of that openness is that the app's behaviour quietly changes with a
+/// choice the user made once and forgot. So instead of guessing, we interrogate
+/// the provider at the moment its address is added, and hand the answer back as
+/// plain facts the user signs off on.
+///
+/// Two legs, both `.untrusted` (the host came from a user-typed value):
+///   1. the well-known payRequest document → can it receive, what limits, notes?
+///   2. its invoice callback at the MINIMUM amount → does it return a LUD-21
+///      `verify` URL, i.e. can a payment to it be observed settling?
+///
+/// Leg 2 mints an invoice that is never paid. That is harmless and normal — an
+/// unpaid Lightning invoice simply expires — and it is the only way to learn
+/// whether `verify` is offered, because `verify` rides with the invoice and not
+/// with the parameters.
+///
+/// `error.NotPayEndpoint` here is the case that matters most: a well-formed
+/// address that belongs to nobody (`connor@strike.me`). It is returned as an
+/// ERROR inside an HTTP **200**, which is why the shape check we used to do was
+/// worthless.
+pub fn probe(
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    lnaddr: []const u8,
+) Error!wallet_caps.Caps {
+    var url_buf: [512]u8 = undefined;
+    const well_known = try wellKnownUrl(&url_buf, lnaddr);
+
+    const params_body = try fetchBody(arena, io, environ, well_known);
+    var callback: []const u8 = "";
+    var caps = wallet_caps.readPayDoc(arena, params_body, &callback) catch |err| return switch (err) {
+        error.CannotReceive => error.NotPayEndpoint, // "this address can't be paid"
+        error.NotPayEndpoint => error.NotPayEndpoint,
+        error.Malformed => error.ProviderDown,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+
+    // Leg 2: the smallest invoice the provider will mint, purely to read the
+    // envelope it comes in. If this leg fails we do NOT fail the probe — the
+    // address demonstrably resolves and can receive, which is the part that
+    // gates publishing. We simply cannot claim auto-confirmation, and the
+    // capability table says so rather than pretending.
+    const msat: u64 = caps.min_sat *| 1000;
+    const sep: u8 = if (std.mem.indexOfScalar(u8, callback, '?') != null) '&' else '?';
+    var cb_buf: [2048]u8 = undefined;
+    const cb_url = std.fmt.bufPrint(&cb_buf, "{s}{c}amount={d}", .{ callback, sep, msat }) catch return caps;
+    const inv_body = fetchBody(arena, io, environ, cb_url) catch return caps;
+    wallet_caps.readInvoice(arena, inv_body, &caps) catch return caps;
+    return caps;
+}
+
+/// One guarded GET returning the raw body — the capability probe parses it with
+/// the pure core rather than through a typed fetch, because the ERROR case is
+/// carried in the body and must be READ, not inferred from the status.
+fn fetchBody(
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    url: []const u8,
+) Error![]const u8 {
+    const resp = http.request(arena, io, environ, url, .{
+        .guard = .untrusted,
+        .max_response_bytes = max_lnurl_bytes,
+    }) catch return error.ProviderDown;
+    // NOTE the asymmetry with `fetchJson` below: we accept a 200 here and let the
+    // core decide, because a refusal IS a 200 with the error in the body.
+    if (resp.status != 200) return error.ProviderDown;
+    return resp.body;
 }
 
 /// One guarded GET + leaky JSON parse into `T`. `.untrusted` so the SSRF guard
