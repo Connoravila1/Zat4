@@ -112,6 +112,10 @@ const Feed = if (mobile_config.have_gpu) struct {
     /// NULL = the pre-auth app: the front door, on the ONE run loop (a phone has
     /// no window, so it could never reach enrollment before).
     session: ?auth.Session,
+    /// The user signed out. The teardown's persist MUST NOT write the session back
+    /// — clearing the cache and then saving it again on the way out is the same as
+    /// not clearing it at all, which is a trap worth naming rather than tripping.
+    signed_out: bool = false,
     store: feed_core.Store,
     run: *tui.MobileRun,
 } else void;
@@ -557,6 +561,7 @@ fn loginEnd(ctx: *Ctx) void {
 fn feedPersist(gpa: std.mem.Allocator, f: *Feed) void {
     _ = cache_shell.saveStore(gpa, f.env, &f.store);
     var sp_buf: [512]u8 = undefined;
+    if (f.signed_out) return; // signed out: the store is theirs, the session is not
     if (f.session) |*sx| {
         if (sx.mode == .oauth) {
             if (cache_shell.oauthSessionPath(&sp_buf, f.env)) |sp| _ = cache_shell.saveOAuthSessionAt(gpa, sp, sx);
@@ -872,6 +877,19 @@ pub export fn zat_feed_step(ctx_ptr: ?*anyopaque) u32 {
                     return 1;
                 }
             }
+        }
+
+        // SIGN OUT. The desktop clears the cached session here; the phone never did
+        // — it ended the feed, restarted it, and `feedStart` resumed the very same
+        // cached session. So the button did nothing at all, which is exactly what
+        // the owner saw. Clear BOTH session blobs (app-password and OAuth), and
+        // mark the feed so the teardown's persist cannot write the session back on
+        // its way out.
+        if (outcome == .signed_out) {
+            f.signed_out = true;
+            cache_shell.clearSession(f.env);
+            logcat("signed out — session cleared; the front door is next", .{});
+            return 2;
         }
 
         return switch (outcome) {
