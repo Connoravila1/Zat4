@@ -5822,6 +5822,10 @@ fn tilePalette(tag: []const u8) u32 {
 /// The warning red — destructive labels (Sign out). Local to the settings
 /// surface for now; promote to the shared palette when a second site needs it.
 const warn: u32 = 0xFFE5544B;
+/// The one POSITIVE state colour (A5's connection dot). Deliberately muted: a
+/// healthy connection is not an achievement, it is the baseline, and it should
+/// read as calm rather than as a notification.
+const good: u32 = 0xFF6FBF73;
 
 /// The SETTINGS screen (`screen_settings`) — a master–detail layout: a left
 /// SECTION list and, on the right, the selected section's rows grouped into
@@ -9131,6 +9135,18 @@ pub const ChatListSearch = struct {
 const chat_px: u16 = 16;
 const chat_line_h: i32 = 23;
 
+/// The relay link's live state as the surface renders it (A5).
+pub const ChatLink = enum(u8) {
+    /// No relay configured — chat is off, and the surface says that elsewhere.
+    off = 0,
+    /// Dialing, or backing off between attempts. THIS is the state that used to
+    /// be invisible and indistinguishable from silence.
+    connecting = 1,
+    connected = 2,
+    /// The relay has verified who we are (A4 slice 2).
+    authenticated = 3,
+};
+
 pub fn layoutChat(
     gpa: Allocator,
     e: *const text.Engine,
@@ -9202,6 +9218,10 @@ pub fn layoutChat(
     /// honest way forward, instead of silently re-minting an identity and
     /// orphaning every conversation the account has.
     identity_elsewhere: bool,
+    /// A5: what the relay link is doing right now. A USER — not a dev reading
+    /// logcat — has to be able to tell "the relay is down" from "nobody has
+    /// messaged me", because those look identical: an empty screen.
+    link: ChatLink,
 ) error{OutOfMemory}!i32 {
     const m: Metrics = if (pane_geom) |g|
         .{ .rail_x = g.rail_x, .col_x = g.col_x, .col_w = g.col_w, .lx = g.lx, .cw = g.cw, .side_x = g.side_x, .wide = g.wide }
@@ -9342,7 +9362,24 @@ pub fn layoutChat(
     try rect(gpa, dl, x0, ban_y, list_w, ban_h, skinPanel(accent), 8);
     try rect(gpa, dl, x0, ban_y, 3, ban_h, (0xC0 << 24) | (accent & 0x00FFFFFF), 1);
     const ban_pen = try str(gpa, dl, e, .semibold, x0 + 12, ban_y + 15, ink, 11, "End-to-end encrypted");
-    try strEllipsis(gpa, dl, e, .regular, ban_pen + 8, ban_y + 15, muted, 11, "— MLS, post-quantum hybrid, forward secrecy", x0 + list_w - 10 - (ban_pen + 8));
+    // A5 — THE CONNECTION DOT. "The relay is down" and "nobody has messaged
+    // you" are the same picture: an empty list. Until now only a dev reading
+    // logcat could tell them apart. The dot sits at the end of the honesty line
+    // because that is where a claim about the channel belongs — and while the
+    // link is down it takes the sentence too, because a note about the
+    // mechanism is worth less than knowing nothing is getting through.
+    const dot_sz: i32 = 6;
+    if (link != .off) {
+        const dot_c: u32 = if (link == .connecting) warn else good;
+        try rect(gpa, dl, x0 + list_w - 10 - dot_sz, ban_y + @divTrunc(ban_h - dot_sz, 2), dot_sz, dot_sz, dot_c, 3);
+    }
+    const gutter: i32 = if (link == .off) 0 else dot_sz + 6;
+    const suffix: []const u8 = if (link == .connecting)
+        "— reconnecting\u{2026}"
+    else
+        "— MLS, post-quantum hybrid, forward secrecy";
+    const suffix_c = if (link == .connecting) warn else muted;
+    try strEllipsis(gpa, dl, e, .regular, ban_pen + 8, ban_y + 15, suffix_c, 11, suffix, x0 + list_w - 10 - gutter - (ban_pen + 8));
     var body_y = ban_y + ban_h + 14;
     if (phone) {
         // The list SEARCH: filter conversations as you type. The render
@@ -9729,10 +9766,21 @@ pub fn layoutChat(
                 "They haven't picked this up yet"
             else
                 "They haven't picked this up \u{2014} tap Re-establish to try again",
+            // A2 — the DRIFT. The two halves walked apart (a Commit one side
+            // never saw) and their messages no longer open. The old behaviour
+            // was to drop the message and say nothing, so the only symptom
+            // anyone ever got was that replies stopped. Say it, and make the
+            // saying itself the repair: the whole strip is the tap target, so
+            // the fix is where the problem is announced — on the phone too,
+            // which has no Re-establish control in its header.
+            .needs_reconnect => "This conversation needs to reconnect \u{2014} tap to fix it",
             .confirmed => unreachable,
         };
+        const line_c = if (delivery == .needs_reconnect) warn else muted;
         const lw: i32 = @intCast(text.measure(e, .regular, msg_line, 12));
-        _ = try str(gpa, dl, e, .regular, detail_x + @divTrunc(detail_w - lw, 2), by + 17, muted, 12, msg_line);
+        _ = try str(gpa, dl, e, .regular, detail_x + @divTrunc(detail_w - lw, 2), by + 17, line_c, 12, msg_line);
+        if (delivery == .needs_reconnect)
+            try emitRegion(gpa, regions, detail_x, by, detail_w, strip_h, 0, .chat_restart);
     }
 
     // The composer: a growing multi-line input + Send. The draft renders
@@ -10068,9 +10116,9 @@ pub fn layoutChat(
         // The way IN to setting up how YOU get paid — the answer to "where do I
         // set my own address?" belongs where money is discussed.
         {
-            const link = "Set up how you get paid \u{203A}";
-            const lw: i32 = @intCast(text.measure(e, .semibold, link, 13));
-            _ = try str(gpa, dl, e, .semibold, mg.x + @divTrunc(mg.w - lw, 2), py + 22, (0xC0 << 24) | (accent & 0x00FFFFFF), 13, link);
+            const cta = "Set up how you get paid \u{203A}";
+            const lw: i32 = @intCast(text.measure(e, .semibold, cta, 13));
+            _ = try str(gpa, dl, e, .semibold, mg.x + @divTrunc(mg.w - lw, 2), py + 22, (0xC0 << 24) | (accent & 0x00FFFFFF), 13, cta);
             try emitRegion(gpa, regions, ix, py + 4, iw, 30, 0, .recv_open);
         }
     }
@@ -10818,7 +10866,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // rail regions, so the counts are exactly the surface's own — one region
     // per conversation row + the composer pair + the "+ New" pill. (460 now
     // exercises the PHONE single-pane shape — its own test below.)
-    const h = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, false);
+    const h = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, false, .authenticated);
     var n_conv: usize = 0;
     var n_input: usize = 0;
     var n_send: usize = 0;
@@ -10851,7 +10899,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // no thread pane and no composer to arm. The "+ New" pill is always there.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h2 = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, false);
+    const h2 = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, false, .authenticated);
     try std.testing.expectEqual(@as(i32, 940), h2);
     var n2_conv: usize = 0;
     var n2_new: usize = 0;
@@ -10867,7 +10915,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // line draws when the shell hands one over.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", .{}, false, true, "chattest.zat4.com", "Couldn't resolve that handle", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, false);
+    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", .{}, false, true, "chattest.zat4.com", "Couldn't resolve that handle", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, false, .authenticated);
     var n3_compose: usize = 0;
     for (regions.items) |r| {
         if (r.kind == .chat_compose_input) n3_compose += 1;
@@ -10880,12 +10928,12 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // (motion never moves a tap target).
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, false);
+    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, false, .authenticated);
     const rest_items = dl.len;
     const rest_regions = regions.items.len;
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{ .typing_t = 1, .typing_phase = 0.7 }, &.{}, .{}, .{}, .{}, .confirmed, false);
+    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{ .typing_t = 1, .typing_phase = 0.7 }, &.{}, .{}, .{}, .{}, .confirmed, false, .authenticated);
     try std.testing.expect(dl.len > rest_items);
     try std.testing.expectEqual(rest_regions, regions.items.len);
 
@@ -10895,13 +10943,13 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // Neither moves a tap target — the strip is a statement, not a control.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .waiting, false);
+    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .waiting, false, .authenticated);
     const waiting_items = dl.len;
     try std.testing.expect(waiting_items > rest_items);
     try std.testing.expectEqual(rest_regions, regions.items.len);
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .undelivered, false);
+    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .undelivered, false, .authenticated);
     try std.testing.expect(dl.len > rest_items);
     try std.testing.expectEqual(rest_regions, regions.items.len);
 }
@@ -10928,7 +10976,7 @@ test "messages screen: chat published from another device says so, and offers ON
     const brows = [_]chat_view.BubbleRow{
         .{ .body = "hey", .age = "2h", .mine = true, .stamp = true, .kind = .text, .tail = true },
     };
-    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, true);
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, true, .authenticated);
 
     // Exactly one tap target on the whole surface: the choice. No conversation
     // rows, no composer, no send — none of them mean anything without an
@@ -10946,7 +10994,7 @@ test "messages screen: chat published from another device says so, and offers ON
     // And with a normal identity the panel is gone and the list is back.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, false);
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, false, .authenticated);
     var convs: usize = 0;
     for (regions.items) |r| {
         try std.testing.expect(r.kind != .chat_identity_reset);
@@ -10974,7 +11022,7 @@ test "messages screen: the phone shape — list page, then an immersive thread w
 
     // LIST page (no peer): full-width rows + the new-conversation button; no
     // composer, no thread chrome, no back — the tab bar is the way out.
-    _ = try layoutChat(gpa, &engine, 430, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{ .top = 48 }, .{}, .confirmed, false);
+    _ = try layoutChat(gpa, &engine, 430, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{ .top = 48 }, .{}, .confirmed, false, .authenticated);
     var l_conv: usize = 0;
     var l_new: usize = 0;
     var l_back: usize = 0;
@@ -10991,7 +11039,7 @@ test "messages screen: the phone shape — list page, then an immersive thread w
     // app-bar's back region + the composer trio are the page's controls.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 430, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{ .top = 48, .bottom = 34 }, .{}, .confirmed, false);
+    _ = try layoutChat(gpa, &engine, 430, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{ .top = 48, .bottom = 34 }, .{}, .confirmed, false, .authenticated);
     var t_conv: usize = 0;
     var t_new: usize = 0;
     var t_back: usize = 0;
@@ -11040,7 +11088,7 @@ test "messages screen: payment cards and the pay sheet emit their regions (M5 A4
     };
 
     // Sheet closed: the card buttons carry their thread ordinals.
-    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, false);
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, false, .authenticated);
     var pay_at: u16 = 999;
     var received_at: u16 = 999;
     var decline_at: u16 = 999;
@@ -11069,7 +11117,7 @@ test "messages screen: payment cards and the pay sheet emit their regions (M5 A4
     // and the amber status line renders without disturbing the regions.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{ .open = true, .rail = .onchain, .amount = "5000", .note = "dinner", .status = "They haven't set up payments" }, .{}, &.{}, .{}, .{}, .{}, .confirmed, false);
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{ .open = true, .rail = .onchain, .amount = "5000", .note = "dinner", .status = "They haven't set up payments" }, .{}, &.{}, .{}, .{}, .{}, .confirmed, false, .authenticated);
     var n_rail: usize = 0;
     var n_chip: usize = 0;
     var n_amount: usize = 0;
@@ -11279,7 +11327,7 @@ test "a WATCHED card says it is being watched, and stops asking for a confirmati
     const watched = [_]chat_view.PayCard{
         .{ .payment_id = 7, .amount_sat = 5000, .rail = .lightning, .status = .pending, .confirmations = 0, .watching = true },
     };
-    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &watched, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, false);
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &watched, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, false, .authenticated);
 
     // The card is still cancellable — a payment you have not approved yet is
     // still yours to abandon.

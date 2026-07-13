@@ -98,13 +98,15 @@ pub fn bucketUnpack(blob: []const u8) ?[]const u8 {
 // ---------------------------------------------------------------------------
 
 const groups_magic = [4]u8{ 'Z', 'A', 'T', 'C' };
-/// Version 2 (A1) appends the per-conversation Welcome-delivery record. A
-/// version-1 blob still restores — its conversations are simply treated as
-/// CONFIRMED, which is the honest reading: they were established under the
-/// old single-shot rule and are either working or already broken, and
-/// re-Welcoming every one of them on upgrade would reset live ratchets to
-/// fix a problem those conversations may not have.
-const groups_version: u16 = 2;
+/// Version 2 (A1) appends the per-conversation Welcome-delivery record;
+/// version 3 (A2) appends one byte more, the drift flag. EVERY older version
+/// still restores — the reader accepts 1, 2 and 3 — and that tolerance is not
+/// politeness, it is safety: a version this reader refuses means `restoreGroups`
+/// bails and the device silently loses EVERY MLS group it has, which is every
+/// conversation it can decrypt. The missing fields simply default (a v1
+/// conversation reads as confirmed, a v2 one as not-drifted), which is the
+/// honest reading of a blob written before the fact existed.
+const groups_version: u16 = 3;
 
 /// What the far side knows about a conversation WE opened. A Welcome used to
 /// be a single unacknowledged shot: if it was lost, the sender kept believing
@@ -128,15 +130,55 @@ pub const WelcomeState = struct {
     /// How many times the Welcome has gone out. At `chat.welcome_retry_max`
     /// we stop and the thread says so, rather than retrying behind the user.
     attempts: u8,
+    /// A2: this conversation's two halves have DRIFTED — a message arrived that
+    /// will not open under our ratchet for a reason that is not tampering and
+    /// not a redelivery. The thread says so and offers the repair, instead of
+    /// dropping the message and looking healthy while replies stop forever.
+    /// Cleared the moment either side re-establishes.
+    drifted: bool,
 
     comptime {
-        // Budget 40: 16 (slice) + 8 + 8 + 1 = 33 bytes of payload, padded to
-        // pointer alignment. One row per conversation. (A7)
+        // Budget 40 (unchanged): 16 (slice) + 8 + 8 + 1 + 1 = 34 bytes of
+        // payload; the two flag bytes land in padding that already existed, so
+        // A2 cost nothing. One row per conversation. (A7)
         assert(@sizeOf(WelcomeState) == 40);
     }
 };
 
-pub const welcome_confirmed: WelcomeState = .{ .bucket = &.{}, .last_sent = 0, .last_ack = 0, .attempts = 0 };
+pub const welcome_confirmed: WelcomeState = .{ .bucket = &.{}, .last_sent = 0, .last_ack = 0, .attempts = 0, .drifted = false };
+
+/// How a failed `mls.receive` should be READ (A2). The distinction already
+/// existed in the error set; it was simply never surfaced — every failure was
+/// dropped on the floor and the thread went on looking healthy while replies
+/// silently stopped.
+///
+/// The trap here, and the reason this is a function and not an `else`: a
+/// **StaleGeneration** is not a break. Relay delivery is at-least-once by
+/// design (a blob is deleted only on ack), so a redelivered message SHOULD
+/// fail to open, routinely. Treating that as damage would put a "this
+/// conversation is broken" banner in front of the user every time the network
+/// hiccupped — crying wolf on the one signal that has to mean something.
+const Failure = enum {
+    /// The epochs diverged: a Commit one side never saw. Nobody is attacking
+    /// anyone; the two halves have simply walked apart, and the fix is to
+    /// rebuild the channel. OFFER THE REPAIR.
+    drift,
+    /// The ciphertext did not authenticate. That is not drift, and it is not
+    /// something a user can fix by tapping a button — refuse it, loudly, and
+    /// never dress it up as a routine reconnect.
+    tamper,
+    /// Ordinary at-least-once redelivery, or a message we already processed.
+    /// Nothing happened. Say nothing.
+    replay,
+};
+
+fn classify(err: anyerror) Failure {
+    return switch (err) {
+        error.WrongEpoch, error.WrongGroup, error.WrongState => .drift,
+        error.StaleGeneration => .replay,
+        else => .tamper, // DecryptFailed, BadSignature, BadSenderData, BadConfirmationTag, malformed…
+    };
+}
 
 /// One account's E2EE chat state: identity + the open conversations'
 /// groups, parallel arrays keyed by peer DID (A3; the DID is the one
@@ -360,6 +402,11 @@ pub fn persist(gpa: Allocator, environ: ?*const std.process.Environ.Map, st: *co
         std.mem.writeInt(i64, &at8, w.last_sent, .little);
         blob.appendSlice(gpa, &at8) catch return;
         blob.append(gpa, w.attempts) catch return;
+        // v3 (A2): a drifted conversation must STILL say it is drifted after a
+        // relaunch. Forgetting would put the healthy-looking thread back in
+        // front of the user — the exact lie A2 exists to end — until the peer
+        // happened to send again, which a peer who has given up will not do.
+        blob.append(gpa, @intFromBool(w.drifted)) catch return;
     }
     var path_buf: [512]u8 = undefined;
     const path = groupsPath(&path_buf, environ, st.my_did) orelse return;
@@ -402,7 +449,8 @@ fn restoreGroups(gpa: Allocator, environ: ?*const std.process.Environ.Map, st: *
             if (blob.len - at < 4) return;
             const wlen = std.mem.readInt(u32, blob[at..][0..4], .little);
             at += 4;
-            if (blob.len - at < @as(usize, wlen) + 8 + 1) return;
+            const tail: usize = if (version >= 3) 8 + 1 + 1 else 8 + 1;
+            if (blob.len - at < @as(usize, wlen) + tail) return;
             if (wlen > 0) {
                 welcome.bucket = gpa.dupe(u8, blob[at .. at + wlen]) catch return;
                 welcome.last_sent = std.mem.readInt(i64, blob[at + wlen ..][0..8], .little);
@@ -412,7 +460,11 @@ fn restoreGroups(gpa: Allocator, environ: ?*const std.process.Environ.Map, st: *
                 // without the client hammering the relay in between.
                 welcome.attempts = 0;
             }
-            at += @as(usize, wlen) + 8 + 1;
+            // v3 (A2): the drift flag. A v2 blob simply has none, and a
+            // conversation written before the fact existed reads as not-drifted
+            // — the next message that fails to open will say otherwise.
+            if (version >= 3) welcome.drifted = blob[at + wlen + 8 + 1] != 0;
+            at += @as(usize, wlen) + tail;
         }
 
         const did_copy = gpa.dupe(u8, did) catch {
@@ -453,8 +505,10 @@ fn appendConversation(gpa: Allocator, st: *State, did_owned: []u8, apub: [32]u8,
 fn confirmWelcome(gpa: Allocator, st: *State, idx: usize) bool {
     const w = &st.welcomes.items[idx];
     if (w.bucket.len == 0) return false; // already confirmed; a duplicate ack is a no-op (E4)
+    const was_drifted = w.drifted; // an ack does not un-break a drifted ratchet
     gpa.free(w.bucket);
     w.* = welcome_confirmed;
+    w.drifted = was_drifted;
     return true;
 }
 
@@ -465,7 +519,9 @@ fn armWelcome(gpa: Allocator, st: *State, idx: usize, bucket: []const u8, now: i
     const copy = gpa.dupe(u8, bucket) catch return; // out of memory: the Welcome still went, we just can't retry it
     const w = &st.welcomes.items[idx];
     gpa.free(w.bucket);
-    w.* = .{ .bucket = copy, .last_sent = now, .last_ack = w.last_ack, .attempts = 1 };
+    // A re-established channel is not a drifted one — that is the whole point
+    // of re-establishing it.
+    w.* = .{ .bucket = copy, .last_sent = now, .last_ack = w.last_ack, .attempts = 1, .drifted = false };
 }
 
 /// What the far side knows about this conversation (A1) — what the thread
@@ -474,6 +530,11 @@ fn armWelcome(gpa: Allocator, st: *State, idx: usize, bucket: []const u8, now: i
 pub fn deliveryState(st: *const State, peer_did: []const u8) chat.Delivery {
     const idx = conversationIndex(st, peer_did) orelse return .confirmed;
     const w = st.welcomes.items[idx];
+    // A2 first: a channel that cannot decrypt is broken NOW, whatever it was
+    // doing before. Saying "waiting for them to receive this" about a
+    // conversation whose ratchets have already diverged would be the same
+    // comfortable lie in a new costume.
+    if (w.drifted) return .needs_reconnect;
     if (w.bucket.len == 0) return .confirmed;
     return if (w.attempts >= chat.welcome_retry_max) .undelivered else .waiting;
 }
@@ -531,6 +592,7 @@ pub fn startConversation(
         .last_sent = clock.unixSeconds(),
         .last_ack = 0,
         .attempts = 1,
+        .drifted = false,
     });
     persist(gpa, environ, st);
 }
@@ -814,6 +876,14 @@ pub const Incoming = union(enum) {
     /// (A1). Nothing enters the store — this only retires the retry and the
     /// thread's "waiting for them to receive this" line.
     confirmed: struct { peer_did: []u8 },
+    /// A2: the two halves DRIFTED — their message will not open under our
+    /// ratchet, and it is not tampering and not a redelivery. The conversation
+    /// is marked as needing to reconnect; the thread says so and offers the
+    /// repair, rather than dropping the message and looking healthy.
+    drifted: struct { peer_did: []u8 },
+    /// A2: the ciphertext did not authenticate. NOT drift, and not something a
+    /// tap can fix — refused, and said so. Never dressed up as a reconnect.
+    tampered: struct { peer_did: []u8 },
     /// A payment CARD (kind 16/17), frame already parsed by the pure core.
     /// The store creates the card — or, when the id names one this
     /// conversation already has, advances it (one card per payment,
@@ -855,6 +925,8 @@ pub fn freeIncoming(gpa: Allocator, inc: Incoming) void {
         .typing => |t| gpa.free(t.peer_did),
         .welcome_again => |s| gpa.free(s.peer_did),
         .confirmed => |s| gpa.free(s.peer_did),
+        .drifted => |s| gpa.free(s.peer_did),
+        .tampered => |s| gpa.free(s.peer_did),
         .payment => |p| {
             gpa.free(p.peer_did);
             gpa.free(p.note);
@@ -967,6 +1039,10 @@ pub fn acceptWelcome(
         // and they are plainly reachable — resending ours would only hand
         // them a second group to choose between.
         _ = confirmWelcome(gpa, st, idx);
+        // And it REPAIRS a drift (A2): this is a brand-new group with fresh
+        // ratchets on both sides, which is precisely what "needs to reconnect"
+        // was asking for. The banner goes away because the problem went away.
+        st.welcomes.items[idx].drifted = false;
         gpa.free(pw.peer_did); // the DID at `idx` is already ours and unchanged
         persist(gpa, environ, st);
         return .{ .restarted = .{ .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]) } };
@@ -1030,11 +1106,23 @@ pub fn onBucket(
             const idx = for (st.groups.items, 0..) |*g, i| {
                 if (std.mem.eql(u8, g.group_id, gid)) break i;
             } else return null; // no such conversation here
-            const received = mls.receive(gpa, &st.groups.items[idx], payload) catch {
+            const received = mls.receive(gpa, &st.groups.items[idx], payload) catch |err| {
                 // A failed open burned that generation by design; state is
                 // intact. Persist the burn so a crash cannot un-burn it.
                 persist(gpa, environ, st);
-                return null;
+                // A2 — READ THE FAILURE INSTEAD OF DROPPING IT. This used to be
+                // an unconditional `return null`: the message vanished, the
+                // thread looked healthy, and the only symptom the user ever got
+                // was that replies stopped. Forever.
+                switch (classify(err)) {
+                    .replay => return null, // at-least-once redelivery: nothing happened
+                    .drift => {
+                        st.welcomes.items[idx].drifted = true;
+                        persist(gpa, environ, st);
+                        return .{ .drifted = .{ .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]) } };
+                    },
+                    .tamper => return .{ .tampered = .{ .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]) } },
+                }
             };
             persist(gpa, environ, st);
             switch (received) {
@@ -1207,6 +1295,7 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
         .last_sent = 1000,
         .last_ack = 0,
         .attempts = 1,
+        .drifted = false,
     });
     try testing.expectEqual(chat.Delivery.waiting, deliveryState(&a, b.my_did));
 
@@ -1608,5 +1697,132 @@ test "chat_e2ee: a VERIFIED re-Welcome re-establishes a desynchronised conversat
             },
             else => return error.TestUnexpectedResult,
         }
+    }
+}
+
+test "chat_e2ee: a DRIFTED conversation says so; a redelivery says nothing (A2)" {
+    // Two ways a message fails to open, and they are NOT the same thing.
+    //
+    // A conversation whose halves have drifted (a Commit one side never saw) is
+    // BROKEN: every message from here on is lost, and the old code dropped each
+    // one on the floor without a word — so the only symptom the user ever got
+    // was that replies stopped. Forever. That is the failure this surfaces.
+    //
+    // But relay delivery is at-least-once BY DESIGN (a blob is deleted only on
+    // ack), so a redelivered message routinely fails to open too. If that also
+    // raised "this conversation is broken", the banner would cry wolf every time
+    // the network hiccupped — and a warning that fires when nothing is wrong is
+    // a warning nobody reads.
+    const gpa = testing.allocator;
+    const io = std.testing.io;
+    const seed_a: [32]u8 = @splat(0xC1);
+    const seed_b: [32]u8 = @splat(0xD2);
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var tmp_buf: [64]u8 = undefined;
+    const tmp = std.fmt.bufPrint(&tmp_buf, "/tmp/zat-drift-test-{d}", .{std.os.linux.getpid()}) catch unreachable;
+    try env.put("ZAT_CACHE_DIR", tmp);
+    defer {
+        var pb: [512]u8 = undefined;
+        for ([_][]const u8{ "did:plc:drift-bob", "did:plc:drift-alice" }) |d| {
+            if (cache.chatGroupsPath(&pb, &env, d)) |p| {
+                var z: [512]u8 = undefined;
+                if (std.fmt.bufPrintZ(&z, "{s}", .{p})) |zp| _ = std.os.linux.unlink(zp) else |_| {}
+            }
+        }
+        var z2: [512]u8 = undefined;
+        if (std.fmt.bufPrintZ(&z2, "{s}", .{tmp})) |zp| _ = std.os.linux.rmdir(zp) else |_| {}
+    }
+
+    var a = try testState(gpa, "did:plc:drift-alice", seed_a, 0x21, 0x22);
+    defer deinit(gpa, &a);
+    var b = try testState(gpa, "did:plc:drift-bob", seed_b, 0x23, 0x24);
+    defer deinit(gpa, &b);
+
+    var group_a = try mls.createGroup(gpa, a.my_did, a.anchor_seed, .{
+        .group_id = @splat(0x30),
+        .enc_seed = @splat(0x31),
+        .epoch_secret = @splat(0x32),
+    });
+    const welcome = try mls.addPeer(gpa, &group_a, b.kp.kp_bytes, 1000, .{
+        .enc_seed = @splat(0x33),
+        .path_secret = @splat(0x34),
+        .welcome_seed = @splat(0x35),
+    });
+    defer gpa.free(welcome);
+    try appendConversation(gpa, &a, try gpa.dupe(u8, b.my_did), try anchor.publicKey(seed_b), group_a, welcome_confirmed);
+
+    var wb: [relay.bucket_len]u8 = undefined;
+    try bucketPack(&wb, welcome);
+    const pw = openWelcome(gpa, &b, bucketUnpack(&wb).?) orelse return error.TestUnexpectedResult;
+    const started = (try acceptWelcome(gpa, &env, &b, pw, try anchor.publicKey(seed_a))) orelse return error.TestUnexpectedResult;
+    freeIncoming(gpa, started);
+
+    const b_traffic = mls.mailboxId(&b.groups.items[0], .mine);
+
+    // One real message lands, and the conversation is healthy.
+    var bucket: [relay.bucket_len]u8 = undefined;
+    {
+        var plaintext: [16]u8 = undefined;
+        plaintext[0] = 0;
+        @memcpy(plaintext[1..][0..5], "hello");
+        const msg = try mls.encrypt(gpa, &a.groups.items[0], plaintext[0..6], 0, .{ 1, 1, 1, 1 });
+        defer gpa.free(msg);
+        try bucketPack(&bucket, msg);
+        const inc = (try onBucket(gpa, gpa, io, &env, &b, b_traffic, &bucket)) orelse return error.TestUnexpectedResult;
+        defer freeIncoming(gpa, inc);
+        try testing.expectEqualStrings("hello", inc.message.text);
+    }
+    try testing.expectEqual(chat.Delivery.confirmed, deliveryState(&b, a.my_did));
+
+    // THE REDELIVERY. The exact same bucket again — which the relay will do,
+    // routinely, because delivery is at-least-once. Nothing user-visible, and
+    // the conversation is still healthy. This is the assertion that keeps the
+    // A2 banner meaningful.
+    try testing.expect((try onBucket(gpa, gpa, io, &env, &b, b_traffic, &bucket)) == null);
+    try testing.expectEqual(chat.Delivery.confirmed, deliveryState(&b, a.my_did));
+
+    // THE DRIFT. Bob's group advances an epoch that Alice never saw — which is
+    // exactly what an unseen Commit does to the two halves — so Alice's next
+    // message arrives stamped with an epoch Bob has moved past. It cannot open.
+    // Before A2 it was dropped in silence and the thread looked perfectly fine.
+    {
+        b.groups.items[0].epoch += 1;
+        var plaintext: [16]u8 = undefined;
+        plaintext[0] = 0;
+        @memcpy(plaintext[1..][0..4], "gone");
+        const msg = try mls.encrypt(gpa, &a.groups.items[0], plaintext[0..5], 0, .{ 2, 2, 2, 2 });
+        defer gpa.free(msg);
+        var drift_bucket: [relay.bucket_len]u8 = undefined;
+        try bucketPack(&drift_bucket, msg);
+        const inc = (try onBucket(gpa, gpa, io, &env, &b, b_traffic, &drift_bucket)) orelse return error.TestUnexpectedResult;
+        defer freeIncoming(gpa, inc);
+        try testing.expectEqualStrings(a.my_did, inc.drifted.peer_did);
+        // The conversation now SAYS it needs to reconnect — and that verdict
+        // outranks anything the Welcome states were saying, because a channel
+        // that cannot decrypt is broken now, whatever it was doing before.
+        try testing.expectEqual(chat.Delivery.needs_reconnect, deliveryState(&b, a.my_did));
+    }
+
+    // AND TAMPERING IS NOT DRIFT. A bucket whose ciphertext does not
+    // authenticate is refused, loudly — never offered a friendly "tap to
+    // reconnect", which would let anyone who can write to a mailbox nag a user
+    // into rebuilding a channel that was never broken.
+    {
+        b.groups.items[0].epoch -= 1; // back in step, so the epoch is not the complaint
+        var plaintext: [16]u8 = undefined;
+        plaintext[0] = 0;
+        @memcpy(plaintext[1..][0..4], "evil");
+        const msg = try mls.encrypt(gpa, &a.groups.items[0], plaintext[0..5], 0, .{ 3, 3, 3, 3 });
+        defer gpa.free(msg);
+        const forged = try gpa.dupe(u8, msg);
+        defer gpa.free(forged);
+        forged[forged.len - 1] ^= 0xFF; // flip a bit in the AEAD tag
+        var bad_bucket: [relay.bucket_len]u8 = undefined;
+        try bucketPack(&bad_bucket, forged);
+        const inc = (try onBucket(gpa, gpa, io, &env, &b, b_traffic, &bad_bucket)) orelse return error.TestUnexpectedResult;
+        defer freeIncoming(gpa, inc);
+        try testing.expectEqualStrings(a.my_did, inc.tampered.peer_did);
     }
 }

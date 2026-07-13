@@ -121,7 +121,14 @@ pub fn welcomeRetryDue(attempts: u8, last_sent: i64, now: i64) bool {
 /// is out and unanswered (we are still retrying) — an honest "waiting for
 /// them to receive this", never a dead thread that looks alive. `undelivered`
 /// = the retries are spent; the repair is one tap away.
-pub const Delivery = enum(u8) { confirmed = 0, waiting = 1, undelivered = 2 };
+///
+/// `needs_reconnect` (A2) is the other way a conversation dies: the two halves
+/// DRIFTED — a Commit one side never saw — and their messages no longer open
+/// under our ratchet. Until now the only signal was "replies stopped," because
+/// the failed message was dropped and the thread went on looking perfectly
+/// healthy. It takes precedence over the Welcome states: a channel that cannot
+/// decrypt is broken now, whatever it was doing before.
+pub const Delivery = enum(u8) { confirmed = 0, waiting = 1, undelivered = 2, needs_reconnect = 3 };
 
 /// The settlement-event WIRE bytes (the reserved 18/19). Like the typing
 /// ping they never enter the store as messages — `parseKind` keeps

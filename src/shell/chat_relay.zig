@@ -147,6 +147,20 @@ fn freeOut(gpa: Allocator, out: Out) void {
     if (out == .deposit) gpa.destroy(out.deposit.blob);
 }
 
+/// What the link is doing RIGHT NOW (A5). The `.status` mail already said
+/// these things, but only once, as text, to whoever happened to be draining —
+/// so a USER could not tell "the relay is down" from "nobody has messaged me."
+/// This is the live fact, readable every frame, and the surface shows it.
+pub const LinkState = enum(u8) {
+    /// Dialing, or backing off between attempts.
+    connecting = 0,
+    /// The socket is up and subscribed. (On a relay that predates per-DID auth,
+    /// this is as far as it goes, and that is fine.)
+    connected = 1,
+    /// The relay has verified who we are (A4 slice 2).
+    authenticated = 2,
+};
+
 /// A7.2: cold struct, size guard waived — one per live chat session.
 pub const ChatRelay = struct {
     gpa: Allocator,
@@ -155,6 +169,10 @@ pub const ChatRelay = struct {
     thread: std.Thread,
     stop: std.atomic.Value(bool),
     socket_fd: std.atomic.Value(i64),
+    /// A5: the link's live state, written by the worker and read by the render
+    /// thread every frame. Atomic because those are two threads, and a byte
+    /// torn across them would be a lie on screen.
+    state: std.atomic.Value(u8),
     host: []const u8,
     port: u16,
     token: []const u8,
@@ -216,6 +234,7 @@ pub fn start(
         .thread = undefined,
         .stop = .init(false),
         .socket_fd = .init(-1),
+        .state = .init(@intFromEnum(LinkState.connecting)),
         .host = host_copy,
         .port = port,
         .token = token_copy,
@@ -254,6 +273,15 @@ pub fn subscribe(cr: *ChatRelay, id: [relay.mailbox_id_len]u8) error{OutOfMemory
     try cr.subs.ensureUnusedCapacity(cr.gpa, 1);
     try cr.outbox.append(cr.gpa, .{ .subscribe = id });
     cr.subs.appendAssumeCapacity(id);
+}
+
+/// The link's live state (A5) — what the connection dot renders from.
+pub fn linkState(cr: *const ChatRelay) LinkState {
+    return @enumFromInt(cr.state.load(.acquire));
+}
+
+fn setState(cr: *ChatRelay, s: LinkState) void {
+    cr.state.store(@intFromEnum(s), .release);
 }
 
 fn takeOutbox(cr: *ChatRelay, into: *std.ArrayList(Out)) error{OutOfMemory}!void {
@@ -310,6 +338,9 @@ fn threadMain(cr: *ChatRelay) void {
     var attempt: u32 = 0;
     while (!cr.stop.load(.acquire)) {
         var healthy = false;
+        // A5: whatever we were, we are dialing now. The dot must never claim a
+        // connection we are in the middle of re-establishing.
+        setState(cr, .connecting);
         // The FIRST dial of a run is logged, and every FAILURE — but not each
         // retry. A silent link was what hid `InvalidHostName` for so long; a link
         // that shouts on every backoff tick is just a different way of hiding it.
@@ -456,6 +487,7 @@ fn runConnection(cr: *ChatRelay, healthy: *bool) !void {
     }
     relayLog("CONNECTED ({d} subscription(s))", .{subs_snap.items.len});
     cr.mailbox.push(gpa, .{ .status = "relay: connected" });
+    setState(cr, .connected);
     healthy.* = true;
 
     var pending_out: std.ArrayList(Out) = .empty;
@@ -534,6 +566,7 @@ fn runConnection(cr: *ChatRelay, healthy: *bool) !void {
                     .auth_ok => {
                         relayLog("AUTHENTICATED — the relay knows this device", .{});
                         cr.mailbox.push(gpa, .{ .status = "relay: authenticated" });
+                        setState(cr, .authenticated);
                     },
                 },
                 .ping => try sendFrame(cr, &conn, .pong, decoded.frame.payload),
