@@ -323,13 +323,18 @@ pub const Conversation = struct {
     pinned: bool = false,
     muted: bool = false,
     hidden: bool = false,
+    /// CHAT_FEATURES: the newest message of OURS they have told us they read (unix
+    /// seconds; 0 = they have never said, which is also what somebody with receipts
+    /// turned OFF looks like — and those two must be indistinguishable, or the
+    /// setting would leak the fact that you turned it off).
+    read_up_to: i64 = 0,
 
     comptime {
-        // A7: still 32. The three flags land in the four bytes of padding that the
-        // i64 alignment was already spending on nothing — they cost literally
-        // nothing, which is why they are bools here rather than a bitset (A6's
-        // reason to move them out of band does not apply when the space is free).
-        assert(@sizeOf(Conversation) == 32);
+        // A7.1 — budget raised 32 → 40. The three flags were free (they landed in
+        // padding); `read_up_to` is a real i64 and is not. Paid deliberately: a read
+        // receipt you cannot store is one you cannot show, and conversations are held
+        // in the dozens, not the millions.
+        assert(@sizeOf(Conversation) == 40);
     }
 };
 
@@ -839,6 +844,25 @@ pub fn replyTo(store: *const Store, msg: u32) u32 {
     return store.msgs.items(.reply_to)[msg];
 }
 
+/// They have read everything of ours up to `at`. The watermark only ever moves
+/// FORWARD: an out-of-order receipt must not un-read a message somebody has read.
+pub fn setReadUpTo(store: *Store, conv: ConvIndex, at: i64) void {
+    const ci: u32 = @intFromEnum(conv);
+    if (ci >= store.convs.len) return;
+    const cur = store.convs.items(.read_up_to)[ci];
+    if (at > cur) store.convs.items(.read_up_to)[ci] = at;
+}
+
+pub fn readUpTo(store: *const Store, conv: ConvIndex) i64 {
+    const ci: u32 = @intFromEnum(conv);
+    return if (ci < store.convs.len) store.convs.items(.read_up_to)[ci] else 0;
+}
+
+/// READ (CHAT_FEATURES). [kind][i64 up_to] — "everything you sent me up to here, I
+/// have seen". A watermark, not a per-message flag: it is one deposit instead of
+/// one per message, which matters when every deposit is a fact the relay can time.
+pub const kind_read_wire: u8 = 11;
+
 /// TOGGLE a reaction: the same emoji from the same person twice is a person taking
 /// it back, which is what everybody expects and nobody writes down.
 pub fn react(gpa: Allocator, store: *Store, msg: u32, emoji: []const u8, mine: bool) error{OutOfMemory}!void {
@@ -1297,7 +1321,7 @@ const codec_magic = [4]u8{ 'Z', 'A', 'T', 'H' };
 /// sections so every v2 blob still reads (a version gate is a compatibility
 /// contract and is written as a RANGE — the day we wrote it as a LIST, a v3 bump
 /// orphaned every conversation on the owner's phone).
-const codec_version: u16 = 7; // v7: reactions
+const codec_version: u16 = 8; // v8: their read watermark, per conversation
 const conv_rec_len = 28; // did span 8 + handle span 8 + i64 8 + u32 4
 const msg_rec_len = 21; // i64 8 + text span 8 + conv 4 + kind 1
 const pay_rec_len = 23; // id 8 + amount 8 + msg 4 + rail 1 + status 1 + conf 1
@@ -1323,7 +1347,8 @@ pub fn serializeStore(gpa: Allocator, store: *const Store) error{OutOfMemory}![]
         (m_count + 7) / 8 + // v4: the edited bitset
         c_count + // v5: one flags byte per conversation
         4 * m_count + // v6: reply_to, one u32 per message
-        4 + store.reactions.len * 13; // v7: reactions (u32 msg + 8 emoji + 1 mine)
+        4 + store.reactions.len * 13 + // v7: reactions (u32 msg + 8 emoji + 1 mine)
+        8 * c_count; // v8: read_up_to, one i64 per conversation
     const out = try gpa.alloc(u8, total);
     errdefer gpa.free(out);
 
@@ -1448,6 +1473,12 @@ pub fn serializeStore(gpa: Allocator, store: *const Store) error{OutOfMemory}![]
         @memcpy(out[at + 4 ..][0..8], &rxs.items(.emoji)[i]);
         out[at + 12] = @intFromBool(rxs.items(.mine)[i]);
         at += 13;
+    }
+
+    // v8: their read watermark.
+    for (0..c_count) |i| {
+        std.mem.writeInt(i64, out[at..][0..8], convs.items(.read_up_to)[i], .little);
+        at += 8;
     }
 
     assert(at == total);
@@ -1725,6 +1756,16 @@ pub fn deserializeStore(gpa: Allocator, bytes: []const u8) DeserializeError!Stor
             if (mb > 1) return error.Malformed; // canonical
             try store.reactions.append(gpa, .{ .msg = m, .emoji = e8, .mine = mb == 1 });
             at += 13;
+        }
+    }
+
+    // v8: the read watermark. A v7 blob has none.
+    if (version >= 8) {
+        if (bytes.len - at < 8 * @as(usize, c_count)) return error.Malformed;
+        const cs2 = store.convs.slice();
+        for (0..c_count) |i| {
+            cs2.items(.read_up_to)[i] = std.mem.readInt(i64, bytes[at..][0..8], .little);
+            at += 8;
         }
     }
 
@@ -2235,7 +2276,7 @@ test "store codec: a version-1 blob (pre-payments) still restores" {
     const v3 = try serializeStore(gpa, &store);
     defer gpa.free(v3);
     const del_len = (store.msgs.len + 7) / 8; // v3 tombstones + v4 edit marks
-    const v5_tail = 2 * del_len + store.convs.len + 4 * store.msgs.len + 4; // v3..v7 (v7 = a zero count)
+    const v5_tail = 2 * del_len + store.convs.len + 4 * store.msgs.len + 4 + 8 * store.convs.len; // v3..v8
     const v1 = try gpa.dupe(u8, v3[0 .. v3.len - v5_tail - 8]);
     defer gpa.free(v1);
     std.mem.writeInt(u16, v1[4..6], 1, .little);
@@ -2280,7 +2321,7 @@ test "store codec v2: every class of payment-section damage is refused" {
     // bytes before it.
     // v3 appends the tombstone bitset AFTER the settlement section, so the
     // payment/settlement records are no longer the tail: step back over it.
-    const del_tail = 2 * ((store.msgs.len + 7) / 8) + store.convs.len + 4 * store.msgs.len + 4; // v3..v7 tails
+    const del_tail = 2 * ((store.msgs.len + 7) / 8) + store.convs.len + 4 * store.msgs.len + 4 + 8 * store.convs.len; // v3..v8
     const ref_at = good.len - del_tail - ref_rec_len;
     const pay_at = good.len - del_tail - ref_rec_len - 4 - pay_rec_len;
 

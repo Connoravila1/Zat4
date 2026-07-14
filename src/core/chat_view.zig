@@ -85,6 +85,10 @@ pub const BubbleRow = struct {
     reacts_n: u8 = 0,
     /// Is one of them ours? (Ours is ringed, so you can see what YOU said.)
     reacts_mine: bool = false,
+    /// The LAST message of ours they have read — the only bubble that wears "Read".
+    /// One mark, at the bottom of the run, not a badge on every bubble: the question
+    /// a person is asking is "did they see it", and they ask it once.
+    read_mark: bool = false,
 
     comptime {
         // A7.1 — budget raised 64 → 88: the reactions ride inline (18 bytes + two
@@ -97,7 +101,7 @@ pub const BubbleRow = struct {
         // message it is acting on, and the alternative — re-deriving the mapping in
         // the shell from a parallel query — is the kind of implicit coupling that
         // breaks the first time the two orderings disagree.
-        assert(@sizeOf(BubbleRow) == 88);
+        assert(@sizeOf(BubbleRow) == 88); // read_mark landed in existing padding
     }
 };
 
@@ -322,6 +326,23 @@ pub fn buildThread(
         }
         prev_at = at;
     }
+    // THE READ MARK, on the newest message of ours they have confirmed. Walk from
+    // the end: the first of ours at or before their watermark gets it, and nothing
+    // else does.
+    {
+        const water = chat.readUpTo(store, conv);
+        if (water > 0) {
+            var i = out.len;
+            while (i > 0) {
+                i -= 1;
+                if (!out[i].mine or out[i].deleted) continue;
+                if (store.msgs.items(.created_at)[out[i].msg] > water) continue;
+                out[i].read_mark = true;
+                break;
+            }
+        }
+    }
+
     // Close each same-sender run: the tail goes on its last bubble (a sender
     // change, a time-divider gap, or the end of the thread ends a run).
     for (out, 0..) |*row, i| {

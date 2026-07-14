@@ -10540,6 +10540,14 @@ pub fn layoutChat(
                             drawn += 1;
                         }
                     }
+                    if (b.read_mark) {
+                        // One quiet word, under the last message they have seen. Not a
+                        // badge on every bubble: the question is "did they see it", and
+                        // a person asks it once.
+                        const rm = "Read";
+                        const rw: i32 = @intCast(text.measure(e, .regular, rm, 10));
+                        _ = try str(gpa, dl, e, .regular, bx + bw - rw, by + hh + 12, faint, 10, rm);
+                    }
                     if (b.edited and !b.deleted) {
                         const em = "Edited";
                         const ew: i32 = @intCast(text.measure(e, .regular, em, 10));

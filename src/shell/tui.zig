@@ -906,6 +906,14 @@ const RunState = struct {
     /// Unsends and edits still trying to reach the other side.
     gpending: [16]Revision,
     gpending_n: usize,
+    /// READ RECEIPTS (under the slice-1 consent). A receipt is DUE for this
+    /// conversation at `gread_due_at` (0 = none pending) covering everything up to
+    /// `gread_up_to`. It is jittered, and it is CANCELLED if we send a message
+    /// first — replying already tells them we read it, and a receipt on top of that
+    /// is a second timestamped event for the relay to keep, bought for nothing.
+    gread_conv: chat_core.ConvIndex,
+    gread_up_to: i64,
+    gread_due_at: i64,
     /// A URL this frame asked the OS to open. On the phone there is no
     /// `xdg-open` — the seam hands it to the activity, which fires an
     /// ACTION_VIEW intent (the same road the OAuth browser already takes).
@@ -1586,6 +1594,8 @@ fn initRunState(
     rs.gchat_reply_to = no_reply;
     rs.gchat_edit_of = no_reply;
     rs.gpending_n = 0;
+    rs.gread_due_at = 0;
+    rs.gread_up_to = 0;
     rs.gboot_start_ns = 0;
     // A signed-in app never plays the entrance: it is the front door's overture,
     // not a splash screen, and somebody who is already inside is not arriving.
@@ -2290,6 +2300,11 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                 // take down a message of THEIRS. We honour it —
                                 // because we choose to, which is the only reason any
                                 // client ever does.
+                                .read => |r| read: {
+                                    const conv = chat_core.openConversation(gpa, &rs.gchat_store, r.peer_did, "") catch break :read;
+                                    chat_core.setReadUpTo(&rs.gchat_store, conv, r.up_to);
+                                    chatPersistHistory(gpa, io, environ, st, &rs.gchat_store);
+                                },
                                 .react => |r| react: {
                                     const conv = chat_core.openConversation(gpa, &rs.gchat_store, r.peer_did, "") catch break :react;
                                     const tgt = chat_core.findByStamp(&rs.gchat_store, conv, r.target_at, r.target_mine) orelse break :react;
@@ -2387,7 +2402,26 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                     chatLog("[chat] history ADOPTED: {d} conversation(s)", .{rs.gchat_store.convs.len});
                                 },
                                 .roster => |r| {
-                                    var it = std.mem.tokenizeScalar(u8, r.dids, '\n');
+                                    // The tail carries the account's privacy answers
+                                    // (slice 1). Adopt them ONLY if we have never been
+                                    // asked — a device that has an answer of its own is
+                                    // not overruled from across the room.
+                                    var dids = r.dids;
+                                    if (dids.len >= 2) {
+                                        const tail = dids[dids.len - 2 ..];
+                                        if ((tail[0] | tail[1]) <= 1) {
+                                            if (!rs.gchat_asked) {
+                                                rs.gchat_receipts = tail[0] == 1;
+                                                rs.gchat_typing_on = tail[1] == 1;
+                                                rs.gchat_asked = true;
+                                                rs.gchat_consent_open = false;
+                                                chatPrefsSave(rs, environ, session.did);
+                                                chatLog("[chat] privacy answers inherited from our other device", .{});
+                                            }
+                                            dids = dids[0 .. dids.len - 2];
+                                        }
+                                    }
+                                    var it = std.mem.tokenizeScalar(u8, dids, '\n');
                                     var queued: usize = 0;
                                     while (it.next()) |did| {
                                         if (rs.groster_n >= rs.groster.len) break;
@@ -2716,6 +2750,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
         // Unsends and edits that have not landed yet — tried again, quietly, until
         // they do (or until we say plainly that they did not).
         if (dev_chat and rs.gpending_n > 0) chatDrainRevisions(rs, gpa, io, environ);
+        if (dev_chat) chatReadReceiptStep(rs, gpa, io, environ, now);
 
         // MULTI-DEVICE (slice 2). Runs whether or not chat is up, because the
         // device that is WAITING to be let in has no chat state by definition — and
@@ -6314,6 +6349,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                             if (chatConvAt(arena, &rs.gchat_store, now, cq, hit.post)) |conv| {
                                                 rs.gchat_sel = conv;
                                                 chat_core.markRead(&rs.gchat_store, conv);
+                                                chatArmReadReceipt(rs, io, conv, now);
                                                 // M2: read-state survives a relaunch too.
                                                 chatPersistHistory(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
                                                 rs.gchat_input_focus = true;
@@ -6578,6 +6614,12 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                                     chatSendReply(rs, gpa, io, environ, sc, rs.gchat_reply_to, body);
                                                     rs.gchat_reply_to = no_reply;
                                                 } else chatSend(gpa, io, environ, if (rs.gchat_e2ee) |*st| st else null, rs.gchat_link, &rs.gchat_store, sc, body);
+                                                // THE PIGGYBACK: a reply already tells
+                                                // them we read it. Drop the pending
+                                                // receipt rather than spend a second
+                                                // deposit saying what the message just
+                                                // said.
+                                                if (rs.gread_due_at != 0 and rs.gread_conv == sc) rs.gread_due_at = 0;
                                                 chatPersistHistory(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
                                                 rs.gchat_draft_len = 0;
                             rs.gchat_caret = 0;
@@ -9859,6 +9901,13 @@ fn rosterPublish(
         }
     }
     if (buf.items.len == 0) return;
+    // THE PREFERENCES RIDE ALONG (slice 1's promise: asked once per ACCOUNT, not per
+    // device). A newly-approved phone inherits the answer silently and never puts the
+    // screen in front of somebody who has already answered it.
+    buf.appendSlice(gpa, if (rs.gchat_receipts) "\x01" else "\x00") catch return;
+    buf.appendSlice(gpa, if (rs.gchat_typing_on) "\x01" else "\x00") catch return;
+    sig ^= @intFromBool(rs.gchat_receipts);
+    sig ^= @as(u64, @intFromBool(rs.gchat_typing_on)) << 1;
     if (sig == rs.groster_sig) return; // nothing has changed; say nothing
     chat_e2ee.sendRoster(gpa, io, env, st, link, buf.items) catch |err| {
         chatLog("[chat] roster: send failed: {s}", .{@errorName(err)});
@@ -9884,6 +9933,49 @@ fn setClipboardText(rs: *RunState, backend: Backend, t: []const u8) void {
     const n = @min(t.len, rs.clip_out_buf.len);
     @memcpy(rs.clip_out_buf[0..n], t[0..n]);
     rs.clip_out_len = n;
+}
+
+/// A read receipt becomes DUE — but not yet, and only if they asked for one.
+///
+/// THE JITTER IS NOT DECORATION. A receipt sent the instant a thread opens hands the
+/// relay a precise timestamp of when you looked at your phone, every single time. A
+/// random delay of up to a minute blurs that into something far less useful without
+/// changing anything the PERSON eventually sees — they still learn you read it, they
+/// just do not learn the second.
+fn chatArmReadReceipt(rs: *RunState, io: std.Io, conv: chat_core.ConvIndex, now: i64) void {
+    if (!rs.gchat_receipts) return; // OFF unless they turned it on (slice 1)
+    // The newest message of THEIRS is what we are confirming.
+    var newest: i64 = 0;
+    var i: u32 = 0;
+    while (i < rs.gchat_store.msgs.len) : (i += 1) {
+        if (rs.gchat_store.msgs.items(.conv)[i] != conv) continue;
+        if (chat_core.isMine(&rs.gchat_store, @enumFromInt(i))) continue;
+        newest = @max(newest, rs.gchat_store.msgs.items(.created_at)[i]);
+    }
+    if (newest == 0 or newest <= rs.gread_up_to) return; // nothing new to confirm
+
+    var b: [1]u8 = undefined;
+    io.randomSecure(&b) catch {
+        b[0] = 30;
+    };
+    const jitter: i64 = 5 + @as(i64, b[0] % 55); // 5–60s
+    rs.gread_conv = conv;
+    rs.gread_up_to = newest;
+    rs.gread_due_at = now + jitter;
+}
+
+/// Send a receipt that has come due — unless we have MESSAGED them since it was
+/// armed, in which case they already know we read it and the deposit would be a
+/// second timestamped event bought for nothing.
+fn chatReadReceiptStep(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, now: i64) void {
+    if (rs.gread_due_at == 0 or now < rs.gread_due_at) return;
+    rs.gread_due_at = 0;
+    if (!rs.gchat_receipts) return;
+    const st = if (rs.gchat_e2ee) |*p| p else return;
+    const link = rs.gchat_link orelse return;
+    const did = chat_core.conversationDid(&rs.gchat_store, rs.gread_conv);
+    chat_e2ee.sendRead(gpa, io, env, st, link, did, rs.gread_up_to) catch |err|
+        chatLog("[chat] read receipt failed: {s}", .{@errorName(err)});
 }
 
 /// React to a message: locally first (so the chip appears under the thumb that

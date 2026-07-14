@@ -1348,6 +1348,25 @@ pub fn sendReact(
     return depositAll(gpa, io, environ, st, link, peer_did, buf[0 .. 10 + emoji.len]);
 }
 
+/// Tell them we have read everything of theirs up to `at`. ONE deposit, a
+/// watermark — not one per message, because every deposit is a fact the relay can
+/// put a timestamp on and there is no reason to hand it more of them than the truth
+/// requires.
+pub fn sendRead(
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    st: *State,
+    link: *chat_relay.ChatRelay,
+    peer_did: []const u8,
+    up_to: i64,
+) SendError!void {
+    var buf: [9]u8 = undefined;
+    buf[0] = chat.kind_read_wire;
+    std.mem.writeInt(i64, buf[1..9], up_to, .little);
+    return depositAll(gpa, io, environ, st, link, peer_did, &buf);
+}
+
 /// One typing-indicator ping (U6a): [kind_typing_wire] alone, through the
 /// full E2EE path — encrypt, persist-before-deposit (the same nonce rule as
 /// a message; a ping advances the ratchet exactly like one), one fixed
@@ -1465,6 +1484,8 @@ pub const Incoming = union(enum) {
     reply: struct { peer_did: []u8, target_at: i64, target_mine: bool, text: []u8 },
     /// They reacted to a message (or took the reaction back).
     react: struct { peer_did: []u8, target_at: i64, target_mine: bool, emoji: []u8 },
+    /// They have read everything of ours up to `up_to`.
+    read: struct { peer_did: []u8, up_to: i64 },
     /// ANOTHER DEVICE OF OURS is asking for the backlog (slice 5). `device` names
     /// which one, so the answer goes to it and to nobody else.
     history_request: struct { device: [32]u8 },
@@ -1549,6 +1570,7 @@ pub fn freeIncoming(gpa: Allocator, inc: Incoming) void {
             gpa.free(r.peer_did);
             gpa.free(r.emoji);
         },
+        .read => |r| gpa.free(r.peer_did),
         .history_request => {},
         .history_chunk => |h| gpa.free(h.bytes),
         .welcome_again => |s| gpa.free(s.peer_did),
@@ -1821,6 +1843,14 @@ pub fn onBucket(
                         if (!std.mem.eql(u8, st.peer_dids.items[idx], st.my_did)) return null;
                         if (data.len < 2) return null;
                         return .{ .roster = .{ .dids = try gpa.dupe(u8, data[1..]) } };
+                    }
+                    // A READ RECEIPT.
+                    if (data[0] == chat.kind_read_wire) {
+                        if (data.len < 9) return null;
+                        return .{ .read = .{
+                            .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]),
+                            .up_to = std.mem.readInt(i64, data[1..9], .little),
+                        } };
                     }
                     // A REACTION.
                     if (data[0] == chat.kind_react_wire) {
