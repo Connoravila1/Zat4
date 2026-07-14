@@ -15097,6 +15097,24 @@ fn paintFrameGpu(
             chat_sig ^= tick *% 0x9E37_79B9_7F4A_7C15;
         }
     };
+    // THE DEVICE SURFACES fold in SEPARATELY, because they are the one part of the
+    // Messages screen that draws when chat did NOT come up — the gate (elsewhere /
+    // waiting / can't-reach) renders with `chat_store == null`, so the block above
+    // (gated on chat_store) never sees it. This is the consent screen's toggles and
+    // the gate's faces; without it the GPU path caches the first frame and a tapped
+    // toggle flips its bool but never repaints — a dead control (the rebuild law,
+    // and the consent toggles were the fourth surface it bit, 2026-07-14).
+    if (g.screen.* == feed_view.screen_messages) {
+        const dv = g.chat_devices;
+        chat_sig ^= (@as(u64, @intFromEnum(dv.state)) +% 1) *% 0x9E37_79B9_7F4A_7C15;
+        chat_sig ^= @as(u64, @intFromBool(dv.consent_open)) *% 0xC2B2_AE3D_27D4_EB4F;
+        chat_sig ^= @as(u64, @intFromBool(dv.consent_receipts)) *% 0xD6E8_FEB8_6659_FD93;
+        chat_sig ^= @as(u64, @intFromBool(dv.consent_typing)) *% 0x2545_F491_4F6C_DD1D;
+        chat_sig ^= @as(u64, @intFromBool(dv.busy)) *% 0x1656_67B1_9E37_79F9;
+        chat_sig ^= @as(u64, @intFromBool(dv.help_open)) *% 0x8EBC_6AF0_9C88_C6E3;
+        chat_sig ^= @as(u64, dv.pending.len) *% 0xF29C_511C_8E3D_45A7;
+        chat_sig ^= std.hash.Wyhash.hash(0x3B8F_55D1, dv.error_line);
+    }
 
     // Zat Chat motion (U6b). The trigger is DERIVED, in this one place, from the
     // observed state transition — the OPEN conversation's newest message key
@@ -15163,6 +15181,16 @@ fn paintFrameGpu(
             gs.chat_typing_t > 0.01 or g.chat_typing or
             g.chat_input_focus or g.chat_composing or g.chat_pay.open or g.chat_recv.open;
     };
+    // The device gate's motion is time-driven and eased — the link that BREATHES
+    // while we wait (a sine on d.t), and the "device added" confirmation that fades
+    // over a couple of seconds. Neither can live in a signature (an eased value
+    // changes every frame, which is the same as no signature). So while the gate is
+    // waiting/offline, or a confirmation is mid-fade, keep frames coming. This runs
+    // OUTSIDE the chat_store guard on purpose: the gate draws when chat is not up.
+    if (g.screen.* == feed_view.screen_messages) {
+        const dv = g.chat_devices;
+        if (dv.state == .pending or dv.state == .offline or dv.added_t > 0.001) chat_animating = true;
+    }
     // ZONES: the hub + zone page render from state the feed signature can't
     // see — the sub-tab, the search text/focus/caret, the catalog's pins and
     // live stats, the motion scalars, and (hub only) the hover position. Fold

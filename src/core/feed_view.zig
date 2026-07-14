@@ -9782,11 +9782,11 @@ fn drawChatConsent(
 
     _ = try str(gpa, dl, e, .semibold, x, y + 10, ink, 24, "Before you start");
     y += 40;
-    _ = try str(gpa, dl, e, .regular, x, y + 12, muted, 14, "Two things you can share with the people you talk to.");
+    _ = try str(gpa, dl, e, .regular, x, y + 12, muted, 14, "Two small signals you can send to the person you're chatting with.");
     y += 20;
-    _ = try str(gpa, dl, e, .regular, x, y + 12, muted, 14, "Most people leave them on. If you'd rather share less, leave them off \u{2014}");
+    _ = try str(gpa, dl, e, .regular, x, y + 12, muted, 14, "Only they ever see them \u{2014} not us, not the server, since your chats are");
     y += 20;
-    _ = try str(gpa, dl, e, .regular, x, y + 12, muted, 14, "nothing else about Zat Chat changes either way.");
+    _ = try str(gpa, dl, e, .regular, x, y + 12, muted, 14, "end-to-end encrypted. Most people leave them on; turn them off if you'd rather not.");
     y += 34;
 
     const Opt = struct { on: bool, act: Action, title: []const u8, body: []const u8, cost: []const u8 };
@@ -9795,21 +9795,22 @@ fn drawChatConsent(
             .on = d.consent_receipts,
             .act = .chat_consent_receipts,
             .title = "Read receipts",
-            .body = "Let people see when you've read their messages.",
-            .cost = "Servers still can't read a word. But a receipt goes out each time you open a chat, so they'd know when you're around \u{2014} even when you don't reply.",
+            .body = "Let the person you're chatting with see when you've opened their message.",
+            .cost = "Only they see it \u{2014} it shows you've read their message and roughly when, even if you don't reply. Nobody else can, not even us. Off = you can read without signalling you're around.",
         },
         .{
             .on = d.consent_typing,
             .act = .chat_consent_typing,
             .title = "Typing indicator",
-            .body = "Let people see the \u{201C}\u{2026}\u{201D} while you're typing.",
-            .cost = "Same trade. Nobody can read what you type; the pings just say you're at your keyboard right now.",
+            .body = "Let the person you're chatting with see the \u{201C}\u{2026}\u{201D} while you're typing.",
+            .cost = "Same deal \u{2014} only they see it, and only that you're typing right now, never the words. Off = no \u{201C}\u{2026}\u{201D}, and they won't know you started a reply and stopped.",
         },
     };
 
     for (opts) |o| {
-        const h: i32 = 138; // room for the COST to be read in full — a truth that
-        // gets clipped halfway through is worse than one nobody printed.
+        const h: i32 = 168; // room for the COST to be read in full — a truth that
+        // gets clipped halfway through is worse than one nobody printed. Four wrapped
+        // lines, sized for the NARROW (phone) card where the cost wraps longest.
         try cardBox(gpa, dl, x, y, iw, h, 12, 0xFF1B1B1B);
         try rect(gpa, dl, x, y, iw, h, 0x2AEDEAE0, 12);
 
@@ -9826,7 +9827,7 @@ fn drawChatConsent(
         _ = try str(gpa, dl, e, .semibold, x + 18, y + 30, ink, 15, o.title);
         _ = try str(gpa, dl, e, .regular, x + 18, y + 54, muted, 13, o.body);
         // The cost, in the same breath as the offer — not in a footnote nobody reads.
-        _ = try wrapLines(gpa, dl, e, x + 18, y + 76, iw - 44, faint, 12, o.cost, 3);
+        _ = try wrapLines(gpa, dl, e, x + 18, y + 76, iw - 44, faint, 12, o.cost, 4);
         y += h + 12;
     }
 

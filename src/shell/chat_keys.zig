@@ -607,10 +607,22 @@ pub fn ensureDevice(
     const devices = set.?;
     for (devices.devices) |d| {
         if (!std.mem.eql(u8, &d.anchor_pub, &mine)) continue;
-        // We are part of the account. Refresh our own record (idempotent) and never
-        // go near anybody else's.
-        _ = try publishDevice(gpa, arena, io, environ, session, device_name, d.root, "");
-        return if (d.root) .root else .approved;
+        // We are part of the account, and here is where a real bug lived: an APPROVED
+        // (non-root) device used to `publishDevice(..., "")` on every bring-up — with
+        // an EMPTY approval — which OVERWRITES its own record and ERASES the signature
+        // another device made over it. It fired on the first two-device test
+        // (2026-07-14): the phone came up approved, republished, and wiped its own
+        // membership; the directory then showed it unapproved and it bounced back to
+        // "waiting" on the next read. An approval can only be MADE by another device;
+        // this one cannot reconstruct it, so it must not touch a record that already
+        // carries it. Being in the resolved set IS the record already being right.
+        if (d.root) {
+            // The root has no approval to lose — it self-attests, so re-asserting is
+            // safe and heals a wiped root record.
+            _ = try publishDevice(gpa, arena, io, environ, session, device_name, true, "");
+            return .root;
+        }
+        return .approved;
     }
     return waitingOrAtTheGate(gpa, arena, io, environ, did, mine);
 }
@@ -703,6 +715,19 @@ pub fn fetchPending(
     var out = try std.ArrayListUnmanaged(PendingDevice).initCapacity(arena, listing.len);
     const now = clock.unixSeconds();
 
+    // A DEVICE NEVER ASKS TO JOIN ITSELF. This is defence in depth behind the
+    // approval-persistence fix: if anything ever leaves our OWN record looking
+    // unapproved (a wiped approval, an expiry, a half-write), the trusted-set check
+    // below would classify it as "pending" and we would prompt a person to approve
+    // their own device — which is nonsense, and is exactly what the owner saw on the
+    // phone on the first two-device test (2026-07-14). Our own anchor is excluded
+    // outright, so no directory state can ever put that prompt in front of anyone.
+    const own: ?[anchor.pk_len]u8 = blk: {
+        var anchor_load = cache.loadOrCreateAnchorSeed(gpa, io, environ, did) orelse break :blk null;
+        defer std.crypto.secureZero(u8, &anchor_load.seed);
+        break :blk anchor.publicKey(anchor_load.seed) catch null;
+    };
+
     for (listing) |r| {
         const v = r.value;
         if (v.root) continue; // the root vouches for itself; it is never pending
@@ -715,6 +740,9 @@ pub fn fetchPending(
             .anchor_sig = decoded.anchor_sig,
             .not_after = decoded.not_after,
         }, now) catch continue;
+
+        // Never us. (See the note at the top: a device does not approve itself.)
+        if (own) |mine| if (std.mem.eql(u8, &mine, &peer.anchor_pub)) continue;
 
         // Already vouched for by somebody we trust? Then it is not asking — it is
         // in, and a prompt about it would be a prompt about nothing.
