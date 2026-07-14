@@ -303,7 +303,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_restart, chat_identity_reset, chat_device_add, chat_device_approve, chat_device_refuse, chat_device_help, chat_help_close, chat_history_get, chat_consent_receipts, chat_consent_typing, chat_consent_done, chat_msg_copy, chat_msg_reply, chat_msg_delete_me, chat_msg_delete_all, chat_menu_dismiss, chat_msg, recv_clip, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, recv_back, recv_use, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_restart, chat_identity_reset, chat_device_add, chat_device_approve, chat_device_refuse, chat_device_help, chat_help_close, chat_history_get, chat_consent_receipts, chat_consent_typing, chat_consent_done, chat_msg_copy, chat_msg_reply, chat_msg_edit, chat_msg_delete_me, chat_msg_delete_all, chat_menu_dismiss, chat_msg, recv_clip, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, recv_back, recv_use, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -9536,9 +9536,14 @@ fn drawPendingDeviceCard(
 pub const ChatMenuItem = enum(u8) {
     copy,
     reply,
+    /// Ours, inside the 24h window.
+    edit,
     delete_me,
-    /// Only ever offered on OUR OWN messages — and it is a REQUEST, which the label
-    /// says out loud.
+    /// Ours, inside the window. It is technically a REQUEST — their client applies it
+    /// because it chooses to — but the LABEL says "Delete for everyone", because that
+    /// is what every person on earth calls this and "Ask them to delete it" is
+    /// confusing even though it is true. The truth lives in the explainer, where it
+    /// can be explained rather than merely hinted at on a button.
     delete_all,
 };
 
@@ -9548,6 +9553,10 @@ pub const ChatMenu = struct {
     /// The message it acts on (store index), and whether it is ours.
     msg: u32 = 0,
     mine: bool = false,
+    /// Ours AND still inside the 24-hour window: Edit and Delete-for-everyone are
+    /// offered only then (a client that has pruned the message cannot be asked to
+    /// change a past nobody can still see).
+    revisable: bool = false,
     /// Where it was summoned, in logical px.
     x: i32 = 0,
     y: i32 = 0,
@@ -9559,24 +9568,35 @@ pub const ChatMenu = struct {
 const chat_menu_w: i32 = 208;
 const chat_menu_row_h: i32 = 44;
 
-fn chatMenuItems(mine: bool, out: *[4]ChatMenuItem) []const ChatMenuItem {
-    out[0] = .copy;
-    out[1] = .reply;
-    out[2] = .delete_me;
-    if (!mine) return out[0..3];
-    out[3] = .delete_all;
-    return out[0..4];
+fn chatMenuItems(mine: bool, revisable: bool, out: *[5]ChatMenuItem) []const ChatMenuItem {
+    var n: usize = 0;
+    out[n] = .copy;
+    n += 1;
+    out[n] = .reply;
+    n += 1;
+    // Edit and Delete-for-everyone are OURS, and only while the window is open. A
+    // greyed-out item people cannot use teaches them nothing; an absent one asks no
+    // questions.
+    if (mine and revisable) {
+        out[n] = .edit;
+        n += 1;
+    }
+    out[n] = .delete_me;
+    n += 1;
+    if (mine and revisable) {
+        out[n] = .delete_all;
+        n += 1;
+    }
+    return out[0..n];
 }
 
 fn chatMenuLabel(it: ChatMenuItem) []const u8 {
     return switch (it) {
         .copy => "Copy",
         .reply => "Reply",
+        .edit => "Edit",
         .delete_me => "Delete for me",
-        // NOT "Delete for everyone" — we cannot reach into their phone, and their
-        // client honours this because it chooses to. Every messenger works this way;
-        // most let people believe otherwise. The label tells the truth instead.
-        .delete_all => "Ask them to delete it",
+        .delete_all => "Delete for everyone",
     };
 }
 
@@ -9584,6 +9604,7 @@ fn chatMenuAction(it: ChatMenuItem) Action {
     return switch (it) {
         .copy => .chat_msg_copy,
         .reply => .chat_msg_reply,
+        .edit => .chat_msg_edit,
         .delete_me => .chat_msg_delete_me,
         .delete_all => .chat_msg_delete_all,
     };
@@ -9601,8 +9622,8 @@ fn drawChatMenu(
     m: ChatMenu,
 ) error{OutOfMemory}!void {
     if (!m.open) return;
-    var buf: [4]ChatMenuItem = undefined;
-    const items = chatMenuItems(m.mine, &buf);
+    var buf: [5]ChatMenuItem = undefined;
+    const items = chatMenuItems(m.mine, m.revisable, &buf);
     const h = chat_menu_row_h * @as(i32, @intCast(items.len)) + 12;
 
     // It stays ON SCREEN. A menu summoned near the bottom edge that runs off it is
@@ -9862,6 +9883,11 @@ fn drawChatHelp(
             "History is stored on the device that received it, so a newly added",
             "device starts empty and fills up from that moment. Nothing is lost",
             "on the device that has it.",
+        } },
+        .{ .h = "Deleting and editing", .b = &[_][]const u8{
+            "\u{201C}Delete for everyone\u{201D} and \u{201C}Edit\u{201D} send a request that the other",
+            "person's app carries out \u{2014} that is how every messenger does it. What it",
+            "cannot do is take back a screenshot, or a copy someone already made.",
         } },
         .{ .h = "\u{201C}Started chat on a new device\u{201D}", .b = &[_][]const u8{
             "If someone's keys change, we say so in the conversation rather than",
@@ -10385,7 +10411,17 @@ pub fn layoutChat(
                 if (!is_fly) {
                     if (b.tail) try bubbleTail(gpa, dl, b.mine, bx, by, bw, hh, fill);
                     try rect(gpa, dl, bx, by, bw, hh, fill, bub_rad);
-                    _ = try wrapBody(gpa, dl, e, bx + pad_x, by + pad_y + 14, bub_max - 2 * pad_x, ink, chat_px, b.body, line_h, true, null);
+                    // A DELETED message is a ghost: no fill weight, no confusion with
+                    // a real one. An EDITED one wears its mark — words that changed
+                    // after you read them and said nothing about it is how somebody
+                    // rewrites the past quietly.
+                    const bubble_ink: u32 = if (b.deleted) faint else ink;
+                    _ = try wrapBody(gpa, dl, e, bx + pad_x, by + pad_y + 14, bub_max - 2 * pad_x, bubble_ink, chat_px, b.body, line_h, true, null);
+                    if (b.edited and !b.deleted) {
+                        const em = "Edited";
+                        const ew: i32 = @intCast(text.measure(e, .regular, em, 10));
+                        _ = try str(gpa, dl, e, .regular, bx + bw - pad_x - ew, by + hh - 6, softA(0xEDEAE0, 0x66), 10, em);
+                    }
                 } else {
                     // THE MORPH. Spring physics, not easing: rise and scale
                     // ride the SAME spring (unclamped t — a gentle ~2%

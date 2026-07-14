@@ -927,19 +927,54 @@ pub fn sendHistory(
 /// Ask the other side to unsend a message of ours (CHAT_FEATURES slice 3). It goes
 /// to every device they have, like any other message — a message that vanished from
 /// their phone but not their laptop would be worse than not deleting it at all.
+/// `to` is who receives it (the peer, or our OWN did for our other devices); `conv`
+/// is the conversation the message lives in.
+///
+/// THE CONVERSATION HAS TO RIDE ALONG. A revision that reaches our own other device
+/// says "delete the message you sent at 14:03" — and that device has no way to know
+/// WHICH conversation that was. The peer ignores this field (its session already
+/// says which conversation it is); our own device needs it.
 pub fn sendUnsend(
     gpa: Allocator,
     io: std.Io,
     environ: ?*const std.process.Environ.Map,
     st: *State,
     link: *chat_relay.ChatRelay,
-    peer_did: []const u8,
+    to: []const u8,
+    conv_did: []const u8,
     created_at: i64,
 ) SendError!void {
-    var buf: [9]u8 = undefined;
+    var buf: [10 + 128]u8 = undefined;
+    if (conv_did.len > 128) return error.TooLong;
     buf[0] = chat.kind_unsend_wire;
     std.mem.writeInt(i64, buf[1..9], created_at, .little);
-    return depositAll(gpa, io, environ, st, link, peer_did, &buf);
+    buf[9] = @intCast(conv_did.len);
+    @memcpy(buf[10..][0..conv_did.len], conv_did);
+    return depositAll(gpa, io, environ, st, link, to, buf[0 .. 10 + conv_did.len]);
+}
+
+/// Ask them to apply an edit to a message of ours.
+pub fn sendEdit(
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    st: *State,
+    link: *chat_relay.ChatRelay,
+    to: []const u8,
+    conv_did: []const u8,
+    created_at: i64,
+    text: []const u8,
+) SendError!void {
+    var buf: [1024]u8 = undefined;
+    if (conv_did.len > 128) return error.TooLong;
+    const head = 10 + conv_did.len;
+    if (head + text.len > buf.len or head + text.len > max_payload) return error.TooLong;
+    buf[0] = chat.kind_edit_wire;
+    std.mem.writeInt(i64, buf[1..9], created_at, .little);
+    buf[9] = @intCast(conv_did.len);
+    @memcpy(buf[10..][0..conv_did.len], conv_did);
+    @memcpy(buf[head..][0..text.len], text);
+    return depositAll(gpa, io, environ, st, link, to, buf[0 .. head + text.len]);
 }
 
 /// What a refresh found out about a peer (slice 4). A7.2: cold, transient.
@@ -1379,7 +1414,9 @@ pub const Incoming = union(enum) {
     /// indicator for a few seconds and lets it lapse. Never stored.
     typing: struct { peer_did: []u8 },
     /// The peer wants a message of THEIRS taken down (CHAT_FEATURES slice 3).
-    unsend: struct { peer_did: []u8, created_at: i64 },
+    unsend: struct { peer_did: []u8, conv_did: []u8, created_at: i64 },
+    /// The peer revised a message of THEIRS.
+    edit: struct { peer_did: []u8, conv_did: []u8, created_at: i64, text: []u8 },
     /// ANOTHER DEVICE OF OURS is asking for the backlog (slice 5). `device` names
     /// which one, so the answer goes to it and to nobody else.
     history_request: struct { device: [32]u8 },
@@ -1447,7 +1484,15 @@ pub fn freeIncoming(gpa: Allocator, inc: Incoming) void {
         .restarted => |s| gpa.free(s.peer_did),
         .typing => |t| gpa.free(t.peer_did),
         .roster => |r| gpa.free(r.dids),
-        .unsend => |u| gpa.free(u.peer_did),
+        .unsend => |u| {
+            gpa.free(u.peer_did);
+            gpa.free(u.conv_did);
+        },
+        .edit => |ed| {
+            gpa.free(ed.peer_did);
+            gpa.free(ed.conv_did);
+            gpa.free(ed.text);
+        },
         .history_request => {},
         .history_chunk => |h| gpa.free(h.bytes),
         .welcome_again => |s| gpa.free(s.peer_did),
@@ -1725,10 +1770,25 @@ pub fn onBucket(
                     // message THEY sent. It can only ever name a message in this
                     // conversation, from them — the session it arrived on says so.
                     if (data[0] == chat.kind_unsend_wire) {
-                        if (data.len < 9) return null;
+                        if (data.len < 10) return null;
+                        const dn: usize = data[9];
+                        if (data.len < 10 + dn) return null;
                         return .{ .unsend = .{
                             .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]),
+                            .conv_did = try gpa.dupe(u8, data[10 .. 10 + dn]),
                             .created_at = std.mem.readInt(i64, data[1..9], .little),
+                        } };
+                    }
+                    // EDIT: they revised something they said.
+                    if (data[0] == chat.kind_edit_wire) {
+                        if (data.len < 11) return null;
+                        const dn: usize = data[9];
+                        if (data.len < 11 + dn) return null;
+                        return .{ .edit = .{
+                            .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]),
+                            .conv_did = try gpa.dupe(u8, data[10 .. 10 + dn]),
+                            .created_at = std.mem.readInt(i64, data[1..9], .little),
+                            .text = try gpa.dupe(u8, data[10 + dn ..]),
                         } };
                     }
                     // HISTORY (slice 5) — the ask, and the bytes. Both carry the

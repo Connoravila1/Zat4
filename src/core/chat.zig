@@ -139,6 +139,13 @@ pub const kind_history_chunk_wire: u8 = 6;
 /// somebody hurt.
 pub const kind_unsend_wire: u8 = 7;
 
+/// EDIT (CHAT_FEATURES). [kind][i64 created_at][the new text] — the same shape as
+/// the unsend, and the same honesty: their client applies it because it chooses to.
+/// The message keeps its timestamp (it is the same message, said better) and the
+/// bubble wears an "Edited" mark, because words that changed after you read them and
+/// said nothing about it is how somebody rewrites the past quietly.
+pub const kind_edit_wire: u8 = 8;
+
 /// How many times an unacknowledged Welcome is re-sent before the client
 /// stops and says so. With the ladder below this is ~1 hour of trying; a
 /// relaunch starts the ladder over (`restoreGroups`), so a peer who comes
@@ -442,6 +449,10 @@ pub const Store = struct {
     /// on the next save — a deletion that leaves the words on disk is not a
     /// deletion, and the person who tapped it believes it was.
     deleted: std.DynamicBitSetUnmanaged = .{},
+    /// EDITED, parallel to `msgs` (A6). The bubble wears an "Edited" mark: a message
+    /// whose words changed and said nothing about it would let somebody rewrite what
+    /// they said after you read it, and quietly.
+    edited: std.DynamicBitSetUnmanaged = .{},
     /// One row per payment card (card ⇔ row; M5 A1).
     payments: std.MultiArrayList(PaymentRow) = .empty,
     /// Cold settlement detail, at most one row per payment (A6).
@@ -457,6 +468,7 @@ pub fn deinitStore(gpa: Allocator, store: *Store) void {
     store.conv_by_did.deinit(gpa);
     store.mine.deinit(gpa);
     store.deleted.deinit(gpa);
+    store.edited.deinit(gpa);
     store.payments.deinit(gpa);
     store.settlements.deinit(gpa);
     store.* = undefined;
@@ -625,6 +637,7 @@ fn appendRecord(
     try store.mine.resize(gpa, store.msgs.len, false);
     store.mine.setValue(index, mine);
     try store.deleted.resize(gpa, store.msgs.len, false);
+    try store.edited.resize(gpa, store.msgs.len, false);
 
     const ci: u32 = @intFromEnum(conv);
     const convs = store.convs.slice();
@@ -659,6 +672,42 @@ pub fn deleteMessage(store: *Store, msg: u32) void {
     const end = @as(usize, span.offset) + span.len;
     if (end <= bytes.len) @memset(bytes[span.offset..end], 0);
     msgs.items(.text)[msg] = TextSpan.empty;
+}
+
+pub fn isEdited(store: *const Store, msg: u32) bool {
+    if (msg >= store.edited.bit_length) return false;
+    return store.edited.isSet(msg);
+}
+
+/// HOW LONG a message stays editable / unsendable. 24 hours, which is where every
+/// messenger landed: long enough for the typo you notice tomorrow morning, short
+/// enough that a client which pruned the message cannot be asked to change a past
+/// nobody can still see.
+pub const edit_window_s: i64 = 24 * 60 * 60;
+
+/// PURE: may this message still be edited or unsent? Only ours, only if it is not
+/// already a tombstone, and only inside the window.
+pub fn canRevise(store: *const Store, msg: u32, now: i64) bool {
+    if (msg >= store.msgs.len) return false;
+    if (isDeleted(store, msg)) return false;
+    if (!isMine(store, @enumFromInt(msg))) return false;
+    return now - store.msgs.items(.created_at)[msg] <= edit_window_s;
+}
+
+/// EDIT a message's text in place (ours, or an accepted edit of theirs). The new
+/// text is appended to the string arena and the span re-pointed; the old bytes are
+/// SCRUBBED, so the words somebody replaced do not survive on disk. The message
+/// keeps its timestamp — it is the same message, said better — and wears the mark.
+pub fn editMessage(gpa: Allocator, store: *Store, msg: u32, text: []const u8) error{OutOfMemory}!void {
+    if (msg >= store.msgs.len) return;
+    const msgs = store.msgs.slice();
+    const old = msgs.items(.text)[msg];
+    const span = try appendString(gpa, store, text);
+    const bytes = store.string_bytes.items;
+    const end = @as(usize, old.offset) + old.len;
+    if (end <= bytes.len) @memset(bytes[old.offset..end], 0);
+    msgs.items(.text)[msg] = span;
+    if (msg < store.edited.bit_length) store.edited.set(msg);
 }
 
 /// Find a message by its conversation + timestamp + direction — how a DELETE
@@ -1076,7 +1125,7 @@ const codec_magic = [4]u8{ 'Z', 'A', 'T', 'H' };
 /// sections so every v2 blob still reads (a version gate is a compatibility
 /// contract and is written as a RANGE — the day we wrote it as a LIST, a v3 bump
 /// orphaned every conversation on the owner's phone).
-const codec_version: u16 = 3;
+const codec_version: u16 = 4; // v4: the EDITED bitset (v3: the deleted one)
 const conv_rec_len = 28; // did span 8 + handle span 8 + i64 8 + u32 4
 const msg_rec_len = 21; // i64 8 + text span 8 + conv 4 + kind 1
 const pay_rec_len = 23; // id 8 + amount 8 + msg 4 + rail 1 + status 1 + conf 1
@@ -1098,7 +1147,8 @@ pub fn serializeStore(gpa: Allocator, store: *const Store) error{OutOfMemory}![]
         (m_count + 7) / 8 +
         4 + p_count * pay_rec_len +
         4 + r_count * ref_rec_len +
-        (m_count + 7) / 8; // v3: the deleted bitset
+        (m_count + 7) / 8 + // v3: the deleted bitset
+        (m_count + 7) / 8; // v4: the edited bitset
     const out = try gpa.alloc(u8, total);
     errdefer gpa.free(out);
 
@@ -1183,6 +1233,14 @@ pub fn serializeStore(gpa: Allocator, store: *const Store) error{OutOfMemory}![]
     @memset(del_bytes, 0);
     for (0..m_count) |i| {
         if (i < store.deleted.bit_length and store.deleted.isSet(i)) del_bytes[i / 8] |= @as(u8, 1) << @intCast(i % 8);
+    }
+    at += (m_count + 7) / 8;
+
+    // v4: the edit marks.
+    const ed_bytes = out[at..][0 .. (m_count + 7) / 8];
+    @memset(ed_bytes, 0);
+    for (0..m_count) |i| {
+        if (i < store.edited.bit_length and store.edited.isSet(i)) ed_bytes[i / 8] |= @as(u8, 1) << @intCast(i % 8);
     }
     at += (m_count + 7) / 8;
 
@@ -1286,6 +1344,7 @@ pub fn deserializeStore(gpa: Allocator, bytes: []const u8) DeserializeError!Stor
     if (bytes.len - at < mine_len) return error.Malformed;
     try store.mine.resize(gpa, m_count, false);
     try store.deleted.resize(gpa, m_count, false);
+    try store.edited.resize(gpa, m_count, false);
     for (0..m_count) |i| {
         const bit = (bytes[at + i / 8] >> @intCast(i % 8)) & 1;
         store.mine.setValue(i, bit == 1);
@@ -1397,6 +1456,22 @@ pub fn deserializeStore(gpa: Allocator, bytes: []const u8) DeserializeError!Stor
             if (bytes[at + del_len - 1] & mask != 0) return error.Malformed; // canonical
         }
         at += del_len;
+    }
+
+    // v4: the edit marks. A v3 blob has none, which is not damage.
+    if (version >= 4) {
+        const ed_len = (@as(usize, m_count) + 7) / 8;
+        if (bytes.len - at < ed_len) return error.Malformed;
+        for (0..m_count) |i| {
+            const bit = (bytes[at + i / 8] >> @intCast(i % 8)) & 1;
+            store.edited.setValue(i, bit == 1);
+        }
+        if (m_count % 8 != 0) {
+            const used: u3 = @intCast(m_count % 8);
+            const mask: u8 = @as(u8, 0xFF) << used;
+            if (bytes[at + ed_len - 1] & mask != 0) return error.Malformed;
+        }
+        at += ed_len;
     }
 
     if (at != bytes.len) return error.Malformed; // exact tail — no trailing bytes
@@ -1901,8 +1976,8 @@ test "store codec: a version-1 blob (pre-payments) still restores" {
     // byte-identical to what M2 wrote.
     const v3 = try serializeStore(gpa, &store);
     defer gpa.free(v3);
-    const del_len = (store.msgs.len + 7) / 8;
-    const v1 = try gpa.dupe(u8, v3[0 .. v3.len - del_len - 8]);
+    const del_len = (store.msgs.len + 7) / 8; // v3 tombstones + v4 edit marks
+    const v1 = try gpa.dupe(u8, v3[0 .. v3.len - 2 * del_len - 8]);
     defer gpa.free(v1);
     std.mem.writeInt(u16, v1[4..6], 1, .little);
 
@@ -1946,7 +2021,7 @@ test "store codec v2: every class of payment-section damage is refused" {
     // bytes before it.
     // v3 appends the tombstone bitset AFTER the settlement section, so the
     // payment/settlement records are no longer the tail: step back over it.
-    const del_tail = (store.msgs.len + 7) / 8;
+    const del_tail = 2 * ((store.msgs.len + 7) / 8); // v3 tombstones + v4 edit marks
     const ref_at = good.len - del_tail - ref_rec_len;
     const pay_at = good.len - del_tail - ref_rec_len - 4 - pay_rec_len;
 

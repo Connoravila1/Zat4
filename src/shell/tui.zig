@@ -897,6 +897,11 @@ const RunState = struct {
     ghold_live: bool,
     /// The message the composer is answering (slice 3), or `no_reply`.
     gchat_reply_to: u32,
+    /// The message the composer is EDITING, or `no_reply`.
+    gchat_edit_of: u32,
+    /// Unsends and edits still trying to reach the other side.
+    gpending: [16]Revision,
+    gpending_n: usize,
     /// A URL this frame asked the OS to open. On the phone there is no
     /// `xdg-open` — the seam hands it to the activity, which fires an
     /// ACTION_VIEW intent (the same road the OAuth browser already takes).
@@ -1575,6 +1580,8 @@ fn initRunState(
     rs.ghold_ns = 0;
     rs.ghold_live = false;
     rs.gchat_reply_to = no_reply;
+    rs.gchat_edit_of = no_reply;
+    rs.gpending_n = 0;
     rs.gboot_start_ns = 0;
     // A signed-in app never plays the entrance: it is the front door's overture,
     // not a splash screen, and somebody who is already inside is not arriving.
@@ -2280,11 +2287,28 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                 // because we choose to, which is the only reason any
                                 // client ever does.
                                 .unsend => |u| unsend: {
-                                    const conv = chat_core.openConversation(gpa, &rs.gchat_store, u.peer_did, "") catch break :unsend;
-                                    const mi = chat_core.findByStamp(&rs.gchat_store, conv, u.created_at, false) orelse break :unsend;
+                                    // From THEM it names a message of theirs; from our
+                                    // OWN other device it names one of OURS (we deleted
+                                    // it on the other screen). The direction bit is the
+                                    // difference, and both are honoured.
+                                    const from_self = std.mem.eql(u8, u.peer_did, st.my_did);
+                                    // Which conversation? From THEM, the session says
+                                    // so. From our own device, only the payload can.
+                                    const cdid = if (from_self) u.conv_did else u.peer_did;
+                                    const conv = chat_core.openConversation(gpa, &rs.gchat_store, cdid, "") catch break :unsend;
+                                    const mi = chat_core.findByStamp(&rs.gchat_store, conv, u.created_at, from_self) orelse break :unsend;
                                     chat_core.deleteMessage(&rs.gchat_store, mi);
                                     chatPersistHistory(gpa, io, environ, st, &rs.gchat_store);
-                                    chatLog("[chat] unsend honoured for {s}", .{u.peer_did});
+                                    chatLog("[chat] unsend honoured (self={})", .{from_self});
+                                },
+                                .edit => |ed| edit: {
+                                    const from_self = std.mem.eql(u8, ed.peer_did, st.my_did);
+                                    const cdid = if (from_self) ed.conv_did else ed.peer_did;
+                                    const conv = chat_core.openConversation(gpa, &rs.gchat_store, cdid, "") catch break :edit;
+                                    const mi = chat_core.findByStamp(&rs.gchat_store, conv, ed.created_at, from_self) orelse break :edit;
+                                    chat_core.editMessage(gpa, &rs.gchat_store, mi, ed.text) catch break :edit;
+                                    chatPersistHistory(gpa, io, environ, st, &rs.gchat_store);
+                                    chatLog("[chat] edit applied (self={})", .{from_self});
                                 },
                                 // HISTORY (slice 5). Our other device asked for the
                                 // backlog: serialize what we have and send it. The
@@ -2668,6 +2692,9 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
         // tapped anything, and nobody had to be trusted. ──
         // The press-and-hold clock (CHAT_FEATURES slice 2).
         if (dev_chat) chatHoldStep(rs);
+        // Unsends and edits that have not landed yet — tried again, quietly, until
+        // they do (or until we say plainly that they did not).
+        if (dev_chat and rs.gpending_n > 0) chatDrainRevisions(rs, gpa, io, environ);
 
         // MULTI-DEVICE (slice 2). Runs whether or not chat is up, because the
         // device that is WAITING to be let in has no chat state by definition — and
@@ -5259,6 +5286,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                                 .open = true,
                                                 .msg = mi,
                                                 .mine = chat_core.isMine(&rs.gchat_store, @enumFromInt(mi)),
+                                                .revisable = chat_core.canRevise(&rs.gchat_store, mi, clock_shell.unixSeconds()),
                                                 .x = rx,
                                                 .y = ry,
                                             };
@@ -6382,6 +6410,17 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                             rs.gcmenu = .{};
                                             rs.status = "chat: copied";
                                         },
+                                        .chat_msg_edit => if (dev_chat) {
+                                            const body = chatMsgText(rs, rs.gcmenu.msg);
+                                            const bn = @min(body.len, rs.gchat_draft_buf.len);
+                                            @memcpy(rs.gchat_draft_buf[0..bn], body[0..bn]);
+                                            rs.gchat_draft_len = bn;
+                                            rs.gchat_caret = bn;
+                                            rs.gchat_edit_of = rs.gcmenu.msg;
+                                            rs.gchat_input_focus = true;
+                                            rs.gcmenu = .{};
+                                            rs.status = "chat: editing — send to save";
+                                        },
                                         .chat_msg_reply => {
                                             // The composer answers a specific message
                                             // (slice 3 draws the quoted strip).
@@ -6415,6 +6454,19 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         .chat_help_close => rs.gdev_help = false,
                                         .chat_send => if (dev_chat) {
                                             const body = std.mem.trimEnd(u8, rs.gchat_draft_buf[0..rs.gchat_draft_len], " \n");
+                                            // EDITING? Then Send SAVES the edit — it
+                                            // does not post a second message. The
+                                            // message keeps its place in the thread; it
+                                            // is the same thing, said better.
+                                            if (body.len > 0 and rs.gchat_edit_of != no_reply) {
+                                                chatEditMessage(rs, gpa, io, environ, rs.gchat_edit_of, body);
+                                                rs.gchat_edit_of = no_reply;
+                                                rs.gchat_draft_len = 0;
+                                                rs.gchat_caret = 0;
+                                                chatCollapseSel(rs);
+                                                rs.gchat_input_focus = true;
+                                                continue;
+                                            }
                                             if (body.len > 0) if (rs.gchat_sel) |sc| {
                                                 _ = chat_core.appendMessage(gpa, &rs.gchat_store, sc, .text, body, now, true) catch {};
                                                 chatSend(gpa, io, environ, if (rs.gchat_e2ee) |*st| st else null, rs.gchat_link, &rs.gchat_store, sc, body);
@@ -9744,9 +9796,15 @@ fn chatMsgText(rs: *const RunState, msg: u32) []const u8 {
     return chat_core.sliceSpan(&rs.gchat_store, rs.gchat_store.msgs.items(.text)[msg]);
 }
 
-/// "Ask them to delete it": drop it here, and ask their devices to drop it too. Ours
-/// goes FIRST — if the network leg fails, the message is still gone from the device
-/// the person was looking at when they tapped, which is what they asked for.
+/// DELETE FOR EVERYONE. Gone here, gone on THEIR devices, and gone on YOUR OTHER
+/// ONES — which is the part that was missing: an unsend that cleared your desktop
+/// and left the message sitting on your phone is not what anybody means by the
+/// words. Ours goes FIRST, so a failed network leg still leaves it gone from the
+/// device the person was looking at when they tapped.
+///
+/// The request is retried (`gpending`) until it lands. Signal engineers this leg
+/// hard for exactly this reason: a delete that quietly failed is the one failure a
+/// person will not forgive.
 fn chatUnsend(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, msg: u32) void {
     if (msg >= rs.gchat_store.msgs.len) return;
     const conv = rs.gchat_store.msgs.items(.conv)[msg];
@@ -9754,17 +9812,103 @@ fn chatUnsend(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.proces
     const did = chat_core.conversationDid(&rs.gchat_store, conv);
 
     chat_core.deleteMessage(&rs.gchat_store, msg);
-    if (rs.gchat_e2ee) |*st| {
-        chatPersistHistory(gpa, io, env, st, &rs.gchat_store);
-        if (rs.gchat_link) |l| {
-            chat_e2ee.sendUnsend(gpa, io, env, st, l, did, at) catch |err| {
-                chatLog("[chat] unsend request failed: {s}", .{@errorName(err)});
-                rs.status = "chat: deleted here — couldn't reach them";
-                return;
-            };
+    const st = if (rs.gchat_e2ee) |*p| p else return;
+    chatPersistHistory(gpa, io, env, st, &rs.gchat_store);
+    chatQueueRevision(rs, .{ .kind = .unsend, .did_len = 0, .at = at, .text_len = 0 }, did, "");
+    chatDrainRevisions(rs, gpa, io, env);
+    rs.status = "chat: deleted for everyone";
+}
+
+/// Apply our own edit, then ask their devices — and ours — to apply it too.
+fn chatEditMessage(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, msg: u32, text: []const u8) void {
+    if (msg >= rs.gchat_store.msgs.len or text.len == 0) return;
+    const conv = rs.gchat_store.msgs.items(.conv)[msg];
+    const at = rs.gchat_store.msgs.items(.created_at)[msg];
+    const did = chat_core.conversationDid(&rs.gchat_store, conv);
+
+    chat_core.editMessage(gpa, &rs.gchat_store, msg, text) catch return;
+    const st = if (rs.gchat_e2ee) |*p| p else return;
+    chatPersistHistory(gpa, io, env, st, &rs.gchat_store);
+    chatQueueRevision(rs, .{ .kind = .edit, .did_len = 0, .at = at, .text_len = 0 }, did, text);
+    chatDrainRevisions(rs, gpa, io, env);
+    rs.status = "chat: edited";
+}
+
+/// A revision waiting to be delivered (an unsend or an edit). It is retried on the
+/// chat tick until it lands, because "I deleted it" and "I tried to delete it" are
+/// not the same sentence and only one of them is what the person heard.
+const Revision = struct {
+    // A7.2: cold struct (a short queue, never in a hot loop), size guard waived.
+    kind: enum { unsend, edit },
+    did_len: u8,
+    at: i64,
+    text_len: u16,
+    did: [128]u8 = undefined,
+    text: [512]u8 = undefined,
+    tries: u8 = 0,
+};
+
+fn chatQueueRevision(rs: *RunState, base: Revision, did: []const u8, text: []const u8) void {
+    if (rs.gpending_n >= rs.gpending.len) return; // a full queue drops the oldest ask, not the newest
+    var r = base;
+    const dn = @min(did.len, r.did.len);
+    @memcpy(r.did[0..dn], did[0..dn]);
+    r.did_len = @intCast(dn);
+    const tn = @min(text.len, r.text.len);
+    @memcpy(r.text[0..tn], text[0..tn]);
+    r.text_len = @intCast(tn);
+    r.tries = 0;
+    rs.gpending[rs.gpending_n] = r;
+    rs.gpending_n += 1;
+}
+
+/// Try every queued revision once. Each goes to THEIR devices and to OUR OTHER ONES
+/// (over the self-session the roster already uses). What lands is dropped; what
+/// fails is kept and tried again on the next tick, until it has been given up on
+/// loudly rather than quietly.
+fn chatDrainRevisions(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map) void {
+    const st = if (rs.gchat_e2ee) |*p| p else return;
+    const link = rs.gchat_link orelse return;
+    var i: usize = 0;
+    while (i < rs.gpending_n) {
+        const r = &rs.gpending[i];
+        const did = r.did[0..r.did_len];
+        const text = r.text[0..r.text_len];
+        var ok = true;
+        switch (r.kind) {
+            .unsend => {
+                chat_e2ee.sendUnsend(gpa, io, env, st, link, did, did, r.at) catch {
+                    ok = false;
+                };
+                // …AND OUR OWN DEVICES. This is the leg that was missing: an unsend
+                // that cleared your desktop and left the message on your phone is not
+                // what anybody means by "delete for everyone".
+                chat_e2ee.sendUnsend(gpa, io, env, st, link, st.my_did, did, r.at) catch {};
+            },
+            .edit => {
+                chat_e2ee.sendEdit(gpa, io, env, st, link, did, did, r.at, text) catch {
+                    ok = false;
+                };
+                chat_e2ee.sendEdit(gpa, io, env, st, link, st.my_did, did, r.at, text) catch {};
+            },
         }
+        if (ok) {
+            rs.gpending[i] = rs.gpending[rs.gpending_n - 1];
+            rs.gpending_n -= 1;
+            continue;
+        }
+        r.tries +|= 1;
+        if (r.tries >= 12) {
+            // Given up on — and SAID SO. A delete that silently never happened is the
+            // one failure a person will not forgive.
+            chatLog("[chat] revision gave up after {d} tries", .{r.tries});
+            rs.status = "chat: couldn't reach them — it's deleted here only";
+            rs.gpending[i] = rs.gpending[rs.gpending_n - 1];
+            rs.gpending_n -= 1;
+            continue;
+        }
+        i += 1;
     }
-    rs.status = "chat: deleted, and asked them to delete it";
 }
 
 /// The menu's snapshot, with its arrival clock (it grows from the point you
@@ -9795,6 +9939,7 @@ fn chatHoldStep(rs: *RunState) void {
         .open = true,
         .msg = rs.ghold_msg,
         .mine = rs.ghold_mine,
+        .revisable = chat_core.canRevise(&rs.gchat_store, rs.ghold_msg, clock_shell.unixSeconds()),
         .x = rs.ghold_x,
         .y = rs.ghold_y,
     };

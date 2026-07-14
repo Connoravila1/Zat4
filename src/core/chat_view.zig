@@ -62,6 +62,9 @@ pub const BubbleRow = struct {
     /// A tombstone: the text is gone and the bubble says so. Rendered rather than
     /// removed — removing the row would renumber every index above it.
     deleted: bool = false,
+    /// The words changed after they were sent. The bubble SAYS so — a message that
+    /// was quietly rewritten after you read it is how somebody edits the past.
+    edited: bool = false,
 
     comptime {
         // A7.1 — budget raised 40 → 48. `msg` (u32) is the row's identity in the
@@ -264,6 +267,7 @@ pub fn buildThread(
             .pay = pay,
             .msg = mi,
             .deleted = gone,
+            .edited = chat.isEdited(store, mi),
         };
         prev_at = at;
     }
