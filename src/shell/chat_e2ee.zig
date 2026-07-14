@@ -203,6 +203,10 @@ pub const InitError = error{
     NoCacheDir,
     PublishFailed,
     OutOfMemory,
+    /// Slice 2: this device has ASKED to join the account's chat and is waiting for
+    /// a device that is already in it to say yes. Not a failure and not the A3 wall
+    /// — a screen that waits, with something true to say while it does.
+    DeviceApprovalPending,
     /// A3: this account already publishes a chat key, and it is not this
     /// device's. Chat was set up somewhere else, and the anchor key that owns
     /// it cannot be copied here (that is what makes it worth anything). We
@@ -239,6 +243,45 @@ pub fn init(
     errdefer std.crypto.secureZero(u8, &anchor_load.seed);
     var kp_path_buf: [512]u8 = undefined;
     const kp_path = cache.chatKeyPackagePath(&kp_path_buf, environ, session.did) orelse return error.NoCacheDir;
+    // WHERE DOES THIS DEVICE STAND? (slice 2). The account may already have chat on
+    // another device — and that used to be the end of the conversation. Now it is a
+    // question with four answers, and only two of them mean "you are not in".
+    //
+    // `adopt` still means what it always meant: the person was told chat lives
+    // elsewhere and chose to start FRESH here anyway, replacing it. That road is
+    // unchanged, and it remains the only one that takes chat away from anybody.
+    // Root (or the legacy `adopt` road) is the only thing that may write the
+    // account's singleton keyPackage record. See the gate at the bottom of init.
+    var owns_singleton = adopt;
+    if (!adopt) {
+        const status = chat_keys.ensureDevice(gpa, arena, io, environ, session, deviceName(environ)) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.NoAnchor => return error.NoAnchor,
+            error.NoCacheDir => return error.NoCacheDir,
+            else => return error.PublishFailed,
+        };
+        switch (status) {
+            // We are part of the account: chat comes up, and our own device record
+            // is published. The legacy singleton is NOT touched — it belongs to the
+            // root, and writing it is the clobber this project exists to end.
+            .root => owns_singleton = true,
+            // An APPROVED, non-root device MUST NOT write the singleton: that
+            // record is the root's, and overwriting it is precisely the clobber
+            // this whole project exists to end. It publishes its own record and
+            // touches nothing else.
+            .approved => {},
+            // We have asked, or have not yet. Either way chat does not come up here,
+            // and the surface says which — a screen that WAITS is not the same as a
+            // screen that offers a button, and telling them apart is the whole
+            // difference between a door and a wall.
+            .pending => return error.DeviceApprovalPending,
+            .not_asked => return error.IdentityElsewhere,
+        }
+    }
+
+    // By here an approved device has already minted + persisted its key package
+    // inside `ensureDevice`, so this load succeeds and the singleton path below is
+    // not reached. The mint-and-publish road remains for the legacy/adopt case.
     var minted_now = false;
     var kp = cache.loadChatKeyPackageAt(gpa, kp_path, session.did) orelse blk: {
         minted_now = true;
@@ -271,7 +314,7 @@ pub fn init(
     // steal the identity back, and two devices trading it every launch is the
     // same footgun wearing a different hat. Refused, quietly — our local
     // conversations still load, which is what this best-effort call is for.
-    if (!minted_now) _ = chat_keys.ensurePublished(gpa, arena, io, environ, session, adopt) catch {};
+    if (!minted_now and owns_singleton) _ = chat_keys.ensurePublished(gpa, arena, io, environ, session, adopt) catch {};
     return st;
 }
 
@@ -294,6 +337,18 @@ pub fn deinit(gpa: Allocator, st: *State) void {
 /// them (chat_relay.subscribe is idempotent) after every drained batch, so
 /// epoch advances and newly opened conversations pick up their rotated IDs.
 /// Caller owns the slice.
+/// What this device calls itself in the other device's approval prompt. It is
+/// COSMETIC and it is UNSIGNED — a record can put whatever it likes here, so it may
+/// put a name in a sentence and nothing else. No decision anywhere turns on it.
+fn deviceName(environ: ?*const std.process.Environ.Map) []const u8 {
+    if (environ) |e| {
+        if (e.get("ZAT_DEVICE_NAME")) |n| {
+            if (n.len > 0) return n;
+        }
+    }
+    return if (builtin.os.tag == .linux and builtin.abi.isAndroid()) "Phone" else "Desktop";
+}
+
 /// Log a mailbox we are about to use. The one fact that has to agree between two
 /// clients, and the one nobody could see.
 fn logMailbox(what: []const u8, id: [relay.mailbox_id_len]u8) void {
