@@ -254,6 +254,12 @@ pub fn init(
     // account's singleton keyPackage record. See the gate at the bottom of init.
     var owns_singleton = adopt;
     if (!adopt) {
+        // Note there is no `DirectoryUnreadable` arm here, and there must not be:
+        // `ensureDevice` does not report an unreadable directory as an ERROR — it
+        // reports it as `.offline`, an ANSWER, so that no caller can lump it in with
+        // "something went wrong, carry on" and let it fall through to a publish. It
+        // is turned back into an error below, deliberately, where the four real
+        // answers are read.
         const status = chat_keys.ensureDevice(gpa, arena, io, environ, session, deviceName(environ)) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.NoAnchor => return error.NoAnchor,
@@ -276,6 +282,13 @@ pub fn init(
             // difference between a door and a wall.
             .pending => return error.DeviceApprovalPending,
             .not_asked => return error.IdentityElsewhere,
+            // We could not read the directory, so we know NOTHING about where this
+            // device stands — least of all that it may claim the account. Chat does
+            // not come up, nothing is published, and the screen says exactly that
+            // rather than inventing one of the four answers above. (2026-07-14: the
+            // invented answer was "I am the root", and it cost the owner his chat
+            // identity.)
+            .offline => return error.DirectoryUnreadable,
         }
     }
 
@@ -292,6 +305,9 @@ pub fn init(
             // A3: the account's chat identity is on another device. Do not
             // publish, do not mint over it, do not pretend chat is up.
             error.IdentityElsewhere => return error.IdentityElsewhere,
+            // And the same restraint when we could not read the record at all: an
+            // unanswered question is not an empty directory.
+            error.DirectoryUnreadable => return error.DirectoryUnreadable,
             else => return error.PublishFailed,
         };
         break :blk cache.loadChatKeyPackageAt(gpa, kp_path, session.did) orelse return error.NoCacheDir;

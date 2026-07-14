@@ -115,11 +115,21 @@ pub fn ensurePublished(
     // What matters is only ever the question this asks — does the account
     // already publish a chat key that is not ours?
     //
-    // A record we cannot read or that fails validation is NOT a foreign
-    // identity: it is a broken one, and publishing over it is the repair.
+    // A record that fails VALIDATION is not a foreign identity: it is a broken one,
+    // and publishing over it is the repair. A record we could not READ is neither —
+    // it is a question we did not get an answer to, and the answer we invented for
+    // it ("there is nothing there") is what let a phone republish the singleton over
+    // the desktop's key on 2026-07-14. An unreadable directory is never permission
+    // to write; we refuse and try again later.
     if (!replace_foreign) {
         const mine = try anchor.publicKey(anchor_load.seed);
-        if (fetchPeer(gpa, arena, io, environ, did) catch null) |published| {
+        const existing = fetchPeer(gpa, arena, io, environ, did) catch |err| blk: {
+            // Broken ⇒ the repair. Unreachable ⇒ nothing, and we say why. Note which
+            // way the DEFAULT falls: a connection that failed is not a broken record.
+            if (brokenRecord(err)) break :blk null;
+            return err;
+        };
+        if (existing) |published| {
             if (!std.mem.eql(u8, &published.anchor_pub, &mine)) return error.IdentityElsewhere;
         }
     }
@@ -209,11 +219,64 @@ pub const PeerKeys = struct {
     anchor_pub: [anchor.pk_len]u8,
 };
 
+/// Did the repo DEFINITIVELY say "there is no such record"? That is the one
+/// refusal that means ABSENCE. Everything else — a 5xx, a gateway's HTML, an auth
+/// refusal, a proxy timing out — means WE DO NOT KNOW, and not-knowing is never
+/// permission to act. An atproto PDS answers a missing record with `RecordNotFound`
+/// and a missing repo with `RepoNotFound` (400 or 404 depending on the
+/// implementation), so the CODE is what is read, and the status only as a fallback.
+fn absentFailure(f: net.Failure) bool {
+    // The record is absent ONLY if the ORIGIN said so, in words. A conformant
+    // atproto PDS names it — `RecordNotFound` for a missing record, `RepoNotFound`
+    // for a missing repo — in the JSON error body, whatever the status line reads.
+    //
+    // There is deliberately NO bare-status fallback. An earlier version also treated
+    // a code-less 404 as absence, and that is exactly wrong behind a CDN: these
+    // accounts sit behind Cloudflare, and an EDGE 404 (a misroute, a cold cache, a
+    // WAF block) carries no atproto error body — so it would have forged "no record
+    // here" on the account's OWN directory and licensed a publish-over. A refusal we
+    // cannot attribute to the origin is not an absence; it is `DirectoryUnreadable`.
+    if (std.mem.eql(u8, f.code, "RecordNotFound")) return true;
+    if (std.mem.eql(u8, f.code, "RepoNotFound")) return true;
+    return false;
+}
+
+/// Is this the error of a record that is BROKEN — or of one we never reached?
+///
+/// The difference decides whether we may publish over it. A record of OUR OWN that
+/// fails the core gate (junk base64, wrong suite, expired, a binding that does not
+/// verify) is broken, and publishing over it is the repair — that has always been the
+/// intent. But a CONNECTION that failed is not a broken record; it is no record at
+/// all, and the whole incident of 2026-07-14 is what happens when the two are spelled
+/// the same way.
+///
+/// So the list is exhaustive and the default is DENY: a transport error, a DNS
+/// failure, a TLS reset, an unreadable directory, an OOM — anything not named here —
+/// is "we did not reach it", and a new error added anywhere below this line inherits
+/// that answer rather than a licence to write. That is the only safe direction for
+/// this predicate to fail in.
+fn brokenRecord(err: anyerror) bool {
+    return switch (err) {
+        error.BadRecord, // base64 / timestamp this file could not decode
+        // ...and the core gate's verdicts (keydir.validate — the six checks).
+        error.DidMismatch,
+        error.WrongSuite,
+        error.Expired,
+        error.BadKeyPackage,
+        error.IdentityMismatch,
+        error.BadBinding,
+        => true,
+        else => false,
+    };
+}
+
 /// Fetch + validate `did`'s key-directory entry: resolve the DID to ITS
 /// OWN PDS (never a guessed host), read the public record, decode, and let
 /// the core gate decide (keydir.validate — the six checks). Null = no
-/// record (the peer has never used chat: an ordinary result, E4). Every
-/// validation failure is an explicit error (E3).
+/// record (the peer has never used chat: an ordinary result, E4). A directory
+/// we could not READ is `error.DirectoryUnreadable`, which is NOT the same
+/// answer and must never be treated as one. Every validation failure is an
+/// explicit error (E3).
 pub fn fetchPeer(
     gpa: Allocator,
     arena: Allocator,
@@ -232,7 +295,14 @@ pub fn fetchPeer(
     const outcome = try net.query(arena, io, environ, pds_url, lexicon.method.get_record, &params, lexicon.GetRecordResponse(KeyPackageRecordIn), .{ .guard = .untrusted });
     const rec = switch (outcome) {
         .ok => |r| r.value,
-        .failed => return null, // absent record = peer not on chat yet (E4)
+        // A REFUSAL IS NOT AN ABSENCE. This used to be a flat `return null` — every
+        // non-2xx, from "there is no such record" to "the PDS is on fire", collapsed
+        // into the one answer "the peer has never used chat". On our OWN did that
+        // answer is a licence to publish, and on 2026-07-14 it was taken: a phone
+        // read a directory it could not read, concluded the account had no chat, and
+        // republished the singleton over the desktop's key. Only a definitive "not
+        // there" is absent (E4); anything else is an error the caller must respect.
+        .failed => |f| if (absentFailure(f)) return null else return error.DirectoryUnreadable,
     };
 
     const Dec = std.base64.standard.Decoder;
@@ -458,6 +528,11 @@ pub const DeviceStatus = enum {
     /// A3 wall — but it is now a door: the person may ask, and their other device
     /// may say yes.
     not_asked,
+    /// WE COULD NOT READ THE DIRECTORY. Not "you are not in" — we do not know, and
+    /// saying we do not know is the whole point of this answer existing. A device
+    /// that cannot read the directory publishes NOTHING (see the note above
+    /// `ensureDevice`), shows a screen that says so, and asks again in a moment.
+    offline,
 };
 
 /// Publish this device where it belongs and report where it stands. The ONE call
@@ -467,6 +542,13 @@ pub const DeviceStatus = enum {
 /// The order matters: a device that is genuinely part of the account refreshes its
 /// own record and NEVER touches the legacy singleton — writing that would clobber
 /// the root's, which is the exact bug this whole project exists to end.
+///
+/// AND SO IS THIS ONE. Every read below used to be `catch null`, which handed a
+/// failed read and an empty directory the same answer — so a device that could not
+/// reach the PDS concluded the account had no chat, declared itself the root, and
+/// republished the singleton over the other device's key. It fired for real
+/// (2026-07-14). The rule now, and it does not bend: **an unreadable directory is
+/// never permission to claim anything.** We say `.offline` and we write nothing.
 pub fn ensureDevice(
     gpa: Allocator,
     arena: Allocator,
@@ -480,13 +562,31 @@ pub fn ensureDevice(
     defer std.crypto.secureZero(u8, &anchor_load.seed);
     const mine = try anchor.publicKey(anchor_load.seed);
 
-    const set = fetchPeerDevices(gpa, arena, io, environ, did) catch null;
+    const set = fetchPeerDevices(gpa, arena, io, environ, did) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .offline, // could not read ⇒ claim nothing, ask again later
+    };
 
     // NOBODY HAS PUBLISHED A DEVICE RECORD YET — every account alive today. The
     // device that already owns chat (or an account with no chat at all) becomes the
     // ROOT, which is what makes it possible for anything else to be approved.
+    //
+    // This is the branch the hijack came through, so it is the one that gets the
+    // strictest reading: we may only conclude "the account has no chat" from a
+    // directory that ANSWERED and answered empty.
     if (set == null) {
-        const legacy = fetchPeer(gpa, arena, io, environ, did) catch null;
+        const legacy = fetchPeer(gpa, arena, io, environ, did) catch |err| blk: {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            // A record that is BROKEN (junk base64, expired, a binding that does not
+            // verify) is ours to repair, and the root path below republishes it.
+            if (brokenRecord(err)) break :blk null;
+            // Anything else — a refused read, a reset connection, a DNS failure — is
+            // a singleton we did not SEE. The account may well have chat on another
+            // device; we simply cannot tell. Claim nothing. This is the exact step
+            // that took the owner's chat identity, and the default now falls the
+            // other way.
+            return .offline;
+        };
         const chat_is_ours = if (legacy) |l| std.mem.eql(u8, &l.anchor_pub, &mine) else true;
         if (chat_is_ours) {
             _ = try publishDevice(gpa, arena, io, environ, session, device_name, true, "");
@@ -501,7 +601,7 @@ pub fn ensureDevice(
         // device model yet. We can still ASK — our record simply waits until it
         // does. (Asking is `publishDevice(root=false, approval="")`; the caller
         // does it when the person taps, never on our own initiative.)
-        return if (try hasOwnRecord(gpa, arena, io, environ, did, mine)) .pending else .not_asked;
+        return waitingOrAtTheGate(gpa, arena, io, environ, did, mine);
     }
 
     const devices = set.?;
@@ -512,7 +612,25 @@ pub fn ensureDevice(
         _ = try publishDevice(gpa, arena, io, environ, session, device_name, d.root, "");
         return if (d.root) .root else .approved;
     }
-    return if (try hasOwnRecord(gpa, arena, io, environ, did, mine)) .pending else .not_asked;
+    return waitingOrAtTheGate(gpa, arena, io, environ, did, mine);
+}
+
+/// Have we asked already, or have we not? A read failure answers NEITHER — and
+/// showing "you have not asked" to a device that asked ten seconds ago would put a
+/// button in front of a person that does the one thing they have already done.
+fn waitingOrAtTheGate(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    did: []const u8,
+    mine: [anchor.pk_len]u8,
+) !DeviceStatus {
+    const asked = hasOwnRecord(gpa, arena, io, environ, did, mine) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .offline,
+    };
+    return if (asked) .pending else .not_asked;
 }
 
 /// Have we already published a record for THIS device (approved or not)? The
@@ -697,6 +815,72 @@ pub fn refuseDevice(
     };
 }
 
+/// What the reclaim did, for the operator to read back.
+/// A7.2: cold struct (one per invocation of a repair command), size guard waived.
+pub const Reclaim = struct {
+    /// Device records removed — every one that was not this device's.
+    devices_removed: u8,
+    /// Where this device stands afterwards. Anything but `.root` means the repair
+    /// did not take, and the operator must be told so rather than reassured.
+    status: DeviceStatus,
+};
+
+/// THIS DEVICE TAKES CHAT BACK — the repair, and it exists because the account
+/// needed one (2026-07-14: a phone read a directory it could not read, concluded
+/// the account had no chat, published itself as root, and republished the singleton
+/// over the desktop's key; the desktop was then locked out of its own chat by the
+/// very A3 wall that is supposed to protect it).
+///
+/// Two things must happen, and BOTH of them: every foreign device record goes (a
+/// device claiming root is a claim about who may speak for the account, and this is
+/// the account saying no), AND the legacy singleton is re-asserted from this
+/// device's stored key. Doing only the first leaves the singleton pinning a foreign
+/// key, and `ensureDevice` — correctly — refuses to publish over it forever.
+///
+/// Nothing is minted: the stored package comes back out of the keystore, so peers
+/// see the key they have always seen and no conversation is orphaned. A device
+/// removed here is not banished — it asks again, and is approved from here, which
+/// is the whole point of the approval chain.
+///
+/// It is an OPERATOR action (`--chat-reclaim`), never something the app does on its
+/// own initiative. That distinction is the entire lesson of the incident.
+pub fn reclaim(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    session: *auth.Session,
+    device_name: []const u8,
+) !Reclaim {
+    const did = session.did;
+    var anchor_load = cache.loadOrCreateAnchorSeed(gpa, io, environ, did) orelse return error.NoAnchor;
+    defer std.crypto.secureZero(u8, &anchor_load.seed);
+    const mine = try anchor.publicKey(anchor_load.seed);
+    var rkey_buf: [32]u8 = undefined;
+    const ours = deviceId(&rkey_buf, mine);
+
+    var removed: u8 = 0;
+    if (try fetchDeviceListing(gpa, arena, io, environ, did)) |records| {
+        for (records) |r| {
+            const rk = rkeyOf(r.uri);
+            if (std.mem.eql(u8, rk, ours)) continue;
+            try refuseDevice(gpa, arena, io, environ, session, rk);
+            removed +|= 1;
+        }
+    }
+
+    // `replace_foreign = true` is precisely what this operation IS: a person at the
+    // keyboard saying the account's chat key is the one on THIS device. It is the
+    // only caller in the codebase that passes it without a human having read what it
+    // costs — because here the human typed the command.
+    _ = try ensurePublished(gpa, arena, io, environ, session, true);
+
+    // And where do we stand now? Say it out loud rather than assuming: with no other
+    // devices and our own singleton, this must come back `.root`.
+    const status = try ensureDevice(gpa, arena, io, environ, session, device_name);
+    return .{ .devices_removed = removed, .status = status };
+}
+
 /// The rkey is the last path segment of an at:// URI.
 fn rkeyOf(uri: []const u8) []const u8 {
     const slash = std.mem.lastIndexOfScalar(u8, uri, '/') orelse return uri;
@@ -731,7 +915,11 @@ fn decodeDevice(arena: Allocator, v: DeviceRecordIn) !DecodedDevice {
     };
 }
 
-/// The raw device records in a repo (public read). Null = no such collection.
+/// The raw device records in a repo (public read). Null = the repo answered, and
+/// it has no device records (E4 — every account alive before the device model).
+/// A repo that did NOT answer is `error.DirectoryUnreadable`: an empty list and an
+/// unanswered question look identical from here, and telling them apart is the
+/// whole difference between "you are the first device" and "I could not check".
 fn fetchDeviceListing(
     gpa: Allocator,
     arena: Allocator,
@@ -748,8 +936,10 @@ fn fetchDeviceListing(
     };
     const outcome = try net.query(arena, io, environ, pds_url, lexicon.method.list_records, &params, ListingOf(DeviceRecordIn), .{ .guard = .untrusted });
     return switch (outcome) {
+        // listRecords on a repo with nothing in the collection is a 2xx with an
+        // empty list. THAT is absence, and it is the only thing that is.
         .ok => |r| if (r.records.len == 0) null else r.records,
-        .failed => null,
+        .failed => |f| if (absentFailure(f)) null else error.DirectoryUnreadable,
     };
 }
 
@@ -813,6 +1003,90 @@ pub fn fetchPeerDevices(
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+// THE HIJACK GUARD (2026-07-14). Every directory read in this file funnels its
+// refusals through `absentFailure`, and that predicate is the whole fix: it decides
+// whether a non-2xx means "the record is not there" (which licenses a device to
+// declare itself the account's chat root) or "we could not read it" (which licenses
+// NOTHING). It used to be, in effect, `return true` — every refusal, from a 502 to a
+// gateway's HTML, read as absence — and a phone that could not reach the PDS
+// concluded the account had no chat, published itself as root, and republished the
+// singleton over the desktop's key. On the owner's real account.
+//
+// So: only a PDS saying, in words, that the thing is not there is an absence.
+test "chat_keys: only a definitive 'not found' is an absence — a broken PDS is not" {
+    // The two answers an atproto PDS gives for a record/repo that genuinely is not
+    // there. These, and only these, may be read as "the account has no chat".
+    try testing.expect(absentFailure(.{ .status = 400, .code = "RecordNotFound", .message = "Could not locate record" }));
+    try testing.expect(absentFailure(.{ .status = 404, .code = "RecordNotFound", .message = "" }));
+    try testing.expect(absentFailure(.{ .status = 400, .code = "RepoNotFound", .message = "Could not find repo" }));
+
+    // EVERY OTHER REFUSAL IS "WE DO NOT KNOW". None of these may license a write.
+    try testing.expect(!absentFailure(.{ .status = 502, .code = "", .message = "" })); // a proxy, mid-tantrum
+    try testing.expect(!absentFailure(.{ .status = 503, .code = "", .message = "" })); // the PDS, briefly gone
+    try testing.expect(!absentFailure(.{ .status = 500, .code = "InternalServerError", .message = "" }));
+    try testing.expect(!absentFailure(.{ .status = 401, .code = "AuthRequired", .message = "" }));
+    try testing.expect(!absentFailure(.{ .status = 403, .code = "Forbidden", .message = "" }));
+    try testing.expect(!absentFailure(.{ .status = 429, .code = "RateLimitExceeded", .message = "" }));
+    try testing.expect(!absentFailure(.{ .status = 400, .code = "InvalidRequest", .message = "" }));
+    // An account that is deactivated HAS chat records; it is simply not serving them.
+    try testing.expect(!absentFailure(.{ .status = 400, .code = "AccountDeactivated", .message = "" }));
+    // THE CDN EDGE 404 — a 404 with no atproto error body. This is the one the
+    // reviewer caught: behind Cloudflare it is a misroute, NOT the origin saying the
+    // record is gone, and it must never read as absence on the account's own dir.
+    try testing.expect(!absentFailure(.{ .status = 404, .code = "", .message = "" }));
+    // A 404 that came with a code we do not recognise is a stranger; strangers get
+    // the safe answer too.
+    try testing.expect(!absentFailure(.{ .status = 404, .code = "SomethingElse", .message = "" }));
+}
+
+// THE SECOND HALF OF THE SAME LESSON. `absentFailure` handles a server that ANSWERED
+// with a refusal. This handles the read that never got an answer at all — and it is
+// the trap I walked straight into while fixing the first one: an `else => null` arm
+// that meant "the record is junk, publishing over it is the repair" also swallowed
+// every TRANSPORT error, so a TLS reset on the singleton read would still have handed
+// a fresh device the account's chat identity. Same bug, one layer over.
+//
+// A broken record is ours to repair. An unreachable one is not ours to touch.
+test "chat_keys: a connection that failed is not a broken record" {
+    // BROKEN — our own record, and it does not work. Publishing over it is the repair.
+    try testing.expect(brokenRecord(error.BadRecord)); // junk base64 / timestamps
+    try testing.expect(brokenRecord(error.DidMismatch)); // the core gate's six checks
+    try testing.expect(brokenRecord(error.WrongSuite));
+    try testing.expect(brokenRecord(error.Expired));
+    try testing.expect(brokenRecord(error.BadKeyPackage));
+    try testing.expect(brokenRecord(error.IdentityMismatch));
+    try testing.expect(brokenRecord(error.BadBinding));
+
+    // NEVER REACHED — and therefore never ours to overwrite. Every one of these used
+    // to fall into the same bucket as "junk", which is exactly how a phone came to
+    // republish the singleton over a desktop's key.
+    try testing.expect(!brokenRecord(error.DirectoryUnreadable)); // the PDS refused
+    try testing.expect(!brokenRecord(error.ConnectionRefused)); // nothing listening
+    try testing.expect(!brokenRecord(error.ConnectionResetByPeer)); // mid-TLS reset
+    try testing.expect(!brokenRecord(error.NetworkUnreachable)); // no route (a phone!)
+    try testing.expect(!brokenRecord(error.TemporaryNameServerFailure)); // DNS
+    try testing.expect(!brokenRecord(error.TlsInitializationFailed));
+    try testing.expect(!brokenRecord(error.OutOfMemory)); // not a verdict on anything
+
+    // And the default: an error nobody has classified yet is NOT a licence to write.
+    // If this ever flips, a new error type in the network stack silently reopens the
+    // hijack — so the direction of the default is the property under test.
+    try testing.expect(!brokenRecord(error.SomeErrorNobodyHasThoughtOfYet));
+}
+
+// The four answers a device can get about where it stands, plus the fifth that is
+// not an answer at all. `.offline` exists precisely so that "I could not read the
+// directory" cannot be spelled as any of the other four — least of all `.root`.
+test "chat_keys: 'I could not read it' is its own answer, distinct from every claim" {
+    try testing.expect(DeviceStatus.offline != DeviceStatus.root);
+    try testing.expect(DeviceStatus.offline != DeviceStatus.approved);
+    try testing.expect(DeviceStatus.offline != DeviceStatus.pending);
+    try testing.expect(DeviceStatus.offline != DeviceStatus.not_asked);
+    // And the enum is exhaustive: a new state cannot be added without a human
+    // deciding, here, whether it may publish.
+    try testing.expectEqual(5, @typeInfo(DeviceStatus).@"enum".fields.len);
+}
 
 test "chat_keys: the record round-trips JSON+base64 into keydir's gate" {
     const gpa = testing.allocator;

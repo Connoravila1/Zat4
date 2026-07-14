@@ -9247,6 +9247,11 @@ pub const ChatDeviceState = enum(u8) {
     elsewhere = 1,
     /// We have asked. Somebody has to say yes.
     pending = 2,
+    /// WE COULD NOT READ THE ACCOUNT'S DIRECTORY. Not a wall, not a wait — an
+    /// admission. This device does not know where it stands, so it says so, offers
+    /// nothing, and keeps trying. The alternative (guessing) is what took the
+    /// owner's chat identity away on 2026-07-14.
+    offline = 3,
 };
 
 /// A device asking to join, as the prompt shows it. A7.2: cold, a handful at most.
@@ -9343,6 +9348,10 @@ fn drawDeviceGate(
     var y: i32 = if (phone) insets.top + 64 else 96;
 
     const waiting = d.state == .pending;
+    // WE DO NOT KNOW WHERE WE STAND. The one honest thing a screen can do here is
+    // say so — and, crucially, offer NOTHING, because every act this screen offers
+    // writes to a directory we just failed to read.
+    const offline = d.state == .offline;
     // While we wait, the link breathes: a slow sine, never a spinner. A spinner
     // says "the machine is busy"; this is waiting on a PERSON, and it should look
     // patient rather than frantic.
@@ -9350,12 +9359,21 @@ fn drawDeviceGate(
     try drawDeviceEmblem(gpa, dl, cx, y, accent, glow);
     y += 74;
 
-    const title: []const u8 = if (waiting) "Waiting for your other device" else "Chat lives on your other device";
+    const title: []const u8 = if (offline)
+        "Can't reach your account"
+    else if (waiting)
+        "Waiting for your other device"
+    else
+        "Chat lives on your other device";
     const tw: i32 = @intCast(text.measure(e, .semibold, title, 22));
     _ = try str(gpa, dl, e, .semibold, cx - @divTrunc(tw, 2), y, ink, 22, title);
     y += 34;
 
-    const body: []const []const u8 = if (waiting) &[_][]const u8{
+    const body: []const []const u8 = if (offline) &[_][]const u8{
+        "We couldn't read your account's device list, so this device",
+        "doesn't know whether it's part of your chat yet \u{2014} and it will not",
+        "guess. Nothing has been changed. It keeps trying on its own.",
+    } else if (waiting) &[_][]const u8{
         "Open Zat4 on the device where you already use chat.",
         "It will ask you to approve this one. This page updates itself.",
     } else &[_][]const u8{
@@ -9372,6 +9390,21 @@ fn drawDeviceGate(
     y += 20;
 
     // THE ACT. Primary, accent-filled, and it is the one that costs nothing.
+    if (offline) {
+        // No button, and no last-resort line either: "set up chat fresh here" writes
+        // over the account's published key, and doing that on the strength of a
+        // directory we could not read is precisely the mistake this whole screen
+        // now exists to refuse. When the read succeeds, the right face appears.
+        const note = "Check your connection. This page updates itself.";
+        const nw: i32 = @intCast(text.measure(e, .regular, note, 13));
+        _ = try str(gpa, dl, e, .regular, cx - @divTrunc(nw, 2), y + 4, faint, 13, note);
+        y += 34;
+        const help = "How Zat Chat works";
+        const hw: i32 = @intCast(text.measure(e, .regular, help, 13));
+        _ = try str(gpa, dl, e, .regular, cx - @divTrunc(hw, 2), y + 4, softA(accentRgbOf(accent), 0xCC), 13, help);
+        try emitRegion(gpa, regions, cx - @divTrunc(hw, 2) - 10, y - 10, hw + 20, 28, 0, .chat_device_help);
+        return y + 40;
+    }
     if (!waiting) {
         const label: []const u8 = if (d.busy) "Asking\u{2026}" else if (phone) "Add this phone" else "Add this device";
         const bw = @min(card_w, 300);

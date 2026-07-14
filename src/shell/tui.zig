@@ -855,6 +855,12 @@ const RunState = struct {
     gdev_pend_rkey_len: u8,
     gdev_poll_ns: u64, // last time we asked the network who is waiting
     gdev_job: DeviceJob,
+    /// Chat bring-up, in flight. It is a WORKER because `chat_e2ee.init` reads the
+    /// device directory and can publish — several HTTPS round trips — and it used to
+    /// run inside `stepFrame`. On the phone that is not slowness, it is death: the
+    /// render thread stalled inside `ensurePublished`, never acked the surface
+    /// detach, and Android killed the app (2026-07-14).
+    gchat_init_job: ChatInitJob,
     /// THE ROSTER QUEUE (slice 3). People another device of ours says we talk to,
     /// waiting to be opened — ONE PER FRAME. Opening a conversation is a network
     /// round-trip; twenty of them inside one frame is the freeze the UI-thread law
@@ -1574,6 +1580,7 @@ fn initRunState(
     rs.gdev_pend_at = 0;
     rs.gdev_poll_ns = 0;
     rs.gdev_job = .{};
+    rs.gchat_init_job = .{};
     rs.groster_n = 0;
     rs.groster_sig = 0;
     rs.groster_at = 0;
@@ -1931,6 +1938,24 @@ fn deinitRunState(rs: *RunState) void {
     {
         for (rs.gchat_mail.items) |m| chat_relay.freeMail(gpa, m);
         rs.gchat_mail.deinit(gpa);
+    }
+    // THE CHAT WORKERS, OFF THE ROAD BEFORE THE STATE THEY POINT AT DIES. Same law
+    // as the front door's (above): a detached thread writing into a freed RunState is
+    // not a trade worth making. Both of these run network legs against `session`, and
+    // both were previously left running at exit — the device job has been since it
+    // was written; the bring-up job would have joined it. They are joined FIRST,
+    // before the e2ee state and the arenas go.
+    if (rs.gchat_init_job.thread) |t| {
+        t.join();
+        rs.gchat_init_job.thread = null;
+        // A bring-up that landed in the frame we shut down: nobody installed its
+        // state, so nobody else will free it.
+        if (rs.gchat_init_job.state) |*st| chat_e2ee.deinit(gpa, st);
+        rs.gchat_init_job.state = null;
+    }
+    if (rs.gdev_job.thread) |t| {
+        t.join();
+        rs.gdev_job.thread = null;
     }
     if (rs.gchat_e2ee) |*st| chat_e2ee.deinit(gpa, st);
     if (rs.gchat_link) |link| chat_relay.shutdown(link);
@@ -2751,6 +2776,10 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
         // they do (or until we say plainly that they did not).
         if (dev_chat and rs.gpending_n > 0) chatDrainRevisions(rs, gpa, io, environ);
         if (dev_chat) chatReadReceiptStep(rs, gpa, io, environ, now);
+
+        // Has the bring-up worker landed? (The keys leg is network, so it is not on
+        // this thread — this is where its result becomes the app's state.)
+        if (dev_chat) chatInitStep(rs, gpa, io, environ);
 
         // MULTI-DEVICE (slice 2). Runs whether or not chat is up, because the
         // device that is WAITING to be let in has no chat state by definition — and
@@ -6433,11 +6462,15 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         // the published key — never on our own.
                                         .chat_identity_reset => if (dev_chat) {
                                             chatLog("[chat] A3: user chose to set chat up fresh on this device (replacing the published key)", .{});
+                                            // The bring-up is a worker now, so its
+                                            // verdict is not in yet — the old line
+                                            // here read `gchat_identity_elsewhere`
+                                            // one instruction after starting the
+                                            // work that sets it, and would have
+                                            // reported the PREVIOUS attempt. Say
+                                            // what is true: it is going.
                                             chatBringUp(rs, gpa, io, environ, session, true);
-                                            rs.status = if (rs.gchat_identity_elsewhere)
-                                                "chat: couldn't set up on this device — try again"
-                                            else
-                                                "chat: set up on this device";
+                                            rs.status = "chat: setting up on this device\u{2026}";
                                         },
                                         // ── MULTI-DEVICE: the two taps, and the two
                                         // ways out of them. Every one of these is a
@@ -9635,6 +9668,14 @@ fn chatSend(gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, st
 /// at startup, and AGAIN if the user chooses "set up chat fresh here" (A3) —
 /// which is the entire reason it is a function rather than an inline block.
 ///
+/// IT DOES NOT DO THE WORK. `chat_e2ee.init` talks to the network (it reads the
+/// device directory, and it may publish), and this used to be called straight from
+/// `stepFrame` — the render thread, mid-frame. On 2026-07-14 the phone froze inside
+/// it and Android killed the app: the surface-detach ack never came because the
+/// thread that owed it was blocked in a TLS read. So the trip goes on a worker
+/// (`chatInitWorker`), and `chatInitStep` installs the result on the loop. This
+/// function only STARTS it, and returns immediately.
+///
 /// `adopt` (A3) is the user's explicit answer to "your chat identity lives on
 /// another device": true means replace the published key and start over here.
 /// It is never true unless a human clicked it.
@@ -9646,36 +9687,117 @@ fn chatBringUp(
     session: *auth.Session,
     adopt: bool,
 ) void {
-    const rhost = rs.gchat_host_buf[0..rs.gchat_host_len];
-    _ = rs.gchat_arena_state.reset(.retain_capacity);
-    var st = chat_e2ee.init(gpa, rs.gchat_arena_state.allocator(), io, env, session, adopt) catch |err| {
+    const job = &rs.gchat_init_job;
+    if (job.thread != null) return; // one bring-up in flight, ever
+    job.adopt = adopt;
+    job.io = io;
+    job.env = env;
+    job.session = session;
+    job.state = null;
+    job.err = null;
+    job.done.store(false, .monotonic);
+    job.thread = std.Thread.spawn(.{}, chatInitWorker, .{ job, gpa }) catch |err| {
+        chatLog("[chat] could not spawn the bring-up worker: {s}", .{@errorName(err)});
+        // Leave the gate at `.offline`, not the default `.ok`. `.ok` with no chat
+        // state is an empty Messages screen that explains nothing and never retries;
+        // `.offline` shows the honest "can't reach your account" face AND arms the 8s
+        // poll (chatDevicesStep), whose `.status` drain re-attempts bring-up. Spawn
+        // failure is near-impossible, but the failure should self-heal, not hang.
+        rs.gdev_state = .offline;
+        return;
+    };
+}
+
+/// The network leg of bring-up, on its own thread. Its arena dies with it — every
+/// lasting thing in `chat_e2ee.State` is gpa-owned, so the state travels back by
+/// value and nothing points into the worker's memory.
+fn chatInitWorker(job: *ChatInitJob, gpa: Allocator) void {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const session = job.session orelse {
+        job.err = error.NoSession;
+        job.done.store(true, .release);
+        return;
+    };
+    if (chat_e2ee.init(gpa, arena_state.allocator(), job.io, job.env, session, job.adopt)) |st| {
+        job.state = st;
+    } else |err| {
+        job.err = err;
+    }
+    job.done.store(true, .release);
+}
+
+/// The bring-up worker has landed: read its verdict, and either raise the whole
+/// chat stack on it or put the honest screen up. Runs on the loop, every frame.
+fn chatInitStep(
+    rs: *RunState,
+    gpa: Allocator,
+    io: std.Io,
+    env: ?*const std.process.Environ.Map,
+) void {
+    const job = &rs.gchat_init_job;
+    if (job.thread == null or !job.done.load(.acquire)) return;
+    job.thread.?.join();
+    job.thread = null;
+
+    const st = job.state orelse {
+        const err = job.err orelse error.PublishFailed;
         chatLog("[chat] E2EE init failed: {s}", .{@errorName(err)});
         // A3 — the one failure that is not a failure but a FACT the user has to
         // be told. Chat was set up on another device, and the key that owns it
         // cannot be copied here; that is exactly what makes it worth having.
         // The Messages screen says so, and offers the only honest way forward.
         rs.gchat_identity_elsewhere = (err == error.IdentityElsewhere);
-        // MULTI-DEVICE: the wall is now a question with two answers. "We asked and
+        // MULTI-DEVICE: the wall is now a question with THREE answers. "We asked and
         // are waiting" is not the same screen as "chat lives elsewhere and you have
-        // not asked" — one waits, the other offers a button, and a person can tell
-        // instantly which of the two they are in.
+        // not asked" — one waits, the other offers a button — and NEITHER is the
+        // same as "we could not read your directory", which offers nothing at all
+        // and keeps trying. A screen that guesses which of the three it is in is how
+        // the owner's chat identity got taken (2026-07-14).
         rs.gdev_state = switch (err) {
             error.DeviceApprovalPending => .pending,
             error.IdentityElsewhere => .elsewhere,
+            error.DirectoryUnreadable => .offline,
             else => rs.gdev_state,
         };
         return;
     };
+    job.state = null;
+    chatBringUpFinish(rs, gpa, io, env, st);
+}
+
+/// Everything bring-up does once the keys are in hand: the relay link, the restored
+/// transcript, the conversation mirror. Local + non-blocking (chat_relay.start hands
+/// the connect to its own thread), so it belongs on the loop.
+fn chatBringUpFinish(
+    rs: *RunState,
+    gpa: Allocator,
+    io: std.Io,
+    env: ?*const std.process.Environ.Map,
+    state: chat_e2ee.State,
+) void {
+    const rhost = rs.gchat_host_buf[0..rs.gchat_host_len];
     rs.gchat_identity_elsewhere = false;
     rs.gdev_state = .ok; // we are part of the account: no gate, and we can approve others
-    rs.gchat_e2ee = st;
+    // A bring-up REPLACES whatever was up. No path reaches here twice today (the gate
+    // only offers its buttons when chat is down), but the assignment below would
+    // otherwise strand the old state and leave its relay link running against keys
+    // nobody holds any more — the kind of thing that is free to prevent now and a
+    // week to find later.
+    if (rs.gchat_e2ee) |*old| chat_e2ee.deinit(gpa, old);
+    if (rs.gchat_link) |old_link| {
+        chat_relay.shutdown(old_link);
+        rs.gchat_link = null;
+    }
+    rs.gchat_e2ee = state;
+    const st = &rs.gchat_e2ee.?;
     // What did this account say the one time we asked? (Never asked ⇒ the setup is
     // due, and it goes in front of everything else on this screen.)
-    chatPrefsLoad(rs, gpa, env, session.did);
+    chatPrefsLoad(rs, gpa, env, st.my_did);
 
     // M2.1: bootstrap inbox (Welcomes) + every restored conversation's
     // current-epoch traffic mailbox.
-    if (chat_e2ee.subscriptions(gpa, &st)) |subs| {
+    if (chat_e2ee.subscriptions(gpa, st)) |subs| {
         defer gpa.free(subs);
         // A4 slice 2: the link carries THIS DEVICE'S identity — the DID and the
         // anchor seed that proves it. The relay challenges us and we sign; a
@@ -9712,16 +9834,16 @@ fn chatBringUp(
     // failed restore writing the empty store would DESTROY the very blob it
     // failed to read.
     if (st.peer_dids.items.len > 0 or rs.gchat_store.convs.len > 0)
-        chatPersistHistory(gpa, io, env, &st, &rs.gchat_store);
+        chatPersistHistory(gpa, io, env, st, &rs.gchat_store);
 
     if (rs.gchat_link != null) {
         chatLog("[chat] E2EE up -> {s} ({d} conversation(s) restored)", .{ rhost, st.peer_dids.items.len });
         // THE mailboxes. A Welcome deposited into an address the peer is not
         // draining is delivered nowhere, forever, and says nothing. Print both ends.
         var hb: [16]u8 = undefined;
-        chatLog("[chat]   my inbox  = {s}  (Welcomes to me land here)", .{chat_e2ee.mailboxHex(&hb, chat_e2ee.inbox(&st))});
+        chatLog("[chat]   my inbox  = {s}  (Welcomes to me land here)", .{chat_e2ee.mailboxHex(&hb, chat_e2ee.inbox(st))});
         for (st.peer_dids.items) |pd| {
-            if (chat_e2ee.peerBootstrap(&st, pd)) |pb| {
+            if (chat_e2ee.peerBootstrap(st, pd)) |pb| {
                 var hb2: [16]u8 = undefined;
                 chatLog("[chat]   peer {s} bootstrap = {s}", .{ pd, chat_e2ee.mailboxHex(&hb2, pb) });
             }
@@ -9743,6 +9865,25 @@ fn chatBringUp(
 // standing law — a chain-send once froze the app for five seconds and that was
 // strike three). The UI states the intent; the worker does the trip; the loop
 // drains the result.
+
+/// Chat bring-up in flight. The keys leg of `chat_e2ee.init` is several HTTPS round
+/// trips (read the device directory, publish this device, re-assert the record), and
+/// it ran on the render thread until it killed the app on a phone. One at a time,
+/// ever: `chatBringUp` refuses to start a second while one is live.
+/// A7.2: cold struct (one live instance, holds a thread), size guard waived.
+const ChatInitJob = struct {
+    thread: ?std.Thread = null,
+    done: std.atomic.Value(bool) = .init(false),
+    adopt: bool = false,
+    io: std.Io = undefined,
+    env: ?*const std.process.Environ.Map = null,
+    session: ?*auth.Session = null,
+    /// The result, by value — everything lasting in `State` is gpa-owned, so nothing
+    /// in it points into the worker's arena. Null + `err` = it did not come up, and
+    /// `err` is WHICH of the honest screens to show.
+    state: ?chat_e2ee.State = null,
+    err: ?anyerror = null,
+};
 
 const DeviceJob = struct {
     // A7.2: cold struct (one live instance, holds a thread), size guard waived.
@@ -10219,11 +10360,14 @@ fn chatHoldStep(rs: *RunState) void {
     }
     rs.gcmenu_ns = clock_shell.monotonicNanos();
     rs.ghold_live = false; // the press has been spent on the menu
-    // FOLLOW-UP: a haptic tick belongs here — a press-and-hold that opens something
-    // should be confirmed by a tap you can FEEL, and the phone has the channel
-    // (`haptic_pending`). It is only reachable from the pointer-event scope, and
-    // wiring it through the frame step properly is a small piece of plumbing that is
-    // not worth doing badly in passing.
+    // THE TICK UNDER THE FINGER. A press-and-hold has no visible progress — the one
+    // thing that tells a person the hold WORKED, at the instant it does, is feeling
+    // it latch. Same weight the drag pick-up uses, for the same reason: something
+    // was seized, and the phone should say so without a pixel.
+    switch (rs.backend) {
+        .mobile => |m| m.haptic_pending = 2,
+        else => {},
+    }
 }
 
 fn chatDevicesOf(rs: *RunState, arena: Allocator) feed_view.ChatDevices {
@@ -10346,14 +10490,27 @@ fn chatDevicesStep(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.p
                     rs.gdev_error = "Refused. Someone signed in as you \u{2014} change your password.";
                 } else rs.gdev_error = "Couldn't refuse it. Try again.";
             },
-            .status => {
-                // Approved. Bring chat up right here: the person is looking at the
-                // waiting screen, and the next thing they should see is their
-                // conversations — not a prompt to restart the app.
-                if (job.ok and (job.status == .approved or job.status == .root)) {
-                    rs.gdev_state = .ok;
-                    rs.gdev_error = "";
-                    chatBringUp(rs, gpa, io, env, session, false);
+            .status => if (job.ok) {
+                switch (job.status) {
+                    // Approved. Bring chat up right here: the person is looking at
+                    // the waiting screen, and the next thing they should see is
+                    // their conversations — not a prompt to restart the app. The
+                    // bring-up is a WORKER (chatBringUp only starts it); calling it
+                    // straight from this drain is what ANR'd the phone on
+                    // 2026-07-14, because this drain runs on the render thread.
+                    .approved, .root => {
+                        rs.gdev_state = .ok;
+                        rs.gdev_error = "";
+                        chatBringUp(rs, gpa, io, env, session, false);
+                    },
+                    // Still waiting on a human. Nothing to say that the screen is
+                    // not already saying.
+                    .pending => rs.gdev_state = .pending,
+                    // We could not read the directory. Say so — and keep asking. The
+                    // one thing we do NOT do is decide what it would have said.
+                    .offline => rs.gdev_state = .offline,
+                    // We are outside the account and have not asked to join.
+                    .not_asked => rs.gdev_state = .elsewhere,
                 }
             },
             .poll => {
@@ -10385,7 +10542,12 @@ fn chatDevicesStep(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.p
     // what makes "this page updates itself" true — and it is why the waiting screen
     // needs no refresh button, which would only be a way for a person to feel that
     // nothing is happening.
-    if (rs.gdev_state == .pending) {
+    // ...and the same clock drives the OFFLINE screen. A device that could not read
+    // the directory has not been refused; it has been left not knowing, and the only
+    // way out of not knowing is to ask again. (It also means the "can't reach your
+    // account" screen heals itself the moment the network does, with nobody tapping
+    // anything.)
+    if (rs.gdev_state == .pending or rs.gdev_state == .offline) {
         if (rs.gdev_poll_ns != 0 and now -| rs.gdev_poll_ns < 8_000_000_000) return; // every 8s
         rs.gdev_poll_ns = now;
         startDeviceJob(rs, gpa, io, env, session, .status);

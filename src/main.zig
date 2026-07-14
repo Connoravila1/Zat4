@@ -224,6 +224,13 @@ pub fn main(init: std.process.Init) !void {
     // back through the public directory path and validates the whole chain
     // (anchor binding, suite, expiry, signatures) — the full U6 loop, headless.
     var chat_publish = false;
+    // THE REPAIR: `--chat-reclaim` makes THIS device the account's chat device
+    // again — it removes every OTHER device record and re-asserts the singleton
+    // from this device's stored key. It exists because a device that could not read
+    // the directory once concluded it was the root and seized the account's chat
+    // identity (2026-07-14); the honest way back is a person, at the keyboard,
+    // saying which device is real. It never runs on the app's own initiative.
+    var chat_reclaim = false;
     // Payment-address directory test (M5 A2): `--pay-publish <lightning|-> <bitcoin|->`
     // validates the addresses (full checksums), publishes the anchor-signed
     // app.zat4.pay.address record, then fetches it back the way a PAYER would
@@ -290,6 +297,8 @@ pub fn main(init: std.process.Init) !void {
             }
         } else if (std.mem.eql(u8, arg, "--chat-publish")) {
             chat_publish = true;
+        } else if (std.mem.eql(u8, arg, "--chat-reclaim")) {
+            chat_reclaim = true;
         } else if (std.mem.eql(u8, arg, "--pay-publish")) {
             if (ai + 2 < args.len) {
                 pay_publish_ln = args[ai + 1];
@@ -822,7 +831,7 @@ pub fn main(init: std.process.Init) !void {
     // resulting at-uri/cid, and exit. This is the write-leg test: the record
     // lands in the user's OWN PDS under app.zat4.feed.post, from where the
     // firehose carries it to the Zat4 AppView.
-    if (post_text != null or follow_target != null or publish_algo_name != null or publish_discover or chat_publish or pay_publish) {
+    if (post_text != null or follow_target != null or publish_algo_name != null or publish_discover or chat_publish or chat_reclaim or pay_publish) {
         var from_cache = false;
         var session: auth.Session = undefined;
         if (appPassword(env)) |password| {
@@ -893,6 +902,31 @@ pub fn main(init: std.process.Init) !void {
                 , .{ pub_hex, peer.kp_bytes.len });
             } else {
                 try out.print("[chat] fetch-back found NO record — publish did not land\n", .{});
+            }
+            try out.flush();
+        }
+
+        // THE REPAIR (2026-07-14). Take chat back for THIS device: drop every other
+        // device's record, then re-assert the account's singleton from the key this
+        // device already holds. Nothing is minted, so peers see the key they have
+        // always seen; a device removed here can simply ask again and be approved.
+        if (chat_reclaim) {
+            const rep = chat_keys.reclaim(gpa, arena, io, env, &session, "Desktop") catch |err| {
+                try out.print("--chat-reclaim FAILED: {s}\n" ++
+                    "  Nothing was changed that this message does not name.\n", .{@errorName(err)});
+                try out.flush();
+                return err;
+            };
+            try out.print(
+                \\[chat] reclaimed — this device is the account's chat device again
+                \\[chat]   other device records removed: {d}
+                \\[chat]   this device now stands: {s}
+                \\
+            , .{ rep.devices_removed, @tagName(rep.status) });
+            if (rep.status != .root) {
+                // Say it plainly rather than reassure: the repair did not take, and
+                // the operator needs to know that BEFORE they trust the account.
+                try out.print("[chat] WARNING: expected 'root'. The directory did not end up where it should — do not assume chat is repaired.\n", .{});
             }
             try out.flush();
         }
