@@ -237,7 +237,7 @@ pub fn main(init: std.process.Init) !void {
         const cthread = try chat_view.buildThread(arena, &cstore, maya, now);
         // Trailing three: a delivered conversation, chat keys that live on THIS
         // device, and a live relay — the still we want to look at is the working one.
-        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread.rows, cthread.cards, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, false, .connected);
+        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread.rows, cthread.cards, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, .connected, .{});
         try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
         try writePpm(io, gpa, &fb, "/tmp/zat_chat.ppm");
         std.debug.print("wrote /tmp/zat_chat.ppm (Zat Chat messages surface)\n", .{});
@@ -247,7 +247,7 @@ pub fn main(init: std.process.Init) !void {
         @memset(fb.pixels, clear);
         dl.len = 0;
         try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
-        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread.rows, cthread.cards, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{ .open = true, .mode = .onboard }, .{}, .{}, .confirmed, false, .connected);
+        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread.rows, cthread.cards, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{ .open = true, .mode = .onboard }, .{}, .{}, .confirmed, .connected, .{});
         try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
         try writePpm(io, gpa, &fb, "/tmp/zat_chat_recv_onboard.ppm");
         std.debug.print("wrote /tmp/zat_chat_recv_onboard.ppm (payment onboarding empty state)\n", .{});
@@ -256,13 +256,13 @@ pub fn main(init: std.process.Init) !void {
         @memset(fb.pixels, clear);
         dl.len = 0;
         try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
-        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread.rows, cthread.cards, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{ .open = true, .mode = .wallets }, .{}, .{}, .confirmed, false, .connected);
+        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread.rows, cthread.cards, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{ .open = true, .mode = .wallets }, .{}, .{}, .confirmed, .connected, .{});
         // The CAPABILITY REVIEW — the wallet's own answer, before anything is
         // published. Strike: receivable, but cannot confirm itself.
         @memset(fb.pixels, clear);
         dl.len = 0;
         try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
-        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread.rows, cthread.cards, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{ .open = true, .mode = .caps, .lightning = "connoravila@strike.me", .caps = .{ .receivable = true, .auto_confirm = false, .min_sat = 1, .max_sat = 16_000_000, .comment_max = 200 } }, .{}, .{}, .confirmed, false, .connected);
+        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread.rows, cthread.cards, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{ .open = true, .mode = .caps, .lightning = "connoravila@strike.me", .caps = .{ .receivable = true, .auto_confirm = false, .min_sat = 1, .max_sat = 16_000_000, .comment_max = 200 } }, .{}, .{}, .confirmed, .connected, .{});
         try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
         try writePpm(io, gpa, &fb, "/tmp/zat_chat_caps.ppm");
         std.debug.print("wrote /tmp/zat_chat_caps.ppm (wallet capability review)\n", .{});
@@ -274,7 +274,7 @@ pub fn main(init: std.process.Init) !void {
         @memset(fb.pixels, clear);
         dl.len = 0;
         try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
-        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread.rows, cthread.cards, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{ .open = true, .mode = .paste, .lightning = "connoravila@strike.me" }, .{}, .{}, .confirmed, false, .connected);
+        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread.rows, cthread.cards, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{ .open = true, .mode = .paste, .lightning = "connoravila@strike.me" }, .{}, .{}, .confirmed, .connected, .{});
         try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
         try writePpm(io, gpa, &fb, "/tmp/zat_chat_recv_paste.ppm");
         std.debug.print("wrote /tmp/zat_chat_recv_paste.ppm (paste form + Remove)\n", .{});
@@ -284,7 +284,7 @@ pub fn main(init: std.process.Init) !void {
         @memset(fb.pixels, clear);
         dl.len = 0;
         try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
-        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread.rows, cthread.cards, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{ .open = true, .step = .confirm, .rail = .lightning, .amount = "150000", .note = "rent", .first_send = true }, .{}, &.{}, .{}, .{}, .{}, .confirmed, false, .connected);
+        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread.rows, cthread.cards, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{ .open = true, .step = .confirm, .rail = .lightning, .amount = "150000", .note = "rent", .first_send = true }, .{}, &.{}, .{}, .{}, .{}, .confirmed, .connected, .{});
         try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
         try writePpm(io, gpa, &fb, "/tmp/zat_chat_pay_confirm.ppm");
         std.debug.print("wrote /tmp/zat_chat_pay_confirm.ppm (send confirm + disclosure)\n", .{});
@@ -295,7 +295,7 @@ pub fn main(init: std.process.Init) !void {
         @memset(fb.pixels, clear);
         dl.len = 0;
         try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
-        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread.rows, cthread.cards, 0, "maya.zat4.com", "", .{}, false, true, "chattest.zat4.com", "No chat keys published for that account", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, false, .connected);
+        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread.rows, cthread.cards, 0, "maya.zat4.com", "", .{}, false, true, "chattest.zat4.com", "No chat keys published for that account", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, .connected, .{});
         try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
         try writePpm(io, gpa, &fb, "/tmp/zat_chat_compose.ppm");
         std.debug.print("wrote /tmp/zat_chat_compose.ppm (compose-new-conversation bar)\n", .{});
@@ -306,7 +306,7 @@ pub fn main(init: std.process.Init) !void {
         @memset(fb.pixels, clear);
         dl.len = 0;
         try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
-        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread.rows, cthread.cards, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{ .typing_t = 1.0, .typing_phase = 0.6 }, &.{}, .{}, .{}, .{}, .confirmed, false, .connected);
+        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread.rows, cthread.cards, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{ .typing_t = 1.0, .typing_phase = 0.6 }, &.{}, .{}, .{}, .{}, .confirmed, .connected, .{});
         try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
         try writePpm(io, gpa, &fb, "/tmp/zat_chat_motion.ppm");
         std.debug.print("wrote /tmp/zat_chat_motion.ppm (U6a mid-send + typing indicator)\n", .{});
@@ -317,7 +317,7 @@ pub fn main(init: std.process.Init) !void {
         @memset(fb.pixels, clear);
         dl.len = 0;
         try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
-        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread.rows, cthread.cards, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{ .open = true, .rail = .lightning, .amount = "5000", .note = "dinner split", .usd_cents_per_btc = 6_500_000 }, .{}, &.{}, .{}, .{}, .{}, .confirmed, false, .connected);
+        _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, cthread.rows, cthread.cards, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{ .open = true, .rail = .lightning, .amount = "5000", .note = "dinner split", .usd_cents_per_btc = 6_500_000 }, .{}, &.{}, .{}, .{}, .{}, .confirmed, .connected, .{});
         try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
         try writePpm(io, gpa, &fb, "/tmp/zat_chat_pay.ppm");
         std.debug.print("wrote /tmp/zat_chat_pay.ppm (payment cards + the pay sheet)\n", .{});
@@ -339,7 +339,7 @@ pub fn main(init: std.process.Init) !void {
             @memset(fb.pixels, clear);
             dl.len = 0;
             try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
-            _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, s2_thread.rows, s2_thread.cards, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, false, .connected);
+            _ = try feed_view.layoutChat(gpa, &engine, @intCast(W), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, clist, s2_thread.rows, s2_thread.cards, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, .connected, .{});
             try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
             try writePpm(io, gpa, &fb, "/tmp/zat_chat_pay_s2.ppm");
             std.debug.print("wrote /tmp/zat_chat_pay_s2.ppm (S2 walletless offer cards)\n", .{});
@@ -842,7 +842,7 @@ pub fn main(init: std.process.Init) !void {
     };
     @memset(fb.pixels, clear);
     dl.len = 0;
-    _ = try feed_view.layoutChat(gpa, &engine, 430, @intCast(H), &dl, null, lens_socket.seatedAccent(feed_t), 0, false, false, null, &conv_rows, &.{}, &.{}, 999, "", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{ .top = 48 }, .{}, .confirmed, false, .connected);
+    _ = try feed_view.layoutChat(gpa, &engine, 430, @intCast(H), &dl, null, lens_socket.seatedAccent(feed_t), 0, false, false, null, &conv_rows, &.{}, &.{}, 999, "", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{ .top = 48 }, .{}, .confirmed, .connected, .{});
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_chat_list_phone.ppm");
     std.debug.print("wrote /tmp/zat_chat_list_phone.ppm (430x{d}, {d} items)\n", .{ H, dl.len });
@@ -856,7 +856,7 @@ pub fn main(init: std.process.Init) !void {
     };
     @memset(fb.pixels, clear);
     dl.len = 0;
-    _ = try feed_view.layoutChat(gpa, &engine, 430, @intCast(H), &dl, null, lens_socket.seatedAccent(feed_t), 0, false, false, null, &conv_rows, &bubbles, &.{}, 0, "desh.zat4.com", "on my way", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{ .top = 48, .bottom = 34 }, .{}, .confirmed, false, .connected);
+    _ = try feed_view.layoutChat(gpa, &engine, 430, @intCast(H), &dl, null, lens_socket.seatedAccent(feed_t), 0, false, false, null, &conv_rows, &bubbles, &.{}, 0, "desh.zat4.com", "on my way", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{ .top = 48, .bottom = 34 }, .{}, .confirmed, .connected, .{});
     try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
     try writePpm(io, gpa, &fb, "/tmp/zat_chat_thread_phone.ppm");
     std.debug.print("wrote /tmp/zat_chat_thread_phone.ppm (430x{d}, {d} items)\n", .{ H, dl.len });
@@ -948,6 +948,30 @@ pub fn main(init: std.process.Init) !void {
         const path = try std.fmt.bufPrint(&epath_buf, "/tmp/zat_{s}.ppm", .{es.name});
         try writePpm(io, gpa, &fb, path);
         std.debug.print("wrote {s} ({d} items)\n", .{ path, dl.len });
+    }
+
+    // MULTI-DEVICE (slice 2): the gate, the wait, the approval card, the explainer.
+    {
+        const md = [_]struct { name: []const u8, w: u32, dev: feed_view.ChatDevices }{
+            .{ .name = "md_gate_phone", .w = 430, .dev = .{ .state = .elsewhere } },
+            .{ .name = "md_gate_busy", .w = 430, .dev = .{ .state = .elsewhere, .busy = true } },
+            .{ .name = "md_wait_phone", .w = 430, .dev = .{ .state = .pending, .t = 1.2 } },
+            .{ .name = "md_help", .w = 430, .dev = .{ .state = .elsewhere, .help_open = true } },
+            .{ .name = "md_approve", .w = 700, .dev = .{ .pending = &[_]feed_view.PendingDeviceView{
+                .{ .name = "Pixel 10 Pro", .fingerprint = "a41f 9c02 7bd3 e158", .age = "just now" },
+            } } },
+            .{ .name = "md_added", .w = 700, .dev = .{ .added_t = 0.35, .added_name = "Pixel 10 Pro" } },
+        };
+        for (md) |c| {
+            @memset(fb.pixels, clear);
+            dl.len = 0;
+            try field.compose(gpa, &f, particles.slice(), light, cell_w, cell_h, &dl);
+            _ = try feed_view.layoutChat(gpa, &engine, @intCast(c.w), @intCast(H), &dl, null, feed_view.accent_house, 0, false, false, null, &.{}, &.{}, &.{}, 255, "", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{ .top = 40 }, .{}, .confirmed, .connected, c.dev);
+            try raster.paint(gpa, &engine, dl.slice(), &fb, clear);
+            const path = try std.fmt.bufPrint(&epath_buf, "/tmp/zat_{s}.ppm", .{c.name});
+            try writePpm(io, gpa, &fb, path);
+            std.debug.print("wrote {s}\n", .{path});
+        }
     }
 
     // THE BOOT ENTRANCE (§5), sampled across its two movements: the log typing

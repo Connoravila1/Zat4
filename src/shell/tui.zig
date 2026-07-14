@@ -51,6 +51,7 @@ const pet_core = @import("../core/pet.zig");
 const gesture = @import("../core/gesture.zig");
 const chat_relay = @import("chat_relay.zig");
 const chat_e2ee = @import("chat_e2ee.zig");
+const chat_keys = @import("chat_keys.zig"); // multi-device: ask / approve / who is waiting
 const enroll_view = @import("../core/enroll_view.zig");
 const boot_intro = @import("../core/boot_intro.zig"); // the signed-out boot entrance (§5)
 const enroll_run = @import("enroll_run.zig");
@@ -828,6 +829,32 @@ const RunState = struct {
     /// refused to overwrite it. Messages says so, plainly, and offers the only
     /// honest way forward — never a silently re-minted identity.
     gchat_identity_elsewhere: bool,
+    /// CHAT_MULTIDEVICE slice 2 — the device gate's live state.
+    /// `pending`: what this account's repo says is asking to join (refreshed off
+    /// the render thread, like every other network fact).
+    gdev_state: feed_view.ChatDeviceState,
+    gdev_busy: bool,
+    gdev_error: []const u8,
+    gdev_added_ns: u64, // when an approval landed (drives the confirmation + its fade)
+    gdev_added_name: [48]u8,
+    gdev_added_len: u8,
+    gdev_help: bool,
+    /// One pending device at a time, always. A STACK of prompts is how you train
+    /// somebody to tap yes without reading, which is the attack.
+    gdev_pend_have: bool,
+    gdev_pend_name: [48]u8,
+    gdev_pend_name_len: u8,
+    gdev_pend_fp: [24]u8,
+    gdev_pend_fp_len: u8,
+    gdev_pend_at: i64,
+    /// What an approval actually acts on: the device's KEY (what gets signed) and
+    /// the record's rkey (where the signature is written). The record's own bytes
+    /// stay in the job, where the poll that read them left them.
+    gdev_pend_anchor: [32]u8,
+    gdev_pend_rkey: [32]u8,
+    gdev_pend_rkey_len: u8,
+    gdev_poll_ns: u64, // last time we asked the network who is waiting
+    gdev_job: DeviceJob,
     /// A URL this frame asked the OS to open. On the phone there is no
     /// `xdg-open` — the seam hands it to the activity, which fires an
     /// ACTION_VIEW intent (the same road the OAuth browser already takes).
@@ -1475,6 +1502,19 @@ fn initRunState(
     rs.glogin_want = false;
     rs.glogin_asked = false;
     rs.genroll_signin_started = false;
+    rs.gdev_state = .ok;
+    rs.gdev_busy = false;
+    rs.gdev_error = "";
+    rs.gdev_added_ns = 0;
+    rs.gdev_added_len = 0;
+    rs.gdev_help = false;
+    rs.gdev_pend_have = false;
+    rs.gdev_pend_name_len = 0;
+    rs.gdev_pend_fp_len = 0;
+    rs.gdev_pend_rkey_len = 0;
+    rs.gdev_pend_at = 0;
+    rs.gdev_poll_ns = 0;
+    rs.gdev_job = .{};
     rs.gboot_start_ns = 0;
     // A signed-in app never plays the entrance: it is the front door's overture,
     // not a splash screen, and somebody who is already inside is not arriving.
@@ -2272,6 +2312,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
             }
         };
 
+
         // Prefetch OUR own receive-setup once, in the background, the first
         // time we're on the messages screen — so the ₿ button opens the pay
         // sheet with no stall (loadOwnReceive is a PDS fetch; on the click it
@@ -2445,6 +2486,11 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
         // one question that used to have no answer: has it landed? When it has,
         // the card flips ITSELF to Sent ✓ and the peer is signalled — nobody
         // tapped anything, and nobody had to be trusted. ──
+        // MULTI-DEVICE (slice 2). Runs whether or not chat is up, because the
+        // device that is WAITING to be let in has no chat state by definition — and
+        // it is the one that most needs its screen to keep itself current.
+        if (dev_chat) chatDevicesStep(rs, gpa, io, environ, session);
+
         if (dev_chat) if (rs.gchat_e2ee) |*st| {
             const now_ns = clock_shell.monotonicNanos();
 
@@ -3502,7 +3548,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        var pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = .{ .cards = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .q_focus = rs.gmarket_q_focus, .loading = rs.market_loading, .filter = rs.gmarket_filter, .hover_x = rs.ghover_x, .hover_y = rs.ghover_y }, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_delivery = chatDeliveryOf(rs), .chat_identity_elsewhere = rs.gchat_identity_elsewhere, .chat_link = chatLinkOf(rs), .enroll = enroll_run.snapshot(&rs.genroll_state, composeBlinkOn(rs.caret_anchor_ns)), .enroll_hits = &rs.genroll_hits, .boot_on = bootIntroOn(rs), .boot_t = bootIntroT(rs), .kbd_visible = softKeyboardWanted(rs), .kbd_shift = rs.kbd_shift, .kbd_page = rs.kbd_page, .kbd_caps = rs.kbd_caps, .kbd_flash_key = rs.kbd_flash_key, .kbd_flash_a = kbdFlashAlpha(rs), .kbd_popup = .{ .opts = rs.kbd_popup_opts[0..rs.kbd_popup_n], .anchor_x = rs.kbd_popup_ax, .anchor_y = rs.kbd_popup_ay, .anchor_w = rs.kbd_popup_aw, .sel = rs.kbd_popup_sel }, .kbd_emoji_open = rs.kbd_emoji_open, .kbd_emoji_scroll = @intFromFloat(rs.kbd_emoji_scroll), .kbd_picker_mode = rs.kbd_picker_mode, .kbd_nav_t = rs.kbd_nav_t, .kbd_nav_scroll = @intFromFloat(rs.kbd_nav_scroll), .chat_q = rs.gchat_q_buf[0..rs.gchat_q_len], .chat_q_focus = rs.gchat_q_focus, .chat_q_caret = composeBlinkOn(rs.caret_anchor_ns), .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_edit = .{ .caret = @min(rs.gchat_caret, rs.gchat_draft_len), .sel_a = @min(rs.gchat_sel_a, rs.gchat_draft_len), .sel_b = @min(rs.gchat_sel_b, rs.gchat_draft_len), .bar = rs.gchat_edit_bar }, .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .step = rs.gpay_step, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents, .busy = rs.gpay_busy }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved, .rooted = rs.grecv_set, .set = rs.grecv_set, .known = rs.grecv_known, .probing = rs.grecv_probing, .caps = rs.gcaps, .saving = rs.gpublish_busy }, .wallet_remove_armed = rs.gwallet_remove_armed, .verify_ids = verifyIdsOf(arena, rs), .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
+        var pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = .{ .cards = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .q_focus = rs.gmarket_q_focus, .loading = rs.market_loading, .filter = rs.gmarket_filter, .hover_x = rs.ghover_x, .hover_y = rs.ghover_y }, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_delivery = chatDeliveryOf(rs), .chat_identity_elsewhere = rs.gchat_identity_elsewhere, .chat_link = chatLinkOf(rs), .chat_devices = chatDevicesOf(rs, arena), .enroll = enroll_run.snapshot(&rs.genroll_state, composeBlinkOn(rs.caret_anchor_ns)), .enroll_hits = &rs.genroll_hits, .boot_on = bootIntroOn(rs), .boot_t = bootIntroT(rs), .kbd_visible = softKeyboardWanted(rs), .kbd_shift = rs.kbd_shift, .kbd_page = rs.kbd_page, .kbd_caps = rs.kbd_caps, .kbd_flash_key = rs.kbd_flash_key, .kbd_flash_a = kbdFlashAlpha(rs), .kbd_popup = .{ .opts = rs.kbd_popup_opts[0..rs.kbd_popup_n], .anchor_x = rs.kbd_popup_ax, .anchor_y = rs.kbd_popup_ay, .anchor_w = rs.kbd_popup_aw, .sel = rs.kbd_popup_sel }, .kbd_emoji_open = rs.kbd_emoji_open, .kbd_emoji_scroll = @intFromFloat(rs.kbd_emoji_scroll), .kbd_picker_mode = rs.kbd_picker_mode, .kbd_nav_t = rs.kbd_nav_t, .kbd_nav_scroll = @intFromFloat(rs.kbd_nav_scroll), .chat_q = rs.gchat_q_buf[0..rs.gchat_q_len], .chat_q_focus = rs.gchat_q_focus, .chat_q_caret = composeBlinkOn(rs.caret_anchor_ns), .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_edit = .{ .caret = @min(rs.gchat_caret, rs.gchat_draft_len), .sel_a = @min(rs.gchat_sel_a, rs.gchat_draft_len), .sel_b = @min(rs.gchat_sel_b, rs.gchat_draft_len), .bar = rs.gchat_edit_bar }, .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .step = rs.gpay_step, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents, .busy = rs.gpay_busy }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved, .rooted = rs.grecv_set, .set = rs.grecv_set, .known = rs.grecv_known, .probing = rs.grecv_probing, .caps = rs.gcaps, .saving = rs.gpublish_busy }, .wallet_remove_armed = rs.gwallet_remove_armed, .verify_ids = verifyIdsOf(arena, rs), .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
         switch (rs.mode) {
             .timeline => try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status),
             .compose => {
@@ -6069,6 +6115,24 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                             else
                                                 "chat: set up on this device";
                                         },
+                                        // ── MULTI-DEVICE: the two taps, and the two
+                                        // ways out of them. Every one of these is a
+                                        // network round-trip, so every one of them
+                                        // goes to a worker and the UI says so.
+                                        .chat_device_add => if (dev_chat) {
+                                            rs.gdev_error = "";
+                                            startDeviceJob(rs, gpa, io, environ, session, .ask);
+                                        },
+                                        .chat_device_approve => if (dev_chat) {
+                                            rs.gdev_error = "";
+                                            startDeviceJob(rs, gpa, io, environ, session, .approve);
+                                        },
+                                        .chat_device_refuse => if (dev_chat) {
+                                            rs.gdev_error = "";
+                                            startDeviceJob(rs, gpa, io, environ, session, .refuse);
+                                        },
+                                        .chat_device_help => rs.gdev_help = true,
+                                        .chat_help_close => rs.gdev_help = false,
                                         .chat_send => if (dev_chat) {
                                             const body = std.mem.trimEnd(u8, rs.gchat_draft_buf[0..rs.gchat_draft_len], " \n");
                                             if (body.len > 0) if (rs.gchat_sel) |sc| {
@@ -9104,9 +9168,19 @@ fn chatBringUp(
         // cannot be copied here; that is exactly what makes it worth having.
         // The Messages screen says so, and offers the only honest way forward.
         rs.gchat_identity_elsewhere = (err == error.IdentityElsewhere);
+        // MULTI-DEVICE: the wall is now a question with two answers. "We asked and
+        // are waiting" is not the same screen as "chat lives elsewhere and you have
+        // not asked" — one waits, the other offers a button, and a person can tell
+        // instantly which of the two they are in.
+        rs.gdev_state = switch (err) {
+            error.DeviceApprovalPending => .pending,
+            error.IdentityElsewhere => .elsewhere,
+            else => rs.gdev_state,
+        };
         return;
     };
     rs.gchat_identity_elsewhere = false;
+    rs.gdev_state = .ok; // we are part of the account: no gate, and we can approve others
     rs.gchat_e2ee = st;
 
     // M2.1: bootstrap inbox (Welcomes) + every restored conversation's
@@ -9172,13 +9246,345 @@ fn chatBringUp(
 /// here, where the same thread is drawing the app. A createAccount is a PDS
 /// round-trip plus a membership-record write; on a phone that is seconds.
 /// A7.2: cold struct, size guard waived — one in flight, ever.
+// ─────────────── multi-device: the network legs, on a worker ───────────────
+//
+// Asking to join, approving, refusing, and polling for who is waiting are all
+// network round-trips, and NONE of them may run on the thread that draws (the
+// standing law — a chain-send once froze the app for five seconds and that was
+// strike three). The UI states the intent; the worker does the trip; the loop
+// drains the result.
+
+const DeviceJob = struct {
+    // A7.2: cold struct (one live instance, holds a thread), size guard waived.
+    thread: ?std.Thread = null,
+    done: std.atomic.Value(bool) = .init(false),
+    kind: enum { none, ask, approve, refuse, poll, status } = .none,
+    /// `status`: where this device now stands with the account.
+    status: chat_keys.DeviceStatus = .not_asked,
+    ok: bool = false,
+    /// `poll`: what the repo says is waiting. Copied out as bytes — the worker's
+    /// arena dies with it, so nothing it allocated escapes.
+    found: bool = false,
+    name: [48]u8 = undefined,
+    name_len: u8 = 0,
+    fp: [24]u8 = undefined,
+    fp_len: u8 = 0,
+    at: i64 = 0,
+    anchor_pub: [32]u8 = undefined,
+    rkey: [32]u8 = undefined,
+    rkey_len: u8 = 0,
+    /// The device we are approving/refusing (copied in by the main thread).
+    target_anchor: [32]u8 = undefined,
+    target_rkey: [32]u8 = undefined,
+    target_rkey_len: u8 = 0,
+    target_kp: [4096]u8 = undefined,
+    target_kp_len: u16 = 0,
+    target_sig: [128]u8 = undefined,
+    target_sig_len: u8 = 0,
+    target_na: [32]u8 = undefined,
+    target_na_len: u8 = 0,
+    io: std.Io = undefined,
+    env: ?*const std.process.Environ.Map = null,
+    session: ?*auth.Session = null,
+};
+
 const CreateJob = struct {
+    // A7.2: cold struct (one live instance, holds a thread), size guard waived.
     thread: ?std.Thread = null,
     done: std.atomic.Value(bool) = .init(false),
     active: bool = false,
     /// The result. Null = it failed, and the card says so rather than hanging.
     session: ?auth.Session = null,
 };
+
+/// The multi-device surfaces' snapshot: plain values in, pixels out.
+fn chatDevicesOf(rs: *RunState, arena: Allocator) feed_view.ChatDevices {
+    var pend: []const feed_view.PendingDeviceView = &.{};
+    if (rs.gdev_pend_have) {
+        const rows = arena.alloc(feed_view.PendingDeviceView, 1) catch return .{};
+        rows[0] = .{
+            .name = if (rs.gdev_pend_name_len > 0) rs.gdev_pend_name[0..rs.gdev_pend_name_len] else "A new device",
+            .fingerprint = rs.gdev_pend_fp[0..rs.gdev_pend_fp_len],
+            .age = deviceAge(arena, rs.gdev_pend_at),
+        };
+        pend = rows;
+    }
+    const now = clock_shell.monotonicNanos();
+    // The confirmation holds for a beat, then fades. An approval that vanished the
+    // instant it landed would leave a person wondering whether they tapped it.
+    var added_t: f32 = 0;
+    if (rs.gdev_added_ns != 0) {
+        const el: f32 = @floatFromInt(now -| rs.gdev_added_ns);
+        added_t = el / 2_600_000_000.0;
+        if (added_t >= 1.0) added_t = 0; // retired
+    }
+    return .{
+        .state = rs.gdev_state,
+        .pending = pend,
+        .busy = rs.gdev_busy,
+        .error_line = rs.gdev_error,
+        .added_t = added_t,
+        .added_name = rs.gdev_added_name[0..rs.gdev_added_len],
+        .t = @as(f32, @floatFromInt(@mod(now / 1_000_000, 100_000))) / 1000.0,
+        .help_open = rs.gdev_help,
+    };
+}
+
+/// "just now" / "4 minutes ago". A request that appeared while you were asleep
+/// deserves more suspicion than one you just triggered, and the surface should let
+/// a person notice that for themselves.
+fn deviceAge(arena: Allocator, at: i64) []const u8 {
+    if (at == 0) return "just now";
+    const secs = clock_shell.unixSeconds() - at;
+    if (secs < 90) return "just now";
+    const mins = @divTrunc(secs, 60);
+    if (mins < 60) return std.fmt.allocPrint(arena, "{d} minutes ago", .{mins}) catch "recently";
+    const hours = @divTrunc(mins, 60);
+    if (hours < 24) return std.fmt.allocPrint(arena, "{d} hours ago", .{hours}) catch "recently";
+    return std.fmt.allocPrint(arena, "{d} days ago", .{@divTrunc(hours, 24)}) catch "a while ago";
+}
+
+/// Every frame Messages is up: keep the device gate's facts current, and drain any
+/// worker that has landed. All of the network is on the worker; none of it is here.
+fn chatDevicesStep(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, session: *auth.Session) void {
+    const job = &rs.gdev_job;
+
+    // Drain a finished leg.
+    if (job.thread != null and job.done.load(.acquire)) {
+        job.thread.?.join();
+        job.thread = null;
+        rs.gdev_busy = false;
+        switch (job.kind) {
+            .ask => {
+                if (job.ok) {
+                    rs.gdev_state = .pending; // now we wait, and the screen says so
+                    rs.gdev_error = "";
+                } else rs.gdev_error = "Couldn't ask right now. Check your connection.";
+            },
+            .approve => {
+                if (job.ok) {
+                    // Say it landed, by name, for a beat.
+                    const n = @min(rs.gdev_pend_name_len, rs.gdev_added_name.len);
+                    @memcpy(rs.gdev_added_name[0..n], rs.gdev_pend_name[0..n]);
+                    rs.gdev_added_len = @intCast(n);
+                    rs.gdev_added_ns = clock_shell.monotonicNanos();
+                    rs.gdev_pend_have = false;
+                    rs.gdev_error = "";
+                } else rs.gdev_error = "Couldn't approve it. Try again.";
+            },
+            .refuse => {
+                if (job.ok) {
+                    rs.gdev_pend_have = false;
+                    // NOT a dismiss. Somebody signed in as this account, and the
+                    // person deserves to be told what that means.
+                    rs.gdev_error = "Refused. Someone signed in as you \u{2014} change your password.";
+                } else rs.gdev_error = "Couldn't refuse it. Try again.";
+            },
+            .status => {
+                // Approved. Bring chat up right here: the person is looking at the
+                // waiting screen, and the next thing they should see is their
+                // conversations — not a prompt to restart the app.
+                if (job.ok and (job.status == .approved or job.status == .root)) {
+                    rs.gdev_state = .ok;
+                    rs.gdev_error = "";
+                    chatBringUp(rs, gpa, io, env, session, false);
+                }
+            },
+            .poll => {
+                if (job.ok) {
+                    if (job.found) {
+                        rs.gdev_pend_have = true;
+                        rs.gdev_pend_anchor = job.anchor_pub;
+                        rs.gdev_pend_rkey_len = job.rkey_len;
+                        @memcpy(rs.gdev_pend_rkey[0..job.rkey_len], job.rkey[0..job.rkey_len]);
+                        rs.gdev_pend_name_len = job.name_len;
+                        @memcpy(rs.gdev_pend_name[0..job.name_len], job.name[0..job.name_len]);
+                        rs.gdev_pend_fp_len = job.fp_len;
+                        @memcpy(rs.gdev_pend_fp[0..job.fp_len], job.fp[0..job.fp_len]);
+                        rs.gdev_pend_at = job.at;
+                    } else if (rs.gdev_added_ns == 0) {
+                        rs.gdev_pend_have = false;
+                    }
+                }
+            },
+            .none => {},
+        }
+        job.kind = .none;
+    }
+
+    if (job.thread != null) return;
+    const now = clock_shell.monotonicNanos();
+
+    // WAITING: ask, quietly and repeatedly, whether we have been let in. This is
+    // what makes "this page updates itself" true — and it is why the waiting screen
+    // needs no refresh button, which would only be a way for a person to feel that
+    // nothing is happening.
+    if (rs.gdev_state == .pending) {
+        if (rs.gdev_poll_ns != 0 and now -| rs.gdev_poll_ns < 8_000_000_000) return; // every 8s
+        rs.gdev_poll_ns = now;
+        startDeviceJob(rs, gpa, io, env, session, .status);
+        return;
+    }
+
+    // IN THE ACCOUNT: is anybody asking to join? Only a device that is actually in
+    // has anybody to approve — a device at the gate has nothing to answer.
+    if (rs.gchat_e2ee == null or rs.gdev_state != .ok) return;
+    if (rs.gdev_poll_ns != 0 and now -| rs.gdev_poll_ns < 20_000_000_000) return; // every 20s
+    rs.gdev_poll_ns = now;
+    startDeviceJob(rs, gpa, io, env, session, .poll);
+}
+
+fn startDeviceJob(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, session: *auth.Session, kind: @TypeOf(@as(DeviceJob, undefined).kind)) void {
+    const job = &rs.gdev_job;
+    if (job.thread != null) return;
+    job.kind = kind;
+    job.io = io;
+    job.env = env;
+    job.session = session;
+    job.ok = false;
+    job.found = false;
+    job.done.store(false, .monotonic);
+    // Approve/refuse act on the pending device we are SHOWING — copied in, so the
+    // worker never reads state the render thread is mutating.
+    if (kind == .approve or kind == .refuse) {
+        job.target_anchor = rs.gdev_pend_anchor;
+        job.target_rkey_len = rs.gdev_pend_rkey_len;
+        @memcpy(job.target_rkey[0..job.target_rkey_len], rs.gdev_pend_rkey[0..rs.gdev_pend_rkey_len]);
+    }
+    job.thread = std.Thread.spawn(.{}, deviceWorker, .{ job, gpa }) catch null;
+    if (job.thread == null) {
+        job.done.store(true, .release);
+        return;
+    }
+    if (kind != .poll) rs.gdev_busy = true; // the button says so; the poll is silent
+}
+
+fn deviceWorker(job: *DeviceJob, gpa: Allocator) void {
+    const a = std.heap.page_allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const session = job.session orelse {
+        job.done.store(true, .release);
+        return;
+    };
+
+    switch (job.kind) {
+        .ask => {
+            chat_keys.requestJoin(gpa, arena, job.io, job.env, session, deviceLabel(job.env)) catch {
+                job.done.store(true, .release);
+                return;
+            };
+            job.ok = true;
+        },
+        .approve, .refuse => {
+            if (job.kind == .refuse) {
+                chat_keys.refuseDevice(gpa, arena, job.io, job.env, session, job.target_rkey[0..job.target_rkey_len]) catch {
+                    job.done.store(true, .release);
+                    return;
+                };
+            } else {
+                chat_keys.approveDevice(gpa, arena, job.io, job.env, session, .{
+                    .anchor_pub = job.target_anchor,
+                    .name = "",
+                    .created_at = 0,
+                    .rkey = job.target_rkey[0..job.target_rkey_len],
+                    .key_package_b64 = job.target_kp[0..job.target_kp_len],
+                    .anchor_sig_b64 = job.target_sig[0..job.target_sig_len],
+                    .not_after = job.target_na[0..job.target_na_len],
+                }) catch {
+                    job.done.store(true, .release);
+                    return;
+                };
+            }
+            job.ok = true;
+        },
+        .status => {
+            // HAS ANYBODY SAID YES YET? The waiting screen asks this on a worker,
+            // never on the thread that draws — a screen that freezes while it waits
+            // is worse than one that says nothing.
+            job.status = chat_keys.ensureDevice(gpa, arena, job.io, job.env, session, deviceLabel(job.env)) catch {
+                job.done.store(true, .release);
+                return;
+            };
+            job.ok = true;
+        },
+        .poll => {
+            // Who is asking? Only devices our OWN trusted set does not already
+            // contain, and only records that actually validate — junk must never be
+            // able to put a prompt in front of a person.
+            const set = chat_keys.fetchPeerDevices(gpa, arena, job.io, job.env, session.did) catch null;
+            var trusted_buf: [16][32]u8 = undefined;
+            var trusted: []const [32]u8 = &.{};
+            if (set) |s| {
+                var n: usize = 0;
+                for (s.devices) |d| {
+                    if (n == trusted_buf.len) break;
+                    trusted_buf[n] = d.anchor_pub;
+                    n += 1;
+                }
+                trusted = trusted_buf[0..n];
+            }
+            const pending = chat_keys.fetchPending(gpa, arena, job.io, job.env, session.did, trusted) catch &.{};
+            if (pending.len > 0) {
+                const p = pending[0];
+                job.found = true;
+                job.anchor_pub = p.anchor_pub;
+                const nn = @min(p.name.len, job.name.len);
+                @memcpy(job.name[0..nn], p.name[0..nn]);
+                job.name_len = @intCast(nn);
+                const rn = @min(p.rkey.len, job.rkey.len);
+                @memcpy(job.rkey[0..rn], p.rkey[0..rn]);
+                job.rkey_len = @intCast(rn);
+                job.at = p.created_at;
+                // The record's own bytes, kept so an approval can be written back
+                // into it without inventing any field it already carries.
+                const kn = @min(p.key_package_b64.len, job.target_kp.len);
+                @memcpy(job.target_kp[0..kn], p.key_package_b64[0..kn]);
+                job.target_kp_len = @intCast(kn);
+                const sn = @min(p.anchor_sig_b64.len, job.target_sig.len);
+                @memcpy(job.target_sig[0..sn], p.anchor_sig_b64[0..sn]);
+                job.target_sig_len = @intCast(sn);
+                const an = @min(p.not_after.len, job.target_na.len);
+                @memcpy(job.target_na[0..an], p.not_after[0..an]);
+                job.target_na_len = @intCast(an);
+                job.fp_len = @intCast(deviceFingerprint(&job.fp, p.anchor_pub).len);
+            }
+            job.ok = true;
+        },
+        .none => {},
+    }
+    job.done.store(true, .release);
+}
+
+/// A short, readable check of a device's key: four groups of four. It answers "is
+/// this the phone in my hand?" — a MIX-UP check, not a security control (an
+/// attacker's device would show a matching one, because it IS the device asking).
+/// Shown quietly; no ritual is built around it.
+fn deviceFingerprint(out: *[24]u8, key: [32]u8) []const u8 {
+    const hex = "0123456789abcdef";
+    var n: usize = 0;
+    for (0..8) |i| {
+        if (i > 0 and i % 2 == 0 and n < out.len) {
+            out[n] = ' ';
+            n += 1;
+        }
+        if (n + 2 > out.len) break;
+        out[n] = hex[key[i] >> 4];
+        out[n + 1] = hex[key[i] & 0xF];
+        n += 2;
+    }
+    return out[0..n];
+}
+
+fn deviceLabel(env: ?*const std.process.Environ.Map) []const u8 {
+    if (env) |e| {
+        if (e.get("ZAT_DEVICE_NAME")) |n| {
+            if (n.len > 0) return n;
+        }
+    }
+    return if (builtin.os.tag == .linux and builtin.abi.isAndroid()) "Phone" else "Desktop";
+}
 
 fn createWorker(job: *CreateJob, gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, st: *enroll_run.State) void {
     job.session = enroll_run.createZatAccount(gpa, io, env, st);
@@ -11973,6 +12379,9 @@ const Grid = struct {
     /// overwrite it. The Messages surface says so instead of showing a list
     /// that cannot work.
     chat_identity_elsewhere: bool = false,
+    /// CHAT_MULTIDEVICE slice 2: the device gate, the wait, the approval card and
+    /// the explainer — everything the multi-device surfaces render from.
+    chat_devices: feed_view.ChatDevices = .{},
     /// A5: what the relay link is doing right now — the connection dot.
     chat_link: feed_view.ChatLink = .off,
     /// The front door (FRONT_DOOR_ROADMAP): the enrollment view (a pure snapshot
@@ -12982,7 +13391,7 @@ fn paintFrame(
                 // Zat Chat (U3, dev-gated): the Messages surface. -scroll maps the
                 // shared ≤0 scroll state onto layoutChat's positive history offset.
                 const cf = buildChatFrame(arena, g.chat_store.?, g.chat_sel, now, g.chat_q, g.verify_ids);
-                g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_edit, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{}, &.{}, g.chat_recv, .{}, .{}, g.chat_delivery, g.chat_identity_elsewhere, g.chat_link) catch g.content_h.*;
+                g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_edit, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{}, &.{}, g.chat_recv, .{}, .{}, g.chat_delivery, g.chat_link, g.chat_devices) catch g.content_h.*;
             } else if (g.screen.* == feed_view.screen_loadout) {
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
                 g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market, g.bench_pick, g.bench_drag, g.published, g.create, g.dev, g.bench, .{}, g.loadout_lib_y) catch g.content_h.*; // software: draw line-art nav
@@ -13850,7 +14259,7 @@ fn paintFrameGpu(
                 }
             } else |_| {}
             const reflow_t: f32 = if (gs.chat_reflow) |rh| (gs.chat_world.position(rh) orelse 1.0) else 1.0;
-            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_edit, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t, .sheet_t = gs.sheet_t }, xforms, g.chat_recv, .{ .top = @intCast(gs.inset_top_l), .bottom = @intCast(@max(gs.inset_bottom_l, @max(gs.ime_bottom_l, if (g.kbd_visible) feed_view.keyboard_h + gs.inset_bottom_l else 0))), .left = @intCast(gs.inset_left_l), .right = @intCast(gs.inset_right_l) }, .{ .q = g.chat_q, .focus = g.chat_q_focus, .caret_on = g.chat_q_caret }, g.chat_delivery, g.chat_identity_elsewhere, g.chat_link) catch g.content_h.*;
+            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_edit, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t, .sheet_t = gs.sheet_t }, xforms, g.chat_recv, .{ .top = @intCast(gs.inset_top_l), .bottom = @intCast(@max(gs.inset_bottom_l, @max(gs.ime_bottom_l, if (g.kbd_visible) feed_view.keyboard_h + gs.inset_bottom_l else 0))), .left = @intCast(gs.inset_left_l), .right = @intCast(gs.inset_right_l) }, .{ .q = g.chat_q, .focus = g.chat_q_focus, .caret_on = g.chat_q_caret }, g.chat_delivery, g.chat_link, g.chat_devices) catch g.content_h.*;
         } else if (g.screen.* == feed_view.screen_algo_docs) {
             g.content_h.* = feed_view.layoutAlgoDocs(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, if (g.docs_kind == 1) algo_docs.dev_doc else algo_docs.user_doc) catch g.content_h.*;
         } else if (g.screen.* == feed_view.screen_algo_detail) {

@@ -303,7 +303,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_restart, chat_identity_reset, recv_clip, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, recv_back, recv_use, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_restart, chat_identity_reset, chat_device_add, chat_device_approve, chat_device_refuse, chat_device_help, chat_help_close, recv_clip, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, recv_back, recv_use, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -9220,6 +9220,379 @@ pub const ChatListSearch = struct {
 const chat_px: u16 = 16;
 const chat_line_h: i32 = 23;
 
+// ---------------------------------------------------------------------------
+// MULTI-DEVICE (CHAT_MULTIDEVICE slice 2) — the surfaces a person actually meets.
+//
+// Three of them, and each answers the question the person is holding:
+//   1. THE GATE — "chat is on your other device". Was a dead end with one
+//      destructive button. Now it leads: ADD THIS DEVICE is the primary act, and
+//      starting over (which costs you every conversation you have) is demoted to
+//      the last resort it always was.
+//   2. THE WAIT — "we asked; your other device has to say yes." It must look
+//      ALIVE, because a screen that has stopped and a screen that is waiting are
+//      the same picture, and this one is waiting on a human.
+//   3. THE APPROVAL — on the device that already has chat. A decision about your
+//      account's security, so it is a card you cannot miss, sitting at the top of
+//      Messages, with the honest alarm attached to the refuse path.
+// ---------------------------------------------------------------------------
+
+pub const ChatDeviceState = enum(u8) {
+    /// This device is part of the account (or chat is simply off). Nothing shows.
+    ok = 0,
+    /// Chat lives elsewhere and we have not asked to join it.
+    elsewhere = 1,
+    /// We have asked. Somebody has to say yes.
+    pending = 2,
+};
+
+/// A device asking to join, as the prompt shows it. A7.2: cold, a handful at most.
+pub const PendingDeviceView = struct {
+    // A7.2: cold struct (a handful at most, never in a hot loop), size guard waived.
+    /// UNSIGNED, therefore capable of lying. It may put a name in a sentence and
+    /// nothing else — the approval signs the KEY, never this.
+    name: []const u8,
+    /// A short check the person can compare against the other screen. It is a
+    /// mix-up check, NOT a security control (an attacker's device would show a
+    /// matching one — it IS the device asking), so it is shown quietly and no
+    /// ritual is built around it.
+    fingerprint: []const u8,
+    /// "just now", "4 minutes ago" — a request that appeared while you were asleep
+    /// deserves more suspicion than one you just triggered, and the surface should
+    /// let a person notice that themselves.
+    age: []const u8,
+};
+
+/// Everything the multi-device surfaces render from. A7.2: cold, one per frame.
+pub const ChatDevices = struct {
+    // A7.2: cold struct (one per frame, config-shaped), size guard waived.
+    state: ChatDeviceState = .ok,
+    /// Devices asking to join THIS account. Never more than one at a time by
+    /// construction (the shell caps it) — a stack of prompts is how you train
+    /// somebody to tap "yes" without reading.
+    pending: []const PendingDeviceView = &.{},
+    /// A network leg is in flight (asking / approving / refusing).
+    busy: bool = false,
+    /// One honest line when something failed. "" = nothing did.
+    error_line: []const u8 = "",
+    /// 0→1 after an approval lands: the check draws itself and the card retires.
+    added_t: f32 = 0,
+    added_name: []const u8 = "",
+    /// Free-running seconds — the waiting pulse. A wait must look alive.
+    t: f32 = 0,
+    /// The "How Zat Chat works" page is open (it is a PAGE, not a modal: it
+    /// replaces the column, so it cannot bleed through anything or eat a tap it
+    /// did not mean to).
+    help_open: bool = false,
+};
+
+// ── the multi-device surfaces ───────────────────────────────────────────────
+
+/// Two devices and the link between them, drawn from primitives. It is the whole
+/// idea of the screen in one glyph — this device, that device, and a bond being
+/// made — and it does the work three paragraphs of copy would otherwise have to.
+fn drawDeviceEmblem(gpa: Allocator, dl: *raster.DrawList, cx: i32, y: i32, accent: u32, glow: f32) error{OutOfMemory}!void {
+    // The established device: a wider slab (a desktop).
+    try cardBox(gpa, dl, cx - 62, y + 6, 46, 34, 5, 0xFF1B1B1B);
+    try rect(gpa, dl, cx - 62, y + 6, 46, 1, 0x2AEDEAE0, 5);
+    try rect(gpa, dl, cx - 54, y + 42, 30, 3, 0xFF2A2A2A, 2); // its little stand
+
+    // This device: a phone, upright.
+    try cardBox(gpa, dl, cx + 22, y, 26, 46, 6, 0xFF1B1B1B);
+    try rect(gpa, dl, cx + 22, y, 26, 1, 0x2AEDEAE0, 6);
+    try rect(gpa, dl, cx + 31, y + 40, 8, 2, 0xFF2A2A2A, 1); // its home pill
+
+    // The bond. It BREATHES while we are waiting on it (glow 0→1) — the one place
+    // motion belongs on this screen, because the thing being waited on is a human
+    // reaching for their other device.
+    const a: u8 = @intFromFloat(60.0 + 150.0 * std.math.clamp(glow, 0.0, 1.0));
+    const dot = (@as(u32, a) << 24) | (accent & 0x00FFFFFF);
+    var i: i32 = 0;
+    while (i < 3) : (i += 1) {
+        try rect(gpa, dl, cx - 10 + i * 10, y + 21, 5, 5, dot, 2);
+    }
+}
+
+/// The gate, in its two faces: ASK, and WAITING.
+fn drawDeviceGate(
+    gpa: Allocator,
+    dl: *raster.DrawList,
+    e: *const text.Engine,
+    regions: ?*Regions,
+    x0: i32,
+    w: i32,
+    width: i32,
+    insets: EdgeInsets,
+    accent: u32,
+    d: ChatDevices,
+) error{OutOfMemory}!i32 {
+    const phone = width <= phone_max;
+    const cx = x0 + @divTrunc(w, 2);
+    const card_w = @min(w - 32, 460);
+    const card_x = cx - @divTrunc(card_w, 2);
+    var y: i32 = if (phone) insets.top + 64 else 96;
+
+    const waiting = d.state == .pending;
+    // While we wait, the link breathes: a slow sine, never a spinner. A spinner
+    // says "the machine is busy"; this is waiting on a PERSON, and it should look
+    // patient rather than frantic.
+    const glow: f32 = if (waiting) 0.5 + 0.5 * @sin(d.t * 2.0) else 0.0;
+    try drawDeviceEmblem(gpa, dl, cx, y, accent, glow);
+    y += 74;
+
+    const title: []const u8 = if (waiting) "Waiting for your other device" else "Chat lives on your other device";
+    const tw: i32 = @intCast(text.measure(e, .semibold, title, 22));
+    _ = try str(gpa, dl, e, .semibold, cx - @divTrunc(tw, 2), y, ink, 22, title);
+    y += 34;
+
+    const body: []const []const u8 = if (waiting) &[_][]const u8{
+        "Open Zat4 on the device where you already use chat.",
+        "It will ask you to approve this one. This page updates itself.",
+    } else &[_][]const u8{
+        "Your chat keys were made on that device and never leave it \u{2014}",
+        "that is exactly what keeps your messages readable only by you",
+        "and the person you're talking to. So this device makes its own,",
+        "and your other device vouches for it.",
+    };
+    for (body) |ln| {
+        const lw: i32 = @intCast(text.measure(e, .regular, ln, 14));
+        _ = try str(gpa, dl, e, .regular, cx - @divTrunc(lw, 2), y, muted, 14, ln);
+        y += 22;
+    }
+    y += 20;
+
+    // THE ACT. Primary, accent-filled, and it is the one that costs nothing.
+    if (!waiting) {
+        const label: []const u8 = if (d.busy) "Asking\u{2026}" else if (phone) "Add this phone" else "Add this device";
+        const bw = @min(card_w, 300);
+        const bx = cx - @divTrunc(bw, 2);
+        const bh: i32 = 46;
+        const fill = if (d.busy) softA(accent, 0x66) else accent;
+        try cardBox(gpa, dl, bx, y, bw, bh, 11, fill);
+        try rect(gpa, dl, bx, y, bw, 1, softA(0xFFFFFF, 0x40), 11); // a lit top edge
+        const lw: i32 = @intCast(text.measure(e, .semibold, label, 15));
+        _ = try str(gpa, dl, e, .semibold, cx - @divTrunc(lw, 2), y + 29, 0xFF12110F, 15, label);
+        if (!d.busy) try emitRegion(gpa, regions, bx, y, bw, bh, 0, .chat_device_add);
+        y += bh + 14;
+
+        const note = "Nothing is copied, and nothing is lost.";
+        const nw: i32 = @intCast(text.measure(e, .regular, note, 13));
+        _ = try str(gpa, dl, e, .regular, cx - @divTrunc(nw, 2), y + 4, faint, 13, note);
+        y += 30;
+    } else {
+        // A wait with nothing on it is indistinguishable from a hang. Say what has
+        // to happen, and say that it is this screen's job to notice.
+        const dots = "\u{00B7} \u{00B7} \u{00B7}";
+        const dw: i32 = @intCast(text.measure(e, .semibold, dots, 18));
+        const a: u8 = @intFromFloat(90.0 + 140.0 * glow);
+        _ = try str(gpa, dl, e, .semibold, cx - @divTrunc(dw, 2), y + 6, (@as(u32, a) << 24) | (accent & 0x00FFFFFF), 18, dots);
+        y += 34;
+    }
+
+    if (d.error_line.len > 0) {
+        const ew: i32 = @intCast(text.measure(e, .regular, d.error_line, 13));
+        _ = try str(gpa, dl, e, .regular, cx - @divTrunc(ew, 2), y + 4, 0xFFE0705C, 13, d.error_line);
+        y += 26;
+    }
+
+    y += 14;
+    try rect(gpa, dl, card_x + 40, y, card_w - 80, 1, 0x14EDEAE0, 0); // a quiet rule
+    y += 22;
+
+    // THE LAST RESORT, and it looks like one. It is not a button; it is a line of
+    // text you have to mean. The cost is stated BEFORE the tap, not after.
+    const reset = "Set up chat fresh on this device instead";
+    const rw: i32 = @intCast(text.measure(e, .semibold, reset, 13));
+    _ = try str(gpa, dl, e, .semibold, cx - @divTrunc(rw, 2), y + 4, muted, 13, reset);
+    try emitRegion(gpa, regions, cx - @divTrunc(rw, 2) - 10, y - 10, rw + 20, 28, 0, .chat_identity_reset);
+    y += 22;
+    const cost = "This device takes over chat. Your conversations don't come with it.";
+    const cw2: i32 = @intCast(text.measure(e, .regular, cost, 12));
+    _ = try str(gpa, dl, e, .regular, cx - @divTrunc(cw2, 2), y + 4, faint, 12, cost);
+    y += 34;
+
+    // The explainer, reachable from the exact screen where the questions arise.
+    const help = "How Zat Chat works";
+    const hw: i32 = @intCast(text.measure(e, .regular, help, 13));
+    _ = try str(gpa, dl, e, .regular, cx - @divTrunc(hw, 2), y + 4, softA(accentRgbOf(accent), 0xCC), 13, help);
+    try emitRegion(gpa, regions, cx - @divTrunc(hw, 2) - 10, y - 10, hw + 20, 28, 0, .chat_device_help);
+    return y + 40;
+}
+
+/// THE APPROVAL CARD, at the top of Messages on the device that already has chat.
+/// Not a modal: a person must be able to look at it, think, and go and check the
+/// other screen without the app holding them hostage. But it cannot be missed
+/// either — this is a decision about who can read their messages.
+fn drawPendingDeviceCard(
+    gpa: Allocator,
+    dl: *raster.DrawList,
+    e: *const text.Engine,
+    regions: ?*Regions,
+    x: i32,
+    y0: i32,
+    w: i32,
+    accent: u32,
+    d: ChatDevices,
+) error{OutOfMemory}!i32 {
+    // The confirmation. It replaces the card for a beat and then retires — an
+    // approval that vanished instantly would leave a person wondering whether they
+    // tapped it at all.
+    if (d.added_t > 0.001) {
+        const h: i32 = 56;
+        const fade = 1.0 - std.math.clamp((d.added_t - 0.7) / 0.3, 0.0, 1.0);
+        const a: u8 = @intFromFloat(255.0 * fade);
+        try cardBox(gpa, dl, x, y0, w, h, 12, (@as(u32, @intFromFloat(24.0 * fade)) << 24) | 0x6FCF97);
+        const pop = std.math.clamp(d.added_t * 3.0, 0.0, 1.0); // the check draws itself in
+        const ok_c: u32 = (@as(u32, a) << 24) | 0x6FCF97;
+        const cxk = x + 24;
+        const cyk = y0 + @divTrunc(h, 2);
+        try line(gpa, dl, cxk - 5, cyk, cxk - 1, cyk + 4, ok_c, 2);
+        if (pop > 0.5) try line(gpa, dl, cxk - 1, cyk + 4, cxk + 7, cyk - 5, ok_c, 2);
+        var buf: [96]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "{s} added. It receives new messages from now on.", .{d.added_name}) catch "Device added.";
+        _ = try str(gpa, dl, e, .regular, x + 44, cyk + 5, (@as(u32, a) << 24) | (ink & 0x00FFFFFF), 14, msg);
+        return h + 12;
+    }
+
+    if (d.pending.len == 0) return 0;
+    const p = d.pending[0]; // ONE at a time, always. A stack of prompts teaches
+    // people to tap yes without reading, which is the attack.
+
+    const h: i32 = 156;
+    try cardBox(gpa, dl, x, y0, w, h, 12, 0xFF1B1B1B);
+    try rect(gpa, dl, x, y0, w, 2, accent, 12); // an accent edge: this wants you
+    try rect(gpa, dl, x, y0, w, h, 0x2AEDEAE0, 12);
+
+    var y = y0 + 26;
+    const title = "A new device wants to join your chats";
+    _ = try str(gpa, dl, e, .semibold, x + 18, y, ink, 15, title);
+    y += 24;
+
+    var line1: [128]u8 = undefined;
+    const who = std.fmt.bufPrint(&line1, "{s} \u{00B7} added {s}", .{ p.name, p.age }) catch p.name;
+    _ = try str(gpa, dl, e, .regular, x + 18, y, muted, 13, who);
+    y += 20;
+
+    // The fingerprint, quietly. It answers "is this the phone in my hand?" — it is
+    // a mix-up check and not a security control, so it is not dressed up as one.
+    var fbuf: [96]u8 = undefined;
+    const fp = std.fmt.bufPrint(&fbuf, "Key {s}", .{p.fingerprint}) catch "";
+    _ = try str(gpa, dl, e, .regular, x + 18, y, faint, 12, fp);
+    y += 24;
+
+    const bh: i32 = 40;
+    const gap: i32 = 10;
+    const bw = @divTrunc(w - 36 - gap, 2);
+    const busy = d.busy;
+
+    // Approve — accent, and it is the one that does something.
+    const afill = if (busy) softA(accent, 0x66) else accent;
+    try cardBox(gpa, dl, x + 18, y, bw, bh, 10, afill);
+    try rect(gpa, dl, x + 18, y, bw, 1, softA(0xFFFFFF, 0x40), 10);
+    const alab: []const u8 = if (busy) "Approving\u{2026}" else "Approve";
+    const alw: i32 = @intCast(text.measure(e, .semibold, alab, 14));
+    _ = try str(gpa, dl, e, .semibold, x + 18 + @divTrunc(bw - alw, 2), y + 26, 0xFF12110F, 14, alab);
+    if (!busy) try emitRegion(gpa, regions, x + 18, y, bw, bh, 0, .chat_device_approve);
+
+    // Not me — a REFUSAL, not a dismiss. It deletes the request and tells the
+    // person what it means, because an attempted takeover should ring a bell.
+    const rx = x + 18 + bw + gap;
+    try cardBox(gpa, dl, rx, y, bw, bh, 10, 0xFF232323);
+    try rect(gpa, dl, rx, y, bw, bh, 0x2AEDEAE0, 10);
+    const rlab = "Not me";
+    const rlw: i32 = @intCast(text.measure(e, .semibold, rlab, 14));
+    _ = try str(gpa, dl, e, .semibold, rx + @divTrunc(bw - rlw, 2), y + 26, ink, 14, rlab);
+    if (!busy) try emitRegion(gpa, regions, rx, y, bw, bh, 0, .chat_device_refuse);
+    y += bh + 16;
+
+    const caution = if (d.error_line.len > 0) d.error_line else "If this wasn't you, choose Not me \u{2014} and change your password.";
+    const wc: u32 = if (d.error_line.len > 0) 0xFFE0705C else faint;
+    _ = try str(gpa, dl, e, .regular, x + 18, y, wc, 12, caution);
+
+    return h + 12;
+}
+
+/// "How Zat Chat works" — the owner's ask, and the right one. A PAGE (it replaces
+/// the column), reachable at any time, and written for the moment somebody is
+/// worried rather than the moment everything is fine.
+fn drawChatHelp(
+    gpa: Allocator,
+    dl: *raster.DrawList,
+    e: *const text.Engine,
+    regions: ?*Regions,
+    x0: i32,
+    width: i32,
+    insets: EdgeInsets,
+    accent: u32,
+) error{OutOfMemory}!i32 {
+    const phone = width <= phone_max;
+    const x = x0 + 20;
+    var y: i32 = if (phone) insets.top + 26 else 40;
+
+    // Close, top-left, where a back control belongs.
+    const close = "\u{2039} Back";
+    _ = try str(gpa, dl, e, .semibold, x, y + 6, muted, 14, close);
+    const clw: i32 = @intCast(text.measure(e, .semibold, close, 14));
+    try emitRegion(gpa, regions, x - 8, y - 12, clw + 20, 34, 0, .chat_help_close);
+    y += 40;
+
+    _ = try str(gpa, dl, e, .semibold, x, y + 10, ink, 24, "How Zat Chat works");
+    y += 44;
+
+    const Section = struct { h: []const u8, b: []const []const u8 };
+    const sections = [_]Section{
+        .{ .h = "Only you and them", .b = &[_][]const u8{
+            "Messages are encrypted on your device and decrypted on theirs.",
+            "We run the servers and we cannot read them. Neither can anyone",
+            "who takes a copy of them.",
+        } },
+        .{ .h = "You are your handle", .b = &[_][]const u8{
+            "Your identity is your account \u{2014} the same one you post with. When",
+            "you start a chat, we look up that person's published keys and check",
+            "they really belong to them before a single word is sent.",
+        } },
+        .{ .h = "Keys live on devices, and are never copied", .b = &[_][]const u8{
+            "Each device makes its own keys, and they never leave it. That is why",
+            "a new device cannot simply pick up your chats \u{2014} there is nothing to",
+            "copy, and that is the point.",
+        } },
+        .{ .h = "Adding a device", .b = &[_][]const u8{
+            "The new device asks; a device you already use says yes. From then on",
+            "both receive everything. Only a device you already trust can approve",
+            "another \u{2014} not a password, and not us.",
+        } },
+        .{ .h = "Your old messages stay put", .b = &[_][]const u8{
+            "History is stored on the device that received it, so a newly added",
+            "device starts empty and fills up from that moment. Nothing is lost",
+            "on the device that has it.",
+        } },
+        .{ .h = "\u{201C}Started chat on a new device\u{201D}", .b = &[_][]const u8{
+            "If someone's keys change, we say so in the conversation rather than",
+            "carrying on quietly \u{2014} because carrying on quietly is exactly what",
+            "an impostor would want. If you see it and it wasn't them, ask them.",
+        } },
+    };
+    for (sections) |sec| {
+        try rect(gpa, dl, x, y + 2, 3, 14, accent, 1); // a small accent tick per section
+        _ = try str(gpa, dl, e, .semibold, x + 12, y + 14, ink, 15, sec.h);
+        y += 26;
+        for (sec.b) |ln| {
+            _ = try str(gpa, dl, e, .regular, x + 12, y + 12, muted, 13, ln);
+            y += 20;
+        }
+        y += 16;
+    }
+    return y + 40;
+}
+
+/// The accent as a bare RGB (the alpha helpers want it without a channel).
+inline fn accentRgbOf(accent: u32) u32 {
+    return accent & 0x00FFFFFF;
+}
+
+inline fn softA(rgb: u32, a: u8) u32 {
+    return (@as(u32, a) << 24) | (rgb & 0x00FFFFFF);
+}
+
 /// The relay link's live state as the surface renders it (A5).
 pub const ChatLink = enum(u8) {
     /// No relay configured — chat is off, and the surface says that elsewhere.
@@ -9298,15 +9671,13 @@ pub fn layoutChat(
     /// `undelivered` draw an honest line under the header; `confirmed` draws
     /// nothing — a working conversation says nothing about its plumbing.
     delivery: chat_msg.Delivery,
-    /// A3: this account's chat keys are published from ANOTHER device, and this
-    /// one refused to overwrite them. The surface says so and offers the only
-    /// honest way forward, instead of silently re-minting an identity and
-    /// orphaning every conversation the account has.
-    identity_elsewhere: bool,
     /// A5: what the relay link is doing right now. A USER — not a dev reading
     /// logcat — has to be able to tell "the relay is down" from "nobody has
     /// messaged me", because those look identical: an empty screen.
     link: ChatLink,
+    /// CHAT_MULTIDEVICE slice 2: where this device stands with the account, who is
+    /// asking to join it, and whether the explainer is open.
+    devices: ChatDevices,
 ) error{OutOfMemory}!i32 {
     const m: Metrics = if (pane_geom) |g|
         .{ .rail_x = g.rail_x, .col_x = g.col_x, .col_w = g.col_w, .lx = g.lx, .cw = g.cw, .side_x = g.side_x, .wide = g.wide }
@@ -9326,59 +9697,28 @@ pub fn layoutChat(
     const x0 = m.lx;
     const w = m.cw;
 
-    // ── A3 — CHAT LIVES ON ANOTHER DEVICE. ──
+    // ── THE EXPLAINER. A page, not a modal: it replaces the column, so it
+    // cannot bleed through anything or swallow a tap meant for something else
+    // (the standing new-overlay law). Reachable at ANY time — an explainer you
+    // can only read when nothing is wrong is a brochure. ──
+    if (devices.help_open) {
+        return try drawChatHelp(gpa, dl, e, regions, x0, width, insets, accent);
+    }
+
+    // ── THE GATE — chat lives on another device (A3, rebuilt for slice 2). ──
     //
-    // The account already publishes a chat key, and it is not this device's.
-    // The old behaviour was to mint a new one and overwrite it, silently: a
-    // reinstall, a cleared cache, or a single run with a different cache dir
-    // would take over the account's chat identity and orphan every conversation
-    // it had — with no warning, and no way back, because the anchor key is
-    // device-bound and unrecoverable.
+    // The account already publishes a chat key and it is not this device's. The
+    // old behaviour was to mint a new one and overwrite it, silently: a reinstall,
+    // a cleared cache, or one run with a different cache dir would take over the
+    // account's chat identity and orphan every conversation it had.
     //
-    // So this surface stops and SAYS SO. There is no list to show and no thread
-    // to open: without an identity, none of it would mean anything. The one
-    // action is the real one, and it is named honestly — because it does have a
-    // cost, and the person paying it should know that before they tap.
-    if (identity_elsewhere) {
-        const cx = x0 + @divTrunc(w, 2);
-        var y = if (phone_max >= width) insets.top + 120 else 140;
-        const title = "Chat is set up on another device";
-        const tw: i32 = @intCast(text.measure(e, .semibold, title, 22));
-        _ = try str(gpa, dl, e, .semibold, cx - @divTrunc(tw, 2), y, ink, 22, title);
-        y += 40;
-        const body = [_][]const u8{
-            "Your chat keys live on the device where you first used chat.",
-            "They can't be copied here \u{2014} that is exactly what keeps your",
-            "messages readable only by you and the person you're talking to.",
-        };
-        for (body) |ln| {
-            const lw: i32 = @intCast(text.measure(e, .regular, ln, 14));
-            _ = try str(gpa, dl, e, .regular, cx - @divTrunc(lw, 2), y, muted, 14, ln);
-            y += 22;
-        }
-        y += 18;
-        const cost = [_][]const u8{
-            "You can start chat fresh on this device instead. If you do, this",
-            "device becomes the one that owns chat for your account, and your",
-            "existing conversations can't come with you \u{2014} you and the people",
-            "you were talking to will each need to start them again.",
-        };
-        for (cost) |ln| {
-            const lw: i32 = @intCast(text.measure(e, .regular, ln, 13));
-            _ = try str(gpa, dl, e, .regular, cx - @divTrunc(lw, 2), y, faint, 13, ln);
-            y += 20;
-        }
-        y += 22;
-        const btn = "Set up chat fresh on this device";
-        const btw: i32 = @intCast(text.measure(e, .semibold, btn, 14));
-        const bw: i32 = btw + 40;
-        const bh: i32 = 40;
-        const bx = cx - @divTrunc(bw, 2);
-        try rect(gpa, dl, bx, y, bw, bh, skinPanel(accent), 10);
-        try rect(gpa, dl, bx, y, bw, 1, 0x24EDEAE0, 10);
-        _ = try str(gpa, dl, e, .semibold, cx - @divTrunc(btw, 2), y + 26, ink, 14, btn);
-        try emitRegion(gpa, regions, bx, y, bw, bh, 0, .chat_identity_reset);
-        return y + bh + 40;
+    // Refusing that was right. Making it a DEAD END was not. There are now two
+    // roads out, and they are ranked the way their consequences rank: ADD THIS
+    // DEVICE (nothing is lost, nothing is copied, your other device says yes) is
+    // the act; starting over — which costs you every conversation you have, and
+    // costs the people you talk to as well — is a quiet last resort underneath it.
+    if (devices.state != .ok) {
+        return try drawDeviceGate(gpa, dl, e, regions, x0, w, width, insets, accent, devices);
     }
 
     // ── THE PHONE SHAPE: single-pane (this surface must carry a standalone
@@ -9515,6 +9855,17 @@ pub fn layoutChat(
             _ = try str(gpa, dl, e, .regular, x0 + 2, body_y + 10, faint, 12, "Enter to start · Esc to cancel");
         }
         body_y += 24;
+    }
+
+    // ── A DEVICE IS ASKING TO JOIN YOUR CHATS. ──
+    //
+    // Above the list, where it cannot be scrolled past or mistaken for a message.
+    // Not a modal: a person must be free to go and LOOK at the other device before
+    // deciding, and an app that holds them hostage while they do that is an app
+    // that teaches them to tap the bright button to make it go away.
+    if (devices.pending.len > 0 or devices.added_t > 0.001) {
+        const used = try drawPendingDeviceCard(gpa, dl, e, regions, x0, body_y, list_w, accent, devices);
+        body_y += used;
     }
 
     // ── Left: the conversation list (avatar + name + preview / age + unread).
@@ -10976,7 +11327,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // rail regions, so the counts are exactly the surface's own — one region
     // per conversation row + the composer pair + the "+ New" pill. (460 now
     // exercises the PHONE single-pane shape — its own test below.)
-    const h = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, false, .authenticated);
+    const h = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{});
     var n_conv: usize = 0;
     var n_input: usize = 0;
     var n_send: usize = 0;
@@ -11009,7 +11360,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // no thread pane and no composer to arm. The "+ New" pill is always there.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h2 = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, false, .authenticated);
+    const h2 = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{});
     try std.testing.expectEqual(@as(i32, 940), h2);
     var n2_conv: usize = 0;
     var n2_new: usize = 0;
@@ -11025,7 +11376,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // line draws when the shell hands one over.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", .{}, false, true, "chattest.zat4.com", "Couldn't resolve that handle", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, false, .authenticated);
+    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", .{}, false, true, "chattest.zat4.com", "Couldn't resolve that handle", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{});
     var n3_compose: usize = 0;
     for (regions.items) |r| {
         if (r.kind == .chat_compose_input) n3_compose += 1;
@@ -11038,12 +11389,12 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // (motion never moves a tap target).
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, false, .authenticated);
+    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{});
     const rest_items = dl.len;
     const rest_regions = regions.items.len;
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{ .typing_t = 1, .typing_phase = 0.7 }, &.{}, .{}, .{}, .{}, .confirmed, false, .authenticated);
+    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{ .typing_t = 1, .typing_phase = 0.7 }, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{});
     try std.testing.expect(dl.len > rest_items);
     try std.testing.expectEqual(rest_regions, regions.items.len);
 
@@ -11053,13 +11404,13 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // Neither moves a tap target — the strip is a statement, not a control.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .waiting, false, .authenticated);
+    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .waiting, .authenticated, .{});
     const waiting_items = dl.len;
     try std.testing.expect(waiting_items > rest_items);
     try std.testing.expectEqual(rest_regions, regions.items.len);
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .undelivered, false, .authenticated);
+    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .undelivered, .authenticated, .{});
     try std.testing.expect(dl.len > rest_items);
     try std.testing.expectEqual(rest_regions, regions.items.len);
 }
@@ -11086,7 +11437,7 @@ test "messages screen: chat published from another device says so, and offers ON
     const brows = [_]chat_view.BubbleRow{
         .{ .body = "hey", .age = "2h", .mine = true, .stamp = true, .kind = .text, .tail = true },
     };
-    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, true, .authenticated);
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{ .state = .elsewhere });
 
     // Exactly one tap target on the whole surface: the choice. No conversation
     // rows, no composer, no send — none of them mean anything without an
@@ -11104,7 +11455,7 @@ test "messages screen: chat published from another device says so, and offers ON
     // And with a normal identity the panel is gone and the list is back.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, false, .authenticated);
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{});
     var convs: usize = 0;
     for (regions.items) |r| {
         try std.testing.expect(r.kind != .chat_identity_reset);
@@ -11132,7 +11483,7 @@ test "messages screen: the phone shape — list page, then an immersive thread w
 
     // LIST page (no peer): full-width rows + the new-conversation button; no
     // composer, no thread chrome, no back — the tab bar is the way out.
-    _ = try layoutChat(gpa, &engine, 430, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{ .top = 48 }, .{}, .confirmed, false, .authenticated);
+    _ = try layoutChat(gpa, &engine, 430, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{ .top = 48 }, .{}, .confirmed, .authenticated, .{});
     var l_conv: usize = 0;
     var l_new: usize = 0;
     var l_back: usize = 0;
@@ -11149,7 +11500,7 @@ test "messages screen: the phone shape — list page, then an immersive thread w
     // app-bar's back region + the composer trio are the page's controls.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 430, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{ .top = 48, .bottom = 34 }, .{}, .confirmed, false, .authenticated);
+    _ = try layoutChat(gpa, &engine, 430, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{ .top = 48, .bottom = 34 }, .{}, .confirmed, .authenticated, .{});
     var t_conv: usize = 0;
     var t_new: usize = 0;
     var t_back: usize = 0;
@@ -11198,7 +11549,7 @@ test "messages screen: payment cards and the pay sheet emit their regions (M5 A4
     };
 
     // Sheet closed: the card buttons carry their thread ordinals.
-    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, false, .authenticated);
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{});
     var pay_at: u16 = 999;
     var received_at: u16 = 999;
     var decline_at: u16 = 999;
@@ -11227,7 +11578,7 @@ test "messages screen: payment cards and the pay sheet emit their regions (M5 A4
     // and the amber status line renders without disturbing the regions.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{ .open = true, .rail = .onchain, .amount = "5000", .note = "dinner", .status = "They haven't set up payments" }, .{}, &.{}, .{}, .{}, .{}, .confirmed, false, .authenticated);
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{ .open = true, .rail = .onchain, .amount = "5000", .note = "dinner", .status = "They haven't set up payments" }, .{}, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{});
     var n_rail: usize = 0;
     var n_chip: usize = 0;
     var n_amount: usize = 0;
@@ -11437,7 +11788,7 @@ test "a WATCHED card says it is being watched, and stops asking for a confirmati
     const watched = [_]chat_view.PayCard{
         .{ .payment_id = 7, .amount_sat = 5000, .rail = .lightning, .status = .pending, .confirmations = 0, .watching = true },
     };
-    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &watched, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, false, .authenticated);
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &watched, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{});
 
     // The card is still cancellable — a payment you have not approved yet is
     // still yours to abandon.
