@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Zat4 — Trending · Desktop</title>
+<style>
+  :root{
+    --ground:#0a0a12;
+    --ground-2:#0d0d18;
+    --panel:#11111f;
+    --panel-2:#15152a;
+    --edge:#1e1e38;
+    --edge-bright:#3a3a6e;
+    --ink:#e8e8f4;
+    --ink-dim:#9a9ac0;
+    --ink-faint:#5c5c84;
+    --violet:#7c6cf0;
+    --violet-bright:#9d8fff;
+    --indigo:#4a4ad0;
+    --live:#6cf0c2;
+    --hash:#8f7cff;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{
+    background:var(--ground);color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    height:100vh;overflow:hidden;
+  }
+  .mono{font-family:"SF Mono",ui-monospace,"Cascadia Code","JetBrains Mono",Menlo,monospace}
+
+  .glyphfield{
+    position:fixed;inset:0;
+    font-family:"SF Mono",ui-monospace,monospace;font-size:13px;line-height:15px;
+    color:var(--violet);opacity:.035;white-space:pre;pointer-events:none;
+    overflow:hidden;z-index:0;user-select:none;
+  }
+
+  /* ===== app shell: left rail · main · right rail ===== */
+  .app{display:grid;grid-template-columns:240px 1fr;height:100vh;position:relative;z-index:1}
+
+  /* left rail */
+  .rail{
+    border-right:1px solid var(--edge);padding:20px 14px;display:flex;flex-direction:column;gap:4px;
+    background:linear-gradient(180deg,var(--ground),var(--ground-2));
+  }
+  .brand{
+    font-family:"SF Mono",ui-monospace,monospace;font-size:20px;font-weight:700;
+    letter-spacing:.04em;padding:6px 12px 22px;color:var(--ink);
+    display:flex;align-items:center;gap:9px;
+  }
+  .brand .mark{
+    width:24px;height:24px;border-radius:7px;
+    background:radial-gradient(circle at 30% 30%, var(--violet-bright), var(--indigo) 65%, #14142c);
+    border:1px solid var(--edge-bright);
+  }
+  .navitem{
+    display:flex;align-items:center;gap:13px;padding:11px 12px;border-radius:11px;
+    color:var(--ink-dim);font-size:15px;cursor:pointer;transition:background .15s,color .15s;
+  }
+  .navitem:hover{background:var(--panel);color:var(--ink)}
+  .navitem.active{background:var(--panel-2);color:var(--ink);font-weight:600}
+  .navitem svg{width:21px;height:21px}
+  .navitem.active svg{color:var(--violet-bright)}
+  .rail .spacer{flex:1}
+  .me{
+    display:flex;align-items:center;gap:11px;padding:10px 12px;border-radius:11px;cursor:pointer;
+  }
+  .me:hover{background:var(--panel)}
+  .me .av{width:32px;height:32px;border-radius:50%;
+    background:radial-gradient(circle at 30% 30%, var(--violet-bright), var(--indigo) 60%, #1a1a3a)}
+  .me .nm{font-size:14px;font-weight:600}
+  .me .hd{font-size:12px;color:var(--ink-faint)}
+
+  /* main split */
+  .main{display:grid;grid-template-columns:minmax(380px,460px) 1fr;height:100vh;overflow:hidden}
+
+  /* ---- master column: trending list ---- */
+  .master{border-right:1px solid var(--edge);display:flex;flex-direction:column;overflow:hidden}
+  .master-head{padding:22px 26px 14px;border-bottom:1px solid var(--edge)}
+  .master-head h1{font-size:24px;font-weight:800;letter-spacing:-.01em;display:flex;align-items:center;gap:11px}
+  .ztab{display:flex;gap:22px;margin-top:16px}
+  .ztab span{font-size:14px;color:var(--ink-faint);padding-bottom:10px;cursor:pointer;position:relative;font-weight:500}
+  .ztab span.on{color:var(--ink);font-weight:700}
+  .ztab span.on::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:2.5px;
+    background:var(--violet);border-radius:2px;box-shadow:0 0 10px var(--violet)}
+  .live-eyebrow{display:flex;align-items:center;gap:8px;font-size:11px;letter-spacing:.16em;
+    text-transform:uppercase;color:var(--ink-faint);padding:14px 26px 6px}
+  .live-eyebrow .dot{width:6px;height:6px;border-radius:50%;background:var(--live);
+    box-shadow:0 0 8px var(--live);animation:breathe 2.4s ease-in-out infinite}
+  @keyframes breathe{0%,100%{opacity:.5;transform:scale(.85)}50%{opacity:1;transform:scale(1.15)}}
+
+  .master-scroll{flex:1;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--edge-bright) transparent}
+  .master-scroll::-webkit-scrollbar{width:8px}
+  .master-scroll::-webkit-scrollbar-thumb{background:var(--edge-bright);border-radius:4px}
+
+  .trend{padding:16px 26px;border-bottom:1px solid var(--edge);cursor:pointer;transition:background .14s;position:relative}
+  .trend:hover{background:var(--ground-2)}
+  .trend.sel{background:var(--panel-2)}
+  .trend.sel::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--violet);box-shadow:0 0 12px var(--violet)}
+  .trend .rank{font-size:12px;color:var(--ink-faint);margin-bottom:4px;display:flex;align-items:center;gap:7px}
+  .trend .rank .cat{color:var(--violet);font-weight:600}
+  .trend .term{font-size:21px;font-weight:700;letter-spacing:-.01em;display:flex;align-items:baseline;gap:9px;flex-wrap:wrap}
+  .trend .term .hash{color:var(--hash)}
+  .trend .with{font-size:13px;color:var(--ink-dim);margin-top:5px;line-height:1.5}
+  .trend .with b{color:var(--ink);font-weight:600}
+  .zonechip{display:inline-flex;align-items:center;gap:7px;margin-top:10px;padding:5px 11px 5px 7px;
+    background:var(--panel);border:1px solid var(--edge-bright);border-radius:9px;font-size:12px;color:var(--ink-dim);width:fit-content}
+  .zonechip .zface{width:16px;height:16px;border-radius:4px;
+    background:radial-gradient(circle at 30% 30%, var(--violet-bright), var(--indigo))}
+  .zonechip .live{color:var(--live);font-weight:600;font-family:"SF Mono",ui-monospace,monospace}
+
+  /* ---- detail column: search feed + zones ---- */
+  .detail{display:grid;grid-template-columns:1fr 300px;overflow:hidden;position:relative}
+  .detail-empty{
+    display:flex;align-items:center;justify-content:center;text-align:center;
+    color:var(--ink-faint);font-size:15px;flex-direction:column;gap:14px;padding:40px;
+    grid-column:1 / -1;
+  }
+  .detail-empty .big{font-size:46px;opacity:.25}
+  .detail.has{}
+
+  .feedcol{overflow-y:auto;border-right:1px solid var(--edge);scrollbar-width:thin;scrollbar-color:var(--edge-bright) transparent}
+  .feedcol::-webkit-scrollbar{width:8px}.feedcol::-webkit-scrollbar-thumb{background:var(--edge-bright);border-radius:4px}
+  .detail-head{padding:20px 26px 16px;border-bottom:1px solid var(--edge);position:sticky;top:0;background:var(--ground);z-index:2}
+  .detail-head .ht{font-size:22px;font-weight:800;display:flex;align-items:center;gap:10px}
+  .detail-head .ht .hash{color:var(--hash)}
+  .detail-head .hs{font-size:12px;color:var(--ink-faint);margin-top:3px;font-family:"SF Mono",ui-monospace,monospace}
+  .resolved{font-size:11px;color:var(--ink-faint);margin-top:9px;display:inline-flex;align-items:center;gap:6px;
+    padding:4px 9px;border:1px solid var(--edge);border-radius:7px}
+  .resolved b{color:var(--violet-bright);font-weight:600}
+
+  .post{padding:16px 26px;border-bottom:1px solid var(--edge)}
+  .post .ph{display:flex;align-items:center;gap:9px;margin-bottom:7px}
+  .post .pavi{width:30px;height:30px;border-radius:50%;
+    background:radial-gradient(circle at 30% 30%, var(--violet-bright), var(--indigo) 70%)}
+  .post .pname{font-size:14px;font-weight:600}
+  .post .phandle{font-size:13px;color:var(--ink-faint)}
+  .post .ptext{font-size:15px;line-height:1.5}
+  .post .ptext .hl{color:var(--hash);font-weight:600}
+  .post .pmeta{display:flex;gap:22px;margin-top:11px;font-size:12px;color:var(--ink-faint);font-family:"SF Mono",ui-monospace,monospace}
+
+  /* zones rail */
+  .zonecol{overflow-y:auto;background:var(--ground-2);scrollbar-width:thin;scrollbar-color:var(--edge-bright) transparent}
+  .zonecol::-webkit-scrollbar{width:8px}.zonecol::-webkit-scrollbar-thumb{background:var(--edge-bright);border-radius:4px}
+  .zonecol .cap{padding:20px 18px 10px;font-size:10px;letter-spacing:.15em;text-transform:uppercase;
+    color:var(--ink-faint);position:sticky;top:0;background:var(--ground-2);z-index:1}
+  .zone-door{padding:16px 18px;border-bottom:1px solid var(--edge);cursor:pointer;transition:background .14s}
+  .zone-door:hover{background:var(--panel)}
+  .zone-door .zface-lg{width:42px;height:42px;border-radius:11px;margin-bottom:10px;
+    background:radial-gradient(circle at 30% 30%, var(--violet-bright), var(--indigo) 65%, #14142c);
+    border:1px solid var(--edge-bright)}
+  .zone-door .zname{font-size:15px;font-weight:700}
+  .zone-door .zname .hash{color:var(--hash)}
+  .zone-door .zblurb{font-size:12px;color:var(--ink-faint);margin-top:3px;line-height:1.4}
+  .ticker{margin-top:11px;display:flex;align-items:center;gap:7px;font-family:"SF Mono",ui-monospace,monospace;font-size:13px}
+  .ticker .pulse{width:7px;height:7px;border-radius:50%;background:var(--live);box-shadow:0 0 8px var(--live);
+    animation:breathe 1.8s ease-in-out infinite;flex:0 0 auto}
+  .ticker .n{color:var(--live);font-weight:700;min-width:3em;transition:color .2s}
+  .ticker .n.bump{color:#c4faec}
+  .ticker .lab{color:var(--ink-faint)}
+  .enter{margin-top:10px;font-size:12px;color:var(--violet-bright);display:flex;align-items:center;gap:6px;opacity:0;transition:opacity .15s}
+  .zone-door:hover .enter{opacity:1}
+
+  .empty-zones{padding:30px 18px;font-size:12px;color:var(--ink-faint);line-height:1.55;text-align:center}
+  .empty-zones .big{font-size:30px;display:block;margin-bottom:10px;opacity:.35}
+</style>
+</head>
+<body>
+<div class="glyphfield" id="gf"></div>
+
+<div class="app">
+  <!-- left rail -->
+  <aside class="rail">
+    <div class="brand"><span class="mark"></span>Zat4</div>
+    <div class="navitem"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>Home</div>
+    <div class="navitem active"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 3v18M3 12h18" opacity=".5"/><circle cx="12" cy="12" r="4"/></svg>Zones</div>
+    <div class="navitem"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.3-4.3"/></svg>Search</div>
+    <div class="navitem"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/></svg>Notifications</div>
+    <div class="navitem"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>Messages</div>
+    <div class="spacer"></div>
+    <div class="me"><div class="av"></div><div><div class="nm">you</div><div class="hd mono">@you.zat4</div></div></div>
+  </aside>
+
+  <!-- main split -->
+  <section class="main">
+    <!-- master: trending list -->
+    <div class="master">
+      <div class="master-head">
+        <h1>Zones</h1>
+        <div class="ztab"><span>Browse</span><span class="on">Trending</span><span>Pinned</span><span>Search</span></div>
+      </div>
+      <div class="live-eyebrow"><span class="dot"></span> Live · ranked by velocity</div>
+      <div class="master-scroll" id="trendlist"></div>
+    </div>
+
+    <!-- detail -->
+    <div class="detail" id="detail">
+      <div class="detail-empty" id="detailEmpty">
+        <div class="big">⌖</div>
+        <div>Select a trend to see what's being said —<br>and which zones it opens into.</div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<script>
+  const CH="$@%=+*~·xo ".split("");
+  (function(){let s="";for(let r=0;r<70;r++){let l="";for(let c=0;c<200;c++){const n=Math.random();l+=n<.3?"$":n<.5?"@":CH[Math.floor(Math.random()*CH.length)];}s+=l+"\n";}document.getElementById('gf').textContent=s;})();
+
+  const TRENDS=[
+    {key:'wweraw',rank:'1 · <span class="cat">Sports</span> · trending',term:'<span class="hash">#</span>WWERaw',with:'Trending with <b>Roman</b>, <b>SummerSlam</b>, <b>KOTR</b>, <b>Brock</b>',chip:{label:'Zone',n:412}},
+    {key:'paraguay',rank:'2 · trending in your network',term:'Paraguay',with:'Trending with <b>Alemania</b>, <b>Havertz</b>, <b>Nagelsmann</b>, <b>Orlando Gill</b>',chip:null},
+    {key:'eclipse',rank:'3 · <span class="cat">Science</span> · trending',term:'eclipse',with:'Trending with <b>totality</b>, <b>corona</b>, <b>#April8</b>',chip:{label:'3 zones',n:208}},
+    {key:'freddy',rank:'4 · trending',term:'Freddy',with:'Trending with <b>trailer</b>, <b>October</b>, <b>#WERWULF</b>',chip:null},
+    {key:'miami',rank:'5 · <span class="cat">Sports</span> · trending',term:'<span class="hash">#</span>miamidolphins',with:'Trending with <b>Tua</b>, <b>Waddle</b>, <b>gameday</b>',chip:{label:'Zone',n:1043}},
+    {key:'soup',rank:'6 · trending',term:'<span class="hash">#</span>souptwitter',with:'Trending with <b>ramen</b>, <b>broth</b>, <b>winter</b>',chip:{label:'Zone',n:74}},
+  ];
+
+  const DATA={
+    wweraw:{term:'<span class="hash">#</span>WWERaw',sub:'Sports · 4.2K posts · live',
+      posts:[['Kayfabe Kara','@kkara','Roman walking out to zero pyro and the whole arena still loses it. <span class="hl">#WWERaw</span> is unreal tonight'],
+        ['Dustin','@dustpan','KOTR bracket is actually stacked this year. nobody talking about Gunther enough'],
+        ['mara','@maravilla','that SummerSlam tease at the end?? they are NOT being subtle <span class="hl">#WWERaw</span>'],
+        ['Big Slick','@bslick','Brock pop was the loudest thing ive heard on Raw in two years']],
+      zones:[['<span class="hash">#</span>WWERaw','the live Monday crowd — wrestling regulars, gameday only',412],
+        ['<span class="hash">#</span>fedtwitter','kayfabe + booking talk, the analysts',97]]},
+    paraguay:{term:'Paraguay',sub:'12.1K posts · live',
+      posts:[['Albirroja Daily','@albidaily','PARAGUAY THROUGH. what a result against Alemania, nobody saw this coming'],
+        ['Hugo','@hugol','Orlando Gill with the save of the tournament I am SHAKING'],
+        ['Nags','@nagswatch','Nagelsmann has no answers. midfield completely overrun'],
+        ['Vero','@verooo','i was not emotionally prepared to be a Paraguay fan tonight but here we are']],
+      zones:[]},
+    eclipse:{term:'eclipse',sub:'Science · 8.7K posts · live',
+      posts:[['Sky','@skywatch','totality was four minutes and i cried through all of them. <span class="hl">#April8</span>'],
+        ['Priya','@priyanebula','the corona was so much bigger than 2017. genuinely speechless'],
+        ['len','@lenslit','got the diamond ring shot CLEAN. years of planning for ten seconds']],
+      zones:[['<span class="hash">#</span>eclipse2026','this week\'s totality — chasers + first-timers',208],
+        ['<span class="hash">#</span>astro','everything sky, the lifers',61],
+        ['<span class="hash">#</span>April8','one-day event tag — spikes today, gone tomorrow',140]]},
+    freddy:{term:'Freddy',sub:'5.5K posts · live',
+      posts:[['WerwulfWatch','@wwwatch','the FREDDY reveal in the WERWULF trailer. i am unwell. October cannot come fast enough'],
+        ['trin','@trinaaa','ok the Freddy casting is actually inspired, did not expect that name'],
+        ['Gore Gazette','@goregazette','horror twitter is FED this morning. Freddy trending off one teaser']],
+      zones:[]},
+    miami:{term:'<span class="hash">#</span>miamidolphins',sub:'Sports · 19K posts · live',
+      posts:[['Fins Up','@finsup','TUA TO WADDLE. that is the whole offense and it is BEAUTIFUL <span class="hl">#miamidolphins</span>'],
+        ['Reef','@reefdolphin','gameday in the zone is electric today, scroll is moving so fast'],
+        ['Coral','@coralg','i have watched this Waddle catch eleven times. eleven.']],
+      zones:[['<span class="hash">#</span>miamidolphins','gameday central — the tide, every sunday',1043],
+        ['<span class="hash">#</span>tualand','QB1 discourse — film + takes',186]]},
+    soup:{term:'<span class="hash">#</span>souptwitter',sub:'Food · 1.1K posts · live',
+      posts:[['brothbae','@brothbae','first cold day of the year means the souptwitter awakening has begun'],
+        ['Min','@minramen','24hr tonkotsu is done. this is the only personality i have now <span class="hl">#souptwitter</span>'],
+        ['ladle','@ladlelife','controversial: corn belongs in almost everything']],
+      zones:[['<span class="hash">#</span>souptwitter','small + cozy — the broth heads',74]]},
+  };
+
+  let tickTimers=[];
+  function clearTicks(){tickTimers.forEach(t=>clearInterval(t));tickTimers=[]}
+
+  // render master list
+  const tl=document.getElementById('trendlist');
+  tl.innerHTML=TRENDS.map((t,i)=>`
+    <div class="trend" data-key="${t.key}" onclick="select('${t.key}',this)">
+      <div class="rank">${t.rank}</div>
+      <div class="term">${t.term}</div>
+      <div class="with">${t.with}</div>
+      ${t.chip?`<div class="zonechip"><span class="zface"></span> ${t.chip.label} · <span class="live"><span class="cn">${t.chip.n.toLocaleString()}</span> active now</span></div>`:''}
+    </div>`).join('');
+
+  // animate chip counts
+  document.querySelectorAll('.zonechip .cn').forEach(el=>{
+    let v=parseInt(el.textContent.replace(/,/g,''),10);
+    setInterval(()=>{v=Math.max(1,v+(Math.floor(Math.random()*7)-2));el.textContent=v.toLocaleString();},1100+Math.random()*900);
+  });
+
+  function select(key,node){
+    document.querySelectorAll('.trend').forEach(n=>n.classList.remove('sel'));
+    node.classList.add('sel');
+    const d=DATA[key];
+    const detail=document.getElementById('detail');
+    detail.classList.add('has');
+
+    const feed=`
+      <div class="feedcol">
+        <div class="detail-head">
+          <div class="ht">${d.term}</div>
+          <div class="hs">${d.sub}</div>
+          <div class="resolved">⊹ resolved through <b>topic index</b> — not keyword match</div>
+        </div>
+        ${d.posts.map(p=>`
+          <div class="post">
+            <div class="ph"><div class="pavi"></div><div class="pname">${p[0]}</div><div class="phandle">${p[1]}</div></div>
+            <div class="ptext">${p[2]}</div>
+            <div class="pmeta"><span>♡ ${Math.floor(Math.random()*900)+40}</span><span>↺ ${Math.floor(Math.random()*200)+5}</span><span>↳ ${Math.floor(Math.random()*80)+2}</span></div>
+          </div>`).join('')}
+      </div>`;
+
+    let zonesHtml;
+    if(d.zones.length===0){
+      zonesHtml=`<div class="zonecol"><div class="cap">Zones</div>
+        <div class="empty-zones"><span class="big">⌖</span>No zone yet.<br><br>This is a word, not a place — the feed shows everything being said about it. If it sticks, a zone precipitates and a doorway appears here.</div></div>`;
+    }else{
+      zonesHtml=`<div class="zonecol"><div class="cap">${d.zones.length===1?'Zone':d.zones.length+' zones'} · enter</div>
+        ${d.zones.map((z,i)=>`
+          <div class="zone-door">
+            <div class="zface-lg"></div>
+            <div class="zname">${z[0]}</div>
+            <div class="zblurb">${z[1]}</div>
+            <div class="ticker"><span class="pulse"></span><span class="n" id="dt-${i}">${z[2].toLocaleString()}</span><span class="lab">active now</span></div>
+            <div class="enter">Enter zone →</div>
+          </div>`).join('')}</div>`;
+    }
+    detail.innerHTML=feed+zonesHtml;
+
+    clearTicks();
+    d.zones.forEach((z,i)=>{
+      let v=z[2];const el=document.getElementById('dt-'+i);
+      tickTimers.push(setInterval(()=>{
+        v=Math.max(1,v+(Math.floor(Math.random()*7)-2));
+        el.textContent=v.toLocaleString();el.classList.add('bump');
+        setTimeout(()=>el.classList.remove('bump'),200);
+      },900+Math.random()*700));
+    });
+  }
+
+  // open the first one by default so the detail isn't empty on load
+  setTimeout(()=>{const f=document.querySelector('.trend');if(f)select('wweraw',f);},120);
+</script>
+</body>
+</html>
