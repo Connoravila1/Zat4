@@ -987,6 +987,41 @@ fn chatGroupsKeystoreKey(buf: *[255]u8, did: []const u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, chat_groups_keystore_prefix ++ "{s}", .{did}) catch null;
 }
 
+// ── chat privacy preferences (CHAT_FEATURES slice 1) ────────────────────────
+//
+// One byte per account: whether they have been ASKED, and what they said about
+// read receipts and typing. Plain (no secrets in it), and deliberately its own
+// file rather than a corner of the groups blob — a preference has no business
+// riding in the same bytes as live ratchet material.
+
+pub const chat_prefs_asked: u8 = 1 << 0;
+pub const chat_prefs_receipts: u8 = 1 << 1;
+pub const chat_prefs_typing: u8 = 1 << 2;
+
+pub fn chatPrefsPath(buf: []u8, environ: ?*const std.process.Environ.Map, did: []const u8) ?[]const u8 {
+    var dir_buf: [512]u8 = undefined;
+    const dir = cacheDir(&dir_buf, environ) orelse return null;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(did, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest[0..8].*, .lower);
+    var name_buf: [36]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "chatprefs-{s}.zat", .{hex}) catch return null;
+    return joinFile(buf, dir, name);
+}
+
+pub fn saveChatPrefsAt(path: []const u8, bits: u8) bool {
+    return writeFileAtomic(path, &[_]u8{bits}, 0o600);
+}
+
+/// Null = never asked on this device. (Which is not the same as "answered no" —
+/// the difference is whether we put a screen in front of somebody.)
+pub fn loadChatPrefsAt(gpa: Allocator, path: []const u8) ?u8 {
+    const blob = readFileAlloc(gpa, path) orelse return null;
+    defer gpa.free(blob);
+    if (blob.len < 1) return null;
+    return blob[0];
+}
+
 pub fn saveChatGroupsAt(gpa: Allocator, path: []const u8, did: []const u8, blob: []const u8) bool {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();

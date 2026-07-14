@@ -877,6 +877,13 @@ const RunState = struct {
     ghist_have: u16,
     /// What the "bring my history" button is doing right now.
     gdev_hist_state: feed_view.HistoryState,
+    /// CHAT_FEATURES slice 1 — the one-time setup. `asked` is the durable fact that
+    /// we have put the screen in front of this account ONCE; the two flags are what
+    /// they said. Both start OFF: the private choice must be the lazy one.
+    gchat_asked: bool,
+    gchat_receipts: bool,
+    gchat_typing_on: bool,
+    gchat_consent_open: bool,
     /// A URL this frame asked the OS to open. On the phone there is no
     /// `xdg-open` — the seam hands it to the activity, which fires an
     /// ACTION_VIEW intent (the same road the OAuth browser already takes).
@@ -1546,6 +1553,10 @@ fn initRunState(
     rs.ghist_total = 0;
     rs.ghist_have = 0;
     rs.gdev_hist_state = .none;
+    rs.gchat_asked = false;
+    rs.gchat_receipts = false;
+    rs.gchat_typing_on = false;
+    rs.gchat_consent_open = false;
     rs.gboot_start_ns = 0;
     // A signed-in app never plays the entrance: it is the front door's overture,
     // not a splash screen, and somebody who is already inside is not arriving.
@@ -6280,6 +6291,18 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                                 };
                                             };
                                         },
+                                        // The one-time setup (slice 1). The switches
+                                        // are local until Start chatting — nothing is
+                                        // persisted, and nothing is emitted, until the
+                                        // person has actually said so.
+                                        .chat_consent_receipts => rs.gchat_receipts = !rs.gchat_receipts,
+                                        .chat_consent_typing => rs.gchat_typing_on = !rs.gchat_typing_on,
+                                        .chat_consent_done => {
+                                            rs.gchat_asked = true;
+                                            rs.gchat_consent_open = false;
+                                            chatPrefsSave(rs, environ, session.did);
+                                            chatLog("[chat] privacy setup: receipts={} typing={}", .{ rs.gchat_receipts, rs.gchat_typing_on });
+                                        },
                                         .chat_device_help => rs.gdev_help = true,
                                         .chat_help_close => rs.gdev_help = false,
                                         .chat_send => if (dev_chat) {
@@ -7476,7 +7499,12 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         // deposit is worker-queued (never blocks the frame);
                         // the ping's persist is the same nonce rule a send
                         // pays — one keystore write per ping, throttled.
-                        if (now - rs.gchat_typing_sent_at >= 4) if (rs.gchat_sel) |sc| {
+                        // AND ONLY IF THEY SAID YES (slice 1). A typing ping is a
+                        // deposit into their mailbox every few seconds — the relay
+                        // cannot read it, but it says "this person is at their
+                        // keyboard right now", and that is a thing to be asked about
+                        // rather than assumed. Off unless they turned it on.
+                        if (rs.gchat_typing_on and now - rs.gchat_typing_sent_at >= 4) if (rs.gchat_sel) |sc| {
                             if (rs.gchat_e2ee) |*st| if (rs.gchat_link) |l| {
                                 chat_e2ee.sendTyping(gpa, io, environ, st, l, chat_core.conversationDid(&rs.gchat_store, sc)) catch {};
                                 rs.gchat_typing_sent_at = now;
@@ -9331,6 +9359,9 @@ fn chatBringUp(
     rs.gchat_identity_elsewhere = false;
     rs.gdev_state = .ok; // we are part of the account: no gate, and we can approve others
     rs.gchat_e2ee = st;
+    // What did this account say the one time we asked? (Never asked ⇒ the setup is
+    // due, and it goes in front of everything else on this screen.)
+    chatPrefsLoad(rs, gpa, env, session.did);
 
     // M2.1: bootstrap inbox (Welcomes) + every restored conversation's
     // current-epoch traffic mailbox.
@@ -9608,7 +9639,36 @@ fn chatDevicesOf(rs: *RunState, arena: Allocator) feed_view.ChatDevices {
         else
             .none,
         .help_open = rs.gdev_help,
+        .consent_open = rs.gchat_consent_open,
+        .consent_receipts = rs.gchat_receipts,
+        .consent_typing = rs.gchat_typing_on,
     };
+}
+
+/// Load what this account said the one time we asked (slice 1). Never asked = the
+/// screen is due; and "never asked" is NOT the same as "said no", which is exactly
+/// why the fact is stored rather than inferred from the two flags.
+fn chatPrefsLoad(rs: *RunState, gpa: Allocator, env: ?*const std.process.Environ.Map, did: []const u8) void {
+    var buf: [512]u8 = undefined;
+    const path = cache_shell.chatPrefsPath(&buf, env, did) orelse return;
+    const bits = cache_shell.loadChatPrefsAt(gpa, path) orelse {
+        rs.gchat_asked = false;
+        rs.gchat_consent_open = true; // first time in: ask, once
+        return;
+    };
+    rs.gchat_asked = (bits & cache_shell.chat_prefs_asked) != 0;
+    rs.gchat_receipts = (bits & cache_shell.chat_prefs_receipts) != 0;
+    rs.gchat_typing_on = (bits & cache_shell.chat_prefs_typing) != 0;
+    rs.gchat_consent_open = !rs.gchat_asked;
+}
+
+fn chatPrefsSave(rs: *RunState, env: ?*const std.process.Environ.Map, did: []const u8) void {
+    var buf: [512]u8 = undefined;
+    const path = cache_shell.chatPrefsPath(&buf, env, did) orelse return;
+    var bits: u8 = cache_shell.chat_prefs_asked;
+    if (rs.gchat_receipts) bits |= cache_shell.chat_prefs_receipts;
+    if (rs.gchat_typing_on) bits |= cache_shell.chat_prefs_typing;
+    _ = cache_shell.saveChatPrefsAt(path, bits);
 }
 
 /// "just now" / "4 minutes ago". A request that appeared while you were asleep

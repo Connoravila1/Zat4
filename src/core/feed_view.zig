@@ -303,7 +303,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_restart, chat_identity_reset, chat_device_add, chat_device_approve, chat_device_refuse, chat_device_help, chat_help_close, chat_history_get, recv_clip, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, recv_back, recv_use, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_restart, chat_identity_reset, chat_device_add, chat_device_approve, chat_device_refuse, chat_device_help, chat_help_close, chat_history_get, chat_consent_receipts, chat_consent_typing, chat_consent_done, recv_clip, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, recv_back, recv_use, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -9285,6 +9285,11 @@ pub const ChatDevices = struct {
     t: f32 = 0,
     /// Slice 5: whether to offer the backlog, and how that offer is going.
     history: HistoryState = .none,
+    /// CHAT_FEATURES slice 1: the one-time setup is up (they have never answered),
+    /// and what the two switches are currently showing. Both start OFF.
+    consent_open: bool = false,
+    consent_receipts: bool = false,
+    consent_typing: bool = false,
     /// The "How Zat Chat works" page is open (it is a PAGE, not a modal: it
     /// replaces the column, so it cannot bleed through anything or eat a tap it
     /// did not mean to).
@@ -9515,6 +9520,133 @@ fn drawPendingDeviceCard(
     _ = try str(gpa, dl, e, .regular, x + 18, y, wc, 12, caution);
 
     return h + 12;
+}
+
+/// THE ONE-TIME SETUP (CHAT_FEATURES slice 1) — the first time somebody opens Zat
+/// Chat, and never again.
+///
+/// Two switches, BOTH OFF. The private choice must be the LAZY choice: a default
+/// only protects the people who never open Settings, which is nearly everybody.
+///
+/// But the copy is NOT an alarm, and this matters. Most people will turn these on
+/// and should feel perfectly fine about it — the switches are here for the people
+/// who genuinely want them off, and they are the ones who deserve to be told what
+/// they cost. Frightening everybody else into a worse experience would be its own
+/// kind of dishonesty.
+fn drawChatConsent(
+    gpa: Allocator,
+    dl: *raster.DrawList,
+    e: *const text.Engine,
+    regions: ?*Regions,
+    x0: i32,
+    w: i32,
+    width: i32,
+    insets: EdgeInsets,
+    accent: u32,
+    d: ChatDevices,
+) error{OutOfMemory}!i32 {
+    const phone = width <= phone_max;
+    const x = x0 + 22;
+    const iw = @min(w - 44, 520);
+    var y: i32 = if (phone) insets.top + 40 else 60;
+
+    _ = try str(gpa, dl, e, .semibold, x, y + 10, ink, 24, "Before you start");
+    y += 40;
+    _ = try str(gpa, dl, e, .regular, x, y + 12, muted, 14, "Two things you can share with the people you talk to.");
+    y += 20;
+    _ = try str(gpa, dl, e, .regular, x, y + 12, muted, 14, "Most people leave them on. If you'd rather share less, leave them off \u{2014}");
+    y += 20;
+    _ = try str(gpa, dl, e, .regular, x, y + 12, muted, 14, "nothing else about Zat Chat changes either way.");
+    y += 34;
+
+    const Opt = struct { on: bool, act: Action, title: []const u8, body: []const u8, cost: []const u8 };
+    const opts = [_]Opt{
+        .{
+            .on = d.consent_receipts,
+            .act = .chat_consent_receipts,
+            .title = "Read receipts",
+            .body = "Let people see when you've read their messages.",
+            .cost = "Servers still can't read a word. But a receipt goes out each time you open a chat, so they'd know when you're around \u{2014} even when you don't reply.",
+        },
+        .{
+            .on = d.consent_typing,
+            .act = .chat_consent_typing,
+            .title = "Typing indicator",
+            .body = "Let people see the \u{201C}\u{2026}\u{201D} while you're typing.",
+            .cost = "Same trade. Nobody can read what you type; the pings just say you're at your keyboard right now.",
+        },
+    };
+
+    for (opts) |o| {
+        const h: i32 = 138; // room for the COST to be read in full — a truth that
+        // gets clipped halfway through is worse than one nobody printed.
+        try cardBox(gpa, dl, x, y, iw, h, 12, 0xFF1B1B1B);
+        try rect(gpa, dl, x, y, iw, h, 0x2AEDEAE0, 12);
+
+        // The switch, on the right, where a thumb expects it.
+        const sw: i32 = 44;
+        const sh: i32 = 26;
+        const sx = x + iw - sw - 18;
+        const sy = y + 22;
+        try cardBox(gpa, dl, sx, sy, sw, sh, 13, if (o.on) accent else 0xFF2A2A2A);
+        const knob_x = if (o.on) sx + sw - 22 else sx + 2;
+        try cardBox(gpa, dl, knob_x, sy + 2, 22, sh - 4, 11, 0xFFEDEAE0);
+        try emitRegion(gpa, regions, sx - 6, sy - 8, sw + 12, sh + 16, 0, o.act);
+
+        _ = try str(gpa, dl, e, .semibold, x + 18, y + 30, ink, 15, o.title);
+        _ = try str(gpa, dl, e, .regular, x + 18, y + 54, muted, 13, o.body);
+        // The cost, in the same breath as the offer — not in a footnote nobody reads.
+        _ = try wrapLines(gpa, dl, e, x + 18, y + 76, iw - 44, faint, 12, o.cost, 3);
+        y += h + 12;
+    }
+
+    y += 10;
+    const bh: i32 = 46;
+    const bw = @min(iw, 240);
+    try cardBox(gpa, dl, x, y, bw, bh, 11, accent);
+    try rect(gpa, dl, x, y, bw, 1, softA(0xFFFFFF, 0x40), 11);
+    const lab = "Start chatting";
+    const lw: i32 = @intCast(text.measure(e, .semibold, lab, 15));
+    _ = try str(gpa, dl, e, .semibold, x + @divTrunc(bw - lw, 2), y + 29, 0xFF12110F, 15, lab);
+    try emitRegion(gpa, regions, x, y, bw, bh, 0, .chat_consent_done);
+    y += bh + 18;
+
+    _ = try str(gpa, dl, e, .regular, x, y + 10, faint, 12, "You can change both of these later in Settings.");
+    y += 24;
+    const help = "How Zat Chat works";
+    _ = try str(gpa, dl, e, .regular, x, y + 10, softA(accentRgbOf(accent), 0xCC), 13, help);
+    const hw: i32 = @intCast(text.measure(e, .regular, help, 13));
+    try emitRegion(gpa, regions, x - 6, y, hw + 12, 28, 0, .chat_device_help);
+    return y + 40;
+}
+
+/// Wrap `s` into at most `max_lines` lines of width `w`. Returns the y below.
+fn wrapLines(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x: i32, y0: i32, w: i32, color: u32, px: u16, s: []const u8, max_lines: usize) error{OutOfMemory}!i32 {
+    var y = y0;
+    var line_start: usize = 0;
+    var last_space: ?usize = null;
+    var lines: usize = 0;
+    var i: usize = 0;
+    while (i <= s.len and lines < max_lines) : (i += 1) {
+        if (i < s.len and s[i] != ' ') continue;
+        const candidate = s[line_start..i];
+        if (@as(i32, @intCast(text.measure(e, .regular, candidate, px))) > w) {
+            const cut = last_space orelse i;
+            _ = try str(gpa, dl, e, .regular, x, y, color, px, s[line_start..cut]);
+            y += px + 5;
+            lines += 1;
+            line_start = cut + 1;
+            last_space = null;
+            continue;
+        }
+        if (i < s.len) last_space = i;
+        if (i == s.len) {
+            _ = try str(gpa, dl, e, .regular, x, y, color, px, s[line_start..]);
+            y += px + 5;
+            lines += 1;
+        }
+    }
+    return y;
 }
 
 /// THE BACKLOG OFFER (slice 5). Bringing your messages across is a choice with a
@@ -9754,6 +9886,13 @@ pub fn layoutChat(
     // can only read when nothing is wrong is a brochure. ──
     if (devices.help_open) {
         return try drawChatHelp(gpa, dl, e, regions, x0, width, insets, accent);
+    }
+
+    // ── THE ONE-TIME SETUP. Before the list, before a thread, before anything:
+    // the first time somebody opens Zat Chat we ask what they want to share. It is
+    // a PAGE (it replaces the column) and it happens exactly once per account. ──
+    if (devices.consent_open and devices.state == .ok) {
+        return try drawChatConsent(gpa, dl, e, regions, x0, w, width, insets, accent, devices);
     }
 
     // ── THE GATE — chat lives on another device (A3, rebuilt for slice 2). ──

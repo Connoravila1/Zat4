@@ -961,6 +961,8 @@ pub fn main(init: std.process.Init) !void {
                 .{ .name = "Pixel 10 Pro", .fingerprint = "a41f 9c02 7bd3 e158", .age = "just now" },
             } } },
             .{ .name = "md_added", .w = 700, .dev = .{ .added_t = 0.35, .added_name = "Pixel 10 Pro" } },
+            .{ .name = "md_consent", .w = 430, .dev = .{ .consent_open = true } },
+            .{ .name = "md_consent_on", .w = 430, .dev = .{ .consent_open = true, .consent_receipts = true } },
         };
         for (md) |c| {
             @memset(fb.pixels, clear);
