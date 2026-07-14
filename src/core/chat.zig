@@ -126,6 +126,19 @@ pub const kind_roster_wire: u8 = 4;
 pub const kind_history_req_wire: u8 = 5;
 pub const kind_history_chunk_wire: u8 = 6;
 
+/// DELETE FOR EVERYONE (CHAT_FEATURES slice 3). [kind][i64 created_at] — the
+/// timestamp of the message the sender wants gone. We carry no message ids on the
+/// wire (there are none in the store), and the stamp is enough: it is scoped to the
+/// session it arrives on, so it can only ever name a message in THAT conversation,
+/// from THAT person.
+///
+/// AND IT IS A REQUEST, NOT A DELETION. We cannot reach into somebody else's phone.
+/// Their client honours it because it chooses to; a modified client simply would
+/// not. Every messenger works this way and most of them let people believe
+/// otherwise — the UI here does not, because that is the kind of lie that gets
+/// somebody hurt.
+pub const kind_unsend_wire: u8 = 7;
+
 /// How many times an unacknowledged Welcome is re-sent before the client
 /// stops and says so. With the ladder below this is ~1 hour of trying; a
 /// relaunch starts the ladder over (`restoreGroups`), so a peer who comes
@@ -420,6 +433,15 @@ pub const Store = struct {
     /// Direction bit, parallel to `msgs` (A6): set = authored by THIS
     /// account, clear = authored by the counterparty.
     mine: std.DynamicBitSetUnmanaged = .{},
+    /// DELETED, parallel to `msgs` (A6, same reason as `mine` — a bool on the hot
+    /// record would cost 8 bytes of padding to carry one bit).
+    ///
+    /// A TOMBSTONE, not a hole. The row stays: removing it would renumber every
+    /// index above it, and half this codebase holds message indexes. The bubble
+    /// renders as "Message deleted" and its text is scrubbed from the string bytes
+    /// on the next save — a deletion that leaves the words on disk is not a
+    /// deletion, and the person who tapped it believes it was.
+    deleted: std.DynamicBitSetUnmanaged = .{},
     /// One row per payment card (card ⇔ row; M5 A1).
     payments: std.MultiArrayList(PaymentRow) = .empty,
     /// Cold settlement detail, at most one row per payment (A6).
@@ -434,6 +456,7 @@ pub fn deinitStore(gpa: Allocator, store: *Store) void {
     store.msgs.deinit(gpa);
     store.conv_by_did.deinit(gpa);
     store.mine.deinit(gpa);
+    store.deleted.deinit(gpa);
     store.payments.deinit(gpa);
     store.settlements.deinit(gpa);
     store.* = undefined;
@@ -601,6 +624,7 @@ fn appendRecord(
     });
     try store.mine.resize(gpa, store.msgs.len, false);
     store.mine.setValue(index, mine);
+    try store.deleted.resize(gpa, store.msgs.len, false);
 
     const ci: u32 = @intFromEnum(conv);
     const convs = store.convs.slice();
@@ -612,6 +636,50 @@ fn appendRecord(
 }
 
 /// The reader has seen this conversation; its unread count returns to zero.
+/// Is this message a tombstone? (PURE.)
+pub fn isDeleted(store: *const Store, msg: u32) bool {
+    if (msg >= store.deleted.bit_length) return false;
+    return store.deleted.isSet(msg);
+}
+
+/// DELETE a message from THIS device's history. The row survives as a tombstone —
+/// removing it would renumber every index above it, and half the codebase holds
+/// message indexes — but its TEXT is scrubbed to nothing here and its bytes stop
+/// being written on the next save. A deletion that leaves the words on disk is not
+/// a deletion, and the person who tapped it believes that it was.
+pub fn deleteMessage(store: *Store, msg: u32) void {
+    if (msg >= store.msgs.len) return;
+    if (msg >= store.deleted.bit_length) return;
+    store.deleted.set(msg);
+    const msgs = store.msgs.slice();
+    const span = msgs.items(.text)[msg];
+    // Scrub the bytes in place: the string arena is shared, so this cannot free
+    // them, but it CAN make them nothing.
+    const bytes = store.string_bytes.items;
+    const end = @as(usize, span.offset) + span.len;
+    if (end <= bytes.len) @memset(bytes[span.offset..end], 0);
+    msgs.items(.text)[msg] = TextSpan.empty;
+}
+
+/// Find a message by its conversation + timestamp + direction — how a DELETE
+/// REQUEST from the other side names the message it wants gone. We do not send
+/// message ids on the wire (there are none), and inventing one would mean a schema
+/// change in a store that is already deployed. A collision would need two messages
+/// from the same person in the same conversation in the same SECOND; if it ever
+/// happens, the oldest matching one goes, which is the one they meant.
+pub fn findByStamp(store: *const Store, conv: ConvIndex, created_at: i64, mine_bit: bool) ?u32 {
+    const msgs = store.msgs.slice();
+    var i: u32 = 0;
+    while (i < store.msgs.len) : (i += 1) {
+        if (msgs.items(.conv)[i] != conv) continue;
+        if (msgs.items(.created_at)[i] != created_at) continue;
+        if (isMine(store, @enumFromInt(i)) != mine_bit) continue;
+        if (isDeleted(store, i)) continue;
+        return i;
+    }
+    return null;
+}
+
 pub fn markRead(store: *Store, conv: ConvIndex) void {
     store.convs.slice().items(.unread)[@intFromEnum(conv)] = 0;
 }
@@ -1004,7 +1072,11 @@ const codec_magic = [4]u8{ 'Z', 'A', 'T', 'H' };
 /// blobs (pre-payments history) are still READ — their sections are simply
 /// empty — so an existing transcript survives the upgrade; writes are
 /// always version 2.
-const codec_version: u16 = 2;
+/// v3 (CHAT_FEATURES): the DELETED bitset, appended after the payments/settlements
+/// sections so every v2 blob still reads (a version gate is a compatibility
+/// contract and is written as a RANGE — the day we wrote it as a LIST, a v3 bump
+/// orphaned every conversation on the owner's phone).
+const codec_version: u16 = 3;
 const conv_rec_len = 28; // did span 8 + handle span 8 + i64 8 + u32 4
 const msg_rec_len = 21; // i64 8 + text span 8 + conv 4 + kind 1
 const pay_rec_len = 23; // id 8 + amount 8 + msg 4 + rail 1 + status 1 + conf 1
@@ -1025,7 +1097,8 @@ pub fn serializeStore(gpa: Allocator, store: *const Store) error{OutOfMemory}![]
         4 + m_count * msg_rec_len +
         (m_count + 7) / 8 +
         4 + p_count * pay_rec_len +
-        4 + r_count * ref_rec_len;
+        4 + r_count * ref_rec_len +
+        (m_count + 7) / 8; // v3: the deleted bitset
     const out = try gpa.alloc(u8, total);
     errdefer gpa.free(out);
 
@@ -1104,6 +1177,15 @@ pub fn serializeStore(gpa: Allocator, store: *const Store) error{OutOfMemory}![]
         @memcpy(out[at + 4 ..][0..32], &refs.items(.ref)[i]);
         at += ref_rec_len;
     }
+
+    // v3: the tombstones. A deletion that a relaunch undoes is not a deletion.
+    const del_bytes = out[at..][0 .. (m_count + 7) / 8];
+    @memset(del_bytes, 0);
+    for (0..m_count) |i| {
+        if (i < store.deleted.bit_length and store.deleted.isSet(i)) del_bytes[i / 8] |= @as(u8, 1) << @intCast(i % 8);
+    }
+    at += (m_count + 7) / 8;
+
     assert(at == total);
     return out;
 }
@@ -1129,7 +1211,12 @@ pub fn deserializeStore(gpa: Allocator, bytes: []const u8) DeserializeError!Stor
 
     if (bytes.len < 10 or !std.mem.eql(u8, bytes[0..4], &codec_magic)) return error.Malformed;
     const version = std.mem.readInt(u16, bytes[4..6], .little);
-    if (version != 1 and version != 2) return error.Malformed;
+    // A RANGE, NOT A LIST. This line read `version != 1 and version != 2`, which was
+    // correct only while there were exactly two versions — and the LAST time a gate
+    // like it was bumped, it silently orphaned every conversation on the owner's
+    // phone (the groups blob, 2026-07-12). Every version we have ever written still
+    // reads; only a version from the FUTURE is refused.
+    if (version < 1 or version > codec_version) return error.Malformed;
     const s_len = std.mem.readInt(u32, bytes[6..10], .little);
     var at: usize = 10;
     if (bytes.len - at < s_len) return error.Malformed;
@@ -1198,6 +1285,7 @@ pub fn deserializeStore(gpa: Allocator, bytes: []const u8) DeserializeError!Stor
     const mine_len = (@as(usize, m_count) + 7) / 8;
     if (bytes.len - at < mine_len) return error.Malformed;
     try store.mine.resize(gpa, m_count, false);
+    try store.deleted.resize(gpa, m_count, false);
     for (0..m_count) |i| {
         const bit = (bytes[at + i / 8] >> @intCast(i % 8)) & 1;
         store.mine.setValue(i, bit == 1);
@@ -1290,6 +1378,25 @@ pub fn deserializeStore(gpa: Allocator, bytes: []const u8) DeserializeError!Stor
             }
             store.settlements.appendAssumeCapacity(.{ .pay = @enumFromInt(pay_raw), .ref = ref });
         }
+    }
+
+    // v3: the tombstones. A v2 blob has none, and that is not damage — nothing had
+    // been deleted before the feature existed. (RANGE, not a list: the day this gate
+    // was written as a list, a version bump silently orphaned every conversation on
+    // the owner's phone.)
+    if (version >= 3) {
+        const del_len = (@as(usize, m_count) + 7) / 8;
+        if (bytes.len - at < del_len) return error.Malformed;
+        for (0..m_count) |i| {
+            const bit = (bytes[at + i / 8] >> @intCast(i % 8)) & 1;
+            store.deleted.setValue(i, bit == 1);
+        }
+        if (m_count % 8 != 0) {
+            const used: u3 = @intCast(m_count % 8);
+            const mask: u8 = @as(u8, 0xFF) << used;
+            if (bytes[at + del_len - 1] & mask != 0) return error.Malformed; // canonical
+        }
+        at += del_len;
     }
 
     if (at != bytes.len) return error.Malformed; // exact tail — no trailing bytes
@@ -1789,11 +1896,13 @@ test "store codec: a version-1 blob (pre-payments) still restores" {
     const a = try openConversation(gpa, &store, "did:plc:aaa", "maya.zat4.com");
     _ = try appendMessage(gpa, &store, a, .text, "old world", 100, true);
 
-    // A v2 blob with no payments is exactly a v1 blob plus two zero counts:
-    // strip them and stamp version 1 — byte-identical to what M2 wrote.
-    const v2 = try serializeStore(gpa, &store);
-    defer gpa.free(v2);
-    const v1 = try gpa.dupe(u8, v2[0 .. v2.len - 8]);
+    // A v1 blob is a v3 blob minus the v3 tombstone bitset (one byte per 8 msgs)
+    // and minus v2's two zero payment counts: strip both and stamp version 1 —
+    // byte-identical to what M2 wrote.
+    const v3 = try serializeStore(gpa, &store);
+    defer gpa.free(v3);
+    const del_len = (store.msgs.len + 7) / 8;
+    const v1 = try gpa.dupe(u8, v3[0 .. v3.len - del_len - 8]);
     defer gpa.free(v1);
     std.mem.writeInt(u16, v1[4..6], 1, .little);
 
@@ -1835,8 +1944,11 @@ test "store codec v2: every class of payment-section damage is refused" {
     }.check;
     // Layout: refs section = last 4 + 36 bytes; payments = the 4 + 23
     // bytes before it.
-    const ref_at = good.len - ref_rec_len;
-    const pay_at = good.len - ref_rec_len - 4 - pay_rec_len;
+    // v3 appends the tombstone bitset AFTER the settlement section, so the
+    // payment/settlement records are no longer the tail: step back over it.
+    const del_tail = (store.msgs.len + 7) / 8;
+    const ref_at = good.len - del_tail - ref_rec_len;
+    const pay_at = good.len - del_tail - ref_rec_len - 4 - pay_rec_len;
 
     // Row → a non-payment message (message 0 is text).
     std.mem.writeInt(u32, bad[pay_at + 16 ..][0..4], 0, .little);

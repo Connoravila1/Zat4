@@ -924,6 +924,24 @@ pub fn sendHistory(
     }
 }
 
+/// Ask the other side to unsend a message of ours (CHAT_FEATURES slice 3). It goes
+/// to every device they have, like any other message — a message that vanished from
+/// their phone but not their laptop would be worse than not deleting it at all.
+pub fn sendUnsend(
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    st: *State,
+    link: *chat_relay.ChatRelay,
+    peer_did: []const u8,
+    created_at: i64,
+) SendError!void {
+    var buf: [9]u8 = undefined;
+    buf[0] = chat.kind_unsend_wire;
+    std.mem.writeInt(i64, buf[1..9], created_at, .little);
+    return depositAll(gpa, io, environ, st, link, peer_did, &buf);
+}
+
 /// What a refresh found out about a peer (slice 4). A7.2: cold, transient.
 pub const Refresh = enum {
     /// They are who they were. Nothing to do, nothing to say.
@@ -1360,6 +1378,8 @@ pub const Incoming = union(enum) {
     /// The peer is typing right now — ephemeral; the shell shows the
     /// indicator for a few seconds and lets it lapse. Never stored.
     typing: struct { peer_did: []u8 },
+    /// The peer wants a message of THEIRS taken down (CHAT_FEATURES slice 3).
+    unsend: struct { peer_did: []u8, created_at: i64 },
     /// ANOTHER DEVICE OF OURS is asking for the backlog (slice 5). `device` names
     /// which one, so the answer goes to it and to nobody else.
     history_request: struct { device: [32]u8 },
@@ -1427,6 +1447,7 @@ pub fn freeIncoming(gpa: Allocator, inc: Incoming) void {
         .restarted => |s| gpa.free(s.peer_did),
         .typing => |t| gpa.free(t.peer_did),
         .roster => |r| gpa.free(r.dids),
+        .unsend => |u| gpa.free(u.peer_did),
         .history_request => {},
         .history_chunk => |h| gpa.free(h.bytes),
         .welcome_again => |s| gpa.free(s.peer_did),
@@ -1699,6 +1720,16 @@ pub fn onBucket(
                         if (!std.mem.eql(u8, st.peer_dids.items[idx], st.my_did)) return null;
                         if (data.len < 2) return null;
                         return .{ .roster = .{ .dids = try gpa.dupe(u8, data[1..]) } };
+                    }
+                    // UNSEND (CHAT_FEATURES slice 3): they are asking us to drop a
+                    // message THEY sent. It can only ever name a message in this
+                    // conversation, from them — the session it arrived on says so.
+                    if (data[0] == chat.kind_unsend_wire) {
+                        if (data.len < 9) return null;
+                        return .{ .unsend = .{
+                            .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]),
+                            .created_at = std.mem.readInt(i64, data[1..9], .little),
+                        } };
                     }
                     // HISTORY (slice 5) — the ask, and the bytes. Both carry the
                     // same rule as the roster, and for the same reason: ONLY from

@@ -54,11 +54,24 @@ pub const BubbleRow = struct {
     /// `PayCard` slice; `no_pay` for every other kind. For a card, `body`
     /// is the NOTE — the renderer draws amount/rail/status itself.
     pay: u32 = no_pay,
+    /// WHICH MESSAGE this row is, in the store (CHAT_FEATURES slice 2). A row IS a
+    /// message; it simply never had to say which one until something could be DONE
+    /// to it. The context menu acts on the store, so the identity has to survive the
+    /// trip out to the view and back.
+    msg: u32 = 0,
+    /// A tombstone: the text is gone and the bubble says so. Rendered rather than
+    /// removed — removing the row would renumber every index above it.
+    deleted: bool = false,
 
     comptime {
-        // Budget 40: 2 slices (32) + 4 bytes + u32 = 40 — `pay` landed in
-        // what was padding. (A7)
-        assert(@sizeOf(BubbleRow) == 40);
+        // A7.1 — budget raised 40 → 48. `msg` (u32) is the row's identity in the
+        // store and `deleted` is one bit that lands in existing padding; the u32
+        // pushes the struct past 40 and alignment rounds to 48. Paid deliberately:
+        // without the id, no message action (delete, reply, react) can name the
+        // message it is acting on, and the alternative — re-deriving the mapping in
+        // the shell from a parallel query — is the kind of implicit coupling that
+        // breaks the first time the two orderings disagree.
+        assert(@sizeOf(BubbleRow) == 48);
     }
 };
 
@@ -239,13 +252,18 @@ pub fn buildThread(
                 next_card += 1;
             }
         }
+        const gone = chat.isDeleted(store, mi);
         row.* = .{
-            .body = chat.sliceSpan(store, store.msgs.items(.text)[mi]),
+            // A deleted message says SO. Leaving the bubble blank would read as a
+            // rendering bug; leaving it out would renumber every row above it.
+            .body = if (gone) "Message deleted" else chat.sliceSpan(store, store.msgs.items(.text)[mi]),
             .age = try ageStr(arena, now, at),
             .mine = chat.isMine(store, msg),
             .stamp = i == 0 or at - prev_at >= stamp_gap,
             .kind = kind,
             .pay = pay,
+            .msg = mi,
+            .deleted = gone,
         };
         prev_at = at;
     }

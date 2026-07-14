@@ -884,6 +884,19 @@ const RunState = struct {
     gchat_receipts: bool,
     gchat_typing_on: bool,
     gchat_consent_open: bool,
+    /// CHAT_FEATURES slice 2 — the message context menu, and the press that opens it.
+    /// A PRESS-AND-HOLD is a press that has not moved and has not been let go: the
+    /// app had no such gesture anywhere, so this is it.
+    gcmenu: feed_view.ChatMenu,
+    gcmenu_ns: u64, // when it opened (drives its arrival)
+    ghold_ns: u64, // when the current press started (0 = no press being watched)
+    ghold_x: i32,
+    ghold_y: i32,
+    ghold_msg: u32,
+    ghold_mine: bool,
+    ghold_live: bool,
+    /// The message the composer is answering (slice 3), or `no_reply`.
+    gchat_reply_to: u32,
     /// A URL this frame asked the OS to open. On the phone there is no
     /// `xdg-open` — the seam hands it to the activity, which fires an
     /// ACTION_VIEW intent (the same road the OAuth browser already takes).
@@ -1557,6 +1570,11 @@ fn initRunState(
     rs.gchat_receipts = false;
     rs.gchat_typing_on = false;
     rs.gchat_consent_open = false;
+    rs.gcmenu = .{};
+    rs.gcmenu_ns = 0;
+    rs.ghold_ns = 0;
+    rs.ghold_live = false;
+    rs.gchat_reply_to = no_reply;
     rs.gboot_start_ns = 0;
     // A signed-in app never plays the entrance: it is the front door's overture,
     // not a splash screen, and somebody who is already inside is not arriving.
@@ -2257,6 +2275,17 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                 // standing law against. They go into a queue and are
                                 // opened one per frame, visibly, so the list fills in
                                 // in front of the person instead of the app dying.
+                                // UNSEND (CHAT_FEATURES slice 3): they asked us to
+                                // take down a message of THEIRS. We honour it —
+                                // because we choose to, which is the only reason any
+                                // client ever does.
+                                .unsend => |u| unsend: {
+                                    const conv = chat_core.openConversation(gpa, &rs.gchat_store, u.peer_did, "") catch break :unsend;
+                                    const mi = chat_core.findByStamp(&rs.gchat_store, conv, u.created_at, false) orelse break :unsend;
+                                    chat_core.deleteMessage(&rs.gchat_store, mi);
+                                    chatPersistHistory(gpa, io, environ, st, &rs.gchat_store);
+                                    chatLog("[chat] unsend honoured for {s}", .{u.peer_did});
+                                },
                                 // HISTORY (slice 5). Our other device asked for the
                                 // backlog: serialize what we have and send it. The
                                 // request already proved it came from one of our own
@@ -2637,6 +2666,9 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
         // one question that used to have no answer: has it landed? When it has,
         // the card flips ITSELF to Sent ✓ and the peer is signalled — nobody
         // tapped anything, and nobody had to be trusted. ──
+        // The press-and-hold clock (CHAT_FEATURES slice 2).
+        if (dev_chat) chatHoldStep(rs);
+
         // MULTI-DEVICE (slice 2). Runs whether or not chat is up, because the
         // device that is WAITING to be let in has no chat state by definition — and
         // it is the one that most needs its screen to keep itself current.
@@ -3699,7 +3731,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        var pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = .{ .cards = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .q_focus = rs.gmarket_q_focus, .loading = rs.market_loading, .filter = rs.gmarket_filter, .hover_x = rs.ghover_x, .hover_y = rs.ghover_y }, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_delivery = chatDeliveryOf(rs), .chat_identity_elsewhere = rs.gchat_identity_elsewhere, .chat_link = chatLinkOf(rs), .chat_devices = chatDevicesOf(rs, arena), .enroll = enroll_run.snapshot(&rs.genroll_state, composeBlinkOn(rs.caret_anchor_ns)), .enroll_hits = &rs.genroll_hits, .boot_on = bootIntroOn(rs), .boot_t = bootIntroT(rs), .kbd_visible = softKeyboardWanted(rs), .kbd_shift = rs.kbd_shift, .kbd_page = rs.kbd_page, .kbd_caps = rs.kbd_caps, .kbd_flash_key = rs.kbd_flash_key, .kbd_flash_a = kbdFlashAlpha(rs), .kbd_popup = .{ .opts = rs.kbd_popup_opts[0..rs.kbd_popup_n], .anchor_x = rs.kbd_popup_ax, .anchor_y = rs.kbd_popup_ay, .anchor_w = rs.kbd_popup_aw, .sel = rs.kbd_popup_sel }, .kbd_emoji_open = rs.kbd_emoji_open, .kbd_emoji_scroll = @intFromFloat(rs.kbd_emoji_scroll), .kbd_picker_mode = rs.kbd_picker_mode, .kbd_nav_t = rs.kbd_nav_t, .kbd_nav_scroll = @intFromFloat(rs.kbd_nav_scroll), .chat_q = rs.gchat_q_buf[0..rs.gchat_q_len], .chat_q_focus = rs.gchat_q_focus, .chat_q_caret = composeBlinkOn(rs.caret_anchor_ns), .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_edit = .{ .caret = @min(rs.gchat_caret, rs.gchat_draft_len), .sel_a = @min(rs.gchat_sel_a, rs.gchat_draft_len), .sel_b = @min(rs.gchat_sel_b, rs.gchat_draft_len), .bar = rs.gchat_edit_bar }, .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .step = rs.gpay_step, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents, .busy = rs.gpay_busy }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved, .rooted = rs.grecv_set, .set = rs.grecv_set, .known = rs.grecv_known, .probing = rs.grecv_probing, .caps = rs.gcaps, .saving = rs.gpublish_busy }, .wallet_remove_armed = rs.gwallet_remove_armed, .verify_ids = verifyIdsOf(arena, rs), .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
+        var pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = .{ .cards = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .q_focus = rs.gmarket_q_focus, .loading = rs.market_loading, .filter = rs.gmarket_filter, .hover_x = rs.ghover_x, .hover_y = rs.ghover_y }, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_delivery = chatDeliveryOf(rs), .chat_identity_elsewhere = rs.gchat_identity_elsewhere, .chat_link = chatLinkOf(rs), .chat_devices = chatDevicesOf(rs, arena), .chat_menu = chatMenuOf(rs), .enroll = enroll_run.snapshot(&rs.genroll_state, composeBlinkOn(rs.caret_anchor_ns)), .enroll_hits = &rs.genroll_hits, .boot_on = bootIntroOn(rs), .boot_t = bootIntroT(rs), .kbd_visible = softKeyboardWanted(rs), .kbd_shift = rs.kbd_shift, .kbd_page = rs.kbd_page, .kbd_caps = rs.kbd_caps, .kbd_flash_key = rs.kbd_flash_key, .kbd_flash_a = kbdFlashAlpha(rs), .kbd_popup = .{ .opts = rs.kbd_popup_opts[0..rs.kbd_popup_n], .anchor_x = rs.kbd_popup_ax, .anchor_y = rs.kbd_popup_ay, .anchor_w = rs.kbd_popup_aw, .sel = rs.kbd_popup_sel }, .kbd_emoji_open = rs.kbd_emoji_open, .kbd_emoji_scroll = @intFromFloat(rs.kbd_emoji_scroll), .kbd_picker_mode = rs.kbd_picker_mode, .kbd_nav_t = rs.kbd_nav_t, .kbd_nav_scroll = @intFromFloat(rs.kbd_nav_scroll), .chat_q = rs.gchat_q_buf[0..rs.gchat_q_len], .chat_q_focus = rs.gchat_q_focus, .chat_q_caret = composeBlinkOn(rs.caret_anchor_ns), .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_edit = .{ .caret = @min(rs.gchat_caret, rs.gchat_draft_len), .sel_a = @min(rs.gchat_sel_a, rs.gchat_draft_len), .sel_b = @min(rs.gchat_sel_b, rs.gchat_draft_len), .bar = rs.gchat_edit_bar }, .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .step = rs.gpay_step, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents, .busy = rs.gpay_busy }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved, .rooted = rs.grecv_set, .set = rs.grecv_set, .known = rs.grecv_known, .probing = rs.grecv_probing, .caps = rs.gcaps, .saving = rs.gpublish_busy }, .wallet_remove_armed = rs.gwallet_remove_armed, .verify_ids = verifyIdsOf(arena, rs), .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
         switch (rs.mode) {
             .timeline => try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status),
             .compose => {
@@ -5127,6 +5159,14 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         }
                     },
                     .move => {
+                        // A FINGER THAT WANDERS IS SCROLLING, not holding. Without
+                        // this, the menu would ambush people mid-scroll — the single
+                        // most irritating way to get a press-and-hold wrong.
+                        if (rs.ghold_live) {
+                            const dx = rx - rs.ghold_x;
+                            const dy = ry - rs.ghold_y;
+                            if (dx * dx + dy * dy > chat_hold_slop_px * chat_hold_slop_px) rs.ghold_live = false;
+                        }
                         // Track the pointer in LOGICAL coords for the hover
                         // highlight (rx/ry are already mapped through scale).
                         rs.ghover_x = rx;
@@ -5209,6 +5249,25 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         // post body. Left-click while the menu is open hits
                         // an item or dismisses it (never the feed beneath).
                         if (pev.button == 3) {
+                            // RIGHT-CLICK ON A MESSAGE = the same menu the phone's
+                            // press-and-hold opens. One menu, two ways in.
+                            if (rs.gscreen == feed_view.screen_messages) {
+                                if (feed_view.hitTest(g.regions.items, rx, ry)) |mh| {
+                                    if (mh.kind == .chat_msg) {
+                                        if (chatMsgAtOrdinal(rs, mh.post)) |mi| {
+                                            rs.gcmenu = .{
+                                                .open = true,
+                                                .msg = mi,
+                                                .mine = chat_core.isMine(&rs.gchat_store, @enumFromInt(mi)),
+                                                .x = rx,
+                                                .y = ry,
+                                            };
+                                            rs.gcmenu_ns = clock_shell.monotonicNanos();
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
                             if (g.gpu) |gs| openContextMenu(gs, rs.gscreen, view_items, g.regions.items, rx, ry);
                         } else if (pev.button == 1) {
                             if (g.gpu) |gs| if (gs.menu_open) {
@@ -5458,6 +5517,24 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             // THE FRONT DOOR owns the pointer when it is up: it has
                             // its own hit list (enroll_view.HitList), so it arms and
                             // fires on its own, and nothing behind it is reachable.
+                            // PRESS-AND-HOLD (CHAT_FEATURES slice 2). The app had
+                            // no such gesture; this is it. A press on a message
+                            // starts a clock, and if it survives 420ms without
+                            // wandering, the menu opens under the finger.
+                            if (rs.gscreen == feed_view.screen_messages and !rs.gcmenu.open) {
+                                if (feed_view.hitTest(g.regions.items, rx, ry)) |mh| {
+                                    if (mh.kind == .chat_msg) {
+                                        if (chatMsgAtOrdinal(rs, mh.post)) |mi| {
+                                            rs.ghold_ns = clock_shell.monotonicNanos();
+                                            rs.ghold_x = rx;
+                                            rs.ghold_y = ry;
+                                            rs.ghold_msg = mi;
+                                            rs.ghold_mine = chat_core.isMine(&rs.gchat_store, @enumFromInt(mi));
+                                            rs.ghold_live = true;
+                                        }
+                                    }
+                                }
+                            }
                             if (rs.gscreen == feed_view.screen_enroll) {
                                 // …unless the ENTRANCE is still playing, in which
                                 // case the press means one thing only: get me past
@@ -5505,6 +5582,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     // button_down arm). Placed after the drag-drop handling so
                     // a drag never also triggers a tap.
                     .button_up => if (pev.button == 1) {
+                        rs.ghold_live = false; // a lift is a tap, not a hold
                         // The front door commits on release over the SAME target —
                         // the same release-activation the feed uses, so a press that
                         // slides off cancels rather than firing something else.
@@ -6295,6 +6373,36 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         // are local until Start chatting — nothing is
                                         // persisted, and nothing is emitted, until the
                                         // person has actually said so.
+                                        // ── THE MESSAGE MENU (slice 2) ──
+                                        .chat_msg => {}, // the bubble itself: a TAP does nothing (the HOLD is the gesture)
+                                        .chat_menu_dismiss => rs.gcmenu = .{},
+                                        .chat_msg_copy => if (dev_chat) {
+                                            const body = chatMsgText(rs, rs.gcmenu.msg);
+                                            if (body.len > 0) setClipboardText(rs, backend, body);
+                                            rs.gcmenu = .{};
+                                            rs.status = "chat: copied";
+                                        },
+                                        .chat_msg_reply => {
+                                            // The composer answers a specific message
+                                            // (slice 3 draws the quoted strip).
+                                            rs.gchat_reply_to = rs.gcmenu.msg;
+                                            rs.gchat_input_focus = true;
+                                            rs.gcmenu = .{};
+                                        },
+                                        .chat_msg_delete_me => if (dev_chat) {
+                                            chat_core.deleteMessage(&rs.gchat_store, rs.gcmenu.msg);
+                                            if (rs.gchat_e2ee) |*st| chatPersistHistory(gpa, io, environ, st, &rs.gchat_store);
+                                            rs.gcmenu = .{};
+                                            rs.status = "chat: deleted on this device";
+                                        },
+                                        .chat_msg_delete_all => if (dev_chat) {
+                                            // OURS only (the menu offers it nowhere
+                                            // else). It is a REQUEST: their client
+                                            // honours it because it chooses to, and
+                                            // the label said so before the tap.
+                                            chatUnsend(rs, gpa, io, environ, rs.gcmenu.msg);
+                                            rs.gcmenu = .{};
+                                        },
                                         .chat_consent_receipts => rs.gchat_receipts = !rs.gchat_receipts,
                                         .chat_consent_typing => rs.gchat_typing_on = !rs.gchat_typing_on,
                                         .chat_consent_done => {
@@ -9601,6 +9709,104 @@ fn rosterPublish(
 }
 
 /// The multi-device surfaces' snapshot: plain values in, pixels out.
+/// No message is being replied to. (u32 max, so it can never collide with a real
+/// store index.)
+const no_reply: u32 = std.math.maxInt(u32);
+
+/// Put text on the system clipboard — the X11 selection on desktop, and on the
+/// phone the seam's ClipboardManager bridge (the same buffer the composer's copy
+/// hands out).
+fn setClipboardText(rs: *RunState, backend: Backend, t: []const u8) void {
+    switch (backend) {
+        .window => |w| window_shell.setClipboard(w, t),
+        else => {},
+    }
+    const n = @min(t.len, rs.clip_out_buf.len);
+    @memcpy(rs.clip_out_buf[0..n], t[0..n]);
+    rs.clip_out_len = n;
+}
+
+/// The store index of the Nth bubble in the OPEN thread. The view hands back an
+/// ordinal (a Region carries a u16 and a long history can outgrow it); this walks
+/// the same query the view's rows were built from, so the two cannot drift apart.
+fn chatMsgAtOrdinal(rs: *RunState, ordinal: u16) ?u32 {
+    const sel = rs.gchat_sel orelse return null;
+    _ = rs.gchat_arena_state.reset(.retain_capacity);
+    const msgs = chat_core.threadSlice(rs.gchat_arena_state.allocator(), &rs.gchat_store, sel) catch return null;
+    if (ordinal >= msgs.len) return null;
+    return @intFromEnum(msgs[ordinal]);
+}
+
+/// The text of one message in the store — what Copy copies.
+fn chatMsgText(rs: *const RunState, msg: u32) []const u8 {
+    if (msg >= rs.gchat_store.msgs.len) return "";
+    if (chat_core.isDeleted(&rs.gchat_store, msg)) return "";
+    return chat_core.sliceSpan(&rs.gchat_store, rs.gchat_store.msgs.items(.text)[msg]);
+}
+
+/// "Ask them to delete it": drop it here, and ask their devices to drop it too. Ours
+/// goes FIRST — if the network leg fails, the message is still gone from the device
+/// the person was looking at when they tapped, which is what they asked for.
+fn chatUnsend(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, msg: u32) void {
+    if (msg >= rs.gchat_store.msgs.len) return;
+    const conv = rs.gchat_store.msgs.items(.conv)[msg];
+    const at = rs.gchat_store.msgs.items(.created_at)[msg];
+    const did = chat_core.conversationDid(&rs.gchat_store, conv);
+
+    chat_core.deleteMessage(&rs.gchat_store, msg);
+    if (rs.gchat_e2ee) |*st| {
+        chatPersistHistory(gpa, io, env, st, &rs.gchat_store);
+        if (rs.gchat_link) |l| {
+            chat_e2ee.sendUnsend(gpa, io, env, st, l, did, at) catch |err| {
+                chatLog("[chat] unsend request failed: {s}", .{@errorName(err)});
+                rs.status = "chat: deleted here — couldn't reach them";
+                return;
+            };
+        }
+    }
+    rs.status = "chat: deleted, and asked them to delete it";
+}
+
+/// The menu's snapshot, with its arrival clock (it grows from the point you
+/// pressed — a menu that appears fully formed reads as a glitch).
+fn chatMenuOf(rs: *const RunState) feed_view.ChatMenu {
+    var m = rs.gcmenu;
+    if (m.open and rs.gcmenu_ns != 0) {
+        const el: f32 = @floatFromInt(clock_shell.monotonicNanos() -| rs.gcmenu_ns);
+        m.t = @min(1.0, el / 130_000_000.0);
+    }
+    return m;
+}
+
+/// How long a press must be held, and how far it may wander, before it becomes a
+/// press-and-hold. 420 ms is the number every platform converged on; 12 px of slop
+/// keeps a thumb that shifts slightly from being read as a scroll.
+const chat_hold_ms: u64 = 420;
+const chat_hold_slop_px: i32 = 12;
+
+/// Watch a press that is being held (slice 2). Called every frame while one is
+/// live: if it survives long enough without moving, the menu opens where the finger
+/// is — and the press is CONSUMED, so letting go does not also fire a tap.
+fn chatHoldStep(rs: *RunState) void {
+    if (!rs.ghold_live or rs.gcmenu.open) return;
+    const el_ms = (clock_shell.monotonicNanos() -| rs.ghold_ns) / 1_000_000;
+    if (el_ms < chat_hold_ms) return;
+    rs.gcmenu = .{
+        .open = true,
+        .msg = rs.ghold_msg,
+        .mine = rs.ghold_mine,
+        .x = rs.ghold_x,
+        .y = rs.ghold_y,
+    };
+    rs.gcmenu_ns = clock_shell.monotonicNanos();
+    rs.ghold_live = false; // the press has been spent on the menu
+    // FOLLOW-UP: a haptic tick belongs here — a press-and-hold that opens something
+    // should be confirmed by a tap you can FEEL, and the phone has the channel
+    // (`haptic_pending`). It is only reachable from the pointer-event scope, and
+    // wiring it through the frame step properly is a small piece of plumbing that is
+    // not worth doing badly in passing.
+}
+
 fn chatDevicesOf(rs: *RunState, arena: Allocator) feed_view.ChatDevices {
     var pend: []const feed_view.PendingDeviceView = &.{};
     if (rs.gdev_pend_have) {
@@ -12723,6 +12929,8 @@ const Grid = struct {
     /// CHAT_MULTIDEVICE slice 2: the device gate, the wait, the approval card and
     /// the explainer — everything the multi-device surfaces render from.
     chat_devices: feed_view.ChatDevices = .{},
+    /// CHAT_FEATURES slice 2: the message context menu.
+    chat_menu: feed_view.ChatMenu = .{},
     /// A5: what the relay link is doing right now — the connection dot.
     chat_link: feed_view.ChatLink = .off,
     /// The front door (FRONT_DOOR_ROADMAP): the enrollment view (a pure snapshot
@@ -13732,7 +13940,7 @@ fn paintFrame(
                 // Zat Chat (U3, dev-gated): the Messages surface. -scroll maps the
                 // shared ≤0 scroll state onto layoutChat's positive history offset.
                 const cf = buildChatFrame(arena, g.chat_store.?, g.chat_sel, now, g.chat_q, g.verify_ids);
-                g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_edit, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{}, &.{}, g.chat_recv, .{}, .{}, g.chat_delivery, g.chat_link, g.chat_devices) catch g.content_h.*;
+                g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_edit, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{}, &.{}, g.chat_recv, .{}, .{}, g.chat_delivery, g.chat_link, g.chat_devices, g.chat_menu) catch g.content_h.*;
             } else if (g.screen.* == feed_view.screen_loadout) {
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
                 g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market, g.bench_pick, g.bench_drag, g.published, g.create, g.dev, g.bench, .{}, g.loadout_lib_y) catch g.content_h.*; // software: draw line-art nav
@@ -14600,7 +14808,7 @@ fn paintFrameGpu(
                 }
             } else |_| {}
             const reflow_t: f32 = if (gs.chat_reflow) |rh| (gs.chat_world.position(rh) orelse 1.0) else 1.0;
-            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_edit, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t, .sheet_t = gs.sheet_t }, xforms, g.chat_recv, .{ .top = @intCast(gs.inset_top_l), .bottom = @intCast(@max(gs.inset_bottom_l, @max(gs.ime_bottom_l, if (g.kbd_visible) feed_view.keyboard_h + gs.inset_bottom_l else 0))), .left = @intCast(gs.inset_left_l), .right = @intCast(gs.inset_right_l) }, .{ .q = g.chat_q, .focus = g.chat_q_focus, .caret_on = g.chat_q_caret }, g.chat_delivery, g.chat_link, g.chat_devices) catch g.content_h.*;
+            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_edit, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t, .sheet_t = gs.sheet_t }, xforms, g.chat_recv, .{ .top = @intCast(gs.inset_top_l), .bottom = @intCast(@max(gs.inset_bottom_l, @max(gs.ime_bottom_l, if (g.kbd_visible) feed_view.keyboard_h + gs.inset_bottom_l else 0))), .left = @intCast(gs.inset_left_l), .right = @intCast(gs.inset_right_l) }, .{ .q = g.chat_q, .focus = g.chat_q_focus, .caret_on = g.chat_q_caret }, g.chat_delivery, g.chat_link, g.chat_devices, g.chat_menu) catch g.content_h.*;
         } else if (g.screen.* == feed_view.screen_algo_docs) {
             g.content_h.* = feed_view.layoutAlgoDocs(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, if (g.docs_kind == 1) algo_docs.dev_doc else algo_docs.user_doc) catch g.content_h.*;
         } else if (g.screen.* == feed_view.screen_algo_detail) {
