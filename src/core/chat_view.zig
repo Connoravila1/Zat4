@@ -27,10 +27,17 @@ pub const ListRow = struct {
     /// Relative age of the last activity; empty when there is none.
     age: []const u8,
     unread: u32,
+    /// CHAT_FEATURES: a pin and a mute that the list does not SHOW are a pin and a
+    /// mute the person cannot trust.
+    pinned: bool = false,
+    muted: bool = false,
 
     comptime {
         // Budget 56: 3 slices (48) + u32 (4) = 52, padded to pointer
         // alignment. (A7; raising this requires A7.1 justification.)
+        // A7: still 56 — the two flags land in padding the three slices already
+        // owned. A pin and a mute the list does not SHOW are ones a person cannot
+        // trust, so they have to reach the view; happily they cost nothing to carry.
         assert(@sizeOf(ListRow) == 56);
     }
 };
@@ -209,6 +216,8 @@ pub fn buildList(
             .preview = preview,
             .age = if (last > 0) try ageStr(arena, now, last) else "",
             .unread = convs.items(.unread)[ci],
+            .pinned = convs.items(.pinned)[ci],
+            .muted = convs.items(.muted)[ci],
         };
     }
     return out;

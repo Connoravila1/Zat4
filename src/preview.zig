@@ -986,6 +986,7 @@ pub fn main(init: std.process.Init) !void {
         const menus = [_]struct { name: []const u8, m: feed_view.ChatMenu }{
             .{ .name = "menu_mine", .m = .{ .open = true, .mine = true, .x = 150, .y = 260, .t = 1.0 } },
             .{ .name = "menu_theirs", .m = .{ .open = true, .mine = false, .x = 60, .y = 260, .t = 1.0 } },
+            .{ .name = "menu_conv", .m = .{ .open = true, .kind = .conversation, .pinned = false, .muted = false, .x = 90, .y = 200, .t = 1.0 } },
         };
         for (menus) |mc| {
             @memset(fb.pixels, clear);

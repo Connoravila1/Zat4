@@ -276,10 +276,21 @@ pub const Conversation = struct {
     last_activity: i64,
     /// Counterparty messages not yet seen; cleared by `markRead`.
     unread: u32,
+    /// CHAT_FEATURES: what the person has DONE to this conversation.
+    /// `pinned` floats it to the top; `muted` silences it (a mute is a promise about
+    /// notifications, so it must exist BEFORE notifications do, or the first thing
+    /// they ever do is wake somebody who asked not to be woken); `hidden` is the
+    /// tombstone left by Delete — the row survives because indexes above it would
+    /// otherwise renumber, and half this codebase holds conversation indexes.
+    pinned: bool = false,
+    muted: bool = false,
+    hidden: bool = false,
 
     comptime {
-        // Budget 32: 2×8 (spans) + 8 (i64) + 4 (u32) = 28 bytes of payload;
-        // i64 alignment pads to 32. Same SoA note as ChatMsg. (A7)
+        // A7: still 32. The three flags land in the four bytes of padding that the
+        // i64 alignment was already spending on nothing — they cost literally
+        // nothing, which is why they are bools here rather than a bitset (A6's
+        // reason to move them out of band does not apply when the space is free).
         assert(@sizeOf(Conversation) == 32);
     }
 };
@@ -729,6 +740,54 @@ pub fn findByStamp(store: *const Store, conv: ConvIndex, created_at: i64, mine_b
     return null;
 }
 
+/// DELETE a conversation from this device: hide it, and scrub every message in it.
+/// The row survives as a tombstone (indexes above it would renumber otherwise), but
+/// nothing of what was said does — a "deleted" conversation whose words sit on disk
+/// is not deleted, and the person who tapped it believes that it is.
+///
+/// It is not sent anywhere: deleting a conversation is a statement about YOUR copy.
+/// (Deleting THEIR copy is what Delete-for-everyone does, message by message, and it
+/// is a different sentence entirely.)
+pub fn deleteConversation(store: *Store, conv: ConvIndex) void {
+    const ci: u32 = @intFromEnum(conv);
+    if (ci >= store.convs.len) return;
+    var i: u32 = 0;
+    while (i < store.msgs.len) : (i += 1) {
+        if (store.msgs.items(.conv)[i] != conv) continue;
+        deleteMessage(store, i);
+    }
+    store.convs.items(.hidden)[ci] = true;
+    store.convs.items(.unread)[ci] = 0;
+}
+
+pub fn setPinned(store: *Store, conv: ConvIndex, on: bool) void {
+    const ci: u32 = @intFromEnum(conv);
+    if (ci < store.convs.len) store.convs.items(.pinned)[ci] = on;
+}
+
+pub fn setMuted(store: *Store, conv: ConvIndex, on: bool) void {
+    const ci: u32 = @intFromEnum(conv);
+    if (ci < store.convs.len) store.convs.items(.muted)[ci] = on;
+}
+
+pub fn isPinned(store: *const Store, conv: ConvIndex) bool {
+    const ci: u32 = @intFromEnum(conv);
+    return ci < store.convs.len and store.convs.items(.pinned)[ci];
+}
+
+pub fn isMuted(store: *const Store, conv: ConvIndex) bool {
+    const ci: u32 = @intFromEnum(conv);
+    return ci < store.convs.len and store.convs.items(.muted)[ci];
+}
+
+/// Mark it UNREAD again — "I saw it, I cannot deal with it now, do not let me
+/// forget." One of the most-used features in every messenger and one of the least
+/// celebrated.
+pub fn markUnread(store: *Store, conv: ConvIndex) void {
+    const ci: u32 = @intFromEnum(conv);
+    if (ci < store.convs.len and store.convs.items(.unread)[ci] == 0) store.convs.items(.unread)[ci] = 1;
+}
+
 pub fn markRead(store: *Store, conv: ConvIndex) void {
     store.convs.slice().items(.unread)[@intFromEnum(conv)] = 0;
 }
@@ -1053,23 +1112,39 @@ pub fn parsePaymentFrame(bytes: []const u8) FrameError!PaymentFrame {
 
 /// The conversation list, newest activity first. Arena-allocated result
 /// (C3); ties break by table order so the output is deterministic.
+/// PINNED FIRST, then by activity — and DELETED conversations are not in the list at
+/// all. (The row still exists in the store; it is simply not something the person is
+/// looking at any more, which is what they asked for when they tapped Delete.)
 pub fn conversationsByActivity(
     arena: Allocator,
     store: *const Store,
 ) error{OutOfMemory}![]ConvIndex {
-    const out = try arena.alloc(ConvIndex, store.convs.len);
-    for (out, 0..) |*slot, i| slot.* = @enumFromInt(i);
+    var keep = try std.ArrayListUnmanaged(ConvIndex).initCapacity(arena, store.convs.len);
+    const hidden = store.convs.items(.hidden);
+    for (0..store.convs.len) |i| {
+        if (hidden[i]) continue;
+        keep.appendAssumeCapacity(@enumFromInt(i));
+    }
+    const out = keep.items;
     const activity = store.convs.items(.last_activity);
+    const pinned = store.convs.items(.pinned);
     const Ctx = struct {
         activity: []const i64,
+        pinned: []const bool,
         pub fn lessThan(ctx: @This(), x: ConvIndex, y: ConvIndex) bool {
+            // A PIN OUTRANKS RECENCY. That is the entire point of a pin: the person
+            // has said "this one stays where I can see it", and a newer message from
+            // somebody else must not be allowed to overrule them.
+            const px = ctx.pinned[@intFromEnum(x)];
+            const py = ctx.pinned[@intFromEnum(y)];
+            if (px != py) return px;
             const ax = ctx.activity[@intFromEnum(x)];
             const ay = ctx.activity[@intFromEnum(y)];
             if (ax != ay) return ax > ay;
             return @intFromEnum(x) < @intFromEnum(y);
         }
     };
-    std.mem.sort(ConvIndex, out, Ctx{ .activity = activity }, Ctx.lessThan);
+    std.mem.sort(ConvIndex, out, Ctx{ .activity = activity, .pinned = pinned }, Ctx.lessThan);
     return out;
 }
 
@@ -1125,7 +1200,7 @@ const codec_magic = [4]u8{ 'Z', 'A', 'T', 'H' };
 /// sections so every v2 blob still reads (a version gate is a compatibility
 /// contract and is written as a RANGE — the day we wrote it as a LIST, a v3 bump
 /// orphaned every conversation on the owner's phone).
-const codec_version: u16 = 4; // v4: the EDITED bitset (v3: the deleted one)
+const codec_version: u16 = 5; // v5: conversation flags (pinned/muted/hidden)
 const conv_rec_len = 28; // did span 8 + handle span 8 + i64 8 + u32 4
 const msg_rec_len = 21; // i64 8 + text span 8 + conv 4 + kind 1
 const pay_rec_len = 23; // id 8 + amount 8 + msg 4 + rail 1 + status 1 + conf 1
@@ -1148,7 +1223,8 @@ pub fn serializeStore(gpa: Allocator, store: *const Store) error{OutOfMemory}![]
         4 + p_count * pay_rec_len +
         4 + r_count * ref_rec_len +
         (m_count + 7) / 8 + // v3: the deleted bitset
-        (m_count + 7) / 8; // v4: the edited bitset
+        (m_count + 7) / 8 + // v4: the edited bitset
+        c_count; // v5: one flags byte per conversation
     const out = try gpa.alloc(u8, total);
     errdefer gpa.free(out);
 
@@ -1243,6 +1319,18 @@ pub fn serializeStore(gpa: Allocator, store: *const Store) error{OutOfMemory}![]
         if (i < store.edited.bit_length and store.edited.isSet(i)) ed_bytes[i / 8] |= @as(u8, 1) << @intCast(i % 8);
     }
     at += (m_count + 7) / 8;
+
+    // v5: what the person has done to each conversation. A pin that a relaunch
+    // forgets is not a pin, and a mute that a relaunch forgets will wake somebody at
+    // 3am who asked not to be woken.
+    for (0..c_count) |i| {
+        var f: u8 = 0;
+        if (convs.items(.pinned)[i]) f |= 1;
+        if (convs.items(.muted)[i]) f |= 2;
+        if (convs.items(.hidden)[i]) f |= 4;
+        out[at] = f;
+        at += 1;
+    }
 
     assert(at == total);
     return out;
@@ -1472,6 +1560,21 @@ pub fn deserializeStore(gpa: Allocator, bytes: []const u8) DeserializeError!Stor
             if (bytes[at + ed_len - 1] & mask != 0) return error.Malformed;
         }
         at += ed_len;
+    }
+
+    // v5: the conversation flags. A v4 blob has none — nothing had been pinned,
+    // muted or deleted before those existed.
+    if (version >= 5) {
+        if (bytes.len - at < c_count) return error.Malformed;
+        const cs = store.convs.slice();
+        for (0..c_count) |i| {
+            const f = bytes[at + i];
+            if (f & ~@as(u8, 7) != 0) return error.Malformed; // canonical: no unknown bits
+            cs.items(.pinned)[i] = (f & 1) != 0;
+            cs.items(.muted)[i] = (f & 2) != 0;
+            cs.items(.hidden)[i] = (f & 4) != 0;
+        }
+        at += c_count;
     }
 
     if (at != bytes.len) return error.Malformed; // exact tail — no trailing bytes
@@ -1977,7 +2080,8 @@ test "store codec: a version-1 blob (pre-payments) still restores" {
     const v3 = try serializeStore(gpa, &store);
     defer gpa.free(v3);
     const del_len = (store.msgs.len + 7) / 8; // v3 tombstones + v4 edit marks
-    const v1 = try gpa.dupe(u8, v3[0 .. v3.len - 2 * del_len - 8]);
+    const v5_tail = 2 * del_len + store.convs.len; // …+ v5 conversation flags
+    const v1 = try gpa.dupe(u8, v3[0 .. v3.len - v5_tail - 8]);
     defer gpa.free(v1);
     std.mem.writeInt(u16, v1[4..6], 1, .little);
 
@@ -2021,7 +2125,7 @@ test "store codec v2: every class of payment-section damage is refused" {
     // bytes before it.
     // v3 appends the tombstone bitset AFTER the settlement section, so the
     // payment/settlement records are no longer the tail: step back over it.
-    const del_tail = 2 * ((store.msgs.len + 7) / 8); // v3 tombstones + v4 edit marks
+    const del_tail = 2 * ((store.msgs.len + 7) / 8) + store.convs.len; // v3+v4+v5 tails
     const ref_at = good.len - del_tail - ref_rec_len;
     const pay_at = good.len - del_tail - ref_rec_len - 4 - pay_rec_len;
 

@@ -895,6 +895,10 @@ const RunState = struct {
     ghold_msg: u32,
     ghold_mine: bool,
     ghold_live: bool,
+    /// What is being held: a message, or a conversation ROW (the other half of what
+    /// "hold down on a chat for options" means).
+    ghold_kind: feed_view.ChatMenuKind,
+    ghold_conv: u16,
     /// The message the composer is answering (slice 3), or `no_reply`.
     gchat_reply_to: u32,
     /// The message the composer is EDITING, or `no_reply`.
@@ -5556,10 +5560,20 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                             rs.ghold_ns = clock_shell.monotonicNanos();
                                             rs.ghold_x = rx;
                                             rs.ghold_y = ry;
+                                            rs.ghold_kind = .message;
                                             rs.ghold_msg = mi;
                                             rs.ghold_mine = chat_core.isMine(&rs.gchat_store, @enumFromInt(mi));
                                             rs.ghold_live = true;
                                         }
+                                    } else if (mh.kind == .chat_conv) {
+                                        // HOLD A CONVERSATION for its options — the
+                                        // thing the owner asked for by name.
+                                        rs.ghold_ns = clock_shell.monotonicNanos();
+                                        rs.ghold_x = rx;
+                                        rs.ghold_y = ry;
+                                        rs.ghold_kind = .conversation;
+                                        rs.ghold_conv = mh.post;
+                                        rs.ghold_live = true;
                                     }
                                 }
                             }
@@ -6404,6 +6418,50 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         // ── THE MESSAGE MENU (slice 2) ──
                                         .chat_msg => {}, // the bubble itself: a TAP does nothing (the HOLD is the gesture)
                                         .chat_menu_dismiss => rs.gcmenu = .{},
+                                        // ── CONVERSATION ACTIONS (press-and-hold a row) ──
+                                        .chat_conv_pin => if (dev_chat) {
+                                            if (chatConvAtOrdinal(rs, rs.gcmenu.conv)) |c| {
+                                                const on = !chat_core.isPinned(&rs.gchat_store, c);
+                                                chat_core.setPinned(&rs.gchat_store, c, on);
+                                                chatPersistHistory(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
+                                                rs.status = if (on) "chat: pinned" else "chat: unpinned";
+                                            }
+                                            rs.gcmenu = .{};
+                                        },
+                                        .chat_conv_mute => if (dev_chat) {
+                                            if (chatConvAtOrdinal(rs, rs.gcmenu.conv)) |c| {
+                                                const on = !chat_core.isMuted(&rs.gchat_store, c);
+                                                chat_core.setMuted(&rs.gchat_store, c, on);
+                                                chatPersistHistory(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
+                                                rs.status = if (on) "chat: muted" else "chat: unmuted";
+                                            }
+                                            rs.gcmenu = .{};
+                                        },
+                                        .chat_conv_unread => if (dev_chat) {
+                                            if (chatConvAtOrdinal(rs, rs.gcmenu.conv)) |c| {
+                                                chat_core.markUnread(&rs.gchat_store, c);
+                                                chatPersistHistory(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
+                                                rs.status = "chat: marked unread";
+                                            }
+                                            rs.gcmenu = .{};
+                                        },
+                                        .chat_conv_delete => if (dev_chat) {
+                                            // YOUR copy. It scrubs every message in it —
+                                            // a "deleted" conversation whose words sit on
+                                            // disk is not deleted. It is not sent
+                                            // anywhere: deleting THEIR copy is what
+                                            // Delete-for-everyone does, message by
+                                            // message, and it is a different sentence.
+                                            if (chatConvAtOrdinal(rs, rs.gcmenu.conv)) |c| {
+                                                chat_core.deleteConversation(&rs.gchat_store, c);
+                                                if (rs.gchat_sel) |sel| if (sel == c) {
+                                                    rs.gchat_sel = null;
+                                                };
+                                                chatPersistHistory(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
+                                                rs.status = "chat: conversation deleted";
+                                            }
+                                            rs.gcmenu = .{};
+                                        },
                                         .chat_msg_copy => if (dev_chat) {
                                             const body = chatMsgText(rs, rs.gcmenu.msg);
                                             if (body.len > 0) setClipboardText(rs, backend, body);
@@ -9778,6 +9836,16 @@ fn setClipboardText(rs: *RunState, backend: Backend, t: []const u8) void {
     rs.clip_out_len = n;
 }
 
+/// The conversation a held list-row names. It goes through the SAME mapping the row
+/// tap uses (`chatConvAt`), because when a search filter is live the ordinal is in
+/// filtered space — and a menu that acted on the wrong conversation would be the
+/// worst bug in this whole feature.
+fn chatConvAtOrdinal(rs: *RunState, ordinal: u16) ?chat_core.ConvIndex {
+    _ = rs.gchat_arena_state.reset(.retain_capacity);
+    const q = rs.gchat_q_buf[0..rs.gchat_q_len];
+    return chatConvAt(rs.gchat_arena_state.allocator(), &rs.gchat_store, clock_shell.unixSeconds(), q, ordinal);
+}
+
 /// The store index of the Nth bubble in the OPEN thread. The view hands back an
 /// ordinal (a Region carries a u16 and a long history can outgrow it); this walks
 /// the same query the view's rows were built from, so the two cannot drift apart.
@@ -9935,14 +10003,28 @@ fn chatHoldStep(rs: *RunState) void {
     if (!rs.ghold_live or rs.gcmenu.open) return;
     const el_ms = (clock_shell.monotonicNanos() -| rs.ghold_ns) / 1_000_000;
     if (el_ms < chat_hold_ms) return;
-    rs.gcmenu = .{
-        .open = true,
-        .msg = rs.ghold_msg,
-        .mine = rs.ghold_mine,
-        .revisable = chat_core.canRevise(&rs.gchat_store, rs.ghold_msg, clock_shell.unixSeconds()),
-        .x = rs.ghold_x,
-        .y = rs.ghold_y,
-    };
+    if (rs.ghold_kind == .conversation) {
+        const conv = chatConvAtOrdinal(rs, rs.ghold_conv);
+        rs.gcmenu = .{
+            .open = true,
+            .kind = .conversation,
+            .conv = rs.ghold_conv,
+            .pinned = if (conv) |c| chat_core.isPinned(&rs.gchat_store, c) else false,
+            .muted = if (conv) |c| chat_core.isMuted(&rs.gchat_store, c) else false,
+            .x = rs.ghold_x,
+            .y = rs.ghold_y,
+        };
+    } else {
+        rs.gcmenu = .{
+            .open = true,
+            .kind = .message,
+            .msg = rs.ghold_msg,
+            .mine = rs.ghold_mine,
+            .revisable = chat_core.canRevise(&rs.gchat_store, rs.ghold_msg, clock_shell.unixSeconds()),
+            .x = rs.ghold_x,
+            .y = rs.ghold_y,
+        };
+    }
     rs.gcmenu_ns = clock_shell.monotonicNanos();
     rs.ghold_live = false; // the press has been spent on the menu
     // FOLLOW-UP: a haptic tick belongs here — a press-and-hold that opens something

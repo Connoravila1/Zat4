@@ -303,7 +303,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_restart, chat_identity_reset, chat_device_add, chat_device_approve, chat_device_refuse, chat_device_help, chat_help_close, chat_history_get, chat_consent_receipts, chat_consent_typing, chat_consent_done, chat_msg_copy, chat_msg_reply, chat_msg_edit, chat_msg_delete_me, chat_msg_delete_all, chat_menu_dismiss, chat_msg, recv_clip, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, recv_back, recv_use, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_restart, chat_identity_reset, chat_device_add, chat_device_approve, chat_device_refuse, chat_device_help, chat_help_close, chat_history_get, chat_consent_receipts, chat_consent_typing, chat_consent_done, chat_msg_copy, chat_msg_reply, chat_msg_edit, chat_msg_delete_me, chat_conv_pin, chat_conv_mute, chat_conv_unread, chat_conv_delete, chat_msg_delete_all, chat_menu_dismiss, chat_msg, recv_clip, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, recv_back, recv_use, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -9533,7 +9533,18 @@ fn drawPendingDeviceCard(
 // hits the menu or dismisses it — never the thread beneath), and the shell folds
 // its state into the rebuild signature.
 
+/// What the open menu is about: a message, or a whole conversation.
+pub const ChatMenuKind = enum(u8) { message, conversation };
+
 pub const ChatMenuItem = enum(u8) {
+    // conversation
+    pin,
+    unpin,
+    mute,
+    unmute,
+    mark_unread,
+    delete_conv,
+    // message
     copy,
     reply,
     /// Ours, inside the 24h window.
@@ -9550,6 +9561,13 @@ pub const ChatMenuItem = enum(u8) {
 /// The open menu. A7.2: cold, one per frame.
 pub const ChatMenu = struct {
     open: bool = false,
+    kind: ChatMenuKind = .message,
+    /// `conversation`: which one (an ordinal into the list), and its current state —
+    /// a menu that offers "Pin" on something already pinned is a menu that has not
+    /// looked at what it is talking about.
+    conv: u16 = 0,
+    pinned: bool = false,
+    muted: bool = false,
     /// The message it acts on (store index), and whether it is ours.
     msg: u32 = 0,
     mine: bool = false,
@@ -9568,7 +9586,18 @@ pub const ChatMenu = struct {
 const chat_menu_w: i32 = 208;
 const chat_menu_row_h: i32 = 44;
 
-fn chatMenuItems(mine: bool, revisable: bool, out: *[5]ChatMenuItem) []const ChatMenuItem {
+fn chatMenuItems(m: ChatMenu, out: *[6]ChatMenuItem) []const ChatMenuItem {
+    if (m.kind == .conversation) {
+        out[0] = if (m.pinned) .unpin else .pin;
+        out[1] = if (m.muted) .unmute else .mute;
+        out[2] = .mark_unread;
+        out[3] = .delete_conv;
+        return out[0..4];
+    }
+    return chatMsgMenuItems(m.mine, m.revisable, out);
+}
+
+fn chatMsgMenuItems(mine: bool, revisable: bool, out: *[6]ChatMenuItem) []const ChatMenuItem {
     var n: usize = 0;
     out[n] = .copy;
     n += 1;
@@ -9592,6 +9621,12 @@ fn chatMenuItems(mine: bool, revisable: bool, out: *[5]ChatMenuItem) []const Cha
 
 fn chatMenuLabel(it: ChatMenuItem) []const u8 {
     return switch (it) {
+        .pin => "Pin",
+        .unpin => "Unpin",
+        .mute => "Mute",
+        .unmute => "Unmute",
+        .mark_unread => "Mark unread",
+        .delete_conv => "Delete conversation",
         .copy => "Copy",
         .reply => "Reply",
         .edit => "Edit",
@@ -9602,6 +9637,10 @@ fn chatMenuLabel(it: ChatMenuItem) []const u8 {
 
 fn chatMenuAction(it: ChatMenuItem) Action {
     return switch (it) {
+        .pin, .unpin => .chat_conv_pin,
+        .mute, .unmute => .chat_conv_mute,
+        .mark_unread => .chat_conv_unread,
+        .delete_conv => .chat_conv_delete,
         .copy => .chat_msg_copy,
         .reply => .chat_msg_reply,
         .edit => .chat_msg_edit,
@@ -9622,8 +9661,8 @@ fn drawChatMenu(
     m: ChatMenu,
 ) error{OutOfMemory}!void {
     if (!m.open) return;
-    var buf: [5]ChatMenuItem = undefined;
-    const items = chatMenuItems(m.mine, m.revisable, &buf);
+    var buf: [6]ChatMenuItem = undefined;
+    const items = chatMenuItems(m, &buf);
     const h = chat_menu_row_h * @as(i32, @intCast(items.len)) + 12;
 
     // It stays ON SCREEN. A menu summoned near the bottom edge that runs off it is
@@ -9651,7 +9690,7 @@ fn drawChatMenu(
     for (items, 0..) |it, i| {
         const iy = y + 6 + @as(i32, @intCast(i)) * chat_menu_row_h;
         if (iy + chat_menu_row_h > y + hh) break; // still growing: do not spill
-        const destructive = it == .delete_me or it == .delete_all;
+        const destructive = it == .delete_me or it == .delete_all or it == .delete_conv;
         const col: u32 = if (destructive) (@as(u32, a) << 24) | 0xE0705C else (@as(u32, a) << 24) | (ink & 0x00FFFFFF);
         _ = try str(gpa, dl, e, .regular, x + 16, iy + 28, col, 14, chatMenuLabel(it));
         try emitRegion(gpa, regions, x, iy, chat_menu_w, @intCast(chat_menu_row_h), @intCast(@min(m.msg, std.math.maxInt(u16))), chatMenuAction(it));
@@ -10242,8 +10281,20 @@ pub fn layoutChat(
             const ns = std.fmt.bufPrint(&nbuf, "{d}", .{@min(row.unread, 99)}) catch "99";
             const nw: i32 = @intCast(text.measure(e, .semibold, ns, 12));
             const pw = nw + 14;
-            try rect(gpa, dl, right - pw, ly + @as(i32, if (phone) 40 else 34), pw, 20, accent, 10);
-            _ = try str(gpa, dl, e, .semibold, right - pw + 7, ly + @as(i32, if (phone) 54 else 48), 0xFF20201A, 12, ns);
+            // A MUTED conversation still counts, quietly. The badge goes grey rather
+            // than accent: you asked not to be pulled toward it, not to be lied to
+            // about whether anything arrived.
+            const badge = if (row.muted) @as(u32, 0xFF3A3A3A) else accent;
+            const badge_ink = if (row.muted) @as(u32, 0xFFB8B4AA) else @as(u32, 0xFF20201A);
+            try rect(gpa, dl, right - pw, ly + @as(i32, if (phone) 40 else 34), pw, 20, badge, 10);
+            _ = try str(gpa, dl, e, .semibold, right - pw + 7, ly + @as(i32, if (phone) 54 else 48), badge_ink, 12, ns);
+        }
+        // A pin, drawn as one: a small head and a shaft, top-right of the row.
+        if (row.pinned) {
+            const px2 = right - 8;
+            const py2 = ly + @as(i32, if (phone) 16 else 14);
+            try rect(gpa, dl, px2 - 4, py2, 8, 5, softA(0xEDEAE0, 0x99), 2);
+            try rect(gpa, dl, px2 - 1, py2 + 5, 2, 5, softA(0xEDEAE0, 0x99), 1);
         }
         const tx = x0 + 10 + av + 14;
         const tw = right - 46 - tx; // clear of the age column
