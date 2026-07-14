@@ -303,7 +303,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_restart, chat_identity_reset, chat_device_add, chat_device_approve, chat_device_refuse, chat_device_help, chat_help_close, chat_history_get, chat_consent_receipts, chat_consent_typing, chat_consent_done, chat_msg_copy, chat_msg_reply, chat_msg_edit, chat_msg_delete_me, chat_conv_pin, chat_conv_mute, chat_conv_unread, chat_conv_delete, chat_ctx_cancel, chat_msg_delete_all, chat_menu_dismiss, chat_msg, recv_clip, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, recv_back, recv_use, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_restart, chat_identity_reset, chat_device_add, chat_device_approve, chat_device_refuse, chat_device_help, chat_help_close, chat_history_get, chat_consent_receipts, chat_consent_typing, chat_consent_done, chat_msg_copy, chat_msg_reply, chat_msg_edit, chat_msg_delete_me, chat_conv_pin, chat_conv_mute, chat_conv_unread, chat_conv_delete, chat_ctx_cancel, chat_msg_react, chat_msg_delete_all, chat_menu_dismiss, chat_msg, recv_clip, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, recv_back, recv_use, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -9583,6 +9583,11 @@ pub const ChatMenu = struct {
     t: f32 = 0,
 };
 
+/// THE SIX. Every messenger converges on roughly this set because it covers almost
+/// everything people actually mean, and a grid of two hundred is a decision nobody
+/// wants to make with their thumb hovering over somebody's message.
+pub const quick_reactions = [_]u21{ '\u{2764}', '\u{1F44D}', '\u{1F602}', '\u{1F62E}', '\u{1F622}', '\u{1F64F}' };
+
 const chat_menu_w: i32 = 208;
 const chat_menu_row_h: i32 = 44;
 
@@ -9663,7 +9668,7 @@ fn drawChatMenu(
     if (!m.open) return;
     var buf: [6]ChatMenuItem = undefined;
     const items = chatMenuItems(m, &buf);
-    const h = chat_menu_row_h * @as(i32, @intCast(items.len)) + 12;
+    const h = chat_menu_row_h * @as(i32, @intCast(items.len)) + 12 + (if (m.kind == .message) @as(i32, 52) else 0);
 
     // It stays ON SCREEN. A menu summoned near the bottom edge that runs off it is
     // a menu with items nobody can reach.
@@ -9676,6 +9681,7 @@ fn drawChatMenu(
     const ease = 1.0 - (1.0 - t) * (1.0 - t);
     const hh: i32 = @intFromFloat(@as(f32, @floatFromInt(h)) * (0.82 + 0.18 * ease));
     const a: u8 = @intFromFloat(255.0 * ease);
+    const react_h: i32 = if (m.kind == .message) 52 else 0;
 
     // THE EATER GOES DOWN FIRST. `hitTest` walks the regions in REVERSE (last
     // pushed wins), so this must be pushed BEFORE the items or it would swallow
@@ -9687,8 +9693,24 @@ fn drawChatMenu(
     try cardBox(gpa, dl, x, y, chat_menu_w, hh, 12, (@as(u32, a) << 24) | 0x232326);
     try rect(gpa, dl, x, y, chat_menu_w, hh, softA(0xEDEAE0, @intCast(@as(u32, a) / 6)), 12);
 
+    // THE REACTION ROW, above the verbs — where a thumb lands first, because
+    // reacting is the thing people do most and reading a menu is the thing they do
+    // least.
+    if (m.kind == .message and ease > 0.55) {
+        const n: i32 = @intCast(quick_reactions.len);
+        const step = @divTrunc(chat_menu_w - 16, n);
+        for (quick_reactions, 0..) |cp, i| {
+            const ex = x + 8 + @as(i32, @intCast(i)) * step;
+            var ebuf: [4]u8 = undefined;
+            const en = std.unicode.utf8Encode(cp, &ebuf) catch continue;
+            _ = try str(gpa, dl, e, .regular, ex + 2, y + 34, (@as(u32, a) << 24) | 0xFFFFFF, 22, ebuf[0..en]);
+            try emitRegion(gpa, regions, ex, y + 6, step, 40, @intCast(i), .chat_msg_react);
+        }
+        try rect(gpa, dl, x + 10, y + 50, chat_menu_w - 20, 1, softA(0xEDEAE0, 0x14), 0);
+    }
+
     for (items, 0..) |it, i| {
-        const iy = y + 6 + @as(i32, @intCast(i)) * chat_menu_row_h;
+        const iy = y + 6 + react_h + @as(i32, @intCast(i)) * chat_menu_row_h;
         if (iy + chat_menu_row_h > y + hh) break; // still growing: do not spill
         const destructive = it == .delete_me or it == .delete_all or it == .delete_conv;
         const col: u32 = if (destructive) (@as(u32, a) << 24) | 0xE0705C else (@as(u32, a) << 24) | (ink & 0x00FFFFFF);
@@ -10373,7 +10395,8 @@ pub fn layoutChat(
             hslot.* = try payCardHeight(gpa, dl, e, b, cards[b.pay], @min(pay_card_w_max, bub_max));
         } else {
             const quote_h: i32 = if (b.quote.len > 0 and !b.deleted) 26 else 0;
-            const text_h = quote_h + try wrapBody(gpa, dl, e, 0, 0, bub_max - 2 * pad_x, 0, chat_px, b.body, line_h, false, null);
+            const react_pad: i32 = if (b.reacts_n > 0) 16 else 0; // room for the chips
+            const text_h = quote_h + react_pad + try wrapBody(gpa, dl, e, 0, 0, bub_max - 2 * pad_x, 0, chat_px, b.body, line_h, false, null);
             hslot.* = text_h + 2 * pad_y - 4;
         }
         total += hslot.* + gap;
@@ -10497,6 +10520,26 @@ pub fn layoutChat(
                         body_y2 += 26;
                     }
                     _ = try wrapBody(gpa, dl, e, bx + pad_x, body_y2, bub_max - 2 * pad_x, bubble_ink, chat_px, b.body, line_h, true, null);
+                    if (b.reacts_n > 0) {
+                        // The chips hang off the bottom edge of the bubble, on the
+                        // sender's side — where they belong to the message rather than
+                        // floating between two of them.
+                        var cx2 = if (b.mine) bx + bw - 8 else bx + 8;
+                        var it2 = std.mem.splitScalar(u8, b.reacts[0..], 0);
+                        var drawn: u8 = 0;
+                        while (it2.next()) |em| {
+                            if (em.len == 0 or drawn >= b.reacts_n) continue;
+                            const cw3: i32 = 26;
+                            const cxx = if (b.mine) cx2 - cw3 else cx2;
+                            try cardBox(gpa, dl, cxx, by + hh - 10, cw3, 22, 11, 0xFF2A2A2E);
+                            // OURS is ringed, so a person can see what THEY said.
+                            if (b.reacts_mine and drawn == b.reacts_n - 1)
+                                try rect(gpa, dl, cxx, by + hh - 10, cw3, 22, softA(accent & 0x00FFFFFF, 0xAA), 11);
+                            _ = try str(gpa, dl, e, .regular, cxx + 5, by + hh + 6, 0xFFFFFFFF, 14, em);
+                            cx2 = if (b.mine) cxx - 4 else cx2 + cw3 + 4;
+                            drawn += 1;
+                        }
+                    }
                     if (b.edited and !b.deleted) {
                         const em = "Edited";
                         const ew: i32 = @intCast(text.measure(e, .regular, em, 10));

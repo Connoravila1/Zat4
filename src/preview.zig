@@ -982,7 +982,7 @@ pub fn main(init: std.process.Init) !void {
         const menu_rows = [_]chat_view.BubbleRow{
             .{ .body = "are we still on for tomorrow?", .age = "2m", .mine = false, .stamp = true, .kind = .text, .tail = true, .msg = 0 },
             .{ .body = "yes — 7pm", .age = "1m", .mine = true, .stamp = false, .kind = .text, .tail = true, .msg = 1, .quote = "are we still on for tomorrow?", .quote_mine = false },
-            .{ .body = "perfect, see you then", .age = "now", .mine = false, .stamp = false, .kind = .text, .tail = true, .msg = 2, .edited = true },
+            .{ .body = "perfect, see you then", .age = "now", .mine = false, .stamp = false, .kind = .text, .tail = true, .msg = 2, .edited = true, .reacts = ("\u{2764}" ++ "\x00" ++ "\u{1F44D}" ++ "\x00").* ++ @as([18 - 9]u8, @splat(0)), .reacts_n = 2, .reacts_mine = true },
         };
         const menus = [_]struct { name: []const u8, m: feed_view.ChatMenu }{
             .{ .name = "menu_mine", .m = .{ .open = true, .mine = true, .x = 150, .y = 260, .t = 1.0 } },

@@ -1327,6 +1327,27 @@ pub fn sendReply(
     return depositAll(gpa, io, environ, st, link, peer_did, plaintext);
 }
 
+/// React to a message (or take a reaction back — the same emoji twice toggles).
+pub fn sendReact(
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    st: *State,
+    link: *chat_relay.ChatRelay,
+    peer_did: []const u8,
+    target_at: i64,
+    target_mine: bool,
+    emoji: []const u8,
+) SendError!void {
+    var buf: [32]u8 = undefined;
+    if (10 + emoji.len > buf.len) return error.TooLong;
+    buf[0] = chat.kind_react_wire;
+    std.mem.writeInt(i64, buf[1..9], target_at, .little);
+    buf[9] = @intFromBool(target_mine);
+    @memcpy(buf[10..][0..emoji.len], emoji);
+    return depositAll(gpa, io, environ, st, link, peer_did, buf[0 .. 10 + emoji.len]);
+}
+
 /// One typing-indicator ping (U6a): [kind_typing_wire] alone, through the
 /// full E2EE path — encrypt, persist-before-deposit (the same nonce rule as
 /// a message; a ping advances the ratchet exactly like one), one fixed
@@ -1442,6 +1463,8 @@ pub const Incoming = union(enum) {
     edit: struct { peer_did: []u8, conv_did: []u8, created_at: i64, text: []u8 },
     /// A message that answers one of ours (or one of theirs).
     reply: struct { peer_did: []u8, target_at: i64, target_mine: bool, text: []u8 },
+    /// They reacted to a message (or took the reaction back).
+    react: struct { peer_did: []u8, target_at: i64, target_mine: bool, emoji: []u8 },
     /// ANOTHER DEVICE OF OURS is asking for the backlog (slice 5). `device` names
     /// which one, so the answer goes to it and to nobody else.
     history_request: struct { device: [32]u8 },
@@ -1521,6 +1544,10 @@ pub fn freeIncoming(gpa: Allocator, inc: Incoming) void {
         .reply => |r| {
             gpa.free(r.peer_did);
             gpa.free(r.text);
+        },
+        .react => |r| {
+            gpa.free(r.peer_did);
+            gpa.free(r.emoji);
         },
         .history_request => {},
         .history_chunk => |h| gpa.free(h.bytes),
@@ -1794,6 +1821,16 @@ pub fn onBucket(
                         if (!std.mem.eql(u8, st.peer_dids.items[idx], st.my_did)) return null;
                         if (data.len < 2) return null;
                         return .{ .roster = .{ .dids = try gpa.dupe(u8, data[1..]) } };
+                    }
+                    // A REACTION.
+                    if (data[0] == chat.kind_react_wire) {
+                        if (data.len < 11 or data.len > 10 + 8) return null;
+                        return .{ .react = .{
+                            .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]),
+                            .target_at = std.mem.readInt(i64, data[1..9], .little),
+                            .target_mine = data[9] == 0, // their "mine" is our "theirs"
+                            .emoji = try gpa.dupe(u8, data[10..]),
+                        } };
                     }
                     // A REPLY: a message, plus which message it answers.
                     if (data[0] == chat.kind_reply_wire) {

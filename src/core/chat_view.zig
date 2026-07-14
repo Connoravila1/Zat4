@@ -78,16 +78,26 @@ pub const BubbleRow = struct {
     quote: []const u8 = "",
     /// Whose message is being quoted (for the quote strip's accent).
     quote_mine: bool = false,
+    /// The reactions on this message: up to two in a 1:1 (theirs and yours), as
+    /// UTF-8 bytes packed back to back with a NUL between. A reaction the bubble does
+    /// not show is a reaction nobody sent.
+    reacts: [18]u8 = @splat(0),
+    reacts_n: u8 = 0,
+    /// Is one of them ours? (Ours is ringed, so you can see what YOU said.)
+    reacts_mine: bool = false,
 
     comptime {
-        // A7.1 — budget raised 48 → 64 (was 40 → 48 for `msg`). `msg` (u32) is the row's identity in the
+        // A7.1 — budget raised 64 → 88: the reactions ride inline (18 bytes + two
+        // counters). They are two emoji at most in a 1:1 and they belong to the row
+        // that draws them; a span into a side table would cost more indirection than
+        // the bytes it saved, on a struct that exists for one frame. `msg` (u32) is the row's identity in the
         // store and `deleted` is one bit that lands in existing padding; the u32
         // pushes the struct past 40 and alignment rounds to 48. Paid deliberately:
         // without the id, no message action (delete, reply, react) can name the
         // message it is acting on, and the alternative — re-deriving the mapping in
         // the shell from a parallel query — is the kind of implicit coupling that
         // breaks the first time the two orderings disagree.
-        assert(@sizeOf(BubbleRow) == 64);
+        assert(@sizeOf(BubbleRow) == 88);
     }
 };
 
@@ -295,6 +305,21 @@ pub fn buildThread(
                 break :blk chat.isMine(store, @enumFromInt(t));
             },
         };
+        {
+            var rbuf: [4]chat.Reaction = undefined;
+            const rn = chat.reactionsOf(store, mi, &rbuf);
+            var at2: usize = 0;
+            for (rbuf[0..rn]) |rx| {
+                const len = std.mem.indexOfScalar(u8, &rx.emoji, 0) orelse rx.emoji.len;
+                if (at2 + len + 1 > row.reacts.len) break;
+                @memcpy(row.reacts[at2..][0..len], rx.emoji[0..len]);
+                at2 += len;
+                row.reacts[at2] = 0; // one NUL between each
+                at2 += 1;
+                if (rx.mine) row.reacts_mine = true;
+                row.reacts_n += 1;
+            }
+        }
         prev_at = at;
     }
     // Close each same-sender run: the tail goes on its last bubble (a sender

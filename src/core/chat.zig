@@ -156,6 +156,11 @@ pub const kind_edit_wire: u8 = 8;
 /// WHICH one, in a thread where four things are being discussed at once.
 pub const kind_reply_wire: u8 = 9;
 
+/// REACT (CHAT_FEATURES). [kind][i64 target_at][u8 target_mine][emoji utf-8]. Same
+/// naming as an unsend; toggling is implied — the same emoji from the same person
+/// twice takes it back, which is what everybody expects and nobody writes down.
+pub const kind_react_wire: u8 = 10;
+
 /// How many times an unacknowledged Welcome is re-sent before the client
 /// stops and says so. With the ladder below this is ~1 hour of trying; a
 /// relaunch starts the ladder over (`restoreGroups`), so a peer who comes
@@ -257,6 +262,23 @@ pub fn parseKind(byte: u8) KindError!Kind {
 /// out of band in `Store.mine` (A6), parallel to `msgs`.
 /// No message is being answered.
 pub const no_reply: u32 = std.math.maxInt(u32);
+
+/// One reaction: WHO (only "me" vs "them" — a 1:1 conversation has nobody else in
+/// it), on WHICH message, with WHAT. The emoji is stored inline as UTF-8 bytes:
+/// they are 4 bytes at most and a span into the string arena would cost more than
+/// the thing it points at.
+pub const Reaction = struct {
+    msg: u32,
+    /// UTF-8, NUL-padded. One codepoint — a reaction is a reaction, not a message.
+    emoji: [8]u8,
+    mine: bool,
+
+    comptime {
+        // Budget 16: 4 (u32) + 8 (bytes) + 1 (bool) = 13, padded to 16 by the u32's
+        // alignment. Held in quantity, so it is guarded. (A7)
+        assert(@sizeOf(Reaction) == 16);
+    }
+};
 
 pub const ChatMsg = struct {
     /// Unix seconds — the codebase-wide unit; relative ages and ordering
@@ -480,6 +502,10 @@ pub const Store = struct {
     /// whose words changed and said nothing about it would let somebody rewrite what
     /// they said after you read it, and quietly.
     edited: std.DynamicBitSetUnmanaged = .{},
+    /// CHAT_FEATURES: reactions. SPARSE by nature — most messages have none — so
+    /// they are their own rows rather than a column on every message (A3/A6: you do
+    /// not pay for a thing on the messages that do not have it).
+    reactions: std.MultiArrayList(Reaction) = .empty,
     /// One row per payment card (card ⇔ row; M5 A1).
     payments: std.MultiArrayList(PaymentRow) = .empty,
     /// Cold settlement detail, at most one row per payment (A6).
@@ -494,6 +520,7 @@ pub fn deinitStore(gpa: Allocator, store: *Store) void {
     store.msgs.deinit(gpa);
     store.conv_by_did.deinit(gpa);
     store.mine.deinit(gpa);
+    store.reactions.deinit(gpa);
     store.deleted.deinit(gpa);
     store.edited.deinit(gpa);
     store.payments.deinit(gpa);
@@ -810,6 +837,47 @@ pub fn setReplyTo(store: *Store, msg: u32, target: u32) void {
 pub fn replyTo(store: *const Store, msg: u32) u32 {
     if (msg >= store.msgs.len) return no_reply;
     return store.msgs.items(.reply_to)[msg];
+}
+
+/// TOGGLE a reaction: the same emoji from the same person twice is a person taking
+/// it back, which is what everybody expects and nobody writes down.
+pub fn react(gpa: Allocator, store: *Store, msg: u32, emoji: []const u8, mine: bool) error{OutOfMemory}!void {
+    if (msg >= store.msgs.len or emoji.len == 0 or emoji.len > 8) return;
+    var e8: [8]u8 = @splat(0);
+    @memcpy(e8[0..emoji.len], emoji);
+
+    const rs = store.reactions.slice();
+    var i: usize = 0;
+    while (i < store.reactions.len) : (i += 1) {
+        if (rs.items(.msg)[i] != msg) continue;
+        if (rs.items(.mine)[i] != mine) continue;
+        if (!std.mem.eql(u8, &rs.items(.emoji)[i], &e8)) continue;
+        _ = store.reactions.orderedRemove(i); // the same one again = take it back
+        return;
+    }
+    // One reaction per person per message: a new one REPLACES theirs.
+    i = 0;
+    while (i < store.reactions.len) : (i += 1) {
+        if (store.reactions.items(.msg)[i] == msg and store.reactions.items(.mine)[i] == mine) {
+            _ = store.reactions.orderedRemove(i);
+            break;
+        }
+    }
+    try store.reactions.append(gpa, .{ .msg = msg, .emoji = e8, .mine = mine });
+}
+
+/// The reactions on a message, written into `out` (at most 2 in a 1:1 conversation:
+/// theirs and yours). Returns how many.
+pub fn reactionsOf(store: *const Store, msg: u32, out: *[4]Reaction) usize {
+    var n: usize = 0;
+    const rs = store.reactions.slice();
+    for (0..store.reactions.len) |i| {
+        if (rs.items(.msg)[i] != msg) continue;
+        if (n == out.len) break;
+        out[n] = .{ .msg = msg, .emoji = rs.items(.emoji)[i], .mine = rs.items(.mine)[i] };
+        n += 1;
+    }
+    return n;
 }
 
 pub fn markUnread(store: *Store, conv: ConvIndex) void {
@@ -1229,7 +1297,7 @@ const codec_magic = [4]u8{ 'Z', 'A', 'T', 'H' };
 /// sections so every v2 blob still reads (a version gate is a compatibility
 /// contract and is written as a RANGE — the day we wrote it as a LIST, a v3 bump
 /// orphaned every conversation on the owner's phone).
-const codec_version: u16 = 6; // v6: the reply column
+const codec_version: u16 = 7; // v7: reactions
 const conv_rec_len = 28; // did span 8 + handle span 8 + i64 8 + u32 4
 const msg_rec_len = 21; // i64 8 + text span 8 + conv 4 + kind 1
 const pay_rec_len = 23; // id 8 + amount 8 + msg 4 + rail 1 + status 1 + conf 1
@@ -1254,7 +1322,8 @@ pub fn serializeStore(gpa: Allocator, store: *const Store) error{OutOfMemory}![]
         (m_count + 7) / 8 + // v3: the deleted bitset
         (m_count + 7) / 8 + // v4: the edited bitset
         c_count + // v5: one flags byte per conversation
-        4 * m_count; // v6: reply_to, one u32 per message
+        4 * m_count + // v6: reply_to, one u32 per message
+        4 + store.reactions.len * 13; // v7: reactions (u32 msg + 8 emoji + 1 mine)
     const out = try gpa.alloc(u8, total);
     errdefer gpa.free(out);
 
@@ -1367,6 +1436,18 @@ pub fn serializeStore(gpa: Allocator, store: *const Store) error{OutOfMemory}![]
     for (0..m_count) |i| {
         std.mem.writeInt(u32, out[at..][0..4], msgs.items(.reply_to)[i], .little);
         at += 4;
+    }
+
+    // v7: reactions.
+    const rx_count: u32 = @intCast(store.reactions.len);
+    std.mem.writeInt(u32, out[at..][0..4], rx_count, .little);
+    at += 4;
+    const rxs = store.reactions.slice();
+    for (0..rx_count) |i| {
+        std.mem.writeInt(u32, out[at..][0..4], rxs.items(.msg)[i], .little);
+        @memcpy(out[at + 4 ..][0..8], &rxs.items(.emoji)[i]);
+        out[at + 12] = @intFromBool(rxs.items(.mine)[i]);
+        at += 13;
     }
 
     assert(at == total);
@@ -1626,6 +1707,24 @@ pub fn deserializeStore(gpa: Allocator, bytes: []const u8) DeserializeError!Stor
             if (r != no_reply and (r >= m_count or r == i)) return error.Malformed;
             ms.items(.reply_to)[i] = r;
             at += 4;
+        }
+    }
+
+    // v7: reactions. A v6 blob has none.
+    if (version >= 7) {
+        if (bytes.len - at < 4) return error.Malformed;
+        const rx_count = std.mem.readInt(u32, bytes[at..][0..4], .little);
+        at += 4;
+        if (bytes.len - at < @as(usize, rx_count) * 13) return error.Malformed;
+        for (0..rx_count) |_| {
+            const m = std.mem.readInt(u32, bytes[at..][0..4], .little);
+            if (m >= m_count) return error.Malformed; // a reaction on nothing
+            var e8: [8]u8 = undefined;
+            @memcpy(&e8, bytes[at + 4 ..][0..8]);
+            const mb = bytes[at + 12];
+            if (mb > 1) return error.Malformed; // canonical
+            try store.reactions.append(gpa, .{ .msg = m, .emoji = e8, .mine = mb == 1 });
+            at += 13;
         }
     }
 
@@ -2136,7 +2235,7 @@ test "store codec: a version-1 blob (pre-payments) still restores" {
     const v3 = try serializeStore(gpa, &store);
     defer gpa.free(v3);
     const del_len = (store.msgs.len + 7) / 8; // v3 tombstones + v4 edit marks
-    const v5_tail = 2 * del_len + store.convs.len + 4 * store.msgs.len; // v3+v4+v5+v6
+    const v5_tail = 2 * del_len + store.convs.len + 4 * store.msgs.len + 4; // v3..v7 (v7 = a zero count)
     const v1 = try gpa.dupe(u8, v3[0 .. v3.len - v5_tail - 8]);
     defer gpa.free(v1);
     std.mem.writeInt(u16, v1[4..6], 1, .little);
@@ -2181,7 +2280,7 @@ test "store codec v2: every class of payment-section damage is refused" {
     // bytes before it.
     // v3 appends the tombstone bitset AFTER the settlement section, so the
     // payment/settlement records are no longer the tail: step back over it.
-    const del_tail = 2 * ((store.msgs.len + 7) / 8) + store.convs.len + 4 * store.msgs.len; // v3..v6 tails
+    const del_tail = 2 * ((store.msgs.len + 7) / 8) + store.convs.len + 4 * store.msgs.len + 4; // v3..v7 tails
     const ref_at = good.len - del_tail - ref_rec_len;
     const pay_at = good.len - del_tail - ref_rec_len - 4 - pay_rec_len;
 

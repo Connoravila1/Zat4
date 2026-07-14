@@ -2290,6 +2290,12 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                 // take down a message of THEIRS. We honour it —
                                 // because we choose to, which is the only reason any
                                 // client ever does.
+                                .react => |r| react: {
+                                    const conv = chat_core.openConversation(gpa, &rs.gchat_store, r.peer_did, "") catch break :react;
+                                    const tgt = chat_core.findByStamp(&rs.gchat_store, conv, r.target_at, r.target_mine) orelse break :react;
+                                    chat_core.react(gpa, &rs.gchat_store, tgt, r.emoji, false) catch break :react;
+                                    chatPersistHistory(gpa, io, environ, st, &rs.gchat_store);
+                                },
                                 .reply => |r| reply: {
                                     const conv = chat_core.openConversation(gpa, &rs.gchat_store, r.peer_did, "") catch break :reply;
                                     const mi = chat_core.appendMessage(gpa, &rs.gchat_store, conv, .text, r.text, now, false) catch break :reply;
@@ -6486,6 +6492,12 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                             rs.gchat_edit_of = no_reply;
                                             rs.gchat_reply_to = no_reply;
                                         },
+                                        // REACT — the row at the top of the menu. The
+                                        // ordinal is which of the six was tapped.
+                                        .chat_msg_react => if (dev_chat) {
+                                            chatReact(rs, gpa, io, environ, rs.gcmenu.msg, hit.post);
+                                            rs.gcmenu = .{};
+                                        },
                                         .chat_msg_copy => if (dev_chat) {
                                             const body = chatMsgText(rs, rs.gcmenu.msg);
                                             if (body.len > 0) setClipboardText(rs, backend, body);
@@ -9872,6 +9884,27 @@ fn setClipboardText(rs: *RunState, backend: Backend, t: []const u8) void {
     const n = @min(t.len, rs.clip_out_buf.len);
     @memcpy(rs.clip_out_buf[0..n], t[0..n]);
     rs.clip_out_len = n;
+}
+
+/// React to a message: locally first (so the chip appears under the thumb that
+/// tapped it), then tell them. The same emoji twice takes it back — a toggle, which
+/// is what everybody expects and nobody writes down.
+fn chatReact(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, msg: u32, which: u16) void {
+    if (which >= feed_view.quick_reactions.len or msg >= rs.gchat_store.msgs.len) return;
+    var ebuf: [4]u8 = undefined;
+    const n = std.unicode.utf8Encode(feed_view.quick_reactions[which], &ebuf) catch return;
+    const emoji = ebuf[0..n];
+
+    chat_core.react(gpa, &rs.gchat_store, msg, emoji, true) catch return;
+    const st = if (rs.gchat_e2ee) |*p| p else return;
+    chatPersistHistory(gpa, io, env, st, &rs.gchat_store);
+    const link = rs.gchat_link orelse return;
+    const conv = rs.gchat_store.msgs.items(.conv)[msg];
+    const at = rs.gchat_store.msgs.items(.created_at)[msg];
+    const mine = chat_core.isMine(&rs.gchat_store, @enumFromInt(msg));
+    const did = chat_core.conversationDid(&rs.gchat_store, conv);
+    chat_e2ee.sendReact(gpa, io, env, st, link, did, at, mine, emoji) catch |err|
+        chatLog("[chat] react send failed: {s}", .{@errorName(err)});
 }
 
 /// Send a reply over the wire: the text, plus WHICH message it answers (named by
