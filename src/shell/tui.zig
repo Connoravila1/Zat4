@@ -2102,7 +2102,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                     // A1: tell them it landed. Without this their
                                     // client cannot tell a delivered Welcome from a
                                     // lost one, and a lost one is silent forever.
-                                    chatAck(rs, gpa, io, environ, st, s.peer_did, now);
+                                    chatAck(rs, gpa, io, environ, st, s.peer_did, s.device, now);
                                 },
                                 // The peer RE-ESTABLISHED this conversation (their
                                 // side had been lost, or never completed). Verified
@@ -2121,14 +2121,14 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                     // hides — replies landing in an unwatched address —
                                     // is invisible.
                                     if (rs.gchat_link) |lnk| chatEnsureSubs(gpa, st, lnk);
-                                    chatAck(rs, gpa, io, environ, st, s.peer_did, now);
+                                    chatAck(rs, gpa, io, environ, st, s.peer_did, s.device, now);
                                 },
                                 // Their Welcome, again (A1): the one we already
                                 // joined. Our ack never reached them, so they are
                                 // still retrying. Nothing changes here — answer.
                                 .welcome_again => |s| {
                                     chatLog("[chat] welcome re-delivered <- {s} (re-acking)", .{s.peer_did});
-                                    chatAck(rs, gpa, io, environ, st, s.peer_did, now);
+                                    chatAck(rs, gpa, io, environ, st, s.peer_did, s.device, now);
                                 },
                                 // A2 — the two halves DRIFTED. Their message will
                                 // not open under our ratchet, and it is neither
@@ -9653,9 +9653,12 @@ fn chatDeliveryOf(rs: *RunState) chat_core.Delivery {
 /// the group we joined, so the starter learns their Welcome LANDED. Failure is
 /// logged, not surfaced — the peer's own retry brings us back here, and this
 /// path is invisible to the user by design.
-fn chatAck(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, st: *chat_e2ee.State, peer_did: []const u8, now: i64) void {
+/// `device` is the peer DEVICE whose Welcome we just accepted. An ack answers ONE
+/// Welcome, so it is encrypted over that one session — never fanned out across
+/// their other devices, which would retire retries for channels that do not exist.
+fn chatAck(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, st: *chat_e2ee.State, peer_did: []const u8, device: [32]u8, now: i64) void {
     const l = rs.gchat_link orelse return;
-    chat_e2ee.sendGroupAck(gpa, io, env, st, l, peer_did, now) catch |err|
+    chat_e2ee.sendGroupAck(gpa, io, env, st, l, peer_did, device, now) catch |err|
         chatLog("[chat] ACK FAILED -> {s}: {s}", .{ peer_did, @errorName(err) });
 }
 

@@ -337,9 +337,56 @@ pub fn subscriptions(gpa: Allocator, st: *const State) error{OutOfMemory}![][rel
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// SESSIONS, NOT CONVERSATIONS (CHAT_MULTIDEVICE slice 1).
+//
+// A row used to be "the conversation with this person". It is now "the session
+// with ONE OF THIS PERSON'S DEVICES" — so a peer with a phone and a desktop owns
+// TWO rows, and a message to them is encrypted separately into each.
+//
+// This is the pairwise model, and it is Signal's: the sender fans out to every
+// device of every participant. We take it because `core/mls.zig` is deliberately
+// a TWO-MEMBER implementation (its first line says so, and its tree is literally
+// two leaves) — putting four devices in one group means writing a full N-member
+// TreeKEM, which is the group-chat problem, and novel cryptography is the last
+// place to be adventurous. Every pairwise session here is an ordinary two-member
+// group of exactly the kind we already ship, debug and understand.
+//
+// What it costs: N deposits instead of one. What it does NOT cost: anything on
+// the wire. The relay is a per-mailbox store, so even a real N-member group would
+// deposit one copy per member — the metadata is identical either way.
+// ---------------------------------------------------------------------------
+
+/// The first session with this peer — the ROOT device's, because sessions are
+/// appended in device-set order and `keydir.resolveDevices` puts the root first.
+/// The root device's key IS the account's chat identity, which is what a caller
+/// asking for "their anchor" (the payment gate) actually means.
 fn conversationIndex(st: *const State, peer_did: []const u8) ?usize {
     for (st.peer_dids.items, 0..) |d, i| {
         if (std.mem.eql(u8, d, peer_did)) return i;
+    }
+    return null;
+}
+
+/// EVERY session with this peer — one per device of theirs. The buffer is the
+/// device cap (`keydir.max_devices`) with headroom, so this never allocates on a
+/// send path.
+fn sessionsOf(st: *const State, peer_did: []const u8, out: *[16]usize) []const usize {
+    var n: usize = 0;
+    for (st.peer_dids.items, 0..) |d, i| {
+        if (n == out.len) break;
+        if (!std.mem.eql(u8, d, peer_did)) continue;
+        out[n] = i;
+        n += 1;
+    }
+    return out[0..n];
+}
+
+/// The session with ONE named device of a peer — a pair is identified by the two
+/// keys at its ends, so this is the only lookup that can be exact.
+fn sessionIndex(st: *const State, peer_did: []const u8, device: [32]u8) ?usize {
+    for (st.peer_dids.items, st.peer_anchors.items, 0..) |d, a, i| {
+        if (std.mem.eql(u8, d, peer_did) and std.mem.eql(u8, &a, &device)) return i;
     }
     return null;
 }
@@ -542,16 +589,32 @@ fn armWelcome(gpa: Allocator, st: *State, idx: usize, bucket: []const u8, now: i
 /// What the far side knows about this conversation (A1) — what the thread
 /// must say. No conversation at all reads as `confirmed`: the caller has
 /// nothing to show a delivery state for.
+/// ACROSS EVERY DEVICE THEY HAVE (slice 1), and the aggregation is a judgement,
+/// not an accident:
+///
+///   - drifted anywhere  → `needs_reconnect`. A channel that cannot decrypt is
+///     broken NOW, whatever the others are doing.
+///   - acked ANYWHERE    → `confirmed`. The PERSON received it. Their spare
+///     laptop being asleep is not the user's problem and must not be dressed up
+///     as one — "waiting for them to receive this" would be a lie about a message
+///     they are reading right now.
+///   - nothing acked     → `waiting`, or `undelivered` once every device has
+///     exhausted its retries.
 pub fn deliveryState(st: *const State, peer_did: []const u8) chat.Delivery {
-    const idx = conversationIndex(st, peer_did) orelse return .confirmed;
-    const w = st.welcomes.items[idx];
-    // A2 first: a channel that cannot decrypt is broken NOW, whatever it was
-    // doing before. Saying "waiting for them to receive this" about a
-    // conversation whose ratchets have already diverged would be the same
-    // comfortable lie in a new costume.
-    if (w.drifted) return .needs_reconnect;
-    if (w.bucket.len == 0) return .confirmed;
-    return if (w.attempts >= chat.welcome_retry_max) .undelivered else .waiting;
+    var buf: [16]usize = undefined;
+    const sessions = sessionsOf(st, peer_did, &buf);
+    if (sessions.len == 0) return .confirmed; // no conversation: nothing to report
+
+    var any_confirmed = false;
+    var all_exhausted = true;
+    for (sessions) |i| {
+        const w = st.welcomes.items[i];
+        if (w.drifted) return .needs_reconnect;
+        if (w.bucket.len == 0) any_confirmed = true;
+        if (w.bucket.len != 0 and w.attempts < chat.welcome_retry_max) all_exhausted = false;
+    }
+    if (any_confirmed) return .confirmed;
+    return if (all_exhausted) .undelivered else .waiting;
 }
 
 // ---------------------------------------------------------------------------
@@ -572,9 +635,77 @@ pub fn startConversation(
     peer_did: []const u8,
 ) StartError!void {
     if (conversationIndex(st, peer_did) != null) return error.AlreadyOpen;
+
+    // EVERY DEVICE THEY HAVE (slice 1). A person is not a device: talking to them
+    // means talking to each device they have vouched for, or the message lands on
+    // the laptop they left at home and nowhere else.
+    var kps_buf: [16]DeviceTarget = undefined;
+    const targets = try peerTargets(gpa, arena, io, environ, peer_did, &kps_buf);
+    if (targets.len == 0) return error.NoKeyPackage;
+
+    var opened: usize = 0;
+    for (targets) |t| {
+        openSession(gpa, io, environ, st, link, peer_did, t) catch {
+            // One device we could not reach is not a conversation we could not
+            // start — the others are live. Only a TOTAL failure is a failure.
+            logMailbox("welcome FAILED ->", keydir.bootstrapMailbox(t.anchor_pub));
+            continue;
+        };
+        opened += 1;
+    }
+    if (opened == 0) return error.RelayDown;
+    persist(gpa, environ, st);
+}
+
+/// One device of a peer, as the directory gives it to us. A7.2: cold, transient.
+const DeviceTarget = struct {
+    kp_bytes: []const u8,
+    anchor_pub: [32]u8,
+};
+
+/// The devices to address a peer at: their signed device set if they publish one,
+/// and otherwise their single legacy keyPackage.
+///
+/// THE FALLBACK IS NOT OPTIONAL. Every account that exists today publishes the old
+/// singleton and no device records at all; dropping them the moment the new path
+/// shipped would take chat away from everybody we already have in order to serve
+/// devices nobody has yet.
+fn peerTargets(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    peer_did: []const u8,
+    out: *[16]DeviceTarget,
+) StartError![]const DeviceTarget {
+    if (chat_keys.fetchPeerDevices(gpa, arena, io, environ, peer_did) catch null) |set| {
+        var n: usize = 0;
+        for (set.devices) |d| {
+            if (n == out.len) break;
+            out[n] = .{ .kp_bytes = d.key_package, .anchor_pub = d.anchor_pub };
+            n += 1;
+        }
+        if (n > 0) return out[0..n];
+    }
     const peer = (chat_keys.fetchPeer(gpa, arena, io, environ, peer_did) catch return error.NoKeyPackage) orelse
         return error.NoKeyPackage;
+    out[0] = .{ .kp_bytes = peer.kp_bytes, .anchor_pub = peer.anchor_pub };
+    return out[0..1];
+}
 
+/// Build ONE pairwise session with ONE device and send it its Welcome. The row is
+/// appended only once the Welcome is away, so a device we could not reach leaves
+/// no half-open session behind.
+fn openSession(
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    st: *State,
+    link: *chat_relay.ChatRelay,
+    peer_did: []const u8,
+    target: DeviceTarget,
+) StartError!void {
+    _ = environ;
     var ce: mls.CreateEntropy = undefined;
     var ae: mls.AddEntropy = undefined;
     io.randomSecure(std.mem.asBytes(&ce)) catch return error.CryptoFailed;
@@ -584,32 +715,31 @@ pub fn startConversation(
 
     var group = mls.createGroup(gpa, st.my_did, st.anchor_seed, ce) catch return error.CryptoFailed;
     errdefer group.deinit(gpa);
-    const welcome = mls.addPeer(gpa, &group, peer.kp_bytes, @intCast(@max(0, clock.unixSeconds())), ae) catch
+    const welcome = mls.addPeer(gpa, &group, target.kp_bytes, @intCast(@max(0, clock.unixSeconds())), ae) catch
         return error.CryptoFailed;
     defer gpa.free(welcome);
 
     var bucket: [relay.bucket_len]u8 = undefined;
     bucketPack(&bucket, welcome) catch return error.CryptoFailed;
-    const target = keydir.bootstrapMailbox(peer.anchor_pub);
-    logMailbox("welcome ->", target);
-    chat_relay.deposit(link, target, &bucket) catch return error.RelayDown;
+    const mailbox = keydir.bootstrapMailbox(target.anchor_pub);
+    logMailbox("welcome ->", mailbox);
+    chat_relay.deposit(link, mailbox, &bucket) catch return error.RelayDown;
 
     const did_copy = try gpa.dupe(u8, peer_did);
     errdefer gpa.free(did_copy);
     // The Welcome is OUT, not DELIVERED. Retain the bucket and wait for their
-    // ack (A1): until it comes back the conversation reads as "waiting", and
+    // ack (A1): until it comes back the session reads as "waiting", and
     // `retryWelcomes` keeps re-sending. One unacknowledged shot is how a
     // conversation ends up alive on one side and absent on the other.
     const retained = try gpa.dupe(u8, &bucket);
     errdefer gpa.free(retained);
-    try appendConversation(gpa, st, did_copy, peer.anchor_pub, group, .{
+    try appendConversation(gpa, st, did_copy, target.anchor_pub, group, .{
         .bucket = retained,
         .last_sent = clock.unixSeconds(),
         .last_ack = 0,
         .attempts = 1,
         .drifted = false,
     });
-    persist(gpa, environ, st);
 }
 
 /// RE-ESTABLISH a conversation we already have: fetch the peer's CURRENT
@@ -634,12 +764,47 @@ pub fn restartConversation(
     link: *chat_relay.ChatRelay,
     peer_did: []const u8,
 ) StartError!void {
-    const idx = conversationIndex(st, peer_did) orelse return error.NoConversation;
-    // Their CURRENT keys — not the ones we pinned. If they reinstalled, this is
-    // where we learn it.
-    const peer = (chat_keys.fetchPeer(gpa, arena, io, environ, peer_did) catch return error.NoKeyPackage) orelse
-        return error.NoKeyPackage;
+    if (conversationIndex(st, peer_did) == null) return error.NoConversation;
 
+    // Their CURRENT devices — not the ones we pinned. If they reinstalled, added a
+    // phone, or started chat over on a new device, THIS is where we learn it: the
+    // repair rebuilds against whoever they are now, not whoever they were.
+    var kps_buf: [16]DeviceTarget = undefined;
+    const targets = try peerTargets(gpa, arena, io, environ, peer_did, &kps_buf);
+    if (targets.len == 0) return error.NoKeyPackage;
+
+    var rebuilt: usize = 0;
+    for (targets) |t| {
+        // A session with THIS device already? Rebuild it in place. Otherwise this
+        // is a device they have added since we last spoke — open a session with it.
+        if (sessionIndex(st, peer_did, t.anchor_pub)) |idx| {
+            rebuildSession(gpa, io, st, link, idx, t) catch continue;
+        } else {
+            openSession(gpa, io, environ, st, link, peer_did, t) catch continue;
+        }
+        rebuilt += 1;
+    }
+    if (rebuilt == 0) return error.RelayDown;
+
+    // Sessions with devices they NO LONGER HAVE are dropped. Keeping them would
+    // mean every message costing a deposit into a mailbox nobody reads, and the
+    // thread reporting "waiting" forever on a device that is gone.
+    dropStaleSessions(gpa, st, peer_did, targets);
+    persist(gpa, environ, st);
+}
+
+/// Rebuild one existing pairwise session against the device's current keys. The
+/// new group replaces the old ONLY once its Welcome is away: if the deposit fails
+/// we keep the old one and the user can try again, rather than being left holding
+/// a group the peer has never heard of.
+fn rebuildSession(
+    gpa: Allocator,
+    io: std.Io,
+    st: *State,
+    link: *chat_relay.ChatRelay,
+    idx: usize,
+    target: DeviceTarget,
+) StartError!void {
     var ce: mls.CreateEntropy = undefined;
     var ae: mls.AddEntropy = undefined;
     io.randomSecure(std.mem.asBytes(&ce)) catch return error.CryptoFailed;
@@ -649,27 +814,42 @@ pub fn restartConversation(
 
     var group = mls.createGroup(gpa, st.my_did, st.anchor_seed, ce) catch return error.CryptoFailed;
     errdefer group.deinit(gpa);
-    const welcome = mls.addPeer(gpa, &group, peer.kp_bytes, @intCast(@max(0, clock.unixSeconds())), ae) catch
+    const welcome = mls.addPeer(gpa, &group, target.kp_bytes, @intCast(@max(0, clock.unixSeconds())), ae) catch
         return error.CryptoFailed;
     defer gpa.free(welcome);
 
     var bucket: [relay.bucket_len]u8 = undefined;
     bucketPack(&bucket, welcome) catch return error.CryptoFailed;
-    const target = keydir.bootstrapMailbox(peer.anchor_pub);
-    logMailbox("re-welcome ->", target);
-    chat_relay.deposit(link, target, &bucket) catch return error.RelayDown;
+    const mailbox = keydir.bootstrapMailbox(target.anchor_pub);
+    logMailbox("re-welcome ->", mailbox);
+    chat_relay.deposit(link, mailbox, &bucket) catch return error.RelayDown;
 
-    // Swap in the new group only once the Welcome is away: if the deposit fails
-    // we keep the old one and the user can try again, rather than being left with
-    // a group the peer has never heard of.
     st.groups.items[idx].deinit(gpa);
     st.groups.items[idx] = group;
-    st.peer_anchors.items[idx] = peer.anchor_pub;
-    // This Welcome is unacknowledged like any other — retry it, and say
-    // "waiting" until they answer (A1). It supersedes whatever bucket the
-    // conversation was already retrying.
+    st.peer_anchors.items[idx] = target.anchor_pub;
     armWelcome(gpa, st, idx, &bucket, clock.unixSeconds());
-    persist(gpa, environ, st);
+}
+
+/// Forget the sessions we hold with devices this peer no longer has (they removed
+/// one, or started chat over and every old device went with it).
+fn dropStaleSessions(gpa: Allocator, st: *State, peer_did: []const u8, targets: []const DeviceTarget) void {
+    var i: usize = st.peer_dids.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (!std.mem.eql(u8, st.peer_dids.items[i], peer_did)) continue;
+        const anchor_i = st.peer_anchors.items[i];
+        var still_theirs = false;
+        for (targets) |t| {
+            if (std.mem.eql(u8, &t.anchor_pub, &anchor_i)) still_theirs = true;
+        }
+        if (still_theirs) continue;
+        gpa.free(st.peer_dids.orderedRemove(i));
+        _ = st.peer_anchors.orderedRemove(i);
+        var g = st.groups.orderedRemove(i);
+        g.deinit(gpa);
+        const w = st.welcomes.orderedRemove(i);
+        gpa.free(w.bucket);
+    }
 }
 
 /// Re-send every Welcome the peer has not acknowledged and that the backoff
@@ -703,6 +883,13 @@ pub fn retryWelcomes(
 /// to the relay, and indistinguishable from any other bucket. Throttled per
 /// conversation, because a Welcome rides a public mailbox and anyone can
 /// replay one at us.
+/// THE ACK IS NOT FANNED OUT, and that is deliberate. It answers ONE Welcome —
+/// the one that established the session with ONE of their devices — so it is
+/// encrypted over that session and no other. Acking every session with the peer
+/// would tell their OTHER devices that a Welcome they may never have sent had
+/// been delivered, retiring a retry for a channel that does not exist. That is
+/// precisely the A1 bug (a conversation alive on one side, absent on the other)
+/// wearing a different hat.
 pub fn sendGroupAck(
     gpa: Allocator,
     io: std.Io,
@@ -710,9 +897,10 @@ pub fn sendGroupAck(
     st: *State,
     link: *chat_relay.ChatRelay,
     peer_did: []const u8,
+    device: [32]u8,
     now: i64,
 ) SendError!void {
-    const idx = conversationIndex(st, peer_did) orelse return error.NoConversation;
+    const idx = sessionIndex(st, peer_did, device) orelse return error.NoConversation;
     const w = &st.welcomes.items[idx];
     if (w.last_ack != 0 and now - w.last_ack < chat.welcome_ack_min_gap_s) return;
     const ack = [1]u8{chat.kind_group_ack_wire};
@@ -752,6 +940,41 @@ fn depositPlain(
     chat_relay.deposit(link, mls.mailboxId(&st.groups.items[idx], .peers), &bucket) catch return error.RelayDown;
 }
 
+/// THE FAN-OUT. Encrypt this plaintext SEPARATELY into every session we hold
+/// with the peer — one per device of theirs — and deposit each into that device's
+/// mailbox. Each session has its own ratchet, so this is N encryptions, not one
+/// ciphertext sent N times: a device that is not in a session cannot read a word
+/// of what the others get.
+///
+/// A DEVICE THAT FAILS IS NOT A FAILED SEND. If their laptop's deposit is refused
+/// but their phone's lands, the message reached the person, and telling them it
+/// did not would be a lie they cannot act on. We fail only when EVERY device
+/// failed — which is the case the user can actually do something about.
+fn depositAll(
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    st: *State,
+    link: *chat_relay.ChatRelay,
+    peer_did: []const u8,
+    plaintext: []const u8,
+) SendError!void {
+    var buf: [16]usize = undefined;
+    const sessions = sessionsOf(st, peer_did, &buf);
+    if (sessions.len == 0) return error.NoConversation;
+
+    var delivered: usize = 0;
+    var last: ?SendError = null;
+    for (sessions) |idx| {
+        depositPlain(gpa, io, environ, st, link, idx, plaintext) catch |err| {
+            last = err;
+            continue;
+        };
+        delivered += 1;
+    }
+    if (delivered == 0) return last orelse error.RelayDown;
+}
+
 /// Encrypt one message ([kind][text]) into the peer's mailbox. Payment
 /// kinds carry a structured frame and go through `sendPayment`.
 pub fn send(
@@ -765,7 +988,6 @@ pub fn send(
     text: []const u8,
 ) SendError!void {
     assert(!chat.isPaymentKind(kind));
-    const idx = conversationIndex(st, peer_did) orelse return error.NoConversation;
     if (text.len + 1 > max_payload) return error.TooLong; // ciphertext ≥ plaintext; cheap early cut
     var plaintext_buf: [1024]u8 = undefined;
     if (text.len + 1 > plaintext_buf.len) return error.TooLong;
@@ -773,7 +995,7 @@ pub fn send(
     @memcpy(plaintext_buf[1..][0..text.len], text);
     const plaintext = plaintext_buf[0 .. 1 + text.len];
     defer std.crypto.secureZero(u8, plaintext);
-    return depositPlain(gpa, io, environ, st, link, idx, plaintext);
+    return depositAll(gpa, io, environ, st, link, peer_did, plaintext);
 }
 
 /// One typing-indicator ping (U6a): [kind_typing_wire] alone, through the
@@ -790,9 +1012,8 @@ pub fn sendTyping(
     link: *chat_relay.ChatRelay,
     peer_did: []const u8,
 ) SendError!void {
-    const idx = conversationIndex(st, peer_did) orelse return error.NoConversation;
     const ping = [1]u8{chat.kind_typing_wire};
-    return depositPlain(gpa, io, environ, st, link, idx, &ping);
+    return depositAll(gpa, io, environ, st, link, peer_did, &ping);
 }
 
 /// Encrypt one payment CARD ([kind 16/17][frame]) into the peer's mailbox
@@ -858,7 +1079,6 @@ fn sendPaymentBytes(
     kind_byte: u8,
     frame: chat.PaymentFrame,
 ) SendError!void {
-    const idx = conversationIndex(st, peer_did) orelse return error.NoConversation;
     var plaintext_buf: [1024]u8 = undefined;
     const need = 1 + chat.payment_frame_min + frame.note.len;
     if (need > plaintext_buf.len or need > max_payload) return error.TooLong;
@@ -866,19 +1086,24 @@ fn sendPaymentBytes(
     const body = chat.buildPaymentFrame(plaintext_buf[1..], frame);
     const plaintext = plaintext_buf[0 .. 1 + body.len];
     defer std.crypto.secureZero(u8, plaintext); // amounts are content too
-    return depositPlain(gpa, io, environ, st, link, idx, plaintext);
+    // A payment card reaches every device they have, like any other message —
+    // a card that showed up on one of a person's devices and not the others
+    // would be a payment they could see and not answer.
+    return depositAll(gpa, io, environ, st, link, peer_did, plaintext);
 }
 
 /// What one inbox bucket became. `peer_did`/`text` are gpa-owned by the
 /// event; release with `freeIncoming`. A7.2: cold union, transient.
 pub const Incoming = union(enum) {
     message: struct { peer_did: []u8, kind: chat.Kind, text: []u8 },
-    started: struct { peer_did: []u8 },
+    /// `device` is the peer DEVICE whose Welcome opened this session — an ack
+    /// answers ONE Welcome, so the shell has to know which one (slice 1).
+    started: struct { peer_did: []u8, device: [32]u8 },
     /// The peer RE-ESTABLISHED an existing conversation (their side had been
     /// lost or was never completed). Their keys are verified — this is not a
     /// warning, it is a fact worth stating in the thread, because from here on
     /// messages will actually arrive, and before now they silently did not.
-    restarted: struct { peer_did: []u8 },
+    restarted: struct { peer_did: []u8, device: [32]u8 },
     /// The peer is typing right now — ephemeral; the shell shows the
     /// indicator for a few seconds and lets it lapse. Never stored.
     typing: struct { peer_did: []u8 },
@@ -886,7 +1111,7 @@ pub const Incoming = union(enum) {
     /// because our ack never reached them. Nothing changes on our side (the
     /// group is the one we are already using; rebuilding it would reset a
     /// live ratchet). The shell simply acks again.
-    welcome_again: struct { peer_did: []u8 },
+    welcome_again: struct { peer_did: []u8, device: [32]u8 },
     /// The peer ACKED our Welcome: the conversation is real on both sides
     /// (A1). Nothing enters the store — this only retires the retry and the
     /// thread's "waiting for them to receive this" line.
@@ -995,8 +1220,15 @@ pub fn openWelcome(gpa: Allocator, st: *State, payload: []const u8) ?PendingWelc
     // made a broken conversation unfixable. It is still not BELIEVED here:
     // `acceptWelcome` checks it against the directory exactly as it does a first
     // contact, so a stranger cannot reset your conversation by shouting at you.
-    const existing = conversationIndex(st, peer_did_view);
-    // The same group we are already in? Then this is the peer's RETRY of a
+    // WHICH DEVICE OF THEIRS SENT THIS (slice 1). A row is a session with ONE
+    // device, so "do we already have this?" is a question about the DEVICE, not
+    // about the person: a Welcome from their newly-added phone, while we already
+    // talk to their desktop, is a NEW SESSION — not a re-establishment of the
+    // desktop's. Replacing the desktop's session there would have quietly torn
+    // down a working channel every time somebody added a device.
+    const sender = group.leaf_sig_pub[1 - group.my_leaf];
+    const existing = sessionIndex(st, peer_did_view, sender);
+    // The same group we are already in? Then this is that device's RETRY of a
     // Welcome we already accepted (our ack was lost), not a new channel.
     const again = if (existing) |i|
         std.mem.eql(u8, st.groups.items[i].group_id, group.group_id)
@@ -1012,25 +1244,37 @@ pub fn openWelcome(gpa: Allocator, st: *State, payload: []const u8) ?PendingWelc
 /// Phase 2: believe the Welcome ONLY if the claimed DID's published record
 /// pins the same anchor key that signed the Welcome's leaf — a Welcome can
 /// claim any DID; the directory is the check. Consumes `pw` either way.
+/// `allowed` is EVERY DEVICE the claimed DID's directory vouches for (slice 1) —
+/// the root and everything it has signed for. The Welcome's leaf key must be one
+/// of them. Being a set rather than a single key is the entire multi-device
+/// change here; the BAR IS UNCHANGED, and it is the bar that matters: a key the
+/// peer's own published, signed device set does not contain cannot open a
+/// conversation with you, no matter what DID it claims.
 pub fn acceptWelcome(
     gpa: Allocator,
     environ: ?*const std.process.Environ.Map,
     st: *State,
     pw: PendingWelcome,
-    directory_anchor_pub: ?[32]u8,
+    allowed: []const [32]u8,
 ) error{OutOfMemory}!?Incoming {
     var group = pw.group;
-    const expected = directory_anchor_pub orelse {
+    if (allowed.len == 0) {
         group.deinit(gpa);
         gpa.free(pw.peer_did);
         return null; // no published record for the claimed DID: refuse
-    };
+    }
     const their_leaf = 1 - group.my_leaf;
-    if (!std.mem.eql(u8, &expected, &group.leaf_sig_pub[their_leaf])) {
+    const sender = group.leaf_sig_pub[their_leaf];
+    var vouched = false;
+    for (allowed) |a| {
+        if (std.mem.eql(u8, &a, &sender)) vouched = true;
+    }
+    if (!vouched) {
         group.deinit(gpa);
         gpa.free(pw.peer_did);
         return null; // an impostor's Welcome (M4 surfaces these refusals)
     }
+    const expected = sender;
 
     // RE-ESTABLISHMENT. The peer is starting the conversation over — because
     // their side of it never completed, or their device was reinstalled, or
@@ -1060,7 +1304,7 @@ pub fn acceptWelcome(
         st.welcomes.items[idx].drifted = false;
         gpa.free(pw.peer_did); // the DID at `idx` is already ours and unchanged
         persist(gpa, environ, st);
-        return .{ .restarted = .{ .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]) } };
+        return .{ .restarted = .{ .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]), .device = expected } };
     }
 
     appendConversation(gpa, st, pw.peer_did, expected, group, welcome_confirmed) catch {
@@ -1069,7 +1313,7 @@ pub fn acceptWelcome(
         return error.OutOfMemory;
     };
     persist(gpa, environ, st);
-    return .{ .started = .{ .peer_did = try gpa.dupe(u8, pw.peer_did) } };
+    return .{ .started = .{ .peer_did = try gpa.dupe(u8, pw.peer_did), .device = expected } };
 }
 
 /// Route one delivered bucket. `from` is the mailbox it arrived on — the
@@ -1103,11 +1347,28 @@ pub fn onBucket(
             // bucket must not turn into a directory lookup we perform on
             // demand for a stranger.)
             if (pw.again) {
+                const dev = pw.group.leaf_sig_pub[1 - pw.group.my_leaf];
                 pw.group.deinit(gpa);
-                return .{ .welcome_again = .{ .peer_did = pw.peer_did } };
+                return .{ .welcome_again = .{ .peer_did = pw.peer_did, .device = dev } };
             }
-            const fetched = chat_keys.fetchPeer(gpa, arena, io, environ, pw.peer_did) catch null;
-            return acceptWelcome(gpa, environ, st, pw, if (fetched) |p| p.anchor_pub else null);
+            // EVERY DEVICE THEY VOUCH FOR. The device set is the authority on who
+            // may speak for a DID; the legacy singleton is the fallback for the
+            // accounts that have not published one yet.
+            var allowed_buf: [16][32]u8 = undefined;
+            var allowed: []const [32]u8 = &.{};
+            if (chat_keys.fetchPeerDevices(gpa, arena, io, environ, pw.peer_did) catch null) |set| {
+                var n: usize = 0;
+                for (set.devices) |d| {
+                    if (n == allowed_buf.len) break;
+                    allowed_buf[n] = d.anchor_pub;
+                    n += 1;
+                }
+                allowed = allowed_buf[0..n];
+            } else if (chat_keys.fetchPeer(gpa, arena, io, environ, pw.peer_did) catch null) |p| {
+                allowed_buf[0] = p.anchor_pub;
+                allowed = allowed_buf[0..1];
+            }
+            return acceptWelcome(gpa, environ, st, pw, allowed);
         },
         .private_message => {
             // M2.3 transition allowance: a private message arriving ON the
@@ -1320,19 +1581,20 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
         const pw = openWelcome(gpa, &b, bucketUnpack(&welcome_bucket).?) orelse return error.TestUnexpectedResult;
         var wrong = try anchor.publicKey(seed_b);
         wrong[0] ^= 1;
-        try testing.expect((try acceptWelcome(gpa, &env, &b, pw, wrong)) == null);
+        try testing.expect((try acceptWelcome(gpa, &env, &b, pw, &.{wrong})) == null);
         try testing.expect(!hasConversation(&b, a.my_did));
     }
-    // And a claimed DID with NO published record → refused.
+    // And a claimed DID with NO published devices at all → refused. (An empty set
+    // is the "we could not learn who they are" case, and it must never open.)
     {
         const pw = openWelcome(gpa, &b, bucketUnpack(&welcome_bucket).?) orelse return error.TestUnexpectedResult;
-        try testing.expect((try acceptWelcome(gpa, &env, &b, pw, null)) == null);
+        try testing.expect((try acceptWelcome(gpa, &env, &b, pw, &.{})) == null);
     }
 
     // The genuine accept: the directory pins A's real anchor key.
     {
         const pw = openWelcome(gpa, &b, bucketUnpack(&welcome_bucket).?) orelse return error.TestUnexpectedResult;
-        const inc = (try acceptWelcome(gpa, &env, &b, pw, try anchor.publicKey(seed_a))) orelse return error.TestUnexpectedResult;
+        const inc = (try acceptWelcome(gpa, &env, &b, pw, &.{try anchor.publicKey(seed_a)})) orelse return error.TestUnexpectedResult;
         defer freeIncoming(gpa, inc);
         try testing.expectEqualStrings(a.my_did, inc.started.peer_did);
     }
@@ -1642,7 +1904,7 @@ test "chat_e2ee: a VERIFIED re-Welcome re-establishes a desynchronised conversat
     {
         const pw = openWelcome(gpa, &b, bucketUnpack(&wb1).?) orelse return error.TestUnexpectedResult;
         try testing.expect(pw.replaces == null); // genuinely first contact
-        const inc = (try acceptWelcome(gpa, &env, &b, pw, try anchor.publicKey(seed_a))) orelse
+        const inc = (try acceptWelcome(gpa, &env, &b, pw, &.{try anchor.publicKey(seed_a)})) orelse
             return error.TestUnexpectedResult;
         defer freeIncoming(gpa, inc);
         try testing.expectEqualStrings(a.my_did, inc.started.peer_did);
@@ -1671,7 +1933,7 @@ test "chat_e2ee: a VERIFIED re-Welcome re-establishes a desynchronised conversat
         const pw = openWelcome(gpa, &b, bucketUnpack(&wb2).?) orelse return error.TestUnexpectedResult;
         try testing.expect(pw.replaces != null);
         const wrong: [32]u8 = @splat(0xEE);
-        try testing.expect((try acceptWelcome(gpa, &env, &b, pw, wrong)) == null);
+        try testing.expect((try acceptWelcome(gpa, &env, &b, pw, &.{wrong})) == null);
     }
     // …and the refusal left B's ORIGINAL conversation intact.
     try testing.expect(hasConversation(&b, a.my_did));
@@ -1680,7 +1942,7 @@ test "chat_e2ee: a VERIFIED re-Welcome re-establishes a desynchronised conversat
     // The genuine re-establishment: A's real anchor, from the directory.
     {
         const pw = openWelcome(gpa, &b, bucketUnpack(&wb2).?) orelse return error.TestUnexpectedResult;
-        const inc = (try acceptWelcome(gpa, &env, &b, pw, try anchor.publicKey(seed_a))) orelse
+        const inc = (try acceptWelcome(gpa, &env, &b, pw, &.{try anchor.publicKey(seed_a)})) orelse
             return error.TestUnexpectedResult;
         defer freeIncoming(gpa, inc);
         // It reports itself as a RESTART, not a new conversation — the thread can
@@ -1771,7 +2033,7 @@ test "chat_e2ee: a DRIFTED conversation says so; a redelivery says nothing (A2)"
     var wb: [relay.bucket_len]u8 = undefined;
     try bucketPack(&wb, welcome);
     const pw = openWelcome(gpa, &b, bucketUnpack(&wb).?) orelse return error.TestUnexpectedResult;
-    const started = (try acceptWelcome(gpa, &env, &b, pw, try anchor.publicKey(seed_a))) orelse return error.TestUnexpectedResult;
+    const started = (try acceptWelcome(gpa, &env, &b, pw, &.{try anchor.publicKey(seed_a)})) orelse return error.TestUnexpectedResult;
     freeIncoming(gpa, started);
 
     const b_traffic = mls.mailboxId(&b.groups.items[0], .mine);
@@ -1874,4 +2136,116 @@ test "chat_e2ee: EVERY groups-blob version we have ever written still restores" 
     // refused, because we cannot know its layout and guessing would corrupt state.
     try testing.expect(groups_version + 1 > groups_version);
     _ = gpa;
+}
+
+test "chat_e2ee: TWO DEVICES OF ONE PERSON ARE TWO SESSIONS, not a takeover (slice 1)" {
+    // The regression this slice exists to prevent. Bob has a desktop AND a phone.
+    // A row is a session with a DEVICE, so his phone's Welcome must OPEN A SECOND
+    // SESSION — not replace the desktop's, which is what a did-keyed row would
+    // have done: every time Bob added a device, his working channel would have
+    // been quietly torn down and rebuilt against the new one.
+    const gpa = testing.allocator;
+    const seed_a: [32]u8 = @splat(0xA1);
+    const seed_desk: [32]u8 = @splat(0xD1);
+    const seed_phone: [32]u8 = @splat(0xF1);
+    const bob = "did:plc:e2ee-bob-two";
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var tmp_buf: [64]u8 = undefined;
+    const tmp = std.fmt.bufPrint(&tmp_buf, "/tmp/zat-e2ee-md-{d}", .{std.os.linux.getpid()}) catch unreachable;
+    try env.put("ZAT_CACHE_DIR", tmp);
+    defer {
+        var pb: [512]u8 = undefined;
+        if (cache.chatGroupsPath(&pb, &env, "did:plc:e2ee-alice-md")) |p| {
+            var z: [512]u8 = undefined;
+            if (std.fmt.bufPrintZ(&z, "{s}", .{p})) |zp| _ = std.os.linux.unlink(zp) else |_| {}
+        }
+        var z2: [512]u8 = undefined;
+        if (std.fmt.bufPrintZ(&z2, "{s}", .{tmp})) |zp| _ = std.os.linux.rmdir(zp) else |_| {}
+    }
+
+    var alice = try testState(gpa, "did:plc:e2ee-alice-md", seed_a, 0x01, 0x02);
+    defer deinit(gpa, &alice);
+    // Bob's two devices: SAME DID, DIFFERENT KEYS. Nothing is copied between them
+    // — that is the whole design.
+    var desk = try testState(gpa, bob, seed_desk, 0x03, 0x04);
+    defer deinit(gpa, &desk);
+    var phone = try testState(gpa, bob, seed_phone, 0x05, 0x06);
+    defer deinit(gpa, &phone);
+
+    const desk_pub = try anchor.publicKey(seed_desk);
+    const phone_pub = try anchor.publicKey(seed_phone);
+    const allowed = [_][32]u8{ desk_pub, phone_pub }; // Bob's signed device set
+
+    // Each of Bob's devices opens its own pairwise session with Alice.
+    for ([_]*State{ &desk, &phone }, [_]u8{ 0x11, 0x22 }) |bob_dev, ent| {
+        var g = try mls.createGroup(gpa, bob_dev.my_did, bob_dev.anchor_seed, .{
+            .group_id = @splat(ent),
+            .enc_seed = @splat(ent +% 1),
+            .epoch_secret = @splat(ent +% 2),
+        });
+        errdefer g.deinit(gpa);
+        const welcome = try mls.addPeer(gpa, &g, alice.kp.kp_bytes, 0, .{
+            .enc_seed = @splat(ent +% 3),
+            .path_secret = @splat(ent +% 4),
+            .welcome_seed = @splat(ent +% 5),
+        });
+        defer gpa.free(welcome);
+        var wb: [relay.bucket_len]u8 = undefined;
+        try bucketPack(&wb, welcome);
+        g.deinit(gpa); // Bob's own copy is not what this test is about
+
+        const pw = openWelcome(gpa, &alice, bucketUnpack(&wb).?) orelse return error.TestUnexpectedResult;
+        const inc = (try acceptWelcome(gpa, &env, &alice, pw, &allowed)) orelse return error.TestUnexpectedResult;
+        defer freeIncoming(gpa, inc);
+        try testing.expect(inc == .started); // BOTH are a start — neither replaces the other
+    }
+
+    // Two sessions with one person.
+    var buf: [16]usize = undefined;
+    const sessions = sessionsOf(&alice, bob, &buf);
+    try testing.expectEqual(@as(usize, 2), sessions.len);
+    try testing.expect(sessionIndex(&alice, bob, desk_pub) != null);
+    try testing.expect(sessionIndex(&alice, bob, phone_pub) != null);
+    // And they are genuinely different channels — not one group counted twice.
+    try testing.expect(!std.mem.eql(
+        u8,
+        alice.groups.items[sessions[0]].group_id,
+        alice.groups.items[sessions[1]].group_id,
+    ));
+
+    // A stranger's device — one Bob's directory does NOT vouch for — cannot open a
+    // session by claiming his DID, no matter how well-formed its Welcome is.
+    {
+        const seed_imp: [32]u8 = @splat(0xEE);
+        var impostor = try testState(gpa, bob, seed_imp, 0x07, 0x08);
+        defer deinit(gpa, &impostor);
+        var g = try mls.createGroup(gpa, impostor.my_did, impostor.anchor_seed, .{
+            .group_id = @splat(0x30),
+            .enc_seed = @splat(0x31),
+            .epoch_secret = @splat(0x32),
+        });
+        const welcome = try mls.addPeer(gpa, &g, alice.kp.kp_bytes, 0, .{
+            .enc_seed = @splat(0x33),
+            .path_secret = @splat(0x34),
+            .welcome_seed = @splat(0x35),
+        });
+        defer gpa.free(welcome);
+        g.deinit(gpa);
+        var wb: [relay.bucket_len]u8 = undefined;
+        try bucketPack(&wb, welcome);
+        const pw = openWelcome(gpa, &alice, bucketUnpack(&wb).?) orelse return error.TestUnexpectedResult;
+        try testing.expect((try acceptWelcome(gpa, &env, &alice, pw, &allowed)) == null);
+        try testing.expectEqual(@as(usize, 2), sessionsOf(&alice, bob, &buf).len); // unchanged
+    }
+
+    // DELIVERY IS ABOUT THE PERSON, NOT THE DEVICE. Alice is waiting on Welcomes of
+    // her own to two of Bob's devices; the moment ONE of them acks, Bob has
+    // received it, and the thread must stop saying "waiting".
+    alice.welcomes.items[sessions[0]] = .{ .bucket = try gpa.dupe(u8, "x"), .last_sent = 1, .last_ack = 0, .attempts = 1, .drifted = false };
+    alice.welcomes.items[sessions[1]] = .{ .bucket = try gpa.dupe(u8, "y"), .last_sent = 1, .last_ack = 0, .attempts = 1, .drifted = false };
+    try testing.expectEqual(chat.Delivery.waiting, deliveryState(&alice, bob));
+    _ = confirmWelcome(gpa, &alice, sessions[1]); // his phone acked
+    try testing.expectEqual(chat.Delivery.confirmed, deliveryState(&alice, bob));
 }
