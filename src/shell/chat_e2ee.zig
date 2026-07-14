@@ -1304,6 +1304,29 @@ pub fn send(
     return depositAll(gpa, io, environ, st, link, peer_did, plaintext);
 }
 
+/// Send a message that ANSWERS another one.
+pub fn sendReply(
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    st: *State,
+    link: *chat_relay.ChatRelay,
+    peer_did: []const u8,
+    target_at: i64,
+    target_mine: bool,
+    text: []const u8,
+) SendError!void {
+    var buf: [1024]u8 = undefined;
+    if (10 + text.len > buf.len or 10 + text.len > max_payload) return error.TooLong;
+    buf[0] = chat.kind_reply_wire;
+    std.mem.writeInt(i64, buf[1..9], target_at, .little);
+    buf[9] = @intFromBool(target_mine);
+    @memcpy(buf[10..][0..text.len], text);
+    const plaintext = buf[0 .. 10 + text.len];
+    defer std.crypto.secureZero(u8, plaintext);
+    return depositAll(gpa, io, environ, st, link, peer_did, plaintext);
+}
+
 /// One typing-indicator ping (U6a): [kind_typing_wire] alone, through the
 /// full E2EE path — encrypt, persist-before-deposit (the same nonce rule as
 /// a message; a ping advances the ratchet exactly like one), one fixed
@@ -1417,6 +1440,8 @@ pub const Incoming = union(enum) {
     unsend: struct { peer_did: []u8, conv_did: []u8, created_at: i64 },
     /// The peer revised a message of THEIRS.
     edit: struct { peer_did: []u8, conv_did: []u8, created_at: i64, text: []u8 },
+    /// A message that answers one of ours (or one of theirs).
+    reply: struct { peer_did: []u8, target_at: i64, target_mine: bool, text: []u8 },
     /// ANOTHER DEVICE OF OURS is asking for the backlog (slice 5). `device` names
     /// which one, so the answer goes to it and to nobody else.
     history_request: struct { device: [32]u8 },
@@ -1492,6 +1517,10 @@ pub fn freeIncoming(gpa: Allocator, inc: Incoming) void {
             gpa.free(ed.peer_did);
             gpa.free(ed.conv_did);
             gpa.free(ed.text);
+        },
+        .reply => |r| {
+            gpa.free(r.peer_did);
+            gpa.free(r.text);
         },
         .history_request => {},
         .history_chunk => |h| gpa.free(h.bytes),
@@ -1765,6 +1794,19 @@ pub fn onBucket(
                         if (!std.mem.eql(u8, st.peer_dids.items[idx], st.my_did)) return null;
                         if (data.len < 2) return null;
                         return .{ .roster = .{ .dids = try gpa.dupe(u8, data[1..]) } };
+                    }
+                    // A REPLY: a message, plus which message it answers.
+                    if (data[0] == chat.kind_reply_wire) {
+                        if (data.len < 11) return null;
+                        return .{ .reply = .{
+                            .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]),
+                            .target_at = std.mem.readInt(i64, data[1..9], .little),
+                            // THEIR "mine" is OUR "theirs". Flipped here, once, where
+                            // the wire is being read — not at each of the places that
+                            // later ask "whose message was that?".
+                            .target_mine = data[9] == 0,
+                            .text = try gpa.dupe(u8, data[10..]),
+                        } };
                     }
                     // UNSEND (CHAT_FEATURES slice 3): they are asking us to drop a
                     // message THEY sent. It can only ever name a message in this

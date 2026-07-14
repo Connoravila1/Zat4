@@ -146,6 +146,16 @@ pub const kind_unsend_wire: u8 = 7;
 /// said nothing about it is how somebody rewrites the past quietly.
 pub const kind_edit_wire: u8 = 8;
 
+/// REPLY (CHAT_FEATURES). [kind][i64 target_at][u8 target_was_mine][text] — the
+/// message being answered, named the same way an unsend names one: by its timestamp
+/// and who sent it. `target_was_mine` is from the SENDER's point of view, so the
+/// receiver flips it (their "mine" is our "theirs").
+///
+/// A reply that arrives as a plain message is not a reply — it is a message that
+/// happened to come after another one, and the whole point of the feature is to say
+/// WHICH one, in a thread where four things are being discussed at once.
+pub const kind_reply_wire: u8 = 9;
+
 /// How many times an unacknowledged Welcome is re-sent before the client
 /// stops and says so. With the ladder below this is ~1 hour of trying; a
 /// relaunch starts the ladder over (`restoreGroups`), so a peer who comes
@@ -245,6 +255,9 @@ pub fn parseKind(byte: u8) KindError!Kind {
 
 /// One message. Direction (mine vs. counterparty's) is a single bit stored
 /// out of band in `Store.mine` (A6), parallel to `msgs`.
+/// No message is being answered.
+pub const no_reply: u32 = std.math.maxInt(u32);
+
 pub const ChatMsg = struct {
     /// Unix seconds — the codebase-wide unit; relative ages and ordering
     /// are integer work.
@@ -252,15 +265,18 @@ pub const ChatMsg = struct {
     text: TextSpan,
     conv: ConvIndex,
     kind: Kind,
+    /// CHAT_FEATURES: the message this one ANSWERS (a store index), or `no_reply`.
+    reply_to: u32 = no_reply,
 
     comptime {
-        // Budget 24: 8 (i64) + 8 (span) + 4 (conv) + 1 (kind) = 21 bytes of
-        // payload; @sizeOf reports 24 because i64 alignment pads the tail.
-        // In the SoA store each field lives in its own array, so the pad
-        // never materializes — the guard pins the honest @sizeOf and forces
-        // a decision the moment any field grows. (A7; raising this number
-        // requires A7.1 justification.)
-        assert(@sizeOf(ChatMsg) == 24);
+        // A7.1 — budget raised 24 → 32. `reply_to` (u32) is what makes a reply a
+        // reply: without it the answer and the thing it answers are two unrelated
+        // messages that merely arrived in order. In the SoA store each field lives
+        // in its OWN array, so the real cost is 4 bytes per message and the 8-byte
+        // tail padding this guard now reports never materializes — the guard pins
+        // the honest @sizeOf of the declared struct, which is what forces this
+        // decision to be made on purpose.
+        assert(@sizeOf(ChatMsg) == 32);
     }
 };
 
@@ -644,6 +660,7 @@ fn appendRecord(
         .text = span,
         .conv = conv,
         .kind = kind,
+        .reply_to = no_reply, // set by `setReplyTo` when this message answers one
     });
     try store.mine.resize(gpa, store.msgs.len, false);
     store.mine.setValue(index, mine);
@@ -783,6 +800,18 @@ pub fn isMuted(store: *const Store, conv: ConvIndex) bool {
 /// Mark it UNREAD again — "I saw it, I cannot deal with it now, do not let me
 /// forget." One of the most-used features in every messenger and one of the least
 /// celebrated.
+/// This message ANSWERS that one. Set right after the append, by whoever knows.
+pub fn setReplyTo(store: *Store, msg: u32, target: u32) void {
+    if (msg >= store.msgs.len) return;
+    if (target != no_reply and target >= store.msgs.len) return;
+    store.msgs.items(.reply_to)[msg] = target;
+}
+
+pub fn replyTo(store: *const Store, msg: u32) u32 {
+    if (msg >= store.msgs.len) return no_reply;
+    return store.msgs.items(.reply_to)[msg];
+}
+
 pub fn markUnread(store: *Store, conv: ConvIndex) void {
     const ci: u32 = @intFromEnum(conv);
     if (ci < store.convs.len and store.convs.items(.unread)[ci] == 0) store.convs.items(.unread)[ci] = 1;
@@ -1200,7 +1229,7 @@ const codec_magic = [4]u8{ 'Z', 'A', 'T', 'H' };
 /// sections so every v2 blob still reads (a version gate is a compatibility
 /// contract and is written as a RANGE — the day we wrote it as a LIST, a v3 bump
 /// orphaned every conversation on the owner's phone).
-const codec_version: u16 = 5; // v5: conversation flags (pinned/muted/hidden)
+const codec_version: u16 = 6; // v6: the reply column
 const conv_rec_len = 28; // did span 8 + handle span 8 + i64 8 + u32 4
 const msg_rec_len = 21; // i64 8 + text span 8 + conv 4 + kind 1
 const pay_rec_len = 23; // id 8 + amount 8 + msg 4 + rail 1 + status 1 + conf 1
@@ -1224,7 +1253,8 @@ pub fn serializeStore(gpa: Allocator, store: *const Store) error{OutOfMemory}![]
         4 + r_count * ref_rec_len +
         (m_count + 7) / 8 + // v3: the deleted bitset
         (m_count + 7) / 8 + // v4: the edited bitset
-        c_count; // v5: one flags byte per conversation
+        c_count + // v5: one flags byte per conversation
+        4 * m_count; // v6: reply_to, one u32 per message
     const out = try gpa.alloc(u8, total);
     errdefer gpa.free(out);
 
@@ -1330,6 +1360,13 @@ pub fn serializeStore(gpa: Allocator, store: *const Store) error{OutOfMemory}![]
         if (convs.items(.hidden)[i]) f |= 4;
         out[at] = f;
         at += 1;
+    }
+
+    // v6: what each message answers. A reply that a relaunch forgets is just a
+    // message that happened to arrive after another one.
+    for (0..m_count) |i| {
+        std.mem.writeInt(u32, out[at..][0..4], msgs.items(.reply_to)[i], .little);
+        at += 4;
     }
 
     assert(at == total);
@@ -1575,6 +1612,21 @@ pub fn deserializeStore(gpa: Allocator, bytes: []const u8) DeserializeError!Stor
             cs.items(.hidden)[i] = (f & 4) != 0;
         }
         at += c_count;
+    }
+
+    // v6: the reply column. A v5 blob has none — nothing answered anything before
+    // replies existed.
+    if (version >= 6) {
+        if (bytes.len - at < 4 * @as(usize, m_count)) return error.Malformed;
+        const ms = store.msgs.slice();
+        for (0..m_count) |i| {
+            const r = std.mem.readInt(u32, bytes[at..][0..4], .little);
+            // A reply must name a message that EXISTS (and never itself): a corrupt
+            // index here would have the renderer chasing a bubble that is not there.
+            if (r != no_reply and (r >= m_count or r == i)) return error.Malformed;
+            ms.items(.reply_to)[i] = r;
+            at += 4;
+        }
     }
 
     if (at != bytes.len) return error.Malformed; // exact tail — no trailing bytes
@@ -1828,9 +1880,13 @@ test "store codec: every class of damage is refused, never half-restored" {
     try expectBad(gpa, bad);
     @memcpy(bad, good);
 
-    // A non-canonical direction byte (unused high bit set; 3 messages, so
-    // the direction byte sits before the two empty v2 section counts).
-    bad[good.len - 9] |= 0x80;
+    // A non-canonical direction byte (unused high bit set). Addressed by POSITION,
+    // not by counting back from the end: the tail has grown four times (v3 tombstones,
+    // v4 edit marks, v5 conversation flags, v6 the reply column) and every one of
+    // those bumps would have silently moved a magic offset onto the wrong byte —
+    // where, as it happens, the test would have kept passing for the wrong reason.
+    const mine_at = msgs_at + 3 * msg_rec_len; // 3 messages
+    bad[mine_at] |= 0x80;
     try expectBad(gpa, bad);
     @memcpy(bad, good);
 
@@ -2080,7 +2136,7 @@ test "store codec: a version-1 blob (pre-payments) still restores" {
     const v3 = try serializeStore(gpa, &store);
     defer gpa.free(v3);
     const del_len = (store.msgs.len + 7) / 8; // v3 tombstones + v4 edit marks
-    const v5_tail = 2 * del_len + store.convs.len; // …+ v5 conversation flags
+    const v5_tail = 2 * del_len + store.convs.len + 4 * store.msgs.len; // v3+v4+v5+v6
     const v1 = try gpa.dupe(u8, v3[0 .. v3.len - v5_tail - 8]);
     defer gpa.free(v1);
     std.mem.writeInt(u16, v1[4..6], 1, .little);
@@ -2125,7 +2181,7 @@ test "store codec v2: every class of payment-section damage is refused" {
     // bytes before it.
     // v3 appends the tombstone bitset AFTER the settlement section, so the
     // payment/settlement records are no longer the tail: step back over it.
-    const del_tail = 2 * ((store.msgs.len + 7) / 8) + store.convs.len; // v3+v4+v5 tails
+    const del_tail = 2 * ((store.msgs.len + 7) / 8) + store.convs.len + 4 * store.msgs.len; // v3..v6 tails
     const ref_at = good.len - del_tail - ref_rec_len;
     const pay_at = good.len - del_tail - ref_rec_len - 4 - pay_rec_len;
 

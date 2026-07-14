@@ -72,16 +72,22 @@ pub const BubbleRow = struct {
     /// The words changed after they were sent. The bubble SAYS so — a message that
     /// was quietly rewritten after you read it is how somebody edits the past.
     edited: bool = false,
+    /// What this message ANSWERS, as one line of the quoted text (empty = nothing).
+    /// The quote is what makes a reply legible: in a thread where four things are in
+    /// the air, "yes" answers nothing at all on its own.
+    quote: []const u8 = "",
+    /// Whose message is being quoted (for the quote strip's accent).
+    quote_mine: bool = false,
 
     comptime {
-        // A7.1 — budget raised 40 → 48. `msg` (u32) is the row's identity in the
+        // A7.1 — budget raised 48 → 64 (was 40 → 48 for `msg`). `msg` (u32) is the row's identity in the
         // store and `deleted` is one bit that lands in existing padding; the u32
         // pushes the struct past 40 and alignment rounds to 48. Paid deliberately:
         // without the id, no message action (delete, reply, react) can name the
         // message it is acting on, and the alternative — re-deriving the mapping in
         // the shell from a parallel query — is the kind of implicit coupling that
         // breaks the first time the two orderings disagree.
-        assert(@sizeOf(BubbleRow) == 48);
+        assert(@sizeOf(BubbleRow) == 64);
     }
 };
 
@@ -277,6 +283,17 @@ pub fn buildThread(
             .msg = mi,
             .deleted = gone,
             .edited = chat.isEdited(store, mi),
+            .quote = blk: {
+                const t = chat.replyTo(store, mi);
+                if (t == chat.no_reply or t >= store.msgs.len) break :blk "";
+                if (chat.isDeleted(store, t)) break :blk "Message deleted";
+                break :blk chat.sliceSpan(store, store.msgs.items(.text)[t]);
+            },
+            .quote_mine = blk: {
+                const t = chat.replyTo(store, mi);
+                if (t == chat.no_reply or t >= store.msgs.len) break :blk false;
+                break :blk chat.isMine(store, @enumFromInt(t));
+            },
         };
         prev_at = at;
     }
