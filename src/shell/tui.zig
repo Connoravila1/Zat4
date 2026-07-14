@@ -865,6 +865,18 @@ const RunState = struct {
     /// actually changed, so a quiet app is a silent one.
     groster_sig: u64,
     groster_at: i64,
+    /// Slice 4: which conversation the device-set refresh looks at next, and when it
+    /// last looked. One at a time, in rotation — checking everybody at once would be
+    /// a burst of network on the render thread for no benefit.
+    gpeer_refresh_at: i64,
+    gpeer_refresh_i: usize,
+    /// Slice 5: the backlog, arriving in pieces from our other device. Adopted only
+    /// when ALL of it is here — half a history is not a history.
+    ghist: std.ArrayListUnmanaged(u8),
+    ghist_total: u16,
+    ghist_have: u16,
+    /// What the "bring my history" button is doing right now.
+    gdev_hist_state: feed_view.HistoryState,
     /// A URL this frame asked the OS to open. On the phone there is no
     /// `xdg-open` — the seam hands it to the activity, which fires an
     /// ACTION_VIEW intent (the same road the OAuth browser already takes).
@@ -1528,6 +1540,12 @@ fn initRunState(
     rs.groster_n = 0;
     rs.groster_sig = 0;
     rs.groster_at = 0;
+    rs.gpeer_refresh_at = 0;
+    rs.gpeer_refresh_i = 0;
+    rs.ghist = .empty;
+    rs.ghist_total = 0;
+    rs.ghist_have = 0;
+    rs.gdev_hist_state = .none;
     rs.gboot_start_ns = 0;
     // A signed-in app never plays the entrance: it is the front door's overture,
     // not a splash screen, and somebody who is already inside is not arriving.
@@ -2228,6 +2246,61 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                 // standing law against. They go into a queue and are
                                 // opened one per frame, visibly, so the list fills in
                                 // in front of the person instead of the app dying.
+                                // HISTORY (slice 5). Our other device asked for the
+                                // backlog: serialize what we have and send it. The
+                                // request already proved it came from one of our own
+                                // devices (it decrypted under a session with our own
+                                // DID), and the person approved that device
+                                // themselves — there is nobody else to ask.
+                                .history_request => |h| hreq: {
+                                    if (rs.gchat_link) |l| {
+                                        const blob = chat_core.serializeStore(gpa, &rs.gchat_store) catch break :hreq;
+                                        defer gpa.free(blob);
+                                        chatLog("[chat] history -> our other device: {d} bytes", .{blob.len});
+                                        chat_e2ee.sendHistory(gpa, io, environ, st, l, h.device, blob) catch |err|
+                                            chatLog("[chat] history send failed: {s}", .{@errorName(err)});
+                                    }
+                                },
+                                // A piece of it. Held until the whole thing has
+                                // arrived — half a history is not a history, and
+                                // adopting one would leave a person with a past that
+                                // silently stops in the middle.
+                                .history_chunk => |h| hchunk: {
+                                    if (h.total == 0 or h.total > 4096) break :hchunk;
+                                    if (rs.ghist_total != h.total) {
+                                        rs.ghist.clearRetainingCapacity();
+                                        rs.ghist_total = h.total;
+                                        rs.ghist_have = 0;
+                                    }
+                                    rs.ghist.appendSlice(gpa, h.bytes) catch break :hchunk;
+                                    rs.ghist_have += 1;
+                                    if (rs.ghist_have < rs.ghist_total) break :hchunk;
+
+                                    // All of it. Adopt ONLY onto an empty store: this
+                                    // is a device that has just been let in, and
+                                    // merging two histories is a different, harder
+                                    // feature that nobody has asked for.
+                                    defer {
+                                        rs.ghist.clearRetainingCapacity();
+                                        rs.ghist_total = 0;
+                                        rs.ghist_have = 0;
+                                    }
+                                    if (rs.gchat_store.convs.len > 0) {
+                                        chatLog("[chat] history arrived but this device already has one — ignored", .{});
+                                        break :hchunk;
+                                    }
+                                    var incoming = chat_core.deserializeStore(gpa, rs.ghist.items) catch {
+                                        chatLog("[chat] history arrived damaged — ignored", .{});
+                                        break :hchunk;
+                                    };
+                                    chat_core.deinitStore(gpa, &rs.gchat_store);
+                                    rs.gchat_store = incoming;
+                                    incoming = .{};
+                                    chatPersistHistory(gpa, io, environ, st, &rs.gchat_store);
+                                    rs.gdev_hist_state = .done;
+                                    rs.status = "chat: your history is here";
+                                    chatLog("[chat] history ADOPTED: {d} conversation(s)", .{rs.gchat_store.convs.len});
+                                },
                                 .roster => |r| {
                                     var it = std.mem.tokenizeScalar(u8, r.dids, '\n');
                                     var queued: usize = 0;
@@ -2367,6 +2440,15 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
             if (now - rs.groster_at >= 15) {
                 rs.groster_at = now;
                 rosterPublish(rs, gpa, io, environ, st, now);
+            }
+
+            // SLICE 4 — KEEP UP WITH WHO PEOPLE ARE. One conversation at a time, in
+            // rotation: are they still on the devices we think they are? This is what
+            // makes a lost phone survivable WITHOUT anybody re-messaging anybody —
+            // and it is where a key change becomes visible instead of silent.
+            if (now - rs.gpeer_refresh_at >= 60) {
+                rs.gpeer_refresh_at = now;
+                peerRefreshNext(rs, gpa, io, environ, st, now);
             }
         };
 
@@ -6189,6 +6271,15 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                             rs.gdev_error = "";
                                             startDeviceJob(rs, gpa, io, environ, session, .refuse);
                                         },
+                                        .chat_history_get => if (dev_chat) {
+                                            if (rs.gchat_e2ee) |*st| if (rs.gchat_link) |l| {
+                                                rs.gdev_hist_state = .asking;
+                                                chat_e2ee.requestHistory(gpa, io, environ, st, l) catch |err| {
+                                                    chatLog("[chat] history request failed: {s}", .{@errorName(err)});
+                                                    rs.gdev_hist_state = .none;
+                                                };
+                                            };
+                                        },
                                         .chat_device_help => rs.gdev_help = true,
                                         .chat_help_close => rs.gdev_help = false,
                                         .chat_send => if (dev_chat) {
@@ -9381,6 +9472,56 @@ fn chatStartWith(
     chatEnsureSubs(gpa, st, link);
 }
 
+/// Check ONE conversation's device set (slice 4), in rotation. When somebody has
+/// started chat on a new device, SAY SO in the thread — a line of grey text, and
+/// the difference between an encrypted app and an app that IS encrypted.
+fn peerRefreshNext(
+    rs: *RunState,
+    gpa: Allocator,
+    io: std.Io,
+    env: ?*const std.process.Environ.Map,
+    st: *chat_e2ee.State,
+    now: i64,
+) void {
+    const link = rs.gchat_link orelse return;
+    const n = rs.gchat_store.convs.len;
+    if (n == 0) return;
+    if (rs.gpeer_refresh_i >= n) rs.gpeer_refresh_i = 0;
+    const conv: chat_core.ConvIndex = @enumFromInt(rs.gpeer_refresh_i);
+    rs.gpeer_refresh_i += 1;
+
+    const did = chat_core.conversationDid(&rs.gchat_store, conv);
+    if (did.len == 0 or std.mem.eql(u8, did, st.my_did)) return; // never ourselves
+    _ = rs.gchat_arena_state.reset(.retain_capacity);
+    const what = chat_e2ee.refreshPeer(gpa, rs.gchat_arena_state.allocator(), io, env, st, link, did);
+    switch (what) {
+        .unchanged => {},
+        .updated => {
+            // They added or retired a device. Housekeeping, not news — we now reach
+            // every device they have, and nobody needs to be interrupted about it.
+            chatLog("[chat] devices changed for {s} — sessions updated", .{did});
+            chatEnsureSubs(gpa, st, link);
+        },
+        .reset => {
+            // EVERY device we knew of theirs is gone. Their messages will reach us
+            // again — and the person MUST be told, because "their keys changed and
+            // everything carried on quietly" is precisely what a successful
+            // impersonation looks like. It costs one line of grey text, and it is the
+            // whole difference between an encrypted app and an app that IS encrypted.
+            chatLog("[chat] {s} STARTED CHAT ON A NEW DEVICE — sessions rebuilt", .{did});
+            chatEnsureSubs(gpa, st, link);
+            const handle = chat_core.conversationHandle(&rs.gchat_store, conv);
+            const who = if (handle.len > 0) handle else did;
+            var buf: [160]u8 = undefined;
+            const line = std.fmt.bufPrint(&buf, "{s} started chat on a new device. If that wasn't them, ask them.", .{who}) catch
+                "They started chat on a new device. If that wasn't them, ask them.";
+            _ = chat_core.appendMessage(gpa, &rs.gchat_store, conv, .system, line, now, false) catch {};
+            chatPersistHistory(gpa, io, env, st, &rs.gchat_store);
+            rs.status = "chat: they started chat on a new device";
+        },
+    }
+}
+
 /// Hand our other devices the list of people we talk to (slice 3) — but only when
 /// there is something new to say. The signature folds in BOTH the conversation list
 /// and how many self-sessions we hold, so a device joining is itself a change.
@@ -9457,6 +9598,15 @@ fn chatDevicesOf(rs: *RunState, arena: Allocator) feed_view.ChatDevices {
         .added_t = added_t,
         .added_name = rs.gdev_added_name[0..rs.gdev_added_len],
         .t = @as(f32, @floatFromInt(@mod(now / 1_000_000, 100_000))) / 1000.0,
+        // The offer belongs on exactly one screen: a device that is IN the account
+        // and has no history of its own. Anywhere else it would be an invitation to
+        // do something that makes no sense.
+        .history = if (rs.gdev_hist_state != .none)
+            rs.gdev_hist_state
+        else if (rs.gchat_e2ee != null and rs.gchat_store.convs.len == 0 and rs.gdev_state == .ok)
+            .offered
+        else
+            .none,
         .help_open = rs.gdev_help,
     };
 }

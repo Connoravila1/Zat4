@@ -303,7 +303,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_restart, chat_identity_reset, chat_device_add, chat_device_approve, chat_device_refuse, chat_device_help, chat_help_close, recv_clip, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, recv_back, recv_use, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_new, chat_restart, chat_identity_reset, chat_device_add, chat_device_approve, chat_device_refuse, chat_device_help, chat_help_close, chat_history_get, recv_clip, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, recv_back, recv_use, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -9236,6 +9236,10 @@ const chat_line_h: i32 = 23;
 //      Messages, with the honest alarm attached to the refuse path.
 // ---------------------------------------------------------------------------
 
+/// The backlog's journey (slice 5): offered, on its way, here. A transfer that
+/// silently did nothing would be indistinguishable from one that failed.
+pub const HistoryState = enum(u8) { none = 0, offered = 1, asking = 2, done = 3 };
+
 pub const ChatDeviceState = enum(u8) {
     /// This device is part of the account (or chat is simply off). Nothing shows.
     ok = 0,
@@ -9279,6 +9283,8 @@ pub const ChatDevices = struct {
     added_name: []const u8 = "",
     /// Free-running seconds — the waiting pulse. A wait must look alive.
     t: f32 = 0,
+    /// Slice 5: whether to offer the backlog, and how that offer is going.
+    history: HistoryState = .none,
     /// The "How Zat Chat works" page is open (it is a PAGE, not a modal: it
     /// replaces the column, so it cannot bleed through anything or eat a tap it
     /// did not mean to).
@@ -9509,6 +9515,51 @@ fn drawPendingDeviceCard(
     _ = try str(gpa, dl, e, .regular, x + 18, y, wc, 12, caution);
 
     return h + 12;
+}
+
+/// THE BACKLOG OFFER (slice 5). Bringing your messages across is a choice with a
+/// cost, so it is a choice — never something bundled invisibly into adding a device.
+fn drawHistoryOffer(
+    gpa: Allocator,
+    dl: *raster.DrawList,
+    e: *const text.Engine,
+    regions: ?*Regions,
+    x: i32,
+    y0: i32,
+    w: i32,
+    accent: u32,
+    state: HistoryState,
+) error{OutOfMemory}!i32 {
+    const h: i32 = 132;
+    try cardBox(gpa, dl, x, y0, w, h, 12, 0xFF1B1B1B);
+    try rect(gpa, dl, x, y0, w, h, 0x2AEDEAE0, 12);
+    var y = y0 + 26;
+
+    if (state == .done) {
+        _ = try str(gpa, dl, e, .semibold, x + 18, y, ink, 15, "Your history is here");
+        y += 24;
+        _ = try str(gpa, dl, e, .regular, x + 18, y, muted, 13, "Everything your other device had, on this one too.");
+        return y0 + h + 12;
+    }
+
+    _ = try str(gpa, dl, e, .semibold, x + 18, y, ink, 15, "This device starts empty");
+    y += 24;
+    _ = try str(gpa, dl, e, .regular, x + 18, y, muted, 13, "New messages arrive here from now on. Your older ones are");
+    y += 18;
+    _ = try str(gpa, dl, e, .regular, x + 18, y, muted, 13, "still on your other device \u{2014} you can bring them across.");
+    y += 22;
+
+    const bh: i32 = 38;
+    const bw = @min(w - 36, 260);
+    const busy = state == .asking;
+    const fill = if (busy) softA(accent, 0x66) else accent;
+    try cardBox(gpa, dl, x + 18, y, bw, bh, 10, fill);
+    try rect(gpa, dl, x + 18, y, bw, 1, softA(0xFFFFFF, 0x40), 10);
+    const lab: []const u8 = if (busy) "Bringing it across\u{2026}" else "Bring my history here";
+    const lw: i32 = @intCast(text.measure(e, .semibold, lab, 14));
+    _ = try str(gpa, dl, e, .semibold, x + 18 + @divTrunc(bw - lw, 2), y + 25, 0xFF12110F, 14, lab);
+    if (!busy) try emitRegion(gpa, regions, x + 18, y, bw, bh, 0, .chat_history_get);
+    return y0 + h + 12;
 }
 
 /// "How Zat Chat works" — the owner's ask, and the right one. A PAGE (it replaces
@@ -9873,7 +9924,16 @@ pub fn layoutChat(
     const row_h: i32 = if (phone) 78 else 64;
     var ly = body_y;
     if (list.len == 0) {
-        _ = try str(gpa, dl, e, .regular, x0, body_y + 24, faint, 14, "No conversations yet");
+        // A DEVICE THAT HAS JUST BEEN LET IN starts empty — that is the honest
+        // default, and it is what we told the person would happen. But the past is
+        // still sitting on their other device, and here is where they can ask for it
+        // (and ONLY here: an offer to move your messages does not belong on a screen
+        // that already has them).
+        if (devices.history != .none) {
+            ly = try drawHistoryOffer(gpa, dl, e, regions, x0, ly, list_w, accent, devices.history);
+        } else {
+            _ = try str(gpa, dl, e, .regular, x0, body_y + 24, faint, 14, "No conversations yet");
+        }
     }
     for (list, 0..) |row, i| {
         const on = !phone and i == sel; // no persistent selection wash on phone

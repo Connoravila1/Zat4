@@ -867,6 +867,134 @@ pub fn sendRoster(
     return depositAll(gpa, io, environ, st, link, st.my_did, plaintext);
 }
 
+// ── HISTORY TRANSFER (slice 5) ──────────────────────────────────────────────
+//
+// The backlog, from the device that has it to the device that has just been let
+// in. Over the SAME pairwise session your devices already share, so it is end-to-
+// end encrypted like everything else and the relay carries it as the same opaque
+// fixed-size buckets it carries messages in.
+//
+// Opt-in, and separate from adding a device on purpose. Adding a device gets you
+// the people; this gets you the past, and only because you asked for it.
+
+/// How much of the blob rides in one bucket. Comfortably inside the payload cap
+/// once the MLS framing is on top — a bucket is a FIXED size (a variable one would
+/// leak the length of what you said), so the chunk must fit with room to spare.
+pub const history_chunk_len: usize = 900;
+
+/// Ask our other devices for the backlog.
+pub fn requestHistory(
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    st: *State,
+    link: *chat_relay.ChatRelay,
+) SendError!void {
+    const req = [1]u8{chat.kind_history_req_wire};
+    return depositAll(gpa, io, environ, st, link, st.my_did, &req);
+}
+
+/// Send `blob` (the serialized store) to ONE of our devices, in order. The mailbox
+/// is FIFO and MLS wants in-order delivery per sender, so the chunks arrive as they
+/// left; a lost one leaves the transfer incomplete rather than corrupt (the
+/// receiver only adopts a history it has all of).
+pub fn sendHistory(
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    st: *State,
+    link: *chat_relay.ChatRelay,
+    device: [32]u8,
+    blob: []const u8,
+) SendError!void {
+    const idx = sessionIndex(st, st.my_did, device) orelse return error.NoConversation;
+    const total = (blob.len + history_chunk_len - 1) / history_chunk_len;
+    if (total == 0 or total > 0xFFFF) return error.TooLong;
+
+    var buf: [5 + history_chunk_len]u8 = undefined;
+    var seq: usize = 0;
+    while (seq < total) : (seq += 1) {
+        const from = seq * history_chunk_len;
+        const to = @min(from + history_chunk_len, blob.len);
+        buf[0] = chat.kind_history_chunk_wire;
+        std.mem.writeInt(u16, buf[1..3], @intCast(seq), .little);
+        std.mem.writeInt(u16, buf[3..5], @intCast(total), .little);
+        @memcpy(buf[5..][0 .. to - from], blob[from..to]);
+        try depositPlain(gpa, io, environ, st, link, idx, buf[0 .. 5 + (to - from)]);
+    }
+}
+
+/// What a refresh found out about a peer (slice 4). A7.2: cold, transient.
+pub const Refresh = enum {
+    /// They are who they were. Nothing to do, nothing to say.
+    unchanged,
+    /// They added or removed a device. We now hold a session with each of the ones
+    /// they have, and none of the ones they do not. Nothing is said: adding a
+    /// phone is not an event that should interrupt anybody.
+    updated,
+    /// EVERY device we knew is gone, and a new one has taken over their chat —
+    /// they started fresh (a lost phone, a reinstall, a wipe). Their messages will
+    /// reach us again, but the person MUST be told, because "their keys changed
+    /// and everything carried on quietly" is exactly what a successful
+    /// impersonation looks like.
+    reset,
+};
+
+/// Bring our sessions with `peer_did` up to date with the devices they publish
+/// NOW — the thing that makes a lost device survivable, and the thing that makes a
+/// key change VISIBLE.
+///
+/// This is what the roadmap calls "the friend's client notices": a person who lost
+/// their phone and signed in on a new one does not have to re-message anybody. The
+/// next time our client looks, it sees the new device, rebuilds, and their thread
+/// simply comes back to life with their next message in it.
+pub fn refreshPeer(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    st: *State,
+    link: *chat_relay.ChatRelay,
+    peer_did: []const u8,
+) Refresh {
+    var known_buf: [16]usize = undefined;
+    const known = sessionsOf(st, peer_did, &known_buf);
+    if (known.len == 0) return .unchanged;
+
+    var kps_buf: [16]DeviceTarget = undefined;
+    const targets = peerTargets(gpa, arena, io, environ, peer_did, &kps_buf) catch return .unchanged;
+    if (targets.len == 0) return .unchanged; // they publish nothing right now: say nothing
+
+    // Do we still recognise ANY of them? If not, every device we ever knew of
+    // theirs is gone and something else is answering for their DID. That is the
+    // "started fresh" signature, and it is the one thing here worth saying out loud.
+    var overlap: usize = 0;
+    var added: usize = 0;
+    for (targets) |t| {
+        if (sessionIndex(st, peer_did, t.anchor_pub) != null) overlap += 1 else added += 1;
+    }
+    if (overlap == 0) {
+        // Rebuild against whoever they are now. (Their old sessions are dead
+        // anyway: a ratchet whose far end no longer exists can decrypt nothing.)
+        for (targets) |t| openSession(gpa, io, environ, st, link, peer_did, t) catch continue;
+        dropStaleSessions(gpa, st, peer_did, targets);
+        persist(gpa, environ, st);
+        return .reset;
+    }
+
+    if (added == 0 and targets.len == known.len) return .unchanged;
+
+    // They added a device (or retired one). Open what is new, forget what is gone —
+    // quietly, because this is housekeeping and not news.
+    for (targets) |t| {
+        if (sessionIndex(st, peer_did, t.anchor_pub) != null) continue;
+        openSession(gpa, io, environ, st, link, peer_did, t) catch continue;
+    }
+    dropStaleSessions(gpa, st, peer_did, targets);
+    persist(gpa, environ, st);
+    return .updated;
+}
+
 /// RE-ESTABLISH a conversation we already have: fetch the peer's CURRENT
 /// published keys, build a fresh group, send them a new Welcome, and replace our
 /// stale group with it.
@@ -1232,6 +1360,12 @@ pub const Incoming = union(enum) {
     /// The peer is typing right now — ephemeral; the shell shows the
     /// indicator for a few seconds and lets it lapse. Never stored.
     typing: struct { peer_did: []u8 },
+    /// ANOTHER DEVICE OF OURS is asking for the backlog (slice 5). `device` names
+    /// which one, so the answer goes to it and to nobody else.
+    history_request: struct { device: [32]u8 },
+    /// A piece of the backlog, from our own device. Adopted only when every piece
+    /// has arrived — a half a history is not a history.
+    history_chunk: struct { seq: u16, total: u16, bytes: []u8 },
     /// ANOTHER DEVICE OF OURS handed us the list of people we talk to (slice 3):
     /// newline-joined DIDs, gpa-owned. Only ever produced for a session with our
     /// OWN did — a roster from anyone else is refused before it gets here.
@@ -1293,6 +1427,8 @@ pub fn freeIncoming(gpa: Allocator, inc: Incoming) void {
         .restarted => |s| gpa.free(s.peer_did),
         .typing => |t| gpa.free(t.peer_did),
         .roster => |r| gpa.free(r.dids),
+        .history_request => {},
+        .history_chunk => |h| gpa.free(h.bytes),
         .welcome_again => |s| gpa.free(s.peer_did),
         .confirmed => |s| gpa.free(s.peer_did),
         .drifted => |s| gpa.free(s.peer_did),
@@ -1563,6 +1699,25 @@ pub fn onBucket(
                         if (!std.mem.eql(u8, st.peer_dids.items[idx], st.my_did)) return null;
                         if (data.len < 2) return null;
                         return .{ .roster = .{ .dids = try gpa.dupe(u8, data[1..]) } };
+                    }
+                    // HISTORY (slice 5) — the ask, and the bytes. Both carry the
+                    // same rule as the roster, and for the same reason: ONLY from
+                    // one of our own devices. A history request from a stranger is
+                    // somebody asking us to send them everything we have ever said,
+                    // and a history CHUNK from a stranger is somebody trying to write
+                    // our past for us. Neither gets past this line.
+                    if (data[0] == chat.kind_history_req_wire) {
+                        if (!std.mem.eql(u8, st.peer_dids.items[idx], st.my_did)) return null;
+                        return .{ .history_request = .{ .device = st.peer_anchors.items[idx] } };
+                    }
+                    if (data[0] == chat.kind_history_chunk_wire) {
+                        if (!std.mem.eql(u8, st.peer_dids.items[idx], st.my_did)) return null;
+                        if (data.len < 5) return null;
+                        return .{ .history_chunk = .{
+                            .seq = std.mem.readInt(u16, data[1..3], .little),
+                            .total = std.mem.readInt(u16, data[3..5], .little),
+                            .bytes = try gpa.dupe(u8, data[5..]),
+                        } };
                     }
                     // Card-FLIP events (settlement 18/19, S2 ready/cancel/
                     // decline 21/22/23): wire-only, like the ping — but their
@@ -2394,7 +2549,7 @@ test "chat_e2ee: TWO DEVICES OF ONE PERSON ARE TWO SESSIONS, not a takeover (sli
     try testing.expectEqual(chat.Delivery.confirmed, deliveryState(&alice, bob));
 }
 
-test "chat_e2ee: a ROSTER is believed only from YOUR OWN device (slice 3)" {
+test "chat_e2ee: a ROSTER and a HISTORY are believed only from YOUR OWN device (slices 3+5)" {
     // The roster tells a client to go and open conversations. So the one question
     // that matters is who is allowed to send one — and the answer is: only another
     // device of yours. A roster from anybody else is an instruction to open
@@ -2449,6 +2604,25 @@ test "chat_e2ee: a ROSTER is believed only from YOUR OWN device (slice 3)" {
         const inc = (try acceptWelcome(gpa, &env, &phone, pw, &.{try anchor.publicKey(snd.seed)})) orelse
             return error.TestUnexpectedResult;
         freeIncoming(gpa, inc);
+
+        // A HISTORY REQUEST over that session. From a stranger this is "send me
+        // everything you have ever said"; it must produce nothing at all.
+        {
+            const req = [_]u8{chat.kind_history_req_wire};
+            const rmsg = try mls.encrypt(gpa, &g, &req, 0, .{ 9, 9, 9, 9 });
+            defer gpa.free(rmsg);
+            var rb: [relay.bucket_len]u8 = undefined;
+            try bucketPack(&rb, rmsg);
+            const rout = try onBucket(gpa, gpa, std.testing.io, &env, &phone, phone.inbox, &rb);
+            if (snd.want_roster) {
+                const got = rout orelse return error.TestUnexpectedResult;
+                defer freeIncoming(gpa, got);
+                try testing.expect(got == .history_request); // our own device may ask
+            } else if (rout) |o| {
+                defer freeIncoming(gpa, o);
+                try testing.expect(o != .history_request); // a stranger may not
+            }
+        }
 
         // …and now they send a roster over that session.
         const payload = [_]u8{chat.kind_roster_wire} ++ "did:plc:someone-they-chose\n".*;

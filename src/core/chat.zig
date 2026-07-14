@@ -110,6 +110,22 @@ pub const kind_group_ack_wire: u8 = 3;
 /// blob is damage, not data.
 pub const kind_roster_wire: u8 = 4;
 
+/// HISTORY TRANSFER (CHAT_MULTIDEVICE slice 5), both halves. Also wire-only, also
+/// only ever between YOUR OWN devices.
+///
+/// `req`: a newly-added device asking its older sibling for the backlog.
+/// `chunk`: [kind][u16 seq][u16 total][bytes] — the serialized store, cut up,
+/// because a history is far bigger than one bucket and a bucket is a fixed size on
+/// purpose (a variable one would leak the length of what you said).
+///
+/// DELIBERATELY OPT-IN AND SEPARATE from adding a device. Bringing your messages
+/// across is a choice with a cost (they leave the one device that held them), and
+/// bundling it invisibly into "add this phone" would be making that choice FOR
+/// somebody. Adding a device gets you the people; this gets you the past, and only
+/// if you ask.
+pub const kind_history_req_wire: u8 = 5;
+pub const kind_history_chunk_wire: u8 = 6;
+
 /// How many times an unacknowledged Welcome is re-sent before the client
 /// stops and says so. With the ladder below this is ~1 hour of trying; a
 /// relaunch starts the ladder over (`restoreGroups`), so a peer who comes
