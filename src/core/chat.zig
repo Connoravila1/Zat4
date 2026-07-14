@@ -88,6 +88,28 @@ pub const kind_typing_wire: u8 = 2;
 /// The ack is the one bit that tells the starter the conversation is real.
 pub const kind_group_ack_wire: u8 = 3;
 
+/// THE ROSTER's WIRE kind byte (reserved 2..15 range) — CHAT_MULTIDEVICE slice 3.
+///
+/// Sent only between YOUR OWN devices, over the pairwise session they share, and
+/// it carries exactly one thing: the DIDs of the people you talk to. No messages,
+/// no history, no names — the list, and nothing else.
+///
+/// Why it has to exist. In the pairwise model your desktop CANNOT create a session
+/// between your phone and your friend's laptop: a session is between two
+/// key-holding endpoints, and your desktop does not hold your phone's keys. That is
+/// not a defect, it is what "nothing is copied" MEANS. So a newly-approved phone can
+/// only join your conversations by opening them ITSELF — and to do that it needs
+/// the one fact it cannot discover alone: who they are. This is that fact.
+///
+/// Without it the phone sits empty until somebody happens to message you, which is
+/// not what we told the user ("your conversation list appears — the people, not the
+/// history").
+///
+/// Wire-only, like the typing ping and the ack: consumed at the session layer,
+/// never stored, so `parseKind` keeps rejecting it. A roster that reached a history
+/// blob is damage, not data.
+pub const kind_roster_wire: u8 = 4;
+
 /// How many times an unacknowledged Welcome is re-sent before the client
 /// stops and says so. With the ladder below this is ~1 hour of trying; a
 /// relaunch starts the ladder over (`restoreGroups`), so a peer who comes

@@ -797,6 +797,76 @@ fn openSession(
     });
 }
 
+// ─────────────── YOUR OWN DEVICES (CHAT_MULTIDEVICE slice 3) ───────────────
+//
+// Your devices hold a pairwise session WITH EACH OTHER — an ordinary two-member
+// group, no different from one with another person, except that both ends are
+// you. It exists to carry the one thing a newly-approved device cannot discover
+// on its own: WHO YOU TALK TO.
+//
+// It has to be this way round. Your desktop cannot open a session between your
+// phone and your friend's laptop, because a session is between two key-holding
+// endpoints and your desktop does not hold your phone's keys. That is not a
+// limitation to work around — it is precisely what "nothing is copied" means. So
+// the desktop hands over the LIST, and the phone opens the conversations itself,
+// which is the one thing only it can do.
+
+/// Open (or top up) the sessions between this device and the account's OTHER
+/// devices. Returns how many we now hold. A device we cannot reach is skipped, not
+/// fatal — it will be picked up the next time this runs.
+pub fn ensureSelfSessions(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    st: *State,
+    link: *chat_relay.ChatRelay,
+) usize {
+    const set = chat_keys.fetchPeerDevices(gpa, arena, io, environ, st.my_did) catch null orelse return 0;
+    const mine = anchor.publicKey(st.anchor_seed) catch return 0;
+
+    var opened: usize = 0;
+    for (set.devices) |d| {
+        if (std.mem.eql(u8, &d.anchor_pub, &mine)) continue; // not with ourselves
+        if (sessionIndex(st, st.my_did, d.anchor_pub) != null) {
+            opened += 1;
+            continue;
+        }
+        openSession(gpa, io, environ, st, link, st.my_did, .{
+            .kp_bytes = d.key_package,
+            .anchor_pub = d.anchor_pub,
+        }) catch continue;
+        opened += 1;
+    }
+    if (opened > 0) persist(gpa, environ, st);
+    return opened;
+}
+
+/// Hand our other devices the list of people we talk to. `dids` is newline-joined
+/// (the caller builds it from the conversation store — the SHELL's list, not ours).
+///
+/// It carries no history and no names: a device that has just been let in gets the
+/// people, and fills up from that moment. Sending the backlog is a separate,
+/// explicit act (slice 5) and must never be bundled quietly into this one.
+pub fn sendRoster(
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    st: *State,
+    link: *chat_relay.ChatRelay,
+    dids: []const u8,
+) SendError!void {
+    if (dids.len == 0) return;
+    var plaintext_buf: [1024]u8 = undefined;
+    if (dids.len + 1 > plaintext_buf.len or dids.len + 1 > max_payload) return error.TooLong;
+    plaintext_buf[0] = chat.kind_roster_wire;
+    @memcpy(plaintext_buf[1..][0..dids.len], dids);
+    const plaintext = plaintext_buf[0 .. 1 + dids.len];
+    // To every other device of ours — including one that was added while this one
+    // was asleep. `depositAll` fans out over exactly those sessions.
+    return depositAll(gpa, io, environ, st, link, st.my_did, plaintext);
+}
+
 /// RE-ESTABLISH a conversation we already have: fetch the peer's CURRENT
 /// published keys, build a fresh group, send them a new Welcome, and replace our
 /// stale group with it.
@@ -1162,6 +1232,10 @@ pub const Incoming = union(enum) {
     /// The peer is typing right now — ephemeral; the shell shows the
     /// indicator for a few seconds and lets it lapse. Never stored.
     typing: struct { peer_did: []u8 },
+    /// ANOTHER DEVICE OF OURS handed us the list of people we talk to (slice 3):
+    /// newline-joined DIDs, gpa-owned. Only ever produced for a session with our
+    /// OWN did — a roster from anyone else is refused before it gets here.
+    roster: struct { dids: []u8 },
     /// A Welcome we ALREADY joined, arriving again (A1) — the peer's retry,
     /// because our ack never reached them. Nothing changes on our side (the
     /// group is the one we are already using; rebuilding it would reset a
@@ -1218,6 +1292,7 @@ pub fn freeIncoming(gpa: Allocator, inc: Incoming) void {
         .started => |s| gpa.free(s.peer_did),
         .restarted => |s| gpa.free(s.peer_did),
         .typing => |t| gpa.free(t.peer_did),
+        .roster => |r| gpa.free(r.dids),
         .welcome_again => |s| gpa.free(s.peer_did),
         .confirmed => |s| gpa.free(s.peer_did),
         .drifted => |s| gpa.free(s.peer_did),
@@ -1474,6 +1549,20 @@ pub fn onBucket(
                     if (data[0] == chat.kind_group_ack_wire) {
                         if (confirmWelcome(gpa, st, idx)) persist(gpa, environ, st);
                         return .{ .confirmed = .{ .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]) } };
+                    }
+                    // THE ROSTER (slice 3) — the list of people we talk to, from
+                    // ANOTHER DEVICE OF OURS.
+                    //
+                    // And it is accepted ONLY from one of our own devices. The
+                    // session it arrived on says whose it is (the DID is pinned to
+                    // the session at Welcome time, and the frame decrypted under
+                    // that session's own ratchet), so a roster from anybody else is
+                    // somebody trying to make our client go and open conversations
+                    // of their choosing. Refused, silently, and nothing happens.
+                    if (data[0] == chat.kind_roster_wire) {
+                        if (!std.mem.eql(u8, st.peer_dids.items[idx], st.my_did)) return null;
+                        if (data.len < 2) return null;
+                        return .{ .roster = .{ .dids = try gpa.dupe(u8, data[1..]) } };
                     }
                     // Card-FLIP events (settlement 18/19, S2 ready/cancel/
                     // decline 21/22/23): wire-only, like the ping — but their
@@ -2303,4 +2392,85 @@ test "chat_e2ee: TWO DEVICES OF ONE PERSON ARE TWO SESSIONS, not a takeover (sli
     try testing.expectEqual(chat.Delivery.waiting, deliveryState(&alice, bob));
     _ = confirmWelcome(gpa, &alice, sessions[1]); // his phone acked
     try testing.expectEqual(chat.Delivery.confirmed, deliveryState(&alice, bob));
+}
+
+test "chat_e2ee: a ROSTER is believed only from YOUR OWN device (slice 3)" {
+    // The roster tells a client to go and open conversations. So the one question
+    // that matters is who is allowed to send one — and the answer is: only another
+    // device of yours. A roster from anybody else is an instruction to open
+    // conversations of THEIR choosing, and it is refused before anything happens.
+    const gpa = testing.allocator;
+    const me = "did:plc:e2ee-roster-me";
+    const them = "did:plc:e2ee-roster-them";
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var tmp_buf: [64]u8 = undefined;
+    const tmp = std.fmt.bufPrint(&tmp_buf, "/tmp/zat-e2ee-ros-{d}", .{std.os.linux.getpid()}) catch unreachable;
+    try env.put("ZAT_CACHE_DIR", tmp);
+    defer {
+        var pb: [512]u8 = undefined;
+        if (cache.chatGroupsPath(&pb, &env, me)) |p| {
+            var z: [512]u8 = undefined;
+            if (std.fmt.bufPrintZ(&z, "{s}", .{p})) |zp| _ = std.os.linux.unlink(zp) else |_| {}
+        }
+        var z2: [512]u8 = undefined;
+        if (std.fmt.bufPrintZ(&z2, "{s}", .{tmp})) |zp| _ = std.os.linux.rmdir(zp) else |_| {}
+    }
+
+    var phone = try testState(gpa, me, @splat(0xA1), 0x01, 0x02); // the device being told
+    defer deinit(gpa, &phone);
+
+    // Two senders: MY desktop (same DID, its own keys) and a stranger.
+    const senders = [_]struct { did: []const u8, seed: [32]u8, ent: u8, want_roster: bool }{
+        .{ .did = them, .seed = @splat(0xB2), .ent = 0x30, .want_roster = false },
+        .{ .did = me, .seed = @splat(0xC3), .ent = 0x50, .want_roster = true },
+    };
+
+    for (senders) |snd| {
+        var sender = try testState(gpa, snd.did, snd.seed, snd.ent, snd.ent +% 1);
+        defer deinit(gpa, &sender);
+
+        var g = try mls.createGroup(gpa, sender.my_did, sender.anchor_seed, .{
+            .group_id = @splat(snd.ent +% 2),
+            .enc_seed = @splat(snd.ent +% 3),
+            .epoch_secret = @splat(snd.ent +% 4),
+        });
+        defer g.deinit(gpa);
+        const welcome = try mls.addPeer(gpa, &g, phone.kp.kp_bytes, 0, .{
+            .enc_seed = @splat(snd.ent +% 5),
+            .path_secret = @splat(snd.ent +% 6),
+            .welcome_seed = @splat(snd.ent +% 7),
+        });
+        defer gpa.free(welcome);
+        var wb: [relay.bucket_len]u8 = undefined;
+        try bucketPack(&wb, welcome);
+        const pw = openWelcome(gpa, &phone, bucketUnpack(&wb).?) orelse return error.TestUnexpectedResult;
+        const inc = (try acceptWelcome(gpa, &env, &phone, pw, &.{try anchor.publicKey(snd.seed)})) orelse
+            return error.TestUnexpectedResult;
+        freeIncoming(gpa, inc);
+
+        // …and now they send a roster over that session.
+        const payload = [_]u8{chat.kind_roster_wire} ++ "did:plc:someone-they-chose\n".*;
+        const msg = try mls.encrypt(gpa, &g, &payload, 0, .{ 1, 2, 3, 4 });
+        defer gpa.free(msg);
+        var bucket: [relay.bucket_len]u8 = undefined;
+        try bucketPack(&bucket, msg);
+
+        const out = try onBucket(gpa, gpa, std.testing.io, &env, &phone, phone.inbox, &bucket);
+        if (snd.want_roster) {
+            // MY OWN DEVICE: the list is taken.
+            const got = out orelse return error.TestUnexpectedResult;
+            defer freeIncoming(gpa, got);
+            try testing.expect(got == .roster);
+            try testing.expect(std.mem.indexOf(u8, got.roster.dids, "did:plc:someone-they-chose") != null);
+        } else {
+            // ANOTHER PERSON: refused. It produces nothing at all — no roster, and
+            // therefore not one conversation opened on their say-so.
+            if (out) |o| {
+                defer freeIncoming(gpa, o);
+                try testing.expect(o != .roster);
+            }
+        }
+    }
 }

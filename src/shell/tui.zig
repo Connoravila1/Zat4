@@ -855,6 +855,16 @@ const RunState = struct {
     gdev_pend_rkey_len: u8,
     gdev_poll_ns: u64, // last time we asked the network who is waiting
     gdev_job: DeviceJob,
+    /// THE ROSTER QUEUE (slice 3). People another device of ours says we talk to,
+    /// waiting to be opened — ONE PER FRAME. Opening a conversation is a network
+    /// round-trip; twenty of them inside one frame is the freeze the UI-thread law
+    /// exists to prevent, and a list that fills in visibly is honest besides.
+    groster: [32]struct { buf: [128]u8, len: u8 },
+    groster_n: usize,
+    /// The roster we SEND: only when our own device set or our conversation list has
+    /// actually changed, so a quiet app is a silent one.
+    groster_sig: u64,
+    groster_at: i64,
     /// A URL this frame asked the OS to open. On the phone there is no
     /// `xdg-open` — the seam hands it to the activity, which fires an
     /// ACTION_VIEW intent (the same road the OAuth browser already takes).
@@ -1515,6 +1525,9 @@ fn initRunState(
     rs.gdev_pend_at = 0;
     rs.gdev_poll_ns = 0;
     rs.gdev_job = .{};
+    rs.groster_n = 0;
+    rs.groster_sig = 0;
+    rs.groster_at = 0;
     rs.gboot_start_ns = 0;
     // A signed-in app never plays the entrance: it is the front door's overture,
     // not a splash screen, and somebody who is already inside is not arriving.
@@ -2207,6 +2220,28 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                     rs.gchat_typing_peer_len = t.peer_did.len;
                                     rs.gchat_typing_deadline = now + 6;
                                 },
+                                // THE ROSTER (slice 3): another device of ours has
+                                // handed over the list of people we talk to. We do
+                                // NOT open them here — that is one network
+                                // round-trip per person, and doing twenty of them
+                                // inside a frame is the freeze this codebase has a
+                                // standing law against. They go into a queue and are
+                                // opened one per frame, visibly, so the list fills in
+                                // in front of the person instead of the app dying.
+                                .roster => |r| {
+                                    var it = std.mem.tokenizeScalar(u8, r.dids, '\n');
+                                    var queued: usize = 0;
+                                    while (it.next()) |did| {
+                                        if (rs.groster_n >= rs.groster.len) break;
+                                        if (did.len == 0 or did.len > 128) continue;
+                                        if (chat_e2ee.hasConversation(st, did)) continue; // already ours
+                                        rs.groster[rs.groster_n].len = @intCast(did.len);
+                                        @memcpy(rs.groster[rs.groster_n].buf[0..did.len], did);
+                                        rs.groster_n += 1;
+                                        queued += 1;
+                                    }
+                                    chatLog("[chat] roster <- our other device: {d} conversation(s) to open", .{queued});
+                                },
                                 // A payment card (M5 A1): a known id advances
                                 // the existing card (one card per payment,
                                 // morphing in place); a fresh one lands as a
@@ -2309,6 +2344,29 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
             if (now >= rs.gchat_retry_at) {
                 rs.gchat_retry_at = now + 1;
                 chat_e2ee.retryWelcomes(gpa, environ, st, rs.gchat_link.?, now);
+            }
+
+            // THE ROSTER, RECEIVING SIDE (slice 3): open ONE queued conversation per
+            // pass. Each is a network round-trip, so they are spread out rather than
+            // fired in a burst — the list fills in in front of the person, which is
+            // both honest and the only thing the render thread can afford.
+            if (rs.groster_n > 0 and now >= rs.gchat_retry_at) {
+                const e = rs.groster[rs.groster_n - 1];
+                rs.groster_n -= 1;
+                const did = e.buf[0..e.len];
+                if (!chat_e2ee.hasConversation(st, did)) {
+                    chatStartWith(rs, gpa, io, environ, st, did);
+                }
+            }
+
+            // THE ROSTER, SENDING SIDE: hand our other devices the people we talk
+            // to. Only when something actually changed (the device set, or the
+            // conversation list) — a quiet app must be a silent one, and re-sending
+            // an unchanged roster every tick would be a deposit per device per tick
+            // for no reason at all.
+            if (now - rs.groster_at >= 15) {
+                rs.groster_at = now;
+                rosterPublish(rs, gpa, io, environ, st, now);
             }
         };
 
@@ -9296,6 +9354,79 @@ const CreateJob = struct {
     /// The result. Null = it failed, and the card says so rather than hanging.
     session: ?auth.Session = null,
 };
+
+/// Open a conversation with one person from the roster our other device sent. The
+/// store row first (so the person appears in the list immediately, even if the
+/// network leg is slow), then the crypto.
+fn chatStartWith(
+    rs: *RunState,
+    gpa: Allocator,
+    io: std.Io,
+    env: ?*const std.process.Environ.Map,
+    st: *chat_e2ee.State,
+    did: []const u8,
+) void {
+    const link = rs.gchat_link orelse return;
+    _ = chat_core.openConversation(gpa, &rs.gchat_store, did, "") catch null;
+    _ = rs.gchat_arena_state.reset(.retain_capacity);
+    chat_e2ee.startConversation(gpa, rs.gchat_arena_state.allocator(), io, env, st, link, did) catch |err| {
+        // Not fatal, and not silent. The person is in the list; the channel will be
+        // built by the next attempt, or by them messaging us.
+        chatLog("[chat] roster: couldn't open {s}: {s}", .{ did, @errorName(err) });
+        return;
+    };
+    chatLog("[chat] roster: opened {s}", .{did});
+    // The new session has its own traffic mailbox — drain it, or the conversation
+    // we just opened would be one we could never hear from.
+    chatEnsureSubs(gpa, st, link);
+}
+
+/// Hand our other devices the list of people we talk to (slice 3) — but only when
+/// there is something new to say. The signature folds in BOTH the conversation list
+/// and how many self-sessions we hold, so a device joining is itself a change.
+fn rosterPublish(
+    rs: *RunState,
+    gpa: Allocator,
+    io: std.Io,
+    env: ?*const std.process.Environ.Map,
+    st: *chat_e2ee.State,
+    now: i64,
+) void {
+    _ = now;
+    const link = rs.gchat_link orelse return;
+    _ = rs.gchat_arena_state.reset(.retain_capacity);
+    const arena = rs.gchat_arena_state.allocator();
+
+    // Our other devices, and a session with each. A device that was approved while
+    // this one was asleep is picked up right here.
+    const selves = chat_e2ee.ensureSelfSessions(gpa, arena, io, env, st, link);
+    if (selves == 0) return; // no other device: nobody to tell
+
+    // The list, newline-joined. The people — not the history, and not their names.
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    var sig: u64 = @intCast(selves);
+    const n = rs.gchat_store.convs.len;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const did = chat_core.conversationDid(&rs.gchat_store, @enumFromInt(i));
+        if (did.len == 0 or std.mem.eql(u8, did, st.my_did)) continue; // never ourselves
+        buf.appendSlice(gpa, did) catch return;
+        buf.append(gpa, '\n') catch return;
+        for (did) |c| {
+            sig ^= c;
+            sig *%= 1099511628211;
+        }
+    }
+    if (buf.items.len == 0) return;
+    if (sig == rs.groster_sig) return; // nothing has changed; say nothing
+    chat_e2ee.sendRoster(gpa, io, env, st, link, buf.items) catch |err| {
+        chatLog("[chat] roster: send failed: {s}", .{@errorName(err)});
+        return; // do NOT bank the signature: an unsent roster must be retried
+    };
+    rs.groster_sig = sig;
+    chatLog("[chat] roster -> our other device(s): {d} people", .{n});
+}
 
 /// The multi-device surfaces' snapshot: plain values in, pixels out.
 fn chatDevicesOf(rs: *RunState, arena: Allocator) feed_view.ChatDevices {
