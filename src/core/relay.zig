@@ -203,8 +203,9 @@ pub const Limits = struct {
 /// Removal is orderedRemove, O(n) at n ≤ max_total — measured against the
 /// scale (a few thousand tiny elements) this is nothing (G3); an index-per-
 /// mailbox is the recorded upgrade if a profiler ever indicts it.
-/// Mailbox rows are never removed (32 bytes each, capped by max_mailboxes;
-/// the cap bounds memory and keeps message rows' u32 references stable).
+/// Mailbox rows are append-only for u32-stability, and an EMPTY row (no message
+/// references it) is reclaimed — its slot reassigned to a new id — only when the
+/// table is full (`reclaimEmptySlot`), so a rotating mailbox set can't exhaust it.
 /// A7.2: cold struct, one per process, size guard waived.
 pub const Store = struct {
     ids: std.ArrayList([mailbox_id_len]u8) = .empty,
@@ -238,6 +239,19 @@ fn pendingOf(store: *const Store, mbox: u32) u32 {
     return n;
 }
 
+/// A mailbox row that no message references (drained to empty), whose slot is
+/// therefore free to reassign to a new id — or null if every row is still live.
+/// Only walked when the table is FULL (an exceptional condition), so its O(n·m)
+/// scan is off the common deposit path; at n ≤ max_mailboxes and m ≤ max_total
+/// it is a handful of milliseconds even then (G3, same scale as the rest of the
+/// store). A free-list is the recorded upgrade if a profiler ever indicts it.
+fn reclaimEmptySlot(store: *const Store) ?u32 {
+    for (0..store.ids.items.len) |i| {
+        if (pendingOf(store, @intCast(i)) == 0) return @intCast(i);
+    }
+    return null;
+}
+
 /// Queue one blob for `id`. Copies the blob (C4 — the store owns its
 /// memory); `now` is the caller's clock (B4).
 pub fn deposit(
@@ -250,7 +264,18 @@ pub fn deposit(
 ) error{OutOfMemory}!DepositResult {
     if (store.msg_blob.items.len >= limits.max_total) return .store_full;
     const mbox = findMailbox(store, id) orelse blk: {
-        if (store.ids.items.len >= limits.max_mailboxes) return .store_full;
+        if (store.ids.items.len >= limits.max_mailboxes) {
+            // The mailbox table is full. Before refusing, reclaim a row that has
+            // drained to empty. Mailbox rows are append-only for u32-stability, so
+            // without this the table only GROWS — and with per-epoch mailbox
+            // rotation (M2) the live set churns constantly, so a long-running relay
+            // fills the table with DEAD rows and then denies every NEW conversation
+            // forever (until restart). A row with zero queued blobs is referenced by
+            // no message, so reassigning its id is safe and disturbs no index.
+            const slot = reclaimEmptySlot(store) orelse return .store_full;
+            store.ids.items[slot] = id;
+            break :blk slot;
+        }
         try store.ids.append(gpa, id);
         break :blk @as(u32, @intCast(store.ids.items.len - 1));
     };
@@ -601,6 +626,54 @@ test "relay store: the caps refuse, explicitly, and nothing leaks" {
 
     // Global cap: the store is at 3 blobs now; even room in a mailbox refuses.
     try testing.expectEqual(DepositResult.store_full, try deposit(gpa, &store, limits, testId(2), &blob, 0));
+}
+
+test "relay store: a full mailbox table reclaims a drained row, so rotation can't exhaust it" {
+    const gpa = testing.allocator;
+    var store: Store = .{};
+    defer deinit(gpa, &store);
+
+    // Room for blobs to spare — the MAILBOX TABLE is the binding cap here, not the
+    // global store, so this isolates the row-exhaustion the append-only table used
+    // to suffer under per-epoch mailbox rotation (M2).
+    const limits: Limits = .{ .max_per_mailbox = 8, .max_total = 64, .max_mailboxes = 2 };
+
+    // Fill the two-row table with two live mailboxes.
+    try testing.expectEqual(DepositResult.ok, try deposit(gpa, &store, limits, testId(1), &testBlob(1), 0));
+    try testing.expectEqual(DepositResult.ok, try deposit(gpa, &store, limits, testId(2), &testBlob(2), 0));
+
+    // A third distinct mailbox is refused while BOTH rows are live — nothing has
+    // drained, so there is nothing to reclaim.
+    try testing.expectEqual(DepositResult.store_full, try deposit(gpa, &store, limits, testId(3), &testBlob(3), 0));
+
+    // Drain mailbox 1 to empty (its one blob is delivered and acked).
+    try testing.expect(ackOldest(gpa, &store, testId(1)));
+    try testing.expectEqual(@as(u32, 0), pendingCount(&store, testId(1)));
+
+    // NOW the third mailbox is admitted — it reclaims mailbox 1's emptied slot
+    // instead of hitting the table cap. This is the whole fix: a rotating set of
+    // mailboxes recycles dead rows rather than exhausting the table forever.
+    try testing.expectEqual(DepositResult.ok, try deposit(gpa, &store, limits, testId(3), &testBlob(3), 0));
+
+    // The reclaimed mailbox is a first-class mailbox: its own blob is queued and
+    // delivers, and the untouched mailbox 2 is undisturbed by the reassignment.
+    try testing.expectEqual(@as(u32, 1), pendingCount(&store, testId(3)));
+    try testing.expectEqual(@as(u32, 1), pendingCount(&store, testId(2)));
+    const got = nthFor(&store, testId(3), 0) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, &testBlob(3), got);
+
+    // The drained id is gone from the table — its slot now belongs to mailbox 3 —
+    // and with both rows live again the table is genuinely full: re-depositing to
+    // the old id is refused, exactly the same as any new mailbox on a full table.
+    // (It resumes the moment anything drains, which is the point.)
+    try testing.expectEqual(@as(u32, 0), pendingCount(&store, testId(1)));
+    try testing.expectEqual(DepositResult.store_full, try deposit(gpa, &store, limits, testId(1), &testBlob(1), 0));
+
+    // ...and it does resume: drain mailbox 2, and the old id opens afresh in the
+    // freed slot.
+    try testing.expect(ackOldest(gpa, &store, testId(2)));
+    try testing.expectEqual(DepositResult.ok, try deposit(gpa, &store, limits, testId(1), &testBlob(1), 0));
+    try testing.expectEqual(@as(u32, 1), pendingCount(&store, testId(1)));
 }
 
 test "TokenBucket: bounds a flooder to its rate, never touches a real user" {
