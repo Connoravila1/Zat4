@@ -10277,6 +10277,15 @@ pub fn layoutChat(
         const plw: i32 = @intCast(text.measure(e, .semibold, "+", 24));
         _ = try str(gpa, dl, e, .semibold, nx + @divTrunc(nb - plw, 2), ny + 29, if (composing) 0xFF20201A else body_c, 24, "+");
         try emitRegion(gpa, regions, nx - 6, ny - 6, nb + 12, nb + 12, 0, .chat_new);
+        // Always-there way into the explainer, left of "+". The onboarding
+        // surfaces each carry a "How Zat Chat works" link, but a device past
+        // them had no way back — the page was reachable-at-any-time in the
+        // renderer yet orphaned in the UI. This is its standing entry.
+        const hx = nx - nb - 10;
+        try rect(gpa, dl, hx, ny, nb, nb, skinPanel(accent), 21);
+        const qw: i32 = @intCast(text.measure(e, .semibold, "?", 22));
+        _ = try str(gpa, dl, e, .semibold, hx + @divTrunc(nb - qw, 2), ny + 28, muted, 22, "?");
+        try emitRegion(gpa, regions, hx - 6, ny - 6, nb + 12, nb + 12, 0, .chat_device_help);
     } else {
         _ = try str(gpa, dl, e, .semibold, x0, top + 22, ink, 24, "Zat Chat");
         const label = "+ New";
@@ -10287,6 +10296,16 @@ pub fn layoutChat(
         try rect(gpa, dl, x0, py0, pill_w, pill_h, if (composing) accent else skinPanel(accent), 15);
         _ = try str(gpa, dl, e, .semibold, x0 + 14, py0 + 20, if (composing) 0xFF20201A else body_c, 14, label);
         try emitRegion(gpa, regions, x0, py0, pill_w, @intCast(pill_h), 0, .chat_new);
+        // The standing entry into the explainer — top-right of the list column,
+        // clear of the title and the "+ New" pill. Reachable at any time (the
+        // onboarding links are gone the moment a device is set up); see the phone
+        // branch above for why this exists.
+        const hb: i32 = 28;
+        const hx = x0 + list_w - hb;
+        try rect(gpa, dl, hx, top, hb, hb, skinPanel(accent), 14);
+        const qw: i32 = @intCast(text.measure(e, .semibold, "?", 15));
+        _ = try str(gpa, dl, e, .semibold, hx + @divTrunc(hb - qw, 2), top + 19, muted, 15, "?");
+        try emitRegion(gpa, regions, hx - 6, top - 6, hb + 12, hb + 12, 0, .chat_device_help);
     }
     // The honesty line (ZAT_CHAT_ROADMAP M1), compact: the claim itself in
     // full, the mechanism suffix ellipsized to whatever the column spares.
@@ -11951,6 +11970,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     var n_pay: usize = 0;
     var n_restart: usize = 0;
     var n_msg: usize = 0;
+    var n_help: usize = 0;
     for (regions.items) |r| {
         if (r.kind == .chat_restart) n_restart += 1;
         if (r.kind == .chat_conv) n_conv += 1;
@@ -11959,6 +11979,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
         if (r.kind == .chat_new) n_new += 1;
         if (r.kind == .pay_open) n_pay += 1;
         if (r.kind == .chat_msg) n_msg += 1;
+        if (r.kind == .chat_device_help) n_help += 1;
     }
     // EVERY BUBBLE IS PRESSABLE (CHAT_FEATURES slice 2). Without a region per
     // message there is no press-and-hold, no right-click, and therefore no delete,
@@ -11976,7 +11997,11 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // sit on every header always, which invited "re-establishing" a working chat and
     // paid a blocking network leg for it.
     try std.testing.expectEqual(@as(usize, 0), n_restart);
-    try std.testing.expectEqual(regions.items.len, n_conv + n_input + n_send + n_new + n_pay + n_restart + n_msg);
+    // The always-available explainer entry: one "?" in the list header, on every
+    // working Messages screen (the onboarding links vanish once a device is set up,
+    // so this is the only standing way back to "How Zat Chat works").
+    try std.testing.expectEqual(@as(usize, 1), n_help);
+    try std.testing.expectEqual(regions.items.len, n_conv + n_input + n_send + n_new + n_pay + n_restart + n_msg + n_help);
 
     // ...and when it IS needed, the delivery strip is the single tap target. Re-lay
     // the same surface with a drifted conversation and the repair reappears, exactly
@@ -12000,13 +12025,16 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     try std.testing.expectEqual(@as(i32, 940), h2);
     var n2_conv: usize = 0;
     var n2_new: usize = 0;
+    var n2_help: usize = 0;
     for (regions.items) |r| {
         if (r.kind == .chat_conv) n2_conv += 1;
         if (r.kind == .chat_new) n2_new += 1;
+        if (r.kind == .chat_device_help) n2_help += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), n2_conv);
     try std.testing.expectEqual(@as(usize, 1), n2_new);
-    try std.testing.expectEqual(regions.items.len, n2_conv + n2_new);
+    try std.testing.expectEqual(@as(usize, 1), n2_help); // the standing explainer entry
+    try std.testing.expectEqual(regions.items.len, n2_conv + n2_new + n2_help);
 
     // Composing: the recipient bar renders with its input region; the status
     // line draws when the shell hands one over.
