@@ -39,22 +39,58 @@ const relay = @import("core/relay.zig");
 const serve = @import("shell/relay_serve.zig");
 const chat_keys = @import("shell/chat_keys.zig");
 
-/// The directory leg of per-DID auth (CHAT_HARDENING A4 slice 2): what anchor
-/// key does this DID PUBLISH? Resolves the DID to its own PDS (never a guessed
-/// host — `identity.pdsForDid`, SSRF-guarded) and reads the public keyPackage
-/// record through the same validation gate the client uses for a counterparty.
-/// The network lives HERE, in the binary; the serve loop takes this as a
-/// function pointer and stays offline and testable (B3).
+/// The directory leg of per-DID auth (CHAT_HARDENING A4 slice 2): which anchor
+/// keys does this DID PUBLISH? Resolves the DID to its own PDS (never a guessed
+/// host — `identity.pdsForDid`, SSRF-guarded) and reads its public records through
+/// the same validation gates the client uses. The network lives HERE, in the
+/// binary; the serve loop takes this as a function pointer and stays offline and
+/// testable (B3).
 ///
-/// False = we do not know this DID, so the relay will not admit it. An
-/// unreachable PDS reads the same as a missing account, deliberately: an
-/// identity we cannot check is one we cannot enforce a limit against.
-fn verifyDid(gpa: std.mem.Allocator, io: std.Io, did: []const u8, out: *[relay.anchor_pub_len]u8) bool {
+/// MULTI-DEVICE: an account admits ANY of its approved devices, not only the
+/// singleton. So we read the whole device set (`fetchPeerDevices` → the vouched-for
+/// set) AND the legacy singleton (`fetchPeer`), and hand back every key. Before
+/// this, only the singleton was accepted, so a phone the desktop had vouched for
+/// signed correctly and was still refused `unauthenticated` — its messages could
+/// never leave the device (the first two-device test, 2026-07-14).
+///
+/// False = we found no key for this DID, so the relay will not admit it. An
+/// unreachable PDS reads the same as a missing account, deliberately: an identity
+/// we cannot check is one we cannot enforce a limit against.
+fn verifyDid(gpa: std.mem.Allocator, io: std.Io, did: []const u8, out: *[serve.max_device_keys][relay.anchor_pub_len]u8, out_n: *usize) bool {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    const peer = (chat_keys.fetchPeer(gpa, arena_state.allocator(), io, null, did) catch return false) orelse return false;
-    out.* = peer.anchor_pub;
-    return true;
+    const arena = arena_state.allocator();
+    var n: usize = 0;
+
+    // Every approved device of the account. `catch null` folds a read failure into
+    // "no set" — the relay fails closed, which is the safe direction here (a device
+    // we cannot confirm is one we refuse, never one we wave through).
+    if (chat_keys.fetchPeerDevices(gpa, arena, io, null, did) catch null) |set| {
+        for (set.devices) |d| {
+            if (n >= out.len) break;
+            out[n] = d.anchor_pub;
+            n += 1;
+        }
+    }
+
+    // The legacy singleton — the only key for a pre-device account, and the root's
+    // own key for a device account (already present, so skip the duplicate).
+    if (chat_keys.fetchPeer(gpa, arena, io, null, did) catch null) |peer| {
+        var dup = false;
+        for (out[0..n]) |k| {
+            if (std.mem.eql(u8, &k, &peer.anchor_pub)) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup and n < out.len) {
+            out[n] = peer.anchor_pub;
+            n += 1;
+        }
+    }
+
+    out_n.* = n;
+    return n > 0;
 }
 
 pub fn main(init: std.process.Init) !void {

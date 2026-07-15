@@ -50,21 +50,53 @@ const websocket = @import("../core/websocket.zig");
 const anchor = @import("../core/anchor.zig");
 const clock = @import("clock.zig");
 
-/// Resolve a DID's PUBLISHED anchor key — the directory half of A4 slice 2.
-/// A signature proves the client HOLDS an anchor key; only the directory
-/// proves that key is this ACCOUNT's, and an identity nobody can mint for
-/// free is the entire point (a flooder who can generate keys can generate
-/// identities, and per-identity limits mean nothing).
+/// The most keys one account may present: every approved device (keydir's
+/// `max_devices`, 8) plus the legacy `keyPackage/self` singleton, which for a
+/// multi-device account is the root's own key (already in the set) and for a
+/// pre-device account is the only key. Nine is the safe ceiling for the union.
+pub const max_device_keys = 9;
+
+/// The set of anchor keys an account currently publishes. A connection is that
+/// account iff it signs our challenge with a key IN this set. Multi-device turned
+/// this from one key into several: before, the relay accepted ONLY the singleton
+/// (the root device), so every OTHER approved device — a phone the desktop had
+/// vouched for — signed correctly and was refused `unauthenticated`, and its chat
+/// could never deliver (found on the first two-device test, 2026-07-14).
+/// A7.2: bounded (<= max_device_keys), held one-per-cache-entry; guarded below.
+pub const AnchorSet = struct {
+    keys: [max_device_keys][relay.anchor_pub_len]u8 = undefined,
+    n: usize = 0,
+
+    fn contains(s: *const AnchorSet, k: [relay.anchor_pub_len]u8) bool {
+        for (s.keys[0..s.n]) |kk| if (std.mem.eql(u8, &kk, &k)) return true;
+        return false;
+    }
+
+    comptime {
+        // 9 * 32 keys + a usize count. An exact check so a wider key or a change
+        // to max_device_keys is a decision, not a silent cache-memory blow-up.
+        std.debug.assert(@sizeOf(AnchorSet) == max_device_keys * relay.anchor_pub_len + @sizeOf(usize));
+    }
+};
+
+/// Resolve the anchor keys a DID PUBLISHES — the directory half of A4 slice 2.
+/// A signature proves the client HOLDS a key; only the directory proves that key
+/// is this ACCOUNT's, and an identity nobody can mint for free is the entire point
+/// (a flooder who can generate keys can generate identities, and per-identity
+/// limits mean nothing).
 ///
-/// A function pointer, so the network lives in the relay BINARY and the serve
-/// loop stays offline and testable (B3/D1). Returns false = no such account,
-/// no published record, or the fetch failed — in every case the relay does
-/// not know this DID and will not admit it.
+/// Fills `out[0..out_n]` with every key the account will be admitted under — all
+/// its approved devices, plus the singleton — and returns true iff there is at
+/// least one. A function pointer, so the network lives in the relay BINARY and the
+/// serve loop stays offline and testable (B3/D1). Returns false = no such account,
+/// no published record, or the fetch failed — in every case the relay does not
+/// know this DID and will not admit it.
 pub const VerifyDidFn = *const fn (
     gpa: Allocator,
     io: std.Io,
     did: []const u8,
-    out: *[relay.anchor_pub_len]u8,
+    out: *[max_device_keys][relay.anchor_pub_len]u8,
+    out_n: *usize,
 ) bool;
 
 /// The header a client sends on the upgrade to say "I speak auth — challenge
@@ -122,12 +154,12 @@ const auth_cache_max: usize = 1024;
 pub const AuthCache = struct {
     locked: std.atomic.Value(bool) = .init(false),
     dids: std.ArrayList([]u8) = .empty,
-    anchors: std.ArrayList([relay.anchor_pub_len]u8) = .empty,
-    /// When the entry was fetched. A NEGATIVE entry (no such account) is
-    /// recorded too — `found` — so a flood of bogus DIDs is not a flood of
-    /// fetches.
+    /// The accepted key SET per DID. A NEGATIVE entry (no such account) is an
+    /// `AnchorSet` with `n == 0`, recorded too — so a flood of bogus DIDs is not a
+    /// flood of fetches. (There is no separate `found` array: `n == 0` IS negative.)
+    sets: std.ArrayList(AnchorSet) = .empty,
+    /// When the entry was fetched.
     at: std.ArrayList(i64) = .empty,
-    found: std.ArrayList(bool) = .empty,
 
     fn lock(c: *AuthCache) void {
         while (c.locked.swap(true, .acquire)) std.atomic.spinLoopHint();
@@ -139,46 +171,46 @@ pub const AuthCache = struct {
     pub fn deinit(c: *AuthCache, gpa: Allocator) void {
         for (c.dids.items) |d| gpa.free(d);
         c.dids.deinit(gpa);
-        c.anchors.deinit(gpa);
+        c.sets.deinit(gpa);
         c.at.deinit(gpa);
-        c.found.deinit(gpa);
     }
 };
 
-/// A cached verdict: null = unknown/expired (go ask the directory).
-fn cacheLookup(c: *AuthCache, did: []const u8, now: i64) ??[relay.anchor_pub_len]u8 {
+/// A cached verdict. `.miss` = unknown/expired (go ask the directory); `.negative`
+/// = cached "no such account" (refuse without a fetch); `.hit` = the accepted set.
+const CacheResult = union(enum) { miss, negative, hit: AnchorSet };
+
+fn cacheLookup(c: *AuthCache, did: []const u8, now: i64) CacheResult {
     c.lock();
     defer c.unlock();
     for (c.dids.items, 0..) |d, i| {
         if (!std.mem.eql(u8, d, did)) continue;
-        if (now - c.at.items[i] > auth_cache_ttl_s) return null; // stale: re-fetch
-        return if (c.found.items[i]) c.anchors.items[i] else @as(?[relay.anchor_pub_len]u8, null);
+        if (now - c.at.items[i] > auth_cache_ttl_s) return .miss; // stale: re-fetch
+        const s = c.sets.items[i];
+        return if (s.n == 0) .negative else .{ .hit = s };
     }
-    return null;
+    return .miss;
 }
 
-fn cacheStore(gpa: Allocator, c: *AuthCache, did: []const u8, anchor_pub: ?[relay.anchor_pub_len]u8, now: i64) void {
+fn cacheStore(gpa: Allocator, c: *AuthCache, did: []const u8, set: AnchorSet, now: i64) void {
     c.lock();
     defer c.unlock();
     for (c.dids.items, 0..) |d, i| {
         if (!std.mem.eql(u8, d, did)) continue;
-        c.anchors.items[i] = anchor_pub orelse @splat(0);
-        c.found.items[i] = anchor_pub != null;
+        c.sets.items[i] = set;
         c.at.items[i] = now;
         return;
     }
     if (c.dids.items.len >= auth_cache_max) return; // the cap; see `auth_cache_max`
-    // Reserve across ALL four arrays before any of them grows: a half-inserted
+    // Reserve across ALL three arrays before any of them grows: a half-inserted
     // row would desync the parallel arrays for the life of the process.
     c.dids.ensureUnusedCapacity(gpa, 1) catch return;
-    c.anchors.ensureUnusedCapacity(gpa, 1) catch return;
+    c.sets.ensureUnusedCapacity(gpa, 1) catch return;
     c.at.ensureUnusedCapacity(gpa, 1) catch return;
-    c.found.ensureUnusedCapacity(gpa, 1) catch return;
     const copy = gpa.dupe(u8, did) catch return;
     c.dids.appendAssumeCapacity(copy);
-    c.anchors.appendAssumeCapacity(anchor_pub orelse @splat(0));
+    c.sets.appendAssumeCapacity(set);
     c.at.appendAssumeCapacity(now);
-    c.found.appendAssumeCapacity(anchor_pub != null);
 }
 
 /// The connection's identity (A4 slice 2): unproven until an `auth` frame's
@@ -221,25 +253,32 @@ fn verifyAuth(gpa: Allocator, io: std.Io, cfg: ServeConfig, a: *ConnAuth, op: an
     if (op.did.len == 0 or op.did.len > relay.max_auth_did_len) return false;
     anchor.verifyRelayAuth(op.anchor_pub, a.challenge, op.did, &op.sig) catch return false;
 
-    // The directory: is this key actually that account's? Without this the
-    // client has only proved it holds A key, and keys are free to mint.
+    // The directory: is this key actually one of that account's? Without this the
+    // client has only proved it holds A key, and keys are free to mint. "One of" is
+    // the multi-device change — the account admits any of its approved devices, not
+    // only the singleton — but the shape of the check is unchanged: a key we did not
+    // get from the account's own directory record is never accepted.
     const verify = cfg.verify_did orelse return false;
     const now = clock.unixSeconds();
-    var published: [relay.anchor_pub_len]u8 = undefined;
+    var set: AnchorSet = .{};
     var known = false;
     if (cfg.auth_cache) |c| {
-        if (cacheLookup(c, op.did, now)) |hit| {
-            const found = hit orelse return false; // cached NEGATIVE: no such account
-            published = found;
-            known = true;
+        switch (cacheLookup(c, op.did, now)) {
+            .miss => {},
+            .negative => return false, // cached: no such account
+            .hit => |s| {
+                set = s;
+                known = true;
+            },
         }
     }
     if (!known) {
-        const ok = verify(gpa, io, op.did, &published);
-        if (cfg.auth_cache) |c| cacheStore(gpa, c, op.did, if (ok) published else null, now);
+        const ok = verify(gpa, io, op.did, &set.keys, &set.n);
+        if (!ok) set.n = 0; // never trust a partially-filled set from a failed fetch
+        if (cfg.auth_cache) |c| cacheStore(gpa, c, op.did, set, now);
         if (!ok) return false;
     }
-    if (!std.mem.eql(u8, &published, &op.anchor_pub)) return false;
+    if (!set.contains(op.anchor_pub)) return false;
 
     a.did_len = op.did.len;
     @memcpy(a.did_buf[0..op.did.len], op.did);
@@ -992,12 +1031,75 @@ const anchor_core = @import("../core/anchor.zig");
 const auth_test_did = "did:plc:relayauthtestaccount";
 const auth_test_seed: [32]u8 = @splat(0x4A);
 
-fn testVerifyDid(gpa: Allocator, io: std.Io, did: []const u8, out: *[relay.anchor_pub_len]u8) bool {
+fn testVerifyDid(gpa: Allocator, io: std.Io, did: []const u8, out: *[max_device_keys][relay.anchor_pub_len]u8, out_n: *usize) bool {
     _ = gpa;
     _ = io;
-    if (!std.mem.eql(u8, did, auth_test_did)) return false; // no such account
-    out.* = anchor_core.publicKey(auth_test_seed) catch return false;
+    if (!std.mem.eql(u8, did, auth_test_did)) {
+        out_n.* = 0;
+        return false; // no such account
+    }
+    out[0] = anchor_core.publicKey(auth_test_seed) catch {
+        out_n.* = 0;
+        return false;
+    };
+    out_n.* = 1;
     return true;
+}
+
+/// A SECOND device of the same account — the phone the desktop vouched for.
+const auth_test_seed2: [32]u8 = @splat(0x5B);
+
+/// A directory that returns TWO keys for the account: the root and an approved
+/// device. Stands in for the real `verifyDid` reading the device set.
+fn testVerifyTwoDevices(gpa: Allocator, io: std.Io, did: []const u8, out: *[max_device_keys][relay.anchor_pub_len]u8, out_n: *usize) bool {
+    _ = gpa;
+    _ = io;
+    if (!std.mem.eql(u8, did, auth_test_did)) {
+        out_n.* = 0;
+        return false;
+    }
+    out[0] = anchor_core.publicKey(auth_test_seed) catch return false; // root / singleton
+    out[1] = anchor_core.publicKey(auth_test_seed2) catch return false; // an approved device
+    out_n.* = 2;
+    return true;
+}
+
+test "relay auth: an approved NON-root device is admitted; a stranger key is not" {
+    // THE MULTI-DEVICE REGRESSION (2026-07-14). The relay used to accept only the
+    // account's SINGLETON key — the root device — so a phone the desktop had signed
+    // for produced a perfectly valid signature and was still refused
+    // `unauthenticated`, and its messages could never leave the device. The relay
+    // now admits ANY key in the account's published set, but the security shape is
+    // unchanged: a valid signature over a key the directory does NOT list is refused.
+    const gpa = testing.allocator;
+    const io = std.testing.io;
+    const cfg: ServeConfig = .{ .verify_did = testVerifyTwoDevices }; // no cache: verify() each time
+    const challenge: [relay.challenge_len]u8 = @splat(0x11);
+
+    // The approved device signs with ITS OWN key — admitted (the whole point).
+    {
+        var ca: ConnAuth = .{ .challenge = challenge };
+        const pub2 = try anchor_core.publicKey(auth_test_seed2);
+        const sig2 = try anchor_core.signRelayAuth(auth_test_seed2, challenge, auth_test_did);
+        try testing.expect(verifyAuth(gpa, io, cfg, &ca, .{ .did = auth_test_did, .anchor_pub = pub2, .sig = sig2 }));
+        try testing.expectEqualStrings(auth_test_did, ca.did());
+    }
+    // The root still authenticates (device 0 in the set).
+    {
+        var ca: ConnAuth = .{ .challenge = challenge };
+        const pub0 = try anchor_core.publicKey(auth_test_seed);
+        const sig0 = try anchor_core.signRelayAuth(auth_test_seed, challenge, auth_test_did);
+        try testing.expect(verifyAuth(gpa, io, cfg, &ca, .{ .did = auth_test_did, .anchor_pub = pub0, .sig = sig0 }));
+    }
+    // A stranger key with a VALID signature over our challenge — refused. Holding a
+    // key is free; being in the account's directory set is not, and that is the line.
+    {
+        var ca: ConnAuth = .{ .challenge = challenge };
+        const stranger: [32]u8 = @splat(0x7C);
+        const pubx = try anchor_core.publicKey(stranger);
+        const sigx = try anchor_core.signRelayAuth(stranger, challenge, auth_test_did);
+        try testing.expect(!verifyAuth(gpa, io, cfg, &ca, .{ .did = auth_test_did, .anchor_pub = pubx, .sig = sigx }));
+    }
 }
 
 test "relay loopback: a connection PROVES who it is, or (once required) does nothing" {
