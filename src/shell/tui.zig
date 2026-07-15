@@ -10411,6 +10411,9 @@ fn chatDevicesOf(rs: *RunState, arena: Allocator) feed_view.ChatDevices {
         .consent_open = rs.gchat_consent_open,
         .consent_receipts = rs.gchat_receipts,
         .consent_typing = rs.gchat_typing_on,
+        // Chat is coming up on the worker right now — the list area shows a load mark
+        // instead of a blank column (the shell owns this fact; the view just draws it).
+        .connecting = rs.gchat_init_job.thread != null,
     };
 }
 
@@ -15112,6 +15115,7 @@ fn paintFrameGpu(
         chat_sig ^= @as(u64, @intFromBool(dv.consent_typing)) *% 0x2545_F491_4F6C_DD1D;
         chat_sig ^= @as(u64, @intFromBool(dv.busy)) *% 0x1656_67B1_9E37_79F9;
         chat_sig ^= @as(u64, @intFromBool(dv.help_open)) *% 0x8EBC_6AF0_9C88_C6E3;
+        chat_sig ^= @as(u64, @intFromBool(dv.connecting)) *% 0x6C62_2726_93D2_35B1;
         chat_sig ^= @as(u64, dv.pending.len) *% 0xF29C_511C_8E3D_45A7;
         chat_sig ^= std.hash.Wyhash.hash(0x3B8F_55D1, dv.error_line);
     }
@@ -15189,7 +15193,7 @@ fn paintFrameGpu(
     // OUTSIDE the chat_store guard on purpose: the gate draws when chat is not up.
     if (g.screen.* == feed_view.screen_messages) {
         const dv = g.chat_devices;
-        if (dv.state == .pending or dv.state == .offline or dv.added_t > 0.001) chat_animating = true;
+        if (dv.state == .pending or dv.state == .offline or dv.added_t > 0.001 or dv.connecting) chat_animating = true;
     }
     // ZONES: the hub + zone page render from state the feed signature can't
     // see — the sub-tab, the search text/focus/caret, the catalog's pins and

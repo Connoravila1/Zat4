@@ -9299,6 +9299,12 @@ pub const ChatDevices = struct {
     /// replaces the column, so it cannot bleed through anything or eat a tap it
     /// did not mean to).
     help_open: bool = false,
+    /// Chat is coming up right now (the bring-up worker is in flight). Shown as a
+    /// live "Connecting…" state ONLY when there is nothing else to show yet, so a
+    /// first-run or empty account never sits on a blank column that reads as broken
+    /// while the keys + relay come up. Restored conversations render immediately —
+    /// this never hides them.
+    connecting: bool = false,
 };
 
 // ── the multi-device surfaces ───────────────────────────────────────────────
@@ -10032,6 +10038,32 @@ pub const ChatLink = enum(u8) {
     authenticated = 3,
 };
 
+/// A load happening ON the conversation column — chat is coming up (keys + relay)
+/// and there is nothing to list yet. Calm, NOT a spinner: a short label and three
+/// dots that travel a gentle wave, so the wait reads as WORKING, not spinning-
+/// because-stuck. Everything around it (the rail, the column frame) is already
+/// drawn, so the app is visibly alive and only this one part is mid-load.
+fn drawChatLoading(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x0: i32, w: i32, height: i32, insets: EdgeInsets, accent: u32, t: f32) error{OutOfMemory}!void {
+    const cx = x0 + @divTrunc(w, 2);
+    const cy = insets.top + @divTrunc(height - insets.top - insets.bottom, 2);
+
+    const label = "Loading your chats\u{2026}";
+    const lw: i32 = @intCast(text.measure(e, .regular, label, 15));
+    _ = try str(gpa, dl, e, .regular, cx - @divTrunc(lw, 2), cy - 6, muted, 15, label);
+
+    // Three dots, a traveling pulse: each 0.6 rad behind the last, so light walks
+    // across them — a heartbeat, not a whirl.
+    const spacing: i32 = 16;
+    var i: i32 = 0;
+    while (i < 3) : (i += 1) {
+        const phase = t * 3.0 - @as(f32, @floatFromInt(i)) * 0.6;
+        const pulse = 0.35 + 0.65 * (0.5 + 0.5 * @sin(phase));
+        const a: u8 = @intFromFloat(std.math.clamp(pulse, 0.0, 1.0) * 235.0 + 20.0);
+        const dot = (@as(u32, a) << 24) | (accentRgbOf(accent) & 0x00FFFFFF);
+        try rect(gpa, dl, cx - spacing + i * spacing - 3, cy + 24, 6, 6, dot, 3);
+    }
+}
+
 pub fn layoutChat(
     gpa: Allocator,
     e: *const text.Engine,
@@ -10158,6 +10190,17 @@ pub fn layoutChat(
     // costs the people you talk to as well — is a quiet last resort underneath it.
     if (devices.state != .ok) {
         return try drawDeviceGate(gpa, dl, e, regions, x0, w, width, insets, accent, devices);
+    }
+
+    // ── A LOAD IN PROGRESS, shown ON the thing that is loading. Chat is coming up
+    // (keys + relay) and there is nothing to list YET. The rail and the column frame
+    // are already drawn above, so the app plainly still works — this is a loading
+    // mark IN the list area, not a screen takeover, so it reads as "this one part is
+    // taking a moment", never as a broken page (the owner's note). It never shows
+    // once there is a real conversation to draw. ──
+    if (devices.connecting and list.len == 0) {
+        try drawChatLoading(gpa, dl, e, x0, w, height, insets, accent, devices.t);
+        return height;
     }
 
     // ── THE PHONE SHAPE: single-pane (this surface must carry a standalone
