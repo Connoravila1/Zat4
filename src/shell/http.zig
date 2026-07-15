@@ -110,6 +110,62 @@ pub const default_max_response_bytes: usize = 4 * 1024 * 1024;
 
 const user_agent = "zat/0.0.1 (atproto client)";
 
+/// The untrusted-fetch SSRF gate (Phase 1), applied before any connection is
+/// opened. For a `.trusted` (operator-configured) fetch it is a no-op. For an
+/// `.untrusted` (network-derived) host it enforces, in order:
+///   1. the scheme is https;
+///   2. an IP-literal host is not in a blocked (private / loopback / link-local /
+///      reserved) range;
+///   3. a host NAME does not RESOLVE into a blocked range — so `evil.example`
+///      whose A/AAAA record is `169.254.169.254` (the classic cloud-metadata
+///      SSRF) is refused, which the literal check alone never saw.
+///
+/// Classification is pure (`core/netguard.zig`) over one live DNS lookup; the
+/// v4-mapped/compat/NAT64 forms a resolver can hand back for an internal v4 are
+/// caught by `isBlockedIpv6`.
+///
+/// RESIDUAL, stated honestly: std's HTTP client re-resolves the name when IT
+/// connects, so this does not defeat an ACTIVE DNS-rebind attacker who answers
+/// our lookup and the connect's lookup differently — closing that needs a
+/// connect-to-a-pinned-IP seam the client does not expose (the same missing seam
+/// that blocks fetch timeouts). An UNRESOLVABLE name falls through untouched: it
+/// reaches no host, so any resulting failure is the connection's to report, and
+/// manufacturing a security refusal out of a transient DNS miss would only break
+/// legitimate fetches. The extra lookup is paid only on untrusted fetches
+/// (identity resolution — .well-known / did:web / serviceEndpoint), which are
+/// rare and never per-frame (G3).
+fn ssrfGate(io: std.Io, url: []const u8, guard: Guard) !void {
+    if (guard != .untrusted) return;
+    if (!netguard.isAllowedScheme(url)) return error.BlockedScheme;
+    const host = netguard.hostOf(url) orelse return error.BlockedAddress;
+    if (netguard.ipLiteralVerdict(host)) |blocked| {
+        // A literal: the verdict is final, no resolution needed.
+        if (blocked) return error.BlockedAddress;
+        return;
+    }
+    // A NAME: resolve it (through the same `io` DNS path the connection itself
+    // uses — on Android that is the getaddrinfo shim) and classify EVERY address
+    // it returns, refusing if any one is internal. `lookup` fills the queue and
+    // closes it; a 32-slot buffer is guaranteed not to block (matches std's own
+    // `connectMany`). A name that fails to parse or resolve falls through: it
+    // reaches no host, so the connection reports the failure — a security refusal
+    // manufactured from a transient DNS miss would only break legitimate fetches.
+    const name = std.Io.net.HostName.init(host) catch return;
+    var buf: [32]std.Io.net.HostName.LookupResult = undefined;
+    var queue: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&buf);
+    name.lookup(io, &queue, .{ .port = 443 }) catch return;
+    while (queue.getOne(io)) |result| switch (result) {
+        .address => |addr| {
+            const blocked = switch (addr) {
+                .ip4 => |a| netguard.isBlockedIpv4(a.bytes),
+                .ip6 => |a| netguard.isBlockedIpv6(a.bytes),
+            };
+            if (blocked) return error.BlockedAddress;
+        },
+        .canonical_name => {},
+    } else |_| {} // queue closed (drained) or canceled: no blocked address seen
+}
+
 /// Perform one HTTP(S) request, following redirects. If `environ` is
 /// provided, the standard proxy variables (http_proxy / https_proxy /
 /// no_proxy) are honored; pass null where no environment exists (tests).
@@ -134,18 +190,9 @@ pub fn request(
     url: []const u8,
     options: RequestOptions,
 ) !Response {
-    // SSRF gate (Phase 1): for an untrusted (network-derived) host, refuse a
-    // non-https scheme or an IP-literal host in a blocked range BEFORE opening
-    // any connection. The classification is pure (`core/netguard.zig`); a host
-    // *name* (verdict null) is left to the connection's own DNS — resolving the
-    // name and classifying every returned address is the next hardening step.
-    if (options.guard == .untrusted) {
-        if (!netguard.isAllowedScheme(url)) return error.BlockedScheme;
-        const host = netguard.hostOf(url) orelse return error.BlockedAddress;
-        if (netguard.ipLiteralVerdict(host)) |blocked| {
-            if (blocked) return error.BlockedAddress;
-        }
-    }
+    // SSRF gate (Phase 1): refuse a bad scheme, a blocked IP literal, OR a name
+    // that resolves into a blocked range, all BEFORE opening any connection.
+    try ssrfGate(io, url, options.guard);
 
     var scratch_state = std.heap.ArenaAllocator.init(gpa); // C5: cleanup at acquisition
     defer scratch_state.deinit();
@@ -229,13 +276,7 @@ pub fn requestCapturing(
     options: RequestOptions,
     capture: []const u8,
 ) !CapturedResponse {
-    if (options.guard == .untrusted) {
-        if (!netguard.isAllowedScheme(url)) return error.BlockedScheme;
-        const host = netguard.hostOf(url) orelse return error.BlockedAddress;
-        if (netguard.ipLiteralVerdict(host)) |blocked| {
-            if (blocked) return error.BlockedAddress;
-        }
-    }
+    try ssrfGate(io, url, options.guard);
 
     var scratch_state = std.heap.ArenaAllocator.init(gpa);
     defer scratch_state.deinit();
@@ -456,4 +497,27 @@ test "ssrf guard: an untrusted request must be https" {
     const io = std.testing.io;
     try std.testing.expectError(error.BlockedScheme, request(gpa, io, null, "http://example.com/x", .{ .guard = .untrusted }));
     try std.testing.expectError(error.BlockedScheme, request(gpa, io, null, "file:///etc/passwd", .{ .guard = .untrusted }));
+}
+
+test "ssrf guard: an untrusted NAME that resolves into a blocked range is refused before connecting" {
+    const gpa = std.testing.allocator; // C6
+    const io = std.testing.io;
+    // `localhost` is not an IP literal, so the literal check passes it through;
+    // the name-resolution half must then resolve it (to 127.0.0.1 / ::1 via
+    // /etc/hosts — no network) and refuse it. No server is listening on the port:
+    // a BlockedAddress here proves the refusal happened at the gate, before any
+    // connection attempt. This is the exact hole the literal-only check missed —
+    // a hostname pointing at an internal address.
+    try std.testing.expectError(error.BlockedAddress, request(gpa, io, null, "https://localhost:9/x", .{ .guard = .untrusted }));
+
+    // The same host under the default `.trusted` posture is NOT gated (operator
+    // endpoints are legitimately loopback in dev): the gate lets it reach the
+    // connection, which then fails to connect — an error, but anything BUT
+    // BlockedAddress.
+    if (request(gpa, io, null, "https://localhost:9/x", .{ .guard = .trusted })) |resp| {
+        gpa.free(resp.body); // nothing listens on :9, so this is unreachable — stay clean anyway
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expect(err != error.BlockedAddress);
+    }
 }
