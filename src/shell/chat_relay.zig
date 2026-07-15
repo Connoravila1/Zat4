@@ -510,6 +510,23 @@ fn runConnection(cr: *ChatRelay, healthy: *bool) !void {
     var idle_ms: u64 = 0;
     var sent_ping = false;
     var waited_ms: u64 = 0;
+
+    // PRIME THE CONNECTION so the relay's challenge is not held in a proxy buffer.
+    //
+    // The relay sends its challenge PROACTIVELY the instant it upgrades us, and
+    // flushes it. But we then sit dead silent — our first idle ping is 30 s away —
+    // and an intermediary (Caddy, and Cloudflare in front of it) holds a
+    // server-initiated frame until it sees traffic FROM the client. So the challenge
+    // sat unread for the full 10 s grace, we gave up, spoke (a premature deposit the
+    // relay refused: `deposit refused: unauthenticated`), and only THEN — the moment
+    // our bytes reached the intermediary — did the buffered challenge come through.
+    // One ping the instant we connect is that client→server traffic, sent on purpose
+    // and up front: it prompts the flush, so we answer the challenge in one round
+    // trip instead of after a ten-second dead window of refused deposits. The relay
+    // pongs a ping and is otherwise unmoved; a relay that genuinely does not speak
+    // auth simply pongs and we fall through to the grace path exactly as before.
+    if (cr.did.len != 0) sendFrame(cr, &conn, .ping, "") catch {};
+
     while (!cr.stop.load(.acquire)) {
         // THE GATE. Speak only once the relay has admitted us — either because
         // it authenticated us, or because it plainly does not speak auth (no
