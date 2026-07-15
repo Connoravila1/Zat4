@@ -861,6 +861,10 @@ const RunState = struct {
     /// render thread stalled inside `ensurePublished`, never acked the surface
     /// detach, and Android killed the app (2026-07-14).
     gchat_init_job: ChatInitJob,
+    /// Re-establish, in flight. The peer-directory read moved off the render thread
+    /// (see `ChatRestartJob`); this holds the worker + its result until the loop
+    /// applies the group rebuild.
+    gchat_restart_job: ChatRestartJob,
     /// Chat sub-surface entrance settle: when the gate/consent/help surface CHANGES,
     /// it fades + slides up instead of popping. `gchat_enter_kind` is which surface
     /// is showing; when it changes, `gchat_enter_ns` restamps and the settle replays.
@@ -1586,6 +1590,7 @@ fn initRunState(
     rs.gdev_poll_ns = 0;
     rs.gdev_job = .{};
     rs.gchat_init_job = .{};
+    rs.gchat_restart_job = .{};
     rs.gchat_enter_ns = 0;
     rs.gchat_enter_kind = 255; // force a settle on the first chat surface shown
     rs.groster_n = 0;
@@ -1963,6 +1968,13 @@ fn deinitRunState(rs: *RunState) void {
     if (rs.gdev_job.thread) |t| {
         t.join();
         rs.gdev_job.thread = null;
+    }
+    if (rs.gchat_restart_job.thread) |t| {
+        t.join();
+        rs.gchat_restart_job.thread = null;
+        // A fetch that landed in the frame we shut down: nobody applied it, so free
+        // the key-package bytes it copied out.
+        chat_e2ee.freeRestartTargets(gpa, &rs.gchat_restart_job.set);
     }
     if (rs.gchat_e2ee) |*st| chat_e2ee.deinit(gpa, st);
     if (rs.gchat_link) |link| chat_relay.shutdown(link);
@@ -2787,6 +2799,10 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
         // Has the bring-up worker landed? (The keys leg is network, so it is not on
         // this thread — this is where its result becomes the app's state.)
         if (dev_chat) chatInitStep(rs, gpa, io, environ);
+
+        // Has a re-establish read landed? The peer-directory fetch runs on a worker
+        // (the "wave of slowdown" when it ran here); this applies the group rebuild.
+        if (dev_chat) chatRestartStep(rs, gpa, io, environ);
 
         // MULTI-DEVICE (slice 2). Runs whether or not chat is up, because the
         // device that is WAITING to be let in has no chat state by definition — and
@@ -9892,6 +9908,29 @@ const ChatInitJob = struct {
     err: ?anyerror = null,
 };
 
+/// Re-establish, in flight. Repairing a drifted conversation reads the PEER'S
+/// device directory (an HTTPS round trip) before it can rebuild the group — and
+/// that read ran inside `stepFrame`, the "wave of slowdown" on tapping
+/// re-establish. Now the read is Phase 1 on this worker; the loop applies the
+/// group rebuild (Phase 2, `chat_e2ee.applyRestart`) when it lands. The worker
+/// never touches the shared chat state, so it stays safe.
+/// A7.2: cold struct (one live instance, holds a thread), size guard waived.
+const ChatRestartJob = struct {
+    thread: ?std.Thread = null,
+    done: std.atomic.Value(bool) = .init(false),
+    io: std.Io = undefined,
+    env: ?*const std.process.Environ.Map = null,
+    /// The conversation is named by DID, copied in so the worker never reads the
+    /// store the render thread is mutating. did:plc is short; did:web is bounded.
+    peer_did_buf: [256]u8 = undefined,
+    peer_did_len: u16 = 0,
+    /// The fetched devices, by value (key-package bytes are gpa-owned, so nothing
+    /// points into the worker's arena). Freed once applied or on failure.
+    set: chat_e2ee.PeerTargetSet = .{},
+    ok: bool = false,
+    err: ?anyerror = null,
+};
+
 const DeviceJob = struct {
     // A7.2: cold struct (one live instance, holds a thread), size guard waived.
     thread: ?std.Thread = null,
@@ -11241,7 +11280,82 @@ fn chatAck(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.process.E
 ///
 /// Costs nothing to use: history is local (the Signal model), and a group the
 /// peer never joined cannot decrypt anything anyway.
+/// START a re-establish. Only the SLOW half — reading the peer's directory — is
+/// deferred to `chatRestartWorker`; the group rebuild happens on the loop in
+/// `chatRestartStep` when the read lands. This function copies what the worker
+/// needs and returns at once, so the tap never stalls the render thread (the
+/// "wave of slowdown"). One at a time; a second tap while one is live is a no-op.
 fn chatRestart(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, conv: chat_core.ConvIndex) void {
+    if (rs.gchat_e2ee == null or rs.gchat_link == null) {
+        rs.status = "chat: offline";
+        return;
+    }
+    const job = &rs.gchat_restart_job;
+    if (job.thread != null) return; // one re-establish in flight, ever
+
+    const peer_did = chat_core.conversationDid(&rs.gchat_store, conv);
+    if (peer_did.len == 0 or peer_did.len > job.peer_did_buf.len) {
+        rs.status = "Couldn't re-establish — try again";
+        return;
+    }
+    @memcpy(job.peer_did_buf[0..peer_did.len], peer_did);
+    job.peer_did_len = @intCast(peer_did.len);
+    job.io = io;
+    job.env = env;
+    job.set = .{};
+    job.ok = false;
+    job.err = null;
+    job.done.store(false, .monotonic);
+    job.thread = std.Thread.spawn(.{}, chatRestartWorker, .{ job, gpa }) catch |err| {
+        chatLog("[chat] could not spawn the re-establish worker: {s}", .{@errorName(err)});
+        rs.status = "Couldn't re-establish — try again";
+        return;
+    };
+    rs.status = "chat: re-establishing\u{2026}";
+}
+
+/// The network leg of re-establish, on its own thread. Its arena dies with it; the
+/// fetched key packages are gpa-owned, so the result travels back by value and
+/// nothing points into the worker's memory. It touches only the network, never the
+/// shared chat state — which is what makes the split safe.
+fn chatRestartWorker(job: *ChatRestartJob, gpa: Allocator) void {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const peer_did = job.peer_did_buf[0..job.peer_did_len];
+    if (chat_e2ee.fetchRestartTargets(gpa, arena_state.allocator(), job.io, job.env, peer_did)) |set| {
+        job.set = set;
+        job.ok = true;
+    } else |err| {
+        job.err = err;
+    }
+    job.done.store(true, .release);
+}
+
+/// The re-establish read has landed: rebuild the group on the loop (Phase 2), then
+/// re-subscribe. Runs every frame; a no-op until the worker is done.
+fn chatRestartStep(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map) void {
+    const job = &rs.gchat_restart_job;
+    if (job.thread == null or !job.done.load(.acquire)) return;
+    job.thread.?.join();
+    job.thread = null;
+    defer chat_e2ee.freeRestartTargets(gpa, &job.set);
+
+    const peer_did = job.peer_did_buf[0..job.peer_did_len];
+
+    if (!job.ok) {
+        const err = job.err orelse error.RelayDown;
+        chatLog("[chat] re-establish fetch FAILED -> {s}: {s}", .{ peer_did, @errorName(err) });
+        rs.status = switch (err) {
+            error.NoKeyPackage => "They haven't set up chat on this account yet",
+            error.RelayDown => "Chat relay unreachable — try again",
+            else => "Couldn't re-establish — try again",
+        };
+        return;
+    }
+
+    // The rebuild + Welcome deposits MUTATE the chat state, so they belong here on
+    // the loop — but they are local crypto and a relay socket write, not the slow
+    // directory read the worker already carried off-thread.
     const state = if (rs.gchat_e2ee) |*p| p else {
         rs.status = "chat: offline";
         return;
@@ -11250,10 +11364,8 @@ fn chatRestart(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.proce
         rs.status = "chat: offline";
         return;
     };
-    const peer_did = chat_core.conversationDid(&rs.gchat_store, conv);
-    _ = rs.gchat_arena_state.reset(.retain_capacity);
-    chat_e2ee.restartConversation(gpa, rs.gchat_arena_state.allocator(), io, env, state, l, peer_did) catch |err| {
-        chatLog("[chat] re-establish FAILED -> {s}: {s}", .{ peer_did, @errorName(err) });
+    chat_e2ee.applyRestart(gpa, env, io, state, l, peer_did, &job.set) catch |err| {
+        chatLog("[chat] re-establish apply FAILED -> {s}: {s}", .{ peer_did, @errorName(err) });
         rs.status = switch (err) {
             error.NoKeyPackage => "They haven't set up chat on this account yet",
             error.RelayDown => "Chat relay unreachable — try again",

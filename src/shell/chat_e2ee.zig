@@ -1087,13 +1087,78 @@ pub fn restartConversation(
     peer_did: []const u8,
 ) StartError!void {
     if (conversationIndex(st, peer_did) == null) return error.NoConversation;
+    var set = try fetchRestartTargets(gpa, arena, io, environ, peer_did);
+    defer freeRestartTargets(gpa, &set);
+    try applyRestart(gpa, environ, io, st, link, peer_did, &set);
+}
 
+/// The peer's CURRENT devices, copied into gpa-owned memory. Split out from
+/// `restartConversation` so the SLOW half — reading the peer's directory — can run
+/// on a worker whose arena dies before the result is applied (the re-establish
+/// "wave of slowdown" was this read blocking the render thread). Nothing here
+/// touches `State`; the container is stack-sized and only the key-package bytes are
+/// heap-owned, so the result travels back to the loop by value.
+/// A7.2: cold, transient — one re-establish in flight at a time.
+pub const PeerTargetSet = struct {
+    count: usize = 0,
+    anchors: [16][32]u8 = undefined,
+    /// gpa-owned; parallel to `anchors`. Free with `freeRestartTargets`.
+    kps: [16][]const u8 = undefined,
+};
+
+/// PHASE 1 (worker-safe): read the peer's device directory and copy every device's
+/// key package into gpa-owned memory. Pure network + heap; never reads or writes
+/// `State`, so it is safe to run off the render thread.
+pub fn fetchRestartTargets(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    peer_did: []const u8,
+) StartError!PeerTargetSet {
     // Their CURRENT devices — not the ones we pinned. If they reinstalled, added a
     // phone, or started chat over on a new device, THIS is where we learn it: the
     // repair rebuilds against whoever they are now, not whoever they were.
     var kps_buf: [16]DeviceTarget = undefined;
     const targets = try peerTargets(gpa, arena, io, environ, peer_did, &kps_buf);
     if (targets.len == 0) return error.NoKeyPackage;
+
+    var set: PeerTargetSet = .{};
+    errdefer freeRestartTargets(gpa, &set);
+    for (targets) |t| {
+        set.kps[set.count] = try gpa.dupe(u8, t.kp_bytes);
+        set.anchors[set.count] = t.anchor_pub;
+        set.count += 1;
+    }
+    return set;
+}
+
+pub fn freeRestartTargets(gpa: Allocator, set: *PeerTargetSet) void {
+    for (set.kps[0..set.count]) |kp| gpa.free(kp);
+    set.count = 0;
+}
+
+/// PHASE 2 (render thread): given the fetched devices, rebuild the pairwise groups
+/// and send the new Welcomes. This MUTATES `State` (the groups, the anchors, the
+/// welcome backlog) and deposits into the relay, so it belongs on the loop, never
+/// on the worker — but it is local crypto plus a relay socket write, not the slow
+/// directory read Phase 1 already carried off-thread.
+pub fn applyRestart(
+    gpa: Allocator,
+    environ: ?*const std.process.Environ.Map,
+    io: std.Io,
+    st: *State,
+    link: *chat_relay.ChatRelay,
+    peer_did: []const u8,
+    set: *const PeerTargetSet,
+) StartError!void {
+    if (conversationIndex(st, peer_did) == null) return error.NoConversation;
+
+    var targets_buf: [16]DeviceTarget = undefined;
+    for (set.kps[0..set.count], set.anchors[0..set.count], 0..) |kp, anchor_pub, i| {
+        targets_buf[i] = .{ .kp_bytes = kp, .anchor_pub = anchor_pub };
+    }
+    const targets = targets_buf[0..set.count];
 
     var rebuilt: usize = 0;
     for (targets) |t| {
