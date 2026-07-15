@@ -9305,6 +9305,11 @@ pub const ChatDevices = struct {
     /// while the keys + relay come up. Restored conversations render immediately —
     /// this never hides them.
     connecting: bool = false,
+    /// Entrance settle, 0→1: when the visible chat sub-surface CHANGES (into the
+    /// gate, the consent page, the help page), it fades + slides up rather than
+    /// popping. 1 = settled (no transform). The shell resets it on a sub-surface
+    /// change and eases it here.
+    enter_t: f32 = 1,
 };
 
 // ── the multi-device surfaces ───────────────────────────────────────────────
@@ -9408,6 +9413,7 @@ fn drawDeviceGate(
         const help = "How Zat Chat works";
         const hw: i32 = @intCast(text.measure(e, .regular, help, 13));
         _ = try str(gpa, dl, e, .regular, cx - @divTrunc(hw, 2), y + 4, softA(accentRgbOf(accent), 0xCC), 13, help);
+        try rect(gpa, dl, cx - @divTrunc(hw, 2), y + 9, hw, 1, softA(accentRgbOf(accent), 0x88), 0); // underline = "tap me"
         try emitRegion(gpa, regions, cx - @divTrunc(hw, 2) - 10, y - 10, hw + 20, 28, 0, .chat_device_help);
         return y + 40;
     }
@@ -9453,6 +9459,7 @@ fn drawDeviceGate(
     const reset = "Set up chat fresh on this device instead";
     const rw: i32 = @intCast(text.measure(e, .semibold, reset, 13));
     _ = try str(gpa, dl, e, .semibold, cx - @divTrunc(rw, 2), y + 4, muted, 13, reset);
+    try rect(gpa, dl, cx - @divTrunc(rw, 2), y + 9, rw, 1, softA(muted, 0x55), 0); // a quiet underline — tappable, but a last resort
     try emitRegion(gpa, regions, cx - @divTrunc(rw, 2) - 10, y - 10, rw + 20, 28, 0, .chat_identity_reset);
     y += 22;
     const cost = "This device takes over chat. Your conversations don't come with it.";
@@ -9464,6 +9471,7 @@ fn drawDeviceGate(
     const help = "How Zat Chat works";
     const hw: i32 = @intCast(text.measure(e, .regular, help, 13));
     _ = try str(gpa, dl, e, .regular, cx - @divTrunc(hw, 2), y + 4, softA(accentRgbOf(accent), 0xCC), 13, help);
+    try rect(gpa, dl, cx - @divTrunc(hw, 2), y + 9, hw, 1, softA(accentRgbOf(accent), 0x88), 0); // underline = "tap me"
     try emitRegion(gpa, regions, cx - @divTrunc(hw, 2) - 10, y - 10, hw + 20, 28, 0, .chat_device_help);
     return y + 40;
 }
@@ -9853,6 +9861,7 @@ fn drawChatConsent(
     const help = "How Zat Chat works";
     _ = try str(gpa, dl, e, .regular, x, y + 10, softA(accentRgbOf(accent), 0xCC), 13, help);
     const hw: i32 = @intCast(text.measure(e, .regular, help, 13));
+    try rect(gpa, dl, x, y + 15, hw, 1, softA(accentRgbOf(accent), 0x88), 0); // underline = "tap me"
     try emitRegion(gpa, regions, x - 6, y, hw + 12, 28, 0, .chat_device_help);
     return y + 40;
 }
@@ -9948,11 +9957,13 @@ fn drawChatHelp(
     const x = x0 + 20;
     var y: i32 = if (phone) insets.top + 26 else 40;
 
-    // Close, top-left, where a back control belongs.
+    // Close, top-left, where a back control belongs — in a pill so it reads as
+    // tappable (the same back-button vocabulary the rest of the app uses).
     const close = "\u{2039} Back";
-    _ = try str(gpa, dl, e, .semibold, x, y + 6, muted, 14, close);
     const clw: i32 = @intCast(text.measure(e, .semibold, close, 14));
-    try emitRegion(gpa, regions, x - 8, y - 12, clw + 20, 34, 0, .chat_help_close);
+    try rect(gpa, dl, x - 12, y - 7, clw + 28, 30, 0x14EDEAE0, 9);
+    _ = try str(gpa, dl, e, .semibold, x, y + 6, ink, 14, close);
+    try emitRegion(gpa, regions, x - 12, y - 7, clw + 28, 30, 0, .chat_help_close);
     y += 40;
 
     _ = try str(gpa, dl, e, .semibold, x, y + 10, ink, 24, "How Zat Chat works");
@@ -10064,6 +10075,17 @@ fn drawChatLoading(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, 
     }
 }
 
+/// Apply the entrance settle to the draw items a chat sub-surface just appended
+/// (`start`..end): a gentle slide-up + fade-in, eased out. `t` = 1 is a no-op, so a
+/// settled screen pays nothing and stays cacheable. Kept small on purpose — a screen
+/// that flies in is worse than one that pops; this just takes the hard edge off.
+fn applyChatEnter(dl: *raster.DrawList, start: usize, t: f32) void {
+    if (t >= 0.999) return;
+    const e = 1.0 - (1.0 - t) * (1.0 - t); // ease-out quad
+    transformDlRange(dl, start, dl.len, 1.0, 0, 0, 0, (1.0 - e) * 12.0); // from +12px
+    fadeItems(dl, start, e);
+}
+
 pub fn layoutChat(
     gpa: Allocator,
     e: *const text.Engine,
@@ -10166,14 +10188,20 @@ pub fn layoutChat(
     // (the standing new-overlay law). Reachable at ANY time — an explainer you
     // can only read when nothing is wrong is a brochure. ──
     if (devices.help_open) {
-        return try drawChatHelp(gpa, dl, e, regions, x0, width, insets, accent);
+        const enter_start = dl.len;
+        const r = try drawChatHelp(gpa, dl, e, regions, x0, width, insets, accent);
+        applyChatEnter(dl, enter_start, devices.enter_t);
+        return r;
     }
 
     // ── THE ONE-TIME SETUP. Before the list, before a thread, before anything:
     // the first time somebody opens Zat Chat we ask what they want to share. It is
     // a PAGE (it replaces the column) and it happens exactly once per account. ──
     if (devices.consent_open and devices.state == .ok) {
-        return try drawChatConsent(gpa, dl, e, regions, x0, w, width, insets, accent, devices);
+        const enter_start = dl.len;
+        const r = try drawChatConsent(gpa, dl, e, regions, x0, w, width, insets, accent, devices);
+        applyChatEnter(dl, enter_start, devices.enter_t);
+        return r;
     }
 
     // ── THE GATE — chat lives on another device (A3, rebuilt for slice 2). ──
@@ -10189,7 +10217,10 @@ pub fn layoutChat(
     // the act; starting over — which costs you every conversation you have, and
     // costs the people you talk to as well — is a quiet last resort underneath it.
     if (devices.state != .ok) {
-        return try drawDeviceGate(gpa, dl, e, regions, x0, w, width, insets, accent, devices);
+        const enter_start = dl.len;
+        const r = try drawDeviceGate(gpa, dl, e, regions, x0, w, width, insets, accent, devices);
+        applyChatEnter(dl, enter_start, devices.enter_t);
+        return r;
     }
 
     // ── A LOAD IN PROGRESS, shown ON the thing that is loading. Chat is coming up

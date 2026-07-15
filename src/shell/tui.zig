@@ -861,6 +861,11 @@ const RunState = struct {
     /// render thread stalled inside `ensurePublished`, never acked the surface
     /// detach, and Android killed the app (2026-07-14).
     gchat_init_job: ChatInitJob,
+    /// Chat sub-surface entrance settle: when the gate/consent/help surface CHANGES,
+    /// it fades + slides up instead of popping. `gchat_enter_kind` is which surface
+    /// is showing; when it changes, `gchat_enter_ns` restamps and the settle replays.
+    gchat_enter_ns: u64,
+    gchat_enter_kind: u8,
     /// THE ROSTER QUEUE (slice 3). People another device of ours says we talk to,
     /// waiting to be opened — ONE PER FRAME. Opening a conversation is a network
     /// round-trip; twenty of them inside one frame is the freeze the UI-thread law
@@ -1581,6 +1586,8 @@ fn initRunState(
     rs.gdev_poll_ns = 0;
     rs.gdev_job = .{};
     rs.gchat_init_job = .{};
+    rs.gchat_enter_ns = 0;
+    rs.gchat_enter_kind = 255; // force a settle on the first chat surface shown
     rs.groster_n = 0;
     rs.groster_sig = 0;
     rs.groster_at = 0;
@@ -10414,7 +10421,31 @@ fn chatDevicesOf(rs: *RunState, arena: Allocator) feed_view.ChatDevices {
         // Chat is coming up on the worker right now — the list area shows a load mark
         // instead of a blank column (the shell owns this fact; the view just draws it).
         .connecting = rs.gchat_init_job.thread != null,
+        // The entrance settle: which sub-surface is showing, and how far its slide-in
+        // has run. Mirror layoutChat's dispatch order so the kind matches what draws.
+        .enter_t = chatEnterT(rs),
     };
+}
+
+/// The chat sub-surface entrance settle (0→1 over ~220ms). Restamps the clock when
+/// the visible surface changes, so each of the gate/consent/help slides in once.
+fn chatEnterT(rs: *RunState) f32 {
+    const kind: u8 = if (rs.gdev_help)
+        3
+    else if (rs.gchat_consent_open and rs.gdev_state == .ok)
+        2
+    else if (rs.gdev_state != .ok)
+        1
+    else
+        0; // the list itself doesn't use this settle
+    if (kind != rs.gchat_enter_kind) {
+        rs.gchat_enter_kind = kind;
+        rs.gchat_enter_ns = clock_shell.monotonicNanos();
+    }
+    if (kind == 0) return 1; // no settle on the list
+    const el: u64 = clock_shell.monotonicNanos() -| rs.gchat_enter_ns;
+    const t = @as(f32, @floatFromInt(el)) / 220_000_000.0;
+    return std.math.clamp(t, 0.0, 1.0);
 }
 
 /// Load what this account said the one time we asked (slice 1). Never asked = the
@@ -15193,7 +15224,9 @@ fn paintFrameGpu(
     // OUTSIDE the chat_store guard on purpose: the gate draws when chat is not up.
     if (g.screen.* == feed_view.screen_messages) {
         const dv = g.chat_devices;
-        if (dv.state == .pending or dv.state == .offline or dv.added_t > 0.001 or dv.connecting) chat_animating = true;
+        // The eased entrance can't live in the signature (it changes every frame);
+        // keep frames coming while it settles, then it's a static, cacheable screen.
+        if (dv.state == .pending or dv.state == .offline or dv.added_t > 0.001 or dv.connecting or dv.enter_t < 0.999) chat_animating = true;
     }
     // ZONES: the hub + zone page render from state the feed signature can't
     // see — the sub-tab, the search text/focus/caret, the catalog's pins and
