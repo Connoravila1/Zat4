@@ -139,6 +139,18 @@ pub const ServeConfig = struct {
 /// A published key changes about never; an hour is short enough that a
 /// rotation takes effect while a reconnect storm still costs one fetch.
 const auth_cache_ttl_s: i64 = 3600;
+/// The SHORT re-fetch window for a MISS-within-a-hit (CHAT_HARDENING follow-up,
+/// 2026-07-15). The cached set is per DID and shared by all of an account's
+/// devices, so it is a point-in-time snapshot: a device APPROVED after the set was
+/// cached is absent from it and, with only the hour-long TTL, was refused for the
+/// whole hour — a newly-added phone could not deliver until the relay was
+/// restarted. So when a connection PROVES key custody (its signature already
+/// verified) for a DID we know, but the key is not in the cached set, we re-fetch
+/// once the entry is older than this — a device may have just been vouched for.
+/// It stays bounded: the re-fetch also refreshes `at`, so it is at most ONE fetch
+/// per DID per window regardless of how many connections ask, which is the whole
+/// point of the cache (a fetch-amplifier is exactly what it exists to stop).
+const auth_cache_refetch_after_s: i64 = 15;
 /// Bounded, because every entry is attacker-suggested (anyone may claim any
 /// DID and make us look it up). At the cap we stop inserting rather than grow
 /// an allocation a stranger steers.
@@ -177,17 +189,25 @@ pub const AuthCache = struct {
 };
 
 /// A cached verdict. `.miss` = unknown/expired (go ask the directory); `.negative`
-/// = cached "no such account" (refuse without a fetch); `.hit` = the accepted set.
-const CacheResult = union(enum) { miss, negative, hit: AnchorSet };
+/// = cached "no such account" (refuse without a fetch); `.hit` = the accepted set,
+/// with `refreshable` = the entry is old enough that a KEY-NOT-IN-SET miss should
+/// trigger one re-fetch (a device may have just been approved).
+/// A7.2: cold, one per lookup (a return value), size guard waived.
+const CacheResult = union(enum) {
+    miss,
+    negative,
+    hit: struct { set: AnchorSet, refreshable: bool },
+};
 
 fn cacheLookup(c: *AuthCache, did: []const u8, now: i64) CacheResult {
     c.lock();
     defer c.unlock();
     for (c.dids.items, 0..) |d, i| {
         if (!std.mem.eql(u8, d, did)) continue;
-        if (now - c.at.items[i] > auth_cache_ttl_s) return .miss; // stale: re-fetch
+        const age = now - c.at.items[i];
+        if (age > auth_cache_ttl_s) return .miss; // stale: re-fetch
         const s = c.sets.items[i];
-        return if (s.n == 0) .negative else .{ .hit = s };
+        return if (s.n == 0) .negative else .{ .hit = .{ .set = s, .refreshable = age > auth_cache_refetch_after_s } };
     }
     return .miss;
 }
@@ -266,9 +286,20 @@ fn verifyAuth(gpa: Allocator, io: std.Io, cfg: ServeConfig, a: *ConnAuth, op: an
         switch (cacheLookup(c, op.did, now)) {
             .miss => {},
             .negative => return false, // cached: no such account
-            .hit => |s| {
-                set = s;
-                known = true;
+            .hit => |h| {
+                if (h.set.contains(op.anchor_pub)) {
+                    // The fast path: cached, and this device is in it.
+                    set = h.set;
+                    known = true;
+                } else if (!h.refreshable) {
+                    // Cached, this key is NOT in it, and the entry is too fresh to
+                    // re-fetch. Refuse WITHOUT a fetch — this is the bound that keeps
+                    // a stream of key-not-in-set attempts from becoming a stream of
+                    // directory fetches (at most one per DID per refetch window).
+                    return false;
+                }
+                // Otherwise: cached, key absent, entry old enough — fall through and
+                // re-fetch ONCE. A device may have been vouched for since we cached.
             },
         }
     }
@@ -1099,6 +1130,54 @@ test "relay auth: an approved NON-root device is admitted; a stranger key is not
         const pubx = try anchor_core.publicKey(stranger);
         const sigx = try anchor_core.signRelayAuth(stranger, challenge, auth_test_did);
         try testing.expect(!verifyAuth(gpa, io, cfg, &ca, .{ .did = auth_test_did, .anchor_pub = pubx, .sig = sigx }));
+    }
+}
+
+test "relay auth cache: a key absent from a cached set re-fetches only after the bound" {
+    // The stale-cache follow-up (2026-07-15). The set is cached per DID and shared
+    // by all of an account's devices, so a device approved AFTER the set was cached
+    // is absent from it. With only the hour TTL, that phone was refused for an hour
+    // (a relay restart was the only cure). Now a key-not-in-set miss re-fetches once
+    // the entry ages past `auth_cache_refetch_after_s` — bounded to one fetch per
+    // DID per window, which is exactly the fetch-amplifier protection the cache is
+    // for. This exercises that decision directly (verifyAuth reads the wall clock;
+    // the cache takes `now`, so time is controllable here).
+    const gpa = testing.allocator;
+    var cache: AuthCache = .{};
+    defer cache.deinit(gpa);
+
+    const did = "did:plc:cachetestaccount0000";
+    var set: AnchorSet = .{};
+    set.keys[0] = @splat(0x11);
+    set.n = 1;
+    const t0: i64 = 1_000_000;
+    cacheStore(gpa, &cache, did, set, t0);
+
+    // Fresh: a hit that is NOT refreshable — a key-not-in-set miss refuses, no fetch.
+    switch (cacheLookup(&cache, did, t0 + 5)) {
+        .hit => |h| {
+            try testing.expect(!h.refreshable);
+            try testing.expect(h.set.contains(@as([relay.anchor_pub_len]u8, @splat(0x11))));
+            try testing.expect(!h.set.contains(@as([relay.anchor_pub_len]u8, @splat(0x22))));
+        },
+        else => return error.ExpectedHit,
+    }
+    // Past the short window: a hit that IS refreshable — a key-not-in-set miss will
+    // re-fetch (so a just-approved device is not locked out for the full TTL).
+    switch (cacheLookup(&cache, did, t0 + auth_cache_refetch_after_s + 1)) {
+        .hit => |h| try testing.expect(h.refreshable),
+        else => return error.ExpectedHit,
+    }
+    // Past the full TTL: a miss (unconditional re-fetch).
+    switch (cacheLookup(&cache, did, t0 + auth_cache_ttl_s + 1)) {
+        .miss => {},
+        else => return error.ExpectedMiss,
+    }
+    // A negative entry (n == 0) reads back as negative, never as a hit.
+    cacheStore(gpa, &cache, did, .{ .n = 0 }, t0 + 2);
+    switch (cacheLookup(&cache, did, t0 + 3)) {
+        .negative => {},
+        else => return error.ExpectedNegative,
     }
 }
 
