@@ -10765,19 +10765,12 @@ pub fn layoutChat(
         const hdr_x = detail_x - @divTrunc(split_gap, 2) + 1;
         try rect(gpa, dl, hdr_x, 0, x0 + w - hdr_x, thread_top, skinHeaderVeil(accent), 0);
         _ = try str(gpa, dl, e, .semibold, detail_x, top + 26, ink, 16, peer_disp);
-        // The repair. Quiet, but always reachable: a conversation can be alive on
-        // your side and absent on theirs (the Welcome that opened it never landed,
-        // or they reinstalled), and until now that state was both terminal and
-        // invisible — your messages appeared and went nowhere. One tap rebuilds
-        // the channel. It costs nothing: history is local, and a group they never
-        // joined could not decrypt anything anyway.
-        if (peer.len > 0) {
-            const rl = "Re-establish";
-            const rw: i32 = @intCast(text.measure(e, .semibold, rl, 12));
-            const rx2 = detail_x + detail_w - rw;
-            _ = try str(gpa, dl, e, .semibold, rx2, top + 26, faint, 12, rl);
-            try emitRegion(gpa, regions, rx2 - 10, top + 8, rw + 16, 28, 0, .chat_restart);
-        }
+        // The repair used to sit HERE, on every conversation's header, always. That
+        // was wrong twice over: it invited a person to "re-establish" a working chat
+        // (a question with no good answer), and the act is a blocking network leg —
+        // a wave of slowdown nobody should meet on a healthy thread. It lives ONLY on
+        // the delivery strip below now, which appears exactly when a conversation
+        // actually needs it, so the fix is where the problem is and nowhere else.
         try rect(gpa, dl, detail_x, top + 40, detail_w, 1, divider, 0);
     }
 
@@ -10797,27 +10790,23 @@ pub fn layoutChat(
         try rect(gpa, dl, detail_x, by + strip_h - 1, detail_w, 1, divider, 0);
         const msg_line = switch (delivery) {
             .waiting => "Waiting for them to receive this\u{2026}",
-            // The retries are spent. On desktop the repair is right there in
-            // the header, so name it; the phone has no such control yet, so
-            // promising one would be a lie.
-            .undelivered => if (phone)
-                "They haven't picked this up yet"
-            else
-                "They haven't picked this up \u{2014} tap Re-establish to try again",
+            // The retries are spent. The strip itself is the repair now (on desktop
+            // AND phone) — one honest place, where the problem is announced.
+            .undelivered => "They haven't picked this up \u{2014} tap to try again",
             // A2 — the DRIFT. The two halves walked apart (a Commit one side
             // never saw) and their messages no longer open. The old behaviour
             // was to drop the message and say nothing, so the only symptom
             // anyone ever got was that replies stopped. Say it, and make the
-            // saying itself the repair: the whole strip is the tap target, so
-            // the fix is where the problem is announced — on the phone too,
-            // which has no Re-establish control in its header.
+            // saying itself the repair: the whole strip is the tap target.
             .needs_reconnect => "This conversation needs to reconnect \u{2014} tap to fix it",
             .confirmed => unreachable,
         };
         const line_c = if (delivery == .needs_reconnect) warn else muted;
         const lw: i32 = @intCast(text.measure(e, .regular, msg_line, 12));
         _ = try str(gpa, dl, e, .regular, detail_x + @divTrunc(detail_w - lw, 2), by + 17, line_c, 12, msg_line);
-        if (delivery == .needs_reconnect)
+        // Tappable exactly when there is something to repair — never on `.waiting`
+        // (that is just patience) and never on a healthy thread (no strip at all).
+        if (delivery == .needs_reconnect or delivery == .undelivered)
             try emitRegion(gpa, regions, detail_x, by, detail_w, strip_h, 0, .chat_restart);
     }
 
@@ -11981,12 +11970,25 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     try std.testing.expectEqual(@as(usize, 1), n_send);
     try std.testing.expectEqual(@as(usize, 1), n_new);
     try std.testing.expectEqual(@as(usize, 1), n_pay); // the pay button (M5 A4)
-    // The REPAIR. A conversation can be alive on your side and absent on theirs
-    // (the Welcome that opened it never landed, or they reinstalled), and that
-    // state used to be terminal AND invisible — your bubbles appeared and went
-    // nowhere. It must always be reachable from an open thread.
-    try std.testing.expectEqual(@as(usize, 1), n_restart);
+    // The REPAIR is CONTEXTUAL now: it appears only when a conversation actually
+    // needs it (delivery `.undelivered`/`.needs_reconnect`), never on a healthy one.
+    // This conversation is `.confirmed`, so there is NO repair control — it used to
+    // sit on every header always, which invited "re-establishing" a working chat and
+    // paid a blocking network leg for it.
+    try std.testing.expectEqual(@as(usize, 0), n_restart);
     try std.testing.expectEqual(regions.items.len, n_conv + n_input + n_send + n_new + n_pay + n_restart + n_msg);
+
+    // ...and when it IS needed, the delivery strip is the single tap target. Re-lay
+    // the same surface with a drifted conversation and the repair reappears, exactly
+    // once, on the strip.
+    dl.clearRetainingCapacity();
+    regions.clearRetainingCapacity();
+    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .needs_reconnect, .authenticated, .{}, .{}, .{});
+    var n_restart_broken: usize = 0;
+    for (regions.items) |r| {
+        if (r.kind == .chat_restart) n_restart_broken += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), n_restart_broken);
     try std.testing.expect(h >= 940); // viewport + any thread overflow
     try std.testing.expect(dl.len > 0);
 
@@ -12032,21 +12034,22 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     try std.testing.expect(dl.len > rest_items);
     try std.testing.expectEqual(rest_regions, regions.items.len);
 
-    // A1 — the delivery line. A conversation whose Welcome is unacknowledged
-    // SAYS SO (extra draw items over the confirmed frame, which draws nothing:
-    // healthy plumbing is silent), and an undelivered one says its own thing.
-    // Neither moves a tap target — the strip is a statement, not a control.
+    // A1 — the delivery line. A conversation whose Welcome is unacknowledged SAYS SO
+    // (extra draw items over the confirmed frame, which draws nothing: healthy
+    // plumbing is silent). `.waiting` is patience, not a problem — a statement, no
+    // tap target. `.undelivered` is a PROBLEM, so its strip is the repair CONTROL:
+    // it adds exactly one tap target (the only re-establish affordance there is now).
     dl.len = 0;
     regions.clearRetainingCapacity();
     _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .waiting, .authenticated, .{}, .{}, .{});
     const waiting_items = dl.len;
     try std.testing.expect(waiting_items > rest_items);
-    try std.testing.expectEqual(rest_regions, regions.items.len);
+    try std.testing.expectEqual(rest_regions, regions.items.len); // patience, no control
     dl.len = 0;
     regions.clearRetainingCapacity();
     _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .undelivered, .authenticated, .{}, .{}, .{});
     try std.testing.expect(dl.len > rest_items);
-    try std.testing.expectEqual(rest_regions, regions.items.len);
+    try std.testing.expectEqual(rest_regions + 1, regions.items.len); // + the repair tap target
 }
 
 test "messages screen: chat published from another device says so, and offers ONE way forward (A3)" {
