@@ -865,6 +865,9 @@ const RunState = struct {
     /// (see `ChatRestartJob`); this holds the worker + its result until the loop
     /// applies the group rebuild.
     gchat_restart_job: ChatRestartJob,
+    /// Periodic chat-maintenance directory reads (roster publish / peer refresh /
+    /// roster receive), off the render thread — see `ChatDirJob`.
+    gchat_dir_job: ChatDirJob,
     /// Chat sub-surface entrance settle: when the gate/consent/help surface CHANGES,
     /// it fades + slides up instead of popping. `gchat_enter_kind` is which surface
     /// is showing; when it changes, `gchat_enter_ns` restamps and the settle replays.
@@ -1591,6 +1594,7 @@ fn initRunState(
     rs.gdev_job = .{};
     rs.gchat_init_job = .{};
     rs.gchat_restart_job = .{};
+    rs.gchat_dir_job = .{};
     rs.gchat_enter_ns = 0;
     rs.gchat_enter_kind = 255; // force a settle on the first chat surface shown
     rs.groster_n = 0;
@@ -1975,6 +1979,11 @@ fn deinitRunState(rs: *RunState) void {
         // A fetch that landed in the frame we shut down: nobody applied it, so free
         // the key-package bytes it copied out.
         chat_e2ee.freeRestartTargets(gpa, &rs.gchat_restart_job.set);
+    }
+    if (rs.gchat_dir_job.thread) |t| {
+        t.join();
+        rs.gchat_dir_job.thread = null;
+        chat_e2ee.freeRestartTargets(gpa, &rs.gchat_dir_job.set);
     }
     if (rs.gchat_e2ee) |*st| chat_e2ee.deinit(gpa, st);
     if (rs.gchat_link) |link| chat_relay.shutdown(link);
@@ -2582,36 +2591,50 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 chat_e2ee.retryWelcomes(gpa, environ, st, rs.gchat_link.?, now);
             }
 
-            // THE ROSTER, RECEIVING SIDE (slice 3): open ONE queued conversation per
-            // pass. Each is a network round-trip, so they are spread out rather than
-            // fired in a burst — the list fills in in front of the person, which is
-            // both honest and the only thing the render thread can afford.
-            if (rs.groster_n > 0 and now >= rs.gchat_retry_at) {
+            // ── PERIODIC CHAT MAINTENANCE — all THREE legs read the peer/self device
+            // directory, which is a BLOCKING network round-trip. They used to run
+            // inline here, so a slow directory read froze the whole UI (input, layout,
+            // paint) on any screen, every 15s. Now each STARTS a `gchat_dir_job` (one
+            // in flight; `chatDirStep` applies the result on the loop) and returns at
+            // once. Each leg's guard includes `dir_job.thread == null`, so the single
+            // worker slot serializes them without skipping a cycle: a leg preempted
+            // this frame keeps its timer and runs the next. ──
+
+            // RECEIVING SIDE (slice 3): open ONE queued conversation per pass. The VIEW
+            // row appears immediately; the crypto sessions build off-thread behind it.
+            if (rs.gchat_dir_job.thread == null and rs.groster_n > 0 and now >= rs.gchat_retry_at) {
                 const e = rs.groster[rs.groster_n - 1];
                 rs.groster_n -= 1;
                 const did = e.buf[0..e.len];
                 if (!chat_e2ee.hasConversation(st, did)) {
-                    chatStartWith(rs, gpa, io, environ, st, did);
+                    _ = chat_core.openConversation(gpa, &rs.gchat_store, did, "") catch null;
+                    startChatDirJob(rs, gpa, io, environ, .roster_open, did);
                 }
             }
 
-            // THE ROSTER, SENDING SIDE: hand our other devices the people we talk
-            // to. Only when something actually changed (the device set, or the
-            // conversation list) — a quiet app must be a silent one, and re-sending
-            // an unchanged roster every tick would be a deposit per device per tick
-            // for no reason at all.
-            if (now - rs.groster_at >= 15) {
+            // SENDING SIDE: hand our other devices the people we talk to. Gated on the
+            // self-device read (off-thread); the send itself (still signature-gated so
+            // a quiet app stays silent) runs in `chatDirStep`.
+            else if (rs.gchat_dir_job.thread == null and now - rs.groster_at >= 15) {
                 rs.groster_at = now;
-                rosterPublish(rs, gpa, io, environ, st, now);
+                startChatDirJob(rs, gpa, io, environ, .self_roster, st.my_did);
             }
 
             // SLICE 4 — KEEP UP WITH WHO PEOPLE ARE. One conversation at a time, in
-            // rotation: are they still on the devices we think they are? This is what
-            // makes a lost phone survivable WITHOUT anybody re-messaging anybody —
-            // and it is where a key change becomes visible instead of silent.
-            if (now - rs.gpeer_refresh_at >= 60) {
+            // rotation: are they still on the devices we think they are? The rotation
+            // (index math + the DID read) is on the loop; only the device fetch is
+            // off-thread, and a key change becomes visible instead of silent.
+            else if (rs.gchat_dir_job.thread == null and now - rs.gpeer_refresh_at >= 60) {
                 rs.gpeer_refresh_at = now;
-                peerRefreshNext(rs, gpa, io, environ, st, now);
+                const n = rs.gchat_store.convs.len;
+                if (n > 0) {
+                    if (rs.gpeer_refresh_i >= n) rs.gpeer_refresh_i = 0;
+                    const conv: chat_core.ConvIndex = @enumFromInt(rs.gpeer_refresh_i);
+                    rs.gpeer_refresh_i += 1;
+                    const did = chat_core.conversationDid(&rs.gchat_store, conv);
+                    if (did.len > 0 and !std.mem.eql(u8, did, st.my_did))
+                        startChatDirJob(rs, gpa, io, environ, .peer_refresh, did);
+                }
             }
         };
 
@@ -2803,6 +2826,11 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
         // Has a re-establish read landed? The peer-directory fetch runs on a worker
         // (the "wave of slowdown" when it ran here); this applies the group rebuild.
         if (dev_chat) chatRestartStep(rs, gpa, io, environ);
+
+        // Has a periodic-maintenance directory read landed? (roster publish / peer
+        // refresh / roster receive — the blocking fetches that used to freeze the UI
+        // every 15s now run on `gchat_dir_job`; this applies the session work.)
+        if (dev_chat) chatDirStep(rs, gpa, io, environ);
 
         // MULTI-DEVICE (slice 2). Runs whether or not chat is up, because the
         // device that is WAITING to be let in has no chat state by definition — and
@@ -9931,6 +9959,31 @@ const ChatRestartJob = struct {
     err: ?anyerror = null,
 };
 
+/// The periodic chat-MAINTENANCE directory read, on a worker. `rosterPublish` (15s),
+/// `peerRefreshNext` (60s) and the roster-receive leg each did a BLOCKING
+/// `fetchPeerDevices` inline in `stepFrame` — so a slow directory read froze the
+/// whole UI (input, layout, paint) for its duration, on ANY screen, every 15s. That
+/// is the render-thread-blocking-I/O law broken three more times. This worker reads
+/// the directory for one DID off-thread; `chatDirStep` applies the session work on
+/// the loop (`chat_e2ee.applySelfSessions`/`applyStartConversation`/`applyPeerRefresh`),
+/// which is local crypto + non-blocking relay deposits. One in flight at a time.
+/// A7.2: cold struct (one live instance, holds a thread), size guard waived.
+const ChatDirJob = struct {
+    thread: ?std.Thread = null,
+    done: std.atomic.Value(bool) = .init(false),
+    io: std.Io = undefined,
+    env: ?*const std.process.Environ.Map = null,
+    /// Which maintenance leg this fetch feeds — decides the apply in `chatDirStep`.
+    kind: enum { none, self_roster, peer_refresh, roster_open } = .none,
+    /// The DID whose device directory to read (self for `self_roster`, the peer
+    /// otherwise). Copied so the worker never reads the store the loop mutates.
+    did_buf: [256]u8 = undefined,
+    did_len: u16 = 0,
+    set: chat_e2ee.PeerTargetSet = .{},
+    ok: bool = false,
+    err: ?anyerror = null,
+};
+
 const DeviceJob = struct {
     // A7.2: cold struct (one live instance, holds a thread), size guard waived.
     thread: ?std.Thread = null,
@@ -9974,104 +10027,123 @@ const CreateJob = struct {
     session: ?auth.Session = null,
 };
 
-/// Open a conversation with one person from the roster our other device sent. The
-/// store row first (so the person appears in the list immediately, even if the
-/// network leg is slow), then the crypto.
-fn chatStartWith(
-    rs: *RunState,
-    gpa: Allocator,
-    io: std.Io,
-    env: ?*const std.process.Environ.Map,
-    st: *chat_e2ee.State,
-    did: []const u8,
-) void {
-    const link = rs.gchat_link orelse return;
-    _ = chat_core.openConversation(gpa, &rs.gchat_store, did, "") catch null;
-    _ = rs.gchat_arena_state.reset(.retain_capacity);
-    chat_e2ee.startConversation(gpa, rs.gchat_arena_state.allocator(), io, env, st, link, did) catch |err| {
-        // Not fatal, and not silent. The person is in the list; the channel will be
-        // built by the next attempt, or by them messaging us.
-        chatLog("[chat] roster: couldn't open {s}: {s}", .{ did, @errorName(err) });
-        return;
-    };
-    chatLog("[chat] roster: opened {s}", .{did});
-    // The new session has its own traffic mailbox — drain it, or the conversation
-    // we just opened would be one we could never hear from.
-    chatEnsureSubs(gpa, st, link);
+/// The network leg of a maintenance directory read, on its own thread. Reads ONE
+/// DID's device set into gpa-owned memory (nothing points into the worker's arena)
+/// and touches no shared chat state — the safety of the whole split. `chatDirStep`
+/// applies the result on the loop.
+fn chatDirWorker(job: *ChatDirJob, gpa: Allocator) void {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const did = job.did_buf[0..job.did_len];
+    if (chat_e2ee.fetchRestartTargets(gpa, arena_state.allocator(), job.io, job.env, did)) |set| {
+        job.set = set;
+        job.ok = true;
+    } else |err| {
+        job.err = err;
+    }
+    job.done.store(true, .release);
 }
 
-/// Check ONE conversation's device set (slice 4), in rotation. When somebody has
-/// started chat on a new device, SAY SO in the thread — a line of grey text, and
-/// the difference between an encrypted app and an app that IS encrypted.
-fn peerRefreshNext(
+/// START a maintenance directory read off the render thread. Copies the DID and
+/// returns at once; one in flight at a time (a second request while one is live is
+/// dropped — the caller's timer retries next cycle).
+fn startChatDirJob(
     rs: *RunState,
     gpa: Allocator,
     io: std.Io,
     env: ?*const std.process.Environ.Map,
-    st: *chat_e2ee.State,
-    now: i64,
+    kind: @TypeOf(@as(ChatDirJob, undefined).kind),
+    did: []const u8,
 ) void {
-    const link = rs.gchat_link orelse return;
-    const n = rs.gchat_store.convs.len;
-    if (n == 0) return;
-    if (rs.gpeer_refresh_i >= n) rs.gpeer_refresh_i = 0;
-    const conv: chat_core.ConvIndex = @enumFromInt(rs.gpeer_refresh_i);
-    rs.gpeer_refresh_i += 1;
+    const job = &rs.gchat_dir_job;
+    if (job.thread != null) return;
+    if (did.len == 0 or did.len > job.did_buf.len) return;
+    @memcpy(job.did_buf[0..did.len], did);
+    job.did_len = @intCast(did.len);
+    job.kind = kind;
+    job.io = io;
+    job.env = env;
+    job.set = .{};
+    job.ok = false;
+    job.err = null;
+    job.done.store(false, .monotonic);
+    job.thread = std.Thread.spawn(.{}, chatDirWorker, .{ job, gpa }) catch {
+        job.kind = .none;
+        return;
+    };
+}
 
-    const did = chat_core.conversationDid(&rs.gchat_store, conv);
-    if (did.len == 0 or std.mem.eql(u8, did, st.my_did)) return; // never ourselves
-    _ = rs.gchat_arena_state.reset(.retain_capacity);
-    const what = chat_e2ee.refreshPeer(gpa, rs.gchat_arena_state.allocator(), io, env, st, link, did);
-    switch (what) {
-        .unchanged => {},
-        .updated => {
-            // They added or retired a device. Housekeeping, not news — we now reach
-            // every device they have, and nobody needs to be interrupted about it.
-            chatLog("[chat] devices changed for {s} — sessions updated", .{did});
+/// A maintenance directory read has landed: apply the session work on the loop. The
+/// apply is local crypto + non-blocking relay deposits — the slow directory read is
+/// already off-thread. Runs every frame; a no-op until a job is done.
+fn chatDirStep(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map) void {
+    const job = &rs.gchat_dir_job;
+    if (job.thread == null or !job.done.load(.acquire)) return;
+    job.thread.?.join();
+    job.thread = null;
+    defer chat_e2ee.freeRestartTargets(gpa, &job.set);
+    const kind = job.kind;
+    job.kind = .none;
+    if (!job.ok) return; // the directory read failed; the timer retries next cycle
+
+    const st = if (rs.gchat_e2ee) |*p| p else return;
+    const link = rs.gchat_link orelse return;
+    const did = job.did_buf[0..job.did_len];
+    switch (kind) {
+        .self_roster => {
+            // Open a session with each of our other devices, then tell them who we
+            // talk to (only if the signature changed). Both are local / non-blocking.
+            const selves = chat_e2ee.applySelfSessions(gpa, env, io, st, link, &job.set);
+            if (selves == 0) return; // no other device: nobody to tell
+            chatEnsureSubs(gpa, st, link);
+            rosterPublishSend(rs, gpa, io, env, st, selves);
+        },
+        .roster_open => {
+            // The VIEW row was already added on the loop; build the crypto sessions.
+            chat_e2ee.applyStartConversation(gpa, env, io, st, link, did, &job.set) catch |err| {
+                chatLog("[chat] roster: couldn't open {s}: {s}", .{ did, @errorName(err) });
+                return;
+            };
+            chatLog("[chat] roster: opened {s}", .{did});
             chatEnsureSubs(gpa, st, link);
         },
-        .reset => {
-            // EVERY device we knew of theirs is gone. Their messages will reach us
-            // again — and the person MUST be told, because "their keys changed and
-            // everything carried on quietly" is precisely what a successful
-            // impersonation looks like. It costs one line of grey text, and it is the
-            // whole difference between an encrypted app and an app that IS encrypted.
-            chatLog("[chat] {s} STARTED CHAT ON A NEW DEVICE — sessions rebuilt", .{did});
-            chatEnsureSubs(gpa, st, link);
-            const handle = chat_core.conversationHandle(&rs.gchat_store, conv);
-            const who = if (handle.len > 0) handle else did;
-            var buf: [160]u8 = undefined;
-            const line = std.fmt.bufPrint(&buf, "{s} started chat on a new device. If that wasn't them, ask them.", .{who}) catch
-                "They started chat on a new device. If that wasn't them, ask them.";
-            _ = chat_core.appendMessage(gpa, &rs.gchat_store, conv, .system, line, now, false) catch {};
-            chatPersistHistory(gpa, io, env, st, &rs.gchat_store);
-            rs.status = "chat: they started chat on a new device";
+        .peer_refresh => switch (chat_e2ee.applyPeerRefresh(gpa, env, io, st, link, did, &job.set)) {
+            .unchanged => {},
+            .updated => {
+                // Housekeeping, not news — we now reach every device they have.
+                chatLog("[chat] devices changed for {s} — sessions updated", .{did});
+                chatEnsureSubs(gpa, st, link);
+            },
+            .reset => {
+                // Every device we knew of theirs is gone — a "started fresh" signature,
+                // and the person MUST be told: a silent key change is what impersonation
+                // looks like. Locate the conversation by DID (indices can shift between
+                // the fetch and now; the DID cannot).
+                chatLog("[chat] {s} STARTED CHAT ON A NEW DEVICE — sessions rebuilt", .{did});
+                chatEnsureSubs(gpa, st, link);
+                if (chat_core.openConversation(gpa, &rs.gchat_store, did, "") catch null) |conv| {
+                    const handle = chat_core.conversationHandle(&rs.gchat_store, conv);
+                    const who = if (handle.len > 0) handle else did;
+                    var buf: [200]u8 = undefined;
+                    const line = std.fmt.bufPrint(&buf, "{s} started chat on a new device. If that wasn't them, ask them.", .{who}) catch
+                        "They started chat on a new device. If that wasn't them, ask them.";
+                    _ = chat_core.appendMessage(gpa, &rs.gchat_store, conv, .system, line, clock_shell.unixSeconds(), false) catch {};
+                    chatPersistHistory(gpa, io, env, st, &rs.gchat_store);
+                }
+                rs.status = "chat: they started chat on a new device";
+            },
         },
+        .none => {},
     }
 }
 
-/// Hand our other devices the list of people we talk to (slice 3) — but only when
-/// there is something new to say. The signature folds in BOTH the conversation list
-/// and how many self-sessions we hold, so a device joining is itself a change.
-fn rosterPublish(
-    rs: *RunState,
-    gpa: Allocator,
-    io: std.Io,
-    env: ?*const std.process.Environ.Map,
-    st: *chat_e2ee.State,
-    now: i64,
-) void {
-    _ = now;
+/// The SEND half of roster publish: build the newline-joined DID list (people, not
+/// history or names) plus the ride-along preferences, and deposit it to our other
+/// devices — but only when the signature changed (a quiet app stays silent). Local
+/// read of the view store + a non-blocking relay deposit; runs on the loop after the
+/// self-session directory read landed.
+fn rosterPublishSend(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, st: *chat_e2ee.State, selves: usize) void {
     const link = rs.gchat_link orelse return;
-    _ = rs.gchat_arena_state.reset(.retain_capacity);
-    const arena = rs.gchat_arena_state.allocator();
-
-    // Our other devices, and a session with each. A device that was approved while
-    // this one was asleep is picked up right here.
-    const selves = chat_e2ee.ensureSelfSessions(gpa, arena, io, env, st, link);
-    if (selves == 0) return; // no other device: nobody to tell
-
-    // The list, newline-joined. The people — not the history, and not their names.
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(gpa);
     var sig: u64 = @intCast(selves);
@@ -10089,8 +10161,7 @@ fn rosterPublish(
     }
     if (buf.items.len == 0) return;
     // THE PREFERENCES RIDE ALONG (slice 1's promise: asked once per ACCOUNT, not per
-    // device). A newly-approved phone inherits the answer silently and never puts the
-    // screen in front of somebody who has already answered it.
+    // device). A newly-approved phone inherits the answer silently.
     buf.appendSlice(gpa, if (rs.gchat_receipts) "\x01" else "\x00") catch return;
     buf.appendSlice(gpa, if (rs.gchat_typing_on) "\x01" else "\x00") catch return;
     sig ^= @intFromBool(rs.gchat_receipts);

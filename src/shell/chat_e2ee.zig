@@ -1155,10 +1155,7 @@ pub fn applyRestart(
     if (conversationIndex(st, peer_did) == null) return error.NoConversation;
 
     var targets_buf: [16]DeviceTarget = undefined;
-    for (set.kps[0..set.count], set.anchors[0..set.count], 0..) |kp, anchor_pub, i| {
-        targets_buf[i] = .{ .kp_bytes = kp, .anchor_pub = anchor_pub };
-    }
-    const targets = targets_buf[0..set.count];
+    const targets = targetsFromSet(set, &targets_buf);
 
     var rebuilt: usize = 0;
     for (targets) |t| {
@@ -1178,6 +1175,114 @@ pub fn applyRestart(
     // thread reporting "waiting" forever on a device that is gone.
     dropStaleSessions(gpa, st, peer_did, targets);
     persist(gpa, environ, st);
+}
+
+/// Rebuild the borrowed `DeviceTarget` slice from a gpa-owned `PeerTargetSet`. The
+/// set is what a worker fetched off-thread; the targets index INTO it, so they live
+/// exactly as long as the caller holds the set.
+fn targetsFromSet(set: *const PeerTargetSet, buf: *[16]DeviceTarget) []const DeviceTarget {
+    for (set.kps[0..set.count], set.anchors[0..set.count], 0..) |kp, anchor_pub, i| {
+        buf[i] = .{ .kp_bytes = kp, .anchor_pub = anchor_pub };
+    }
+    return buf[0..set.count];
+}
+
+// ── The apply halves of the periodic maintenance legs (the "wave of slowdown"
+// class, one layer out from re-establish). Each mirrors an existing function
+// whose directory READ now runs on a worker; these do the SESSION work on the
+// loop from the fetched `PeerTargetSet`. None of them read the network. ──
+
+/// `ensureSelfSessions`'s apply half: open a session with each of our OWN other
+/// devices we don't yet hold one with. Returns the count of self-sessions (new +
+/// existing) — the caller publishes the roster only when that is nonzero.
+pub fn applySelfSessions(
+    gpa: Allocator,
+    environ: ?*const std.process.Environ.Map,
+    io: std.Io,
+    st: *State,
+    link: *chat_relay.ChatRelay,
+    set: *const PeerTargetSet,
+) usize {
+    const mine = anchor.publicKey(st.anchor_seed) catch return 0;
+    var buf: [16]DeviceTarget = undefined;
+    const targets = targetsFromSet(set, &buf);
+    var opened: usize = 0;
+    for (targets) |t| {
+        if (std.mem.eql(u8, &t.anchor_pub, &mine)) continue; // not with ourselves
+        if (sessionIndex(st, st.my_did, t.anchor_pub) != null) {
+            opened += 1;
+            continue;
+        }
+        openSession(gpa, io, environ, st, link, st.my_did, t) catch continue;
+        opened += 1;
+    }
+    if (opened > 0) persist(gpa, environ, st);
+    return opened;
+}
+
+/// `startConversation`'s apply half: open a brand-new conversation with a peer from
+/// their fetched device set (the roster-receive leg).
+pub fn applyStartConversation(
+    gpa: Allocator,
+    environ: ?*const std.process.Environ.Map,
+    io: std.Io,
+    st: *State,
+    link: *chat_relay.ChatRelay,
+    peer_did: []const u8,
+    set: *const PeerTargetSet,
+) StartError!void {
+    if (conversationIndex(st, peer_did) != null) return; // already open — nothing to do
+    var buf: [16]DeviceTarget = undefined;
+    const targets = targetsFromSet(set, &buf);
+    if (targets.len == 0) return error.NoKeyPackage;
+    var opened: usize = 0;
+    for (targets) |t| {
+        openSession(gpa, io, environ, st, link, peer_did, t) catch continue;
+        opened += 1;
+    }
+    if (opened == 0) return error.RelayDown;
+    persist(gpa, environ, st);
+}
+
+/// `refreshPeer`'s apply half: reconcile an existing peer's sessions against their
+/// fetched device set, returning the same `unchanged`/`updated`/`reset`
+/// classification (the shell says "started chat on a new device" on `reset`).
+pub fn applyPeerRefresh(
+    gpa: Allocator,
+    environ: ?*const std.process.Environ.Map,
+    io: std.Io,
+    st: *State,
+    link: *chat_relay.ChatRelay,
+    peer_did: []const u8,
+    set: *const PeerTargetSet,
+) Refresh {
+    var known_buf: [16]usize = undefined;
+    const known = sessionsOf(st, peer_did, &known_buf);
+    if (known.len == 0) return .unchanged;
+
+    var buf: [16]DeviceTarget = undefined;
+    const targets = targetsFromSet(set, &buf);
+    if (targets.len == 0) return .unchanged; // they publish nothing right now: say nothing
+
+    var overlap: usize = 0;
+    var added: usize = 0;
+    for (targets) |t| {
+        if (sessionIndex(st, peer_did, t.anchor_pub) != null) overlap += 1 else added += 1;
+    }
+    if (overlap == 0) {
+        for (targets) |t| openSession(gpa, io, environ, st, link, peer_did, t) catch continue;
+        dropStaleSessions(gpa, st, peer_did, targets);
+        persist(gpa, environ, st);
+        return .reset;
+    }
+    if (added == 0 and targets.len == known.len) return .unchanged;
+    for (targets) |t| {
+        if (sessionIndex(st, peer_did, t.anchor_pub) != null) continue;
+        openSession(gpa, io, environ, st, link, peer_did, t) catch continue;
+    }
+    dropStaleSessions(gpa, st, peer_did, targets);
+    persist(gpa, environ, st);
+    return .updated;
 }
 
 /// Rebuild one existing pairwise session against the device's current keys. The
