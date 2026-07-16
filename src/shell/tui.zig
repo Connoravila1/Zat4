@@ -2255,7 +2255,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     .blob => |b| {
                         saw_bucket = true;
                         _ = rs.gchat_arena_state.reset(.retain_capacity);
-                        const inc = chat_e2ee.onBucket(gpa, rs.gchat_arena_state.allocator(), io, environ, st, b.id, b.data) catch null;
+                        const inc = chat_e2ee.onBucket(gpa, environ, st, b.id, b.data) catch null;
                         if (inc) |ev| {
                             defer chat_e2ee.freeIncoming(gpa, ev);
                             switch (ev) {
@@ -2599,6 +2599,17 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
             // once. Each leg's guard includes `dir_job.thread == null`, so the single
             // worker slot serializes them without skipping a cycle: a leg preempted
             // this frame keeps its timer and runs the next. ──
+
+            // VERIFY A STASHED WELCOME (highest priority). `onBucket` opened an incoming
+            // Welcome but no longer reads the directory to verify its sender on this
+            // thread — it stashed it; read that DID's device set off-thread, then
+            // `chatDirStep` finishes it. A person waiting to hear from you comes before
+            // any housekeeping.
+            if (rs.gchat_dir_job.thread == null) {
+                if (chat_e2ee.pendingWelcomeDid(st)) |wdid| {
+                    startChatDirJob(rs, gpa, io, environ, .welcome_verify, wdid);
+                }
+            }
 
             // RECEIVING SIDE (slice 3): open ONE queued conversation per pass. The VIEW
             // row appears immediately; the crypto sessions build off-thread behind it.
@@ -9974,7 +9985,8 @@ const ChatDirJob = struct {
     io: std.Io = undefined,
     env: ?*const std.process.Environ.Map = null,
     /// Which maintenance leg this fetch feeds — decides the apply in `chatDirStep`.
-    kind: enum { none, self_roster, peer_refresh, roster_open } = .none,
+    /// `welcome_verify` reads the sender's device set for a stashed incoming Welcome.
+    kind: enum { none, self_roster, peer_refresh, roster_open, welcome_verify } = .none,
     /// The DID whose device directory to read (self for `self_roster`, the peer
     /// otherwise). Copied so the worker never reads the store the loop mutates.
     did_buf: [256]u8 = undefined,
@@ -10132,6 +10144,36 @@ fn chatDirStep(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.proce
                 }
                 rs.status = "chat: they started chat on a new device";
             },
+        },
+        .welcome_verify => {
+            // The sender's device set is in hand — finish the stashed Welcome with the
+            // SAME verification `onBucket` used to run inline (its leaf must be one of
+            // these keys). `finishWelcome` consumes the pending Welcome.
+            const allowed = job.set.anchors[0..job.set.count];
+            const ev = (chat_e2ee.finishWelcome(gpa, env, st, allowed) catch null) orelse return;
+            defer chat_e2ee.freeIncoming(gpa, ev);
+            const now = clock_shell.unixSeconds();
+            switch (ev) {
+                .started => |s| {
+                    _ = chat_core.openConversation(gpa, &rs.gchat_store, s.peer_did, "") catch null;
+                    rs.status = "chat: new conversation";
+                    chatLog("[chat] started <- {s}", .{s.peer_did});
+                    chatPersistHistory(gpa, io, env, st, &rs.gchat_store);
+                    chatAck(rs, gpa, io, env, st, s.peer_did, s.device, now);
+                },
+                .restarted => |s| {
+                    _ = chat_core.openConversation(gpa, &rs.gchat_store, s.peer_did, "") catch null;
+                    rs.status = "chat: conversation re-established";
+                    chatLog("[chat] RE-ESTABLISHED <- {s} (their keys verified)", .{s.peer_did});
+                    chatEnsureSubs(gpa, st, link); // the replacement group has a NEW mailbox
+                    chatPersistHistory(gpa, io, env, st, &rs.gchat_store);
+                    chatAck(rs, gpa, io, env, st, s.peer_did, s.device, now);
+                },
+                // A Welcome that fails verification (impostor / no published record)
+                // yields null and never reaches here; any other variant is not one
+                // acceptWelcome produces — ignore rather than mishandle.
+                else => {},
+            }
         },
         .none => {},
     }

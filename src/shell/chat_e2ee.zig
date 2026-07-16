@@ -196,6 +196,12 @@ pub const State = struct {
     groups: std.ArrayList(mls.Group) = .empty,
     /// Welcome delivery, parallel to `groups` (A1).
     welcomes: std.ArrayList(WelcomeState) = .empty,
+    /// A decrypted Welcome waiting on the directory read that verifies its sender
+    /// (`onBucket` no longer does that HTTPS fetch on the render thread — it stashes
+    /// the opened Welcome here; the shell fetches off-thread and calls `finishWelcome`).
+    /// One at a time: a second Welcome arriving while this is set is deferred (the
+    /// relay re-delivers). Freed on `finishWelcome`, on defer, and in `deinit`.
+    pending_welcome: ?PendingWelcome = null,
 };
 
 pub const InitError = error{
@@ -345,6 +351,10 @@ pub fn deinit(gpa: Allocator, st: *State) void {
     st.groups.deinit(gpa);
     for (st.welcomes.items) |w| gpa.free(w.bucket);
     st.welcomes.deinit(gpa);
+    if (st.pending_welcome) |*pw| {
+        pw.group.deinit(gpa);
+        gpa.free(pw.peer_did);
+    }
 }
 
 /// Every mailbox this account drains right now: the bootstrap inbox
@@ -1912,18 +1922,39 @@ pub fn acceptWelcome(
     return .{ .started = .{ .peer_did = try gpa.dupe(u8, pw.peer_did), .device = expected } };
 }
 
+/// The DID whose directory a stashed Welcome is waiting on, or null. The shell polls
+/// this each frame and, when a worker slot is free, reads that DID's device set
+/// off-thread and hands it to `finishWelcome`.
+pub fn pendingWelcomeDid(st: *const State) ?[]const u8 {
+    return if (st.pending_welcome) |pw| pw.peer_did else null;
+}
+
+/// Finish a Welcome that was stashed by `onBucket`, now that its sender's device set
+/// has been read off-thread. `allowed` is every anchor key the claimed DID vouches
+/// for; `acceptWelcome` believes the Welcome only if its leaf is one of them — the
+/// SAME bar `onBucket` used to apply inline, just with the fetch moved off this
+/// thread. Consumes the pending Welcome either way.
+pub fn finishWelcome(
+    gpa: Allocator,
+    environ: ?*const std.process.Environ.Map,
+    st: *State,
+    allowed: []const [32]u8,
+) error{OutOfMemory}!?Incoming {
+    const pw = st.pending_welcome orelse return null;
+    st.pending_welcome = null; // move ownership into acceptWelcome, which consumes it
+    return acceptWelcome(gpa, environ, st, pw, allowed);
+}
+
 /// Route one delivered bucket. `from` is the mailbox it arrived on — the
 /// M2.3 gate: a Welcome is believed ONLY off the bootstrap inbox (a
 /// stranger stuffing Welcomes into a traffic mailbox is refused before any
 /// crypto runs). Null = nothing user-visible (damage from a stranger, an
-/// epoch advance, an unverifiable Welcome) — the connection and every
-/// conversation stay intact (E2/E4). The Welcome branch performs the one
-/// network fetch (directory verification) on this thread — first-contact
-/// events, rare by nature (the module header's recorded v1 posture).
+/// epoch advance, or a Welcome now STASHED for off-thread verification) — the
+/// connection and every conversation stay intact (E2/E4). NO network on this
+/// thread: a first-contact Welcome is decrypted and stashed in `pending_welcome`;
+/// the shell reads the directory off-thread and calls `finishWelcome`.
 pub fn onBucket(
     gpa: Allocator,
-    arena: Allocator,
-    io: std.Io,
     environ: ?*const std.process.Environ.Map,
     st: *State,
     from: [relay.mailbox_id_len]u8,
@@ -1947,24 +1978,20 @@ pub fn onBucket(
                 pw.group.deinit(gpa);
                 return .{ .welcome_again = .{ .peer_did = pw.peer_did, .device = dev } };
             }
-            // EVERY DEVICE THEY VOUCH FOR. The device set is the authority on who
-            // may speak for a DID; the legacy singleton is the fallback for the
-            // accounts that have not published one yet.
-            var allowed_buf: [16][32]u8 = undefined;
-            var allowed: []const [32]u8 = &.{};
-            if (chat_keys.fetchPeerDevices(gpa, arena, io, environ, pw.peer_did) catch null) |set| {
-                var n: usize = 0;
-                for (set.devices) |d| {
-                    if (n == allowed_buf.len) break;
-                    allowed_buf[n] = d.anchor_pub;
-                    n += 1;
-                }
-                allowed = allowed_buf[0..n];
-            } else if (chat_keys.fetchPeer(gpa, arena, io, environ, pw.peer_did) catch null) |p| {
-                allowed_buf[0] = p.anchor_pub;
-                allowed = allowed_buf[0..1];
+            // VERIFY AGAINST THE DIRECTORY — but NOT on this thread. Believing the
+            // Welcome needs the claimed DID's published device set (the authority on
+            // who may speak for a DID), and reading it is a blocking HTTPS fetch that
+            // used to freeze the render thread here on every first-contact Welcome.
+            // Stash the opened Welcome; the shell fetches the directory off-thread and
+            // calls `finishWelcome` with the result. One at a time: if a Welcome is
+            // already awaiting verification, defer this one (the relay re-delivers).
+            if (st.pending_welcome != null) {
+                pw.group.deinit(gpa);
+                gpa.free(pw.peer_did);
+                return null;
             }
-            return acceptWelcome(gpa, environ, st, pw, allowed);
+            st.pending_welcome = pw;
+            return null;
         },
         .private_message => {
             // M2.3 transition allowance: a private message arriving ON the
@@ -2205,7 +2232,6 @@ fn testState(gpa: Allocator, did: []const u8, seed: [32]u8, kp_init: u8, kp_enc:
 
 test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused" {
     const gpa = testing.allocator;
-    const io = std.testing.io;
     const seed_a: [32]u8 = @splat(0xA7);
     const seed_b: [32]u8 = @splat(0xB8);
 
@@ -2303,7 +2329,7 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
 
     // M2.3: the same Welcome bucket arriving on a TRAFFIC mailbox is
     // refused before any crypto runs.
-    try testing.expect((try onBucket(gpa, gpa, io, &env, &b, b_traffic, &welcome_bucket)) == null);
+    try testing.expect((try onBucket(gpa, &env, &b, b_traffic, &welcome_bucket)) == null);
 
     // A1 — THE ACK. B (the joiner) answers the Welcome over the group it just
     // joined; A stops believing in a conversation it cannot prove and starts
@@ -2316,7 +2342,7 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
         defer gpa.free(msg);
         var bucket: [relay.bucket_len]u8 = undefined;
         try bucketPack(&bucket, msg);
-        const inc = (try onBucket(gpa, gpa, io, &env, &a, a_traffic, &bucket)) orelse return error.TestUnexpectedResult;
+        const inc = (try onBucket(gpa, &env, &a, a_traffic, &bucket)) orelse return error.TestUnexpectedResult;
         defer freeIncoming(gpa, inc);
         try testing.expectEqualStrings(b.my_did, inc.confirmed.peer_did);
         try testing.expectEqual(chat.Delivery.confirmed, deliveryState(&a, b.my_did));
@@ -2333,7 +2359,7 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
         const gid_before = try gpa.dupe(u8, b.groups.items[0].group_id);
         defer gpa.free(gid_before);
         const epoch_before = b.groups.items[0].epoch;
-        const inc = (try onBucket(gpa, gpa, io, &env, &b, b.inbox, &welcome_bucket)) orelse return error.TestUnexpectedResult;
+        const inc = (try onBucket(gpa, &env, &b, b.inbox, &welcome_bucket)) orelse return error.TestUnexpectedResult;
         defer freeIncoming(gpa, inc);
         try testing.expectEqualStrings(a.my_did, inc.welcome_again.peer_did);
         try testing.expectEqual(@as(usize, 1), b.groups.items.len);
@@ -2351,7 +2377,7 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
         defer gpa.free(msg);
         var bucket: [relay.bucket_len]u8 = undefined;
         try bucketPack(&bucket, msg);
-        const inc = (try onBucket(gpa, gpa, io, &env, &b, b_traffic, &bucket)) orelse return error.TestUnexpectedResult;
+        const inc = (try onBucket(gpa, &env, &b, b_traffic, &bucket)) orelse return error.TestUnexpectedResult;
         defer freeIncoming(gpa, inc);
         try testing.expectEqual(chat.Kind.text, inc.message.kind);
         try testing.expectEqualStrings("hello, bob", inc.message.text);
@@ -2373,7 +2399,7 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
         defer gpa.free(msg);
         var bucket: [relay.bucket_len]u8 = undefined;
         try bucketPack(&bucket, msg);
-        const inc = (try onBucket(gpa, gpa, io, &env, &b2, b_traffic, &bucket)) orelse return error.TestUnexpectedResult;
+        const inc = (try onBucket(gpa, &env, &b2, b_traffic, &bucket)) orelse return error.TestUnexpectedResult;
         defer freeIncoming(gpa, inc);
         try testing.expectEqualStrings("after a restart", inc.message.text);
     }
@@ -2386,7 +2412,7 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
         defer gpa.free(msg);
         var bucket: [relay.bucket_len]u8 = undefined;
         try bucketPack(&bucket, msg);
-        const inc = (try onBucket(gpa, gpa, io, &env, &a, a_traffic, &bucket)) orelse return error.TestUnexpectedResult;
+        const inc = (try onBucket(gpa, &env, &a, a_traffic, &bucket)) orelse return error.TestUnexpectedResult;
         defer freeIncoming(gpa, inc);
         try testing.expectEqualStrings("hi alice", inc.message.text);
     }
@@ -2400,7 +2426,7 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
         defer gpa.free(msg);
         var bucket: [relay.bucket_len]u8 = undefined;
         try bucketPack(&bucket, msg);
-        const inc = (try onBucket(gpa, gpa, io, &env, &b2, b_traffic, &bucket)) orelse return error.TestUnexpectedResult;
+        const inc = (try onBucket(gpa, &env, &b2, b_traffic, &bucket)) orelse return error.TestUnexpectedResult;
         defer freeIncoming(gpa, inc);
         try testing.expectEqualStrings(a.my_did, inc.typing.peer_did);
 
@@ -2411,7 +2437,7 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
         defer gpa.free(msg2);
         var bucket2: [relay.bucket_len]u8 = undefined;
         try bucketPack(&bucket2, msg2);
-        const inc2 = (try onBucket(gpa, gpa, io, &env, &b2, b_traffic, &bucket2)) orelse return error.TestUnexpectedResult;
+        const inc2 = (try onBucket(gpa, &env, &b2, b_traffic, &bucket2)) orelse return error.TestUnexpectedResult;
         defer freeIncoming(gpa, inc2);
         try testing.expectEqualStrings("after ping", inc2.message.text);
     }
@@ -2433,7 +2459,7 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
         defer gpa.free(msg);
         var bucket: [relay.bucket_len]u8 = undefined;
         try bucketPack(&bucket, msg);
-        const inc = (try onBucket(gpa, gpa, io, &env, &b2, b_traffic, &bucket)) orelse return error.TestUnexpectedResult;
+        const inc = (try onBucket(gpa, &env, &b2, b_traffic, &bucket)) orelse return error.TestUnexpectedResult;
         defer freeIncoming(gpa, inc);
         try testing.expectEqual(chat.Kind.payment_request, inc.payment.kind);
         try testing.expectEqual(@as(u64, 0xCAFE), inc.payment.id);
@@ -2462,7 +2488,7 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
         defer gpa.free(msg);
         var bucket: [relay.bucket_len]u8 = undefined;
         try bucketPack(&bucket, msg);
-        const inc = (try onBucket(gpa, gpa, io, &env, &b2, b_traffic, &bucket)) orelse return error.TestUnexpectedResult;
+        const inc = (try onBucket(gpa, &env, &b2, b_traffic, &bucket)) orelse return error.TestUnexpectedResult;
         defer freeIncoming(gpa, inc);
         try testing.expectEqual(chat.PayStatus.settled, inc.payment_update.status);
         try testing.expectEqual(@as(u64, 0xCAFE), inc.payment_update.id);
@@ -2487,7 +2513,7 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
         defer gpa.free(msg);
         var bucket: [relay.bucket_len]u8 = undefined;
         try bucketPack(&bucket, msg);
-        const inc = (try onBucket(gpa, gpa, io, &env, &b2, b_traffic, &bucket)) orelse return error.TestUnexpectedResult;
+        const inc = (try onBucket(gpa, &env, &b2, b_traffic, &bucket)) orelse return error.TestUnexpectedResult;
         defer freeIncoming(gpa, inc);
         try testing.expect(inc.payment.is_offer);
         try testing.expectEqual(chat.Kind.payment_sent, inc.payment.kind);
@@ -2512,7 +2538,7 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
         defer gpa.free(msg);
         var bucket: [relay.bucket_len]u8 = undefined;
         try bucketPack(&bucket, msg);
-        const inc = (try onBucket(gpa, gpa, io, &env, &b2, b_traffic, &bucket)) orelse return error.TestUnexpectedResult;
+        const inc = (try onBucket(gpa, &env, &b2, b_traffic, &bucket)) orelse return error.TestUnexpectedResult;
         defer freeIncoming(gpa, inc);
         try testing.expectEqual(chat.PayStatus.ready, inc.payment_update.status);
         try testing.expectEqual(@as(u64, 0x0FFE), inc.payment_update.id);
@@ -2527,12 +2553,12 @@ test "chat_e2ee: the full E2EE exchange, with a relaunch and an impostor refused
         defer gpa.free(msg);
         var bucket: [relay.bucket_len]u8 = undefined;
         try bucketPack(&bucket, msg);
-        try testing.expect((try onBucket(gpa, gpa, io, &env, &b2, b_traffic, &bucket)) == null);
+        try testing.expect((try onBucket(gpa, &env, &b2, b_traffic, &bucket)) == null);
     }
 
     // A stranger's random bucket is dropped without a mark.
     var junk: [relay.bucket_len]u8 = @splat(0x5A);
-    try testing.expect((try onBucket(gpa, gpa, io, &env, &a, a.inbox, &junk)) == null);
+    try testing.expect((try onBucket(gpa, &env, &a, a.inbox, &junk)) == null);
 }
 
 test "chat_e2ee: a VERIFIED re-Welcome re-establishes a desynchronised conversation" {
@@ -2676,7 +2702,6 @@ test "chat_e2ee: a DRIFTED conversation says so; a redelivery says nothing (A2)"
     // the network hiccupped — and a warning that fires when nothing is wrong is
     // a warning nobody reads.
     const gpa = testing.allocator;
-    const io = std.testing.io;
     const seed_a: [32]u8 = @splat(0xC1);
     const seed_b: [32]u8 = @splat(0xD2);
 
@@ -2732,7 +2757,7 @@ test "chat_e2ee: a DRIFTED conversation says so; a redelivery says nothing (A2)"
         const msg = try mls.encrypt(gpa, &a.groups.items[0], plaintext[0..6], 0, .{ 1, 1, 1, 1 });
         defer gpa.free(msg);
         try bucketPack(&bucket, msg);
-        const inc = (try onBucket(gpa, gpa, io, &env, &b, b_traffic, &bucket)) orelse return error.TestUnexpectedResult;
+        const inc = (try onBucket(gpa, &env, &b, b_traffic, &bucket)) orelse return error.TestUnexpectedResult;
         defer freeIncoming(gpa, inc);
         try testing.expectEqualStrings("hello", inc.message.text);
     }
@@ -2742,7 +2767,7 @@ test "chat_e2ee: a DRIFTED conversation says so; a redelivery says nothing (A2)"
     // routinely, because delivery is at-least-once. Nothing user-visible, and
     // the conversation is still healthy. This is the assertion that keeps the
     // A2 banner meaningful.
-    try testing.expect((try onBucket(gpa, gpa, io, &env, &b, b_traffic, &bucket)) == null);
+    try testing.expect((try onBucket(gpa, &env, &b, b_traffic, &bucket)) == null);
     try testing.expectEqual(chat.Delivery.confirmed, deliveryState(&b, a.my_did));
 
     // THE DRIFT. Bob's group advances an epoch that Alice never saw — which is
@@ -2758,7 +2783,7 @@ test "chat_e2ee: a DRIFTED conversation says so; a redelivery says nothing (A2)"
         defer gpa.free(msg);
         var drift_bucket: [relay.bucket_len]u8 = undefined;
         try bucketPack(&drift_bucket, msg);
-        const inc = (try onBucket(gpa, gpa, io, &env, &b, b_traffic, &drift_bucket)) orelse return error.TestUnexpectedResult;
+        const inc = (try onBucket(gpa, &env, &b, b_traffic, &drift_bucket)) orelse return error.TestUnexpectedResult;
         defer freeIncoming(gpa, inc);
         try testing.expectEqualStrings(a.my_did, inc.drifted.peer_did);
         // The conversation now SAYS it needs to reconnect — and that verdict
@@ -2783,7 +2808,7 @@ test "chat_e2ee: a DRIFTED conversation says so; a redelivery says nothing (A2)"
         forged[forged.len - 1] ^= 0xFF; // flip a bit in the AEAD tag
         var bad_bucket: [relay.bucket_len]u8 = undefined;
         try bucketPack(&bad_bucket, forged);
-        const inc = (try onBucket(gpa, gpa, io, &env, &b, b_traffic, &bad_bucket)) orelse return error.TestUnexpectedResult;
+        const inc = (try onBucket(gpa, &env, &b, b_traffic, &bad_bucket)) orelse return error.TestUnexpectedResult;
         defer freeIncoming(gpa, inc);
         try testing.expectEqualStrings(a.my_did, inc.tampered.peer_did);
     }
@@ -2999,7 +3024,7 @@ test "chat_e2ee: a ROSTER and a HISTORY are believed only from YOUR OWN device (
             defer gpa.free(rmsg);
             var rb: [relay.bucket_len]u8 = undefined;
             try bucketPack(&rb, rmsg);
-            const rout = try onBucket(gpa, gpa, std.testing.io, &env, &phone, phone.inbox, &rb);
+            const rout = try onBucket(gpa, &env, &phone, phone.inbox, &rb);
             if (snd.want_roster) {
                 const got = rout orelse return error.TestUnexpectedResult;
                 defer freeIncoming(gpa, got);
@@ -3017,7 +3042,7 @@ test "chat_e2ee: a ROSTER and a HISTORY are believed only from YOUR OWN device (
         var bucket: [relay.bucket_len]u8 = undefined;
         try bucketPack(&bucket, msg);
 
-        const out = try onBucket(gpa, gpa, std.testing.io, &env, &phone, phone.inbox, &bucket);
+        const out = try onBucket(gpa, &env, &phone, phone.inbox, &bucket);
         if (snd.want_roster) {
             // MY OWN DEVICE: the list is taken.
             const got = out orelse return error.TestUnexpectedResult;
