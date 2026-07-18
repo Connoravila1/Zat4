@@ -46,6 +46,8 @@ const feed_core = @import("../core/feed.zig");
 const chat_core = @import("../core/chat.zig");
 const chat_view_core = @import("../core/chat_view.zig");
 const spring = @import("../core/spring.zig");
+const chat_effects = @import("../core/chat_effects.zig");
+const screen_fx = @import("../core/screen_fx.zig");
 const shatter = @import("../core/shatter.zig");
 const pet_core = @import("../core/pet.zig");
 const gesture = @import("../core/gesture.zig");
@@ -14149,6 +14151,15 @@ const GpuState = struct {
     /// indicator keeps its own small spring. ONE trigger site — the observed
     /// state transition (the open conversation's newest message advanced).
     chat_world: spring.World = .empty,
+    /// Screen-effect overlay (balloons / confetti / lasers …): a message whose
+    /// text triggers an effect seeds a particle show here, played over the thread
+    /// until it drains. `sfx_pending` carries the just-detected effect from the
+    /// send/receive trigger to the render, where the viewport size to seed against
+    /// is known. Both ends derive the effect from the body (chat_effects.detectAuto),
+    /// so an auto-phrase effect needs no wire field.
+    sfx_pool: screen_fx.Pool = .empty,
+    sfx_pending: chat_effects.ScreenEffect = .none,
+    sfx_seed: u64 = 0,
     chat_anims: std.ArrayListUnmanaged(ChatAnim) = .empty,
     chat_reflow: ?spring.Handle = null,
     chat_typing_t: f32 = 0,
@@ -14385,6 +14396,7 @@ fn deinitGpuState(gpa: Allocator, gs: *GpuState) void {
     gs.sel_glyphs.deinit(gpa);
     gs.chat_anims.deinit(gpa);
     gs.chat_world.deinit(gpa);
+    gs.sfx_pool.deinit(gpa);
     gs.shatter_x.deinit(gpa);
     gs.shatter_y.deinit(gpa);
     gs.shatter_vx.deinit(gpa);
@@ -15437,6 +15449,17 @@ fn paintFrameGpu(
                 spawnBubbleAnim(gpa, gs, newest, chat_core.isMine(cs, msg), spring_now);
                 startChatReflow(gpa, gs);
                 gs.chat_seen_key = newest;
+                // SCREEN EFFECT: if the new message's TEXT triggers one, queue it to
+                // seed at render (where the viewport size is known). Both ends derive
+                // the effect from the body, so this fires for our OWN send AND a
+                // peer's arrival with no wire field — iMessage's auto-phrase behaviour.
+                if (cs.msgs.items(.kind)[newest] == .text) {
+                    const fx = chat_effects.detectAuto(chat_core.sliceSpan(cs, cs.msgs.items(.text)[newest]));
+                    if (fx != .none) {
+                        gs.sfx_pending = fx;
+                        gs.sfx_seed = spring_now;
+                    }
+                }
             }
         } else {
             gs.chat_seen_valid = false; // no conversation open
@@ -15458,6 +15481,12 @@ fn paintFrameGpu(
         chat_animating = gs.chat_anims.items.len > 0 or gs.chat_reflow != null or
             gs.chat_typing_t > 0.01 or g.chat_typing or
             g.chat_input_focus or g.chat_composing or g.chat_pay.open or g.chat_recv.open;
+        // Tick the screen-effect show and keep the frame rebuilding while it plays
+        // (a per-frame animation must never cache — the standing GPU-rebuild law).
+        if (gs.sfx_pool.len > 0) {
+            screen_fx.step(&gs.sfx_pool, dt);
+            chat_animating = true;
+        }
     };
     // The device gate's motion is time-driven and eased — the link that BREATHES
     // while we wait (a sine on d.t), and the "device added" confirmation that fades
@@ -15709,6 +15738,16 @@ fn paintFrameGpu(
             } else |_| {}
             const reflow_t: f32 = if (gs.chat_reflow) |rh| (gs.chat_world.position(rh) orelse 1.0) else 1.0;
             g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_edit, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t, .sheet_t = gs.sheet_t }, xforms, g.chat_recv, .{ .top = @intCast(gs.inset_top_l), .bottom = @intCast(@max(gs.inset_bottom_l, @max(gs.ime_bottom_l, if (g.kbd_visible) feed_view.keyboard_h + gs.inset_bottom_l else 0))), .left = @intCast(gs.inset_left_l), .right = @intCast(gs.inset_right_l) }, .{ .q = g.chat_q, .focus = g.chat_q_focus, .caret_on = g.chat_q_caret }, g.chat_delivery, g.chat_link, g.chat_devices, g.chat_menu, g.chat_ctx) catch g.content_h.*;
+            // SCREEN EFFECT overlay: seed a queued show now the viewport size
+            // (design_w × lh) is known, then compose the live particles ON TOP of
+            // the thread. `chat_animating` (set while the pool is non-empty) keeps
+            // this rebuilding every frame until the show drains.
+            if (gs.sfx_pending != .none) {
+                screen_fx.seedShow(gpa, &gs.sfx_pool, gs.sfx_pending, @intCast(gs.design_w), @intCast(lh), gs.sfx_seed) catch {};
+                gs.sfx_pending = .none;
+            }
+            if (gs.sfx_pool.len > 0)
+                screen_fx.compose(gpa, &gs.sfx_pool, @intCast(gs.design_w), g.draw) catch {};
         } else if (g.screen.* == feed_view.screen_algo_docs) {
             g.content_h.* = feed_view.layoutAlgoDocs(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, if (g.docs_kind == 1) algo_docs.dev_doc else algo_docs.user_doc) catch g.content_h.*;
         } else if (g.screen.* == feed_view.screen_algo_detail) {
