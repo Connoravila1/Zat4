@@ -37,8 +37,8 @@ if [ "${ZAT_ENROLL_REHEARSAL:-0}" = "1" ]; then REHEARSE_ARGS="-Denroll-rehearsa
 PRODUCT="${ZAT_PRODUCT:-zat4}"
 PRODUCT_ARG=""
 OUT="zig-out/Zat4-android-arm64.apk"
-ICON="assets/icon/zat4_256.png"
-[ "$PRODUCT" = "chat" ] && { PRODUCT_ARG="-Dproduct=chat"; OUT="zig-out/ZatChat-android-arm64.apk"; ICON="assets/icon/zatchat_256.png"; }
+ICON="assets/icon/zat4_256.png"; ICBG="assets/icon/zat4_ic_bg.png"; ICFG="assets/icon/zat4_ic_fg.png"
+[ "$PRODUCT" = "chat" ] && { PRODUCT_ARG="-Dproduct=chat"; OUT="zig-out/ZatChat-android-arm64.apk"; ICON="assets/icon/zatchat_256.png"; ICBG="assets/icon/zatchat_ic_bg.png"; ICFG="assets/icon/zatchat_ic_fg.png"; }
 
 "$ZIG" build libzat -Doptimize=ReleaseSafe -Dandroid-ndk="$NDK" -Dappview-token="$ZAT_APPVIEW_TOKEN" $RELAY_ARGS $REHEARSE_ARGS $PRODUCT_ARG
 
@@ -57,8 +57,14 @@ if [ "$PRODUCT" = "chat" ]; then
 fi
 
 # Resources: the launcher icon (one density is enough for a test build).
-mkdir -p "$stage/res/mipmap"
-cp "$ICON" "$stage/res/mipmap/ic_launcher.png"
+mkdir -p "$stage/res/mipmap" "$stage/res/mipmap-anydpi-v26" "$stage/res/drawable"
+cp "$ICON" "$stage/res/mipmap/ic_launcher.png" # pre-26 fallback (unused on minSdk 29, keeps the ref resolvable)
+# ADAPTIVE ICON (v26+): a full-bleed brand-colour background + the mark on top, so
+# the launcher fills its circular/squircle mask edge-to-edge instead of shrinking a
+# square bitmap inside a white circle.
+cp assets/android/ic_launcher_adaptive.xml "$stage/res/mipmap-anydpi-v26/ic_launcher.xml"
+cp "$ICBG" "$stage/res/drawable/ic_launcher_background.png"
+cp "$ICFG" "$stage/res/drawable/ic_launcher_foreground.png"
 "$BT/aapt2" compile --dir "$stage/res" -o "$stage/res.flata"
 
 # Link the binary manifest + resources against the platform.
