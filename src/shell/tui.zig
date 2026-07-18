@@ -1702,8 +1702,11 @@ fn initRunState(
     }
     rs.gcreate_prepare_frames = 0; // the .preparing loading beat's progress (frames)
     // The active top-level Screen (index into feed_view.nav_labels); the rail
-    // sets it on a click. 0 = Home (the feed). Lives across frames in run().
-    rs.gscreen = 0;
+    // sets it on a click. 0 = Home (the feed) for the full client; the standalone
+    // Zat Chat flavor boots straight into Messages (its whole reason to exist).
+    // The not-signed-in override to the enroll screen still wins below (a chat app
+    // still has a front door).
+    rs.gscreen = if (comptime dist_config.product == .chat) feed_view.screen_messages else feed_view.screen_home;
     // The premium Profile screen is a VIEW over the ONE shared `store`, not a
     // second store (ZONES invariant 4 — the post is the post). Entering it
     // fetches the viewed author's posts as CONTENT into `store`; the view's

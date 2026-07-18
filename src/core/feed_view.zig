@@ -313,6 +313,13 @@ pub const feed_clamp_lines: u32 = 10;
 /// The six top-level rail destinations, in order. The `Screen` index a nav
 /// region carries is an index into this. Shared by the rail (draw + hit) and
 /// the body (the screen title), so the two never drift.
+/// The product flavor, a COMPTIME build identity. B4 note: this is neither runtime
+/// I/O, a clock, nor a renderer — it is resolved at compile time, exactly like
+/// `builtin.target` (which core already branches on in lens_socket.zig), so
+/// `layout()` stays a pure function of its runtime inputs for any given build. The
+/// standalone Zat Chat flavor boots into Messages with a chat-only rail + wordmark.
+const chat_app = @import("dist_config").product == .chat;
+
 /// Rail destinations. Slot 4 is "Algorithms" (the loadout page) — it took the
 /// old Profile slot, since the bottom-left "you" card already opens Profile.
 pub const nav_labels = [_][]const u8{ "Home", "Zones", "Activity", "Zat Chat", "Algorithms", "Settings" };
@@ -375,15 +382,20 @@ pub const screen_enroll: u8 = 13;
 /// The rail / drawer rows, in VISUAL order, as screen ids. Algorithms sits under
 /// Zones; Zat Chat above Activity; Wallet before Settings — money is a place you
 /// go, not a modal you summon.
-const nav_rows = [_]u8{
-    screen_home,
-    screen_zones_browse,
-    screen_loadout,
-    screen_messages,
-    2, // Activity (no surface yet — a placeholder screen)
-    screen_wallet,
-    screen_settings,
-};
+const nav_rows: []const u8 = if (chat_app)
+    // The standalone Zat Chat app: only the messaging-relevant destinations.
+    // Money lives IN chat (payments are messages), and Settings is the app's own.
+    &.{ screen_messages, screen_wallet, screen_settings }
+else
+    &.{
+        screen_home,
+        screen_zones_browse,
+        screen_loadout,
+        screen_messages,
+        2, // Activity (no surface yet — a placeholder screen)
+        screen_wallet,
+        screen_settings,
+    };
 
 /// The name a rail destination wears. `nav_labels` is indexed by screen for the
 /// first six; anything past them names itself here rather than growing that
@@ -1759,7 +1771,7 @@ fn drawRail(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, rx: i32
     const box_w: i32 = @intFromFloat(52.0 + @as(f32, @floatFromInt(rail_w - 24 - 52)) * ex);
     const pill_w: i32 = @intFromFloat(44.0 + @as(f32, @floatFromInt(rail_w - 32 - 44)) * ex);
 
-    const wm = try str(gpa, dl, e, .semibold, x0 + 8, 58, (accent & 0x00FFFFFF) | ea, 26, "Zat4");
+    const wm = try str(gpa, dl, e, .semibold, x0 + 8, 58, (accent & 0x00FFFFFF) | ea, 26, if (chat_app) "Zat Chat" else "Zat4");
     _ = try str(gpa, dl, e, .semibold, wm, 58, (ink & 0x00FFFFFF) | ea, 26, ".");
 
     // The nav GROUP box (visible always; just narrower when condensed). Sized to

@@ -33,6 +33,12 @@
 
 const std = @import("std");
 
+/// The product flavor a build produces. `.zat4` is the full social client; `.chat`
+/// is the standalone Zat Chat app — the SAME codebase (same account, relay, MLS),
+/// booted into Messages with a chat-only rail and its own name. A build-time
+/// identity, surfaced to the code as `dist_config.product` (read at comptime).
+const Product = enum { zat4, chat };
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -81,13 +87,20 @@ pub fn build(b: *std.Build) void {
     const enroll_rehearsal = b.option(bool, "enroll-rehearsal", "Front door: walk the flow without minting an account (dev)") orelse false;
     dist_opts.addOption(bool, "enroll_rehearsal", enroll_rehearsal);
     dist_opts.addOption(bool, "dist", dist);
+    // The product flavor (default .zat4). `-Dproduct=chat` builds the standalone
+    // Zat Chat app from this same tree. Read at comptime as `dist_config.product`.
+    const product = b.option(Product, "product", "Product flavor: zat4 (full client) or chat (standalone Zat Chat)") orelse .zat4;
+    dist_opts.addOption(Product, "product", product);
     exe_mod.addOptions("dist_config", dist_opts);
 
     // The product a tester downloads is called Zat4 (the exe name IS the app
     // name on Windows/macOS); the Linux binary stays `zat` so the dev scripts
     // and the box deploy keep their paths. (DISTRIBUTION_ROADMAP P phase)
     const client_name = switch (target.result.os.tag) {
-        .windows, .macos => "Zat4",
+        // The exe name IS the app name on Windows/macOS; the chat flavor wears its
+        // own. The Linux binary stays `zat` either way so the dev scripts + box
+        // deploy keep their paths (the flavor there differs by title/boot, not path).
+        .windows, .macos => if (product == .chat) "Zat Chat" else "Zat4",
         else => "zat",
     };
     const exe = b.addExecutable(.{
@@ -243,6 +256,7 @@ pub fn build(b: *std.Build) void {
     const mobile_test_opts = b.addOptions();
     mobile_test_opts.addOption(bool, "have_gpu", false);
     mobile_test_mod.addOptions("mobile_config", mobile_test_opts);
+    mobile_test_mod.addOptions("dist_config", dist_opts); // feed_view (via the seam) reads product at comptime
     const mobile_tests = b.addTest(.{ .root_module = mobile_test_mod });
     const run_mobile_tests = b.addRunArtifact(mobile_tests);
     test_step.dependOn(&run_mobile_tests.step);
@@ -299,6 +313,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     addFontEngine(b, preview_mod);
+    preview_mod.addOptions("dist_config", dist_opts); // feed_view reads product at comptime
     const preview_exe = b.addExecutable(.{ .name = "zat-preview", .root_module = preview_mod });
     const run_preview = b.addRunArtifact(preview_exe);
     if (b.args) |args| run_preview.addArgs(args);
@@ -332,6 +347,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     addFontEngine(b, gpu_preview_mod);
+    gpu_preview_mod.addOptions("dist_config", dist_opts); // feed_view reads product at comptime
     const gpu_preview_exe = b.addExecutable(.{ .name = "zat-gpu-preview", .root_module = gpu_preview_mod });
     const run_gpu_preview = b.addRunArtifact(gpu_preview_exe);
     if (b.args) |args| run_gpu_preview.addArgs(args);
@@ -367,6 +383,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     addFontEngine(b, tiling_mod);
+    tiling_mod.addOptions("dist_config", dist_opts); // feed_view reads product at comptime
     const tiling_exe = b.addExecutable(.{ .name = "zat-tiling-spike", .root_module = tiling_mod });
     const run_tiling = b.addRunArtifact(tiling_exe);
     if (b.args) |args| run_tiling.addArgs(args);
@@ -384,6 +401,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     addFontEngine(b, tiling_live_mod);
+    tiling_live_mod.addOptions("dist_config", dist_opts); // feed_view reads product at comptime
     const tiling_live_exe = b.addExecutable(.{ .name = "zat-tiling-live", .root_module = tiling_live_mod });
     const run_tiling_live = b.addRunArtifact(tiling_live_exe);
     if (b.args) |args| run_tiling_live.addArgs(args);
@@ -399,6 +417,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     addFontEngine(b, tiling_real_mod);
+    tiling_real_mod.addOptions("dist_config", dist_opts); // feed_view reads product at comptime
     const tiling_real_exe = b.addExecutable(.{ .name = "zat-tiling-real", .root_module = tiling_real_mod });
     const run_tiling_real = b.addRunArtifact(tiling_real_exe);
     if (b.args) |args| run_tiling_real.addArgs(args);
