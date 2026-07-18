@@ -8142,25 +8142,34 @@ pub const ChatMotion = struct {
 /// `thread` (B5); the shell's spring indexes never cross (A5). Identity
 /// (`grow = 1, rise = 0, alpha = 1`) = a seated, resting bubble.
 pub const BubbleXform = struct {
-    /// Scale multiplier on the bubble rect (its scale spring's position). May
-    /// exceed 1 briefly — the overshoot that reads as native.
+    /// Uniform scale on the bubble rect — a counterparty ARRIVAL's pop (0.92→1
+    /// with a breath of overshoot). An own SEND leaves this at 1: it is full size
+    /// from birth and morphs via `emerge` instead.
     grow: f32 = 1,
     /// Pixels BELOW the seat the bubble is drawn (its offset spring's position),
     /// settling to 0 as it rises into place.
     rise: f32 = 0,
+    /// SEND-morph progress: 0 = born at the composer's width, 1 = seated at the
+    /// bubble's own width. Drives a RIGHT-ANCHORED width contraction — the send-side
+    /// edge is pinned and the LEFT edge sweeps in, the composer peeling into the
+    /// bubble. 1 for arrivals and resting rows (no width morph).
+    emerge: f32 = 1,
     /// Opacity 0..1. NOT a spring (an overshooting opacity flickers): a short
-    /// monotonic ramp the shell derives from the scale spring's progress.
+    /// monotonic ramp the shell derives from the spawn clock.
     alpha: f32 = 1,
 
     comptime {
-        // Three f32, no padding. One per visible in-flight bubble.
-        assert(@sizeOf(BubbleXform) == 12);
+        // A7.1 — budget raised 12 → 16: the send morph needs a width channel
+        // (`emerge`, a right-anchored contraction) distinct from the uniform
+        // `grow` scale. Four f32, no padding. One per visible in-flight bubble —
+        // a handful animate at once, never a bulk collection — so 16 stays tight.
+        assert(@sizeOf(BubbleXform) == 16);
     }
 };
 
 /// True when a transform is the resting identity — the bubble draws normally.
 pub fn xformIsRest(x: BubbleXform) bool {
-    return x.grow == 1 and x.rise == 0 and x.alpha == 1;
+    return x.grow == 1 and x.rise == 0 and x.emerge == 1 and x.alpha == 1;
 }
 
 /// The caret's alpha at `phase` seconds after the last keystroke: solid
@@ -10570,6 +10579,17 @@ pub fn layoutChat(
     // silently TOP-anchored an overflowing thread instead, hiding the
     // NEWEST messages below the composer (the owner's field bug: sends
     // showed in the list preview but not in the thread).
+    // The OWN-SEND morph is deferred out of this loop and drawn ON TOP of the
+    // composer (below), so the bubble emerges FROM the input pill instead of
+    // popping in the thread above it. The loop records the newest own message's
+    // seat + payload here; the morph itself happens after the composer draws.
+    const SendFlight = struct { bx: i32, by: i32, bw: i32, hh: i32, fill: u32, ink: u32, body: []const u8, tail: bool, emerge: f32 };
+    var send_flight: ?SendFlight = null;
+    // A PAYMENT card send morphs too, but a card is a fixed layout — it keeps its
+    // size (content must not reflow mid-flight) and slides up from the composer to
+    // its seat, revealing the emptied input beneath, rather than collapsing width.
+    const PayFlight = struct { b: chat_view.BubbleRow, bx: i32, by: i32, bw: i32, hh: i32, ordinal: u16, emerge: f32 };
+    var pay_flight: ?PayFlight = null;
     var y = thread_bot - total + scroll;
     for (thread, bh, 0..) |b, hh, idx| {
         const xf = rowXform(xforms, idx);
@@ -10595,13 +10615,18 @@ pub fn layoutChat(
                 const sw2: i32 = @intCast(text.measure(e, .regular, b.body, 12));
                 _ = try str(gpa, dl, e, .regular, detail_x + @divTrunc(detail_w - sw2, 2), by + 16, faint, 12, b.body);
             } else if (b.pay != chat_view.no_pay and b.pay < cards.len) {
-                // A payment card draws at its seat even when it is the
-                // newest row mid-flight — the thread still slides as one; a
-                // card is a document, not a chat pop (motion polish can
-                // revisit under judgment).
                 const cw2 = @min(pay_card_w_max, bub_max);
                 const cbx = if (b.mine) detail_x + detail_w - cw2 else detail_x;
-                try drawPayCard(gpa, dl, e, regions, accent, cbx, by, cw2, hh, b, cards[b.pay], @intCast(@min(idx, std.math.maxInt(u16))), pay.busy, motion.caret_phase);
+                if (is_fly and b.mine) {
+                    // AN OWN PAYMENT SEND — deferred and drawn ON TOP of the
+                    // composer (below), so the card emerges FROM the input like a
+                    // message bubble. It keeps its size and slides up from the
+                    // composer to this seat as `emerge` runs; the emptied input is
+                    // revealed beneath. (Was: drawn statically at its seat mid-flight.)
+                    pay_flight = .{ .b = b, .bx = cbx, .by = by, .bw = cw2, .hh = hh, .ordinal = @intCast(@min(idx, std.math.maxInt(u16))), .emerge = xf.emerge };
+                } else {
+                    try drawPayCard(gpa, dl, e, regions, accent, cbx, by, cw2, hh, b, cards[b.pay], @intCast(@min(idx, std.math.maxInt(u16))), pay.busy, motion.caret_phase);
+                }
             } else {
                 // Single-line bubbles shrink-wrap; wrapped ones take the max.
                 const one_w: i32 = @intCast(text.measure(e, .regular, b.body, chat_px));
@@ -10680,31 +10705,39 @@ pub fn layoutChat(
                         const ew: i32 = @intCast(text.measure(e, .regular, em, 10));
                         _ = try str(gpa, dl, e, .regular, bx + bw - pad_x - ew, by + hh - 6, softA(0xEDEAE0, 0x66), 10, em);
                     }
+                } else if (b.mine) {
+                    // THE OWN SEND — deferred and drawn ON TOP of the composer
+                    // (below): the bubble is born exactly on the input pill (so the
+                    // input appears to BECOME the message) and its whole rect glides
+                    // up-and-in to this seat while the empty input is revealed
+                    // beneath. Record the destination seat + payload; `emerge` (0→1,
+                    // critically damped) drives the morph after the composer draws.
+                    send_flight = .{
+                        .bx = bx,
+                        .by = by,
+                        .bw = bw,
+                        .hh = hh,
+                        .fill = fill,
+                        .ink = if (b.deleted) faint else ink,
+                        .body = b.body,
+                        .tail = b.tail,
+                        .emerge = xf.emerge,
+                    };
                 } else {
-                    // THE MORPH. Spring physics, not easing: rise and scale
-                    // ride the SAME spring (unclamped t — a gentle ~2%
-                    // overshoot that settles reads as native). The motion
-                    // is VERTICAL only — a rise from just below the seat
-                    // (the composer / typing-indicator slot is right
-                    // there); a cross-pane sweep read wrong. The rect (and
-                    // its tail) does the scaling, TIGHT (86%+), anchored at
-                    // the sender-side bottom corner; the text stays at its
-                    // final size and position — the renderer rasterizes
-                    // text at integer px, so continuous glyph scaling
-                    // STEPS between sizes (the chop). Opacity ramps faster
-                    // than the transform: the shell already shaped `alpha` so
-                    // the bubble is solid while it is still settling.
+                    // A COUNTERPARTY ARRIVAL: the uniform pop, in place — a rise
+                    // from just below the seat + a scale from 92%, its gentle
+                    // overshoot the native-arrival breath. (Own sends morph out of
+                    // the composer instead — the branch above.)
                     const fade = xf.alpha;
                     const grow = xf.grow;
                     const seat_bot: f32 = @floatFromInt(y + hh);
                     const bot_a = seat_bot + xf.rise;
                     const bw_a: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(bw)) * grow));
                     const hh_a: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(hh)) * grow));
-                    const bx_a = if (b.mine) bx + (bw - bw_a) else bx;
                     const by_a = @as(i32, @intFromFloat(@round(bot_a))) - hh_a;
                     const fill_a = scaleAlpha(fill, fade);
-                    if (b.tail) try bubbleTail(gpa, dl, b.mine, bx_a, by_a, bw_a, hh_a, fill_a);
-                    try rect(gpa, dl, bx_a, by_a, bw_a, hh_a, fill_a, bub_rad);
+                    if (b.tail) try bubbleTail(gpa, dl, b.mine, bx, by_a, bw_a, hh_a, fill_a);
+                    try rect(gpa, dl, bx, by_a, bw_a, hh_a, fill_a, bub_rad);
                     _ = try wrapBody(gpa, dl, e, bx + pad_x, by_a + pad_y + 14, bub_max - 2 * pad_x, scaleAlpha(ink, fade), chat_px, b.body, line_h, true, null);
                 }
             }
@@ -10967,6 +11000,54 @@ pub fn layoutChat(
         _ = try str(gpa, dl, e, .semibold, sx + @divTrunc(send_w - sw3, 2), sy + 29, if (armed) 0xFF20201A else faint, 14, "Send");
     }
     try emitRegion(gpa, regions, sx, sy, send_w, 46, 0, .chat_send);
+
+    // ── THE OWN-SEND MORPH (drawn here, ON TOP of the composer, so the bubble
+    // emerges FROM the input). A shared-element transition: at emerge = 0 the
+    // bubble's rect is exactly the input pill (the input appears to turn into the
+    // message); at emerge = 1 it is the seated bubble up in the thread. Every edge
+    // lerps together, so the pill lifts up-and-in and narrows in one motion while
+    // the (now empty) input is revealed beneath it — the native send, not a pop.
+    // Critically damped upstream (no bounce). The text and tail fade in as it
+    // seats (a pill has no tail, and glyphs reflowing mid-morph would chop).
+    const lf = struct {
+        fn l(a: i32, b: i32, u: f32) i32 {
+            return a + @as(i32, @intFromFloat(@round(@as(f32, @floatFromInt(b - a)) * u)));
+        }
+    }.l;
+    if (send_flight) |sf| {
+        const t = std.math.clamp(sf.emerge, 0.0, 1.0);
+        const left_a = lf(input_x, sf.bx, t);
+        const top_a = lf(comp_y, sf.by, t);
+        const right_a = lf(input_x + input_w, sf.bx + sf.bw, t);
+        const bot_a = lf(comp_y + comp_h, sf.by + sf.hh, t);
+        const w_a = right_a - left_a;
+        const h_a = bot_a - top_a;
+        const send_rad: u8 = if (phone) 17 else 14;
+        const rad_a: u8 = @intFromFloat(@round(@as(f32, @floatFromInt(in_rad)) + (@as(f32, @floatFromInt(send_rad)) - @as(f32, @floatFromInt(in_rad))) * t));
+        // Tail resolves only as it seats (a composer pill has none).
+        if (sf.tail and t > 0.55) {
+            const ta = (t - 0.55) / 0.45;
+            try bubbleTail(gpa, dl, true, left_a, top_a, w_a, h_a, scaleAlpha(sf.fill, ta));
+        }
+        try rect(gpa, dl, left_a, top_a, w_a, h_a, sf.fill, rad_a);
+        // Text fades in over the back half, riding the moving rect (wrapped at the
+        // SEATED width so it does not reflow per frame).
+        const text_a = std.math.clamp((t - 0.35) / 0.5, 0.0, 1.0);
+        if (text_a > 0.01)
+            _ = try wrapBody(gpa, dl, e, left_a + pad_x, top_a + pad_y + 14, sf.bw - 2 * pad_x, scaleAlpha(sf.ink, text_a), chat_px, sf.body, line_h, true, null);
+    }
+    // The OWN-PAYMENT morph: the whole card (its real content, drawn opaque) slides
+    // up from the composer to its seat — a position morph, not a width collapse, so
+    // the amount / rail / status never reflow mid-flight. `regions = null` keeps its
+    // buttons untappable while it flies; the loop draws the live, tappable card once
+    // it seats. `emerge` is the same critically-damped spring as the bubble.
+    if (pay_flight) |pf| {
+        const t = std.math.clamp(pf.emerge, 0.0, 1.0);
+        const left_a = lf(input_x, pf.bx, t);
+        const bot_a = lf(comp_y + comp_h, pf.by + pf.hh, t);
+        const top_a = bot_a - pf.hh;
+        try drawPayCard(gpa, dl, e, null, accent, left_a, top_a, pf.bw, pf.hh, pf.b, cards[pf.b.pay], pf.ordinal, true, motion.caret_phase);
+    }
 
     // ── The money modal. One chrome (`payModal`), four faces: the send-confirm,
     // the pay compose sheet, and the receive-setup flow's three modes. Drawn and

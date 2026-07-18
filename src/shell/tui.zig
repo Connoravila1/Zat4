@@ -14175,8 +14175,14 @@ const ChatAnim = struct {
     /// The bubble's stable message key (`@intFromEnum(MsgIndex)`), matched
     /// against the thread's order to place the transform on the right row.
     key: u32,
-    scale: spring.Handle, // grows the bubble into place (0.86/0.92 → 1.0, bouncy)
+    /// The bubble's motion spring. For an OWN send it drives `emerge` (the
+    /// right-anchored width morph out of the composer, 0→1); for a counterparty
+    /// arrival it drives the uniform `grow` pop (0.92→1). `mine` selects which.
+    scale: spring.Handle,
     off: spring.Handle, // rises it from below the seat (px → 0)
+    /// Own send vs counterparty arrival — decides how the springs map to the
+    /// bubble transform (morph vs pop) at the xform-build site.
+    mine: bool,
     /// Spawn time (monotonic ns) — drives the short, monotonic opacity ramp,
     /// which is deliberately NOT a spring (an overshooting alpha flickers).
     born_ns: u64,
@@ -14391,13 +14397,19 @@ fn deinitGpuState(gpa: Allocator, gs: *GpuState) void {
 }
 
 // ── Zat Chat per-bubble motion (U6b) ─────────────────────────────────────────
-// The presets are the roadmap's tuning seeds (duration/bounce, §8 step 7). An
-// OWN send pops a touch harder than a counterparty ARRIVAL (0.28 vs 0.20 bounce)
-// and starts smaller/lower — it springs up out of the composer; an arrival
-// settles more gently. Tune these live (this is the ONE place hand-taste belongs).
-const chat_scale_mine = spring.springConstants(0.28, 0.35);
+// The presets are the tuning seeds (duration/bounce). A counterparty ARRIVAL
+// pops (uniform grow, a little overshoot) and settles gently on `chat_off_c`.
+// An OWN SEND is a different motion entirely: the composer PEELS into the bubble
+// — a right-anchored width morph (`emerge` 0→1) + a short rise out of the input
+// — CRITICALLY DAMPED, because the native send does not bounce (frame-by-frame
+// of a real iMessage send, 2026-07-17). Tune these live (the ONE place hand-taste
+// belongs): send_start_rise = how far below the seat it is born; chat_send_c's
+// duration = how brisk the peel is.
 const chat_scale_them = spring.springConstants(0.20, 0.35);
 const chat_off_c = spring.springConstants(0.15, 0.40);
+const chat_send_c = spring.springConstants(0.0, 0.30); // send morph: brisk, no overshoot
+const send_start_emerge: f32 = 0.0; // 0 = born on the composer input, → 1 seated
+const send_start_rise: f32 = 40.0; // (kept for the shared spawn; mine's vertical now rides `emerge`)
 const chat_reflow_c = spring.springConstants(0.0, 0.40); // critical: a reflow must not overshoot
 const chat_fade_ns: f32 = 0.18 * 1_000_000_000.0; // opacity ramp duration
 
@@ -14411,15 +14423,18 @@ const sheet_spring_c = spring.springConstants(0.18, 0.30);
 /// never a crash — E4).
 fn spawnBubbleAnim(gpa: Allocator, gs: *GpuState, key: u32, mine: bool, born_ns: u64) void {
     for (gs.chat_anims.items) |a| if (a.key == key) return;
-    const c_scale = if (mine) chat_scale_mine else chat_scale_them;
-    const start_scale: f32 = if (mine) 0.86 else 0.92;
-    const start_rise: f32 = if (mine) 26.0 else 20.0;
+    // MINE: the send morph — `scale` drives `emerge` (0 → 1, born at composer
+    // width), both channels critically damped. THEM: the uniform arrival pop.
+    const c_scale = if (mine) chat_send_c else chat_scale_them;
+    const c_off = if (mine) chat_send_c else chat_off_c;
+    const start_scale: f32 = if (mine) send_start_emerge else 0.92;
+    const start_rise: f32 = if (mine) send_start_rise else 20.0;
     const sh = gs.chat_world.spawn(gpa, start_scale, 1.0, c_scale) catch return;
-    const oh = gs.chat_world.spawn(gpa, start_rise, 0.0, chat_off_c) catch {
+    const oh = gs.chat_world.spawn(gpa, start_rise, 0.0, c_off) catch {
         gs.chat_world.release(sh);
         return;
     };
-    gs.chat_anims.append(gpa, .{ .key = key, .scale = sh, .off = oh, .born_ns = born_ns }) catch {
+    gs.chat_anims.append(gpa, .{ .key = key, .scale = sh, .off = oh, .mine = mine, .born_ns = born_ns }) catch {
         gs.chat_world.release(sh);
         gs.chat_world.release(oh);
     };
@@ -15668,13 +15683,22 @@ fn paintFrameGpu(
                 for (gs.chat_anims.items) |a| {
                     for (cf.order, 0..) |m, ri| {
                         if (@intFromEnum(m) == a.key and ri < xforms.len) {
-                            const grow = gs.chat_world.position(a.scale) orelse 1.0;
+                            const s = gs.chat_world.position(a.scale) orelse 1.0;
                             const rise = gs.chat_world.position(a.off) orelse 0.0;
-                            // Opacity: a short monotonic ramp off the spawn clock,
-                            // NOT a spring — opaque well before the transform settles.
+                            // Opacity ramp off the spawn clock, NOT a spring. The
+                            // send pill is SOLID almost at once (the native send does
+                            // not fade in); an arrival keeps the gentle ramp.
                             const age_ns: f32 = @floatFromInt(gs.chat_clock_ns -| a.born_ns);
-                            const alpha = std.math.clamp(age_ns / chat_fade_ns, 0.0, 1.0);
-                            xforms[ri] = .{ .grow = grow, .rise = rise, .alpha = alpha };
+                            const ramp = std.math.clamp(age_ns / chat_fade_ns, 0.0, 1.0);
+                            // The one `scale` spring means different things: an OWN
+                            // send drives `emerge` (the composer→bubble morph, drawn
+                            // OPAQUE — the input is turning into the message; its text
+                            // fades in at the render). An arrival drives the uniform
+                            // `grow` pop with the alpha ramp.
+                            xforms[ri] = if (a.mine)
+                                .{ .grow = 1.0, .emerge = s, .rise = rise, .alpha = 1.0 }
+                            else
+                                .{ .grow = s, .emerge = 1.0, .rise = rise, .alpha = ramp };
                             break;
                         }
                     }
