@@ -85,6 +85,7 @@ const feed_view = @import("../core/feed_view.zig");
 const pin_store = @import("../core/zone_pins.zig");
 const compose_core = @import("../core/compose.zig");
 const settings_view = @import("../core/settings_view.zig");
+const prefs = @import("../core/prefs.zig");
 const kbd_lm = @import("../core/kbd_lm.zig");
 const emoji_atlas = @import("../core/emoji_atlas.zig");
 const text_select = @import("../core/text_select.zig");
@@ -964,6 +965,11 @@ const RunState = struct {
     toggle_bits: u64,
     account_handle_buf: [128]u8,
     choice_sel: [settings_view.choices.len]u8,
+    /// The settings state last written to the client cache. One funnel
+    /// (`prefsPersistStep`) compares this against the live state each frame, so
+    /// a NEW settings mutation site cannot forget to persist — there is nothing
+    /// for it to remember to call.
+    prefs_sig: u64,
     gsettings_picking: u8,
     zone_catalog: std.ArrayList(feed_view.ZoneCard),
     on_browse_prev: bool,
@@ -1770,6 +1776,18 @@ fn initRunState(
         for (settings_view.choices, 0..) |c, i| s[i] = c.default;
         break :blk s;
     };
+    // Settings PERSISTENCE: the defaults seeded above are the floor; anything
+    // the viewer changed in a previous run is folded over them here (absent =
+    // keep the default, so a partial or missing file is not a reset — E4).
+    // `core/prefs.zig` owns the format, the action-keying, and the deny list
+    // that keeps a wedging toy (Gravity) off disk entirely.
+    if (cache_shell.loadPrefs(gpa, environ)) |saved| {
+        rs.toggle_bits = prefs.applyToggles(&saved, rs.toggle_bits);
+        prefs.applyChoices(&saved, &rs.choice_sel);
+    }
+    // The last state written to disk. Seeded from the state we just loaded so a
+    // launch that changes nothing writes nothing.
+    rs.prefs_sig = prefsSignature(rs);
     rs.gsettings_picking = 255;
     // Zones BROWSE catalog (`screen_zones_browse`): gpa-owned zone cards (the
     // display tag duped + post count), (re)fetched from `listTags` on entering
@@ -2847,6 +2865,13 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
         // refresh / roster receive — the blocking fetches that used to freeze the UI
         // every 15s now run on `gchat_dir_job`; this applies the session work.)
         if (dev_chat) chatDirStep(rs, gpa, io, environ);
+
+        // Did a Settings toggle or choice change this frame? One funnel, so no
+        // mutation site has to remember to persist. A no-op unless something
+        // actually differs from what is on disk (DISK, not network — a small
+        // atomic write, and only on an actual change, so it is not the kind of
+        // blocking I/O the render thread has been burned by before).
+        prefsPersistStep(rs);
 
         // MULTI-DEVICE (slice 2). Runs whether or not chat is up, because the
         // device that is WAITING to be let in has no chat state by definition — and
@@ -14582,6 +14607,30 @@ fn packChoices(sel: []const u8) u64 {
 /// The live selected option index for a choice action (0 if it isn't a choice).
 fn choiceSel(sel: []const u8, action: u8) u8 {
     return if (settings_view.choiceIndex(action)) |i| sel[i] else 0;
+}
+
+/// A fingerprint of everything Settings persists. Not a hash of the FILE — of
+/// the live state — so it changes exactly when a write is owed.
+fn prefsSignature(rs: *const RunState) u64 {
+    return rs.toggle_bits ^ (packChoices(&rs.choice_sel) *% 0x9E37_79B9_7F4A_7C15);
+}
+
+/// THE ONE PERSIST FUNNEL. Settings are mutated from several places (a toggle
+/// tap, a picker option, the Toy Box motion group's mutual exclusion), and the
+/// number of those sites only grows — so rather than a save call at each one,
+/// which a new site can forget, this compares the live state to what was last
+/// written and saves on any difference. Cheap: two words and a compare.
+///
+/// `prefs_sig` is advanced whether or not the write SUCCEEDS. A failing write
+/// (no home directory, a full or read-only disk) would otherwise be retried
+/// every frame forever; the cost of not retrying is that one change is lost
+/// until the next one, which is the better trade for an appearance setting.
+fn prefsPersistStep(rs: *RunState) void {
+    const sig = prefsSignature(rs);
+    if (sig == rs.prefs_sig) return;
+    rs.prefs_sig = sig;
+    const set = prefs.collect(rs.toggle_bits, &rs.choice_sel);
+    _ = cache_shell.savePrefs(rs.environ, &set);
 }
 
 /// "Accent" choice → an accent override, or null for "Auto" (follow the lens).

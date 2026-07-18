@@ -98,6 +98,9 @@ const snapshot = @import("../core/snapshot.zig");
 const feed = @import("../core/feed.zig");
 const algo_library = @import("../core/algo_library.zig");
 const zone_pins = @import("../core/zone_pins.zig");
+const prefs = @import("../core/prefs.zig");
+const settings_view = @import("../core/settings_view.zig");
+const dist_config = @import("dist_config");
 const auth = @import("auth.zig");
 const keystore = @import("keystore.zig");
 
@@ -473,6 +476,48 @@ pub fn savePins(gpa: Allocator, environ: ?*const std.process.Environ.Map, pins: 
     const bytes = zone_pins.serialize(gpa, pins) catch return false;
     defer gpa.free(bytes);
     return writeFileAtomic(path, bytes, 0o644);
+}
+
+// ---------------------------------------------------------------------------
+// Settings prefs — the viewer's toggles + choices (core/prefs.zig owns what the
+// bytes mean; this is only the path + fd work)
+// ---------------------------------------------------------------------------
+
+/// PRODUCT-NAMESPACED. Zat4 and the standalone Zat Chat are two apps that share
+/// one account and one cache directory on desktop, but their appearance is NOT
+/// shared: Zat Chat defaults to a light canvas and its own accent, and changing
+/// either must not reach back into Zat4 (owner, 2026-07-18). Separate files is
+/// what makes that structural rather than conventional. On Android the two are
+/// already separate installs with separate data dirs, so this only has to hold
+/// the desktop case — but it holds it in one place, for both.
+const prefs_file = if (dist_config.product == .chat) "prefs_chat.txt" else "prefs.txt";
+
+pub fn loadPrefsAt(gpa: Allocator, path: []const u8) ?prefs.Set {
+    const bytes = readFileAlloc(gpa, path) orelse return null;
+    defer gpa.free(bytes);
+    return prefs.parse(bytes);
+}
+
+pub fn savePrefsAt(path: []const u8, set: *const prefs.Set) bool {
+    var out_buf: [4096]u8 = undefined;
+    const bytes = prefs.serialize(&out_buf, set) orelse return false;
+    return writeFileAtomic(path, bytes, 0o644);
+}
+
+pub fn loadPrefs(gpa: Allocator, environ: ?*const std.process.Environ.Map) ?prefs.Set {
+    var dir_buf: [512]u8 = undefined;
+    var path_buf: [512]u8 = undefined;
+    const dir = cacheDir(&dir_buf, environ) orelse return null;
+    const path = joinFile(&path_buf, dir, prefs_file) orelse return null;
+    return loadPrefsAt(gpa, path);
+}
+
+pub fn savePrefs(environ: ?*const std.process.Environ.Map, set: *const prefs.Set) bool {
+    var dir_buf: [512]u8 = undefined;
+    var path_buf: [512]u8 = undefined;
+    const dir = cacheDir(&dir_buf, environ) orelse return false;
+    const path = joinFile(&path_buf, dir, prefs_file) orelse return false;
+    return savePrefsAt(path, set);
 }
 
 // ---------------------------------------------------------------------------
@@ -1485,6 +1530,47 @@ test "cache: chat history round-trips; the sealed image binds body, header, and 
         defer gpa.free(downgraded);
         try testing.expect(!std.mem.eql(u8, downgraded, blob));
     }
+}
+
+test "cache: settings prefs survive the disk; a missing file is a clean default" {
+    const gpa = testing.allocator; // C6
+    var path_buf: [128]u8 = undefined;
+    const path = tmpPath(&path_buf, "prefs");
+    defer unlink(path);
+    unlink(path); // a stale file from an earlier run would mask the absent case
+
+    // Never written: absent, not an error — the caller keeps its defaults.
+    try testing.expectEqual(@as(?prefs.Set, null), loadPrefsAt(gpa, path));
+
+    var sel = [_]u8{0} ** settings_view.choices.len;
+    sel[0] = 2; // accent -> "Blue"
+    const light_row = settings_view.rowOf(settings_view.act_light).?;
+    const grav_row = settings_view.rowOf(settings_view.act_gravity).?;
+
+    // Light ON and Gravity ON go in; only Light is allowed back out.
+    const set = prefs.collect((@as(u64, 1) << light_row) | (@as(u64, 1) << grav_row), &sel);
+    try testing.expect(savePrefsAt(path, &set));
+
+    const loaded = loadPrefsAt(gpa, path) orelse return error.TestUnexpectedResult;
+    const bits = prefs.applyToggles(&loaded, 0);
+    try testing.expect(bits & (@as(u64, 1) << light_row) != 0);
+    try testing.expect(bits & (@as(u64, 1) << grav_row) == 0); // wedging toy stays off disk
+
+    var out = [_]u8{0} ** settings_view.choices.len;
+    prefs.applyChoices(&loaded, &out);
+    try testing.expectEqual(@as(u8, 2), out[0]);
+}
+
+test "cache: a corrupt prefs file is a cold start, not a crash" {
+    const gpa = testing.allocator; // C6
+    var path_buf: [128]u8 = undefined;
+    const path = tmpPath(&path_buf, "prefs_bad");
+    defer unlink(path);
+
+    try testing.expect(writeFileAtomic(path, "\x00\xff not our file \x00", 0o644));
+    const loaded = loadPrefsAt(gpa, path) orelse return error.TestUnexpectedResult;
+    // Parsed to an empty set, so every setting keeps its table default.
+    try testing.expectEqual(@as(u64, 0b1101), prefs.applyToggles(&loaded, 0b1101));
 }
 
 test "cache: anchorPath keys files by DID" {

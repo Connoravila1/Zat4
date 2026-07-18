@@ -1269,6 +1269,7 @@ test {
     _ = @import("core/feed_view.zig");
     _ = @import("core/zone_pins.zig");
     _ = @import("core/settings_view.zig");
+    _ = @import("core/prefs.zig");
     _ = @import("core/lens_socket.zig");
     _ = @import("core/lens_catalog.zig");
     _ = @import("core/algo_library.zig");
