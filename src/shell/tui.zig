@@ -14160,6 +14160,16 @@ const GpuState = struct {
     sfx_pool: screen_fx.Pool = .empty,
     sfx_pending: chat_effects.ScreenEffect = .none,
     sfx_seed: u64 = 0,
+    /// "Plays when you open it" — the async half. `sfx_base` is the max message key
+    /// the moment the chat surface first opened, so only messages that arrived THIS
+    /// session (a higher key) can auto-play on open — opening old history never
+    /// replays. `sfx_played` is the LOCAL set of keys whose effect has already fired
+    /// on this device (so re-opening a conversation does not replay it). Both are
+    /// device-local; nothing here is transmitted (privacy: derived + rendered
+    /// locally, never signalled — same posture as detectAuto itself).
+    sfx_base: u32 = 0,
+    sfx_base_set: bool = false,
+    sfx_played: std.ArrayListUnmanaged(u32) = .empty,
     chat_anims: std.ArrayListUnmanaged(ChatAnim) = .empty,
     chat_reflow: ?spring.Handle = null,
     chat_typing_t: f32 = 0,
@@ -14397,6 +14407,7 @@ fn deinitGpuState(gpa: Allocator, gs: *GpuState) void {
     gs.chat_anims.deinit(gpa);
     gs.chat_world.deinit(gpa);
     gs.sfx_pool.deinit(gpa);
+    gs.sfx_played.deinit(gpa);
     gs.shatter_x.deinit(gpa);
     gs.shatter_y.deinit(gpa);
     gs.shatter_vx.deinit(gpa);
@@ -14436,6 +14447,19 @@ const sheet_spring_c = spring.springConstants(0.18, 0.30);
 /// Spawn a bubble's scale + offset springs and bind them to its message key.
 /// Idempotent per key; silently no-ops on OOM (a missed animation is cosmetic,
 /// never a crash — E4).
+/// Has the screen effect for message `key` already fired on THIS device? Local
+/// membership scan (the played set is tiny — effect-triggering messages are rare).
+fn sfxPlayed(gs: *const GpuState, key: u32) bool {
+    for (gs.sfx_played.items) |k| if (k == key) return true;
+    return false;
+}
+/// Record that `key`'s effect has fired, so re-opening the conversation does not
+/// replay it. Local only; a failed append just means it might replay once (cosmetic).
+fn sfxMarkPlayed(gpa: Allocator, gs: *GpuState, key: u32) void {
+    if (sfxPlayed(gs, key)) return;
+    gs.sfx_played.append(gpa, key) catch {};
+}
+
 fn spawnBubbleAnim(gpa: Allocator, gs: *GpuState, key: u32, mine: bool, born_ns: u64) void {
     for (gs.chat_anims.items) |a| if (a.key == key) return;
     // MINE: the send morph — `scale` drives `emerge` (0 → 1, born at composer
@@ -15433,6 +15457,14 @@ fn paintFrameGpu(
             if (@abs(gs.sheet_t - target) > 0.001 or @abs(gs.sheet_v) > 0.001) chat_animating = true;
         }
 
+        // The screen-effect session watermark: the max message key the first time
+        // the chat surface is live. Only messages that arrive AFTER this (a higher
+        // key) can auto-play on open, so opening old history never replays.
+        if (!gs.sfx_base_set) {
+            gs.sfx_base = if (cs.msgs.len > 0) @intCast(cs.msgs.len - 1) else 0;
+            gs.sfx_base_set = true;
+        }
+
         // Detect a new bubble in the SELECTED conversation and spawn its springs.
         if (g.chat_sel) |conv| {
             const order = chat_core.threadSlice(arena, cs, conv) catch &[_]chat_core.MsgIndex{};
@@ -15444,6 +15476,24 @@ fn paintFrameGpu(
                 gs.chat_seen_conv = conv_key;
                 gs.chat_seen_key = newest;
                 gs.chat_seen_valid = true;
+                // ASYNC PLAY ("plays when you open it"): if this conversation's newest
+                // message is a triggering PEER text message that arrived THIS session
+                // (key past the watermark) and hasn't played on this device, fire it
+                // now. Local only — derived from text we already hold, nothing sent,
+                // no read-signal (privacy). Opening old history never replays.
+                if (order.len > 0) {
+                    const msg = order[order.len - 1];
+                    if (newest > gs.sfx_base and !chat_core.isMine(cs, msg) and
+                        cs.msgs.items(.kind)[newest] == .text and !sfxPlayed(gs, newest))
+                    {
+                        const fx = chat_effects.detectAuto(chat_core.sliceSpan(cs, cs.msgs.items(.text)[newest]));
+                        if (fx != .none) {
+                            gs.sfx_pending = fx;
+                            gs.sfx_seed = spring_now;
+                            sfxMarkPlayed(gpa, gs, newest);
+                        }
+                    }
+                }
             } else if (order.len > 0 and newest > gs.chat_seen_key) {
                 const msg = order[order.len - 1];
                 spawnBubbleAnim(gpa, gs, newest, chat_core.isMine(cs, msg), spring_now);
@@ -15458,6 +15508,7 @@ fn paintFrameGpu(
                     if (fx != .none) {
                         gs.sfx_pending = fx;
                         gs.sfx_seed = spring_now;
+                        sfxMarkPlayed(gpa, gs, newest); // so leaving + reopening won't replay
                     }
                 }
             }

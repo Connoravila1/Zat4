@@ -37,7 +37,8 @@ if [ "${ZAT_ENROLL_REHEARSAL:-0}" = "1" ]; then REHEARSE_ARGS="-Denroll-rehearsa
 PRODUCT="${ZAT_PRODUCT:-zat4}"
 PRODUCT_ARG=""
 OUT="zig-out/Zat4-android-arm64.apk"
-[ "$PRODUCT" = "chat" ] && { PRODUCT_ARG="-Dproduct=chat"; OUT="zig-out/ZatChat-android-arm64.apk"; }
+ICON="assets/icon/zat4_256.png"
+[ "$PRODUCT" = "chat" ] && { PRODUCT_ARG="-Dproduct=chat"; OUT="zig-out/ZatChat-android-arm64.apk"; ICON="assets/icon/zatchat_256.png"; }
 
 "$ZIG" build libzat -Doptimize=ReleaseSafe -Dandroid-ndk="$NDK" -Dappview-token="$ZAT_APPVIEW_TOKEN" $RELAY_ARGS $REHEARSE_ARGS $PRODUCT_ARG
 
@@ -57,7 +58,7 @@ fi
 
 # Resources: the launcher icon (one density is enough for a test build).
 mkdir -p "$stage/res/mipmap"
-cp assets/icon/zat4_256.png "$stage/res/mipmap/ic_launcher.png"
+cp "$ICON" "$stage/res/mipmap/ic_launcher.png"
 "$BT/aapt2" compile --dir "$stage/res" -o "$stage/res.flata"
 
 # Link the binary manifest + resources against the platform.
