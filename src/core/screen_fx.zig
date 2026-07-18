@@ -73,17 +73,22 @@ pub const Particle = struct {
 /// `seedShow`, drained by `step`, read by `compose`.
 pub const Pool = std.MultiArrayList(Particle);
 
-// ── Tunable recipe constants (a later live pass dials these — [TUNE]) ────────
-const balloon_count: u32 = 18;
+// ── Tunable recipe constants (owner live pass 2026-07-17 — [TUNE]) ───────────
+// Confetti is the owner's favourite and is left as the template; balloons were
+// starting too far below to climb into view (barely-visible/inconsistent) and now
+// launch just under the bottom edge and rise fast enough to cross the screen;
+// fireworks read "too simple/short" → more bursts, more sparks, longer life.
+const balloon_count: u32 = 24;
 const confetti_count: u32 = 90;
-const firework_bursts: u32 = 5;
-const spark_per_burst: u32 = 26;
-const laser_beams: u32 = 7;
+const firework_bursts: u32 = 9;
+const spark_per_burst: u32 = 40;
+const laser_beams: u32 = 11;
 
-const balloon_rise: f32 = -150.0; // px/s upward
+const balloon_rise: f32 = -320.0; // px/s upward — must actually cross the viewport
 const confetti_fall: f32 = 190.0; // px/s downward
 const gravity: f32 = 520.0; // px/s² for sparks
-const show_seconds: f32 = 2.6; // nominal show length (balloons/confetti travel)
+const firework_life: f32 = 2.2; // per-spark seconds (was 1.4 — read too short)
+const show_seconds: f32 = 2.8; // nominal show length (balloons/confetti travel)
 
 // Festive palette (opaque 0xAARRGGBB); compose applies the fade to the alpha.
 const festive = [_]u32{ 0xFFE0466E, 0xFF4A9EE0, 0xFF57C46A, 0xFFF2C14E, 0xFFB06AD8, 0xFFE07A3F };
@@ -119,13 +124,13 @@ pub fn seedShow(gpa: Allocator, pool: *Pool, effect: ScreenEffect, w: u16, h: u1
         .balloons => {
             var i: u32 = 0;
             while (i < balloon_count) : (i += 1) {
-                const sz = rndR(&st, 26, 44);
+                const sz = rndR(&st, 34, 56);
                 try pool.append(gpa, .{
-                    .x = rndR(&st, 0.06 * fw, 0.94 * fw),
-                    .y = fh + rndR(&st, 0, 0.5 * fh), // start below the screen
-                    .vx = rndR(&st, -12, 12),
-                    .vy = balloon_rise * rndR(&st, 0.75, 1.25),
-                    .life = show_seconds * rndR(&st, 0.85, 1.15),
+                    .x = rndR(&st, 0.05 * fw, 0.95 * fw),
+                    .y = fh + rndR(&st, 0, 0.15 * fh), // JUST below the bottom edge (small stagger)
+                    .vx = rndR(&st, -16, 16),
+                    .vy = balloon_rise * rndR(&st, 0.85, 1.2),
+                    .life = show_seconds * rndR(&st, 0.9, 1.15),
                     .max_life = show_seconds,
                     .size = sz,
                     .seed = @truncate(mix(&st)),
@@ -154,22 +159,21 @@ pub fn seedShow(gpa: Allocator, pool: *Pool, effect: ScreenEffect, w: u16, h: u1
         .fireworks => {
             var b: u32 = 0;
             while (b < firework_bursts) : (b += 1) {
-                const cx = rndR(&st, 0.15 * fw, 0.85 * fw);
-                const cy = rndR(&st, 0.15 * fh, 0.55 * fh);
+                const cx = rndR(&st, 0.12 * fw, 0.88 * fw);
+                const cy = rndR(&st, 0.12 * fh, 0.62 * fh);
                 const hue: u8 = @intCast(mix(&st) % festive.len);
-                const delay = rndR(&st, 0.0, 0.9); // staggered bursts (as shorter life)
                 var p: u32 = 0;
                 while (p < spark_per_burst) : (p += 1) {
                     const ang = rndR(&st, 0, std.math.tau);
-                    const spd = rndR(&st, 90, 240);
+                    const spd = rndR(&st, 90, 320); // wider spread → a fuller burst
                     try pool.append(gpa, .{
                         .x = cx,
                         .y = cy,
                         .vx = @cos(ang) * spd,
                         .vy = @sin(ang) * spd,
-                        .life = (1.4 - delay) * rndR(&st, 0.8, 1.1),
-                        .max_life = 1.4,
-                        .size = rndR(&st, 3, 5),
+                        .life = firework_life * rndR(&st, 0.75, 1.1),
+                        .max_life = firework_life,
+                        .size = rndR(&st, 3, 6),
                         .seed = @truncate(mix(&st)),
                         .kind = .spark,
                         .hue = hue,
@@ -185,9 +189,9 @@ pub fn seedShow(gpa: Allocator, pool: *Pool, effect: ScreenEffect, w: u16, h: u1
                     .y = rndR(&st, 0.15 * fh, 0.85 * fh),
                     .vx = 0,
                     .vy = rndR(&st, -60, 60), // slight drift
-                    .life = show_seconds * rndR(&st, 0.6, 1.0),
+                    .life = show_seconds * rndR(&st, 0.55, 1.0),
                     .max_life = show_seconds,
-                    .size = rndR(&st, 2, 5), // beam thickness
+                    .size = rndR(&st, 3, 7), // beam thickness — a touch punchier
                     .seed = @truncate(mix(&st)),
                     .kind = .beam,
                     .hue = @intCast(mix(&st) % laser_hues.len),
@@ -331,13 +335,17 @@ pub fn compose(gpa: Allocator, pool: *const Pool, w: u16, dl: *raster.DrawList) 
                 } });
             },
             .beam => {
-                // A bright line across the viewport, slightly diagonal, pulsing.
-                const col = fade(laser_hues[hue % laser_hues.len], a * (0.6 + 0.4 * @abs(@sin(life * 12.0))));
+                // A bright line across the viewport. Each beam has a FIXED diagonal
+                // slope from its seed, so the beams CROSS at varied angles (punchier
+                // than parallel near-horizontal lines), and pulses on its own phase.
+                const sd: f32 = @floatFromInt(s.items(.seed)[i]);
+                const slope = (@mod(sd, 100.0) / 100.0 - 0.5) * fwv * 0.9;
+                const col = fade(laser_hues[hue % laser_hues.len], a * (0.55 + 0.45 * @abs(@sin(life * 14.0 + sd * 0.01))));
                 try dl.append(gpa, .{ .line = .{
                     .x0 = 0,
                     .y0 = clamp16(y),
                     .x1 = clamp16(fwv),
-                    .y1 = clamp16(y + @sin(life * 2.0) * 24.0),
+                    .y1 = clamp16(y + slope),
                     .color = col,
                     .thickness = @intFromFloat(std.math.clamp(size, 1, 255)),
                 } });
