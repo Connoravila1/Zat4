@@ -1284,6 +1284,7 @@ test {
     _ = @import("core/field.zig");
     _ = @import("core/effect.zig");
     _ = @import("core/chat_effects.zig");
+    _ = @import("core/screen_fx.zig");
     _ = @import("core/field_ui.zig");
     _ = @import("core/compose.zig");
     _ = @import("core/websocket.zig");
