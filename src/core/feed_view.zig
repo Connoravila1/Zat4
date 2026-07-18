@@ -1866,7 +1866,13 @@ pub fn drawTabBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, w
     // Chat (centre) · activity · you. Composing is NOT a tab — it is the
     // floating FAB below. Everything else (Algorithms, Settings) lives in the
     // swipe-right nav DRAWER (drawDrawer).
-    const slots = [_]Slot{ .{ .nav = screen_home }, .{ .nav = screen_zones_browse }, .{ .nav = screen_messages }, .{ .nav = 2 }, .you };
+    const slots: []const Slot = if (chat_app)
+        // The standalone Zat Chat app: chats · money · settings · you. Payments are
+        // a chat-native feature, so the wallet earns a tab (part of going past the
+        // plain-messenger baseline); Home/Zones/Activity have no place here.
+        &.{ .{ .nav = screen_messages }, .{ .nav = screen_wallet }, .{ .nav = screen_settings }, .you }
+    else
+        &.{ .{ .nav = screen_home }, .{ .nav = screen_zones_browse }, .{ .nav = screen_messages }, .{ .nav = 2 }, .you };
     const slot_w = @divTrunc(width, @as(i32, @intCast(slots.len)));
     const icon_cy = by + 36;
     for (slots, 0..) |slot, i| {
@@ -1881,7 +1887,10 @@ pub fn drawTabBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, w
                 // re-derives the icon centre from THIS geometry (r.x + r.w/2,
                 // r.y + 36) — keep them in sync.
                 if (on) try rect(gpa, dl, cx - 28, icon_cy - 26, 56, 52, (0x22 << 24) | (accent & 0x00FFFFFF), 15);
-                if (!skip_nav) try navIcon(idx, gpa, dl, cx - 14, icon_cy - 14, 28, if (on) accent else muted);
+                // Draw line-art for any icon the SDF pass doesn't cover (e.g. the
+                // wallet ₿, screen id past screen_settings) even on the GPU path —
+                // mirrors drawRail's fallback, so a non-SDF tab slot is never empty.
+                if (!skip_nav or !navIconIsSdf(idx)) try navIcon(idx, gpa, dl, cx - 14, icon_cy - 14, 28, if (on) accent else muted);
                 try emitRegion(gpa, regions, slot_w * @as(i32, @intCast(i)), by, slot_w, @intCast(@min(tab_bar_h + @max(0, bottom_inset), 32767)), idx, .nav);
             },
             .you => {

@@ -31,10 +31,29 @@ if [ -n "${ZAT_RELAY_URL:-}" ]; then RELAY_ARGS="-Drelay-url=$ZAT_RELAY_URL -Dre
 # leaving a real account on the PDS every time.
 REHEARSE_ARGS=""
 if [ "${ZAT_ENROLL_REHEARSAL:-0}" = "1" ]; then REHEARSE_ARGS="-Denroll-rehearsal"; echo "[apk] REHEARSAL build — no account will be minted"; fi
-"$ZIG" build libzat -Doptimize=ReleaseSafe -Dandroid-ndk="$NDK" -Dappview-token="$ZAT_APPVIEW_TOKEN" $RELAY_ARGS $REHEARSE_ARGS
+# The product flavor: zat4 (default) or chat (the standalone Zat Chat app —
+# built with -Dproduct=chat AND given its OWN package id + label below so it
+# installs ALONGSIDE Zat4 rather than replacing it). Set ZAT_PRODUCT=chat.
+PRODUCT="${ZAT_PRODUCT:-zat4}"
+PRODUCT_ARG=""
+OUT="zig-out/Zat4-android-arm64.apk"
+[ "$PRODUCT" = "chat" ] && { PRODUCT_ARG="-Dproduct=chat"; OUT="zig-out/ZatChat-android-arm64.apk"; }
+
+"$ZIG" build libzat -Doptimize=ReleaseSafe -Dandroid-ndk="$NDK" -Dappview-token="$ZAT_APPVIEW_TOKEN" $RELAY_ARGS $REHEARSE_ARGS $PRODUCT_ARG
 
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
+
+# The manifest: the chat flavor gets its own package id + label (a distinct app
+# beside Zat4). The OAuth VIEW scheme is left as-is — our-PDS accounts sign in by
+# in-app password (no browser), so it is unused for the standalone app's v1.
+MANIFEST="assets/android/AndroidManifest.xml"
+if [ "$PRODUCT" = "chat" ]; then
+  MANIFEST="$stage/AndroidManifest.xml"
+  sed -e 's/package="com.zat4.client"/package="com.zatchat.client"/' \
+      -e 's/android:label="Zat4"/android:label="Zat Chat"/' \
+      assets/android/AndroidManifest.xml > "$MANIFEST"
+fi
 
 # Resources: the launcher icon (one density is enough for a test build).
 mkdir -p "$stage/res/mipmap"
@@ -44,7 +63,7 @@ cp assets/icon/zat4_256.png "$stage/res/mipmap/ic_launcher.png"
 # Link the binary manifest + resources against the platform.
 "$BT/aapt2" link \
   -I "$PLATFORM" \
-  --manifest assets/android/AndroidManifest.xml \
+  --manifest "$MANIFEST" \
   -o "$stage/base.apk" \
   "$stage/res.flata"
 
@@ -63,6 +82,6 @@ if [[ ! -f "$KS" ]]; then
 fi
 "$JAVA" -jar "$BT/lib/apksigner.jar" sign \
   --ks "$KS" --ks-pass pass:zat4debug --ks-key-alias zat4debug \
-  --out zig-out/Zat4-android-arm64.apk "$stage/aligned.apk"
-"$JAVA" -jar "$BT/lib/apksigner.jar" verify --print-certs zig-out/Zat4-android-arm64.apk | head -3
-echo "zig-out/Zat4-android-arm64.apk"
+  --out "$OUT" "$stage/aligned.apk"
+"$JAVA" -jar "$BT/lib/apksigner.jar" verify --print-certs "$OUT" | head -3
+echo "$OUT"
