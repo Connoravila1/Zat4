@@ -161,6 +161,24 @@ pub const kind_reply_wire: u8 = 9;
 /// twice takes it back, which is what everybody expects and nobody writes down.
 pub const kind_react_wire: u8 = 10;
 
+/// TEXT SENT WITH AN EFFECT. [kind][u8 effect][utf-8 text] — an ordinary text
+/// message that also names the screen effect it was sent with, so the recipient
+/// plays the one the SENDER chose.
+///
+/// This kind exists because a manually-picked effect cannot be re-derived. The
+/// automatic phrase effects need no wire field at all: both ends run the same
+/// pure `chat_effects.detectAuto` over the same text and reach the same answer.
+/// But "hi" sent with lasers is indistinguishable from "hi" — the intent lives
+/// only in the sender's tap, so it has to travel.
+///
+/// A message with NO effect is still encoded as a plain `[0][text]`, byte for
+/// byte what it was before this kind existed. Only an effect-carrying message
+/// takes this path, so ordinary delivery is untouched.
+///
+/// The id rides INSIDE the E2EE payload, so it is exactly as private as the
+/// words it decorates — the relay sees one more opaque blob of the same shape.
+pub const kind_text_fx_wire: u8 = 11;
+
 /// How many times an unacknowledged Welcome is re-sent before the client
 /// stops and says so. With the ladder below this is ~1 hour of trying; a
 /// relaunch starts the ladder over (`restoreGroups`), so a peer who comes
@@ -289,15 +307,24 @@ pub const ChatMsg = struct {
     kind: Kind,
     /// CHAT_FEATURES: the message this one ANSWERS (a store index), or `no_reply`.
     reply_to: u32 = no_reply,
+    /// The screen effect this message was SENT WITH (a `chat_effects.ScreenEffect`
+    /// ordinal; 0 = none). Only a manually-picked effect is carried — the phrase
+    /// -triggered ones are re-derived from the text on both ends, so storing them
+    /// would be storing a duplicate of something already known.
+    effect: u8 = 0,
 
     comptime {
-        // A7.1 — budget raised 24 → 32. `reply_to` (u32) is what makes a reply a
-        // reply: without it the answer and the thing it answers are two unrelated
-        // messages that merely arrived in order. In the SoA store each field lives
-        // in its OWN array, so the real cost is 4 bytes per message and the 8-byte
-        // tail padding this guard now reports never materializes — the guard pins
-        // the honest @sizeOf of the declared struct, which is what forces this
+        // A7.1 — budget raised 24 → 32 for `reply_to` (u32), which is what makes a
+        // reply a reply: without it the answer and the thing it answers are two
+        // unrelated messages that merely arrived in order. In the SoA store each
+        // field lives in its OWN array, so the real cost is 4 bytes per message and
+        // the 8-byte tail padding this guard reports never materializes — the guard
+        // pins the honest @sizeOf of the declared struct, which is what forces this
         // decision to be made on purpose.
+        //
+        // `effect` (u8) was then added for FREE: it lands in that existing tail
+        // padding, so the budget is unchanged at 32 and the SoA cost is one byte
+        // per message. Had it not fit, it would have been a real decision.
         assert(@sizeOf(ChatMsg) == 32);
     }
 };
@@ -693,6 +720,7 @@ fn appendRecord(
         .conv = conv,
         .kind = kind,
         .reply_to = no_reply, // set by `setReplyTo` when this message answers one
+        .effect = 0, // set by `setEffect` when this message was sent with one
     });
     try store.mine.resize(gpa, store.msgs.len, false);
     store.mine.setValue(index, mine);
@@ -842,6 +870,18 @@ pub fn setReplyTo(store: *Store, msg: u32, target: u32) void {
 pub fn replyTo(store: *const Store, msg: u32) u32 {
     if (msg >= store.msgs.len) return no_reply;
     return store.msgs.items(.reply_to)[msg];
+}
+
+/// Record the screen effect a message was sent with (`setReplyTo`'s shape: the
+/// append stays one function, the decoration is applied after).
+pub fn setEffect(store: *Store, msg: u32, effect: u8) void {
+    if (msg >= store.msgs.len) return;
+    store.msgs.items(.effect)[msg] = effect;
+}
+
+pub fn effectOf(store: *const Store, msg: u32) u8 {
+    if (msg >= store.msgs.len) return 0;
+    return store.msgs.items(.effect)[msg];
 }
 
 /// They have read everything of ours up to `at`. The watermark only ever moves
@@ -1321,7 +1361,7 @@ const codec_magic = [4]u8{ 'Z', 'A', 'T', 'H' };
 /// sections so every v2 blob still reads (a version gate is a compatibility
 /// contract and is written as a RANGE — the day we wrote it as a LIST, a v3 bump
 /// orphaned every conversation on the owner's phone).
-const codec_version: u16 = 8; // v8: their read watermark, per conversation
+const codec_version: u16 = 9; // v9: the effect column, one u8 per message
 const conv_rec_len = 28; // did span 8 + handle span 8 + i64 8 + u32 4
 const msg_rec_len = 21; // i64 8 + text span 8 + conv 4 + kind 1
 const pay_rec_len = 23; // id 8 + amount 8 + msg 4 + rail 1 + status 1 + conf 1
@@ -1348,7 +1388,8 @@ pub fn serializeStore(gpa: Allocator, store: *const Store) error{OutOfMemory}![]
         c_count + // v5: one flags byte per conversation
         4 * m_count + // v6: reply_to, one u32 per message
         4 + store.reactions.len * 13 + // v7: reactions (u32 msg + 8 emoji + 1 mine)
-        8 * c_count; // v8: read_up_to, one i64 per conversation
+        8 * c_count + // v8: read_up_to, one i64 per conversation
+        m_count; // v9: effect, one u8 per message
     const out = try gpa.alloc(u8, total);
     errdefer gpa.free(out);
 
@@ -1481,8 +1522,36 @@ pub fn serializeStore(gpa: Allocator, store: *const Store) error{OutOfMemory}![]
         at += 8;
     }
 
+    // v9: what each message was SENT WITH. Same reasoning as the reply column: a
+    // message sent with lasers that a relaunch forgets is just a message.
+    for (0..m_count) |i| {
+        out[at] = msgs.items(.effect)[i];
+        at += 1;
+    }
+
     assert(at == total);
     return out;
+}
+
+/// The byte length of the v3..v9 per-record tail — everything appended AFTER the
+/// settlement section by a codec version bump.
+///
+/// This exists because the arithmetic was written out by hand in two damage
+/// tests, and the v9 bump broke BOTH: one started failing for the wrong reason
+/// and the other stopped failing cleanly at all (a stale offset landed in a
+/// length field and the deserializer tried to allocate it, so the test OOM'd
+/// instead of reporting `Malformed`). Those tests locate the older sections by
+/// stepping back over this tail, so every future version must extend it HERE,
+/// once, rather than in each copy.
+fn versionTailLen(store: *const Store) usize {
+    const m = store.msgs.len;
+    const c = store.convs.len;
+    return 2 * ((m + 7) / 8) + // v3 tombstones + v4 edit marks
+        c + // v5 conversation flags
+        4 * m + // v6 reply_to
+        4 + store.reactions.len * 13 + // v7 reactions (count + rows)
+        8 * c + // v8 read_up_to
+        m; // v9 effect
 }
 
 /// True when `span` names a real NUL-terminated string inside `bytes` (the
@@ -1769,6 +1838,17 @@ pub fn deserializeStore(gpa: Allocator, bytes: []const u8) DeserializeError!Stor
         }
     }
 
+    // v9: the effect column. A v8 blob has none — nothing was sent with an
+    // effect before the picker could attach one.
+    if (version >= 9) {
+        if (bytes.len - at < m_count) return error.Malformed;
+        const ms2 = store.msgs.slice();
+        for (0..m_count) |i| {
+            ms2.items(.effect)[i] = bytes[at];
+            at += 1;
+        }
+    }
+
     if (at != bytes.len) return error.Malformed; // exact tail — no trailing bytes
     return store;
 }
@@ -1940,6 +2020,26 @@ test "store codec: full round-trip, and the restored store keeps working" {
     try std.testing.expectEqual(a, a2);
     _ = try appendMessage(gpa, &restored, a2, .text, "post-restore", 200, true);
     try std.testing.expectEqual(@as(usize, 4), restored.msgs.len);
+}
+
+test "store codec v9: the effect column survives a relaunch" {
+    const gpa = std.testing.allocator;
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+
+    const a = try openConversation(gpa, &store, "did:plc:aaa", "amy.zat4.com");
+    const plain = try appendMessage(gpa, &store, a, .text, "hi", 100, true);
+    const withfx = try appendMessage(gpa, &store, a, .text, "hi", 101, true);
+    setEffect(&store, @intFromEnum(withfx), 5); // lasers
+
+    const blob = try serializeStore(gpa, &store);
+    defer gpa.free(blob);
+    var restored = try deserializeStore(gpa, blob);
+    defer deinitStore(gpa, &restored);
+
+    // A message sent with lasers that a relaunch forgets is just a message.
+    try std.testing.expectEqual(@as(u8, 5), effectOf(&restored, @intFromEnum(withfx)));
+    try std.testing.expectEqual(@as(u8, 0), effectOf(&restored, @intFromEnum(plain)));
 }
 
 test "store codec: the empty store round-trips" {
@@ -2275,8 +2375,7 @@ test "store codec: a version-1 blob (pre-payments) still restores" {
     // byte-identical to what M2 wrote.
     const v3 = try serializeStore(gpa, &store);
     defer gpa.free(v3);
-    const del_len = (store.msgs.len + 7) / 8; // v3 tombstones + v4 edit marks
-    const v5_tail = 2 * del_len + store.convs.len + 4 * store.msgs.len + 4 + 8 * store.convs.len; // v3..v8
+    const v5_tail = versionTailLen(&store); // v3..v9 — see versionTailLen
     const v1 = try gpa.dupe(u8, v3[0 .. v3.len - v5_tail - 8]);
     defer gpa.free(v1);
     std.mem.writeInt(u16, v1[4..6], 1, .little);
@@ -2321,7 +2420,7 @@ test "store codec v2: every class of payment-section damage is refused" {
     // bytes before it.
     // v3 appends the tombstone bitset AFTER the settlement section, so the
     // payment/settlement records are no longer the tail: step back over it.
-    const del_tail = 2 * ((store.msgs.len + 7) / 8) + store.convs.len + 4 * store.msgs.len + 4 + 8 * store.convs.len; // v3..v8
+    const del_tail = versionTailLen(&store); // v3..v9 — see versionTailLen
     const ref_at = good.len - del_tail - ref_rec_len;
     const pay_at = good.len - del_tail - ref_rec_len - 4 - pay_rec_len;
 

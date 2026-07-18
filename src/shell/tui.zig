@@ -2284,7 +2284,14 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             switch (ev) {
                                 .message => |msg| {
                                     if (chat_core.openConversation(gpa, &rs.gchat_store, msg.peer_did, "") catch null) |c| {
-                                        _ = chat_core.appendMessage(gpa, &rs.gchat_store, c, msg.kind, msg.text, now, false) catch {};
+                                        if (chat_core.appendMessage(gpa, &rs.gchat_store, c, msg.kind, msg.text, now, false) catch null) |mi| {
+                                            // What they SENT it with. Only a manual
+                                            // pick rides the wire; the phrase effects
+                                            // are re-derived from the text locally, so
+                                            // this is exactly the sender's intent and
+                                            // nothing inferred.
+                                            if (msg.effect != 0) chat_core.setEffect(&rs.gchat_store, @intFromEnum(mi), msg.effect);
+                                        }
                                         chat_mutated = true;
                                     }
                                     // The message supersedes its typing bubble.
@@ -6614,8 +6621,12 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                             rs.gcmenu = .{}; // close the picker
                                             const body = std.mem.trimEnd(u8, rs.gchat_draft_buf[0..rs.gchat_draft_len], " \n");
                                             if (body.len > 0) if (rs.gchat_sel) |sc| {
-                                                _ = chat_core.appendMessage(gpa, &rs.gchat_store, sc, .text, body, now, true) catch continue;
-                                                chatSend(gpa, io, environ, if (rs.gchat_e2ee) |*st| st else null, rs.gchat_link, &rs.gchat_store, sc, body);
+                                                const mi = chat_core.appendMessage(gpa, &rs.gchat_store, sc, .text, body, now, true) catch continue;
+                                                // Record it on OUR copy as well, so the
+                                                // sender's history says what it was sent
+                                                // with — not just the recipient's.
+                                                chat_core.setEffect(&rs.gchat_store, @intFromEnum(mi), @intFromEnum(fx));
+                                                chatSend(gpa, io, environ, if (rs.gchat_e2ee) |*st| st else null, rs.gchat_link, &rs.gchat_store, sc, body, @intFromEnum(fx));
                                                 chatPersistHistory(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
                                                 rs.gchat_draft_len = 0;
                                                 rs.gchat_caret = 0;
@@ -6765,7 +6776,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                                     chat_core.setReplyTo(&rs.gchat_store, @intFromEnum(mi), rs.gchat_reply_to);
                                                     chatSendReply(rs, gpa, io, environ, sc, rs.gchat_reply_to, body);
                                                     rs.gchat_reply_to = no_reply;
-                                                } else chatSend(gpa, io, environ, if (rs.gchat_e2ee) |*st| st else null, rs.gchat_link, &rs.gchat_store, sc, body);
+                                                } else chatSend(gpa, io, environ, if (rs.gchat_e2ee) |*st| st else null, rs.gchat_link, &rs.gchat_store, sc, body, 0);
                                                 // THE PIGGYBACK: a reply already tells
                                                 // them we read it. Drop the pending
                                                 // receipt rather than spend a second
@@ -7881,7 +7892,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         const body = std.mem.trimEnd(u8, rs.gchat_draft_buf[0..rs.gchat_draft_len], " \n");
                         if (body.len > 0) if (rs.gchat_sel) |sc| {
                             _ = chat_core.appendMessage(gpa, &rs.gchat_store, sc, .text, body, now, true) catch {};
-                            chatSend(gpa, io, environ, if (rs.gchat_e2ee) |*st| st else null, rs.gchat_link, &rs.gchat_store, sc, body);
+                            chatSend(gpa, io, environ, if (rs.gchat_e2ee) |*st| st else null, rs.gchat_link, &rs.gchat_store, sc, body, 0);
                             chatPersistHistory(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
                             rs.gchat_draft_len = 0;
                             rs.gscroll_px = 0; // re-anchor to the newest message
@@ -9771,14 +9782,14 @@ const ChatFrame = struct {
 /// session/link (no ZAT4_RELAY) keeps the send local-only — the bubble still
 /// shows, it just doesn't transmit. A crypto/relay error is a status line,
 /// never a crash (E2). `env` feeds the persist-after-send.
-fn chatSend(gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, st: ?*chat_e2ee.State, link: ?*chat_relay.ChatRelay, cs: *const chat_core.Store, conv: chat_core.ConvIndex, text: []const u8) void {
+fn chatSend(gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, st: ?*chat_e2ee.State, link: ?*chat_relay.ChatRelay, cs: *const chat_core.Store, conv: chat_core.ConvIndex, text: []const u8, effect: u8) void {
     const state = st orelse return;
     const l = link orelse return;
     chatLog("[chat] send -> {s} ({d} bytes)", .{ chat_core.conversationDid(cs, conv), text.len });
     const peer_did = chat_core.conversationDid(cs, conv);
     // A swallowed send error is how a message "disappears": the bubble appears,
     // nothing leaves, and nobody is told. Say it.
-    chat_e2ee.send(gpa, io, env, state, l, peer_did, .text, text) catch |err|
+    chat_e2ee.send(gpa, io, env, state, l, peer_did, .text, text, effect) catch |err|
         chatLog("[chat] SEND FAILED -> {s}: {s}", .{ peer_did, @errorName(err) });
 }
 
@@ -14507,6 +14518,21 @@ const sheet_spring_c = spring.springConstants(0.18, 0.30);
 /// Spawn a bubble's scale + offset springs and bind them to its message key.
 /// Idempotent per key; silently no-ops on OOM (a missed animation is cosmetic,
 /// never a crash — E4).
+/// The screen effect a message should play: what the sender PICKED if they picked
+/// one, otherwise whatever its text implies.
+///
+/// The manual pick WINS, and that ordering is the whole reason the id is on the
+/// wire. A phrase effect is re-derivable — both ends run the same pure scan over
+/// the same body and reach the same answer, so it needs no wire field. A pick is
+/// not: "hi" sent with lasers is byte-identical to "hi", and the intent exists
+/// only in the sender's tap. An untrusted byte is filtered through
+/// `chat_effects.fromWire`, so an id this build cannot play degrades to nothing.
+fn sfxFor(cs: *const chat_core.Store, msg: u32) chat_effects.ScreenEffect {
+    const picked = chat_effects.fromWire(chat_core.effectOf(cs, msg));
+    if (picked != .none) return picked;
+    return chat_effects.detectAuto(chat_core.sliceSpan(cs, cs.msgs.items(.text)[msg]));
+}
+
 /// Has the screen effect for message `key` already fired on THIS device? Local
 /// membership scan (the played set is tiny — effect-triggering messages are rare).
 fn sfxPlayed(gs: *const GpuState, key: u32) bool {
@@ -15570,7 +15596,7 @@ fn paintFrameGpu(
                     if (newest > gs.sfx_base and !chat_core.isMine(cs, msg) and
                         cs.msgs.items(.kind)[newest] == .text and !sfxPlayed(gs, newest))
                     {
-                        const fx = chat_effects.detectAuto(chat_core.sliceSpan(cs, cs.msgs.items(.text)[newest]));
+                        const fx = sfxFor(cs, newest);
                         if (fx != .none) {
                             gs.sfx_pending = fx;
                             gs.sfx_seed = spring_now;
@@ -15588,7 +15614,7 @@ fn paintFrameGpu(
                 // the effect from the body, so this fires for our OWN send AND a
                 // peer's arrival with no wire field — iMessage's auto-phrase behaviour.
                 if (cs.msgs.items(.kind)[newest] == .text) {
-                    const fx = chat_effects.detectAuto(chat_core.sliceSpan(cs, cs.msgs.items(.text)[newest]));
+                    const fx = sfxFor(cs, newest);
                     if (fx != .none) {
                         gs.sfx_pending = fx;
                         gs.sfx_seed = spring_now;

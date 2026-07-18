@@ -68,6 +68,35 @@ pub const ScreenEffect = enum(u8) {
     _, // forward-compat: an unknown id from a newer peer degrades to "no effect"
 };
 
+/// A WIRE byte → an effect this build can actually play.
+///
+/// The effect id arrives from another device, so it is untrusted input like any
+/// other: a newer peer may name an effect that did not exist when this build
+/// shipped, and a hostile one may name something that never will. The enum is
+/// non-exhaustive precisely so those values are representable, but a tag nothing
+/// switches on must not reach the renderer — it degrades to `.none` here, once,
+/// at the boundary.
+///
+/// Written exhaustively over the NAMED tags on purpose: adding an effect forces
+/// a decision at this line rather than silently defaulting.
+pub fn fromWire(b: u8) ScreenEffect {
+    const fx: ScreenEffect = @enumFromInt(b);
+    return switch (fx) {
+        .none,
+        .balloons,
+        .confetti,
+        .fireworks,
+        .hearts,
+        .lasers,
+        .celebration,
+        .spotlight,
+        .echo,
+        .shooting_star,
+        => fx,
+        _ => .none,
+    };
+}
+
 /// A human label for an effect — for the send-effect picker UI (and tests). Pure.
 pub fn screenName(fx: ScreenEffect) []const u8 {
     return switch (fx) {
@@ -176,4 +205,16 @@ test "screen effect ordinals are stable (wire contract) and labels are total" {
     const future: ScreenEffect = @enumFromInt(200);
     try testing.expectEqualStrings("None", screenName(future));
     try testing.expectEqualStrings("Balloons", screenName(.balloons));
+}
+
+test "screen effects: a wire byte only becomes an effect this build can play" {
+    // Every named id survives the boundary.
+    try std.testing.expectEqual(ScreenEffect.balloons, fromWire(1));
+    try std.testing.expectEqual(ScreenEffect.lasers, fromWire(5));
+    try std.testing.expectEqual(ScreenEffect.shooting_star, fromWire(9));
+    // An id from a newer peer, and a hostile one, both degrade to nothing
+    // rather than reaching the renderer as a tag nothing switches on.
+    try std.testing.expectEqual(ScreenEffect.none, fromWire(10));
+    try std.testing.expectEqual(ScreenEffect.none, fromWire(200));
+    try std.testing.expectEqual(ScreenEffect.none, fromWire(255));
 }

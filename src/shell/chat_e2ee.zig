@@ -1488,14 +1488,28 @@ pub fn send(
     peer_did: []const u8,
     kind: chat.Kind,
     text: []const u8,
+    /// The screen effect the sender PICKED for this message (0 = none). Only a
+    /// manual pick travels: the phrase-triggered effects are re-derived from the
+    /// text by the same pure function on both ends.
+    effect: u8,
 ) SendError!void {
     assert(!chat.isPaymentKind(kind));
-    if (text.len + 1 > max_payload) return error.TooLong; // ciphertext ≥ plaintext; cheap early cut
+    // With no effect the bytes are EXACTLY what they were before this feature
+    // existed — one kind byte and the text. Only an effect-carrying message
+    // takes the wider frame, so ordinary delivery is untouched (and a peer on an
+    // older build keeps receiving every ordinary message).
+    const head: usize = if (effect == 0) 1 else 2;
+    if (text.len + head > max_payload) return error.TooLong; // ciphertext ≥ plaintext; cheap early cut
     var plaintext_buf: [1024]u8 = undefined;
-    if (text.len + 1 > plaintext_buf.len) return error.TooLong;
-    plaintext_buf[0] = @intFromEnum(kind);
-    @memcpy(plaintext_buf[1..][0..text.len], text);
-    const plaintext = plaintext_buf[0 .. 1 + text.len];
+    if (text.len + head > plaintext_buf.len) return error.TooLong;
+    if (effect == 0) {
+        plaintext_buf[0] = @intFromEnum(kind);
+    } else {
+        plaintext_buf[0] = chat.kind_text_fx_wire;
+        plaintext_buf[1] = effect;
+    }
+    @memcpy(plaintext_buf[head..][0..text.len], text);
+    const plaintext = plaintext_buf[0 .. head + text.len];
     defer std.crypto.secureZero(u8, plaintext);
     return depositAll(gpa, io, environ, st, link, peer_did, plaintext);
 }
@@ -1660,7 +1674,7 @@ fn sendPaymentBytes(
 /// What one inbox bucket became. `peer_did`/`text` are gpa-owned by the
 /// event; release with `freeIncoming`. A7.2: cold union, transient.
 pub const Incoming = union(enum) {
-    message: struct { peer_did: []u8, kind: chat.Kind, text: []u8 },
+    message: struct { peer_did: []u8, kind: chat.Kind, text: []u8, effect: u8 = 0 },
     /// `device` is the peer DEVICE whose Welcome opened this session — an ack
     /// answers ONE Welcome, so the shell has to know which one (slice 1).
     started: struct { peer_did: []u8, device: [32]u8 },
@@ -2165,6 +2179,22 @@ pub fn onBucket(
                             .is_offer = true,
                         } };
                     }
+                    // TEXT SENT WITH AN EFFECT. Decoded into the SAME `.message`
+                    // variant, because that is what it is — an ordinary text
+                    // message that also knows how the sender wanted it to land.
+                    // Every consumer keeps working unchanged; only the ones that
+                    // care read `effect`.
+                    if (data[0] == chat.kind_text_fx_wire) {
+                        if (data.len < 2) return null; // no room for the effect byte
+                        const fx_text = try gpa.dupe(u8, data[2..]);
+                        errdefer gpa.free(fx_text);
+                        return .{ .message = .{
+                            .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]),
+                            .kind = .text,
+                            .text = fx_text,
+                            .effect = data[1],
+                        } };
+                    }
                     const kind = chat.parseKind(data[0]) catch return null; // reserved kinds refused until their milestone
                     if (chat.isPaymentKind(kind)) {
                         const f = chat.parsePaymentFrame(data[1..]) catch return null;
@@ -2187,6 +2217,7 @@ pub fn onBucket(
                         .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]),
                         .kind = kind,
                         .text = text,
+                        .effect = 0, // a plain message was sent with nothing
                     } };
                 },
             }
