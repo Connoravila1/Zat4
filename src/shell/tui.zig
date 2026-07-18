@@ -5722,6 +5722,15 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         rs.ghold_kind = .conversation;
                                         rs.ghold_conv = mh.post;
                                         rs.ghold_live = true;
+                                    } else if (mh.kind == .chat_send and rs.gchat_draft_len > 0) {
+                                        // HOLD SEND for the "Send with…" effect picker
+                                        // (a plain tap still sends). Only with a draft
+                                        // to send — an empty picker sends nothing.
+                                        rs.ghold_ns = clock_shell.monotonicNanos();
+                                        rs.ghold_x = rx;
+                                        rs.ghold_y = ry;
+                                        rs.ghold_kind = .send;
+                                        rs.ghold_live = true;
                                     }
                                 }
                             }
@@ -6571,6 +6580,24 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         // ── THE MESSAGE MENU (slice 2) ──
                                         .chat_msg => {}, // the bubble itself: a TAP does nothing (the HOLD is the gesture)
                                         .chat_menu_dismiss => rs.gcmenu = .{},
+                                        // "Send with…": the picked effect sends the
+                                        // current draft immediately and plays that
+                                        // effect (locally now; the wire leg carries the
+                                        // id to the peer in the next slice).
+                                        .chat_send_fx => if (dev_chat) {
+                                            const fx: chat_effects.ScreenEffect = @enumFromInt(@as(u8, @truncate(hit.post)));
+                                            rs.gcmenu = .{}; // close the picker
+                                            const body = std.mem.trimEnd(u8, rs.gchat_draft_buf[0..rs.gchat_draft_len], " \n");
+                                            if (body.len > 0) if (rs.gchat_sel) |sc| {
+                                                _ = chat_core.appendMessage(gpa, &rs.gchat_store, sc, .text, body, now, true) catch continue;
+                                                chatSend(gpa, io, environ, if (rs.gchat_e2ee) |*st| st else null, rs.gchat_link, &rs.gchat_store, sc, body);
+                                                chatPersistHistory(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
+                                                rs.gchat_draft_len = 0;
+                                                rs.gchat_caret = 0;
+                                                chatCollapseSel(rs);
+                                                if (rs.gpu_state) |*gs2| gs2.sfx_manual = fx; // play the picked effect
+                                            };
+                                        },
                                         // ── CONVERSATION ACTIONS (press-and-hold a row) ──
                                         .chat_conv_pin => if (dev_chat) {
                                             if (chatConvAtOrdinal(rs, rs.gcmenu.conv)) |c| {
@@ -10500,7 +10527,10 @@ fn chatHoldStep(rs: *RunState) void {
     if (!rs.ghold_live or rs.gcmenu.open) return;
     const el_ms = (clock_shell.monotonicNanos() -| rs.ghold_ns) / 1_000_000;
     if (el_ms < chat_hold_ms) return;
-    if (rs.ghold_kind == .conversation) {
+    if (rs.ghold_kind == .send) {
+        // The "Send with…" effect picker grows from the Send button.
+        rs.gcmenu = .{ .open = true, .kind = .send, .x = rs.ghold_x, .y = rs.ghold_y };
+    } else if (rs.ghold_kind == .conversation) {
         const conv = chatConvAtOrdinal(rs, rs.ghold_conv);
         rs.gcmenu = .{
             .open = true,
@@ -14160,6 +14190,11 @@ const GpuState = struct {
     sfx_pool: screen_fx.Pool = .empty,
     sfx_pending: chat_effects.ScreenEffect = .none,
     sfx_seed: u64 = 0,
+    /// A MANUALLY-picked "Send with…" effect to play on this frame. Takes precedence
+    /// over the auto-detected one (a picked effect is a deliberate choice; the phrase
+    /// scanner must not override it). Set by the .chat_send_fx handler, consumed at
+    /// render.
+    sfx_manual: chat_effects.ScreenEffect = .none,
     /// "Plays when you open it" — the async half. `sfx_base` is the max message key
     /// the moment the chat surface first opened, so only messages that arrived THIS
     /// session (a higher key) can auto-play on open — opening old history never
@@ -15793,7 +15828,12 @@ fn paintFrameGpu(
             // (design_w × lh) is known, then compose the live particles ON TOP of
             // the thread. `chat_animating` (set while the pool is non-empty) keeps
             // this rebuilding every frame until the show drains.
-            if (gs.sfx_pending != .none) {
+            // A MANUALLY-picked ("Send with…") effect wins over the auto-detected one.
+            if (gs.sfx_manual != .none) {
+                screen_fx.seedShow(gpa, &gs.sfx_pool, gs.sfx_manual, @intCast(gs.design_w), @intCast(lh), gs.chat_clock_ns) catch {};
+                gs.sfx_manual = .none;
+                gs.sfx_pending = .none; // don't also auto-play the same message
+            } else if (gs.sfx_pending != .none) {
                 screen_fx.seedShow(gpa, &gs.sfx_pool, gs.sfx_pending, @intCast(gs.design_w), @intCast(lh), gs.sfx_seed) catch {};
                 gs.sfx_pending = .none;
             }
