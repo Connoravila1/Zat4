@@ -2301,6 +2301,20 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                     if (std.mem.eql(u8, msg.peer_did, rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]))
                                         rs.gchat_typing_deadline = 0;
                                 },
+                                // A GAME MOVE. Stored as an ordinary message of
+                                // kind `.game_move` carrying the encoded byte —
+                                // the board is not stored anywhere, it is replayed
+                                // from these. Whether the move was theirs to make
+                                // is decided at replay (`replaySent`), not here:
+                                // this leg only records what arrived.
+                                .game_move => |gm| {
+                                    if (chat_core.openConversation(gpa, &rs.gchat_store, gm.peer_did, "") catch null) |c| {
+                                        if (chat_core.appendMessage(gpa, &rs.gchat_store, c, .game_move, "", now, false) catch null) |mi| {
+                                            chat_core.setGameMove(&rs.gchat_store, @intFromEnum(mi), gm.encoded);
+                                        }
+                                        chat_mutated = true;
+                                    }
+                                },
                                 .started => |s| {
                                     _ = chat_core.openConversation(gpa, &rs.gchat_store, s.peer_did, "") catch null;
                                     chat_mutated = true;

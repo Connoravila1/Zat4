@@ -69,8 +69,13 @@ pub const Outcome = enum(u8) { ongoing, x_wins, o_wins, draw };
 
 /// One move, as it travels ON THE WIRE inside a chat message: which game, and the
 /// target cell (0..8, row-major). The mover is NOT encoded — it is implied by the
-/// replay position (turns strictly alternate from X), so a forged "I am X twice"
-/// move is rejected by `apply`, not trusted from the payload. Encodes to one byte.
+/// replay position (turns strictly alternate from X), so there is no "I am X"
+/// claim in the payload to forge in the first place. Encodes to one byte.
+///
+/// NOTE: not encoding the mover is what makes a lie unrepresentable, but it is
+/// NOT by itself what stops a player moving twice — `apply` cannot see who sent
+/// anything. `replaySent` is where authorship is checked; use it for any move a
+/// peer can influence.
 pub const Move = struct {
     game: Game = .tictactoe,
     cell: u8, // 0..8, row-major (row*3 + col)
@@ -142,7 +147,8 @@ fn judge(board: [9]Seat, moves: u8) Outcome {
 
 /// Is `m` a legal next move in `s`? Pure predicate: the game must be ongoing, the
 /// cell in range, and the cell empty. Whose move it is comes from `s.turn`, not
-/// from the move — so a player cannot move twice or move for the opponent.
+/// from the move — this layer knows the RULES, not the players. Whether the right
+/// person sent it is a separate question, answered by `replaySent`.
 pub fn legal(s: State, m: Move) bool {
     return m.game == .tictactoe and
         s.outcome == .ongoing and
@@ -166,16 +172,82 @@ pub fn apply(s: State, m: Move) ?State {
     return ns;
 }
 
-/// Derive the current state by replaying a sequence of moves (the thread's game
-/// messages, oldest first). Illegal moves are SKIPPED, not fatal — so a replay is
-/// robust to duplicates and to a peer that sent a move out of turn. Pure: same
-/// moves ⇒ same state, which is the whole reason the game needs no stored state.
+/// Derive the current state by replaying a sequence of moves (oldest first),
+/// TRUSTING that they are in turn order. Illegal moves are SKIPPED, not fatal, so
+/// this is robust to duplicates and to a move that no longer fits the board. Pure:
+/// same moves ⇒ same state, which is why the game needs no stored state.
+///
+/// This is the RULES-ONLY form. It cannot tell one player's move from the other's,
+/// so a sequence where the same person moved twice replays as if they alternated.
+/// For anything a peer can influence, use `replaySent`.
 pub fn replay(moves: []const Move) State {
     var s = init();
     for (moves) |m| {
         if (apply(s, m)) |ns| s = ns;
     }
     return s;
+}
+
+/// A move as it actually ARRIVES in a thread: the move, plus who sent it.
+///
+/// `mine` is the store's own "did I send this" bit — the one fact the wire cannot
+/// forge, because it comes from which E2EE session the message was decrypted on,
+/// not from anything the sender wrote.
+pub const SentMove = struct {
+    move: Move,
+    mine: bool,
+
+    comptime {
+        // 2 (Move) + 1 (bool), all byte-aligned — no padding.
+        assert(@sizeOf(SentMove) == 3);
+    }
+};
+
+/// Replay a thread's moves, VERIFYING AUTHORSHIP. This is the one to use for
+/// anything a peer can influence; plain `replay` is the rules-only form and
+/// trusts its input to be in turn order.
+///
+/// Why it must exist: `apply` takes the mover from `s.turn`, so it cannot tell a
+/// legitimate reply from a second move by the same player — replaying Alice,
+/// Alice would seat the first as X and the SECOND AS O, letting Alice play her
+/// opponent's move. The rules layer has no authorship information to catch that
+/// with, and adding a "mover" field to the wire would only invite a lie. The fix
+/// is to check the sender against the seat whose turn it is, here, where both
+/// facts are in hand.
+///
+/// Seats come from the thread itself: **the initiator is X** — whoever sent the
+/// first move of the game — and the other participant is O. A move from the
+/// player whose turn it is NOT is skipped exactly like an illegal one (E4), so a
+/// cheating or confused peer degrades to "that move didn't happen" rather than
+/// corrupting the board.
+pub fn replaySent(moves: []const SentMove) State {
+    var s = init();
+    if (moves.len == 0) return s;
+    // X is whoever moved first; every later move is X's if it came from the same
+    // side, O's otherwise.
+    const x_is_mine = moves[0].mine;
+    for (moves) |sm| {
+        const sender: Seat = if (sm.mine == x_is_mine) .x else .o;
+        if (sender != s.turn) continue; // not their turn: a move for someone else
+        if (apply(s, sm.move)) |ns| s = ns;
+    }
+    return s;
+}
+
+/// Which seat WE hold in this game, or `.none` before anyone has moved. The
+/// initiator is X, so if we sent the first move we are X.
+pub fn mySeat(moves: []const SentMove) Seat {
+    if (moves.len == 0) return .none;
+    return if (moves[0].mine) .x else .o;
+}
+
+/// Is it OUR move? The question every board renderer actually asks.
+pub fn myTurn(moves: []const SentMove) bool {
+    const s = replaySent(moves);
+    if (s.outcome != .ongoing) return false;
+    // Before the first move the board is open and either side may open it.
+    if (moves.len == 0) return true;
+    return s.turn == mySeat(moves);
 }
 
 /// Which seat, if any, has WON — a convenience over `outcome` for the view.
@@ -288,4 +360,83 @@ test "Move encodes and decodes round-trip through one wire byte" {
     }
     // The byte is compact: tic-tac-toe cell 8 → 0x08.
     try testing.expectEqual(@as(u8, 0x08), (Move{ .cell = 8 }).encode());
+}
+
+test "replaySent: a player cannot move twice in a row" {
+    // THE CHEAT the rules layer cannot see. We open at 0, then send a second
+    // move immediately. Plain `replay` would seat that second move as O — we
+    // would have played our opponent's move for them.
+    const cheat = [_]SentMove{
+        .{ .move = .{ .cell = 0 }, .mine = true },
+        .{ .move = .{ .cell = 4 }, .mine = true }, // not our turn
+    };
+
+    const rules_only = replay(&[_]Move{ .{ .cell = 0 }, .{ .cell = 4 } });
+    try testing.expectEqual(Seat.o, rules_only.board[4]); // the gap, demonstrated
+
+    const checked = replaySent(&cheat);
+    try testing.expectEqual(Seat.x, checked.board[0]); // our legitimate move stands
+    try testing.expectEqual(Seat.none, checked.board[4]); // the second is skipped
+    try testing.expectEqual(Seat.o, checked.turn); // still waiting on them
+    try testing.expectEqual(@as(u8, 1), checked.moves);
+}
+
+test "replaySent: a peer cannot move for us either" {
+    const cheat = [_]SentMove{
+        .{ .move = .{ .cell = 0 }, .mine = false }, // they open, so they are X
+        .{ .move = .{ .cell = 1 }, .mine = false }, // and try to play our O
+    };
+    const s = replaySent(&cheat);
+    try testing.expectEqual(Seat.x, s.board[0]);
+    try testing.expectEqual(Seat.none, s.board[1]);
+    try testing.expectEqual(Seat.x, mySeat(&cheat).other()); // we are O
+    try testing.expectEqual(Seat.o, mySeat(&cheat));
+}
+
+test "replaySent: a legitimate alternating game plays out normally" {
+    // X takes the top row; every move is from the side whose turn it is.
+    const game = [_]SentMove{
+        .{ .move = .{ .cell = 0 }, .mine = true },
+        .{ .move = .{ .cell = 3 }, .mine = false },
+        .{ .move = .{ .cell = 1 }, .mine = true },
+        .{ .move = .{ .cell = 4 }, .mine = false },
+        .{ .move = .{ .cell = 2 }, .mine = true },
+    };
+    const s = replaySent(&game);
+    try testing.expectEqual(Outcome.x_wins, s.outcome);
+    try testing.expectEqual(Seat.x, winner(s));
+    try testing.expectEqual(Seat.x, mySeat(&game)); // we opened, so we are X
+    try testing.expectEqual(false, myTurn(&game)); // a finished game is nobody's turn
+}
+
+test "replaySent: a duplicate resend of the SAME move changes nothing" {
+    // Delivery can repeat a message; the cell is already taken, so it is skipped
+    // as illegal — and skipping must not hand the turn to the wrong player.
+    const dup = [_]SentMove{
+        .{ .move = .{ .cell = 0 }, .mine = true },
+        .{ .move = .{ .cell = 0 }, .mine = true },
+        .{ .move = .{ .cell = 4 }, .mine = false },
+    };
+    const s = replaySent(&dup);
+    try testing.expectEqual(Seat.x, s.board[0]);
+    try testing.expectEqual(Seat.o, s.board[4]);
+    try testing.expectEqual(@as(u8, 2), s.moves);
+    try testing.expectEqual(Seat.x, s.turn); // back to us, correctly
+}
+
+test "replaySent: an empty thread is an open board that we may start" {
+    const none = [_]SentMove{};
+    try testing.expectEqual(Seat.none, mySeat(&none));
+    try testing.expectEqual(true, myTurn(&none)); // anyone may open
+    try testing.expectEqual(Outcome.ongoing, replaySent(&none).outcome);
+}
+
+test "replaySent: an out-of-range cell from a hostile peer is refused" {
+    const bad = [_]SentMove{
+        .{ .move = Move.decode(0x0F), .mine = false }, // cell 15
+        .{ .move = .{ .cell = 0 }, .mine = false }, // they are still X, still first
+    };
+    const s = replaySent(&bad);
+    try testing.expectEqual(Seat.x, s.board[0]);
+    try testing.expectEqual(@as(u8, 1), s.moves);
 }

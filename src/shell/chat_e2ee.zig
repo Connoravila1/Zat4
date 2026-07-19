@@ -1514,6 +1514,27 @@ pub fn send(
     return depositAll(gpa, io, environ, st, link, peer_did, plaintext);
 }
 
+/// Send ONE GAME MOVE. Two bytes: the kind and the encoded move.
+///
+/// The mover is deliberately NOT on the wire. There is no "I am X" field to
+/// forge — the seat comes from replay position, and whether the sender was
+/// entitled to that seat is checked on arrival by `chat_games.replaySent`, which
+/// can see who sent what. A move that was not this player's to make is skipped
+/// there, so a cheating peer degrades to "that move didn't happen".
+pub fn sendGameMove(
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    st: *State,
+    link: *chat_relay.ChatRelay,
+    peer_did: []const u8,
+    encoded_move: u8,
+) SendError!void {
+    var buf: [2]u8 = .{ @intFromEnum(chat.Kind.game_move), encoded_move };
+    defer std.crypto.secureZero(u8, &buf);
+    return depositAll(gpa, io, environ, st, link, peer_did, &buf);
+}
+
 /// Send a message that ANSWERS another one.
 pub fn sendReply(
     gpa: Allocator,
@@ -1675,6 +1696,10 @@ fn sendPaymentBytes(
 /// event; release with `freeIncoming`. A7.2: cold union, transient.
 pub const Incoming = union(enum) {
     message: struct { peer_did: []u8, kind: chat.Kind, text: []u8, effect: u8 = 0 },
+    /// One move of an in-thread game. Separate from `.message` because it is not
+    /// a message anybody reads — it carries no text, and the thread renders it as
+    /// a board rather than a bubble.
+    game_move: struct { peer_did: []u8, encoded: u8 },
     /// `device` is the peer DEVICE whose Welcome opened this session — an ack
     /// answers ONE Welcome, so the shell has to know which one (slice 1).
     started: struct { peer_did: []u8, device: [32]u8 },
@@ -1759,6 +1784,7 @@ pub fn freeIncoming(gpa: Allocator, inc: Incoming) void {
             gpa.free(m.peer_did);
             gpa.free(m.text);
         },
+        .game_move => |g| gpa.free(g.peer_did),
         .started => |s| gpa.free(s.peer_did),
         .restarted => |s| gpa.free(s.peer_did),
         .typing => |t| gpa.free(t.peer_did),
@@ -2193,6 +2219,15 @@ pub fn onBucket(
                             .kind = .text,
                             .text = fx_text,
                             .effect = data[1],
+                        } };
+                    }
+                    // A GAME MOVE. Exactly two bytes; anything else claiming this
+                    // kind is malformed and dropped rather than guessed at.
+                    if (data[0] == @intFromEnum(chat.Kind.game_move)) {
+                        if (data.len != 2) return null;
+                        return .{ .game_move = .{
+                            .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]),
+                            .encoded = data[1],
                         } };
                     }
                     const kind = chat.parseKind(data[0]) catch return null; // reserved kinds refused until their milestone

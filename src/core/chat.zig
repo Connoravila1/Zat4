@@ -58,7 +58,19 @@ pub const Kind = enum(u8) {
     payment_request = 16,
     /// A payment card announcing an initiated payment (starts `broadcast`).
     payment_sent = 17,
+    /// ONE MOVE of an in-thread game. Stored like a payment card rather than
+    /// consumed at the session layer, because the thread IS the game: the board
+    /// is derived by replaying these in order (`chat_games.replaySent`), exactly
+    /// as the payment card's state is derived from its row. The move byte itself
+    /// lives in `ChatMsg.game`; the text span is empty.
+    game_move = 12,
 };
+
+/// True for the kinds that carry a game move (there is one today; the shape
+/// generalizes when connect-four lands).
+pub fn isGameKind(kind: Kind) bool {
+    return kind == .game_move;
+}
 
 /// True for the kinds that carry a parallel payment row (card ⇔ row, A1).
 pub fn isPaymentKind(kind: Kind) bool {
@@ -270,6 +282,7 @@ pub fn parseKind(byte: u8) KindError!Kind {
     return switch (byte) {
         0 => .text,
         1 => .system,
+        12 => .game_move,
         16 => .payment_request,
         17 => .payment_sent,
         else => error.UnknownKind,
@@ -312,6 +325,9 @@ pub const ChatMsg = struct {
     /// -triggered ones are re-derived from the text on both ends, so storing them
     /// would be storing a duplicate of something already known.
     effect: u8 = 0,
+    /// For a `.game_move`, the encoded `chat_games.Move` byte. Meaningless (and
+    /// zero) for every other kind — the KIND is what says whether to read it.
+    game: u8 = 0,
 
     comptime {
         // A7.1 — budget raised 24 → 32 for `reply_to` (u32), which is what makes a
@@ -322,9 +338,10 @@ pub const ChatMsg = struct {
         // pins the honest @sizeOf of the declared struct, which is what forces this
         // decision to be made on purpose.
         //
-        // `effect` (u8) was then added for FREE: it lands in that existing tail
-        // padding, so the budget is unchanged at 32 and the SoA cost is one byte
-        // per message. Had it not fit, it would have been a real decision.
+        // `effect` and `game` (u8 each) were then added for FREE: they land in
+        // that existing tail padding, so the budget is unchanged at 32 and the SoA
+        // cost is one byte per message each. Had either not fit, it would have
+        // been a real decision rather than a free one.
         assert(@sizeOf(ChatMsg) == 32);
     }
 };
@@ -630,6 +647,17 @@ pub fn paymentMine(store: *const Store, pay: PayIndex) bool {
 /// Append a string (plus a NUL so the span can serve as an interning key)
 /// and return its span.
 fn appendString(gpa: Allocator, store: *Store, s: []const u8) error{OutOfMemory}!TextSpan {
+    // An EMPTY string is `TextSpan.empty`, canonically — offset 0, not "wherever
+    // the arena happened to end". `spanOk` requires exactly that of any
+    // zero-length span, so returning a non-canonical one made the message
+    // unrestorable; and because `deserializeStore` rejects the WHOLE blob on a
+    // bad span, a single empty text cost the ENTIRE history rather than itself.
+    //
+    // This was reachable in shipping code: the note on a payment is optional, so
+    // sending money without a note wrote a history that would not load again.
+    // Against the durability law directly, and silent — the save succeeded, and
+    // only the next launch found out.
+    if (s.len == 0) return .empty;
     const offset: u32 = @intCast(store.string_bytes.items.len);
     try store.string_bytes.ensureUnusedCapacity(gpa, s.len + 1);
     store.string_bytes.appendSliceAssumeCapacity(s);
@@ -721,6 +749,7 @@ fn appendRecord(
         .kind = kind,
         .reply_to = no_reply, // set by `setReplyTo` when this message answers one
         .effect = 0, // set by `setEffect` when this message was sent with one
+        .game = 0, // set by `setGameMove` for a `.game_move`
     });
     try store.mine.resize(gpa, store.msgs.len, false);
     store.mine.setValue(index, mine);
@@ -882,6 +911,17 @@ pub fn setEffect(store: *Store, msg: u32, effect: u8) void {
 pub fn effectOf(store: *const Store, msg: u32) u8 {
     if (msg >= store.msgs.len) return 0;
     return store.msgs.items(.effect)[msg];
+}
+
+/// Record the encoded move byte on a `.game_move` message.
+pub fn setGameMove(store: *Store, msg: u32, encoded: u8) void {
+    if (msg >= store.msgs.len) return;
+    store.msgs.items(.game)[msg] = encoded;
+}
+
+pub fn gameMoveOf(store: *const Store, msg: u32) u8 {
+    if (msg >= store.msgs.len) return 0;
+    return store.msgs.items(.game)[msg];
 }
 
 /// They have read everything of ours up to `at`. The watermark only ever moves
@@ -1361,7 +1401,7 @@ const codec_magic = [4]u8{ 'Z', 'A', 'T', 'H' };
 /// sections so every v2 blob still reads (a version gate is a compatibility
 /// contract and is written as a RANGE — the day we wrote it as a LIST, a v3 bump
 /// orphaned every conversation on the owner's phone).
-const codec_version: u16 = 9; // v9: the effect column, one u8 per message
+const codec_version: u16 = 10; // v10: the game-move column, one u8 per message
 const conv_rec_len = 28; // did span 8 + handle span 8 + i64 8 + u32 4
 const msg_rec_len = 21; // i64 8 + text span 8 + conv 4 + kind 1
 const pay_rec_len = 23; // id 8 + amount 8 + msg 4 + rail 1 + status 1 + conf 1
@@ -1389,7 +1429,8 @@ pub fn serializeStore(gpa: Allocator, store: *const Store) error{OutOfMemory}![]
         4 * m_count + // v6: reply_to, one u32 per message
         4 + store.reactions.len * 13 + // v7: reactions (u32 msg + 8 emoji + 1 mine)
         8 * c_count + // v8: read_up_to, one i64 per conversation
-        m_count; // v9: effect, one u8 per message
+        m_count + // v9: effect, one u8 per message
+        m_count; // v10: game move, one u8 per message
     const out = try gpa.alloc(u8, total);
     errdefer gpa.free(out);
 
@@ -1529,11 +1570,19 @@ pub fn serializeStore(gpa: Allocator, store: *const Store) error{OutOfMemory}![]
         at += 1;
     }
 
+    // v10: the game moves. THE BOARD IS THESE BYTES — the game has no stored
+    // state of its own, so a relaunch that forgot this column would not forget a
+    // detail of the game, it would forget the game.
+    for (0..m_count) |i| {
+        out[at] = msgs.items(.game)[i];
+        at += 1;
+    }
+
     assert(at == total);
     return out;
 }
 
-/// The byte length of the v3..v9 per-record tail — everything appended AFTER the
+/// The byte length of the v3..v10 per-record tail — everything appended AFTER the
 /// settlement section by a codec version bump.
 ///
 /// This exists because the arithmetic was written out by hand in two damage
@@ -1551,7 +1600,8 @@ fn versionTailLen(store: *const Store) usize {
         4 * m + // v6 reply_to
         4 + store.reactions.len * 13 + // v7 reactions (count + rows)
         8 * c + // v8 read_up_to
-        m; // v9 effect
+        m + // v9 effect
+        m; // v10 game move
 }
 
 /// True when `span` names a real NUL-terminated string inside `bytes` (the
@@ -1849,6 +1899,16 @@ pub fn deserializeStore(gpa: Allocator, bytes: []const u8) DeserializeError!Stor
         }
     }
 
+    // v10: the game-move column. A v9 blob has none — no game had been played.
+    if (version >= 10) {
+        if (bytes.len - at < m_count) return error.Malformed;
+        const ms3 = store.msgs.slice();
+        for (0..m_count) |i| {
+            ms3.items(.game)[i] = bytes[at];
+            at += 1;
+        }
+    }
+
     if (at != bytes.len) return error.Malformed; // exact tail — no trailing bytes
     return store;
 }
@@ -2040,6 +2100,34 @@ test "store codec v9: the effect column survives a relaunch" {
     // A message sent with lasers that a relaunch forgets is just a message.
     try std.testing.expectEqual(@as(u8, 5), effectOf(&restored, @intFromEnum(withfx)));
     try std.testing.expectEqual(@as(u8, 0), effectOf(&restored, @intFromEnum(plain)));
+}
+
+test "store codec v10: the game moves survive a relaunch — they ARE the board" {
+    const gpa = std.testing.allocator;
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+
+    const a = try openConversation(gpa, &store, "did:plc:aaa", "amy.zat4.com");
+    // Two moves and an ordinary message between them, as a real thread would be.
+    const m0 = try appendMessage(gpa, &store, a, .game_move, "", 100, true);
+    setGameMove(&store, @intFromEnum(m0), 0x00); // cell 0
+    _ = try appendMessage(gpa, &store, a, .text, "your go", 101, true);
+    const m1 = try appendMessage(gpa, &store, a, .game_move, "", 102, false);
+    setGameMove(&store, @intFromEnum(m1), 0x04); // cell 4
+
+    const blob = try serializeStore(gpa, &store);
+    defer gpa.free(blob);
+    var restored = try deserializeStore(gpa, blob);
+    defer deinitStore(gpa, &restored);
+
+    // The game has no stored state of its own — losing this column would not
+    // lose a detail of the game, it would lose the game.
+    try std.testing.expectEqual(@as(u8, 0x00), gameMoveOf(&restored, @intFromEnum(m0)));
+    try std.testing.expectEqual(@as(u8, 0x04), gameMoveOf(&restored, @intFromEnum(m1)));
+    try std.testing.expectEqual(Kind.game_move, restored.msgs.items(.kind)[@intFromEnum(m1)]);
+    // A non-game message carries a zero move byte, and its kind says to ignore it.
+    try std.testing.expectEqual(@as(u8, 0), gameMoveOf(&restored, 1));
+    try std.testing.expect(!isGameKind(restored.msgs.items(.kind)[1]));
 }
 
 test "store codec: the empty store round-trips" {
@@ -2375,7 +2463,7 @@ test "store codec: a version-1 blob (pre-payments) still restores" {
     // byte-identical to what M2 wrote.
     const v3 = try serializeStore(gpa, &store);
     defer gpa.free(v3);
-    const v5_tail = versionTailLen(&store); // v3..v9 — see versionTailLen
+    const v5_tail = versionTailLen(&store); // v3..v10 — see versionTailLen
     const v1 = try gpa.dupe(u8, v3[0 .. v3.len - v5_tail - 8]);
     defer gpa.free(v1);
     std.mem.writeInt(u16, v1[4..6], 1, .little);
@@ -2420,7 +2508,7 @@ test "store codec v2: every class of payment-section damage is refused" {
     // bytes before it.
     // v3 appends the tombstone bitset AFTER the settlement section, so the
     // payment/settlement records are no longer the tail: step back over it.
-    const del_tail = versionTailLen(&store); // v3..v9 — see versionTailLen
+    const del_tail = versionTailLen(&store); // v3..v10 — see versionTailLen
     const ref_at = good.len - del_tail - ref_rec_len;
     const pay_at = good.len - del_tail - ref_rec_len - 4 - pay_rec_len;
 
@@ -2494,8 +2582,11 @@ test "store codec v2: duplicate rows and duplicate correlation keys are refused"
     defer gpa.free(good);
     var bad = try gpa.dupe(u8, good);
     defer gpa.free(bad);
-    // Layout tail: [p_count=2][row0][row1][r_count=0]; rows are 23 bytes.
-    const row1_at = good.len - 4 - pay_rec_len;
+    // Layout after the payment rows: [r_count=0] then the v3..v10 per-record
+    // tail. This offset USED TO ignore the tail entirely, so it corrupted tail
+    // bytes rather than payment rows and only reached `Malformed` by accident —
+    // the test passed without testing what it claimed. Step back over both.
+    const row1_at = good.len - versionTailLen(&store) - 4 - pay_rec_len;
     const row0_at = row1_at - pay_rec_len;
 
     // Two rows claiming the same card (row1's msg → row0's msg).
@@ -2532,4 +2623,28 @@ test "welcome retry: the ladder climbs, caps, and gives up" {
 
     // The ack byte stays wire-only: it must never parse as a stored kind.
     try t.expectError(error.UnknownKind, parseKind(kind_group_ack_wire));
+}
+
+test "store codec: a message with EMPTY text still restores (a payment with no note)" {
+    // The note on a payment is optional, so an empty one is an ordinary thing to
+    // send — and an empty text span must round-trip like any other. It is worth a
+    // test of its own because the failure is not local: `deserializeStore`
+    // rejects the WHOLE blob, so one note-less payment would cost the entire
+    // history, which is exactly what must never happen.
+    const gpa = std.testing.allocator;
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+
+    const a = try openConversation(gpa, &store, "did:plc:aaa", "amy.zat4.com");
+    _ = try appendMessage(gpa, &store, a, .text, "hello", 100, true);
+    _ = try appendPayment(gpa, &store, a, .payment_request, 0xCAFE, .lightning, 5000, "", 200, true);
+
+    const blob = try serializeStore(gpa, &store);
+    defer gpa.free(blob);
+    var restored = try deserializeStore(gpa, blob);
+    defer deinitStore(gpa, &restored);
+
+    try std.testing.expectEqual(@as(usize, 2), restored.msgs.len);
+    try std.testing.expectEqualStrings("hello", sliceSpan(&restored, restored.msgs.items(.text)[0]));
+    try std.testing.expectEqualStrings("", sliceSpan(&restored, restored.msgs.items(.text)[1]));
 }
