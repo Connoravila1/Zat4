@@ -15,6 +15,11 @@
 //! describes the tree.
 
 const std = @import("std");
+
+/// The product flavor, read at COMPTIME (the same way core reads `builtin`) so
+/// the flavor-specific defaults below fold out entirely in the other build.
+/// B4 note: this is a build-time identity, not I/O — the module stays pure.
+const chat_app = @import("dist_config").product == .chat;
 const assert = std.debug.assert;
 
 /// The closed set of row archetypes. Every settings row is one of these — a
@@ -162,11 +167,64 @@ pub const Choice = struct {
     options: []const []const u8,
 };
 
+/// One entry in the UI accent palette: the name the picker shows and the colour
+/// it means, as ONE table.
+///
+/// These used to be two parallel lists — the option STRINGS here and a colour
+/// switch in the shell — agreeing only by index, with nothing enforcing it.
+/// Filtering an option out for one product would have silently shifted every
+/// colour after it. Both now derive from this, so they cannot drift.
+///
+/// A7.2: cold config — a handful of comptime rows, read when the picker opens.
+pub const AccentOption = struct {
+    label: []const u8,
+    /// null = "Auto": follow the seated lens.
+    color: ?u32,
+};
+
+/// PRODUCT-SPLIT. In Zat4 the accent follows the seated feed-socket lens, so
+/// "Auto" leads and is the default. Zat Chat has no feed and no socket to
+/// follow, so the accent is simply a choice — "Auto" would name a mechanism
+/// that does not exist there — and it defaults to Blue, the messenger's colour
+/// (owner, 2026-07-18).
+pub const accent_options = if (chat_app) [_]AccentOption{
+    .{ .label = "Blue", .color = 0xFF4A9EFF },
+    .{ .label = "Amber", .color = 0xFFF2762A },
+    .{ .label = "Green", .color = 0xFF3FC97E },
+    .{ .label = "Violet", .color = 0xFF9B7BFF },
+    .{ .label = "Rose", .color = 0xFFFF5C8A },
+    .{ .label = "Teal", .color = 0xFF33C2C2 },
+} else [_]AccentOption{
+    .{ .label = "Auto", .color = null },
+    .{ .label = "Amber", .color = 0xFFF2762A }, // feed_view.accent_house
+    .{ .label = "Blue", .color = 0xFF4A9EFF },
+    .{ .label = "Green", .color = 0xFF3FC97E },
+    .{ .label = "Violet", .color = 0xFF9B7BFF },
+    .{ .label = "Rose", .color = 0xFFFF5C8A },
+    .{ .label = "Teal", .color = 0xFF33C2C2 },
+};
+
+/// The accent picker's option labels, derived from the palette above so the two
+/// can never disagree.
+const accent_labels = blk: {
+    var l: [accent_options.len][]const u8 = undefined;
+    for (accent_options, 0..) |o, i| l[i] = o.label;
+    break :blk l;
+};
+
+/// The colour an accent option index means, or null for "Auto" (follow the
+/// lens). Out of range is treated as Auto — a stale persisted index from an
+/// older option list must not index off the end.
+pub fn accentColor(opt: u8) ?u32 {
+    if (opt >= accent_options.len) return null;
+    return accent_options[opt].color;
+}
+
 /// The choices wired to a live effect (option index → a knob in the shell). Each
 /// `choice` ROW must carry the matching `action`. ≤ 8 options each (packed 3 bits
 /// per choice in the shell's selection word).
 pub const choices = [_]Choice{
-    .{ .action = act_accent, .default = 0, .options = &.{ "Auto", "Amber", "Blue", "Green", "Violet", "Rose", "Teal" } },
+    .{ .action = act_accent, .default = 0, .options = &accent_labels },
     .{ .action = act_field_intensity, .default = 1, .options = &.{ "Subtle", "Normal", "Vivid" } },
     .{ .action = act_pet_color, .default = 0, .options = &.{ "Blue", "Mint", "Rose", "Amber", "Violet", "Grey" } },
     .{ .action = act_pet_size, .default = 1, .options = &.{ "Small", "Medium", "Large" } },
@@ -262,7 +320,8 @@ pub const rows = [_]Row{
     .{ .section = sec_account, .group = 2, .kind = .action, .action = act_sign_out, .flags = flag_destructive, .label = "Sign out", .value = "" },
 
     // ── Appearance ───────────────────────────────────────────────────────
-    .{ .section = sec_appearance, .group = 0, .kind = .toggle, .action = act_light, .flags = 0, .label = "Light mode", .value = "" },
+    // Zat Chat is a LIGHT app by default (owner, 2026-07-18); Zat4 stays dark.
+    .{ .section = sec_appearance, .group = 0, .kind = .toggle, .action = act_light, .flags = if (chat_app) flag_on else 0, .label = "Light mode", .value = "" },
     .{ .section = sec_appearance, .group = 0, .kind = .toggle, .action = act_zat_kbd, .flags = flag_on, .label = "Zat4 keyboard", .value = "" },
     .{ .section = sec_appearance, .group = 0, .kind = .toggle, .action = act_kbd_pulses, .flags = flag_on, .label = "Keyboard circuit pulses", .value = "" },
     .{ .section = sec_appearance, .group = 0, .kind = .toggle, .action = act_kbd_haptic, .flags = flag_on, .label = "Keyboard haptics", .value = "" },
@@ -374,4 +433,39 @@ test "groups within a section are contiguous (no interleaving)" {
             }
         }
     }
+}
+
+test "accent palette: labels and colours are one table, not two that agree by luck" {
+    const c = choiceOf(act_accent).?;
+    try std.testing.expectEqual(accent_options.len, c.options.len);
+    for (accent_options, 0..) |o, i| {
+        try std.testing.expectEqualStrings(o.label, c.options[i]);
+        try std.testing.expectEqual(o.color, accentColor(@intCast(i)));
+    }
+    // The picker packs its selection into 3 bits per choice in the shell.
+    try std.testing.expect(accent_options.len <= 8);
+}
+
+test "accent palette: the default option matches the product" {
+    const c = choiceOf(act_accent).?;
+    const label = c.options[c.default];
+    if (chat_app) {
+        // Zat Chat has no feed socket to follow, so no "Auto" is offered and
+        // the accent is simply a choice, defaulting to Blue.
+        try std.testing.expectEqualStrings("Blue", label);
+        for (accent_options) |o| try std.testing.expect(o.color != null);
+    } else {
+        try std.testing.expectEqualStrings("Auto", label);
+        try std.testing.expectEqual(@as(?u32, null), accent_options[0].color);
+    }
+}
+
+test "accent palette: an out-of-range index is Auto, never off the end" {
+    try std.testing.expectEqual(@as(?u32, null), accentColor(@intCast(accent_options.len)));
+    try std.testing.expectEqual(@as(?u32, null), accentColor(255));
+}
+
+test "light mode: Zat Chat starts light, Zat4 starts dark" {
+    const row = rows[rowOf(act_light).?];
+    try std.testing.expectEqual(chat_app, (row.flags & flag_on) != 0);
 }

@@ -14663,15 +14663,10 @@ fn prefsPersistStep(rs: *RunState) void {
 /// Option order matches settings_view.choices: Auto, Amber, Blue, Green, Violet,
 /// Rose, Teal (the lens-socket palette colours).
 fn accentChoiceColor(opt: u8) ?u32 {
-    return switch (opt) {
-        1 => feed_view.accent_house, // Amber (house)
-        2 => 0xFF4A9EFF, // Blue
-        3 => 0xFF3FC97E, // Green
-        4 => 0xFF9B7BFF, // Violet
-        5 => 0xFFFF5C8A, // Rose
-        6 => 0xFF33C2C2, // Teal
-        else => null, // 0 = Auto
-    };
+    // The palette lives with the option LABELS (settings_view.accent_options) so
+    // the two cannot drift apart by index — they were two parallel lists agreeing
+    // only by convention, which the product split would have broken silently.
+    return settings_view.accentColor(opt);
 }
 
 /// "Field intensity" choice → the field's uGain. Subtle / Normal / Vivid.
