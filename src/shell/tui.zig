@@ -108,6 +108,9 @@ const algorithm_shell = @import("algorithm.zig");
 // service endpoint — never assume the session PDS (the cross-PDS install bug).
 const identity_shell = @import("identity.zig");
 const dist_config = @import("dist_config");
+/// The standalone Zat Chat build, as a comptime identity (the same alias
+/// `feed_view` uses) so flavor branches read the same way on both sides.
+const chat_app = dist_config.product == .chat;
 const loadout_store = @import("loadout.zig");
 const effect_core = @import("../core/effect.zig");
 const clock_shell = @import("clock.zig");
@@ -5925,7 +5928,13 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         // Left-rail destination: switch the active screen
                                         // (post carries the Screen index). Selecting Profile
                                         // targets YOUR own profile; the next frame re-renders.
-                                        .nav => {
+                                        // THE PRODUCT decides where you may go, not the
+                                        // region's payload. Shared draw code emits nav
+                                        // regions knowing nothing about the flavor, so
+                                        // this is the one place that can hold the line
+                                        // (feed_view.reachable). Folds to always-true in
+                                        // Zat4.
+                                        .nav => if (feed_view.reachable(@intCast(hit.post))) {
                                             rs.gscreen = @intCast(hit.post);
                                             if (rs.gscreen == feed_view.screen_profile) {
                                                 rs.profile_target_did = session.did;
@@ -5962,7 +5971,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         // Zones hub IS the search surface (its "search or jump
                                         // to a tag" field) until a global search exists — land
                                         // there with the field focused.
-                                        .search => {
+                                        .search => if (feed_view.reachable(feed_view.screen_zones_browse)) {
                                             rs.gscreen = feed_view.screen_zones_browse;
                                             rs.gscroll_px = 0;
                                             rs.gzones_q_focus = true;
@@ -5985,7 +5994,12 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         },
                                         // New-post button → the composer (cell path for now).
                                         // Fresh post: no reply target, no quote attached.
-                                        .compose => {
+                                        // Belt and braces: the emit sites are gone in
+                                        // the chat build, but the FEED-POST composer is
+                                        // the one door the owner named, so the dispatch
+                                        // refuses it too. A surface added later cannot
+                                        // reopen it by emitting a region.
+                                        .compose => if (!chat_app) {
                                             rs.reply_target = null;
                                             rs.reply_handle = "";
                                             rs.quote_target = null;
@@ -9280,16 +9294,26 @@ fn backNavigate(rs: *RunState) bool {
         rs.gchat_sel = null; // the phone chat thread pops to the conversation list
         return true;
     }
+    // THE ROOT differs by product: Zat4's is the feed, Zat Chat's is the
+    // conversation list. Backing out of Settings in the chat app used to land on
+    // the Zat4 timeline — a screen with no nav row to leave by, so the way out
+    // was the way back in.
+    const root_screen: u8 = if (comptime dist_config.product == .chat)
+        feed_view.screen_messages
+    else
+        feed_view.screen_home;
+
+    if (rs.gscreen == root_screen) {
+        // The double-back convention (owner asked for the TikTok pattern): the
+        // FIRST back at the root shows a heads-up pill and arms a short window; a
+        // second back inside it minimizes. Clock is shell-side.
+        const now_ns = clock_shell.monotonicNanos();
+        if (now_ns < rs.back_hint_until) return false; // second swipe → minimize
+        rs.back_hint_until = now_ns + 2_000_000_000;
+        return true; // consumed — the hint pill shows while armed
+    }
+
     switch (rs.gscreen) {
-        feed_view.screen_home => {
-            // The double-back convention (owner asked for the TikTok pattern):
-            // the FIRST back at the root shows a heads-up pill and arms a short
-            // window; a second back inside it minimizes. Clock is shell-side.
-            const now_ns = clock_shell.monotonicNanos();
-            if (now_ns < rs.back_hint_until) return false; // second swipe → minimize
-            rs.back_hint_until = now_ns + 2_000_000_000;
-            return true; // consumed — the hint pill shows while armed
-        },
         feed_view.screen_algo_docs => rs.gscreen = rs.docs_return_screen,
         feed_view.screen_algo_detail => rs.gscreen = feed_view.screen_loadout,
         feed_view.screen_transparency => {
@@ -9306,8 +9330,8 @@ fn backNavigate(rs: *RunState) bool {
         feed_view.screen_thread => rs.gscreen = rs.thread_return_screen,
         feed_view.screen_zones => rs.gscreen = rs.zone_return_screen,
         // Every other top-level page (zones hub, loadout, settings, chat,
-        // profile, activity) steps back to Home — the tab bar's own root.
-        else => rs.gscreen = feed_view.screen_home,
+        // profile, activity) steps back to the product's ROOT.
+        else => rs.gscreen = root_screen,
     }
     rs.gscroll_px = 0;
     return true;

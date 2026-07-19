@@ -380,6 +380,38 @@ pub const screen_wallet: u8 = 12;
 /// window to own — so a phone could not create an account at all.
 pub const screen_enroll: u8 = 13;
 
+/// Does this screen EXIST in this product?
+///
+/// `nav_rows` decides what is LISTED; this decides what can be REACHED, and the
+/// distinction is the whole bug it was written for. The chat flavor hid three
+/// rail rows and called itself standalone, but every navigation dispatch sets
+/// whatever screen id a tap REGION happens to carry — and regions are emitted by
+/// shared draw code that knew nothing about the product. So the Zat4 feed, the
+/// zones catalog, the algorithm marketplace and the rest all stayed one tap away
+/// through side doors: an avatar tap, the header magnifier, a post body, and the
+/// system-back handler, which sent you to the FEED from anywhere.
+///
+/// Gating the dispatch instead of the buttons is what makes this hold: a new
+/// surface that emits a `.nav` region cannot silently reopen a door, because the
+/// answer to "may I go there" is asked in one place and answered from the
+/// product, not from the payload.
+///
+/// Zat4 is the full client, so everything is reachable there and this folds to a
+/// constant `true` at comptime.
+pub fn reachable(screen: u8) bool {
+    if (!chat_app) return true;
+    return switch (screen) {
+        // The messenger, its money, its settings — and `You`, which the chat tab
+        // bar deliberately offers.
+        screen_messages, screen_wallet, screen_settings, screen_profile => true,
+        // Pre-session: the front door has to be reachable before anything else.
+        screen_enroll => true,
+        // Everything else is Zat4's: the feed, threads, zones, algorithms, the
+        // marketplace, the transparency and docs pages.
+        else => false,
+    };
+}
+
 /// The rail / drawer rows, in VISUAL order, as screen ids. Algorithms sits under
 /// Zones; Zat Chat above Activity; Wallet before Settings — money is a place you
 /// go, not a modal you summon.
@@ -1799,10 +1831,16 @@ fn drawRail(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, rx: i32
     // column); their regions are emitted only while visible so a hidden control
     // can't be clicked.
     if (ex > 0.05) {
-        try rect(gpa, dl, x0 + 6, ny, rail_w - 44, 50, (accent & 0x00FFFFFF) | ea, 14);
-        const npw: i32 = @intCast(text.measure(e, .semibold, "New post", 16));
-        _ = try str(gpa, dl, e, .semibold, x0 + 6 + @divTrunc(rail_w - 44 - npw, 2), ny + 32, (bg & 0x00FFFFFF) | ea, 16, "New post");
-        try emitRegion(gpa, regions, x0 + 6, ny, rail_w - 44, 50, 0, .compose);
+        // "New post" writes a FEED post — a Zat4 act with no meaning in the
+        // messenger, where the equivalent gesture is starting a conversation.
+        // Not drawn there, and its region is not emitted, so there is nothing to
+        // tap rather than something invisible to tap.
+        if (!chat_app) {
+            try rect(gpa, dl, x0 + 6, ny, rail_w - 44, 50, (accent & 0x00FFFFFF) | ea, 14);
+            const npw: i32 = @intCast(text.measure(e, .semibold, "New post", 16));
+            _ = try str(gpa, dl, e, .semibold, x0 + 6 + @divTrunc(rail_w - 44 - npw, 2), ny + 32, (bg & 0x00FFFFFF) | ea, 16, "New post");
+            try emitRegion(gpa, regions, x0 + 6, ny, rail_w - 44, 50, 0, .compose);
+        }
 
         const by = height - 60;
         try rect(gpa, dl, x0 - 2, by - 10, rail_w - 24, 58, (skinPanel(accent) & 0x00FFFFFF) | ea, 16);
@@ -1906,6 +1944,10 @@ pub fn drawTabBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, w
     // The floating COMPOSE button (Bluesky pattern): a raised accent circle
     // above the bar at the right, distinct from the five nav tabs — posting
     // lives here now that the centre tab is Zat Chat.
+    // The PLUS writes a feed post. In Zat Chat there is no feed to post to, so
+    // the button is absent entirely — the messenger's "+" is the composer's own
+    // attachment menu, which lives in the thread, not on the tab bar.
+    if (chat_app) return;
     const fab_r: i32 = 27;
     const fab_box = composeFabBox(width, height, bottom_inset);
     const fab_cx = fab_box.x0 + fab_r;
@@ -7674,14 +7716,22 @@ fn drawTopBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: Me
         try rect(gpa, dl, m.lx, ham_cy, 22, 2, ink, 1);
         try rect(gpa, dl, m.lx, ham_cy + 7, 22, 2, ink, 1);
         try emitRegion(gpa, regions, m.lx - 6, ham_cy - 15, 40, 38, 0, .drawer_open);
-        const ww: i32 = @intCast(text.measure(e, .semibold, "Zat4.", 22));
+        // The phone header wordmark. `drawTopBar` had no flavor branch at all, so
+        // every non-chat screen in the chat build introduced itself as "Zat4."
+        const mark = if (chat_app) "Zat Chat" else "Zat4";
+        const ww: i32 = @intCast(text.measure(e, .semibold, mark, 22) + if (chat_app) 0 else text.measure(e, .semibold, ".", 22));
         const wmx = m.col_x + @divTrunc(m.col_w - ww, 2);
-        const wm = try str(gpa, dl, e, .semibold, wmx, 29, accent, 22, "Zat4");
-        _ = try str(gpa, dl, e, .semibold, wm, 29, ink, 22, ".");
-        const right_margin = m.lx - m.col_x;
-        const srch_x = m.col_x + m.col_w - right_margin - 26;
-        try iconSearch(gpa, dl, srch_x, 8, 26, ink);
-        try emitRegion(gpa, regions, srch_x - 6, 5, 40, 38, 0, .search);
+        const wm = try str(gpa, dl, e, .semibold, wmx, 29, accent, 22, mark);
+        if (!chat_app) _ = try str(gpa, dl, e, .semibold, wm, 29, ink, 22, ".");
+        // The magnifier's only destination is the ZONES catalog (there is no
+        // global search yet), which is a Zat4 surface — so in the messenger it is
+        // a control that cannot lead anywhere. Not drawn rather than drawn-dead.
+        if (!chat_app) {
+            const right_margin = m.lx - m.col_x;
+            const srch_x = m.col_x + m.col_w - right_margin - 26;
+            try iconSearch(gpa, dl, srch_x, 8, 26, ink);
+            try emitRegion(gpa, regions, srch_x - 6, 5, 40, 38, 0, .search);
+        }
         if (is_home) if (socket_tray) |tray| {
             const geom: lens_socket.Geometry = .{ .x = m.lx, .y = socket_y_narrow, .w = m.cw, .scale = 1.0 };
             _ = try lens_socket.build(gpa, e, tray, socket_ui, geom, dl, socket_hits);
@@ -11629,9 +11679,8 @@ test "layout emits 4 tap regions per post (avatar + 3 engagement); hitTest resol
     const h = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, screen_home, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{}, .{});
     try std.testing.expect(h > 112); // content extends below the top bar
     // 8 post regions (body + avatar + reply/repost/like + bookmark/share/more)
-    // + 2 mobile-header regions (the hamburger drawer-opener and the search
-    // magnifier) = 10.
-    try std.testing.expectEqual(@as(usize, 10), regions.items.len);
+    // + the phone header's chrome (see header_chrome_regions).
+    try std.testing.expectEqual(@as(usize, 8 + header_chrome_regions), regions.items.len);
 
     var saw_like = false;
     var saw_author = false;
@@ -12038,13 +12087,13 @@ test "profile screen renders the author's posts under a header; other screens st
 
     // A non-Home, non-Profile screen is a titled placeholder: no posts render,
     // so no POST regions, and the height clamps to the viewport (no post stack).
-    // On the phone header it still carries the 2 chrome regions (hamburger +
-    // search), so the total is 2, not 0.
+    // On the phone header it still carries its chrome regions (hamburger, plus
+    // search in Zat4), so the total is that, not 0.
     dl.len = 0;
     regions.clearRetainingCapacity();
     const he = try layout(gpa, &engine, 460, 940, &posts, 0, &dl, &regions, null, false, 2, null, 0, accent_house, null, .{}, null, null, null, "", .{}, null, 0, 0, .{}, 0, 255, null, .{}, .{}); // Activity (a still-bare placeholder)
     try std.testing.expectEqual(@as(i32, 940), he);
-    try std.testing.expectEqual(@as(usize, 2), regions.items.len);
+    try std.testing.expectEqual(header_chrome_regions, regions.items.len);
 
     // The Settings screen is now a master–detail surface (driven by the
     // settings_view table): one tap region per SECTION (left list) plus one per
@@ -12707,4 +12756,37 @@ test "inline #tags emit tappable .tag_inline regions, resolved case-insensitivel
     try std.testing.expectEqual(@as(usize, 2), n);
     try std.testing.expectEqual(@as(u8, 0), pads[0]); // #deep → tags[0]
     try std.testing.expectEqual(@as(u8, 1), pads[1]); // #SmallWeb → tags[1] (case-insensitive)
+}
+
+/// How many CHROME regions the phone header emits: the hamburger drawer-opener
+/// always, plus the search magnifier in Zat4 only (its sole destination is the
+/// zones catalog, a surface the messenger does not have). Shared by the layout
+/// tests so the count lives in ONE place with its reason attached.
+const header_chrome_regions: usize = if (chat_app) 1 else 2;
+
+test "standalone gate: Zat4 reaches everything; Zat Chat reaches only its own" {
+    // The screens the messenger owns.
+    try std.testing.expect(reachable(screen_messages));
+    try std.testing.expect(reachable(screen_wallet));
+    try std.testing.expect(reachable(screen_settings));
+    try std.testing.expect(reachable(screen_profile));
+    try std.testing.expect(reachable(screen_enroll));
+
+    // The Zat4 surfaces that used to be one side-door tap away. In Zat4 these
+    // are all reachable; in the chat build, none of them are.
+    const zat4_only = [_]u8{
+        screen_home,       screen_zones_browse, screen_zones,
+        screen_thread,     screen_loadout,      screen_algo_detail,
+        screen_algo_docs,  screen_transparency,
+    };
+    for (zat4_only) |sc| try std.testing.expectEqual(!chat_app, reachable(sc));
+}
+
+test "standalone gate: every LISTED nav row is reachable" {
+    // A row you can see but cannot open would be a dead control — the gate and
+    // the nav table have to agree, and this is what keeps them agreeing.
+    for (nav_rows) |sc| {
+        if (sc == 2) continue; // the Activity placeholder has no surface yet
+        try std.testing.expect(reachable(sc));
+    }
 }
