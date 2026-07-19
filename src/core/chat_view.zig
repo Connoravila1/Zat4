@@ -13,6 +13,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const chat = @import("chat.zig");
+const chat_games = @import("chat_games.zig");
 const timefmt = @import("timefmt.zig");
 
 /// One conversation-list entry, resolved for drawing. Built fresh per frame
@@ -61,6 +62,11 @@ pub const BubbleRow = struct {
     /// `PayCard` slice; `no_pay` for every other kind. For a card, `body`
     /// is the NOTE — the renderer draws amount/rail/status itself.
     pay: u32 = no_pay,
+    /// Game moves only: ordinal into the thread's parallel `GameCard` slice;
+    /// `no_game` for every other kind. One card PER MOVE, each showing the board
+    /// as of that move — the thread IS the game, so scrolling back through it is
+    /// scrolling back through the play. Only the newest card is interactive.
+    game: u32 = no_game,
     /// WHICH MESSAGE this row is, in the store (CHAT_FEATURES slice 2). A row IS a
     /// message; it simply never had to say which one until something could be DONE
     /// to it. The context menu acts on the store, so the identity has to survive the
@@ -106,6 +112,7 @@ pub const BubbleRow = struct {
 };
 
 pub const no_pay: u32 = std.math.maxInt(u32);
+pub const no_game: u32 = std.math.maxInt(u32);
 
 /// A payment card's display facts, parallel to the thread rows (M5 A4).
 /// `payment_id` is the wire correlation key — the value a tap hands back
@@ -134,11 +141,32 @@ pub const PayCard = struct {
     }
 };
 
-/// `buildThread`'s result: the rows plus the payment cards they point at.
+/// One game board's display facts, parallel to the thread rows. The board is
+/// DERIVED (`chat_games.replaySent` over the moves up to and including this one),
+/// never stored — the same relationship a payment card has to its row.
+/// Per-frame loop ⇒ guarded (A7).
+pub const GameCard = struct {
+    state: chat_games.State,
+    /// Which seat WE hold in this game — so the board can say "you are X" and
+    /// colour our marks as ours.
+    my_seat: chat_games.Seat,
+    /// The NEWEST board in the thread: the only one a tap may act on. Older cards
+    /// are history and are drawn inert, which is also what stops a tap on a
+    /// scrolled-back board from sending a move into a game that has moved on.
+    live: bool,
+
+    comptime {
+        // 12 (State) + 1 (Seat) + 1 (bool) = 14, all byte-aligned — no padding.
+        assert(@sizeOf(GameCard) == 14);
+    }
+};
+
+/// `buildThread`'s result: the rows plus the cards they point at.
 /// A7.2: cold struct, size guard waived — one transient per frame.
 pub const Thread = struct {
     rows: []BubbleRow = &.{},
     cards: []PayCard = &.{},
+    games: []GameCard = &.{},
 };
 
 /// A gap this long between consecutive messages earns a time divider.
@@ -261,12 +289,57 @@ pub fn buildThread(
         if (chat.isPaymentKind(store.msgs.items(.kind)[@intFromEnum(msg)])) n_pay += 1;
     }
     const cards = try arena.alloc(PayCard, n_pay);
+    var n_game: usize = 0;
+    for (order) |msg| {
+        if (chat.isGameKind(store.msgs.items(.kind)[@intFromEnum(msg)])) n_game += 1;
+    }
+    const games = try arena.alloc(GameCard, n_game);
+    var next_game: u32 = 0;
+    // The running board, advanced move by move as the thread is walked. It mirrors
+    // `chat_games.currentGame`'s loop: authorship is checked against the seat whose
+    // turn it is, and a move arriving on a FINISHED board opens a rematch rather
+    // than being discarded as illegal.
+    var g_state = chat_games.init();
+    var g_x_is_mine = true;
+    var g_started = false;
+    const last_game_msg: ?u32 = blk: {
+        var found: ?u32 = null;
+        for (order) |msg| {
+            if (chat.isGameKind(store.msgs.items(.kind)[@intFromEnum(msg)])) found = @intFromEnum(msg);
+        }
+        break :blk found;
+    };
     var next_card: u32 = 0;
     var prev_at: i64 = 0;
     for (order, out, 0..) |msg, *row, i| {
         const mi: u32 = @intFromEnum(msg);
         const at = created_col[mi];
         const kind = store.msgs.items(.kind)[mi];
+        var game: u32 = no_game;
+        if (chat.isGameKind(kind)) {
+            const mine_move = chat.isMine(store, msg);
+            if (!g_started or g_state.outcome != .ongoing) {
+                // The first move of the thread, or the first after a result: a new
+                // board, and whoever moved opens it as X.
+                g_state = chat_games.init();
+                g_x_is_mine = mine_move;
+                g_started = true;
+            }
+            const sender: chat_games.Seat = if (mine_move == g_x_is_mine) .x else .o;
+            // A move out of turn is skipped, exactly as `replaySent` skips it — the
+            // board simply does not advance, so a cheating peer cannot move for us.
+            if (sender == g_state.turn) {
+                const mv = chat_games.Move.decode(chat.gameMoveOf(store, mi));
+                if (chat_games.apply(g_state, mv)) |ns| g_state = ns;
+            }
+            games[next_game] = .{
+                .state = g_state,
+                .my_seat = if (g_x_is_mine) .x else .o,
+                .live = last_game_msg != null and last_game_msg.? == mi,
+            };
+            game = next_game;
+            next_game += 1;
+        }
         var pay: u32 = no_pay;
         if (chat.isPaymentKind(kind)) {
             // A card without its row is impossible by store invariant;
@@ -294,6 +367,7 @@ pub fn buildThread(
             .stamp = i == 0 or at - prev_at >= stamp_gap,
             .kind = kind,
             .pay = pay,
+            .game = game,
             .msg = mi,
             .deleted = gone,
             .edited = chat.isEdited(store, mi),
@@ -348,7 +422,7 @@ pub fn buildThread(
     for (out, 0..) |*row, i| {
         row.tail = i + 1 == out.len or out[i + 1].mine != row.mine or out[i + 1].stamp;
     }
-    return .{ .rows = out, .cards = cards[0..next_card] };
+    return .{ .rows = out, .cards = cards[0..next_card], .games = games[0..next_game] };
 }
 
 // ---------------------------------------------------------------------------
@@ -481,4 +555,72 @@ test "payment cards ride rows with parallel card facts; list previews summarize"
     _ = try chat.advancePayment(gpa, &store, req, .settled, null);
     const th2 = try buildThread(arena, &store, a, 2000);
     try std.testing.expectEqual(chat.PayStatus.settled, th2.cards[0].status);
+}
+
+test "buildThread: a game move carries a board, derived not stored" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store: chat.Store = .{};
+    defer chat.deinitStore(gpa, &store);
+    const c = try chat.openConversation(gpa, &store, "did:plc:aaa", "amy.zat4.com");
+
+    // We open at 0, they take 4, we take 1 — with a plain message in between, so
+    // the ordinals must survive a thread that is not all game.
+    const moves = [_]struct { cell: u8, mine: bool }{
+        .{ .cell = 0, .mine = true },
+        .{ .cell = 4, .mine = false },
+        .{ .cell = 1, .mine = true },
+    };
+    var t: i64 = 100;
+    for (moves) |m| {
+        const mi = try chat.appendMessage(gpa, &store, c, .game_move, "", t, m.mine);
+        chat.setGameMove(&store, @intFromEnum(mi), (chat_games.Move{ .cell = m.cell }).encode());
+        t += 1;
+    }
+    _ = try chat.appendMessage(gpa, &store, c, .text, "your go", t, true);
+
+    const th = try buildThread(arena, &store, c, t + 1);
+    try std.testing.expectEqual(@as(usize, 4), th.rows.len);
+    try std.testing.expectEqual(@as(usize, 3), th.games.len);
+
+    // The board advances move by move, and only the LAST card is live.
+    try std.testing.expectEqual(@as(u8, 1), th.games[0].state.moves);
+    try std.testing.expectEqual(@as(u8, 3), th.games[2].state.moves);
+    try std.testing.expectEqual(chat_games.Seat.x, th.games[2].state.board[0]);
+    try std.testing.expectEqual(chat_games.Seat.o, th.games[2].state.board[4]);
+    try std.testing.expectEqual(chat_games.Seat.x, th.games[2].my_seat); // we opened
+    try std.testing.expect(!th.games[0].live);
+    try std.testing.expect(th.games[2].live);
+
+    // The plain message is not a board, and the game rows point at real cards.
+    try std.testing.expectEqual(no_game, th.rows[3].game);
+    try std.testing.expectEqual(@as(u32, 0), th.rows[0].game);
+    try std.testing.expectEqual(@as(u32, 2), th.rows[2].game);
+}
+
+test "buildThread: a peer moving out of turn does not advance the board" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store: chat.Store = .{};
+    defer chat.deinitStore(gpa, &store);
+    const c = try chat.openConversation(gpa, &store, "did:plc:aaa", "");
+
+    // They open (so they are X), then immediately try to play our O.
+    const m0 = try chat.appendMessage(gpa, &store, c, .game_move, "", 100, false);
+    chat.setGameMove(&store, @intFromEnum(m0), (chat_games.Move{ .cell = 0 }).encode());
+    const m1 = try chat.appendMessage(gpa, &store, c, .game_move, "", 101, false);
+    chat.setGameMove(&store, @intFromEnum(m1), (chat_games.Move{ .cell = 1 }).encode());
+
+    const th = try buildThread(arena, &store, c, 200);
+    // The second move is skipped: one mark on the board, still our turn.
+    try std.testing.expectEqual(@as(u8, 1), th.games[1].state.moves);
+    try std.testing.expectEqual(chat_games.Seat.none, th.games[1].state.board[1]);
+    try std.testing.expectEqual(chat_games.Seat.o, th.games[1].state.turn);
+    try std.testing.expectEqual(chat_games.Seat.o, th.games[1].my_seat);
 }

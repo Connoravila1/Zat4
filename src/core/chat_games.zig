@@ -234,6 +234,37 @@ pub fn replaySent(moves: []const SentMove) State {
     return s;
 }
 
+/// The moves belonging to the CURRENT game — the tail of `moves` after the last
+/// finished one.
+///
+/// A thread outlives a game: once a board is won or drawn it can take no further
+/// move, so the next move that arrives is not an illegal move on the old board,
+/// it is the opening of a REMATCH. Without this, `replaySent` would skip every
+/// move after the first game ended and the pair could never play again — the
+/// board would be permanently frozen on the last result.
+///
+/// Segmenting here, in a pure function over the same move list, means a rematch
+/// needs no "new game" message kind and no stored state: the boundary is derived
+/// from the moves exactly as the board is.
+pub fn currentGame(moves: []const SentMove) []const SentMove {
+    var start: usize = 0;
+    var s = init();
+    var x_is_mine = if (moves.len > 0) moves[0].mine else true;
+    for (moves, 0..) |sm, i| {
+        if (s.outcome != .ongoing) {
+            // The previous game is over; this move opens the next one, and
+            // whoever sent it is that game's X.
+            start = i;
+            s = init();
+            x_is_mine = sm.mine;
+        }
+        const sender: Seat = if (sm.mine == x_is_mine) .x else .o;
+        if (sender != s.turn) continue;
+        if (apply(s, sm.move)) |ns| s = ns;
+    }
+    return moves[start..];
+}
+
 /// Which seat WE hold in this game, or `.none` before anyone has moved. The
 /// initiator is X, so if we sent the first move we are X.
 pub fn mySeat(moves: []const SentMove) Seat {
@@ -439,4 +470,57 @@ test "replaySent: an out-of-range cell from a hostile peer is refused" {
     const s = replaySent(&bad);
     try testing.expectEqual(Seat.x, s.board[0]);
     try testing.expectEqual(@as(u8, 1), s.moves);
+}
+
+test "currentGame: a rematch starts a new board instead of freezing the old one" {
+    // We win the top row; then THEY open a rematch at centre.
+    const thread = [_]SentMove{
+        .{ .move = .{ .cell = 0 }, .mine = true },
+        .{ .move = .{ .cell = 3 }, .mine = false },
+        .{ .move = .{ .cell = 1 }, .mine = true },
+        .{ .move = .{ .cell = 4 }, .mine = false },
+        .{ .move = .{ .cell = 2 }, .mine = true }, // X wins here
+        .{ .move = .{ .cell = 4 }, .mine = false }, // rematch: they open
+    };
+    // Without segmenting, that last move is illegal on a finished board and the
+    // pair could never play again.
+    const cur = currentGame(&thread);
+    try testing.expectEqual(@as(usize, 1), cur.len);
+
+    const s = replaySent(cur);
+    try testing.expectEqual(Outcome.ongoing, s.outcome);
+    try testing.expectEqual(Seat.x, s.board[4]); // THEY opened, so they are X now
+    try testing.expectEqual(Seat.o, mySeat(cur)); // and we are O
+    try testing.expectEqual(true, myTurn(cur)); // our move
+}
+
+test "currentGame: an unfinished game is returned whole" {
+    const thread = [_]SentMove{
+        .{ .move = .{ .cell = 0 }, .mine = true },
+        .{ .move = .{ .cell = 4 }, .mine = false },
+    };
+    try testing.expectEqual(@as(usize, 2), currentGame(&thread).len);
+    try testing.expectEqual(@as(usize, 0), currentGame(&[_]SentMove{}).len);
+}
+
+test "currentGame: a DRAW also ends a game, so a rematch can follow it" {
+    // A full board with no winner, then one more move.
+    const thread = [_]SentMove{
+        .{ .move = .{ .cell = 0 }, .mine = true }, // X
+        .{ .move = .{ .cell = 1 }, .mine = false }, // O
+        .{ .move = .{ .cell = 2 }, .mine = true }, // X
+        .{ .move = .{ .cell = 4 }, .mine = false }, // O
+        .{ .move = .{ .cell = 3 }, .mine = true }, // X
+        .{ .move = .{ .cell = 5 }, .mine = false }, // O
+        .{ .move = .{ .cell = 7 }, .mine = true }, // X
+        .{ .move = .{ .cell = 6 }, .mine = false }, // O
+        .{ .move = .{ .cell = 8 }, .mine = true }, // X — board full
+        .{ .move = .{ .cell = 0 }, .mine = true }, // rematch, we open
+    };
+    const full = replaySent(thread[0..9]);
+    try testing.expectEqual(Outcome.draw, full.outcome);
+
+    const cur = currentGame(&thread);
+    try testing.expectEqual(@as(usize, 1), cur.len);
+    try testing.expectEqual(Seat.x, mySeat(cur)); // we opened the rematch
 }
