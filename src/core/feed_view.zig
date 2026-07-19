@@ -6208,7 +6208,13 @@ fn drawSettings(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: 
     // ── Left: the section list (icon + label + chevron + active pill). ──
     const sec_row_h: i32 = 50;
     var ly = body_y;
+    var shown_sections: usize = 0;
     for (settings_view.sections, 0..) |sec, si| {
+        // A section with nothing in it for this product is not shown. The section
+        // ids stay the ROW's own numbering (rows point at them by name), so this
+        // hides the entry without renumbering anything.
+        if (!settings_view.sectionInProduct(@intCast(si))) continue;
+        shown_sections += 1;
         const on = si == ss;
         if (on) try rect(gpa, dl, x0, ly, list_w, sec_row_h - 6, (0x1F << 24) | (accent & 0x00FFFFFF), 12);
         try settingsIcon(sec.icon, gpa, dl, x0 + 14, ly + 11, 22, if (on) accent else muted);
@@ -6220,7 +6226,7 @@ fn drawSettings(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: 
 
     // ── Right (phone: BELOW the list): the selected section's detail. ──
     const sec = settings_view.sections[ss];
-    const detail_y0 = if (phone) body_y + @as(i32, @intCast(settings_view.sections.len)) * sec_row_h + 20 else body_y;
+    const detail_y0 = if (phone) body_y + @as(i32, @intCast(shown_sections)) * sec_row_h + 20 else body_y;
     _ = try str(gpa, dl, e, .semibold, detail_x, detail_y0 + 24, ink, 22, sec.label);
     var dy = detail_y0 + 50;
 
@@ -6240,6 +6246,7 @@ fn drawSettings(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: 
     for (settings_view.rows) |r| {
         if (r.section != ss) continue;
         if (phone and !settings_view.rowOnPhone(r)) continue; // dead on mobile
+        if (!settings_view.rowInProduct(r)) continue; // belongs to the other product
         if (ng == 0 or group_ids[ng - 1] != r.group) {
             if (ng == group_ids.len) break; // table guard (more than 32 groups: unreached)
             group_ids[ng] = r.group;
@@ -6267,6 +6274,7 @@ fn drawSettings(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, m: 
             for (settings_view.rows, 0..) |r, ridx| {
                 if (r.section != ss or r.group != gid) continue;
                 if (phone and !settings_view.rowOnPhone(r)) continue; // dead on mobile
+        if (!settings_view.rowInProduct(r)) continue; // belongs to the other product
 
                 const ry = dy + k * row_h;
                 if (k > 0) try rect(gpa, dl, detail_x + 18, ry, detail_w - 36, 1, divider, 0);
@@ -12116,9 +12124,15 @@ test "profile screen renders the author's posts under a header; other screens st
         if (r.kind == .settings_section) n_sections += 1;
         if (r.kind == .sign_out) n_sign_out += 1;
     }
-    // Every section is listed, and Account's interactive rows are tappable.
-    try std.testing.expectEqual(settings_view.sections.len, n_sections);
-    try std.testing.expectEqual(settings_view.sections.len + account_interactive, regions.items.len);
+    // Every section THIS PRODUCT has is listed, and Account's interactive rows
+    // are tappable. Zat Chat hides "Feed & Content" entirely, so the count is of
+    // the sections that survive the product filter, not of the whole table.
+    var listed_sections: usize = 0;
+    for (settings_view.sections, 0..) |_, si| {
+        if (settings_view.sectionInProduct(@intCast(si))) listed_sections += 1;
+    }
+    try std.testing.expectEqual(listed_sections, n_sections);
+    try std.testing.expectEqual(listed_sections + account_interactive, regions.items.len);
     // The one wired control survives the rework: Account's Sign out still routes
     // through the live `.sign_out` handler.
     try std.testing.expectEqual(@as(usize, 1), n_sign_out);

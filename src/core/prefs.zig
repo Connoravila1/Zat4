@@ -105,6 +105,12 @@ pub fn persists(action: u8) bool {
     if (action == settings_view.act_none) return false; // a decorative/WIP row
     return switch (action) {
         settings_view.act_gravity => false,
+        // The MESSAGING-PRIVACY rows are mirrors, not owners: read receipts and
+        // typing indicators live in the chat session and persist with the chat
+        // history. Writing them here too would put the same setting in two files
+        // that can disagree — and when they do, neither is the truth. The
+        // Settings row re-derives its bit from the session every frame.
+        settings_view.act_chat_receipts, settings_view.act_chat_typing => false,
         else => true,
     };
 }

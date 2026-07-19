@@ -2881,6 +2881,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
         // actually differs from what is on disk (DISK, not network — a small
         // atomic write, and only on an actual change, so it is not the kind of
         // blocking I/O the render thread has been burned by before).
+        syncChatPrivacyBits(rs);
         prefsPersistStep(rs);
 
         // MULTI-DEVICE (slice 2). Runs whether or not chat is up, because the
@@ -7362,6 +7363,23 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                             } else rs.pet_name_focus = false;
                                             if (hit.post < settings_view.rows.len and settings_view.rows[hit.post].kind == .toggle) {
                                                 rs.toggle_bits ^= @as(u64, 1) << @intCast(hit.post);
+                                                // MESSAGING PRIVACY rows do not OWN their state —
+                                                // the chat session does, and it persists with the
+                                                // chat history. The bit above is only what the row
+                                                // draws; the authoritative flip happens here, and
+                                                // `syncChatPrivacyBits` re-derives the bit each
+                                                // frame so the two can never disagree.
+                                                switch (settings_view.rows[hit.post].action) {
+                                                    settings_view.act_chat_receipts => {
+                                                        rs.gchat_receipts = !rs.gchat_receipts;
+                                                        chatPersistHistory(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
+                                                    },
+                                                    settings_view.act_chat_typing => {
+                                                        rs.gchat_typing_on = !rs.gchat_typing_on;
+                                                        chatPersistHistory(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
+                                                    },
+                                                    else => {},
+                                                }
                                                 // Layout-owning toys are mutually exclusive (they all
                                                 // resolve a post's on-screen position). Flipping one ON
                                                 // clears the others. F4: fold into a real radio control
@@ -14657,6 +14675,28 @@ fn packChoices(sel: []const u8) u64 {
 /// The live selected option index for a choice action (0 if it isn't a choice).
 fn choiceSel(sel: []const u8, action: u8) u8 {
     return if (settings_view.choiceIndex(action)) |i| sel[i] else 0;
+}
+
+/// Re-derive the messaging-privacy toggle BITS from the chat session, which is
+/// where those two settings actually live (they persist with the chat history,
+/// and until now the consent screen shown once during chat onboarding was the
+/// only way to reach them — so somebody who chose in a hurry could never change
+/// their mind).
+///
+/// Done every frame, in one direction only: chat state → bit. That is what keeps
+/// the Settings row honest no matter who else flips the underlying value (the
+/// consent screen still can), and it is why these two actions are on
+/// `prefs.persists`'s deny list — a second copy on disk could disagree with the
+/// first, and then neither is the truth.
+fn syncChatPrivacyBits(rs: *RunState) void {
+    if (settings_view.rowOf(settings_view.act_chat_receipts)) |row| {
+        const bit = @as(u64, 1) << row;
+        if (rs.gchat_receipts) rs.toggle_bits |= bit else rs.toggle_bits &= ~bit;
+    }
+    if (settings_view.rowOf(settings_view.act_chat_typing)) |row| {
+        const bit = @as(u64, 1) << row;
+        if (rs.gchat_typing_on) rs.toggle_bits |= bit else rs.toggle_bits &= ~bit;
+    }
 }
 
 /// A fingerprint of everything Settings persists. Not a hash of the FILE — of

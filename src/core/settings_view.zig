@@ -81,6 +81,29 @@ pub const act_crt: u8 = 4; // Toy Box: CRT scanline overlay
 pub const act_frametiming: u8 = 5; // Toy Box: fps/frame-time overlay
 pub const act_field: u8 = 6; // Appearance: the living glyph field on/off
 
+/// Does this SECTION exist in this product? "Feed & Content" is a timeline
+/// concept, and the messenger has no timeline.
+pub fn sectionInProduct(section: u8) bool {
+    if (!chat_app) return true;
+    return section != sec_feed;
+}
+
+/// Does this ROW exist in this product? Zat4 is the full client, so everything
+/// shows there and this folds to `true`.
+///
+/// The distinction the owner drew (2026-07-18) is between toys that RE-THEME the
+/// app and toys that RE-LAYOUT the feed. The pet, Julia mode, the CRT overlay and
+/// the XP skin all dress the whole app and carry over to the messenger happily.
+/// The feed-motion toys do not: Depth looms posts by engagement, Tectonic makes
+/// the timeline a filmstrip, Zero-G and Liquid drift and slosh it, Gravity piles
+/// it up. With no timeline these are not "off" in Zat Chat — they are meaningless,
+/// and a settings row that cannot do anything is worse than an absent one.
+pub fn rowInProduct(r: Row) bool {
+    if (!chat_app) return true;
+    if (!sectionInProduct(r.section)) return false;
+    return (r.flags & flag_zat4_only) == 0;
+}
+
 /// Rows that DO NOTHING on the phone (the glyph field is compiled off
 /// mobile for battery, and the like-ripple rides it): the phone's list
 /// hides them; desktop keeps them. Pure table logic, used by the renderer.
@@ -114,6 +137,14 @@ pub const act_kbd_pulses: u8 = 24; // Keyboard: the circuit-lattice glints
 pub const act_kbd_haptic: u8 = 25; // Keyboard: a soft tick per keystroke
 pub const act_kbd_pop: u8 = 26; // Keyboard: the key-preview pop above the finger
 pub const act_kbd_lm: u8 = 27; // Keyboard: smart tap targeting (the letter-trigram prior)
+// MESSAGING privacy. These two are NOT ordinary settings bits: their authoritative
+// state lives in the chat session (`gchat_receipts` / `gchat_typing_on`, persisted
+// with the chat history), and until now the ONLY way to reach them was the consent
+// screen shown once during chat onboarding — so a person who chose in a hurry could
+// never change their mind. The Settings rows mirror that state; they do not own it.
+pub const act_chat_receipts: u8 = 28; // send read receipts
+pub const act_chat_typing: u8 = 29; // send typing indicators
+pub const act_chat_disappearing: u8 = 30; // disappearing messages (M3 — not built yet)
 
 /// Optional one-line explainer shown as a HOVER TOOLTIP over a row — opt-in per
 /// action, empty for the rest. Kept out of band (a switch, not a `Row` field) so
@@ -255,6 +286,12 @@ comptime {
 pub const flag_destructive: u8 = 1 << 0; // render the label in the warning red
 pub const flag_on: u8 = 1 << 1; // a toggle's displayed state (skeleton: static)
 pub const flag_wip: u8 = 1 << 2; // not yet implemented — rendered dimmed + a "Soon"
+/// This row belongs to ZAT4 ONLY — it governs something the standalone Zat Chat
+/// build has no surface for. Carried as a table BIT rather than switched on by
+/// action, because several placeholder rows share `act_none` and cannot be told
+/// apart by action at all. Editing the table is how you change what a product
+/// shows, which is the point of a schema-driven settings tree.
+pub const flag_zat4_only: u8 = 1 << 3;
 //                                  tag, and non-interactive (no tap region). Clear
 //                                  the flag when the row's behaviour is wired.
 
@@ -342,18 +379,31 @@ pub const rows = [_]Row{
     .{ .section = sec_feed, .group = 1, .kind = .choice, .action = act_none, .flags = flag_wip, .label = "Sensitive content", .value = "Warn" },
 
     // ── Notifications ────────────────────────────────────────────────────
-    .{ .section = sec_notifications, .group = 0, .kind = .toggle, .action = act_none, .flags = flag_wip, .label = "Likes", .value = "" },
-    .{ .section = sec_notifications, .group = 0, .kind = .toggle, .action = act_none, .flags = flag_wip, .label = "Replies", .value = "" },
-    .{ .section = sec_notifications, .group = 0, .kind = .toggle, .action = act_none, .flags = flag_wip, .label = "Reposts", .value = "" },
-    .{ .section = sec_notifications, .group = 0, .kind = .toggle, .action = act_none, .flags = flag_wip, .label = "New followers", .value = "" },
-    .{ .section = sec_notifications, .group = 1, .kind = .toggle, .action = act_none, .flags = flag_wip, .label = "Zone activity", .value = "" },
+    // MESSAGE notifications lead: they are the only ones the standalone app has,
+    // and a messenger that cannot tell you a message arrived is not a messenger.
+    // Still `flag_wip` — push notifications are genuinely unbuilt, and a switch
+    // that silently governs nothing is worse than one marked "Soon".
+    .{ .section = sec_notifications, .group = 0, .kind = .toggle, .action = act_none, .flags = flag_wip, .label = "New messages", .value = "" },
+    .{ .section = sec_notifications, .group = 0, .kind = .toggle, .action = act_none, .flags = flag_wip, .label = "Reactions", .value = "" },
+    .{ .section = sec_notifications, .group = 0, .kind = .toggle, .action = act_none, .flags = flag_wip, .label = "Show message previews", .value = "" },
+    .{ .section = sec_notifications, .group = 1, .kind = .toggle, .action = act_none, .flags = flag_wip | flag_zat4_only, .label = "Likes", .value = "" },
+    .{ .section = sec_notifications, .group = 1, .kind = .toggle, .action = act_none, .flags = flag_wip | flag_zat4_only, .label = "Replies", .value = "" },
+    .{ .section = sec_notifications, .group = 1, .kind = .toggle, .action = act_none, .flags = flag_wip | flag_zat4_only, .label = "Reposts", .value = "" },
+    .{ .section = sec_notifications, .group = 1, .kind = .toggle, .action = act_none, .flags = flag_wip | flag_zat4_only, .label = "New followers", .value = "" },
+    .{ .section = sec_notifications, .group = 2, .kind = .toggle, .action = act_none, .flags = flag_wip | flag_zat4_only, .label = "Zone activity", .value = "" },
 
     // ── Privacy & Safety ─────────────────────────────────────────────────
-    .{ .section = sec_privacy, .group = 0, .kind = .choice, .action = act_none, .flags = flag_wip, .label = "Who can reply", .value = "Everyone" },
-    .{ .section = sec_privacy, .group = 0, .kind = .toggle, .action = act_none, .flags = flag_wip, .label = "Discoverable", .value = "" },
-    .{ .section = sec_privacy, .group = 1, .kind = .disclosure, .action = act_none, .flags = flag_wip, .label = "Blocked accounts", .value = "" },
-    .{ .section = sec_privacy, .group = 1, .kind = .disclosure, .action = act_none, .flags = flag_wip, .label = "Muted accounts", .value = "" },
-    .{ .section = sec_privacy, .group = 2, .kind = .toggle, .action = act_none, .flags = flag_wip, .label = "Privacy labels on lenses", .value = "" },
+    // MESSAGING privacy, group 0 — the first thing in Privacy, because for a
+    // messenger it is the whole of it. Both default OFF: a receipt or a typing
+    // dot is a disclosure about you, so it is opted INTO, never out of.
+    .{ .section = sec_privacy, .group = 0, .kind = .toggle, .action = act_chat_receipts, .flags = 0, .label = "Send read receipts", .value = "" },
+    .{ .section = sec_privacy, .group = 0, .kind = .toggle, .action = act_chat_typing, .flags = 0, .label = "Send typing indicators", .value = "" },
+    .{ .section = sec_privacy, .group = 0, .kind = .toggle, .action = act_chat_disappearing, .flags = flag_wip, .label = "Disappearing messages", .value = "" },
+    .{ .section = sec_privacy, .group = 1, .kind = .choice, .action = act_none, .flags = flag_wip | flag_zat4_only, .label = "Who can reply", .value = "Everyone" },
+    .{ .section = sec_privacy, .group = 1, .kind = .toggle, .action = act_none, .flags = flag_wip, .label = "Discoverable", .value = "" },
+    .{ .section = sec_privacy, .group = 2, .kind = .disclosure, .action = act_none, .flags = flag_wip, .label = "Blocked accounts", .value = "" },
+    .{ .section = sec_privacy, .group = 2, .kind = .disclosure, .action = act_none, .flags = flag_wip, .label = "Muted accounts", .value = "" },
+    .{ .section = sec_privacy, .group = 3, .kind = .toggle, .action = act_none, .flags = flag_wip | flag_zat4_only, .label = "Privacy labels on lenses", .value = "" },
 
     // ── Toy Box ──────────────────────────────────────────────────────────
     // Your playground. Grouped into CATEGORIES (the group index is the category,
@@ -364,7 +414,7 @@ pub const rows = [_]Row{
     //
     // Group 0 — Effects: independent decorative overlays (stack with anything).
     .{ .section = sec_toybox, .group = 0, .kind = .toggle, .action = act_julia, .flags = 0, .label = "Julia mode", .value = "" },
-    .{ .section = sec_toybox, .group = 0, .kind = .toggle, .action = act_ripples, .flags = flag_on, .label = "Ripples on like", .value = "" },
+    .{ .section = sec_toybox, .group = 0, .kind = .toggle, .action = act_ripples, .flags = flag_on | flag_zat4_only, .label = "Ripples on like", .value = "" },
     .{ .section = sec_toybox, .group = 0, .kind = .toggle, .action = act_crt, .flags = 0, .label = "CRT scanlines", .value = "" },
     .{ .section = sec_toybox, .group = 0, .kind = .toggle, .action = act_frametiming, .flags = 0, .label = "Show frame timing", .value = "" },
     // Group 1 — Companion: the Pet toggle + its colour / size / name options.
@@ -376,11 +426,11 @@ pub const rows = [_]Row{
     .{ .section = sec_toybox, .group = 2, .kind = .toggle, .action = act_xp, .flags = 0, .label = "XP skin", .value = "" },
     // Group 3 — Feed motion: mutually-exclusive layout toys (only one owns the
     // feed at a time), rendered as a "pick one" selectable card grid.
-    .{ .section = sec_toybox, .group = 3, .kind = .toggle, .action = act_depth, .flags = 0, .label = "Depth feed", .value = "" },
-    .{ .section = sec_toybox, .group = 3, .kind = .toggle, .action = act_tectonic, .flags = 0, .label = "Tectonic timeline", .value = "" },
-    .{ .section = sec_toybox, .group = 3, .kind = .toggle, .action = act_gravity, .flags = 0, .label = "Gravity", .value = "" },
-    .{ .section = sec_toybox, .group = 3, .kind = .toggle, .action = act_zero_g, .flags = 0, .label = "Zero-G", .value = "" },
-    .{ .section = sec_toybox, .group = 3, .kind = .toggle, .action = act_liquid, .flags = 0, .label = "Liquid", .value = "" },
+    .{ .section = sec_toybox, .group = 3, .kind = .toggle, .action = act_depth, .flags = flag_zat4_only, .label = "Depth feed", .value = "" },
+    .{ .section = sec_toybox, .group = 3, .kind = .toggle, .action = act_tectonic, .flags = flag_zat4_only, .label = "Tectonic timeline", .value = "" },
+    .{ .section = sec_toybox, .group = 3, .kind = .toggle, .action = act_gravity, .flags = flag_zat4_only, .label = "Gravity", .value = "" },
+    .{ .section = sec_toybox, .group = 3, .kind = .toggle, .action = act_zero_g, .flags = flag_zat4_only, .label = "Zero-G", .value = "" },
+    .{ .section = sec_toybox, .group = 3, .kind = .toggle, .action = act_liquid, .flags = flag_zat4_only, .label = "Liquid", .value = "" },
 
     // ── About ────────────────────────────────────────────────────────────
     .{ .section = sec_about, .group = 0, .kind = .info, .action = act_none, .flags = 0, .label = "Version", .value = "0.1.0-dev" },
@@ -468,4 +518,52 @@ test "accent palette: an out-of-range index is Auto, never off the end" {
 test "light mode: Zat Chat starts light, Zat4 starts dark" {
     const row = rows[rowOf(act_light).?];
     try std.testing.expectEqual(chat_app, (row.flags & flag_on) != 0);
+}
+
+test "product filter: the feed-motion toys are absent from the messenger" {
+    // They re-layout a timeline Zat Chat does not have — not "off", meaningless.
+    for ([_]u8{ act_depth, act_tectonic, act_gravity, act_zero_g, act_liquid }) |a| {
+        const r = rows[rowOf(a).?];
+        try std.testing.expectEqual(!chat_app, rowInProduct(r));
+    }
+}
+
+test "product filter: the whole-app toys carry over to the messenger" {
+    // The owner's distinction: toys that RE-THEME travel, toys that RE-LAYOUT
+    // the feed do not.
+    for ([_]u8{ act_pet, act_julia, act_crt, act_xp }) |a| {
+        try std.testing.expect(rowInProduct(rows[rowOf(a).?]));
+    }
+}
+
+test "product filter: Feed & Content is a Zat4 section only" {
+    try std.testing.expectEqual(!chat_app, sectionInProduct(sec_feed));
+    // Every other section survives in both products.
+    for ([_]u8{ sec_account, sec_toybox, sec_appearance, sec_notifications, sec_privacy, sec_about }) |sc| {
+        try std.testing.expect(sectionInProduct(sc));
+    }
+}
+
+test "product filter: no section is left with nothing in it" {
+    // A section header opening an empty pane is a dead end; if a product ever
+    // filters out every row of a section, that section must go too.
+    for (sections, 0..) |_, si| {
+        const sc: u8 = @intCast(si);
+        if (!sectionInProduct(sc)) continue;
+        var any = false;
+        for (rows) |r| {
+            if (r.section == sc and rowInProduct(r)) any = true;
+        }
+        try std.testing.expect(any);
+    }
+}
+
+test "messaging privacy: receipts and typing are present in BOTH products" {
+    // Chat exists in Zat4 too, so these are not chat-flavor-only rows.
+    for ([_]u8{ act_chat_receipts, act_chat_typing }) |a| {
+        const r = rows[rowOf(a).?];
+        try std.testing.expect(rowInProduct(r));
+        // Both OFF by default: a receipt is a disclosure about you, opted INTO.
+        try std.testing.expectEqual(@as(u8, 0), r.flags & flag_on);
+    }
 }

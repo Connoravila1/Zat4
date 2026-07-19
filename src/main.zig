@@ -1323,6 +1323,7 @@ test {
     _ = @import("shell/mobile_host.zig");
     _ = @import("core/pow.zig");
     _ = @import("shell/pow.zig");
+    _ = @import("core/constellation.zig");
     _ = @import("core/credential.zig");
     _ = @import("shell/credential.zig");
     _ = @import("core/membership.zig");
