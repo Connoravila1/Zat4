@@ -32,10 +32,54 @@ const card_fill: u32 = 0xF21D1D1F; // ~95% — opaque enough that the field does
 const card_edge: u32 = 0x16FFFFFF; // top inner-light hairline
 const line_c: u32 = 0x1AEDEAE0; // ~10% ink — dividers / field borders
 const field_fill: u32 = 0xFF141416;
-/// The onboarding accent. The house amber keeps it unmistakably Zat (pre-lens,
-/// so there is no seated-lens accent yet). One token; flip here to retune.
-pub const accent: u32 = 0xFFE8B84B;
-const accent_soft: u32 = 0x24E8B84B;
+/// The product flavor, read at COMPTIME (as core reads `builtin`), so the other
+/// product's copy folds out entirely. B4: a build-time identity, not I/O.
+const chat_app = @import("dist_config").product == .chat;
+
+/// THE BRAND — every user-visible product name in the front door, in ONE place.
+///
+/// These were ~11 hardcoded "Zat4" literals, and the front door had no flavor
+/// branch at all: the standalone messenger's sign-up said "Join Zat4", explained
+/// that "Zat4 is its own space on the AT Protocol", and finished with "Enter
+/// Zat4". The front door is the FIRST thing a person meets, and one that names
+/// the wrong product has already told them they are in the wrong place.
+///
+/// Naming only. The STEP COMPOSITION is a separate question — `membership` and
+/// `provenance` are social-network framings a messenger front door probably
+/// should not have — and it is deliberately not answered here.
+const brand = struct {
+    // A7.2: cold struct, size guard waived — not a record at all but a namespace
+    // of comptime string constants (no fields, nothing instantiated), so there is
+    // no layout to pin. Same posture as the extern-fn namespaces in the shell.
+
+    /// The product name, in running text.
+    const name = if (chat_app) "Zat Chat" else "Zat4";
+    /// The first headline, and the button that finishes the funnel.
+    const join = "Join " ++ name;
+    const enter = "Enter " ++ name;
+    /// One line on what this place IS — the only string whose SHAPE differs, not
+    /// just its noun: a messenger's promise is privacy, a network's is space.
+    const pitch = if (chat_app)
+        "Zat Chat is private, end-to-end encrypted messaging on the AT Protocol. Pick how you're coming in."
+    else
+        "Zat4 is its own space on the AT Protocol. Pick how you're coming in.";
+    const welcome = "Verified — welcome to " ++ name ++ ".";
+    const password_hint = "Your " ++ name ++ " password";
+    const membership_existing = "Your existing identity now has a " ++ name ++ " membership.";
+    const membership_new = "Your new identity and " ++ name ++ " membership are ready.";
+    const did_note = "You'll confirm on your own provider, then come straight back. " ++
+        name ++ " only learns your DID — a scoped, revocable token, never your password.";
+    const privacy = "Privacy Policy — placeholder. The full policy arrives before launch. In short: " ++
+        name ++ " stores your DID, a one-way hash of your password, and your " ++ name ++
+        " content. It never sees your provider password, and your " ++ name ++
+        " content stays in the " ++ name ++ " namespace.";
+};
+
+/// The onboarding accent. Pre-lens, so there is no seated-lens accent yet — the
+/// house amber keeps Zat4 unmistakably Zat, and Zat Chat opens in its own blue
+/// so the door matches the room behind it. One token; flip here to retune.
+pub const accent: u32 = if (chat_app) 0xFF4A9EFF else 0xFFE8B84B;
+const accent_soft: u32 = if (chat_app) 0x244A9EFF else 0x24E8B84B;
 const ok_c: u32 = 0xFF6FCF97; // success green (the "you're in" check)
 const warn_c: u32 = 0xFFE0705C; // soft warm red — a confirm mismatch hint
 const shadow_c: u32 = 0x33000000;
@@ -49,8 +93,7 @@ const password_info =
 // place now. (ENROLLMENT_BUILD §7: A — consent gate.)
 const tos_placeholder =
     "Terms of Service — placeholder. The full terms arrive before launch. In short: be a good neighbour, follow the community rules and acceptable-use policy, and understand the membership-deposit terms. Joining records that you accepted this version.";
-const privacy_placeholder =
-    "Privacy Policy — placeholder. The full policy arrives before launch. In short: Zat4 stores your DID, a one-way hash of your password, and your Zat4 posts. It never sees your provider password, and your Zat4 content stays in the Zat4 namespace.";
+const privacy_placeholder = brand.privacy;
 
 /// Which step of the funnel the surface is showing. `recovery` only appears for
 /// a NEW, no-email identity (it reveals the account recovery key) — it sits
@@ -293,7 +336,7 @@ pub fn layout(
     // ── brand row (accent mark + wordmark) ──
     try rect(gpa, dl, ix, y, 26, 26, accent, 7);
     try rect(gpa, dl, ix, y, 26, 2, soft(0xFFFFFF, 0x40), 7); // a lit top edge on the mark
-    _ = try str(gpa, dl, e, .semibold, ix + 36, y + 19, ink, 18, "Zat4");
+    _ = try str(gpa, dl, e, .semibold, ix + 36, y + 19, ink, 18, brand.name);
     y += 26 + 18;
 
     // ── step progress dots (5 bars; on = accent, off = faint) ──
@@ -387,9 +430,9 @@ pub fn confirmMatch(typed: []const u8, password: []const u8) bool {
 
 fn stepProvenance(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, ix: i32, iw: i32, y0: i32, hits: ?*HitList) !void {
     var y = y0;
-    _ = try str(gpa, dl, e, .semibold, ix, y + 16, ink, 21, "Join Zat4");
+    _ = try str(gpa, dl, e, .semibold, ix, y + 16, ink, 21, brand.join);
     y += 36;
-    y = try wrap(gpa, dl, e, ix, y, iw, muted, 14, "Zat4 is its own space on the AT Protocol. Pick how you're coming in.");
+    y = try wrap(gpa, dl, e, ix, y, iw, muted, 14, brand.pitch);
     y += 16;
 
     y = try choice(gpa, dl, e, ix, iw, y, "I already have an account",
@@ -409,7 +452,7 @@ fn stepIdentity(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, ix:
         y += 14;
         y = try field(gpa, dl, e, ix, iw, y, "Your handle", view.handle, "connor.bsky.social", "", view.focus == .handle, view.caret, view.blink_on, hits, .field_handle);
         y += 14;
-        y = try note(gpa, dl, e, ix, iw, y, "You'll confirm on your own provider, then come straight back. Zat4 only learns your DID — a scoped, revocable token, never your password.");
+        y = try note(gpa, dl, e, ix, iw, y, brand.did_note);
         label = "Verify & continue";
     } else {
         _ = try str(gpa, dl, e, .semibold, ix, y + 16, ink, 21, "Create your identity");
@@ -679,9 +722,9 @@ fn stepDone(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, ix: i32
         return;
     }
     const sub = if (view.branch == .existing)
-        "Your existing identity now has a Zat4 membership."
+        brand.membership_existing
     else
-        "Your new identity and Zat4 membership are ready.";
+        brand.membership_new;
     y = try wrapCenter(gpa, dl, e, ix, y, iw, muted, 14, sub);
     y += 16;
     // DID + handle pills, centred
@@ -689,7 +732,7 @@ fn stepDone(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, ix: i32
     const hh = if (view.final_handle.len > 0) view.final_handle else "connor.zat4.com";
     try pillRow(gpa, dl, e, ix, iw, y, did, hh);
     y += 34 + 18;
-    try primaryButton(gpa, dl, e, ix, iw, y, "Enter Zat4", true, hits);
+    try primaryButton(gpa, dl, e, ix, iw, y, brand.enter, true, hits);
 }
 
 /// THE PROOF-OF-WORK GATE — shown after "Enter Zat4." A clockwise-filling ring
@@ -722,7 +765,7 @@ fn stepVerifying(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, ix
         var hb: [16]u8 = undefined;
         try centerStr(gpa, dl, e, cx - 50, 100, cy + 18, faint, 11, hexSpin(view.bar_phase, &hb));
     }
-    const status = if (done) "Verified — welcome to Zat4." else "Running proof of work\u{2026}";
+    const status = if (done) brand.welcome else "Running proof of work\u{2026}";
     try centerStr(gpa, dl, e, ix, iw, cy + r + 30, if (done) ok_c else faint, 13, status);
 }
 
@@ -863,8 +906,8 @@ fn stepSignin(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, ix: i
     y += 36;
 
     var hb: [160]u8 = undefined;
-    const body = std.fmt.bufPrint(&hb, "{s} is hosted here on Zat4, so you sign in right here — no browser trip.", .{view.handle}) catch
-        "This account is hosted here on Zat4, so you sign in right here — no browser trip.";
+    const body = std.fmt.bufPrint(&hb, "{s} is hosted here on " ++ brand.name ++ ", so you sign in right here — no browser trip.", .{view.handle}) catch
+        "This account is hosted here on " ++ brand.name ++ ", so you sign in right here — no browser trip.";
     y = try wrap(gpa, dl, e, ix, y, iw, muted, 14, body);
     y += 14;
 
@@ -917,7 +960,7 @@ fn secretField(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, ix: 
         mask_buf[i * 3 + 2] = 0xA2;
     }
     const masked = mask_buf[0 .. dots * 3];
-    const drawn: []const u8 = if (value.len == 0) "Your Zat4 password" else if (show) value else masked;
+    const drawn: []const u8 = if (value.len == 0) brand.password_hint else if (show) value else masked;
     const col = if (value.len > 0) ink else faint;
     const tx = ix + 14;
     _ = try str(gpa, dl, e, .regular, tx, yy + 28, col, 15, drawn);

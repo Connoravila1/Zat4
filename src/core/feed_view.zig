@@ -9303,11 +9303,17 @@ pub const ChatListSearch = struct {
     caret_on: bool = false,
 };
 
-/// Chat body type: bubbles + the composer input. 14px read too small on the
-/// phone (owner, 2026-07-11) — 16 on a 23px line is the default until the
-/// settings text-size control lands.
-const chat_px: u16 = 16;
-const chat_line_h: i32 = 23;
+/// Chat body type: bubbles + the composer input. Bumped twice on the owner's
+/// read: 14 → 16 (2026-07-11) and 16 → 18 (2026-07-18, "still too small ...
+/// maybe one notch bigger"). The notch is 2px because that is the step that
+/// actually reads as different at this size — the first bump proved a smaller
+/// one would have been another round trip.
+///
+/// The line height tracks the size at ~1.44×, the ratio the 16/23 pair set, so
+/// the paragraph colour stays put as the type grows. These two constants are the
+/// whole control until the settings text-size row lands — change them together.
+const chat_px: u16 = 18;
+const chat_line_h: i32 = 26;
 
 // ---------------------------------------------------------------------------
 // MULTI-DEVICE (CHAT_MULTIDEVICE slice 2) — the surfaces a person actually meets.

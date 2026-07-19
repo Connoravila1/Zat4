@@ -195,7 +195,7 @@ const craft_dur_ns: f32 = 1_900_000_000;
 /// Run the Join flow. Returns the new account's `Session` when sign-up completes
 /// (the caller drops into the feed), or null when the window is closed / Esc.
 pub fn run(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map) !?auth.Session {
-    const win = window_shell.open(gpa, env, "Zat4 - join", 150, 52) catch |err| {
+    const win = window_shell.open(gpa, env, if (dist_config.product == .chat) "Zat Chat - join" else "Zat4 - join", 150, 52) catch |err| {
         std.debug.print("window.open failed: {s} (on X11, is DISPLAY set?)\n", .{@errorName(err)});
         return err;
     };
