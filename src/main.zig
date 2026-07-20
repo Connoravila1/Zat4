@@ -1328,6 +1328,7 @@ test {
     _ = @import("core/gate_wire.zig");
     _ = @import("core/gate_record.zig");
     _ = @import("shell/gate_store.zig");
+    _ = @import("shell/gate_pool.zig");
     _ = @import("shell/gate_serve.zig");
     _ = @import("core/credential.zig");
     _ = @import("shell/credential.zig");

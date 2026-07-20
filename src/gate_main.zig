@@ -47,6 +47,7 @@ const gate = @import("shell/gate_serve.zig");
 const pow_issue = @import("core/pow_issue.zig");
 const constellation = @import("core/constellation.zig");
 const gate_store = @import("shell/gate_store.zig");
+const gate_pool = @import("shell/gate_pool.zig");
 
 /// Replay-guard capacity: how many SOLVED tickets can be in flight inside one
 /// TTL. Sized generously because the set is naturally small — an entry only
@@ -67,6 +68,16 @@ const default_port: u16 = 2590;
 
 /// Where the durable log lives if `ZAT_GATE_STORE` does not say otherwise.
 const default_store_path = "/var/lib/zat4-gate/enrollments.log";
+
+/// The invite-code pool: one pre-minted single-use code per line, `#` comments
+/// allowed. Refill with `pdsadmin create-invite-code` (§9.5). Must not be
+/// group- or world-readable — it is a file of account credentials.
+const default_pool_path = "/var/lib/zat4-gate/invite-pool";
+
+/// Append-only record of which pool slots have been handed out, so a restart
+/// never re-issues a code. Kept separate from the pool file so a refill is a
+/// plain append and never has to rewrite state.
+const default_consumed_path = "/var/lib/zat4-gate/invite-consumed.log";
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -111,6 +122,11 @@ pub fn main(init: std.process.Init) !void {
 
     const rp = gate_store.replay(gpa, store_path, tokens);
 
+    const pool_path = env.get("ZAT_GATE_POOL") orelse default_pool_path;
+    const consumed_path = env.get("ZAT_GATE_CONSUMED") orelse default_consumed_path;
+    var pool = gate_pool.load(gpa, pool_path, consumed_path);
+    defer gate_pool.unload(gpa, &pool);
+
     const rate = try gpa.alloc(gate.RateSlot, gate.rate_slot_count);
     defer gpa.free(rate);
     @memset(rate, .{ .key = 0, .bucket = .{ .tokens = 0, .capacity = 0, .refill_per_sec = 0, .last = 0 } });
@@ -121,6 +137,7 @@ pub fn main(init: std.process.Init) !void {
         .tokens = tokens,
         .token_len = rp.len,
         .store = store,
+        .pool = pool,
     };
 
     // Report what the replay found, including what it SHED. A store quietly
@@ -141,6 +158,27 @@ pub fn main(init: std.process.Init) !void {
             "zat4-gate: ⚠ NOTHING WILL BE PERSISTED. Observations die with this process.\n",
             .{},
         );
+    }
+
+    // The pool is what actually completes an enrollment, so an empty or unsafe
+    // one is an OUTAGE, not a degradation. Say so at the top of the log rather
+    // than letting the first real user discover it.
+    const left = gate_pool.remaining(pool);
+    try out.print("zat4-gate: invite pool {s} — {d} codes available\n", .{ pool_path, left });
+    if (pool.insecure_mode) {
+        try out.print(
+            "zat4-gate: ⚠ POOL REFUSED — {s} is group/world readable. It is a file of\n" ++
+                "           account credentials; chmod 600 it. NO CODES WILL BE ISSUED.\n",
+            .{pool_path},
+        );
+    } else if (left == 0) {
+        try out.print(
+            "zat4-gate: ⚠ POOL EMPTY — nobody can complete an enrollment. Refill with\n" ++
+                "           pdsadmin create-invite-code (one per line, chmod 600).\n",
+            .{},
+        );
+    } else if (left < gate_pool.low_water) {
+        try out.print("zat4-gate: ⚠ pool low ({d} left) — refill soon.\n", .{left});
     }
     const cfg: gate.ServeConfig = .{
         .port = port,

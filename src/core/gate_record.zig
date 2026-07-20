@@ -57,7 +57,11 @@ const constellation = @import("constellation.zig");
 /// Format tag, version included. A future layout change bumps the last byte and
 /// `decode` rejects the old one rather than misreading it — records are fixed
 /// size, so a silent misparse would otherwise be perfectly plausible.
-pub const magic = [4]u8{ 'Z', 'G', 'S', '1' };
+pub const magic = [4]u8{ 'Z', 'G', 'S', '2' };
+
+/// `code_index` value meaning "no invite code was issued for this observation"
+/// — the state before the pool existed, and the state if the pool was empty.
+pub const no_code: u16 = 0xFFFF;
 
 /// Upper bound on tokens per enrollment. Equal to the signal count: one token
 /// per signal, and `constellation.derive` cannot emit more.
@@ -73,7 +77,8 @@ const off_subject = 4; //  8
 const off_observed = 12; //  8
 const off_factor = 20; //  4
 const off_len = 24; //  1
-// 25..28 reserved
+const off_code = 25; //  2
+// 27..28 reserved
 const off_tokens = 28; // 96  (6 × 16)
 const off_checksum = 124; //  4
 
@@ -95,11 +100,19 @@ pub const Enrollment = struct {
     /// How many of `tokens` are populated. Fewer than `max_tokens` is normal:
     /// graph shape is always absent at enrollment.
     token_len: u8,
-    _reserved: [3]u8 = .{0} ** 3,
+    /// Which slot of the invite pool was handed to this enrollment, or
+    /// `no_code`. This is the JOIN KEY: the gate observes before an account
+    /// exists, so there is no DID to key on — the code is the only thing that
+    /// travels from here into `createAccount`. Binding DID↔observation later
+    /// means matching on this. Stored as an INDEX, never the code itself, so
+    /// this log stays free of bearer tokens (§2: a breach reveals coordination
+    /// structure, not credentials).
+    code_index: u16 = no_code,
+    _reserved: [1]u8 = .{0} ** 1,
     tokens: [max_tokens]constellation.Token,
 
     comptime {
-        // Budget: 8 + 8 + 4 + 1 + 3 (reserved) = 24, then 6 × 16 = 96 of
+        // Budget: 8 + 8 + 4 + 1 + 2 (code_index) + 1 (reserved) = 24, then 6 × 16 = 96 of
         // tokens, aligned to 8 by the u64 = 120 bytes in memory. The DISK
         // record is 128 (it also carries magic and checksum); the two sizes
         // are independent on purpose and `encode` is the only bridge.
@@ -122,6 +135,7 @@ pub fn encode(e: Enrollment) [record_bytes]u8 {
     // every future replay.
     const n = @min(e.token_len, max_tokens);
     b[off_len] = n;
+    std.mem.writeInt(u16, b[off_code..][0..2], e.code_index, .little);
 
     for (e.tokens[0..n], 0..) |t, i| {
         const at = off_tokens + i * 16;
@@ -155,6 +169,7 @@ pub fn decode(b: []const u8) ?Enrollment {
         .observed_at = std.mem.readInt(i64, b[off_observed..][0..8], .little),
         .factor_x100 = std.mem.readInt(u32, b[off_factor..][0..4], .little),
         .token_len = n,
+        .code_index = std.mem.readInt(u16, b[off_code..][0..2], .little),
         .tokens = undefined,
     };
 

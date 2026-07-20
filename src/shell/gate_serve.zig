@@ -33,12 +33,14 @@
 //! Nothing here can price anyone until a deposit spine exists AND someone
 //! deliberately flips it from observed to enforced.
 //!
-//! ── Where the invite code is NOT ──
-//! Handing out a real invite code is the next slice. The gate holds no PDS
-//! admin credential by design (§9.5, the pool model) — a compromised gate must
-//! not be able to mint accounts, and it holds no session token, no password and
-//! no OAuth material either, so it cannot impersonate anyone. Keeping that true
-//! is worth more than the convenience of self-minting.
+//! ── The invite code (§9.5, the pool model) ──
+//! A successful redemption hands out one pre-minted single-use invite code,
+//! which is what actually lets `createAccount` succeed. The gate holds NO PDS
+//! admin credential and cannot mint more — so a fully compromised gate can
+//! exhaust a small pool, which the owner refills, but it can never mint
+//! unlimited accounts. It holds no session token, no password and no OAuth
+//! material either, so it cannot impersonate anyone. That containment is worth
+//! more than the convenience of self-minting.
 //!
 //! ── The concurrency cap, for free (§9.7) ──
 //! The accept loop is SEQUENTIAL: accept → handle → close. So exactly one
@@ -61,6 +63,7 @@ const constellation = @import("../core/constellation.zig");
 const relay = @import("../core/relay.zig");
 const gate_record = @import("../core/gate_record.zig");
 const gate_store = @import("gate_store.zig");
+const gate_pool = @import("gate_pool.zig");
 const pow_shell = @import("pow.zig");
 const clock = @import("clock.zig");
 
@@ -152,6 +155,12 @@ pub const GateState = struct {
     /// gate quietly failing to write is indistinguishable from a healthy one
     /// unless someone is counting.
     persist_failures: u64 = 0,
+    /// The invite-code pool (§9.5). A gate with an empty pool still observes
+    /// and scores; it simply cannot complete an enrollment.
+    pool: gate_pool.Pool = .{},
+    /// Enrollments refused because the pool ran dry. This is an OUTAGE counter:
+    /// every one is a real person who did the work and could not join.
+    pool_exhausted: u64 = 0,
 };
 
 /// SHELL (B3): bind loopback and serve until killed.
@@ -347,26 +356,51 @@ fn serveRedeem(
     // Disk first, then the in-memory index: if the write fails we still want
     // the observation scoring this session, but we must not let a successful
     // in-memory update disguise a failed durable one.
+    // Draw the invite code BEFORE writing the observation, so the record can
+    // carry the slot as its join key (`code_index`) — that is the only thing
+    // linking this observation to the account that gets created later, since
+    // no DID exists yet.
+    const issued = gate_pool.take(&state.pool, now);
+    if (issued == null) state.pool_exhausted +|= 1;
+
     const entry: gate_record.Enrollment = .{
         .subject_tag = tag,
         .observed_at = now,
         .factor_x100 = factor,
         .token_len = derived.len,
+        .code_index = if (issued) |x| x.index else gate_record.no_code,
         .tokens = derived.tokens,
     };
     if (!gate_store.append(state.store, entry)) {
         state.persist_failures +|= 1;
     }
 
-    // SHADOW MODE: log the assessment, admit regardless.
+    // SHADOW MODE: log the assessment, admit regardless of the score.
     std.debug.print(
-        "[gate] enroll observed: signals={d} factor_x100={d} index={d} dropped={d} unpersisted={d}\n",
-        .{ derived.len, factor, state.token_len, state.dropped, state.persist_failures },
+        "[gate] enroll observed: signals={d} factor_x100={d} index={d} dropped={d} unpersisted={d} pool_left={d}\n",
+        .{ derived.len, factor, state.token_len, state.dropped, state.persist_failures, gate_pool.remaining(state.pool) },
     );
 
     record(state, derived);
 
-    respondJson(req, .ok, "{\"ok\":true,\"mode\":\"shadow\"}");
+    // An empty pool is an enrollment OUTAGE, not a quiet degradation: the user
+    // solved the work and there is nothing to give them. Say so plainly with a
+    // distinct code so the client can tell "come back later" from "you failed".
+    const out = issued orelse {
+        respondJson(req, .service_unavailable, "{\"error\":\"NoInviteAvailable\"}");
+        return;
+    };
+
+    var body: [256]u8 = undefined;
+    const payload = std.fmt.bufPrint(
+        &body,
+        "{{\"ok\":true,\"mode\":\"shadow\",\"inviteCode\":\"{s}\"}}",
+        .{out.code},
+    ) catch {
+        respondJson(req, .internal_server_error, "{\"error\":\"Internal\"}");
+        return;
+    };
+    respondJson(req, .ok, payload);
 }
 
 /// Append a derivation to the shadow store.
