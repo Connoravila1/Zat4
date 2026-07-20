@@ -484,6 +484,167 @@ fn token(salt: [32]u8, kind: SignalKind, value: []const u8) Token {
     return .{ .value = std.mem.readInt(u64, digest[0..8], .little), .kind = kind };
 }
 
+// ══ Phase G2 — score-and-threshold (§3 Phase 1) ══
+//
+// The first operational Gate. A candidate enrollment's tokens are compared
+// against the store; each overlap is a weighted vote; the weighted sum decides
+// the deposit multiplier. This is a RUNG, not the destination — a score says
+// "this looks coordinated" but not "this is the 14th account from this
+// operator". The exponential curve needs cluster SIZE, which needs G3.
+
+/// How many stored accounts share each signal's token with the candidate.
+/// Indexed by `@intFromEnum(SignalKind)`.
+///
+/// A7: one per in-flight assessment, walked in the scoring loop. Guarded.
+pub const MatchCounts = struct {
+    per_signal: [signal_count]u32,
+
+    comptime {
+        // Budget: 6 × 4 = 24 bytes, exact.
+        assert(@sizeOf(MatchCounts) == 24);
+    }
+};
+
+/// The weighted outcome of one assessment.
+///
+/// `carrier_total` is tracked SEPARATELY from `total` rather than recomputed,
+/// because the weak-tier cap needs to know how much of the score came from
+/// signals that can actually carry an escalation. Folding them into one number
+/// would lose exactly the distinction the cap depends on.
+///
+/// A7: held per assessment; guarded.
+pub const Score = struct {
+    /// Weighted sum across all six signals.
+    total: u32,
+    /// Weighted sum across the moderate and strong tiers only.
+    carrier_total: u32,
+
+    comptime {
+        // Budget: 4 + 4 = 8 bytes, exact.
+        assert(@sizeOf(Score) == 8);
+    }
+};
+
+/// The escalation threshold: below this, the deposit stays at base rate.
+///
+/// ⚠️ PLACEHOLDER — NOT CALIBRATED (§6 Open Problem 6). ⚠️ For scale, one shared
+/// timing token is 80 and one shared graph token is 100, so this sits just above
+/// "a single strong signal matched one other account" — deliberately, because a
+/// single overlap with one other account is not coordination, it is coincidence.
+const escalation_threshold: u32 = 100;
+
+/// The stepped escalation curve for G2 — deposit multiplier in hundredths
+/// (100 = 1.0×, base rate).
+///
+/// ⚠️ PLACEHOLDER — NOT CALIBRATED. ⚠️ §3 says only that the shape is
+/// "monotonically increasing"; whether it is linear, stepped, or continuous is
+/// explicitly empirical. Steps are used here because they are legible in logs
+/// during shadow mode, which is what this phase is actually for. Note this is
+/// NOT the exponential curve from §0 — that one is keyed to cluster size and
+/// arrives with G3. A score-based curve cannot express "the 14th account".
+const escalation_steps = [_]struct { at: u32, factor_x100: u32 }{
+    .{ .at = 100, .factor_x100 = 150 },
+    .{ .at = 250, .factor_x100 = 200 },
+    .{ .at = 500, .factor_x100 = 400 },
+    .{ .at = 1000, .factor_x100 = 800 },
+};
+
+/// PURE (B2): count, per signal, how many stored tokens the candidate shares.
+///
+/// A token matches only within its own signal — `kind` is compared as well as
+/// `value`, so a coincidental 64-bit collision across two different signals
+/// cannot manufacture a match (the kind is already mixed into the hash, so this
+/// is belt-and-braces, and it is free).
+///
+/// This is the pure DEFINITION of the matching semantics and the oracle the
+/// tests check against. It is deliberately a linear scan: a real store will
+/// index by token value, but there is no store yet, and building the index
+/// before the store exists would be abstracting ahead of use (F4). The shell
+/// owns that optimization when it owns the store.
+pub fn countMatches(candidate: Derived, stored: []const Token) MatchCounts {
+    var counts: MatchCounts = .{ .per_signal = .{0} ** signal_count };
+    for (candidate.tokens[0..candidate.len]) |c| {
+        var n: u32 = 0;
+        for (stored) |s| {
+            if (s.kind == c.kind and s.value == c.value) {
+                // Saturate rather than wrap: the store is adversarial input
+                // (§6 Open Problem 5), and a wrapped count would read as ZERO
+                // matches — turning a colossal cluster into a clean account.
+                n +|= 1;
+            }
+        }
+        counts.per_signal[@intFromEnum(c.kind)] = n;
+    }
+    return counts;
+}
+
+/// PURE (B2): the weighted scoring sum of §3 Phase 1.
+///
+/// ```
+/// score = Σ (signal_weight[i] × signal_match_count[i])
+/// ```
+///
+/// Arithmetic saturates throughout. Every input here is attacker-influenced —
+/// an adversary who can inflate a match count controls one multiplicand — and a
+/// wrapped sum would silently produce a LOW score from an extreme cluster,
+/// which is precisely the failure an attacker would want.
+pub fn scoreOf(counts: MatchCounts) Score {
+    var total: u32 = 0;
+    var carrier_total: u32 = 0;
+    for (counts.per_signal, 0..) |n, i| {
+        const kind: SignalKind = @enumFromInt(i);
+        const contribution: u32 = @as(u32, weightOf(kind)) *| n;
+        total +|= contribution;
+        if (tierOf(kind) != .weak) carrier_total +|= contribution;
+    }
+    return .{ .total = total, .carrier_total = carrier_total };
+}
+
+/// PURE (B2): the deposit multiplier in hundredths (100 = base rate).
+///
+/// ── THE WEAK-TIER CAP (§3, decided 2026-07-19) ──
+/// If NO moderate or strong signal matched, the deposit stays at base rate no
+/// matter how large the weak-tier score grows. Signals 4, 5 and 6 — IP type,
+/// shared IP, and platform bucket — cannot escalate anyone on their own.
+///
+/// This is the single most important line in the scoring path, and it answers
+/// two separate threats with one rule:
+///
+///   1. The honest FIRST-time enrollee. A real person on a VPN, behind carrier
+///      NAT, signing up during a launch spike matches all three weak signals
+///      against thousands of strangers. For a first account the "refundable
+///      deposit" ethic offers them nothing — they never pay it, they are simply
+///      priced out of joining. Weak signals must never be able to do that.
+///   2. Cluster poisoning (§6 Open Problem 5). An adversary inducing false
+///      clustering will reach for the cheap signals, because those are the ones
+///      they can manufacture. Capping them bounds the whole attack.
+///
+/// The cap also gets stronger over time, which is the point: with no signal
+/// decay (§2) match counts only ever grow, so a carrier-NAT or university IP
+/// token accumulates accounts forever. Without this rule those users would
+/// drift into permanent escalation purely for sharing an address.
+pub fn escalationFactor(s: Score) u32 {
+    if (s.carrier_total == 0) return 100; // the cap — base rate, full stop
+    if (s.total < escalation_threshold) return 100;
+
+    var factor: u32 = 100;
+    for (escalation_steps) |step| {
+        if (s.total >= step.at) factor = step.factor_x100;
+    }
+    return factor;
+}
+
+/// PURE (B2): the whole G2 assessment in one call — the shell's entry point.
+/// Returns the deposit multiplier in hundredths for a candidate enrollment
+/// against the current store.
+///
+/// ⚠️ SHADOW MODE: during bootstrap this result is LOGGED, not charged (§9.10).
+/// It cannot harm an honest user until the deposit spine exists and someone
+/// deliberately switches it from observed to enforced.
+pub fn assess(candidate: Derived, stored: []const Token) u32 {
+    return escalationFactor(scoreOf(countMatches(candidate, stored)));
+}
+
 // ── Tests: the pure core, no Io, no allocator ──
 
 const test_salt = [_]u8{0x5A} ** 32;
@@ -670,4 +831,144 @@ fn tokenOf(d: Derived, kind: SignalKind) ?u64 {
         if (t.kind == kind) return t.value;
     }
     return null;
+}
+
+/// Test helper: flatten N derived enrollments into one store-shaped slice.
+fn storeOf(buf: []Token, derived: []const Derived) []Token {
+    var n: usize = 0;
+    for (derived) |d| {
+        for (d.tokens[0..d.len]) |t| {
+            buf[n] = t;
+            n += 1;
+        }
+    }
+    return buf[0..n];
+}
+
+// ── G2 tests ──
+
+test "a lone first enrollment matches nothing and pays base rate" {
+    const d = derive(testObservation(), test_salt);
+    const counts = countMatches(d, &[_]Token{});
+    for (counts.per_signal) |n| try std.testing.expectEqual(@as(u32, 0), n);
+
+    const s = scoreOf(counts);
+    try std.testing.expectEqual(@as(u32, 0), s.total);
+    try std.testing.expectEqual(@as(u32, 100), escalationFactor(s));
+}
+
+test "countMatches counts per signal and never across signals" {
+    const a = derive(testObservation(), test_salt);
+
+    // Three more enrollments from the same address, all in different windows
+    // and on different platforms: only ip_shared should accumulate.
+    var others: [3]Derived = undefined;
+    for (&others, 0..) |*o, i| {
+        var obs = testObservation();
+        obs.enrolled_at += timing_window_secs * @as(i64, @intCast(i + 5));
+        obs.platform = .desktop_windows;
+        obs.graph_shape = 0;
+        obs.pow_solve_ms = 0;
+        o.* = derive(obs, test_salt);
+    }
+    var buf: [signal_count * 3]Token = undefined;
+    const counts = countMatches(a, storeOf(&buf, &others));
+
+    try std.testing.expectEqual(@as(u32, 3), counts.per_signal[@intFromEnum(SignalKind.ip_shared)]);
+    try std.testing.expectEqual(@as(u32, 3), counts.per_signal[@intFromEnum(SignalKind.ip_type)]);
+    try std.testing.expectEqual(@as(u32, 0), counts.per_signal[@intFromEnum(SignalKind.timing)]);
+    try std.testing.expectEqual(@as(u32, 0), counts.per_signal[@intFromEnum(SignalKind.platform)]);
+    try std.testing.expectEqual(@as(u32, 0), counts.per_signal[@intFromEnum(SignalKind.graph)]);
+}
+
+test "THE WEAK-TIER CAP: weak signals alone never escalate, at any scale" {
+    // The honest first-timer: a real person on a VPN, behind carrier NAT,
+    // signing up during a launch spike. They share IP type, shared IP, and
+    // platform with an enormous number of strangers — and nothing else.
+    // This must cost them exactly the base rate.
+    var counts: MatchCounts = .{ .per_signal = .{0} ** signal_count };
+    counts.per_signal[@intFromEnum(SignalKind.ip_type)] = 50_000;
+    counts.per_signal[@intFromEnum(SignalKind.ip_shared)] = 50_000;
+    counts.per_signal[@intFromEnum(SignalKind.platform)] = 50_000;
+
+    const s = scoreOf(counts);
+    try std.testing.expect(s.total > escalation_threshold); // enormous...
+    try std.testing.expectEqual(@as(u32, 0), s.carrier_total); // ...but no carrier
+    try std.testing.expectEqual(@as(u32, 100), escalationFactor(s)); // base rate
+
+    // One carrier match flips it: the weak votes now count as support.
+    counts.per_signal[@intFromEnum(SignalKind.timing)] = 1;
+    const with_carrier = scoreOf(counts);
+    try std.testing.expect(with_carrier.carrier_total > 0);
+    try std.testing.expect(escalationFactor(with_carrier) > 100);
+}
+
+test "a single strong overlap with one account is coincidence, not coordination" {
+    var counts: MatchCounts = .{ .per_signal = .{0} ** signal_count };
+    counts.per_signal[@intFromEnum(SignalKind.timing)] = 1; // 80 < threshold 100
+    try std.testing.expectEqual(@as(u32, 100), escalationFactor(scoreOf(counts)));
+
+    counts.per_signal[@intFromEnum(SignalKind.graph)] = 1; // +100 → 180
+    try std.testing.expect(escalationFactor(scoreOf(counts)) > 100);
+}
+
+test "escalation is monotonic in match count" {
+    var last: u32 = 0;
+    var n: u32 = 0;
+    while (n < 40) : (n += 1) {
+        var counts: MatchCounts = .{ .per_signal = .{0} ** signal_count };
+        counts.per_signal[@intFromEnum(SignalKind.timing)] = n;
+        counts.per_signal[@intFromEnum(SignalKind.pow_class)] = n;
+        const f = escalationFactor(scoreOf(counts));
+        try std.testing.expect(f >= last);
+        last = f;
+    }
+    try std.testing.expect(last > 100); // it did actually climb
+}
+
+test "scoring saturates rather than wrapping on adversarial counts" {
+    // A wrapped sum would turn a colossal cluster into a LOW score — exactly
+    // the failure an attacker would engineer for. Saturation makes the worst
+    // case "maximally escalated", never "clean".
+    const counts: MatchCounts = .{ .per_signal = .{std.math.maxInt(u32)} ** signal_count };
+    const s = scoreOf(counts);
+    try std.testing.expectEqual(std.math.maxInt(u32), s.total);
+    try std.testing.expect(s.carrier_total > 0);
+    try std.testing.expect(escalationFactor(s) > 100);
+
+    // And countMatches saturates too, rather than wrapping to zero matches.
+    const d = derive(testObservation(), test_salt);
+    const one = tokenOf(d, .ip_shared).?;
+    var many: [8]Token = undefined;
+    for (&many) |*t| t.* = .{ .value = one, .kind = .ip_shared };
+    const c = countMatches(d, &many);
+    try std.testing.expectEqual(@as(u32, 8), c.per_signal[@intFromEnum(SignalKind.ip_shared)]);
+}
+
+test "assess: a farm bursting from one machine escalates; a stranger does not" {
+    // Ten accounts, same window, same address, same platform, same PoW band.
+    var farm: [10]Derived = undefined;
+    for (&farm, 0..) |*f, i| {
+        var obs = testObservation();
+        obs.enrolled_at += @intCast(i * 3); // seconds apart — same bucket
+        f.* = derive(obs, test_salt);
+    }
+    var buf: [signal_count * 10]Token = undefined;
+    const store = storeOf(&buf, &farm);
+
+    // The eleventh account from that same machine.
+    var next_obs = testObservation();
+    next_obs.enrolled_at += 40;
+    try std.testing.expect(assess(derive(next_obs, test_salt), store) > 100);
+
+    // An unrelated person: different address, different window, different
+    // hardware, different platform. They share only the IP *type* (both
+    // residential) — a weak signal, so the cap holds them at base rate.
+    var stranger = testObservation();
+    stranger.enrolled_at += timing_window_secs * 900;
+    stranger.ip = [_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    stranger.pow_solve_ms = 180;
+    stranger.platform = .mobile_ios;
+    stranger.graph_shape = 0;
+    try std.testing.expectEqual(@as(u32, 100), assess(derive(stranger, test_salt), store));
 }

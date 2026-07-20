@@ -181,6 +181,31 @@ pub fn build(b: *std.Build) void {
     const relay_test_step = b.step("test-relay", "Run the relay's offline unit tests (leak-checked)");
     relay_test_step.dependOn(&run_relay_tests.step);
 
+    // The Constellation Gate — the enrollment trust boundary
+    // (CONSTELLATION_GATE_DESIGN.md §9). Like the AppView and relay, a separate
+    // headless binary that binds LOOPBACK only and cross-compiles to the box:
+    // `zig build -Dtarget=x86_64-linux gate`.
+    const gate_mod = b.createModule(.{
+        .root_source_file = b.path("src/gate_main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const gate_exe = b.addExecutable(.{
+        .name = "zat4-gate",
+        .root_module = gate_mod,
+    });
+    b.installArtifact(gate_exe);
+    const gate_run = b.addRunArtifact(gate_exe);
+    gate_run.step.dependOn(b.getInstallStep());
+    if (b.args) |args| gate_run.addArgs(args);
+    const gate_step = b.step("gate", "Run the Constellation Gate (enrollment trust boundary)");
+    gate_step.dependOn(&gate_run.step);
+
+    const gate_tests = b.addTest(.{ .root_module = gate_mod });
+    const run_gate_tests = b.addRunArtifact(gate_tests);
+    const gate_test_step = b.step("test-gate", "Run the Constellation Gate's offline unit tests (leak-checked)");
+    gate_test_step.dependOn(&run_gate_tests.step);
+
     const unit_tests = b.addTest(.{ .root_module = exe_mod });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run offline unit tests (leak-checked)");
@@ -189,6 +214,7 @@ pub fn build(b: *std.Build) void {
     // `zig build test` covers the whole project including the servers.
     test_step.dependOn(&run_appview_tests.step);
     test_step.dependOn(&run_relay_tests.step);
+    test_step.dependOn(&run_gate_tests.step);
 
     // Mobile (MOBILE_ROADMAP M-And.0): the C-ABI seam as an Android shared
     // library. v0 is pure Zig — no libc, hence no fonts/EGL yet; the
