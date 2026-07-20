@@ -42,8 +42,7 @@ const membership_record = @import("membership_record.zig"); // the on-network Za
 const config = @import("config.zig"); // the PDS host new accounts are minted on
 const netguard = @import("../core/netguard.zig"); // pure hostOf() — is this PDS ours?
 const lexicon = @import("../core/lexicon.zig");
-const pow = @import("../core/pow.zig");
-const pow_shell = @import("pow.zig");
+const gate_client = @import("gate_client.zig");
 const glyph_field = @import("../core/glyph_field.zig");
 const clock_shell = @import("clock.zig");
 
@@ -381,14 +380,16 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         // loop drives it with, so the two cannot drift apart.
         stepMotion(&state, frame_ns);
 
-        // Proof-of-work gate (REAL): a background worker runs pow.solve. The ring
+        // The Constellation Gate exchange (§9): a background worker asks the
+        // server for a challenge, does the memory-hard work, and redeems it for
+        // the invite code account creation needs. The ring
         // CREEPS (a decelerating exponential of elapsed time) the whole way — the
         // motion is spread across the entire unknown solve, slowing as it climbs,
         // never quite reaching the top — so it always reads as "working," not a
         // fast fill then a dead stall near the end. It honors a min floor and only
         // finishes + seals when the genuine solution actually lands.
         if (state.step == .verifying) {
-            if (!powjob.active) startPow(&powjob, &state, io);
+            if (!powjob.active) startPow(&powjob, &state, gpa, io, env);
             const el: f32 = @floatFromInt(frame_ns -| state.pow_start_ns);
             const floor_ns: f32 = 3_200_000_000.0;
             const solved = powjob.done.load(.acquire);
@@ -452,7 +453,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
             if (state.branch == .new) {
                 if (state.seal_t >= 1.0 and !signup_attempted) {
                     signup_attempted = true;
-                    if (createZatAccount(gpa, io, env, &state)) |sess| {
+                    if (createZatAccount(gpa, io, env, &state, issuedInvite(&powjob))) |sess| {
                         stopPow(&powjob);
                         return sess; // signed up → drop into the feed
                     }
@@ -1207,58 +1208,153 @@ fn genRecoveryKey(s: *State, io: std.Io) void {
     s.recovery_len = n;
 }
 
-// ── REAL proof-of-work (background worker) ──────────────────────────────────
+// ── Enrollment proof-of-work (background worker) ────────────────────────────
 //
-// [CALIBRATE] enrollment difficulty: memory is FIXED + phone-safe (the one knob
-// that can OOM a device — never adaptive, per ANTIBOT_DESIGN); only the attempt
-// target (leading_zero_bits) would adapt in production. Here, tuned for a few
-// visible seconds on a dev box. No-email pays more (the design's invisible tax).
-// Production swaps these for a SERVER-ISSUED, risk-adaptive difficulty.
-const enroll_pow: pow.Difficulty = .{ .mem_kib = 32 * 1024, .iters = 1, .lanes = 1, .leading_zero_bits = 6 };
-const enroll_pow_hard: pow.Difficulty = .{ .mem_kib = 32 * 1024, .iters = 1, .lanes = 1, .leading_zero_bits = 7 };
+// The local difficulty constants that used to live here are GONE. They were the
+// prototype's self-imposed tax: the client picked its own numbers, solved them,
+// and discarded the answer, which a modified client could skip entirely. The
+// difficulty now comes down the wire from the Constellation Gate, calibrated
+// against real hardware (`core/pow.zig`'s heavy tier) and validated + bounded
+// client-side before any work starts (`shell/gate_client.zig`). "Production
+// swaps these for a SERVER-ISSUED difficulty" — this is that swap.
 
-/// The background PoW job. Lives in `run` (NOT in `State`, which gets reset),
-/// so the worker thread + its atomics outlive a state reset cleanly.
+/// The background enrollment job. Lives in `run` (NOT in `State`, which gets
+/// reset), so the worker thread + its atomics outlive a state reset cleanly.
+///
+/// ── What this job now does (Constellation Gate §9) ──
+/// It used to be a client-side self-imposed PoW: the app invented its own
+/// challenge, solved it, and threw the answer away — which a modified client
+/// could simply skip. It now runs the real gate exchange: ask the server for a
+/// challenge, do the memory-hard work, and redeem it for the invite code that
+/// `createAccount` needs. The work is the same shape to the user (a few seconds
+/// of visible progress); the difference is that a server issued it and is
+/// watching, and that the result is a credential rather than a discarded nonce.
+///
+/// The name is kept because `tui.zig` drives it as `startPow`/`stopPow` and the
+/// user-facing meaning ("prove some work before you may join") is unchanged.
 pub const PowJob = struct {
     // A7.2: cold struct (one live instance, holds a thread + lifecycle), size guard waived.
     thread: ?std.Thread = null,
     cancel: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
-    ok: bool = false, // solution verified (informational; completion gates on `done`)
-    solution: pow.Solution = .{ .nonce = 0 },
-    challenge: pow.Challenge = undefined,
-    difficulty: pow.Difficulty = enroll_pow,
+    ok: bool = false, // an invite code was obtained (completion still gates on `done`)
     active: bool = false, // a job is running for this verifying session
+
+    /// The invite code the gate issued, owned by `gpa`. Read after `done`
+    /// (release/acquire fences the plain write). Freed by `stopPow`.
+    invite_code: ?[]u8 = null,
+    /// Why the exchange failed, when it did. Kept so the failure is legible in
+    /// the log rather than surfacing later as an opaque createAccount refusal.
+    failure: ?gate_client.Failure = null,
+
+    // Worker inputs, set by `startPow` before the thread is spawned.
+    gpa: std.mem.Allocator = undefined,
+    io: std.Io = undefined,
+    environ: ?*const std.process.Environ.Map = null,
+    gate_url_buf: [256]u8 = undefined,
+    gate_url_len: usize = 0,
 };
 
-/// Worker body: the genuine memory-hard solve, off the UI thread. Uses the
-/// thread-safe page allocator for Argon2's buffers (no contention with the main
-/// render allocator). Publishes the result via `done` (release/acquire fences
-/// the plain `solution`/`ok` writes).
-fn powWorker(job: *PowJob, io: std.Io) void {
-    const a = std.heap.page_allocator;
-    if (pow_shell.solve(a, io, job.challenge, job.difficulty, &job.cancel)) |sol| {
-        job.solution = sol;
-        job.ok = pow_shell.verify(a, io, job.challenge, sol, job.difficulty) catch false;
-    } else |_| {
-        job.ok = false; // canceled or errored — don't hang the UI
+/// Worker body: the whole gate exchange, off the UI thread — two network round
+/// trips plus the memory-hard solve. Publishes via `done` (release/acquire
+/// fences the plain `invite_code`/`ok` writes).
+///
+/// Allocation uses a thread-safe allocator, never the single-threaded render
+/// allocator (same posture the membership worker uses).
+fn powWorker(job: *PowJob) void {
+    const gate_url = job.gate_url_buf[0..job.gate_url_len];
+
+    switch (gate_client.exchange(job.gpa, job.io, job.environ, gate_url, &job.cancel)) {
+        .ok => |code| {
+            job.invite_code = @constCast(code);
+            job.ok = true;
+        },
+        .failed => |f| {
+            defer if (f.refusal.len > 0) job.gpa.free(f.refusal);
+            job.failure = f.why;
+            job.ok = false;
+            if (f.why != .canceled) {
+                std.debug.print(
+                    "[enroll] gate exchange failed: {t} {s} ({s})\n",
+                    .{ f.why, f.refusal, gate_url },
+                );
+            }
+
+            // ── BOOTSTRAP FALLBACK, and it is deliberately loud ──
+            // While the gate is not yet routed publicly, a hand-distributed
+            // ZAT_INVITE_CODE is still how a developer signs up. Falling back
+            // to it means this enrollment was NOT observed by the
+            // constellation — which is exactly the bypass the gate exists to
+            // close, so it announces itself every time.
+            // MUST BE REMOVED before the gate is the real front door.
+            if (f.why != .canceled) {
+                if (job.environ) |e| {
+                    if (e.get("ZAT_INVITE_CODE")) |env_code| {
+                        if (job.gpa.dupe(u8, env_code)) |owned| {
+                            job.invite_code = owned;
+                            job.ok = true;
+                            std.debug.print(
+                                "[enroll] ⚠ GATE BYPASSED — using ZAT_INVITE_CODE. " ++
+                                    "This signup was NOT observed by the constellation.\n",
+                                .{},
+                            );
+                        } else |_| {}
+                    }
+                }
+            }
+        },
     }
     job.done.store(true, .release);
 }
 
-/// Spawn the solve for this verifying session. The challenge seed binds to the
-/// account (the would-be handle) so the work proves effort for THIS entry.
-pub fn startPow(job: *PowJob, s: *State, io: std.Io) void {
-    const who = if (s.final_handle_len > 0) s.final_handle[0..s.final_handle_len] else "zat4-enroll";
-    const seed = pow.seedForPost(who, 0);
-    job.challenge = pow.challengeFor(seed, .heavy);
-    job.difficulty = if (s.branch == .new and !s.use_email) enroll_pow_hard else enroll_pow;
+/// Spawn the gate exchange for this verifying session.
+///
+/// The challenge is no longer derived locally — the SERVER issues it, which is
+/// what makes the work an enforced control rather than a self-imposed one. The
+/// seed, the difficulty and the TTL all come down the wire.
+pub fn startPow(
+    job: *PowJob,
+    s: *State,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+) void {
+    _ = s; // the gate binds its own seed; the handle is no longer an input
+
+    freeInvite(job);
+    job.failure = null;
+    job.gpa = gpa;
+    job.io = io;
+    job.environ = environ;
+
+    const url = if (environ) |e|
+        e.get(gate_client.gate_url_env) orelse gate_client.default_gate_url
+    else
+        gate_client.default_gate_url;
+    const n = @min(url.len, job.gate_url_buf.len);
+    @memcpy(job.gate_url_buf[0..n], url[0..n]);
+    job.gate_url_len = n;
+
     job.cancel.store(false, .monotonic);
     job.done.store(false, .monotonic);
     job.ok = false;
     job.active = true;
-    job.thread = std.Thread.spawn(.{}, powWorker, .{ job, io }) catch null;
+    job.thread = std.Thread.spawn(.{}, powWorker, .{job}) catch null;
     if (job.thread == null) job.done.store(true, .release); // spawn failed → complete anyway
+}
+
+/// Release the issued code. Called before a new exchange and on teardown, so a
+/// re-entered signup cannot reuse a code from an abandoned attempt.
+fn freeInvite(job: *PowJob) void {
+    if (job.invite_code) |c| {
+        job.gpa.free(c);
+        job.invite_code = null;
+    }
+}
+
+/// The invite code from the finished exchange, or null. Read after `done`.
+pub fn issuedInvite(job: *const PowJob) ?[]const u8 {
+    return job.invite_code;
 }
 
 /// Cancel + join any in-flight solve (cooperative; the worker checks `cancel`
@@ -1269,6 +1365,7 @@ pub fn stopPow(job: *PowJob) void {
         th.join();
         job.thread = null;
     }
+    if (job.invite_code != null) freeInvite(job);
     job.active = false;
 }
 
@@ -1709,8 +1806,9 @@ fn reset(s: *State) void {
 
 /// Mint the NEW `.zat4.com` account on the PDS (slice 3b-#1). The minted
 /// credential is the account password; the handle is `<username>.zat4.com`; the
-/// invite code comes from `ZAT_INVITE_CODE` (the PDS is invite-gated while
-/// bootstrapping). Returns the gpa-owned session on success, or null on a refusal
+/// invite code is EARNED: it comes from the Constellation Gate exchange run by
+/// `PowJob` (§9), passed in by the caller. The PDS is invite-gated, so this code
+/// is what makes the account creation succeed at all. Returns the gpa-owned session on success, or null on a refusal
 /// / transport error (printed). Email path for now; the no-email / recovery-DID
 /// binding is a later sub-slice. A transient arena holds the request strings.
 /// The Terms-of-Service version recorded in the consent at enrollment. PLACEHOLDER
@@ -1718,7 +1816,13 @@ fn reset(s: *State) void {
 /// string so the membership record can pin which version was agreed to.
 pub const tos_version_placeholder = "draft-2026-06";
 
-pub fn createZatAccount(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, s: *State) ?auth.Session {
+pub fn createZatAccount(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: ?*const std.process.Environ.Map,
+    s: *State,
+    invite: ?[]const u8,
+) ?auth.Session {
     if (!s.has_pw) return null;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -1729,7 +1833,6 @@ pub fn createZatAccount(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.pro
     if (uname.len == 0) return null;
     const handle = std.fmt.bufPrint(&hbuf, "{s}.zat4.com", .{uname}) catch return null;
     const email: ?[]const u8 = if (s.use_email and s.email.len > 0) tfView(&s.email) else null;
-    const invite: ?[]const u8 = if (env) |e| e.get("ZAT_INVITE_CODE") else null;
     const pds = config.fromEnv(env).pds_url;
 
     const outcome = auth.createAccount(gpa, arena, io, env, pds, lexicon.CreateAccountInput{

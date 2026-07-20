@@ -10257,6 +10257,11 @@ const CreateJob = struct {
     active: bool = false,
     /// The result. Null = it failed, and the card says so rather than hanging.
     session: ?auth.Session = null,
+    /// The invite code the Constellation Gate issued for THIS signup (§9).
+    /// Borrowed from `genroll_pow`, which owns it and frees it in `stopPow` —
+    /// the gate job outlives this one, so the borrow is safe for the worker's
+    /// whole life. The PDS refuses account creation without it.
+    invite: ?[]const u8 = null,
 };
 
 /// The network leg of a maintenance directory read, on its own thread. Reads ONE
@@ -11125,7 +11130,9 @@ fn deviceLabel(env: ?*const std.process.Environ.Map) []const u8 {
 }
 
 fn createWorker(job: *CreateJob, gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, st: *enroll_run.State) void {
-    job.session = enroll_run.createZatAccount(gpa, io, env, st);
+    // The invite code was EARNED by the gate exchange this signup just ran
+    // (Constellation Gate §9); without it the PDS refuses account creation.
+    job.session = enroll_run.createZatAccount(gpa, io, env, st, job.invite);
     job.done.store(true, .release);
 }
 
@@ -11164,7 +11171,7 @@ fn enrollVerify(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.proc
     }
 
     if (!rs.genroll_pow.active) {
-        enroll_run.startPow(&rs.genroll_pow, s, io);
+        enroll_run.startPow(&rs.genroll_pow, s, gpa, io, env);
         s.pow_start_ns = frame_ns;
     }
     const el: f32 = @floatFromInt(frame_ns -| s.pow_start_ns);
@@ -11219,6 +11226,10 @@ fn enrollVerify(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.proc
     if (s.seal_t >= 1.0 and !rs.genroll_create.active and rs.genroll_create.thread == null and s.branch == .new) {
         rs.genroll_create.done.store(false, .monotonic);
         rs.genroll_create.session = null;
+        // Carry across the code the gate exchange just earned. Read after the
+        // gate job's `done` (which `seal_t` reaching 1.0 implies), so the plain
+        // field write is fenced.
+        rs.genroll_create.invite = enroll_run.issuedInvite(&rs.genroll_pow);
         rs.genroll_create.thread = std.Thread.spawn(.{}, createWorker, .{ &rs.genroll_create, gpa, io, env, s }) catch null;
         rs.genroll_create.active = rs.genroll_create.thread != null;
         if (!rs.genroll_create.active) s.step = .done; // could not even start: say so
