@@ -9326,6 +9326,53 @@ fn backNavigate(rs: *RunState) bool {
         rs.gchat_sel = null; // the phone chat thread pops to the conversation list
         return true;
     }
+    // ── OVERLAYS CLOSE BEFORE PAGES MOVE ──────────────────────────────────
+    // Back "worked on some pages but not others" (owner, on-device). The reason:
+    // everything above dispatches on `gscreen`, but an OVERLAY is not a screen —
+    // it is a FLAG over one. So on any overlay, back fell past every case here,
+    // reached the root test, concluded "you are at the root", and armed
+    // exit-the-app. Reading the help page and swiping back closed the whole app.
+    //
+    // Ordered TOPMOST first, because they nest: a picker sits over a sheet, a
+    // sheet over a page. Each closes exactly one layer, which is what back means.
+    //
+    // LAW (joins the new-overlay checklist): a new overlay must draw in the nav
+    // tile, gate the SDF passes, join the rebuild signature, consume input — AND
+    // be listed here. An overlay the back handler cannot see is an overlay that
+    // closes the app.
+    if (rs.gsettings_picking != 255) {
+        rs.gsettings_picking = 255; // the choice popover
+        return true;
+    }
+    if (rs.gcmenu.open) {
+        rs.gcmenu = .{}; // the message / conversation context menu
+        return true;
+    }
+    if (rs.grepost_menu != null) {
+        rs.grepost_menu = null;
+        return true;
+    }
+    if (rs.gpay_open) {
+        rs.gpay_open = false; // the send-money sheet
+        return true;
+    }
+    if (rs.grecv_open) {
+        rs.grecv_open = false; // the receive-address sheet
+        return true;
+    }
+    if (rs.gdev_help) {
+        rs.gdev_help = false; // "How Zat Chat works"
+        return true;
+    }
+    if (rs.gchat_consent_open) {
+        rs.gchat_consent_open = false; // the one-time privacy setup
+        return true;
+    }
+    if (rs.gpu_state) |*gsd| if (gsd.drawer_want) {
+        gsd.drawer_want = false; // the phone nav drawer
+        return true;
+    };
+
     // THE ROOT differs by product: Zat4's is the feed, Zat Chat's is the
     // conversation list. Backing out of Settings in the chat app used to land on
     // the Zat4 timeline — a screen with no nav row to leave by, so the way out
