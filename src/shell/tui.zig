@@ -973,6 +973,10 @@ const RunState = struct {
     /// a NEW settings mutation site cannot forget to persist — there is nothing
     /// for it to remember to call.
     prefs_sig: u64,
+    /// The persisted transcript has been read off disk. Set by the early restore
+    /// (or by bring-up, if it got there first), and read by the Messages surface
+    /// so it shows the LIST rather than a loading mark.
+    gchat_hist_restored: bool,
     gsettings_picking: u8,
     zone_catalog: std.ArrayList(feed_view.ZoneCard),
     on_browse_prev: bool,
@@ -1791,6 +1795,11 @@ fn initRunState(
     // The last state written to disk. Seeded from the state we just loaded so a
     // launch that changes nothing writes nothing.
     rs.prefs_sig = prefsSignature(rs);
+    rs.gchat_hist_restored = false;
+    // THE CHATS ARE ON DISK. Read them now, on the way up, so the conversation
+    // list is on screen from the first frame instead of behind a spinner waiting
+    // for crypto and a directory fetch it never needed.
+    if (dev_chat and session.did.len > 0) chatRestoreHistoryEarly(rs, gpa, environ, session.did);
     rs.gsettings_picking = 255;
     // Zones BROWSE catalog (`screen_zones_browse`): gpa-owned zone cards (the
     // display tag duped + post count), (re)fetched from `listTags` on entering
@@ -8599,6 +8608,14 @@ pub fn mobileClipFeed(mr: *MobileRun, bytes: []const u8) void {
 /// pet name — not just the composer (the "none of the keyboard stuff works"
 /// on-device finding: only compose mode ever summoned it). The activity polls
 /// this per lap and shows/hides the IME on the transition.
+/// Is the app drawing on a LIGHT canvas? The activity polls this each lap and
+/// flips the system bars' appearance on the transition — without it the status
+/// bar keeps its light-on-dark icons and the clock/battery vanish into a white
+/// page, which is what Zat Chat's light default made everyday rather than rare.
+pub fn mobileLightMode(mr: *MobileRun) bool {
+    return toggleOn(mr.rs.toggle_bits, settings_view.act_light);
+}
+
 pub fn mobileImeWanted(mr: *MobileRun) bool {
     // The Zat4 keyboard replaces the system IME entirely while enabled — the
     // settings toggle (Appearance → "Zat4 keyboard") swaps back.
@@ -9896,6 +9913,37 @@ fn chatSend(gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, st
         chatLog("[chat] SEND FAILED -> {s}: {s}", .{ peer_did, @errorName(err) });
 }
 
+/// Read the persisted transcript from DISK, before any crypto or network.
+///
+/// The conversation list is LOCAL data. It was being restored inside the chat
+/// bring-up — after the E2EE session, which reads the device directory over the
+/// network — so opening the app showed "Loading your chats…" while it waited on
+/// work the list does not depend on. The history blob's key comes from the OS
+/// keystore keyed by DID, and the DID is known the moment the session is: there
+/// was never a reason to wait.
+///
+/// Only the READ moves. Mirroring the session's peers into the store and the
+/// heal-persist still happen at bring-up, because those genuinely need `st`.
+/// Idempotent: sets `gchat_hist_restored` so bring-up does not read twice.
+fn chatRestoreHistoryEarly(rs: *RunState, gpa: Allocator, env: ?*const std.process.Environ.Map, did: []const u8) void {
+    if (rs.gchat_hist_restored) return;
+    var path_buf: [512]u8 = undefined;
+    const path = cache_shell.chatHistoryPath(&path_buf, env, did) orelse return;
+    const blob = cache_shell.loadChatHistoryAt(gpa, path, did) orelse return;
+    defer {
+        std.crypto.secureZero(u8, blob);
+        gpa.free(blob);
+    }
+    // A missing or corrupt blob is a COLD START, never a half-restore, and never
+    // a write — the heal-guard's rule that a failed read must not overwrite the
+    // blob it failed to read applies here too (we simply do not mark it done).
+    if (chat_core.deserializeStore(gpa, blob)) |restored| {
+        chat_core.deinitStore(gpa, &rs.gchat_store);
+        rs.gchat_store = restored;
+        rs.gchat_hist_restored = true;
+    } else |_| {}
+}
+
 /// Bring the whole chat stack up: the E2EE session (anchor + keyPackage +
 /// restored MLS groups), the relay link, the restored transcript. Called once
 /// at startup, and AGAIN if the user chooses "set up chat fresh here" (A3) —
@@ -10044,7 +10092,7 @@ fn chatBringUpFinish(
     // still recovers the conversation LIST from the MLS groups; only the
     // transcript would be gone.
     var hist_path_buf: [512]u8 = undefined;
-    if (cache_shell.chatHistoryPath(&hist_path_buf, env, st.my_did)) |hist_path| {
+    if (!rs.gchat_hist_restored) if (cache_shell.chatHistoryPath(&hist_path_buf, env, st.my_did)) |hist_path| {
         if (cache_shell.loadChatHistoryAt(gpa, hist_path, st.my_did)) |blob| {
             defer {
                 std.crypto.secureZero(u8, blob);
@@ -10053,9 +10101,10 @@ fn chatBringUpFinish(
             if (chat_core.deserializeStore(gpa, blob)) |restored| {
                 chat_core.deinitStore(gpa, &rs.gchat_store);
                 rs.gchat_store = restored;
+                rs.gchat_hist_restored = true;
             } else |_| {}
         }
-    }
+    };
     // Mirror restored conversations into the view store so they show on launch
     // (openConversation dedupes by DID, so ones already in the history blob are
     // found, not doubled), then persist once to heal any divergence.
@@ -10741,6 +10790,7 @@ fn chatDevicesOf(rs: *RunState, arena: Allocator) feed_view.ChatDevices {
         else
             .none,
         .help_open = rs.gdev_help,
+        .restored = rs.gchat_hist_restored,
         .consent_open = rs.gchat_consent_open,
         .consent_receipts = rs.gchat_receipts,
         .consent_typing = rs.gchat_typing_on,
@@ -15665,6 +15715,10 @@ fn paintFrameGpu(
         chat_sig ^= @as(u64, @intFromBool(dv.busy)) *% 0x1656_67B1_9E37_79F9;
         chat_sig ^= @as(u64, @intFromBool(dv.help_open)) *% 0x8EBC_6AF0_9C88_C6E3;
         chat_sig ^= @as(u64, @intFromBool(dv.connecting)) *% 0x6C62_2726_93D2_35B1;
+        // THE REBUILD LAW: `restored` decides whether the list or the loading mark
+        // draws, so it is state the screen renders FROM — without this the verts
+        // go stale and the spinner outlives the data it was waiting for.
+        chat_sig ^= @as(u64, @intFromBool(dv.restored)) *% 0xB5F8_3D21_7A4C_1E9D;
         chat_sig ^= @as(u64, dv.pending.len) *% 0xF29C_511C_8E3D_45A7;
         chat_sig ^= std.hash.Wyhash.hash(0x3B8F_55D1, dv.error_line);
     }

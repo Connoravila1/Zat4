@@ -9405,6 +9405,9 @@ pub const ChatDevices = struct {
     /// replaces the column, so it cannot bleed through anything or eat a tap it
     /// did not mean to).
     help_open: bool = false,
+    /// The persisted transcript has been read off disk. Until it has, an empty
+    /// list means "not known yet"; after it, an empty list means "no chats".
+    restored: bool = false,
     /// Chat is coming up right now (the bring-up worker is in flight). Shown as a
     /// live "Connecting…" state ONLY when there is nothing else to show yet, so a
     /// first-run or empty account never sits on a blank column that reads as broken
@@ -10395,7 +10398,12 @@ pub fn layoutChat(
     // mark IN the list area, not a screen takeover, so it reads as "this one part is
     // taking a moment", never as a broken page (the owner's note). It never shows
     // once there is a real conversation to draw. ──
-    if (devices.connecting and list.len == 0) {
+    // Only while the transcript has NOT been read yet. It used to be "connecting
+    // and empty", which meant a returning viewer watched a spinner during a
+    // network bring-up their conversation list does not depend on — and a viewer
+    // with genuinely no chats was shown "loading" instead of the empty state,
+    // which is a different (and truer) thing to say.
+    if (devices.connecting and list.len == 0 and !devices.restored) {
         try drawChatLoading(gpa, dl, e, x0, w, height, insets, accent, devices.t);
         return height;
     }

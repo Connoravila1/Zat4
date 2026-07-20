@@ -387,6 +387,45 @@ fn deliverIntentRedirect(activity: *Activity) bool {
 /// (SHOW_FORCED — the plain flag is a no-op without a focused editor).
 /// Render thread; attach/detach like the browser hop. Failures log and
 /// no-op — typing just needs a relaunch, never a crash (E2/E4).
+/// Set the SYSTEM BARS' appearance to match the app's canvas.
+///
+/// Android draws the status bar's clock, battery and signal in one of two
+/// palettes, and it does not look at what is behind them — the app declares it.
+/// The default is light-on-dark, which is right for Zat4 and wrong the moment a
+/// light canvas is underneath: the whole strip vanishes into the page, which is
+/// exactly what Zat Chat's light default made the everyday case.
+///
+/// API 30+ path only (`WindowInsetsController.setSystemBarsAppearance`), the
+/// same controller `imeSetVisible` already dials. A device without it simply
+/// keeps the default bars — a wrong-coloured clock is a blemish, never a reason
+/// to fail a frame (E4), so every step here bails quietly.
+fn setLightSystemBars(activity: *Activity, light: bool) void {
+    // APPEARANCE_LIGHT_STATUS_BARS (1<<3) | APPEARANCE_LIGHT_NAVIGATION_BARS
+    // (1<<4) — "light BARS" in the framework's naming means DARK ICONS, i.e.
+    // the set to use when the app's own surface is light.
+    const appearance_light_bars: i32 = (1 << 3) | (1 << 4);
+
+    const vm: JavaVm = @ptrCast(@alignCast(activity.vm));
+    var env: JniEnv = undefined;
+    if (@as(AttachFn, @ptrCast(@alignCast(vm.*.slots[vm_attach_current_thread].?)))(vm, &env, null) != 0) return;
+    defer _ = @as(DetachFn, @ptrCast(@alignCast(vm.*.slots[vm_detach_current_thread].?)))(vm);
+
+    const get_window = jniMethod(env, activity.clazz, "getWindow", "()Landroid/view/Window;") orelse return;
+    const window = jniCallObj(env, activity.clazz, get_window, &no_args) orelse return;
+    const get_decor = jniMethod(env, window, "getDecorView", "()Landroid/view/View;") orelse return;
+    const decor = jniCallObj(env, window, get_decor, &no_args) orelse return;
+    const gic = jniMethod(env, decor, "getWindowInsetsController", "()Landroid/view/WindowInsetsController;") orelse return;
+    const ctrl = jniCallObj(env, decor, gic, &no_args) orelse return;
+    const set_app = jniMethod(env, ctrl, "setSystemBarsAppearance", "(II)V") orelse return;
+    // The MASK is always both bits: it says which bits this call owns, so
+    // turning light mode OFF clears them rather than leaving them stuck on.
+    jniFn(env, jni_call_void_method_a, CallVoidMethodAFn)(env, ctrl, set_app, &[_]jvalue{
+        .{ .i = if (light) appearance_light_bars else 0 },
+        .{ .i = appearance_light_bars },
+    });
+    _ = jniFailed(env);
+}
+
 fn imeSetVisible(activity: *Activity, show: bool) void {
     const vm: JavaVm = @ptrCast(@alignCast(activity.vm));
     var env: JniEnv = undefined;
@@ -797,6 +836,9 @@ fn renderThread() void {
     var feed_parked = seam.zat_feed_parked(ctx);
     var feed_errs: u32 = 0;
     var ime_shown = false;
+    // Mirrors `ime_shown`: the last appearance pushed to the system bars, so the
+    // JNI hop happens on change rather than every lap.
+    var light_bars: bool = false;
     var last_ns: u64 = clock.monotonicNanos();
     if (app.reoffer_login) seam.zat_login_reoffer(ctx); // fresh instance, waiting flow → browser again
 
@@ -952,6 +994,14 @@ fn renderThread() void {
             if (want_ime != ime_shown) {
                 if (app.activity) |act| imeSetVisible(act, want_ime);
                 ime_shown = want_ime;
+            }
+            // The system bars follow the canvas. Polled like the IME and applied
+            // only on the TRANSITION, so a settings toggle reaches the status bar
+            // without a relaunch and a steady frame costs nothing.
+            const want_light = seam.zat_light_mode(ctx);
+            if (want_light != light_bars) {
+                if (app.activity) |act| setLightSystemBars(act, want_light);
+                light_bars = want_light;
             }
             // The gesture system's threshold ticks (drawer latch,
             // pull-to-refresh arm) land as one taptic each.

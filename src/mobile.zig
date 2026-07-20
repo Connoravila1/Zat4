@@ -1115,6 +1115,15 @@ pub export fn zat_ime_wanted(ctx_ptr: ?*anyopaque) bool {
     return tui.mobileImeWanted(f.run);
 }
 
+/// Is the frame drawing light? The activity polls this each lap and sets the
+/// system bars' appearance on the transition.
+pub export fn zat_light_mode(ctx_ptr: ?*anyopaque) bool {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return false));
+    if (comptime !mobile_config.have_gpu) return false;
+    const f = if (ctx.feed) |*ff| ff else return false;
+    return tui.mobileLightMode(f.run);
+}
+
 /// Stop the feed and persist (store + rotated tokens). Safe without a start.
 pub export fn zat_feed_end(ctx_ptr: ?*anyopaque) void {
     const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return));
