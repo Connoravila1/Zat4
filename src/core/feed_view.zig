@@ -1700,26 +1700,18 @@ fn iconFlask(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, s: i32, c: u3
 /// embedded fonts carry no ₿ glyph, so it is drawn — the composer used to spell
 /// it as a text "B" plus two loose ticks, which drifted apart at every size.
 /// Built from the same `line`/`rect` vocabulary as its siblings, so it scales.
-fn iconBitcoin(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, s: i32, c: u32) !void {
-    const f: f32 = @floatFromInt(s);
-    const st: u8 = @intCast(@max(2, @min(255, fxi(f * 0.09)))); // stroke
-    const l = x + fxi(f * 0.30); // the B's spine
-    const r = x + fxi(f * 0.72);
-    const top = y + fxi(f * 0.20);
-    const mid = y + fxi(f * 0.50);
-    const bot = y + fxi(f * 0.80);
-    try line(gpa, dl, l, top, l, bot, c, st); // spine
-    // The two bowls, squared off — a round bowl reads as a blob at 16px.
-    try line(gpa, dl, l, top, r - fxi(f * 0.06), top, c, st);
-    try line(gpa, dl, r, top + st, r, mid - st, c, st);
-    try line(gpa, dl, l, mid, r - fxi(f * 0.02), mid, c, st);
-    try line(gpa, dl, r + fxi(f * 0.04), mid + st, r + fxi(f * 0.04), bot - st, c, st);
-    try line(gpa, dl, l, bot, r + fxi(f * 0.02), bot, c, st);
-    // The two ticks that make it a currency and not a letter.
-    try line(gpa, dl, x + fxi(f * 0.42), y + fxi(f * 0.08), x + fxi(f * 0.42), top, c, st);
-    try line(gpa, dl, x + fxi(f * 0.58), y + fxi(f * 0.08), x + fxi(f * 0.58), top, c, st);
-    try line(gpa, dl, x + fxi(f * 0.42), bot, x + fxi(f * 0.42), y + fxi(f * 0.92), c, st);
-    try line(gpa, dl, x + fxi(f * 0.58), bot, x + fxi(f * 0.58), y + fxi(f * 0.92), c, st);
+fn iconBitcoin(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x: i32, y: i32, s: i32, c: u32) !void {
+    // The real ₿, drawn as type. This used to be eleven hand-placed strokes — a
+    // squared-off "B" wearing two ticks — written because the face was believed
+    // to carry no bitcoin glyph. It does. Type also scales and hints properly,
+    // which the line art never did at the 15-16px sizes it is used at.
+    const px: u16 = @intCast(@max(8, @min(s, 255)));
+    const w: i32 = @intCast(text.measure(e, .semibold, btc_glyph, px));
+    // Centre it in the box the caller reserved, and sit it on the baseline the
+    // box implies (~0.78 of the box, the face's cap height at these sizes).
+    const bx = x + @divTrunc(s - w, 2);
+    const baseline = y + @divTrunc(s * 78, 100);
+    _ = try str(gpa, dl, e, .semibold, bx, baseline, c, px, btc_glyph);
 }
 
 /// The lightning bolt — the rail mark. Two triangles: a bolt is a zigzag, and
@@ -1774,14 +1766,14 @@ fn settingsIcon(icon: settings_view.Icon, gpa: Allocator, dl: *raster.DrawList, 
     }
 }
 
-fn navIcon(idx: usize, gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, s: i32, c: u32) !void {
+fn navIcon(idx: usize, gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, x: i32, y: i32, s: i32, c: u32) !void {
     switch (idx) {
         0 => try iconHome(gpa, dl, x, y, s, c),
         1 => try iconZones(gpa, dl, x, y, s, c),
         2 => try iconHeartHollow(gpa, dl, x, y, s, c),
         3 => try iconReply(gpa, dl, x, y, s, c),
         4 => try iconAlgorithms(gpa, dl, x, y, s, c), // the "Algorithms" loadout page
-        screen_wallet => try iconBitcoin(gpa, dl, x, y, s, c),
+        screen_wallet => try iconBitcoin(gpa, dl, e, x, y, s, c),
         else => try iconGear(gpa, dl, x, y, s, c),
     }
 }
@@ -1819,7 +1811,7 @@ fn drawRail(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, rx: i32
         if (on) try rect(gpa, dl, x0 + 2, ny - 8, pill_w, 42, (0x1F << 24) | (accent & 0x00FFFFFF), 12);
         // Rows the SDF pass doesn't cover draw their own line-art on the GPU path
         // too, or they'd be a label with no icon.
-        if (!skip_nav or !navIconIsSdf(scr)) try navIcon(scr, gpa, dl, x0 + 10, ny, 22, if (on) accent else muted);
+        if (!skip_nav or !navIconIsSdf(scr)) try navIcon(scr, gpa, dl, e, x0 + 10, ny, 22, if (on) accent else muted);
         _ = try str(gpa, dl, e, if (on) .semibold else .regular, x0 + 48, ny + 17, (col & 0x00FFFFFF) | ea, 16, navLabel(scr));
         // The region posts the SCREEN, not the row — see `nav_rows`.
         try emitRegion(gpa, regions, rx + 14, ny - 8, box_w, 42, scr, .nav);
@@ -1929,7 +1921,7 @@ pub fn drawTabBar(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, w
                 // Draw line-art for any icon the SDF pass doesn't cover (e.g. the
                 // wallet ₿, screen id past screen_settings) even on the GPU path —
                 // mirrors drawRail's fallback, so a non-SDF tab slot is never empty.
-                if (!skip_nav or !navIconIsSdf(idx)) try navIcon(idx, gpa, dl, cx - 14, icon_cy - 14, 28, if (on) accent else muted);
+                if (!skip_nav or !navIconIsSdf(idx)) try navIcon(idx, gpa, dl, e, cx - 14, icon_cy - 14, 28, if (on) accent else muted);
                 try emitRegion(gpa, regions, slot_w * @as(i32, @intCast(i)), by, slot_w, @intCast(@min(tab_bar_h + @max(0, bottom_inset), 32767)), idx, .nav);
             },
             .you => {
@@ -2847,7 +2839,7 @@ pub fn drawDrawer(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, w
     for (nav_rows) |scr| {
         const on = scr == active;
         if (on) try rect(gpa, dl, px + 12, ry - 8, drawer_w - 24, 42, (0x1F << 24) | (accent & 0x00FFFFFF), 12);
-        if (!skip_nav or !navIconIsSdf(scr)) try navIcon(scr, gpa, dl, px + 24, ry, 22, if (on) accent else muted);
+        if (!skip_nav or !navIconIsSdf(scr)) try navIcon(scr, gpa, dl, e, px + 24, ry, 22, if (on) accent else muted);
         _ = try str(gpa, dl, e, if (on) .semibold else .regular, px + 62, ry + 17, if (on) ink else muted, 16, navLabel(scr));
         // Region x sits so the SDF pass's x+21 = the icon centre (px+35).
         if (open) try emitRegion(gpa, regions, px + 14, ry - 8, drawer_w - 28, 42, scr, .nav);
@@ -6174,7 +6166,7 @@ fn walletAddrRow(
     if (lightning)
         try iconLightning(gpa, dl, x + 14, y + 15, 16, muted)
     else
-        try iconBitcoin(gpa, dl, x + 14, y + 15, 16, muted);
+        try iconBitcoin(gpa, dl, e, x + 14, y + 15, 16, muted);
     _ = try str(gpa, dl, e, .semibold, x + 38, y + 28, muted, 12, rail);
     const rw: i32 = @intCast(text.measure(e, .semibold, rail, 12));
     const ax = x + 38 + rw + 14;
@@ -6898,6 +6890,9 @@ fn lightFill(c: u32) u32 {
 fn lightInk(c: u32) u32 {
     const a = c & 0xFF000000;
     const rgb = c & 0x00FFFFFF;
+    // Ink ON an accent surface keeps its value: the fill under it kept its hue,
+    // so inverting the text would put near-black on blue.
+    if (rgb == (on_accent_ink & 0x00FFFFFF)) return c;
     if (rgb == (ink & 0x00FFFFFF)) return a | (light_ink & 0x00FFFFFF);
     if (rgb == (muted & 0x00FFFFFF)) return a | (light_muted & 0x00FFFFFF);
     if (rgb == (faint & 0x00FFFFFF)) return a | (light_faint & 0x00FFFFFF);
@@ -9312,6 +9307,22 @@ pub const ChatListSearch = struct {
 /// The line height tracks the size at ~1.44×, the ratio the 16/23 pair set, so
 /// the paragraph colour stays put as the type grows. These two constants are the
 /// whole control until the settings text-size row lands — change them together.
+/// The REAL bitcoin sign, U+20BF. The embedded face carries it (glyph index
+/// 1340) — a long-standing comment claimed otherwise and several icons were
+/// hand-drawn around that belief. Verified against the font, not assumed.
+pub const btc_glyph = "\u{20BF}";
+
+/// Ink that sits ON a saturated accent surface (an outgoing chat bubble, a
+/// filled button). It must stay LIGHT in both themes, because what it contrasts
+/// against is the accent, not the page.
+///
+/// This needs to be its own token rather than plain `ink`: `rethemeLight`
+/// classifies each draw item on its own and cannot see what is painted behind
+/// it, so it darkened the text on a blue bubble into near-black on blue. The
+/// fill was already special-cased to keep its hue (`lightFill` preserves
+/// saturated opaque fills); the ink on top needs the matching exemption.
+pub const on_accent_ink: u32 = 0xFFFFFFFF;
+
 const chat_px: u16 = 18;
 const chat_line_h: i32 = 26;
 
@@ -10779,7 +10790,9 @@ pub fn layoutChat(
                     // a real one. An EDITED one wears its mark — words that changed
                     // after you read them and said nothing about it is how somebody
                     // rewrites the past quietly.
-                    const bubble_ink: u32 = if (b.deleted) faint else ink;
+                    // Ours is the accent-filled bubble, so its words are light
+                    // ON that fill in BOTH themes — not the page's ink.
+                    const bubble_ink: u32 = if (b.deleted) faint else if (b.mine) on_accent_ink else ink;
                     var body_y2 = by + pad_y + 14;
                     if (b.quote.len > 0 and !b.deleted) {
                         // WHAT IS BEING ANSWERED, above the answer: an accent rule and
@@ -11088,18 +11101,18 @@ pub fn layoutChat(
             bx += cw + 8;
         }
     }
-    // The pay button: a "B" wearing the two ₿ ticks (the embedded fonts
-    // carry no bitcoin glyph; the line-art spelling is ours). Pins to the
-    // input's bottom edge like Send; accent-filled while the sheet is open.
+    // The pay button: the REAL ₿ (U+20BF). This was a hand-drawn "B" wearing two
+    // line-art ticks, on the belief that "the embedded fonts carry no bitcoin
+    // glyph" — that was simply untrue; the face has it at glyph index 1340, and
+    // the drawn spelling was working around a limitation that did not exist.
+    // Pins to the input's bottom edge like Send; accent-filled while open.
     {
         const py = comp_y + comp_h - 46;
         try rect(gpa, dl, detail_x, py, pay_btn, 46, if (pay.open) accent else skinPanel(accent), if (phone) 23 else 14);
         const bc: u32 = if (pay.open) 0xFF20201A else body_c;
-        const bw2: i32 = @intCast(text.measure(e, .semibold, "B", 17));
+        const bw2: i32 = @intCast(text.measure(e, .semibold, btc_glyph, 19));
         const bx2 = detail_x + @divTrunc(pay_btn - bw2, 2);
-        _ = try str(gpa, dl, e, .semibold, bx2, py + 29, bc, 17, "B");
-        try rect(gpa, dl, bx2 + @divTrunc(bw2, 2) - 1, py + 11, 2, 4, bc, 0);
-        try rect(gpa, dl, bx2 + @divTrunc(bw2, 2) - 1, py + 31, 2, 4, bc, 0);
+        _ = try str(gpa, dl, e, .semibold, bx2, py + 30, bc, 19, btc_glyph);
         try emitRegion(gpa, regions, detail_x, py, pay_btn, 46, 0, .pay_open);
     }
     // Send pins to the input's bottom edge as the composer grows. Phone: a
@@ -11228,7 +11241,7 @@ pub fn layoutChat(
             if (pay.rail == .lightning)
                 try iconLightning(gpa, dl, rx - 20, py + 16, 15, muted)
             else
-                try iconBitcoin(gpa, dl, rx - 20, py + 16, 15, muted);
+                try iconBitcoin(gpa, dl, e, rx - 20, py + 16, 15, muted);
         }
         py += 74 + 14;
 

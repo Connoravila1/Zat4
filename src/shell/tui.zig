@@ -15010,7 +15010,16 @@ fn paintFrame(
             // row, dividers) painted OVER the field as proportional items, fed
             // by the REAL timeline via a pure transform (B5). An empty timeline
             // renders the chrome with no posts — no placeholder content.
-            const feed_posts = feed_view.fromTimeline(arena, view_items, now, g.expanded) catch &[_]feed_view.PostView{};
+            const feed_posts = if (chat_app and g.screen.* == feed_view.screen_profile)
+                // ZAT CHAT's "You" is an IDENTITY page, not a timeline. The
+                // profile screen falls through to the shared post loop, which is
+                // right in Zat4 and wrong here — the messenger has no feed, so a
+                // list of your posts under your handle is a door back into the
+                // product this one was carved out of. Handing it nothing leaves
+                // the identity band and drops the stack.
+                &[_]feed_view.PostView{}
+            else
+                feed_view.fromTimeline(arena, view_items, now, g.expanded) catch &[_]feed_view.PostView{};
             if (g.screen.* == feed_view.screen_wallet) {
                 // The Wallet page: how you get paid, as a durable place. Owns its
                 // whole surface and its own scroll (the layoutChat precedent).
@@ -15831,7 +15840,10 @@ fn paintFrameGpu(
     if (sig != gs.feed_sig or gs.feed.verts.items.len == 0 or g.socket_ui.drag_active != null or search_animating or zones_animating or drawer_animating or rail_hover_animating or algo_animating or chat_animating or enroll_animating or g.screen.* == feed_view.screen_loadout or g.frametiming_on or gs.shatter_active or g.pet or feed_animating) {
         gs.feed_sig = sig;
         // An empty timeline renders the chrome with no posts (no placeholders).
-        const feed_posts = feed_view.fromTimeline(arena, items, now, g.expanded) catch &[_]feed_view.PostView{};
+        const feed_posts = if (chat_app and g.screen.* == feed_view.screen_profile)
+            &[_]feed_view.PostView{} // see the note on the software path: identity, not timeline
+        else
+            feed_view.fromTimeline(arena, items, now, g.expanded) catch &[_]feed_view.PostView{};
         // Per-post height cache: post heights are scroll-invariant, so only
         // reset the cache when the CONTENT or WIDTH changed (scroll/height
         // zeroed in this signature). A pure scroll then reuses every post's
