@@ -199,14 +199,27 @@ pub const Observation = struct {
     /// §1.6 bucket, from `classifyPlatform`.
     platform: PlatformClass,
 
+    /// Nonzero when `ip` holds a real observed address.
+    ///
+    /// ⚠️ This exists because an all-zero `ip` would otherwise be a SENTINEL,
+    /// and a sentinel for absence is exactly what this module refuses to do.
+    /// Without the flag, every enrollment whose address could not be read —
+    /// a missing `X-Forwarded-For`, or any IPv6 client while only v4 is parsed
+    /// — would derive the SAME `ip_shared` token and cluster together on their
+    /// shared absence. That is the "a missing signal must never look like a
+    /// shared one" rule, and it is easy to reintroduce at the shell seam even
+    /// when the core is careful.
+    ip_known: u8 = 0,
+
     /// A6: explicit, named padding rather than compiler-chosen. Room for a
     /// future flag byte without moving anything.
-    _reserved: [5]u8 = .{0} ** 5,
+    _reserved: [4]u8 = .{0} ** 4,
 
     comptime {
         // Budget: 8 (enrolled_at) + 16 (ip) + 4 (pow_solve_ms) + 1 (pow_tier)
-        // + 1 (graph_shape) + 1 (ip_class) + 1 (platform) + 5 (reserved)
-        // = 37 payload, rounded to 40 by the i64's 8-byte alignment.
+        // + 1 (graph_shape) + 1 (ip_class) + 1 (platform) + 1 (ip_known)
+        // + 4 (reserved) = 37 payload, rounded to 40 by the i64's 8-byte
+        // alignment.
         // Raising this requires an A7.1 justification recorded HERE.
         assert(@sizeOf(Observation) == 40);
     }
@@ -441,8 +454,12 @@ pub fn derive(obs: Observation, salt: [32]u8) Derived {
         out = push(out, token(salt, .ip_type, &[_]u8{@intFromEnum(obs.ip_class)}));
     }
 
-    // Signal 5 — shared address.
-    out = push(out, token(salt, .ip_shared, &obs.ip));
+    // Signal 5 — shared address. Emitted ONLY when an address was actually
+    // observed: see `Observation.ip_known`. An unreadable address is absence,
+    // and absence must never derive a token that others share.
+    if (obs.ip_known != 0) {
+        out = push(out, token(salt, .ip_shared, &obs.ip));
+    }
 
     // Signal 6 — platform bucket. `.unknown` means no UA was presented.
     if (obs.platform != .unknown) {
@@ -659,6 +676,7 @@ fn testObservation() Observation {
         .graph_shape = 40,
         .ip_class = .residential,
         .platform = .desktop_linux,
+        .ip_known = 1,
     };
 }
 
@@ -701,6 +719,25 @@ test "an unobserved signal emits NO token rather than a sentinel one" {
     for (d.tokens[0..d.len]) |t| {
         try std.testing.expect(t.kind == .timing or t.kind == .ip_shared);
     }
+}
+
+test "an UNREADABLE address emits no ip_shared token" {
+    // Regression: the shell seam once passed an all-zero ip for "not observed",
+    // which made every client with an unreadable address (a missing
+    // X-Forwarded-For, or any IPv6 client while only v4 is parsed) share one
+    // token and cluster on their shared absence. The core must not be able to
+    // express that.
+    var obs = testObservation();
+    obs.ip_known = 0;
+    const d = derive(obs, test_salt);
+    try std.testing.expect(tokenOf(d, .ip_shared) == null);
+
+    // And two such enrollments still share NOTHING via the address.
+    var other = testObservation();
+    other.ip_known = 0;
+    other.ip = [_]u8{0xAB} ** 16; // different bytes, both unknown
+    const e = derive(other, test_salt);
+    try std.testing.expect(tokenOf(e, .ip_shared) == null);
 }
 
 test "two accounts in the same window share a timing token; a later one does not" {

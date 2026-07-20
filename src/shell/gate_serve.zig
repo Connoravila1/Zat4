@@ -335,9 +335,15 @@ fn serveRedeem(
     // The raw observation is a stack value that dies with this function; only
     // the derived tokens outlive it. That is the privacy doctrine made
     // structural rather than promised.
+    // An unreadable address is ABSENCE, not a zero address — see
+    // `constellation.Observation.ip_known`. Passing a sentinel here would make
+    // every client we cannot place cluster together.
+    const observed_ip = observedIp(req);
+
     const obs: constellation.Observation = .{
         .enrolled_at = now,
-        .ip = observedIp(req) orelse .{0} ** 16,
+        .ip = observed_ip orelse .{0} ** 16,
+        .ip_known = if (observed_ip == null) 0 else 1,
         .pow_solve_ms = solveMillis(ticket.issued_at, now),
         .pow_tier = @intFromEnum(ticket.tier),
         .graph_shape = 0, // always absent at enrollment; accrues over weeks
@@ -681,6 +687,7 @@ test "record drops rather than evicts when the store is full" {
         .graph_shape = 0,
         .ip_class = .residential,
         .platform = .desktop_linux,
+        .ip_known = 1,
     };
     const d = constellation.derive(obs, [_]u8{0x5A} ** 32); // 4 tokens
 
