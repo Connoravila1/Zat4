@@ -9476,12 +9476,17 @@ fn drawDeviceGate(
     try drawDeviceEmblem(gpa, dl, cx, y, accent, glow);
     y += 74;
 
+    // ACTION-LED. This was "Chat lives on your other device", which tells a person
+    // where chat ISN'T — on the standalone app's first run that reads as "you are
+    // locked out", which is the opposite of the truth (you are one tap from in).
     const title: []const u8 = if (offline)
         "Can't reach your account"
     else if (waiting)
         "Waiting for your other device"
+    else if (phone)
+        "Add this phone to your chats"
     else
-        "Chat lives on your other device";
+        "Add this device to your chats";
     const tw: i32 = @intCast(text.measure(e, .semibold, title, 22));
     _ = try str(gpa, dl, e, .semibold, cx - @divTrunc(tw, 2), y, ink, 22, title);
     y += 34;
@@ -9494,10 +9499,12 @@ fn drawDeviceGate(
         "Open Zat4 on the device where you already use chat.",
         "It will ask you to approve this one. This page updates itself.",
     } else &[_][]const u8{
-        "Your chat keys were made on that device and never leave it \u{2014}",
-        "that is exactly what keeps your messages readable only by you",
-        "and the person you're talking to. So this device makes its own,",
-        "and your other device vouches for it.",
+        // TWO lines, not four. The full key explanation is genuinely good, but it
+        // belongs behind "How Zat Chat works" (right there at the foot) — a first
+        // run should say what to do and why in a breath, not teach the protocol
+        // before offering the button.
+        "Your messages are encrypted with keys that never leave your",
+        "devices, so a device you already use has to let this one in.",
     };
     for (body) |ln| {
         const lw: i32 = @intCast(text.measure(e, .regular, ln, 14));
@@ -9562,13 +9569,19 @@ fn drawDeviceGate(
 
     // THE LAST RESORT, and it looks like one. It is not a button; it is a line of
     // text you have to mean. The cost is stated BEFORE the tap, not after.
-    const reset = "Set up chat fresh on this device instead";
+    const reset = if (phone) "Start fresh on this phone instead" else "Start fresh on this device instead";
     const rw: i32 = @intCast(text.measure(e, .semibold, reset, 13));
     _ = try str(gpa, dl, e, .semibold, cx - @divTrunc(rw, 2), y + 4, muted, 13, reset);
     try rect(gpa, dl, cx - @divTrunc(rw, 2), y + 9, rw, 1, softA(muted, 0x55), 0); // a quiet underline — tappable, but a last resort
     try emitRegion(gpa, regions, cx - @divTrunc(rw, 2) - 10, y - 10, rw + 20, 28, 0, .chat_identity_reset);
     y += 22;
-    const cost = "This device takes over chat. Your conversations don't come with it.";
+    // The cost, still stated BEFORE the tap and still the whole truth — but "takes
+    // over" and "don't come with it" read as damage. Both facts survive: this
+    // device becomes the chat device, and history does not follow.
+    const cost = if (phone)
+        "This phone becomes your chat device. Existing conversations stay on the other one."
+    else
+        "This device becomes your chat device. Existing conversations stay on the other one.";
     const cw2: i32 = @intCast(text.measure(e, .regular, cost, 12));
     _ = try str(gpa, dl, e, .regular, cx - @divTrunc(cw2, 2), y + 4, faint, 12, cost);
     y += 34;
@@ -10090,18 +10103,30 @@ fn drawChatHelp(
     width: i32,
     insets: EdgeInsets,
     accent: u32,
+    /// How far the reader has scrolled. The page is TALLER than a phone, and
+    /// without this it drew from a fixed origin — so everything past the first
+    /// screenful was unreachable. The explainer that answers "what is this app
+    /// doing with my keys" was the one page you could not read to the end of.
+    scroll: i32,
 ) error{OutOfMemory}!i32 {
     const phone = width <= phone_max;
     const x = x0 + 20;
-    var y: i32 = if (phone) insets.top + 26 else 40;
+    const y_top: i32 = if (phone) insets.top + 26 else 40;
+    var y: i32 = y_top - scroll;
 
     // Close, top-left, where a back control belongs — in a pill so it reads as
     // tappable (the same back-button vocabulary the rest of the app uses).
     const close = "\u{2039} Back";
     const clw: i32 = @intCast(text.measure(e, .semibold, close, 14));
-    try rect(gpa, dl, x - 12, y - 7, clw + 28, 30, 0x14EDEAE0, 9);
-    _ = try str(gpa, dl, e, .semibold, x, y + 6, ink, 14, close);
-    try emitRegion(gpa, regions, x - 12, y - 7, clw + 28, 30, 0, .chat_help_close);
+    // CENTRE the label in its pill, both ways. It was padded 12 left / 16 right
+    // and — the visible part — sat with its baseline at the pill's vertical
+    // centre rather than a cap-height below it, so the text rode high in the
+    // capsule. Pill spans y-7..y+23 (centre y+8); a 14px cap is ~10, so the
+    // baseline belongs at y+13.
+    const pill_pad: i32 = 14;
+    try rect(gpa, dl, x - pill_pad, y - 7, clw + 2 * pill_pad, 30, 0x14EDEAE0, 9);
+    _ = try str(gpa, dl, e, .semibold, x, y + 13, ink, 14, close);
+    try emitRegion(gpa, regions, x - pill_pad, y - 7, clw + 2 * pill_pad, 30, 0, .chat_help_close);
     y += 40;
 
     _ = try str(gpa, dl, e, .semibold, x, y + 10, ink, 24, "How Zat Chat works");
@@ -10327,9 +10352,12 @@ pub fn layoutChat(
     // can only read when nothing is wrong is a brochure. ──
     if (devices.help_open) {
         const enter_start = dl.len;
-        const r = try drawChatHelp(gpa, dl, e, regions, x0, width, insets, accent);
+        const r = try drawChatHelp(gpa, dl, e, regions, x0, width, insets, accent, scroll);
         applyChatEnter(dl, enter_start, devices.enter_t);
-        return r;
+        // The height the SCROLLER needs is the content's own, so add back what we
+        // scrolled by — otherwise the page would shrink as it is read and the
+        // scroll would fight itself.
+        return r + scroll;
     }
 
     // ── THE ONE-TIME SETUP. Before the list, before a thread, before anything:
