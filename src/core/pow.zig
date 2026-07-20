@@ -242,14 +242,53 @@ const calibration = struct {
         .lanes = 1,
         .leading_zero_bits = 4,
     };
-    /// Mass / amplifying actions. 64 MiB, 2^6 ≈ 64 expected attempts.
-    /// Untouched placeholder — the prototype write path does not draw this
-    /// yet; it lands when tiering is wired (DESIGN §5).
+    /// Enrollment / mass actions. **CALIBRATED 2026-07-19 against real
+    /// hardware** (G1: no path is tuned without a number) — this is the one
+    /// tier in this table that is no longer a guess.
+    ///
+    /// Measured ms per argon2id hash, `-OReleaseFast`, lanes = 1:
+    ///
+    /// ```
+    ///   config            Pixel 10 Pro (Tensor G5)   Hetzner box (2-core EPYC)
+    ///    8 MiB, t=1                16.6 ms                    9.1 ms
+    ///   16 MiB, t=1                17.1 ms                   18.8 ms
+    ///   32 MiB, t=1                33.0 ms                   37.4 ms
+    ///   64 MiB, t=1                68.8 ms                   77.3 ms
+    ///   64 MiB, t=3               136.1 ms                  173.1 ms   <- was
+    /// ```
+    ///
+    /// The two costs are NOT symmetric and that asymmetry is the whole design:
+    ///   • the honest client pays `2^leading_zero_bits × ms` (it searches),
+    ///   • the server pays `1 × ms` (it checks one nonce).
+    /// So `leading_zero_bits` is FREE for the server and is the correct knob
+    /// for deterrence, exactly as the note above says: keep `iters` low, let
+    /// memory carry the hardness, let attempt COUNT carry the cost.
+    ///
+    /// The old 64 MiB/t=3/6-bit setting got both sides wrong. Honest solve was
+    /// 8.7 s on a FLAGSHIP phone (a budget device is 3–5× worse, so 30 s+),
+    /// while server verification cost 173 ms — and since the gate's accept loop
+    /// is sequential, that capped the whole service at 5.8 verifications/sec.
+    /// One attacker holding one valid ticket could saturate it.
+    ///
+    /// Now: 16 MiB, t=1, 7 bits.
+    ///   • honest solve  = 128 × 17.1 ms ≈ 2.2 s on a Pixel, ~7 s on a slow
+    ///     phone — a tolerable one-time enrollment cost with a progress cue;
+    ///   • server verify = 18.8 ms, a 9× throughput improvement;
+    ///   • memory stays genuinely hard at 16 MiB (note the phone measures 8 and
+    ///     16 MiB at the SAME speed, so 16 is free on the client side and only
+    ///     the server pays for it — spend it there).
+    ///
+    /// What this tier is NOT: the Sybil deterrent. The gap between farm
+    /// hardware and a budget phone is 10–50×, so any setting an honest slow
+    /// device tolerates is trivial for a farm. PoW is a supporting volume tax
+    /// (ANTIBOT Layer 4); the refundable deposit is the spine and the
+    /// constellation is the linker. Tuning it as though it were the deterrent
+    /// is how you end up excluding real users to inconvenience nobody.
     const heavy: Difficulty = .{
-        .mem_kib = 64 * 1024,
-        .iters = 3,
+        .mem_kib = 16 * 1024,
+        .iters = 1,
         .lanes = 1,
-        .leading_zero_bits = 6,
+        .leading_zero_bits = 7,
     };
 };
 

@@ -111,7 +111,12 @@ pub fn main(init: std.process.Init) !void {
 
     const rp = gate_store.replay(gpa, store_path, tokens);
 
+    const rate = try gpa.alloc(gate.RateSlot, gate.rate_slot_count);
+    defer gpa.free(rate);
+    @memset(rate, .{ .key = 0, .bucket = .{ .tokens = 0, .capacity = 0, .refill_per_sec = 0, .last = 0 } });
+
     var state: gate.GateState = .{
+        .rate = rate,
         .spent = spent,
         .tokens = tokens,
         .token_len = rp.len,

@@ -49,12 +49,16 @@
 //! that is exactly the kind of invariant that gets lost in a refactor.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 
 const pow = @import("../core/pow.zig");
 const pow_issue = @import("../core/pow_issue.zig");
 const wire = @import("../core/gate_wire.zig");
 const constellation = @import("../core/constellation.zig");
+// Reuses the chat relay's TokenBucket rather than writing a second one: it is a
+// plain, size-guarded, already-tested value type (F4 - do not duplicate).
+const relay = @import("../core/relay.zig");
 const gate_record = @import("../core/gate_record.zig");
 const gate_store = @import("gate_store.zig");
 const pow_shell = @import("pow.zig");
@@ -82,10 +86,50 @@ pub const ServeConfig = struct {
     skew_secs: i64 = pow_issue.default_skew_secs,
 };
 
+/// One address's rate-limit slot.
+///
+/// A7: held in quantity — one per recently-seen address, scanned on every
+/// request. Guarded.
+pub const RateSlot = struct {
+    /// Hashed client address. 0 means the slot is free.
+    key: u64,
+    bucket: relay.TokenBucket,
+
+    comptime {
+        // Budget: 8 (key) + 32 (TokenBucket: 4 × f64) = 40 bytes, exact.
+        assert(@sizeOf(RateSlot) == 40);
+    }
+};
+
+/// Per-address limits (§9.7). Deliberately generous — these must never bite a
+/// real person, only a flood.
+///
+/// The load-bearing one is CHALLENGE issuance, because spending the ticket
+/// before verifying (see `serveRedeem`) makes one issued ticket the ceiling on
+/// one memory-hard verification. Capping issuance therefore caps the server's
+/// total argon2 work directly: 0.5/sec sustained is ~9 ms/sec of CPU at the
+/// calibrated difficulty, which is nothing.
+///
+/// Sized for shared addresses, not single users: a burst of 10 covers a
+/// household or a small office arriving together, and 0.5/sec sustained is
+/// 1,800 enrollments an hour from ONE address — far past any honest pattern
+/// and still far below what would hurt.
+const rate_burst: f64 = 10;
+const rate_per_sec: f64 = 0.5;
+
+/// How many addresses are tracked at once. A full table falls back to shared
+/// accounting rather than to no limit — see `allow`.
+pub const rate_slot_count = 1024;
+
 /// Mutable service state, owned by the caller.
 ///
 /// A7.2: cold struct — one instance for the process's lifetime.
 pub const GateState = struct {
+    /// Per-address rate limiters. Caller-owned and caller-sized (C1/C4).
+    rate: []RateSlot = &.{},
+    /// Requests refused for rate. Counted so a limit that is actually biting
+    /// real users is visible as a number rather than as silence.
+    rate_refusals: u64 = 0,
     /// The replay guard (`pow_issue.checkAndSpend`). Caller-sized: the shell
     /// knows the box, and the core must not allocate (C1/C2).
     spent: []pow_issue.SpentEntry,
@@ -150,6 +194,18 @@ fn handleConn(
     // public and unauthenticated (§9.7). Everything it parses is therefore
     // hostile input, which is why the wire format is fixed-size hex with no
     // body and no JSON parser (`core/gate_wire.zig`).
+
+    // Per-address rate limit, BEFORE any work (§9.7). Applied to both
+    // endpoints: capping challenge issuance caps memory-hard verification,
+    // because a spent-before-verify ticket makes one issued ticket the ceiling
+    // on one argon2 (see serveRedeem).
+    if (std.mem.eql(u8, path, "/gate/challenge") or std.mem.eql(u8, path, "/gate/redeem")) {
+        if (!allow(state.rate, rateKey(&req), nowSeconds())) {
+            state.rate_refusals +|= 1;
+            respondJson(&req, .too_many_requests, "{\"error\":\"RateLimited\"}");
+            return;
+        }
+    }
 
     if (std.mem.eql(u8, path, "/gate/challenge")) {
         return serveChallenge(io, cfg, &req);
@@ -235,19 +291,36 @@ fn serveRedeem(
     const difficulty = pow.difficultyFor(ticket.tier) orelse
         return refuse(req, .no_work_required);
 
-    // 3. The one expensive step. Sequential accept loop ⇒ one at a time.
-    const challenge = pow.challengeFor(ticket.seed, ticket.tier);
-    const solved = pow_shell.verify(gpa, io, challenge, .{ .nonce = nonce }, difficulty) catch false;
-    if (!solved) return refuse(req, .unsolved);
-
-    // 4. Spend it. A stateless ticket is replayable by construction until this
-    //    records it, so one solve would otherwise buy unlimited enrollments.
+    // 3. SPEND THE TICKET *BEFORE* VERIFYING. This ordering is the pre-filter
+    //    §9.7 asks for, and it is structural rather than heuristic.
+    //
+    //    The MAC check above already rejects forged tickets for microseconds.
+    //    But it does nothing about the actual attack, which is cheaper than
+    //    forgery: request a legitimate ticket (issuance is free and O(1)), then
+    //    submit wrong nonces to it forever. Verifying after spending would let
+    //    ONE ticket absorb unlimited memory-hard verifications — measured at
+    //    18.8 ms each on the box, against a sequential accept loop.
+    //
+    //    Spending first caps it at exactly ONE argon2 per issued ticket, so the
+    //    server's total memory-hard work is bounded by the ticket ISSUANCE
+    //    rate — which costs nothing to serve and is rate-limited per address
+    //    above. The expensive operation is now gated by a cheap one.
+    //
+    //    The cost is that a wrong solve burns the ticket: an honest client that
+    //    submits a bad nonce must request another. That is a fair trade, since
+    //    a correct client submits exactly once and a new ticket is free.
     const tag = pow_issue.spentTag(ticket);
     switch (pow_issue.checkAndSpend(state.spent, tag, now, ticket.issued_at + cfg.ttl_secs)) {
         .recorded => {},
         .replay => return refuse(req, .replayed),
         .full => return refuse(req, .at_capacity),
     }
+
+    // 4. The one expensive step, now provably at most once per ticket.
+    //    Sequential accept loop ⇒ one at a time (the memory cap, §9.7).
+    const challenge = pow.challengeFor(ticket.seed, ticket.tier);
+    const solved = pow_shell.verify(gpa, io, challenge, .{ .nonce = nonce }, difficulty) catch false;
+    if (!solved) return refuse(req, .unsolved);
 
     // ── Observe → derive → discard (§2) ──
     // The raw observation is a stack value that dies with this function; only
@@ -312,6 +385,55 @@ fn record(state: *GateState, derived: constellation.Derived) void {
         state.tokens[state.token_len] = t;
         state.token_len += 1;
     }
+}
+
+/// Spend one rate token for `key`, returning false if the address is over its
+/// rate. `now_s` is monotonic seconds — never wall time, so an NTP step cannot
+/// hand an attacker a free refill.
+///
+/// A linear scan over a small fixed table: no allocation (C1/C2), and at 1024
+/// slots the scan is trivial next to the 18.8 ms verification it protects.
+///
+/// ── On a full table, accounting is SHARED, never skipped ──
+/// If every slot is taken by a live address, the newcomer is folded into the
+/// slot its key lands on rather than being waved through. That is deliberately
+/// the unfair-but-safe direction: under a flood from many addresses, honest
+/// users may be throttled alongside the flood, but the flood is never granted
+/// unlimited memory-hard work. Failing open here would mean the limiter
+/// disappears exactly when it is needed.
+fn allow(slots: []RateSlot, key: u64, now_s: f64) bool {
+    if (slots.len == 0) return true; // limiter not configured
+    const k = if (key == 0) 1 else key; // 0 marks a free slot
+
+    // Known address?
+    for (slots) |*s| {
+        if (s.key == k) return s.bucket.take(now_s);
+    }
+    // No: claim a free slot. Kept as a second pass so the hit path above is one
+    // comparison per slot.
+    for (slots) |*s| {
+        if (s.key == 0) {
+            s.* = .{ .key = k, .bucket = relay.TokenBucket.init(rate_burst, rate_per_sec, now_s) };
+            return s.bucket.take(now_s);
+        }
+    }
+    // Table full: share a slot rather than skip the check.
+    const shared = &slots[@intCast(k % slots.len)];
+    return shared.bucket.take(now_s);
+}
+
+/// The rate-limit key for a request: its observed address, or a single shared
+/// key when the address is unknown. Unknown-address traffic is throttled as one
+/// bucket — if we cannot tell clients apart, they do not get to be counted
+/// separately.
+fn rateKey(req: *std.http.Server.Request) u64 {
+    const ip = observedIp(req) orelse return 1;
+    return std.hash.Wyhash.hash(0, &ip);
+}
+
+/// Monotonic seconds for the rate limiter.
+fn nowSeconds() f64 {
+    return @as(f64, @floatFromInt(clock.monotonicNanos())) / 1_000_000_000.0;
 }
 
 /// The client's address, per `X-Forwarded-For`.
@@ -418,6 +540,69 @@ fn queryValue(target: []const u8, name: []const u8) ?[]const u8 {
 
 // ── Tests: the pure helpers. The socket path is exercised by running the
 // binary (`zig build gate`) and curling it — see gate_main.zig.
+
+test "the rate limiter allows a burst then throttles the same address" {
+    var slots: [8]RateSlot = undefined;
+    @memset(&slots, .{ .key = 0, .bucket = .{ .tokens = 0, .capacity = 0, .refill_per_sec = 0, .last = 0 } });
+
+    // The burst is spendable...
+    var i: usize = 0;
+    while (i < @as(usize, @intFromFloat(rate_burst))) : (i += 1) {
+        try std.testing.expect(allow(&slots, 42, 1000.0));
+    }
+    // ...and then the same address is refused at the same instant.
+    try std.testing.expect(!allow(&slots, 42, 1000.0));
+
+    // A DIFFERENT address is unaffected — the limit is per-address, not global.
+    try std.testing.expect(allow(&slots, 43, 1000.0));
+}
+
+test "rate tokens refill over time" {
+    var slots: [4]RateSlot = undefined;
+    @memset(&slots, .{ .key = 0, .bucket = .{ .tokens = 0, .capacity = 0, .refill_per_sec = 0, .last = 0 } });
+
+    var i: usize = 0;
+    while (i < @as(usize, @intFromFloat(rate_burst))) : (i += 1) _ = allow(&slots, 7, 0.0);
+    try std.testing.expect(!allow(&slots, 7, 0.0));
+
+    // rate_per_sec = 0.5, so one token is back after two seconds.
+    try std.testing.expect(allow(&slots, 7, 2.0));
+    try std.testing.expect(!allow(&slots, 7, 2.0));
+}
+
+test "a full rate table SHARES accounting rather than skipping the check" {
+    // Failing open here would remove the limiter exactly when a flood from many
+    // addresses is filling the table — i.e. precisely when it is needed.
+    var slots: [2]RateSlot = undefined;
+    @memset(&slots, .{ .key = 0, .bucket = .{ .tokens = 0, .capacity = 0, .refill_per_sec = 0, .last = 0 } });
+
+    // Two addresses claim both slots and drain them.
+    for ([_]u64{ 100, 200 }) |k| {
+        var i: usize = 0;
+        while (i < @as(usize, @intFromFloat(rate_burst))) : (i += 1) _ = allow(&slots, k, 0.0);
+    }
+    // A third address finds no free slot. It must still be accounted, not
+    // waved through — it folds into an existing (already drained) bucket.
+    try std.testing.expect(!allow(&slots, 300, 0.0));
+}
+
+test "an unconfigured limiter allows everything rather than blocking everything" {
+    // E4/E2: a limiter that was never wired must not become an accidental
+    // outage. The gate binary always allocates one; this is the safety net.
+    var none: [0]RateSlot = .{};
+    try std.testing.expect(allow(&none, 1, 0.0));
+}
+
+test "key 0 is remapped so it cannot alias a free slot" {
+    var slots: [2]RateSlot = undefined;
+    @memset(&slots, .{ .key = 0, .bucket = .{ .tokens = 0, .capacity = 0, .refill_per_sec = 0, .last = 0 } });
+    // A hash of exactly 0 must still be rate limited, not treated as "empty".
+    var i: usize = 0;
+    while (i < @as(usize, @intFromFloat(rate_burst))) : (i += 1) {
+        try std.testing.expect(allow(&slots, 0, 0.0));
+    }
+    try std.testing.expect(!allow(&slots, 0, 0.0));
+}
 
 test "queryValue pulls named params and tolerates junk" {
     const t = "/gate/redeem?t=abc&n=42";
