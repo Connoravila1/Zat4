@@ -46,6 +46,7 @@ const std = @import("std");
 const gate = @import("shell/gate_serve.zig");
 const pow_issue = @import("core/pow_issue.zig");
 const constellation = @import("core/constellation.zig");
+const gate_store = @import("shell/gate_store.zig");
 
 /// Replay-guard capacity: how many SOLVED tickets can be in flight inside one
 /// TTL. Sized generously because the set is naturally small — an entry only
@@ -56,12 +57,16 @@ const spent_capacity = 4096;
 
 /// Shadow-store capacity, in tokens (≈ 6 per enrollment). 65536 × 16 bytes =
 /// 1 MiB, so roughly 10,000 observed enrollments before it fills and starts
-/// counting drops. In-memory for this slice; the durable append-only log (the
-/// `appview_store.zig` pattern) is the next one, at which point this bound
-/// stops mattering.
+/// counting drops. This bounds the in-memory INDEX, not the durable log — the
+/// log keeps everything; this is how much of it the scorer can hold at once.
+/// A replay that overflows it is reported at startup rather than silently
+/// truncating the gate's view of history.
 const token_capacity = 65536;
 
 const default_port: u16 = 2590;
+
+/// Where the durable log lives if `ZAT_GATE_STORE` does not say otherwise.
+const default_store_path = "/var/lib/zat4-gate/enrollments.log";
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -95,7 +100,43 @@ pub fn main(init: std.process.Init) !void {
     const tokens = try gpa.alloc(constellation.Token, token_capacity);
     defer gpa.free(tokens);
 
-    var state: gate.GateState = .{ .spent = spent, .tokens = tokens };
+    // ── The durable store (§9.10 step 2) ──
+    // Shadow mode exists to accumulate calibration data; an in-memory store
+    // would lose all of it on every restart while still looking like a working
+    // gate. Path from ZAT_GATE_STORE, defaulting to a sensible box location.
+    const store_path = env.get("ZAT_GATE_STORE") orelse default_store_path;
+
+    var store = gate_store.open(store_path);
+    defer gate_store.close(&store);
+
+    const rp = gate_store.replay(gpa, store_path, tokens);
+
+    var state: gate.GateState = .{
+        .spent = spent,
+        .tokens = tokens,
+        .token_len = rp.len,
+        .store = store,
+    };
+
+    // Report what the replay found, including what it SHED. A store quietly
+    // dropping records must show up as a number at startup rather than as an
+    // unexplained gap in the calibration data months later.
+    try out.print(
+        "zat4-gate: store {s} — {d} enrollments replayed, {d} tokens indexed\n",
+        .{ if (gate_store.enabled(store)) store_path else "(DISABLED — running in memory)", rp.result.applied, rp.len },
+    );
+    if (rp.result.corrupt > 0 or rp.result.trailing_bytes > 0 or rp.result.dropped_full > 0) {
+        try out.print(
+            "zat4-gate: ⚠ replay shed data — {d} corrupt, {d} trailing bytes, {d} dropped (index full)\n",
+            .{ rp.result.corrupt, rp.result.trailing_bytes, rp.result.dropped_full },
+        );
+    }
+    if (!gate_store.enabled(store)) {
+        try out.print(
+            "zat4-gate: ⚠ NOTHING WILL BE PERSISTED. Observations die with this process.\n",
+            .{},
+        );
+    }
     const cfg: gate.ServeConfig = .{
         .port = port,
         .ticket_key = ticket_key,

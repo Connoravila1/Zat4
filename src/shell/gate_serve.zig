@@ -55,6 +55,8 @@ const pow = @import("../core/pow.zig");
 const pow_issue = @import("../core/pow_issue.zig");
 const wire = @import("../core/gate_wire.zig");
 const constellation = @import("../core/constellation.zig");
+const gate_record = @import("../core/gate_record.zig");
+const gate_store = @import("gate_store.zig");
 const pow_shell = @import("pow.zig");
 const clock = @import("clock.zig");
 
@@ -87,16 +89,25 @@ pub const GateState = struct {
     /// The replay guard (`pow_issue.checkAndSpend`). Caller-sized: the shell
     /// knows the box, and the core must not allocate (C1/C2).
     spent: []pow_issue.SpentEntry,
-    /// The shadow-mode coordination store. In-memory and bounded for this
-    /// slice; the durable append-only log (the `appview_store.zig` pattern) is
-    /// the next slice. When it fills, new tokens are DROPPED rather than
-    /// evicted — see `record`.
+    /// The in-memory index the scorer reads: every token the gate has observed,
+    /// rebuilt from `store` at startup. When it fills, new tokens are DROPPED
+    /// rather than evicted — see `record`.
     tokens: []constellation.Token,
     token_len: usize = 0,
-    /// Count of enrollments whose tokens were dropped because the store was
+    /// Count of enrollments whose tokens were dropped because the index was
     /// full. Surfaced so a silently-degraded gate is visible (§"no silent
     /// caps") rather than looking like a quiet, well-behaved one.
     dropped: u64 = 0,
+    /// The durable append-only log. A disabled store (`fd < 0`) degrades the
+    /// gate to in-memory operation rather than failing it (E2) — but see
+    /// `persist_failures`, because "degraded" must never look like "fine".
+    store: gate_store.Store = .{},
+    /// Observations that were assessed but did NOT reach disk. Every one is a
+    /// permanently lost calibration data point, so it is counted and printed
+    /// rather than ignored: shadow mode exists to accumulate this data, and a
+    /// gate quietly failing to write is indistinguishable from a healthy one
+    /// unless someone is counting.
+    persist_failures: u64 = 0,
 };
 
 /// SHELL (B3): bind loopback and serve until killed.
@@ -254,10 +265,30 @@ fn serveRedeem(
     const derived = constellation.derive(obs, cfg.salt);
     const factor = constellation.assess(derived, state.tokens[0..state.token_len]);
 
+    // ── Persist BEFORE indexing (§8A, the freeze rule) ──
+    // The factor is computed against the store as it stands RIGHT NOW and is
+    // written down with the tokens. Charge time reads this number; it must
+    // never re-run `assess`, or a user who waited would be priced against
+    // months of growth they had no part in.
+    //
+    // Disk first, then the in-memory index: if the write fails we still want
+    // the observation scoring this session, but we must not let a successful
+    // in-memory update disguise a failed durable one.
+    const entry: gate_record.Enrollment = .{
+        .subject_tag = tag,
+        .observed_at = now,
+        .factor_x100 = factor,
+        .token_len = derived.len,
+        .tokens = derived.tokens,
+    };
+    if (!gate_store.append(state.store, entry)) {
+        state.persist_failures +|= 1;
+    }
+
     // SHADOW MODE: log the assessment, admit regardless.
     std.debug.print(
-        "[gate] enroll observed: signals={d} factor_x100={d} store={d} dropped={d}\n",
-        .{ derived.len, factor, state.token_len, state.dropped },
+        "[gate] enroll observed: signals={d} factor_x100={d} index={d} dropped={d} unpersisted={d}\n",
+        .{ derived.len, factor, state.token_len, state.dropped, state.persist_failures },
     );
 
     record(state, derived);

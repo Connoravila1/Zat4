@@ -1326,6 +1326,9 @@ test {
     _ = @import("core/constellation.zig");
     _ = @import("core/pow_issue.zig");
     _ = @import("core/gate_wire.zig");
+    _ = @import("core/gate_record.zig");
+    _ = @import("shell/gate_store.zig");
+    _ = @import("shell/gate_serve.zig");
     _ = @import("core/credential.zig");
     _ = @import("shell/credential.zig");
     _ = @import("core/membership.zig");
