@@ -65,6 +65,18 @@ pub const ScreenEffect = enum(u8) {
     spotlight = 7,
     echo = 8,
     shooting_star = 9,
+    // ── NAME EASTER EGGS (owner + friends/family, consented). LOCAL-ONLY: fired
+    // by `detectAuto` on a name in the message text, exactly like the phrase
+    // effects, and NEVER offered in the "Send with…" picker. They ride the same
+    // ScreenEffect type only because playback is shared; both ends derive them
+    // from the same text, so no wire field is needed and none is added.
+    eg_goats = 10, // "connor avila"  — goats run across
+    eg_hearts_fall = 11, // "julia avila"  — hearts fall
+    eg_blue_hearts = 12, // "elaine avila"  — a calm ocean of blue hearts
+    eg_gloves = 13, // "bill/guillermo avila" — boxing gloves
+    eg_notes = 14, // "vicki/victoria geismar" — music notes
+    eg_pigs = 15, // "technoblade" — crowned pigs (never dies)
+    eg_hurricane = 16, // "roger mccrary" — a hurricane across the screen
     _, // forward-compat: an unknown id from a newer peer degrades to "no effect"
 };
 
@@ -92,6 +104,13 @@ pub fn fromWire(b: u8) ScreenEffect {
         .spotlight,
         .echo,
         .shooting_star,
+        .eg_goats,
+        .eg_hearts_fall,
+        .eg_blue_hearts,
+        .eg_gloves,
+        .eg_notes,
+        .eg_pigs,
+        .eg_hurricane,
         => fx,
         _ => .none,
     };
@@ -110,6 +129,13 @@ pub fn screenName(fx: ScreenEffect) []const u8 {
         .spotlight => "Spotlight",
         .echo => "Echo",
         .shooting_star => "Shooting Star",
+        .eg_goats => "Goats",
+        .eg_hearts_fall => "Falling Hearts",
+        .eg_blue_hearts => "Blue Hearts",
+        .eg_gloves => "Boxing Gloves",
+        .eg_notes => "Music Notes",
+        .eg_pigs => "Crowned Pigs",
+        .eg_hurricane => "Hurricane",
         _ => "None",
     };
 }
@@ -130,6 +156,24 @@ const auto_rules = [_]PhraseRule{
     .{ .needle = "congrats", .effect = .confetti },
     .{ .needle = "pew pew", .effect = .lasers },
     .{ .needle = "i love you", .effect = .hearts },
+    // ── NAME EASTER EGGS ─────────────────────────────────────────────────────
+    // Typing a friend's or family member's full name plays a private effect the
+    // two of you share. Everyone named here ASKED for theirs (owner, 2026-07-20)
+    // — these are consented in-jokes, not surveillance: the scan is the same pure
+    // LOCAL text match every phrase above uses, nothing about it is stored or
+    // sent, and the name never leaves the device. Full names (first + last) so a
+    // bare "julia" in ordinary conversation does not set off fireworks of hearts.
+    // More specific names come first (first-match wins).
+    .{ .needle = "technoblade", .effect = .eg_pigs }, // "never dies" — a tribute
+    .{ .needle = "connor avila", .effect = .eg_goats },
+    .{ .needle = "julia avila", .effect = .eg_hearts_fall },
+    .{ .needle = "elaine avila", .effect = .eg_blue_hearts },
+    .{ .needle = "guillermo avila", .effect = .eg_gloves },
+    .{ .needle = "bill avila", .effect = .eg_gloves },
+    .{ .needle = "victoria geismar", .effect = .eg_notes },
+    .{ .needle = "vicki geismar", .effect = .eg_notes },
+    .{ .needle = "roger mccrary", .effect = .eg_hurricane },
+    .{ .needle = "rocky mccrary", .effect = .eg_hurricane },
 };
 
 /// ASCII lowercase fold of one byte (leaves non-letters, incl. UTF-8 bytes and
@@ -212,9 +256,22 @@ test "screen effects: a wire byte only becomes an effect this build can play" {
     try std.testing.expectEqual(ScreenEffect.balloons, fromWire(1));
     try std.testing.expectEqual(ScreenEffect.lasers, fromWire(5));
     try std.testing.expectEqual(ScreenEffect.shooting_star, fromWire(9));
+    try std.testing.expectEqual(ScreenEffect.eg_hurricane, fromWire(16)); // the last named egg
     // An id from a newer peer, and a hostile one, both degrade to nothing
-    // rather than reaching the renderer as a tag nothing switches on.
-    try std.testing.expectEqual(ScreenEffect.none, fromWire(10));
+    // rather than reaching the renderer as a tag nothing switches on. 17 is the
+    // first value past every named effect.
+    try std.testing.expectEqual(ScreenEffect.none, fromWire(17));
     try std.testing.expectEqual(ScreenEffect.none, fromWire(200));
     try std.testing.expectEqual(ScreenEffect.none, fromWire(255));
+}
+
+test "name eggs: a full name fires its effect, case-insensitively; a bare first name does not" {
+    try testing.expectEqual(ScreenEffect.eg_goats, detectAuto("hey connor avila"));
+    try testing.expectEqual(ScreenEffect.eg_goats, detectAuto("CONNOR AVILA!!"));
+    try testing.expectEqual(ScreenEffect.eg_pigs, detectAuto("technoblade never dies"));
+    try testing.expectEqual(ScreenEffect.eg_hurricane, detectAuto("thanks roger mccrary"));
+    try testing.expectEqual(ScreenEffect.eg_notes, detectAuto("vicki geismar"));
+    // A first name alone must NOT trigger — full name only, so ordinary talk is safe.
+    try testing.expectEqual(ScreenEffect.none, detectAuto("hi connor"));
+    try testing.expectEqual(ScreenEffect.none, detectAuto("julia said hi"));
 }

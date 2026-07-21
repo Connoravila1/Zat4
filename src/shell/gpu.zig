@@ -620,6 +620,7 @@ pub const Renderer = struct {
     /// The emoji sprite sheet (RGBA, unit 1), uploaded once at init.
     emoji_tex: GLuint,
     u_viewport: GLint,
+    u_shake: GLint,
     u_atlas: GLint,
     u_emoji: GLint,
     u_alpha: GLint,
@@ -693,6 +694,7 @@ pub fn initRenderer() Error!Renderer {
         .atlas_dim = 0,
         .emoji_tex = etex,
         .u_viewport = glGetUniformLocation(prog, "uViewport"),
+        .u_shake = glGetUniformLocation(prog, "uShake"),
         .u_atlas = glGetUniformLocation(prog, "uAtlas"),
         .u_emoji = glGetUniformLocation(prog, "uEmoji"),
         .u_alpha = glGetUniformLocation(prog, "uAlpha"),
@@ -897,7 +899,11 @@ pub fn buildVertices(
             const vb: f32 = (@as(f32, @floatFromInt(o.y)) + (box - cb) / box * cell_f) * eh;
             const p = [4][2]f32{ .{ dx, dy }, .{ dx + bw, dy }, .{ dx + bw, dy + bh }, .{ dx, dy + bh } };
             const uv = [4][2]f32{ .{ ua, va }, .{ ub, va }, .{ ub, vb }, .{ ua, vb } };
-            try pushQuad(&verts, gpa, p, uv, zero_local, .{ 0, 0 }, 0, mode_emoji, .{ 1, 1, 1, 1 });
+            // The emoji shader multiplies texel alpha by vColor.a — so the
+            // whole-sprite fade (effect particles) rides the tint's alpha; inline
+            // emoji default to 255 → 1.0, unchanged.
+            const ea: f32 = @as(f32, @floatFromInt(it.alpha)) / 255.0;
+            try pushQuad(&verts, gpa, p, uv, zero_local, .{ 0, 0 }, 0, mode_emoji, .{ 1, 1, 1, ea });
         },
         .tri => {
             const it = bare.tri;
@@ -919,9 +925,21 @@ pub fn buildVertices(
 
 /// Upload the vertex buffer and issue the single draw call. `atlas` must
 /// already be uploaded (uploadAtlas) and bound on texture unit 0.
+// Whole-frame shake offset in pixels (the boxing-gloves rumble). A module var
+// rather than a parameter so it reaches every feedDraw (content, rail, menu) in a
+// frame without threading through eight call sites; the shell sets it each frame
+// (0 when nothing is rumbling).
+var g_shake_x: f32 = 0;
+var g_shake_y: f32 = 0;
+pub fn setShake(x: f32, y: f32) void {
+    g_shake_x = x;
+    g_shake_y = y;
+}
+
 pub fn draw(r: *Renderer, verts: []const Vertex, vw: i32, vh: i32, alpha: f32) void {
     if (verts.len == 0 or alpha <= 0.001) return;
     glUseProgram(r.program);
+    glUniform2f(r.u_shake, g_shake_x, g_shake_y);
     glBindBuffer(GL_ARRAY_BUFFER, r.vbo);
     glBufferData(GL_ARRAY_BUFFER, @intCast(verts.len * @sizeOf(Vertex)), verts.ptr, GL_DYNAMIC_DRAW);
 

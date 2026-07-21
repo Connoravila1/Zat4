@@ -124,6 +124,11 @@ pub const MobileHost = struct {
     /// render loop ticks even on a motionless finger, so the timer fires.
     down_ms: u32 = 0,
     hold_fired: bool = false,
+    /// A press-and-hold opened a chat MENU this gesture. Distinct from
+    /// `hold_fired` (which owns the card-drag and its drop): the menu is already
+    /// the whole action, so the release must not also fire a tap underneath it —
+    /// a hold that then taps whatever it opened over is not a hold.
+    hold_menu: bool = false,
     /// The system BACK (edge swipe / back button), delivered by the activity's
     /// key drain: the pump pops one level of in-app navigation. When there is
     /// nothing left to pop (Home, no overlays), the pump sets `minimize_pending`

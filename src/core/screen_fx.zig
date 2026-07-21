@@ -38,6 +38,7 @@ const assert = std.debug.assert;
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const raster = @import("raster.zig");
+const emoji_atlas = @import("emoji_atlas.zig");
 const chat_effects = @import("chat_effects.zig");
 
 pub const ScreenEffect = chat_effects.ScreenEffect;
@@ -48,6 +49,9 @@ pub const Kind = enum(u8) {
     confetti, // gravity, flutters side to side; a small chip
     spark, // firework ember: radial launch, gravity, quick fade
     beam, // laser: a bright line sweeping across, pulsing
+    heart, // "love": a heart that rises and sways, like a warmer balloon
+    sprite, // an EMOJI sprite (cell index in `hue`): goats, gloves, notes, waves…
+    pig_king, // a pig wearing a crown — Technoblade's mark, drawn as two sprites
 };
 
 /// One particle. HOT — hundreds live during a show, swept in bulk (A7).
@@ -89,10 +93,30 @@ const confetti_fall: f32 = 190.0; // px/s downward
 const gravity: f32 = 520.0; // px/s² for sparks
 const firework_life: f32 = 2.2; // per-spark seconds (was 1.4 — read too short)
 const show_seconds: f32 = 2.8; // nominal show length (balloons/confetti travel)
+const egg_seconds: f32 = 3.2; // name eggs linger a touch longer — they are the treat
+
+// Resolve an emoji cell by codepoint (robust to the atlas being repacked — never
+// a hardcoded index). A missing glyph yields a benign 0 rather than an error; the
+// egg simply draws the wrong-but-present sprite, never crashes (E4).
+fn egCell(cp: u21) u8 {
+    return @intCast(@min(emoji_atlas.cellOf(cp) orelse 0, 255));
+}
+const cp_goat: u21 = 0x1F410;
+const cp_pig: u21 = 0x1F437;
+const cp_crown: u21 = 0x1F451;
+const cp_glove: u21 = 0x1F94A;
+const cp_note: u21 = 0x1F3B5;
+const cp_blue_heart: u21 = 0x1F499;
+const cp_wave: u21 = 0x1F30A;
+const cp_cyclone: u21 = 0x1F32A;
+const cp_lifter: u21 = 0x1F3CB; // weightlifter — Vicki's singing lifter
+const cp_biceps: u21 = 0x1F4AA;
 
 // Festive palette (opaque 0xAARRGGBB); compose applies the fade to the alpha.
 const festive = [_]u32{ 0xFFE0466E, 0xFF4A9EE0, 0xFF57C46A, 0xFFF2C14E, 0xFFB06AD8, 0xFFE07A3F };
 const laser_hues = [_]u32{ 0xFF39E08A, 0xFF39D6E0, 0xFFE039C4, 0xFFE0C039 };
+const heart_hues = [_]u32{ 0xFFE0466E, 0xFFF25C8A, 0xFFE0397A, 0xFFFF7FA8 };
+const heart_count: u32 = 22;
 
 // ── A tiny deterministic PRNG (pure; the shell owns the seed) ────────────────
 fn mix(state: *u64) u64 {
@@ -156,6 +180,23 @@ pub fn seedShow(gpa: Allocator, pool: *Pool, effect: ScreenEffect, w: u16, h: u1
                 });
             }
         },
+        .hearts => {
+            var i: u32 = 0;
+            while (i < heart_count) : (i += 1) {
+                try pool.append(gpa, .{
+                    .x = rndR(&st, 0.08 * fw, 0.92 * fw),
+                    .y = fh + rndR(&st, 0, 0.2 * fh),
+                    .vx = rndR(&st, -14, 14),
+                    .vy = balloon_rise * rndR(&st, 0.7, 1.05), // a touch slower than balloons
+                    .life = show_seconds * rndR(&st, 0.9, 1.15),
+                    .max_life = show_seconds,
+                    .size = rndR(&st, 20, 34),
+                    .seed = @truncate(mix(&st)),
+                    .kind = .heart,
+                    .hue = @intCast(mix(&st) % heart_hues.len),
+                });
+            }
+        },
         .fireworks => {
             var b: u32 = 0;
             while (b < firework_bursts) : (b += 1) {
@@ -200,6 +241,200 @@ pub fn seedShow(gpa: Allocator, pool: *Pool, effect: ScreenEffect, w: u16, h: u1
         },
         // No recipe yet — an honest no-op rather than a wrong effect. (hearts,
         // spotlight, echo, shooting_star, none, and any future/unknown id.)
+        // ── NAME EASTER EGGS ────────────────────────────────────────────────
+        .eg_goats => {
+            // A STAMPEDE — a whole herd runs across, at every height, and some are
+            // already on screen so it reads instantly. Left-to-right, staggered.
+            var i: u32 = 0;
+            while (i < 46) : (i += 1) {
+                try pool.append(gpa, .{
+                    .x = rndR(&st, -0.6 * fw, 0.95 * fw), // spread: some mid-screen already
+                    .y = rndR(&st, 0.04 * fh, 0.94 * fh),
+                    .vx = rndR(&st, 230, 380), // gallop rightward
+                    .vy = 0,
+                    .life = egg_seconds * rndR(&st, 0.85, 1.15),
+                    .max_life = egg_seconds,
+                    .size = rndR(&st, 36, 54),
+                    .seed = @truncate(mix(&st)),
+                    .kind = .sprite,
+                    .hue = egCell(cp_goat),
+                });
+            }
+        },
+        .eg_pigs => {
+            // Crowned pigs fill the screen — Technoblade never dies.
+            var i: u32 = 0;
+            while (i < 26) : (i += 1) {
+                try pool.append(gpa, .{
+                    .x = rndR(&st, 0.05 * fw, 0.95 * fw),
+                    // Spread from mid-screen to just below, so the first ones show
+                    // at once and the rest rise up behind them.
+                    .y = rndR(&st, 0.35 * fh, 1.05 * fh),
+                    .vx = rndR(&st, -20, 20),
+                    .vy = balloon_rise * rndR(&st, 0.75, 1.05),
+                    .life = egg_seconds * rndR(&st, 0.85, 1.15),
+                    .max_life = egg_seconds,
+                    .size = rndR(&st, 42, 60),
+                    .seed = @truncate(mix(&st)),
+                    .kind = .pig_king,
+                    .hue = egCell(cp_pig),
+                });
+            }
+        },
+        .eg_gloves => {
+            // A flurry of jabs SMACKING in from both walls — the shell shakes the
+            // whole screen while these fly (the rumble the owner asked for; it keys
+            // off this effect being live, see `shakeActive`).
+            var i: u32 = 0;
+            while (i < 18) : (i += 1) {
+                const from_left = (i & 1) == 0;
+                try pool.append(gpa, .{
+                    .x = if (from_left) rndR(&st, -0.35 * fw, -0.05 * fw) else rndR(&st, 1.05 * fw, 1.35 * fw),
+                    .y = rndR(&st, 0.08 * fh, 0.92 * fh),
+                    .vx = if (from_left) rndR(&st, 420, 640) else rndR(&st, -640, -420), // fast jabs
+                    .vy = rndR(&st, -40, 40),
+                    .life = egg_seconds * rndR(&st, 0.55, 0.85),
+                    .max_life = egg_seconds,
+                    .size = rndR(&st, 42, 58),
+                    .seed = @truncate(mix(&st)),
+                    .kind = .sprite,
+                    .hue = egCell(cp_glove),
+                });
+            }
+        },
+        .eg_notes => {
+            // A WEIGHTLIFTER stands lower-centre and FLINGS musical notes out of a
+            // single spot — sung and thrown, with the fitness reference right there
+            // in the source. Notes spray up-and-out on radial paths; a couple of
+            // flexed biceps fly with them.
+            const sx = 0.5 * fw;
+            const sy = 0.72 * fh;
+            // The lifter — big, parked, a gentle bob (near-zero velocity).
+            try pool.append(gpa, .{
+                .x = sx, .y = sy,
+                .vx = 0, .vy = rndR(&st, -6, 0),
+                .life = egg_seconds, .max_life = egg_seconds,
+                .size = rndR(&st, 62, 74),
+                .seed = @truncate(mix(&st)),
+                .kind = .sprite, .hue = egCell(cp_lifter),
+            });
+            var i: u32 = 0;
+            while (i < 24) : (i += 1) {
+                // A radial spray biased UPWARD (angles from ~200° to ~340°, i.e.
+                // up-left through up-right), flung from the lifter's spot.
+                const ang = rndR(&st, 3.5, 6.0); // radians, upper hemisphere-ish
+                const spd = rndR(&st, 150, 340);
+                const biceps = (i % 8) == 0;
+                try pool.append(gpa, .{
+                    .x = sx + rndR(&st, -12, 12),
+                    .y = sy + rndR(&st, -12, 12),
+                    .vx = @cos(ang) * spd,
+                    .vy = -@abs(@sin(ang)) * spd - rndR(&st, 20, 80), // always up-ish
+                    .life = egg_seconds * rndR(&st, 0.55, 0.9),
+                    .max_life = egg_seconds,
+                    .size = if (biceps) rndR(&st, 30, 40) else rndR(&st, 30, 46),
+                    .seed = @truncate(mix(&st)),
+                    .kind = .sprite,
+                    .hue = if (biceps) egCell(cp_biceps) else egCell(cp_note),
+                });
+            }
+        },
+        .eg_blue_hearts => {
+            // A LITERAL OCEAN: a rolling body of wave-water fills the lower screen,
+            // undulating in place, and blue hearts float UP out of the sea. The
+            // waves are the water; the hearts are what rise from it (owner: "an
+            // ocean feel... literal ocean water and stuff").
+            const ocean_secs = egg_seconds * 1.5;
+            // THE SEA — overlapping wave tiles across the bottom band, many, packed,
+            // barely drifting so the surface churns rather than travels. Big enough
+            // to overlap into a continuous body of water.
+            var wx: f32 = -0.1 * fw;
+            while (wx < 1.1 * fw) : (wx += 0.11 * fw) {
+                var row: u32 = 0;
+                while (row < 3) : (row += 1) {
+                    const fr: f32 = @floatFromInt(row);
+                    try pool.append(gpa, .{
+                        .x = wx + rndR(&st, -0.04 * fw, 0.04 * fw),
+                        .y = fh - fr * 0.11 * fh - rndR(&st, 0, 0.05 * fh), // stacked up from the floor
+                        .vx = rndR(&st, -10, 10),
+                        .vy = rndR(&st, -6, 6), // churn in place, not travel
+                        .life = ocean_secs * rndR(&st, 0.9, 1.1),
+                        .max_life = ocean_secs,
+                        .size = rndR(&st, 64, 92), // large, so they overlap into a sea
+                        .seed = @truncate(mix(&st)),
+                        .kind = .sprite,
+                        .hue = egCell(cp_wave),
+                    });
+                }
+            }
+            // THE HEARTS — rising out of the water, gently.
+            var i: u32 = 0;
+            while (i < 34) : (i += 1) {
+                try pool.append(gpa, .{
+                    .x = rndR(&st, 0.02 * fw, 0.98 * fw),
+                    .y = rndR(&st, 0.45 * fh, fh), // born in/above the sea
+                    .vx = rndR(&st, -8, 8),
+                    .vy = rndR(&st, -60, -24), // float up off the surface
+                    .life = ocean_secs * rndR(&st, 0.8, 1.1),
+                    .max_life = ocean_secs,
+                    .size = rndR(&st, 22, 38),
+                    .seed = @truncate(mix(&st)),
+                    .kind = .sprite,
+                    .hue = egCell(cp_blue_heart),
+                });
+            }
+        },
+        .eg_hearts_fall => {
+            // A DOWNPOUR of hearts — many, and some already mid-fall so the screen
+            // is full at once. Rose vector hearts, tumbling.
+            var i: u32 = 0;
+            while (i < 64) : (i += 1) {
+                try pool.append(gpa, .{
+                    .x = rndR(&st, 0, fw),
+                    .y = rndR(&st, -0.7 * fh, fh), // spread top-to-bottom already
+                    .vx = rndR(&st, -26, 26),
+                    .vy = confetti_fall * rndR(&st, 0.6, 1.0),
+                    .life = egg_seconds * rndR(&st, 0.85, 1.2),
+                    .max_life = egg_seconds,
+                    .size = rndR(&st, 18, 32),
+                    .seed = @truncate(mix(&st)),
+                    .kind = .heart,
+                    .hue = @intCast(mix(&st) % heart_hues.len),
+                });
+            }
+        },
+        .eg_hurricane => {
+            // ONE big cyclone sweeps across, plus torn debris — Roger's storm. The
+            // message-displacement "bonus" rides the toy transform in the shell,
+            // not here; this is the visible weather.
+            try pool.append(gpa, .{
+                .x = -0.2 * fw,
+                .y = 0.45 * fh,
+                .vx = (1.4 * fw) / egg_seconds, // cross the whole screen in the show
+                .vy = 0,
+                .life = egg_seconds,
+                .max_life = egg_seconds,
+                .size = @min(fw, fh) * 0.7, // huge
+                .seed = @truncate(mix(&st)),
+                .kind = .sprite,
+                .hue = egCell(cp_cyclone),
+            });
+            var i: u32 = 0;
+            while (i < 10) : (i += 1) {
+                try pool.append(gpa, .{
+                    .x = rndR(&st, -0.3 * fw, 0.2 * fw),
+                    .y = rndR(&st, 0.1 * fh, 0.9 * fh),
+                    .vx = rndR(&st, 260, 520),
+                    .vy = rndR(&st, -60, 60),
+                    .life = egg_seconds * rndR(&st, 0.6, 1.0),
+                    .max_life = egg_seconds,
+                    .size = rndR(&st, 26, 40),
+                    .seed = @truncate(mix(&st)),
+                    .kind = .sprite,
+                    .hue = egCell(cp_wave),
+                });
+            }
+        },
         else => {},
     }
 }
@@ -243,15 +478,68 @@ pub fn step(pool: *Pool, dt: f32) void {
             .beam => {
                 ys[i] += vys[i] * dt;
             },
+            .heart => {
+                xs[i] += (vxs[i] + @sin(lives[i] * 2.4 + phase) * 20.0) * dt;
+                ys[i] += vys[i] * dt;
+            },
+            .sprite, .pig_king => {
+                // Straight drift + a little sway, so a herd/flock does not look
+                // like it is on rails. Risers (negative vy) sway more.
+                const sway: f32 = if (vys[i] < 0) 18.0 else 8.0;
+                xs[i] += (vxs[i] + @sin(lives[i] * 2.2 + phase) * sway) * dt;
+                ys[i] += vys[i] * dt;
+            },
         }
         i += 1;
     }
+}
+
+/// Should the SCREEN rumble right now? True while any boxing-glove sprite is in
+/// flight — the gloves smack the walls and the whole frame shakes with the
+/// impacts (owner's ask). Pure over the pool: the shell reads this and applies
+/// the offset, so the shake lives and dies with the effect and needs no timer of
+/// its own. Returns 0..1 intensity (fades as the flurry thins).
+pub fn shakeActive(pool: *const Pool) f32 {
+    const kinds = pool.items(.kind);
+    const hues = pool.items(.hue);
+    const lives = pool.items(.life);
+    const maxes = pool.items(.max_life);
+    const glove = @min(emoji_atlas.cellOf(cp_glove) orelse 0, 255);
+    var peak: f32 = 0;
+    for (kinds, hues, lives, maxes) |k, h, life, ml| {
+        if (k != .sprite or h != glove or ml <= 0) continue;
+        const frac = std.math.clamp(life / ml, 0, 1);
+        if (frac > peak) peak = frac;
+    }
+    return peak;
 }
 
 /// True while the show still has particles — the shell keeps ticking/redrawing
 /// (and folding this into its rebuild signature) until it drains.
 pub fn active(pool: *const Pool) bool {
     return pool.len > 0;
+}
+
+/// How dark the screen behind the show should be, 0..1. iMessage DIMS the whole
+/// conversation for the beat an effect plays, then lifts it — the dim is what
+/// makes the balloons read as "over everything" rather than "in front of the
+/// feed". Derived from the show's own life: the freshest particle's remaining
+/// fraction, so the dim holds while anything is mid-flight and releases as the
+/// last of them die. Peak is capped well below opaque — the messages must stay
+/// readable underneath. Empty pool ⇒ 0 (no show, no dim).
+pub const dim_peak: f32 = 0.45;
+pub fn dimAlpha(pool: *const Pool) f32 {
+    const lives = pool.items(.life);
+    const maxes = pool.items(.max_life);
+    var peak: f32 = 0;
+    for (lives, maxes) |life, ml| {
+        if (ml <= 0) continue;
+        const frac = std.math.clamp(life / ml, 0, 1);
+        if (frac > peak) peak = frac;
+    }
+    // Ease the tail so the lift is smooth, not a step, as the peak falls to 0.
+    const eased = peak * peak * (3.0 - 2.0 * peak);
+    return eased * dim_peak;
 }
 
 /// Colour with its alpha byte scaled by `a` (0..1) — the fade.
@@ -332,6 +620,58 @@ pub fn compose(gpa: Allocator, pool: *const Pool, w: u16, dl: *raster.DrawList) 
                     .h = clampU16(size),
                     .color = col,
                     .radius = @intCast(@min(@as(u16, 255), clampU16(size * 0.5))),
+                } });
+            },
+            .heart => {
+                // A heart at particle scale: two rounded lobes side by side and a
+                // triangle closing to a point below — cheaper and rounder than a
+                // glyph, and it reads at 20-34px.
+                const col = fade(heart_hues[hue % heart_hues.len], a);
+                const lobe = clampU16(size * 0.58);
+                const r: u8 = @intCast(@min(@as(u16, 255), clampU16(size * 0.29)));
+                try dl.append(gpa, .{ .rect = .{ .x = clamp16(x - size * 0.5), .y = clamp16(y), .w = lobe, .h = lobe, .color = col, .radius = r } });
+                try dl.append(gpa, .{ .rect = .{ .x = clamp16(x - size * 0.08), .y = clamp16(y), .w = lobe, .h = lobe, .color = col, .radius = r } });
+                try dl.append(gpa, .{ .tri = .{
+                    .x0 = clamp16(x - size * 0.5),
+                    .y0 = clamp16(y + size * 0.34),
+                    .x1 = clamp16(x + size * 0.5),
+                    .y1 = clamp16(y + size * 0.34),
+                    .x2 = clamp16(x),
+                    .y2 = clamp16(y + size * 0.92),
+                    .color = col,
+                } });
+            },
+            .sprite => {
+                // An emoji sprite (cell in `hue`). The fade rides the alpha of the
+                // whole item — drawEmoji multiplies its own texel alpha by this.
+                const box: u16 = clampU16(size);
+                const av: u8 = @intFromFloat(std.math.clamp(a * 255.0, 0, 255));
+                try dl.append(gpa, .{ .emoji = .{
+                    .x = clamp16(x - size * 0.5),
+                    .y = clamp16(y - size * 0.5),
+                    .px = box,
+                    .cell = hue,
+                    .alpha = av,
+                } });
+            },
+            .pig_king => {
+                // A pig with a crown perched above it — Technoblade's mark.
+                const box: u16 = clampU16(size);
+                const av: u8 = @intFromFloat(std.math.clamp(a * 255.0, 0, 255));
+                try dl.append(gpa, .{ .emoji = .{
+                    .x = clamp16(x - size * 0.5),
+                    .y = clamp16(y - size * 0.5),
+                    .px = box,
+                    .cell = hue, // the pig
+                    .alpha = av,
+                } });
+                const crown: u16 = clampU16(size * 0.6);
+                try dl.append(gpa, .{ .emoji = .{
+                    .x = clamp16(x - size * 0.3),
+                    .y = clamp16(y - size * 0.5 - size * 0.42),
+                    .px = crown,
+                    .cell = egCell(cp_crown),
+                    .alpha = av,
                 } });
             },
             .beam => {
@@ -421,11 +761,24 @@ test "every show self-drains within its lifetime (E4, no leak)" {
 
 test "effects without a recipe yet seed nothing (honest no-op)" {
     const gpa = testing.allocator;
-    for ([_]ScreenEffect{ .none, .hearts, .spotlight, .echo, .shooting_star }) |fx| {
+    for ([_]ScreenEffect{ .none, .spotlight, .echo, .shooting_star }) |fx| {
         var pool: Pool = .empty;
         defer pool.deinit(gpa);
         try seedShow(gpa, &pool, fx, 400, 800, 3);
         try testing.expectEqual(@as(usize, 0), pool.len);
+    }
+}
+
+test "hearts seed and rise (a real recipe now, not a no-op)" {
+    const gpa = testing.allocator;
+    var pool: Pool = .empty;
+    defer pool.deinit(gpa);
+    try seedShow(gpa, &pool, .hearts, 400, 800, 7);
+    try testing.expect(pool.len > 0);
+    // Every heart rises (negative vy) and is tagged as a heart.
+    for (pool.items(.vy), pool.items(.kind)) |vy, k| {
+        try testing.expect(vy < 0);
+        try testing.expectEqual(Kind.heart, k);
     }
 }
 
@@ -457,4 +810,49 @@ test "compose emits at least one draw item per live particle and leaks nothing" 
     try testing.expect(dl.len >= pool.len); // one rect per confetti chip
     // Guard the record size stayed put (A7).
     try testing.expectEqual(@as(usize, 32), @sizeOf(Particle));
+}
+
+test "name eggs: each seeds particles of the right kind" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { fx: ScreenEffect, kind: Kind }{
+        .{ .fx = .eg_goats, .kind = .sprite },
+        .{ .fx = .eg_pigs, .kind = .pig_king },
+        .{ .fx = .eg_gloves, .kind = .sprite },
+        .{ .fx = .eg_notes, .kind = .sprite },
+        .{ .fx = .eg_blue_hearts, .kind = .sprite },
+        .{ .fx = .eg_hearts_fall, .kind = .heart },
+        .{ .fx = .eg_hurricane, .kind = .sprite },
+    };
+    for (cases) |c| {
+        var pool: Pool = .empty;
+        defer pool.deinit(gpa);
+        try seedShow(gpa, &pool, c.fx, 400, 800, 11);
+        try testing.expect(pool.len > 0);
+        // At least one particle is the expected kind (hurricane mixes cyclone+debris,
+        // both sprite; pig_king is all pig_king).
+        var found = false;
+        for (pool.items(.kind)) |k| {
+            if (k == c.kind) found = true;
+        }
+        try testing.expect(found);
+    }
+}
+
+test "name eggs: compose emits draw items without tripping (the sprite path)" {
+    const gpa = testing.allocator;
+    for ([_]ScreenEffect{ .eg_goats, .eg_pigs, .eg_gloves, .eg_notes, .eg_blue_hearts, .eg_hurricane }) |fx| {
+        var pool: Pool = .empty;
+        defer pool.deinit(gpa);
+        try seedShow(gpa, &pool, fx, 400, 700, 5);
+        var i: u32 = 0;
+        while (i < 30) : (i += 1) step(&pool, 0.016);
+        var dl: raster.DrawList = .empty;
+        defer dl.deinit(gpa);
+        try compose(gpa, &pool, 400, &dl);
+        // Something was drawn, and every emoji item names a real atlas cell.
+        try testing.expect(dl.len > 0);
+        for (dl.items(.tags), dl.items(.data)) |tag, d| {
+            if (tag == .emoji) try testing.expect(d.emoji.cell < emoji_atlas.count);
+        }
+    }
 }

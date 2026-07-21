@@ -160,12 +160,17 @@ pub const EmojiItem = struct {
     /// (a hard viewport clip). Zero for inline text emoji.
     crop_top: u8 = 0,
     crop_bot: u8 = 0,
+    /// Whole-sprite opacity, 0..255. DEFAULT 255 (opaque) so inline text emoji
+    /// are untouched; the screen-effect particles set it below 255 to fade a
+    /// sprite in/out over its life. Multiplied into each texel's own alpha.
+    alpha: u8 = 255,
 
     comptime {
-        // Budget: 10 — the 8-byte sprite + the two crop bytes (A7.1: the
-        // scrolling picker needs viewport clipping; still inside the
-        // union's 16-byte payload, so the DrawItem guard is untouched).
-        assert(@sizeOf(EmojiItem) == 10);
+        // A7.1 — budget 10 → 12: `alpha` (u8) lets an emoji particle fade like
+        // every other effect particle; the trailing byte is padding to the u16
+        // alignment. Still inside the union's 16-byte payload, so the DrawItem
+        // guard is untouched.
+        assert(@sizeOf(EmojiItem) == 12);
     }
 };
 
@@ -429,7 +434,8 @@ fn drawEmoji(fb: *Framebuffer, it: EmojiItem) void {
             if (px2 < 0 or px2 >= fb.width) continue;
             const sx = o.x + @as(u32, @intCast(@divTrunc(ox * @as(i32, @intCast(emoji_atlas.cell_px)), box)));
             const si = (@as(usize, sy) * emoji_atlas.sheet_w + sx) * 4;
-            const a: u32 = emoji_atlas.sheet_rgba[si + 3];
+            var a: u32 = emoji_atlas.sheet_rgba[si + 3];
+            if (it.alpha != 255) a = (a * it.alpha) / 255; // whole-sprite fade
             if (a == 0) continue;
             const fg = (@as(u32, emoji_atlas.sheet_rgba[si]) << 16) |
                 (@as(u32, emoji_atlas.sheet_rgba[si + 1]) << 8) |

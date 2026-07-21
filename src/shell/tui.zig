@@ -4221,6 +4221,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         m.down_y = tev.y;
                         m.down_ms = now_ms; // the long-press clock starts
                         m.hold_fired = false;
+                        m.hold_menu = false;
                         m.scrolling = false;
                         m.hswipe = false;
                         m.drag_y = tev.y;
@@ -4825,7 +4826,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             // (its keys already fired at touch-down; the
                             // panel swallows the rest by design) or on a
                             // selection handle (the drag was the action).
-                            if (!m.press_in_kbd and !m.input_lp and m.chat_hnd == 0) {
+                            if (!m.press_in_kbd and !m.input_lp and !m.hold_menu and m.chat_hnd == 0) {
                                 pointer_events.append(gpa, .{ .x = @intCast(m.down_x), .y = @intCast(m.down_y), .kind = .button_down, .button = 1, .mods = 0, ._pad = 0 }) catch {};
                                 pointer_events.append(gpa, .{ .x = tev.x, .y = tev.y, .kind = .button_up, .button = 1, .mods = 0, ._pad = 0 }) catch {};
                             }
@@ -5029,6 +5030,40 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 // hold a home-screen icon to move it. The continuous render loop ticks
                 // even on a motionless finger, so this per-frame timer fires. Once
                 // lifted, the move/up arms above own the ghost + the drop.
+                // THE CHAT PRESS-AND-HOLD, from the REAL finger-down.
+                //
+                // The phone synthesizes its button_down/button_up pair at RELEASE
+                // (that is how it tells a tap from a scroll), so the desktop's
+                // arm-on-button-down never ran until the finger was already up —
+                // the 420ms clock started and ended in the same instant and no
+                // long-press on mobile could ever fire. Measured on-device:
+                // "ARM send" and "UP el=0ms" at the same millisecond, three
+                // seconds after the finger actually landed.
+                //
+                // So the phone runs its own timer off the true press, exactly as
+                // the loadout card-drag below already does, and arms through the
+                // shared `chatHoldArm`. The menu is the whole action, so the
+                // release suppresses its tap via `hold_menu`.
+                if (dev_chat and m.down_x >= 0 and !m.hold_fired and !m.hold_menu and
+                    !m.scrolling and !m.hswipe and !m.socket_swipe and !m.press_in_kbd and
+                    rs.gscreen == feed_view.screen_messages and !rs.gcmenu.open and
+                    (now_ms -% m.down_ms) >= chat_hold_ms)
+                {
+                    const chx: i32 = @intFromFloat(@as(f32, @floatFromInt(m.down_x)) / scale);
+                    const chy: i32 = @intFromFloat(@as(f32, @floatFromInt(m.down_y)) / scale);
+                    if (chatHoldArm(rs, rs.gregions.items, chx, chy)) {
+                        // Arming stamps "now"; the wait has ALREADY happened, so
+                        // back-date it past the threshold and let the one shared
+                        // step open the menu.
+                        rs.ghold_ns = clock_shell.monotonicNanos() -| (@as(u64, chat_hold_ms) * 1_000_000);
+                        chatHoldStep(rs);
+                        if (rs.gcmenu.open) {
+                            m.hold_menu = true;
+                            m.haptic_pending = 2; // it opened under the finger; say so
+                        }
+                    }
+                }
+
                 const hold_ms: u32 = 300;
                 if (m.down_x >= 0 and !m.hold_fired and !m.scrolling and !m.hswipe and !m.socket_swipe and
                     rs.gbench_drag == null and rs.gbench_pick == null and
@@ -5761,37 +5796,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             // starts a clock, and if it survives 420ms without
                             // wandering, the menu opens under the finger.
                             if (rs.gscreen == feed_view.screen_messages and !rs.gcmenu.open) {
-                                if (feed_view.hitTest(g.regions.items, rx, ry)) |mh| {
-                                    if (mh.kind == .chat_msg) {
-                                        if (chatMsgAtOrdinal(rs, mh.post)) |mi| {
-                                            rs.ghold_ns = clock_shell.monotonicNanos();
-                                            rs.ghold_x = rx;
-                                            rs.ghold_y = ry;
-                                            rs.ghold_kind = .message;
-                                            rs.ghold_msg = mi;
-                                            rs.ghold_mine = chat_core.isMine(&rs.gchat_store, @enumFromInt(mi));
-                                            rs.ghold_live = true;
-                                        }
-                                    } else if (mh.kind == .chat_conv) {
-                                        // HOLD A CONVERSATION for its options — the
-                                        // thing the owner asked for by name.
-                                        rs.ghold_ns = clock_shell.monotonicNanos();
-                                        rs.ghold_x = rx;
-                                        rs.ghold_y = ry;
-                                        rs.ghold_kind = .conversation;
-                                        rs.ghold_conv = mh.post;
-                                        rs.ghold_live = true;
-                                    } else if (mh.kind == .chat_send and rs.gchat_draft_len > 0) {
-                                        // HOLD SEND for the "Send with…" effect picker
-                                        // (a plain tap still sends). Only with a draft
-                                        // to send — an empty picker sends nothing.
-                                        rs.ghold_ns = clock_shell.monotonicNanos();
-                                        rs.ghold_x = rx;
-                                        rs.ghold_y = ry;
-                                        rs.ghold_kind = .send;
-                                        rs.ghold_live = true;
-                                    }
-                                }
+                                _ = chatHoldArm(rs, g.regions.items, rx, ry);
                             }
                             if (rs.gscreen == feed_view.screen_enroll) {
                                 // …unless the ENTRANCE is still playing, in which
@@ -6669,6 +6674,13 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                                 rs.gchat_draft_len = 0;
                                                 rs.gchat_caret = 0;
                                                 chatCollapseSel(rs);
+                                                // KEEP THE KEYBOARD. A plain Send does
+                                                // (it re-asserts focus after posting);
+                                                // sending WITH an effect must feel the
+                                                // same — you are mid-conversation either
+                                                // way. Without this the keyboard dropped
+                                                // only when you picked an effect.
+                                                rs.gchat_input_focus = true;
                                                 if (rs.gpu_state) |*gs2| gs2.sfx_manual = fx; // play the picked effect
                                             };
                                         },
@@ -10711,11 +10723,48 @@ fn chatMenuOf(rs: *const RunState) feed_view.ChatMenu {
 /// press-and-hold. 420 ms is the number every platform converged on; 12 px of slop
 /// keeps a thumb that shifts slightly from being read as a scroll.
 const chat_hold_ms: u64 = 420;
+/// The cinematic pre-roll before a screen effect: the screen dims over this many
+/// seconds and holds, then the particles burst (owner, 2026-07-20).
+const sfx_leadin_s: f32 = 0.42;
 const chat_hold_slop_px: i32 = 12;
 
 /// Watch a press that is being held (slice 2). Called every frame while one is
 /// live: if it survives long enough without moving, the menu opens where the finger
 /// is — and the press is CONSUMED, so letting go does not also fire a tap.
+/// Arm the chat press-and-hold at a press point. Returns true if the point is
+/// something holdable (a message, a conversation row, or Send with a draft).
+///
+/// Extracted because the two input models reach it differently. The desktop arms
+/// it on the real button-down. The PHONE cannot: it synthesizes the
+/// button_down/button_up pair at RELEASE time, so it can tell a tap from a
+/// scroll — which means on mobile a press event does not exist until the finger
+/// is already up, and every long-press clock started and ended in the same
+/// instant. The phone therefore arms this from its own per-frame hold timer,
+/// off the REAL finger-down, exactly as the loadout card-drag already does.
+fn chatHoldArm(rs: *RunState, regions: []const feed_view.Region, rx: i32, ry: i32) bool {
+    const mh = feed_view.hitTest(regions, rx, ry) orelse return false;
+    if (mh.kind == .chat_msg) {
+        const mi = chatMsgAtOrdinal(rs, mh.post) orelse return false;
+        rs.ghold_kind = .message;
+        rs.ghold_msg = mi;
+        rs.ghold_mine = chat_core.isMine(&rs.gchat_store, @enumFromInt(mi));
+    } else if (mh.kind == .chat_conv) {
+        // HOLD A CONVERSATION for its options — the thing the owner asked for
+        // by name.
+        rs.ghold_kind = .conversation;
+        rs.ghold_conv = mh.post;
+    } else if (mh.kind == .chat_send and rs.gchat_draft_len > 0) {
+        // HOLD SEND for the "Send with…" effect picker (a plain tap still
+        // sends). Only with a draft — an empty picker sends nothing.
+        rs.ghold_kind = .send;
+    } else return false;
+    rs.ghold_ns = clock_shell.monotonicNanos();
+    rs.ghold_x = rx;
+    rs.ghold_y = ry;
+    rs.ghold_live = true;
+    return true;
+}
+
 fn chatHoldStep(rs: *RunState) void {
     if (!rs.ghold_live or rs.gcmenu.open) return;
     const el_ms = (clock_shell.monotonicNanos() -| rs.ghold_ns) / 1_000_000;
@@ -14390,6 +14439,10 @@ const GpuState = struct {
     sfx_pool: screen_fx.Pool = .empty,
     sfx_pending: chat_effects.ScreenEffect = .none,
     sfx_seed: u64 = 0,
+    /// CINEMATIC PRE-ROLL: seconds of dim-only pause remaining before the effect
+    /// particles start. The screen darkens over this beat and holds, THEN the show
+    /// bursts — so an effect lands like a moment, not a jump-cut (owner ask).
+    sfx_lead_s: f32 = 0,
     /// A MANUALLY-picked "Send with…" effect to play on this frame. Takes precedence
     /// over the auto-detected one (a picked effect is a deliberate choice; the phrase
     /// scanner must not override it). Set by the .chat_send_fx handler, consumed at
@@ -15428,6 +15481,10 @@ fn paintFrameGpu(
     profile_header: ?feed_view.ProfileHeader,
     now: i64,
 ) !void {
+    // Clear any leftover rumble at the top of every frame; the chat effect
+    // compose below re-raises it while boxing gloves are in flight, so it can
+    // never linger onto another screen.
+    gpu.setShake(0, 0);
     // Frame-period measurement for the "Show frame timing" overlay — a smoothed
     // ms between successive frames (cheap; the clock read is the only cost).
     {
@@ -15839,7 +15896,11 @@ fn paintFrameGpu(
         // Tick the screen-effect show and keep the frame rebuilding while it plays
         // (a per-frame animation must never cache — the standing GPU-rebuild law).
         if (gs.sfx_pool.len > 0) {
-            screen_fx.step(&gs.sfx_pool, dt);
+            if (gs.sfx_lead_s > 0) {
+                gs.sfx_lead_s -= dt; // the dim-only pause; particles held at spawn
+            } else {
+                screen_fx.step(&gs.sfx_pool, dt);
+            }
             chat_animating = true;
         }
     };
@@ -16100,17 +16161,52 @@ fn paintFrameGpu(
             // (design_w × lh) is known, then compose the live particles ON TOP of
             // the thread. `chat_animating` (set while the pool is non-empty) keeps
             // this rebuilding every frame until the show drains.
+            // The VISIBLE height: seed into the area ABOVE the keyboard, so an
+            // effect that rises from the bottom is not born behind the keys and
+            // only crawls into view as it is ending (owner, 2026-07-20). Effects
+            // read the height they are given as "the screen"; handing them the
+            // visible slice keeps every one of them — eggs and picker alike —
+            // playing where it can actually be seen.
+            const vis_h: u16 = @intCast(@max(120, @as(i32, @intCast(lh)) - (if (g.kbd_visible) feed_view.keyboard_h + @as(i32, @intCast(gs.inset_bottom_l)) else 0)));
             // A MANUALLY-picked ("Send with…") effect wins over the auto-detected one.
             if (gs.sfx_manual != .none) {
-                screen_fx.seedShow(gpa, &gs.sfx_pool, gs.sfx_manual, @intCast(gs.design_w), @intCast(lh), gs.chat_clock_ns) catch {};
+                screen_fx.seedShow(gpa, &gs.sfx_pool, gs.sfx_manual, @intCast(gs.design_w), vis_h, gs.chat_clock_ns) catch {};
                 gs.sfx_manual = .none;
                 gs.sfx_pending = .none; // don't also auto-play the same message
+                gs.sfx_lead_s = sfx_leadin_s;
             } else if (gs.sfx_pending != .none) {
-                screen_fx.seedShow(gpa, &gs.sfx_pool, gs.sfx_pending, @intCast(gs.design_w), @intCast(lh), gs.sfx_seed) catch {};
+                screen_fx.seedShow(gpa, &gs.sfx_pool, gs.sfx_pending, @intCast(gs.design_w), vis_h, gs.sfx_seed) catch {};
                 gs.sfx_pending = .none;
+                gs.sfx_lead_s = sfx_leadin_s;
             }
-            if (gs.sfx_pool.len > 0)
-                screen_fx.compose(gpa, &gs.sfx_pool, @intCast(gs.design_w), g.draw) catch {};
+            if (gs.sfx_pool.len > 0) {
+                // THE DIM: darken the whole conversation UNDER the particles, so
+                // the show reads as over everything. During the PRE-ROLL the dim
+                // ramps in on its own (no particles yet) — the cinematic beat; once
+                // the show starts, its alpha rides the particles' life and lifts as
+                // the last of them die.
+                const leading = gs.sfx_lead_s > 0;
+                const dim = if (leading)
+                    screen_fx.dim_peak * std.math.clamp(1.0 - gs.sfx_lead_s / sfx_leadin_s, 0, 1)
+                else
+                    screen_fx.dimAlpha(&gs.sfx_pool);
+                if (dim > 0.004) {
+                    const da: u32 = @intFromFloat(std.math.clamp(dim * 255.0, 0, 255));
+                    g.draw.append(gpa, .{ .rect = .{ .x = 0, .y = 0, .w = @intCast(@min(gs.design_w, 65535)), .h = @intCast(@min(lh, 65535)), .color = (da << 24), .radius = 0 } }) catch {};
+                }
+                // No particles drawn during the pre-roll — just the darkening.
+                if (!leading) screen_fx.compose(gpa, &gs.sfx_pool, @intCast(gs.design_w), g.draw) catch {};
+                // THE RUMBLE: while boxing gloves are in flight, jolt the whole
+                // frame. Intensity fades with the flurry; the jitter is a fast
+                // decaying oscillation off the clock, scaled to logical px and
+                // then to device px (the shader offsets in device space).
+                const rumble = screen_fx.shakeActive(&gs.sfx_pool);
+                if (rumble > 0.01) {
+                    const amp = rumble * 11.0 * gs.scale; // px
+                    const tt = gs.t * 46.0;
+                    gpu.setShake(@sin(tt) * amp, @cos(tt * 1.37) * amp);
+                } else gpu.setShake(0, 0);
+            } else gpu.setShake(0, 0);
         } else if (g.screen.* == feed_view.screen_algo_docs) {
             g.content_h.* = feed_view.layoutAlgoDocs(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, g.scroll.*, if (g.docs_kind == 1) algo_docs.dev_doc else algo_docs.user_doc) catch g.content_h.*;
         } else if (g.screen.* == feed_view.screen_algo_detail) {

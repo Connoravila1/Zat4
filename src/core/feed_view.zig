@@ -9871,7 +9871,14 @@ fn drawChatMenu(
     // It stays ON SCREEN. A menu summoned near the bottom edge that runs off it is
     // a menu with items nobody can reach.
     const x = std.math.clamp(m.x, 8, @max(8, width - chat_menu_w - 8));
-    const y = std.math.clamp(m.y, 8, @max(8, height - h - 8));
+    // "Send with…" GROWS UP from the Send button, the iMessage grammar — and,
+    // load-bearing on the phone, that keeps it clear of the soft keyboard, which
+    // covers the bottom of the screen and was clipping a downward menu. Every
+    // other menu opens under the press point where the finger already is.
+    const y = if (m.kind == .send)
+        std.math.clamp(m.y - h - 10, 8, @max(8, height - h - 8))
+    else
+        std.math.clamp(m.y, 8, @max(8, height - h - 8));
 
     // The arrival: it grows from where you pressed. Cheap, and it makes the menu
     // feel like a consequence of the press rather than an interruption.
