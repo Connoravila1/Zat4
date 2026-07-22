@@ -4287,14 +4287,15 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                 const klx: i32 = @intFromFloat(@as(f32, @floatFromInt(tev.x)) / gsd.scale);
                                 const kly: i32 = @intFromFloat(@as(f32, @floatFromInt(tev.y)) / gsd.scale);
                                 const klh: i32 = @intFromFloat(@as(f32, @floatFromInt(m.height_px)) / gsd.scale);
-                                const kbd_res = ui_insets.safeBottom(@intCast(gsd.inset_bottom_l), 0);
-                                // The bottom `kbd_res` strip is the OS swipe-up-home gesture
-                                // zone: a touch that STARTS there is NOT a keyboard press (it
-                                // belongs to the system gesture), so exclude it — otherwise
-                                // kbdResolve snaps it to the nearest key (the space bar) and a
-                                // swipe-to-switch-apps types a space. Only the real key area
-                                // [top … klh - kbd_res) fires keys.
-                                if (kly >= klh - feed_view.keyboard_h - kbd_res and kly < klh - kbd_res) {
+                                const kbd_inset: i32 = @intCast(gsd.inset_bottom_l);
+                                const kbd_res = ui_insets.safeBottom(kbd_inset, 0);
+                                // The keyboard sits at its natural height (top = klh - keyboard_h
+                                // - inset). The bottom `kbd_res` band is the OS swipe-up-home
+                                // gesture zone: a touch that STARTS there is NOT a keyboard press
+                                // (kbdResolve would snap it to the space bar and a swipe-to-switch-
+                                // apps would type a space). So the press area is the real key rows
+                                // only: [keyboard top … klh - kbd_res).
+                                if (kly >= klh - feed_view.keyboard_h - kbd_inset and kly < klh - kbd_res) {
                                     m.press_in_kbd = true;
                                     // PRESS-COMMIT: the key fires the instant
                                     // the finger lands (flash + bytes) — real
@@ -15664,8 +15665,9 @@ fn paintComposeGpu(
     // The keyboard SLIDE (Rover `ui/reveal`): the panel eases in/out and the
     // composer rides its animated height (`kbd_lift`) rather than jumping.
     reveal.advance(&gs.kbd_reveal, g.kbd_visible, 1.0 / 60.0);
-    const kbd_reserve = ui_insets.safeBottom(@intCast(gs.inset_bottom_l), 0);
-    const kbd_full = feed_view.keyboard_h + kbd_reserve;
+    // Natural panel height (keyboard_h + the system-bars inset) — the keyboard is
+    // NOT lifted for the gesture strip; that is handled by the tap-region cutoff.
+    const kbd_full = feed_view.keyboard_h + @as(i32, @intCast(gs.inset_bottom_l));
     const kbd_slide_px: i32 = @intFromFloat(reveal.slideUp(gs.kbd_reveal, @floatFromInt(kbd_full)));
     const kbd_lift: u32 = @intCast(@max(0, kbd_full - kbd_slide_px)); // 0 hidden … kbd_full seated
     feed_view.layoutCompose(gpa, g.engine, @intCast(gs.design_w), @intCast(lh - kbd_lift), g.accent, ctx, reply_handle, quoting, draft, caret, sel_start, sel_end, blink_on, status, segments, tag_bar, g.draw, g.regions) catch {};
@@ -15816,8 +15818,9 @@ fn paintFrameGpu(
     // is the animated visible height the content above must reserve.
     reveal.advance(&gs.kbd_reveal, g.kbd_visible, 1.0 / 60.0);
     const kbd_animating = reveal.active(gs.kbd_reveal, g.kbd_visible);
-    const kbd_reserve = ui_insets.safeBottom(@intCast(gs.inset_bottom_l), 0);
-    const kbd_full = feed_view.keyboard_h + kbd_reserve;
+    // Natural panel height (keyboard_h + system-bars inset). The keyboard is NOT
+    // lifted for the gesture strip — the tap-region cutoff handles that.
+    const kbd_full = feed_view.keyboard_h + @as(i32, @intCast(gs.inset_bottom_l));
     const kbd_slide_px: i32 = @intFromFloat(reveal.slideUp(gs.kbd_reveal, @floatFromInt(kbd_full)));
     const kbd_render = !reveal.dismissed(gs.kbd_reveal);
     const kbd_lift: i32 = @max(0, kbd_full - kbd_slide_px);
@@ -16457,7 +16460,7 @@ fn paintFrameGpu(
             // read the height they are given as "the screen"; handing them the
             // visible slice keeps every one of them — eggs and picker alike —
             // playing where it can actually be seen.
-            const vis_h: u16 = @intCast(@max(120, @as(i32, @intCast(lh)) - (if (g.kbd_visible) feed_view.keyboard_h + ui_insets.safeBottom(@intCast(gs.inset_bottom_l), 0) else 0)));
+            const vis_h: u16 = @intCast(@max(120, @as(i32, @intCast(lh)) - (if (g.kbd_visible) feed_view.keyboard_h + @as(i32, @intCast(gs.inset_bottom_l)) else 0)));
             // A MANUALLY-picked ("Send with…") effect wins over the auto-detected one.
             if (gs.sfx_manual != .none) {
                 screen_fx.seedShow(gpa, &gs.sfx_pool, gs.sfx_manual, @intCast(gs.design_w), vis_h, gs.chat_clock_ns) catch {};
@@ -17405,7 +17408,7 @@ fn drawSdfIcons(g: Grid, gs: *GpuState, items: []const feed_core.TimelineItem, v
     // icon whose centre lands under it would bleed through onto the keys
     // (the on-device space-bar bleed, 2026-07-10). The cartridge-sheet rule
     // at panel scale: skip them, tab-bar nav icons included.
-    const kbd_top: i32 = if (g.kbd_visible) logical_h - feed_view.keyboard_h - ui_insets.safeBottom(@intCast(gs.inset_bottom_l), 0) else std.math.maxInt(i32);
+    const kbd_top: i32 = if (g.kbd_visible) logical_h - feed_view.keyboard_h - @as(i32, @intCast(gs.inset_bottom_l)) else std.math.maxInt(i32);
     const clipped = struct {
         fn f(r: feed_view.Region, top: i32, bot: i32) bool {
             const c = @as(i32, r.y) + @divTrunc(@as(i32, r.h), 2);
@@ -17550,7 +17553,7 @@ fn drawEngagementHearts(g: Grid, gs: *GpuState, items: []const feed_core.Timelin
     // so bottom_clip misses it). Phone only. Same box source as drawSdfIcons.
     const fab = feed_view.composeFabBox(@intCast(gs.design_w), logical_h, gs.inset_bottom_l);
     // And the Zat4 keyboard band — the same bleed rule as drawSdfIcons.
-    const kbd_top: i32 = if (g.kbd_visible) logical_h - feed_view.keyboard_h - ui_insets.safeBottom(@intCast(gs.inset_bottom_l), 0) else std.math.maxInt(i32);
+    const kbd_top: i32 = if (g.kbd_visible) logical_h - feed_view.keyboard_h - @as(i32, @intCast(gs.inset_bottom_l)) else std.math.maxInt(i32);
     for (g.regions.items) |r| {
         if (r.kind != .like or r.post >= items.len) continue;
         const row_c = @as(i32, r.y) + @divTrunc(@as(i32, r.h), 2);

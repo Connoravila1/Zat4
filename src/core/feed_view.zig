@@ -2288,22 +2288,22 @@ pub fn drawKeyboard(
     /// bottom edge. Keys/picker/popups all derive from `top`, so they slide together.
     slide_px: i32,
 ) error{OutOfMemory}!void {
-    // Reserve the SWIPE-UP-HOME gesture strip at the bottom (Rover `ui/insets`):
-    // the whole keyboard sits `reserve` above the screen edge instead of the bare
-    // system-bars inset, so a swipe-up to switch apps no longer lands on the space
-    // row. Everything below derives from `top`, so keys/picker/popups lift together.
-    // (`0` = the system-gesture inset is not plumbed yet; the primitive falls back
-    // to a safe default until it is.)
-    const reserve = ui_insets.safeBottom(bottom_inset, 0);
-    const top = view_h - keyboard_h - reserve + slide_px;
+    // The keyboard sits at its natural height (bottom-anchored over the system-bars
+    // inset) — the same position it always had. The SWIPE-UP-HOME gesture strip is
+    // handled WITHOUT lifting the keys: `gesture_reserve` only pulls the bottom
+    // row's TAP region up (below), leaving the very bottom band non-interactive so a
+    // swipe-to-switch-apps isn't stolen by the space bar. Lifting the whole panel
+    // (an earlier attempt) just made the keyboard float too high.
+    const gesture_reserve = ui_insets.safeBottom(bottom_inset, 0);
+    const top = view_h - keyboard_h - bottom_inset + slide_px;
     // The panel: opaque (nothing ghosts through chrome), filling to the screen edge.
-    try rect(gpa, dl, 0, top, width, keyboard_h + reserve, bg, 0);
-    try rect(gpa, dl, 0, top, width, keyboard_h + reserve, 0x14FFFFFF, 0);
+    try rect(gpa, dl, 0, top, width, keyboard_h + bottom_inset, bg, 0);
+    try rect(gpa, dl, 0, top, width, keyboard_h + bottom_inset, 0x14FFFFFF, 0);
     // The lit top edge — the circuit's supply rail.
     try rect(gpa, dl, 0, top, width, 2, (0xC8 << 24) | (accent & 0x00FFFFFF), 0);
     // Swallow every tap on the panel (the bar-blocker pattern): keys win by
     // being emitted after.
-    try emitRegion(gpa, regions, 0, top, width, @intCast(@min(keyboard_h + reserve, 32767)), 0, .blocker);
+    try emitRegion(gpa, regions, 0, top, width, @intCast(@min(keyboard_h + bottom_inset, 32767)), 0, .blocker);
 
     const m: i32 = 6; // outer margin
     const row_w = width - 2 * m;
@@ -2723,9 +2723,9 @@ pub fn drawKeyboard(
             const ry0: i32 = if (row_i == 0) top + 2 else y - hg;
             // The bottom row's targets stop at the gesture-safe line, NOT the screen
             // edge — otherwise the space bar's tap region reaches into the swipe-up
-            // gesture strip and a swipe-to-switch-apps types a space. The bottom
-            // `reserve` px stays non-interactive (the visual keys already sit above it).
-            const ry1: i32 = if (row_i == n_rows - 1) view_h - reserve else y + kbd_key_h + hg;
+            // gesture strip and a swipe-to-switch-apps types a space. The keys stay at
+            // their natural height; only the bottom `gesture_reserve` band is inert.
+            const ry1: i32 = if (row_i == n_rows - 1) view_h - gesture_reserve else y + kbd_key_h + hg;
             if (k.ctrl != 0) {
                 if (k.ctrl == 5) {
                     // The emoji key: a drawn face (the embedded font carries
