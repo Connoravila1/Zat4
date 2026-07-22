@@ -6886,18 +6886,18 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         .chat_device_help => rs.gdev_help = true,
                                         .chat_help_close => rs.gdev_help = false,
                                         .chat_send => if (dev_chat) {
-                                            // A STAGED GAME takes priority: Send commits the
-                                            // invite (seats us as X, shows an empty board to
-                                            // both), then clears the staged chip. The draft
-                                            // is normally empty here, but if it is not it
-                                            // sends on the next tap.
+                                            // A STAGED GAME sends the invite first (seats us as
+                                            // X, shows an empty board), then FALLS THROUGH so a
+                                            // note typed alongside it goes as the message right
+                                            // after — you get the game AND your text in one Send,
+                                            // never a stranded draft. (No `continue`: the text
+                                            // path below runs on the same tap.)
                                             if (rs.gchat_pending_game) {
-                                                if (rs.gchat_sel) |sc| {
+                                                if (rs.gchat_sel) |sc|
                                                     chatSendGameMove(rs, gpa, io, environ, sc, chat_games.inviteMove().encode());
-                                                    rs.status = "games: tic-tac-toe sent";
-                                                }
                                                 rs.gchat_pending_game = false;
-                                                continue;
+                                                rs.status = "games: tic-tac-toe sent";
+                                                rs.gscroll_px = 0; // ride to the newest, so the card is in view
                                             }
                                             const body = std.mem.trimEnd(u8, rs.gchat_draft_buf[0..rs.gchat_draft_len], " \n");
                                             // EDITING? Then Send SAVES the edit — it

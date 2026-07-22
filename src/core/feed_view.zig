@@ -236,13 +236,20 @@ fn progressRail(gpa: Allocator, e: *const text.Engine, dl: *raster.DrawList, x: 
 
 /// A chat bubble's fill — FULLY OPAQUE, so a message reads as a solid bubble,
 /// not a tint you can see the field through. Mine = the accent at full opacity
-/// (the "sent" bubble); theirs = the opaque panel skin (the "received" bubble).
-/// The panel/accent RGB is kept; only the alpha is forced to 0xFF.
+/// (the "sent" bubble); theirs = the received-bubble skin.
+///
+/// The received bubble uses its OWN token `bubble_them`, not `panel`. In dark
+/// mode it is `0xFF1C1C1C` — one level off `panel`'s `0xFF1B1B1B`, imperceptible
+/// there — but a DISTINCT value, so `rethemeLight` can send cards to pure white
+/// while sending received bubbles to a visible grey. Sharing `panel` made both
+/// remap to white, so received bubbles vanished into the light canvas.
+const bubble_them: u32 = 0xFF1C1C1C;
 inline fn bubbleFill(accent: u32, mine: bool) u32 {
-    return if (mine)
-        0xFF000000 | (accent & 0x00FFFFFF)
+    if (mine) return 0xFF000000 | (accent & 0x00FFFFFF);
+    return if (accent == lens_socket.julia_pink)
+        0xFF000000 | (panel_julia & 0x00FFFFFF)
     else
-        0xFF000000 | (skinPanel(accent) & 0x00FFFFFF);
+        bubble_them;
 }
 
 // Julia mode is a LIGHT theme (white field, bright pink panels), so the text must
@@ -6845,6 +6852,7 @@ const light_muted: u32 = 0xFF63605A; // handles, secondary
 const light_faint: u32 = 0xFF8C887E; // tertiary
 const light_card: u32 = 0xFFFFFFFF; // card/menu face — pure white, so it lifts off the canvas
 const light_card_hover: u32 = 0xFFF1EFE9; // a card under the pointer — a hair grey
+const light_bubble_them: u32 = 0xFFE6E3DC; // received bubbles: a warm grey that reads on white
 const light_border: u32 = 0xFFDBD8CF; // the card hairline, visible on white
 const light_col: u32 = 0xF6FFFFFF; // the content column — bright white, a whisper of field through
 const light_header: u32 = 0xFAFFFFFF; // sticky bars over the column — nearly solid white
@@ -6873,6 +6881,7 @@ fn lightFill(c: u32) u32 {
     switch (c) {
         panel => return light_card,
         panel_hover => return light_card_hover,
+        bubble_them => return light_bubble_them, // received bubbles: a visible grey, not white
         card_line => return light_border,
         veil => return light_col, // the content column reads bright white, not a dull grey
         header_veil => return light_header,
@@ -9985,7 +9994,7 @@ pub const ChatGame = struct {
 };
 
 pub const game_board_w: i32 = 240;
-pub const game_card_h: i32 = 128; // the thread card — a tall, tappable board preview
+pub const game_card_h: i32 = 148; // the thread card — a tall, tappable board preview
 
 /// The status line for a game (whose turn / result), from OUR perspective.
 fn gameStatusLine(st: chat_games.State, my_seat: chat_games.Seat) []const u8 {
