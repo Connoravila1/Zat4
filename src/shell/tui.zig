@@ -4287,7 +4287,14 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                 const klx: i32 = @intFromFloat(@as(f32, @floatFromInt(tev.x)) / gsd.scale);
                                 const kly: i32 = @intFromFloat(@as(f32, @floatFromInt(tev.y)) / gsd.scale);
                                 const klh: i32 = @intFromFloat(@as(f32, @floatFromInt(m.height_px)) / gsd.scale);
-                                if (kly >= klh - feed_view.keyboard_h - ui_insets.safeBottom(@intCast(gsd.inset_bottom_l), 0)) {
+                                const kbd_res = ui_insets.safeBottom(@intCast(gsd.inset_bottom_l), 0);
+                                // The bottom `kbd_res` strip is the OS swipe-up-home gesture
+                                // zone: a touch that STARTS there is NOT a keyboard press (it
+                                // belongs to the system gesture), so exclude it — otherwise
+                                // kbdResolve snaps it to the nearest key (the space bar) and a
+                                // swipe-to-switch-apps types a space. Only the real key area
+                                // [top … klh - kbd_res) fires keys.
+                                if (kly >= klh - feed_view.keyboard_h - kbd_res and kly < klh - kbd_res) {
                                     m.press_in_kbd = true;
                                     // PRESS-COMMIT: the key fires the instant
                                     // the finger lands (flash + bytes) — real
