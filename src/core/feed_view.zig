@@ -9996,6 +9996,10 @@ pub const ChatGame = struct {
     my_seat: chat_games.Seat = .none,
     /// A cell staged in the overlay before Send (0..8), or 255 = none.
     staged: u8 = 255,
+    /// The overlay's present-transition progress [0,1] (Rover `ui/reveal`, driven
+    /// by the shell). The overlay draws while this is > 0, so it can slide OUT too.
+    /// Default 0 so static callers (preview) never draw a stray overlay.
+    reveal_t: f32 = 0,
 };
 
 pub const game_board_w: i32 = 240;
@@ -10105,24 +10109,29 @@ fn drawGameStagedChip(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engin
 /// next message). A dim scrim (tap-outside closes), a large centred board whose
 /// empty cells are tappable ONLY when it is our turn, the staged move drawn as a
 /// ghost mark, and a Send bar. Draws LAST so it sits over the whole chat.
-fn drawGameOverlay(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, regions: ?*Regions, width: i32, height: i32, game: ChatGame, accent: u32) !void {
+fn drawGameOverlay(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, regions: ?*Regions, width: i32, height: i32, game: ChatGame, accent: u32, reveal_t: f32) !void {
+    // The present transition (Rover `ui/reveal`): the scrim fades in with progress
+    // and the whole panel rises `dy` px into place — it slides up, never pops.
+    const rt = std.math.clamp(reveal_t, 0.0, 1.0);
+    const dy: i32 = @intFromFloat((1.0 - rt) * 56.0);
+    const scrim_a: u8 = @intFromFloat(rt * 255.0);
     // Scrim: eats every tap; a tap anywhere but the board/Send closes the overlay.
-    try rect(gpa, dl, 0, 0, width, height, 0xE6101012, 0);
+    try rect(gpa, dl, 0, 0, width, height, scaleAlpha(0xE6101012, scrim_a), 0);
     try emitRegion(gpa, regions, 0, 0, width, @intCast(height), 0, .game_close);
 
     const st = game.state;
     const my_turn = st.outcome == .ongoing and st.turn == game.my_seat and game.my_seat != .none;
 
     // Title + close ✕.
-    _ = try str(gpa, dl, e, .semibold, 24, 60, 0xFFEDEAE0, 22, "Tic-Tac-Toe");
-    _ = try str(gpa, dl, e, .semibold, width - 44, 58, softA(0xEDEAE0, 0xCC), 22, "\u{00D7}");
-    try emitRegion(gpa, regions, width - 60, 30, 60, 60, 0, .game_close);
+    _ = try str(gpa, dl, e, .semibold, 24, 60 + dy, 0xFFEDEAE0, 22, "Tic-Tac-Toe");
+    _ = try str(gpa, dl, e, .semibold, width - 44, 58 + dy, softA(0xEDEAE0, 0xCC), 22, "\u{00D7}");
+    try emitRegion(gpa, regions, width - 60, 30 + dy, 60, 60, 0, .game_close);
 
     // The board: a large square, centred, leaving room for the Send bar.
     const board_max = @min(width - 56, height - 240);
     const s = @max(180, board_max);
     const bx = @divTrunc(width - s, 2);
-    const by = 120;
+    const by = 120 + dy;
     const cell = @divTrunc(s, 3);
 
     // Grid lines.
@@ -12158,9 +12167,10 @@ pub fn layoutChat(
 
     // THE GAME OVERLAY, LAST OF ALL — a full-screen modal board over even the menu
     // (opening a game closes the menu, but the overlay law says draw it on top and
-    // let it eat every stray tap regardless).
-    if (game.open)
-        try drawGameOverlay(gpa, dl, e, regions, width, height, game, accent);
+    // let it eat every stray tap regardless). Drawn while the present transition is
+    // in flight (reveal_t > 0), so it slides in AND out rather than popping.
+    if (game.reveal_t > 0.001)
+        try drawGameOverlay(gpa, dl, e, regions, width, height, game, accent, game.reveal_t);
 
     return height + @max(0, total - (thread_bot - thread_top));
 }

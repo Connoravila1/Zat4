@@ -47,6 +47,7 @@ const chat_core = @import("../core/chat.zig");
 const chat_view_core = @import("../core/chat_view.zig");
 const chat_games = @import("../core/chat_games.zig");
 const spring = @import("../core/spring.zig");
+const reveal = @import("../ui/reveal.zig"); // Rover: portable present/dismiss transition
 const chat_effects = @import("../core/chat_effects.zig");
 const screen_fx = @import("../core/screen_fx.zig");
 const shatter = @import("../core/shatter.zig");
@@ -10061,6 +10062,9 @@ fn chatGameOf(rs: *RunState, arena: Allocator) feed_view.ChatGame {
         .pending = rs.gchat_pending_game,
         .open = rs.gchat_game_open,
         .staged = rs.gchat_game_staged,
+        // The present transition's progress (stepped in paintFrameGpu). One frame
+        // of pipeline lag is imperceptible; the overlay draws while this is > 0.
+        .reveal_t = if (rs.gpu_state) |*gs| gs.game_reveal.progress else if (rs.gchat_game_open) 1 else 0,
     };
     const sel = rs.gchat_sel orelse return g;
     const moves = collectSentMoves(rs, arena, sel);
@@ -14658,6 +14662,9 @@ const GpuState = struct {
     /// animation and the modal freezes half-risen — the standing rebuild law.
     sheet_t: f32 = 0,
     sheet_v: f32 = 0,
+    /// The game overlay's present transition (Rover `ui/reveal`): springs toward
+    /// 1 while the board is open, 0 while closed, so the overlay slides in and out.
+    game_reveal: reveal.Reveal = .{},
 };
 
 /// One in-flight bubble's spring binding (U6b). A7.2: cold-ish — a handful live
@@ -16030,6 +16037,14 @@ fn paintFrameGpu(
             spring.stepScalar(&gs.sheet_t, &gs.sheet_v, target, sheet_spring_c, dt);
             if (@abs(gs.sheet_t - target) > 0.001 or @abs(gs.sheet_v) > 0.001) chat_animating = true;
         }
+
+        // The GAME OVERLAY's present transition (Rover ui/reveal): slide it in when
+        // open, out when closed. Keep rebuilding while it moves (the rebuild law),
+        // and fold its quantized progress into chat_sig below so the slide animates
+        // on the GPU path instead of caching frame one half-risen.
+        reveal.advance(&gs.game_reveal, g.chat_game.open, dt);
+        if (reveal.active(gs.game_reveal, g.chat_game.open)) chat_animating = true;
+        chat_sig ^= @as(u64, @intFromFloat(gs.game_reveal.progress * 255.0)) *% 0xD1B5_4A32_D192_ED03;
 
         // The screen-effect session watermark: the max message key the first time
         // the chat surface is live. Only messages that arrive AFTER this (a higher
