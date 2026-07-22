@@ -10,9 +10,11 @@ const std = @import("std");
 
 /// A conservative fallback for the bottom system-gesture strip (the swipe-up-home
 /// zone), in logical px, used when the OS system-gesture inset is not yet known.
-/// ~48dp is Android's typical gesture-zone height; erring large keeps interactive
-/// controls clear of it rather than fighting the OS for the touch.
-pub const default_gesture_bottom: i32 = 48;
+/// Android's gesture zone is ~48dp; at a typical phone's logical scale that is a
+/// bit more than 48 LOGICAL px, so a 48-logical reserve fell just short and a
+/// swipe still clipped the space bar. 64 clears it with margin. (The exact value
+/// arrives when the real system-gesture inset is plumbed from the OS.)
+pub const default_gesture_bottom: i32 = 64;
 
 /// The bottom reserve a bottom-anchored INTERACTIVE control (a keyboard's space
 /// row, a bottom action bar) must keep clear so the OS swipe-up-home gesture does

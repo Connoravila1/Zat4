@@ -2721,7 +2721,11 @@ pub fn drawKeyboard(
             const rx0: i32 = if (ki == 0) 0 else x - hg;
             const rx1: i32 = if (ki == nk - 1) width else x + kw + hg;
             const ry0: i32 = if (row_i == 0) top + 2 else y - hg;
-            const ry1: i32 = if (row_i == n_rows - 1) view_h else y + kbd_key_h + hg;
+            // The bottom row's targets stop at the gesture-safe line, NOT the screen
+            // edge — otherwise the space bar's tap region reaches into the swipe-up
+            // gesture strip and a swipe-to-switch-apps types a space. The bottom
+            // `reserve` px stays non-interactive (the visual keys already sit above it).
+            const ry1: i32 = if (row_i == n_rows - 1) view_h - reserve else y + kbd_key_h + hg;
             if (k.ctrl != 0) {
                 if (k.ctrl == 5) {
                     // The emoji key: a drawn face (the embedded font carries
