@@ -928,6 +928,16 @@ const RunState = struct {
     gchat_reply_to: u32,
     /// The message the composer is EDITING, or `no_reply`.
     gchat_edit_of: u32,
+    /// GAMES (GamePigeon flow). A game STAGED in the composer, not yet sent — the
+    /// chip with the ✕. Sending it posts the invite. Tic-tac-toe is the only game
+    /// for now, so a bool; becomes an enum when there are more.
+    gchat_pending_game: bool,
+    /// The full-screen game view is open (an overlay over the thread). You reach it
+    /// by tapping a game card; you make a move there, then Send.
+    gchat_game_open: bool,
+    /// The cell STAGED in the full-screen view before Send (0..8), or 255 = none.
+    /// The move is not sent until Send is pressed (the second stage-then-send).
+    gchat_game_staged: u8,
     /// Unsends and edits still trying to reach the other side.
     gpending: [16]Revision,
     gpending_n: usize,
@@ -1632,6 +1642,9 @@ fn initRunState(
     rs.ghold_live = false;
     rs.gchat_reply_to = no_reply;
     rs.gchat_edit_of = no_reply;
+    rs.gchat_pending_game = false;
+    rs.gchat_game_open = false;
+    rs.gchat_game_staged = 255;
     rs.gpending_n = 0;
     rs.gread_due_at = 0;
     rs.gread_up_to = 0;
@@ -3974,7 +3987,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        var pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = .{ .cards = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .q_focus = rs.gmarket_q_focus, .loading = rs.market_loading, .filter = rs.gmarket_filter, .hover_x = rs.ghover_x, .hover_y = rs.ghover_y }, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_delivery = chatDeliveryOf(rs), .chat_identity_elsewhere = rs.gchat_identity_elsewhere, .chat_link = chatLinkOf(rs), .chat_devices = chatDevicesOf(rs, arena), .chat_menu = chatMenuOf(rs), .chat_ctx = chatComposeCtxOf(rs), .enroll = enroll_run.snapshot(&rs.genroll_state, composeBlinkOn(rs.caret_anchor_ns)), .enroll_hits = &rs.genroll_hits, .boot_on = bootIntroOn(rs), .boot_t = bootIntroT(rs), .kbd_visible = softKeyboardWanted(rs), .kbd_shift = rs.kbd_shift, .kbd_page = rs.kbd_page, .kbd_caps = rs.kbd_caps, .kbd_flash_key = rs.kbd_flash_key, .kbd_flash_a = kbdFlashAlpha(rs), .kbd_popup = .{ .opts = rs.kbd_popup_opts[0..rs.kbd_popup_n], .anchor_x = rs.kbd_popup_ax, .anchor_y = rs.kbd_popup_ay, .anchor_w = rs.kbd_popup_aw, .sel = rs.kbd_popup_sel }, .kbd_emoji_open = rs.kbd_emoji_open, .kbd_emoji_scroll = @intFromFloat(rs.kbd_emoji_scroll), .kbd_picker_mode = rs.kbd_picker_mode, .kbd_nav_t = rs.kbd_nav_t, .kbd_nav_scroll = @intFromFloat(rs.kbd_nav_scroll), .chat_q = rs.gchat_q_buf[0..rs.gchat_q_len], .chat_q_focus = rs.gchat_q_focus, .chat_q_caret = composeBlinkOn(rs.caret_anchor_ns), .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_edit = .{ .caret = @min(rs.gchat_caret, rs.gchat_draft_len), .sel_a = @min(rs.gchat_sel_a, rs.gchat_draft_len), .sel_b = @min(rs.gchat_sel_b, rs.gchat_draft_len), .bar = rs.gchat_edit_bar }, .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .step = rs.gpay_step, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents, .busy = rs.gpay_busy }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved, .rooted = rs.grecv_set, .set = rs.grecv_set, .known = rs.grecv_known, .probing = rs.grecv_probing, .caps = rs.gcaps, .saving = rs.gpublish_busy }, .wallet_remove_armed = rs.gwallet_remove_armed, .verify_ids = verifyIdsOf(arena, rs), .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
+        var pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = .{ .cards = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .q_focus = rs.gmarket_q_focus, .loading = rs.market_loading, .filter = rs.gmarket_filter, .hover_x = rs.ghover_x, .hover_y = rs.ghover_y }, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_delivery = chatDeliveryOf(rs), .chat_identity_elsewhere = rs.gchat_identity_elsewhere, .chat_link = chatLinkOf(rs), .chat_devices = chatDevicesOf(rs, arena), .chat_menu = chatMenuOf(rs), .chat_ctx = chatComposeCtxOf(rs), .chat_game = chatGameOf(rs, arena), .enroll = enroll_run.snapshot(&rs.genroll_state, composeBlinkOn(rs.caret_anchor_ns)), .enroll_hits = &rs.genroll_hits, .boot_on = bootIntroOn(rs), .boot_t = bootIntroT(rs), .kbd_visible = softKeyboardWanted(rs), .kbd_shift = rs.kbd_shift, .kbd_page = rs.kbd_page, .kbd_caps = rs.kbd_caps, .kbd_flash_key = rs.kbd_flash_key, .kbd_flash_a = kbdFlashAlpha(rs), .kbd_popup = .{ .opts = rs.kbd_popup_opts[0..rs.kbd_popup_n], .anchor_x = rs.kbd_popup_ax, .anchor_y = rs.kbd_popup_ay, .anchor_w = rs.kbd_popup_aw, .sel = rs.kbd_popup_sel }, .kbd_emoji_open = rs.kbd_emoji_open, .kbd_emoji_scroll = @intFromFloat(rs.kbd_emoji_scroll), .kbd_picker_mode = rs.kbd_picker_mode, .kbd_nav_t = rs.kbd_nav_t, .kbd_nav_scroll = @intFromFloat(rs.kbd_nav_scroll), .chat_q = rs.gchat_q_buf[0..rs.gchat_q_len], .chat_q_focus = rs.gchat_q_focus, .chat_q_caret = composeBlinkOn(rs.caret_anchor_ns), .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_edit = .{ .caret = @min(rs.gchat_caret, rs.gchat_draft_len), .sel_a = @min(rs.gchat_sel_a, rs.gchat_draft_len), .sel_b = @min(rs.gchat_sel_b, rs.gchat_draft_len), .bar = rs.gchat_edit_bar }, .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .step = rs.gpay_step, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents, .busy = rs.gpay_busy }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved, .rooted = rs.grecv_set, .set = rs.grecv_set, .known = rs.grecv_known, .probing = rs.grecv_probing, .caps = rs.gcaps, .saving = rs.gpublish_busy }, .wallet_remove_armed = rs.gwallet_remove_armed, .verify_ids = verifyIdsOf(arena, rs), .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
         switch (rs.mode) {
             .timeline => try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status),
             .compose => {
@@ -6690,22 +6703,46 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                             rs.gcmenu = .{ .open = true, .kind = .attach, .x = @as(i32, hit.x) + @divTrunc(@as(i32, hit.w), 2), .y = hit.y };
                                             rs.gcmenu_ns = clock_shell.monotonicNanos(); // the fade-in clock (was blank without it)
                                         },
-                                        .chat_attach_game => if (dev_chat) {
+                                        // Pick a game from the "+" menu: STAGE it in the
+                                        // composer (the chip with the ✕) — GamePigeon flow.
+                                        // Nothing is sent until Send; the chip arms Send.
+                                        .chat_attach_game, .chat_game_stage => if (dev_chat) {
                                             rs.gcmenu = .{};
-                                            if (rs.gchat_sel) |sc| {
-                                                // Open a tic-tac-toe: the invite seats us
-                                                // as X and shows an empty board to both.
-                                                chatSendGameMove(rs, gpa, io, environ, sc, chat_games.inviteMove().encode());
-                                                rs.gchat_input_focus = false; // let the board breathe
-                                                rs.status = "games: tic-tac-toe started";
-                                            }
+                                            rs.gchat_pending_game = true;
+                                            rs.gchat_input_focus = false; // the chip, not the caret
+                                            rs.status = "games: tic-tac-toe staged \u{2014} press Send";
                                         },
-                                        // A tap on an empty board cell: send that move.
+                                        // The ✕ on the staged chip: drop the staged game.
+                                        .chat_game_unstage => if (dev_chat) {
+                                            rs.gchat_pending_game = false;
+                                        },
+                                        // Tap a game card in the thread: open the full-screen
+                                        // board (you do NOT play from the thread).
+                                        .game_open => if (dev_chat) {
+                                            rs.gchat_game_open = true;
+                                            rs.gchat_game_staged = 255;
+                                            rs.gcmenu = .{};
+                                            rs.gchat_input_focus = false;
+                                        },
+                                        // A tap on an empty board cell (in the overlay): STAGE
+                                        // that move — it shows as a ghost until Send commits it.
                                         .game_cell => if (dev_chat) {
-                                            if (rs.gchat_sel) |sc| {
-                                                const mv = chat_games.Move{ .cell = @intCast(@min(hit.post, 8)) };
+                                            rs.gchat_game_staged = @intCast(@min(hit.post, 8));
+                                        },
+                                        // Send the staged move: it goes as the next message,
+                                        // then the overlay closes.
+                                        .game_send => if (dev_chat) {
+                                            if (rs.gchat_game_staged != 255) if (rs.gchat_sel) |sc| {
+                                                const mv = chat_games.Move{ .cell = @intCast(rs.gchat_game_staged) };
                                                 chatSendGameMove(rs, gpa, io, environ, sc, mv.encode());
-                                            }
+                                            };
+                                            rs.gchat_game_open = false;
+                                            rs.gchat_game_staged = 255;
+                                        },
+                                        // Close the overlay without moving (tap-outside / ✕).
+                                        .game_close => if (dev_chat) {
+                                            rs.gchat_game_open = false;
+                                            rs.gchat_game_staged = 255;
                                         },
                                         // Photos/Videos emit no region yet (drawn "Soon"),
                                         // so these arms exist only for completeness.
@@ -6785,6 +6822,9 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                                 chatCollapseSel(rs);
                                             }
                                             rs.gchat_edit_of = no_reply;
+    rs.gchat_pending_game = false;
+    rs.gchat_game_open = false;
+    rs.gchat_game_staged = 255;
                                             rs.gchat_reply_to = no_reply;
                                         },
                                         // REACT — the row at the top of the menu. The
@@ -6842,6 +6882,19 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         .chat_device_help => rs.gdev_help = true,
                                         .chat_help_close => rs.gdev_help = false,
                                         .chat_send => if (dev_chat) {
+                                            // A STAGED GAME takes priority: Send commits the
+                                            // invite (seats us as X, shows an empty board to
+                                            // both), then clears the staged chip. The draft
+                                            // is normally empty here, but if it is not it
+                                            // sends on the next tap.
+                                            if (rs.gchat_pending_game) {
+                                                if (rs.gchat_sel) |sc| {
+                                                    chatSendGameMove(rs, gpa, io, environ, sc, chat_games.inviteMove().encode());
+                                                    rs.status = "games: tic-tac-toe sent";
+                                                }
+                                                rs.gchat_pending_game = false;
+                                                continue;
+                                            }
                                             const body = std.mem.trimEnd(u8, rs.gchat_draft_buf[0..rs.gchat_draft_len], " \n");
                                             // EDITING? Then Send SAVES the edit — it
                                             // does not post a second message. The
@@ -6850,6 +6903,9 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                             if (body.len > 0 and rs.gchat_edit_of != no_reply) {
                                                 chatEditMessage(rs, gpa, io, environ, rs.gchat_edit_of, body);
                                                 rs.gchat_edit_of = no_reply;
+    rs.gchat_pending_game = false;
+    rs.gchat_game_open = false;
+    rs.gchat_game_staged = 255;
                                                 rs.gchat_draft_len = 0;
                                                 rs.gchat_caret = 0;
                                                 chatCollapseSel(rs);
@@ -9347,6 +9403,24 @@ fn backNavigate(rs: *RunState) bool {
         rs.grepost_menu = null;
         return true;
     }
+    // THE GAME FLOW answers back before anything else on Messages: the full-screen
+    // board closes first, then the "+" menu, then the staged chip — each is a
+    // modal layer the person expects back to peel, one at a time (the overlay law).
+    if (rs.gscreen == feed_view.screen_messages) {
+        if (rs.gchat_game_open) {
+            rs.gchat_game_open = false;
+            rs.gchat_game_staged = 255;
+            return true;
+        }
+        if (rs.gcmenu.open) {
+            rs.gcmenu = .{};
+            return true;
+        }
+        if (rs.gchat_pending_game) {
+            rs.gchat_pending_game = false;
+            return true;
+        }
+    }
     // A money modal owns "back" while it is up — BEFORE the keyboard-blur step
     // below, not after.
     //
@@ -9971,6 +10045,39 @@ fn chatSend(gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, st
     // nothing leaves, and nobody is told. Say it.
     chat_e2ee.send(gpa, io, env, state, l, peer_did, .text, text, effect, bubble) catch |err|
         chatLog("[chat] SEND FAILED -> {s}: {s}", .{ peer_did, @errorName(err) });
+}
+
+/// The GAME view for the open conversation (GamePigeon flow): the staged chip,
+/// whether the full-screen overlay is up, and the CURRENT game's board (segmented
+/// so a rematch shows a fresh board). Derived fresh each frame from the store.
+fn chatGameOf(rs: *RunState, arena: Allocator) feed_view.ChatGame {
+    var g: feed_view.ChatGame = .{
+        .pending = rs.gchat_pending_game,
+        .open = rs.gchat_game_open,
+        .staged = rs.gchat_game_staged,
+    };
+    const sel = rs.gchat_sel orelse return g;
+    const moves = collectSentMoves(rs, arena, sel);
+    const cur = chat_games.currentGame(moves);
+    g.state = chat_games.replaySent(cur);
+    g.my_seat = chat_games.mySeat(cur);
+    return g;
+}
+
+/// Walk the conversation's game_move messages into `SentMove`s (move + our-side
+/// bit), for the pure engine to replay. Arena-owned.
+fn collectSentMoves(rs: *RunState, arena: Allocator, conv: chat_core.ConvIndex) []chat_games.SentMove {
+    const order = chat_core.threadSlice(arena, &rs.gchat_store, conv) catch return &.{};
+    var out = std.ArrayList(chat_games.SentMove).empty;
+    for (order) |mi| {
+        const idx = @intFromEnum(mi);
+        if (!chat_core.isGameKind(rs.gchat_store.msgs.items(.kind)[idx])) continue;
+        out.append(arena, .{
+            .move = chat_games.Move.decode(chat_core.gameMoveOf(&rs.gchat_store, idx)),
+            .mine = chat_core.isMine(&rs.gchat_store, mi),
+        }) catch break;
+    }
+    return out.items;
 }
 
 /// Append a game move to OUR store and transmit it: one encoded byte, kind
@@ -14121,6 +14228,8 @@ const Grid = struct {
     chat_menu: feed_view.ChatMenu = .{},
     /// What the composer is answering or editing.
     chat_ctx: feed_view.ChatComposeCtx = .{},
+    /// The GAME view (staged chip, open overlay, current board).
+    chat_game: feed_view.ChatGame = .{},
     /// A5: what the relay link is doing right now — the connection dot.
     chat_link: feed_view.ChatLink = .off,
     /// The front door (FRONT_DOOR_ROADMAP): the enrollment view (a pure snapshot
@@ -15278,7 +15387,7 @@ fn paintFrame(
                 // Zat Chat (U3, dev-gated): the Messages surface. -scroll maps the
                 // shared ≤0 scroll state onto layoutChat's positive history offset.
                 const cf = buildChatFrame(arena, g.chat_store.?, g.chat_sel, now, g.chat_q, g.verify_ids);
-                g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.cards, cf.games, cf.sel, cf.peer, g.chat_draft, g.chat_edit, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{}, &.{}, g.chat_recv, .{}, .{}, g.chat_delivery, g.chat_link, g.chat_devices, g.chat_menu, g.chat_ctx) catch g.content_h.*;
+                g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.cards, cf.games, cf.sel, cf.peer, g.chat_draft, g.chat_edit, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{}, &.{}, g.chat_recv, .{}, .{}, g.chat_delivery, g.chat_link, g.chat_devices, g.chat_menu, g.chat_ctx, g.chat_game) catch g.content_h.*;
             } else if (g.screen.* == feed_view.screen_loadout) {
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
                 g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market, g.bench_pick, g.bench_drag, g.published, g.create, g.dev, g.bench, .{}, g.loadout_lib_y) catch g.content_h.*; // software: draw line-art nav
@@ -15855,6 +15964,15 @@ fn paintFrameGpu(
             const tick: u64 = gs.chat_clock_ns / (33 * std.time.ns_per_ms);
             chat_sig ^= tick *% 0x9E37_79B9_7F4A_7C15;
         }
+        // THE GAME FLOW is render-affecting state the menu's continuous rebuild
+        // does not cover: the staged composer chip (pending), the full-screen
+        // overlay (open), and the ghost move inside it (staged). Each must rebuild
+        // the frame it changes — a staged move that does not repaint is a dead
+        // board (the rebuild law). The current board itself rides `msgs.len`, since
+        // a move is a message.
+        chat_sig ^= @as(u64, @intFromBool(g.chat_game.pending)) *% 0x8EBC_6AF0_9C88_C6E3;
+        chat_sig ^= @as(u64, @intFromBool(g.chat_game.open)) *% 0x6C62_2726_93D2_35B1;
+        chat_sig ^= (@as(u64, g.chat_game.staged) +% 1) *% 0xB5F8_3D21_7A4C_1E9D;
     };
     // THE DEVICE SURFACES fold in SEPARATELY, because they are the one part of the
     // Messages screen that draws when chat did NOT come up — the gate (elsewhere /
@@ -16277,7 +16395,7 @@ fn paintFrameGpu(
                 }
             } else |_| {}
             const reflow_t: f32 = if (gs.chat_reflow) |rh| (gs.chat_world.position(rh) orelse 1.0) else 1.0;
-            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.games, cf.sel, cf.peer, g.chat_draft, g.chat_edit, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t, .sheet_t = gs.sheet_t }, xforms, g.chat_recv, .{ .top = @intCast(gs.inset_top_l), .bottom = @intCast(@max(gs.inset_bottom_l, @max(gs.ime_bottom_l, if (g.kbd_visible) feed_view.keyboard_h + gs.inset_bottom_l else 0))), .left = @intCast(gs.inset_left_l), .right = @intCast(gs.inset_right_l) }, .{ .q = g.chat_q, .focus = g.chat_q_focus, .caret_on = g.chat_q_caret }, g.chat_delivery, g.chat_link, g.chat_devices, g.chat_menu, g.chat_ctx) catch g.content_h.*;
+            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.games, cf.sel, cf.peer, g.chat_draft, g.chat_edit, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t, .sheet_t = gs.sheet_t }, xforms, g.chat_recv, .{ .top = @intCast(gs.inset_top_l), .bottom = @intCast(@max(gs.inset_bottom_l, @max(gs.ime_bottom_l, if (g.kbd_visible) feed_view.keyboard_h + gs.inset_bottom_l else 0))), .left = @intCast(gs.inset_left_l), .right = @intCast(gs.inset_right_l) }, .{ .q = g.chat_q, .focus = g.chat_q_focus, .caret_on = g.chat_q_caret }, g.chat_delivery, g.chat_link, g.chat_devices, g.chat_menu, g.chat_ctx, g.chat_game) catch g.content_h.*;
             // SCREEN EFFECT overlay: seed a queued show now the viewport size
             // (design_w × lh) is known, then compose the live particles ON TOP of
             // the thread. `chat_animating` (set while the pool is non-empty) keeps
