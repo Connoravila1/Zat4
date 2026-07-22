@@ -10116,25 +10116,6 @@ fn chatInitStep(
             error.DirectoryUnreadable => .offline,
             else => rs.gdev_state,
         };
-        // DIAG (boot-to-gate, owner 2026-07-22): this gate firing on EVERY launch
-        // for a device that was working means the account's device directory does
-        // not list this device. Log the verdict + our identity so a relaunch shows
-        // whether our key is stable and what the directory concluded.
-        {
-            var apub: [32]u8 = undefined;
-            const have = if (cache_shell.loadOrCreateAnchorSeed(gpa, io, env, rs.session.did)) |al| blk: {
-                var seed = al.seed;
-                defer std.crypto.secureZero(u8, &seed);
-                const pk = anchor_core.publicKey(seed) catch break :blk false;
-                apub = pk;
-                break :blk true;
-            } else false;
-            if (have) {
-                chatLog("[gate] verdict={s} anchor={x}{x}{x}{x} did={s}", .{ @errorName(err), apub[0], apub[1], apub[2], apub[3], rs.session.did });
-            } else {
-                chatLog("[gate] verdict={s} anchor=UNREADABLE did={s}", .{ @errorName(err), rs.session.did });
-            }
-        }
         return;
     };
     job.state = null;

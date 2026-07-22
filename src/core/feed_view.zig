@@ -9581,19 +9581,19 @@ fn drawDeviceGate(
 
     // THE LAST RESORT, and it looks like one. It is not a button; it is a line of
     // text you have to mean. The cost is stated BEFORE the tap, not after.
-    const reset = if (phone) "Start fresh on this phone instead" else "Start fresh on this device instead";
+    const reset = if (phone) "Set up fresh on this phone" else "Set up fresh on this device";
     const rw: i32 = @intCast(text.measure(e, .semibold, reset, 13));
     _ = try str(gpa, dl, e, .semibold, cx - @divTrunc(rw, 2), y + 4, muted, 13, reset);
     try rect(gpa, dl, cx - @divTrunc(rw, 2), y + 9, rw, 1, softA(muted, 0x55), 0); // a quiet underline — tappable, but a last resort
     try emitRegion(gpa, regions, cx - @divTrunc(rw, 2) - 10, y - 10, rw + 20, 28, 0, .chat_identity_reset);
     y += 22;
-    // The cost, still stated BEFORE the tap and still the whole truth — but "takes
-    // over" and "don't come with it" read as damage. Both facts survive: this
-    // device becomes the chat device, and history does not follow.
+    // The cost, stated BEFORE the tap — and now TRUE, since the choice sticks
+    // (2026-07-22): this device is set up for chat from here on, and old message
+    // history does not carry over. Like reinstalling Signal without your old phone.
     const cost = if (phone)
-        "This phone becomes your chat device. Existing conversations stay on the other one."
+        "You'll be set up to chat from this phone. Old message history won't carry over."
     else
-        "This device becomes your chat device. Existing conversations stay on the other one.";
+        "You'll be set up to chat from this device. Old message history won't carry over.";
     const cw2: i32 = @intCast(text.measure(e, .regular, cost, 12));
     _ = try str(gpa, dl, e, .regular, cx - @divTrunc(cw2, 2), y + 4, faint, 12, cost);
     y += 34;
