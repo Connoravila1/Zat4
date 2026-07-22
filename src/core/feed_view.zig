@@ -9985,7 +9985,7 @@ pub const ChatGame = struct {
 };
 
 pub const game_board_w: i32 = 240;
-pub const game_card_h: i32 = 68; // the compact thread card
+pub const game_card_h: i32 = 128; // the thread card — a tall, tappable board preview
 
 /// The status line for a game (whose turn / result), from OUR perspective.
 fn gameStatusLine(st: chat_games.State, my_seat: chat_games.Seat) []const u8 {
@@ -10031,15 +10031,18 @@ fn drawGameThumb(gpa: Allocator, dl: *raster.DrawList, board: [9]chat_games.Seat
 /// tapped (all open the same current game for now).
 fn drawGameCard(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, regions: ?*Regions, accent: u32, x: i32, y: i32, w: i32, card: chat_view.GameCard, ordinal: u16) !void {
     const h = game_card_h;
-    try cardBox(gpa, dl, x, y, w, h, 14, skinPanel(accent));
-    const thumb = h - 20;
-    try drawGameThumb(gpa, dl, card.state.board, x + 10, y + 10, thumb, accent);
-    const tx = x + thumb + 22;
-    _ = try str(gpa, dl, e, .semibold, tx, y + 26, on_accent_ink, 15, "Tic-Tac-Toe");
+    try cardBox(gpa, dl, x, y, w, h, 18, skinPanel(accent));
+    // A generous board preview fills the card's height, so the game reads as a
+    // GAME and not a one-line row — the owner wanted it TALL and to take up space.
+    const pad: i32 = 16;
+    const thumb = h - 2 * pad;
+    try drawGameThumb(gpa, dl, card.state.board, x + pad, y + pad, thumb, accent);
+    const tx = x + thumb + pad + 14;
+    _ = try str(gpa, dl, e, .semibold, tx, y + @divTrunc(h, 2) - 8, on_accent_ink, 18, "Tic-Tac-Toe");
     const status = gameStatusLine(card.state, card.my_seat);
-    _ = try str(gpa, dl, e, .regular, tx, y + 48, softA(0xEDEAE0, 0xAA), 12, status);
+    _ = try str(gpa, dl, e, .regular, tx, y + @divTrunc(h, 2) + 16, softA(0xEDEAE0, 0xBB), 14, status);
     // A chevron hinting "opens".
-    try iconChevron(gpa, dl, x + w - 26, y + @divTrunc(h - 16, 2), 16, softA(0xEDEAE0, 0x66));
+    try iconChevron(gpa, dl, x + w - 30, y + @divTrunc(h - 18, 2), 18, softA(0xEDEAE0, 0x66));
     try emitRegion(gpa, regions, x, y, w, @intCast(h), ordinal, .game_open);
 }
 
@@ -11214,7 +11217,7 @@ pub fn layoutChat(
                 _ = try str(gpa, dl, e, .regular, detail_x + @divTrunc(detail_w - sw2, 2), by + 16, faint, 12, b.body);
             } else if (b.game != chat_view.no_game and b.game < games.len) {
                 if (games[b.game].live) {
-                    const gwid = @min(game_board_w + 40, bub_max);
+                    const gwid = @min(game_board_w + 120, bub_max);
                     const gbx = if (b.mine) detail_x + detail_w - gwid else detail_x;
                     try drawGameCard(gpa, dl, e, regions, accent, gbx, by, gwid, games[b.game], @intCast(@min(idx, std.math.maxInt(u16))));
                 } else {

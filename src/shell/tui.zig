@@ -6709,7 +6709,11 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         .chat_attach_game, .chat_game_stage => if (dev_chat) {
                                             rs.gcmenu = .{};
                                             rs.gchat_pending_game = true;
-                                            rs.gchat_input_focus = false; // the chip, not the caret
+                                            // Keep the keyboard UP — staging a game is like
+                                            // attaching a photo: the composer stays live so you
+                                            // can add a note and Send without the keyboard
+                                            // collapsing under you.
+                                            rs.gchat_input_focus = true;
                                             rs.status = "games: tic-tac-toe staged \u{2014} press Send";
                                         },
                                         // The ✕ on the staged chip: drop the staged game.
