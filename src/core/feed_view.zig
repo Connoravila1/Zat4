@@ -3233,6 +3233,15 @@ pub fn layout(
         feed_y0 = if (m.wide) home_header_h_wide + 14 else home_header_h_narrow + 12;
     }
 
+    // ZAT CHAT: the profile tab is a messenger IDENTITY card, not a timeline. Draw
+    // its own body and return — skip the Zat4 profile header + the post loop + the
+    // top bar entirely (own-body screen, like the Zones hub).
+    if (chat_app and active_screen == screen_profile) {
+        const _cph = try drawChatProfile(gpa, dl, e, width, height, regions, accent, profile, insets);
+        if (insets.top > 0) try rect(gpa, dl, 0, 0, width, insets.top, skinHeaderVeil(accent), 0);
+        return _cph;
+    }
+
     // The Profile screen draws an identity header band, then falls through to
     // the SAME post loop below (the posts handed in are this account's own —
     // read-only in Cut 1). Every OTHER non-Home screen is still a titled
@@ -10719,6 +10728,62 @@ fn applyChatEnter(dl: *raster.DrawList, start: usize, t: f32) void {
     const e = 1.0 - (1.0 - t) * (1.0 - t); // ease-out quad
     transformDlRange(dl, start, dl.len, 1.0, 0, 0, 0, (1.0 - e) * 12.0); // from +12px
     fadeItems(dl, start, e);
+}
+
+/// THE ZAT CHAT PROFILE SCREEN (chat flavor only). A messenger identity card — your
+/// avatar, name, and handle, an E2EE note, and Sign out — NOT a timeline. The
+/// account is the same DID you post with on Zat4; this screen just says WHO you are
+/// here. Own-body screen: it draws the whole surface and returns its height.
+fn drawChatProfile(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, width: i32, height: i32, regions: ?*Regions, accent: u32, profile: ?ProfileHeader, insets: EdgeInsets) error{OutOfMemory}!i32 {
+    const disp = if (profile) |p| p.display_name else "";
+    const handle = if (profile) |p| p.handle else "";
+    // The avatar key is the handle without its leading "@" (so the initial is a
+    // letter, and the tint matches how the conversation list keys its discs).
+    const key = if (handle.len > 0 and handle[0] == '@') handle[1..] else handle;
+
+    var y: i32 = insets.top + 20;
+    _ = try str(gpa, dl, e, .semibold, 24, y + 34, ink, 30, "You");
+    y += 84;
+
+    // Big avatar, centred.
+    const av: i32 = 104;
+    const ax = @divTrunc(width - av, 2);
+    try rect(gpa, dl, ax, y, av, av, tintFor(key), @intCast(@divTrunc(av, 2)));
+    const ini = [1]u8{initialOf(if (disp.len > 0) disp else key)};
+    const iw: i32 = @intCast(text.measure(e, .semibold, &ini, 40));
+    _ = try str(gpa, dl, e, .semibold, ax + @divTrunc(av - iw, 2), y + @divTrunc(av, 2) + 15, 0xFF20201A, 40, &ini);
+    y += av + 24;
+
+    // Name + handle, centred.
+    if (disp.len > 0) {
+        const nw: i32 = @intCast(text.measure(e, .semibold, disp, 24));
+        _ = try str(gpa, dl, e, .semibold, @divTrunc(width - nw, 2), y, ink, 24, disp);
+        y += 36;
+    }
+    if (handle.len > 0) {
+        const hw: i32 = @intCast(text.measure(e, .regular, handle, 15));
+        _ = try str(gpa, dl, e, .regular, @divTrunc(width - hw, 2), y, muted, 15, handle);
+        y += 46;
+    }
+
+    const mx: i32 = 20;
+    const cw = width - 2 * mx;
+    // The identity card: what this account IS.
+    {
+        const ch: i32 = 96;
+        try cardBox(gpa, dl, mx, y, cw, ch, 14, panel);
+        try rect(gpa, dl, mx, y, 3, ch, accent, 2);
+        _ = try str(gpa, dl, e, .semibold, mx + 16, y + 28, ink, 14, "End-to-end encrypted");
+        try strEllipsis(gpa, dl, e, .regular, mx + 16, y + 50, muted, 12, "MLS · post-quantum hybrid · forward secrecy", cw - 32);
+        try strEllipsis(gpa, dl, e, .regular, mx + 16, y + 72, faint, 12, "The same account you post with on Zat4.", cw - 32);
+        y += ch + 18;
+    }
+
+    // Sign out (the one action; everything else lives in Settings).
+    try buttonSecondary(gpa, e, dl, regions, mx, y, cw, 48, "Sign out", 0, .sign_out);
+    y += 48 + 24;
+
+    return @max(height, y + insets.bottom);
 }
 
 pub fn layoutChat(
