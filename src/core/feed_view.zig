@@ -35,6 +35,7 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const text = @import("text.zig");
 const raster = @import("raster.zig");
+const ui_insets = @import("../ui/insets.zig"); // Rover: safe-area / gesture-inset math
 const lens_socket = @import("lens_socket.zig");
 const kbd_lm = @import("kbd_lm.zig");
 const emoji_atlas = @import("emoji_atlas.zig");
@@ -2283,15 +2284,22 @@ pub fn drawKeyboard(
     /// it home on release.
     nav_scroll: i32,
 ) error{OutOfMemory}!void {
-    const top = view_h - keyboard_h - bottom_inset;
-    // The panel: opaque (nothing ghosts through chrome) with a faint wash.
-    try rect(gpa, dl, 0, top, width, keyboard_h + bottom_inset, bg, 0);
-    try rect(gpa, dl, 0, top, width, keyboard_h + bottom_inset, 0x14FFFFFF, 0);
+    // Reserve the SWIPE-UP-HOME gesture strip at the bottom (Rover `ui/insets`):
+    // the whole keyboard sits `reserve` above the screen edge instead of the bare
+    // system-bars inset, so a swipe-up to switch apps no longer lands on the space
+    // row. Everything below derives from `top`, so keys/picker/popups lift together.
+    // (`0` = the system-gesture inset is not plumbed yet; the primitive falls back
+    // to a safe default until it is.)
+    const reserve = ui_insets.safeBottom(bottom_inset, 0);
+    const top = view_h - keyboard_h - reserve;
+    // The panel: opaque (nothing ghosts through chrome), filling to the screen edge.
+    try rect(gpa, dl, 0, top, width, keyboard_h + reserve, bg, 0);
+    try rect(gpa, dl, 0, top, width, keyboard_h + reserve, 0x14FFFFFF, 0);
     // The lit top edge — the circuit's supply rail.
     try rect(gpa, dl, 0, top, width, 2, (0xC8 << 24) | (accent & 0x00FFFFFF), 0);
     // Swallow every tap on the panel (the bar-blocker pattern): keys win by
     // being emitted after.
-    try emitRegion(gpa, regions, 0, top, width, @intCast(@min(keyboard_h + bottom_inset, 32767)), 0, .blocker);
+    try emitRegion(gpa, regions, 0, top, width, @intCast(@min(keyboard_h + reserve, 32767)), 0, .blocker);
 
     const m: i32 = 6; // outer margin
     const row_w = width - 2 * m;

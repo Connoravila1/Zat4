@@ -48,6 +48,7 @@ const chat_view_core = @import("../core/chat_view.zig");
 const chat_games = @import("../core/chat_games.zig");
 const spring = @import("../core/spring.zig");
 const reveal = @import("../ui/reveal.zig"); // Rover: portable present/dismiss transition
+const ui_insets = @import("../ui/insets.zig"); // Rover: safe-area / gesture-inset math
 const chat_effects = @import("../core/chat_effects.zig");
 const screen_fx = @import("../core/screen_fx.zig");
 const shatter = @import("../core/shatter.zig");
@@ -4286,7 +4287,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                 const klx: i32 = @intFromFloat(@as(f32, @floatFromInt(tev.x)) / gsd.scale);
                                 const kly: i32 = @intFromFloat(@as(f32, @floatFromInt(tev.y)) / gsd.scale);
                                 const klh: i32 = @intFromFloat(@as(f32, @floatFromInt(m.height_px)) / gsd.scale);
-                                if (kly >= klh - feed_view.keyboard_h - @as(i32, @intCast(gsd.inset_bottom_l))) {
+                                if (kly >= klh - feed_view.keyboard_h - ui_insets.safeBottom(@intCast(gsd.inset_bottom_l), 0)) {
                                     m.press_in_kbd = true;
                                     // PRESS-COMMIT: the key fires the instant
                                     // the finger lands (flash + bytes) — real
@@ -15649,7 +15650,7 @@ fn paintComposeGpu(
     // 2026-07-10): the composer lays out ABOVE the panel (its footer lifts
     // clear), the keys draw over the bottom band + inset, and their regions
     // land last so they win the taps.
-    const kbd_lift: u32 = if (g.kbd_visible) @intCast(feed_view.keyboard_h + @as(i32, @intCast(gs.inset_bottom_l))) else 0;
+    const kbd_lift: u32 = if (g.kbd_visible) @intCast(feed_view.keyboard_h + ui_insets.safeBottom(@intCast(gs.inset_bottom_l), 0)) else 0;
     feed_view.layoutCompose(gpa, g.engine, @intCast(gs.design_w), @intCast(lh - kbd_lift), g.accent, ctx, reply_handle, quoting, draft, caret, sel_start, sel_end, blink_on, status, segments, tag_bar, g.draw, g.regions) catch {};
     if (g.kbd_visible)
         feed_view.drawKeyboard(gpa, g.draw, g.engine, g.regions, @intCast(gs.design_w), @intCast(lh), @intCast(gs.inset_bottom_l), g.accent, g.kbd_shift, g.kbd_page, g.kbd_caps, g.kbd_flash_key, g.kbd_flash_a, gs.t, toggleOn(g.settings_toggles, settings_view.act_kbd_pulses), toggleOn(g.settings_toggles, settings_view.act_kbd_pop), g.kbd_popup, g.kbd_emoji_open, g.kbd_emoji_scroll, g.kbd_picker_mode, g.kbd_nav_t, g.kbd_nav_scroll) catch {};
@@ -16416,7 +16417,7 @@ fn paintFrameGpu(
                 }
             } else |_| {}
             const reflow_t: f32 = if (gs.chat_reflow) |rh| (gs.chat_world.position(rh) orelse 1.0) else 1.0;
-            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.games, cf.sel, cf.peer, g.chat_draft, g.chat_edit, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t, .sheet_t = gs.sheet_t }, xforms, g.chat_recv, .{ .top = @intCast(gs.inset_top_l), .bottom = @intCast(@max(gs.inset_bottom_l, @max(gs.ime_bottom_l, if (g.kbd_visible) feed_view.keyboard_h + gs.inset_bottom_l else 0))), .left = @intCast(gs.inset_left_l), .right = @intCast(gs.inset_right_l) }, .{ .q = g.chat_q, .focus = g.chat_q_focus, .caret_on = g.chat_q_caret }, g.chat_delivery, g.chat_link, g.chat_devices, g.chat_menu, g.chat_ctx, g.chat_game) catch g.content_h.*;
+            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.games, cf.sel, cf.peer, g.chat_draft, g.chat_edit, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t, .sheet_t = gs.sheet_t }, xforms, g.chat_recv, .{ .top = @intCast(gs.inset_top_l), .bottom = @intCast(@max(gs.inset_bottom_l, @max(gs.ime_bottom_l, if (g.kbd_visible) feed_view.keyboard_h + ui_insets.safeBottom(@intCast(gs.inset_bottom_l), 0) else 0))), .left = @intCast(gs.inset_left_l), .right = @intCast(gs.inset_right_l) }, .{ .q = g.chat_q, .focus = g.chat_q_focus, .caret_on = g.chat_q_caret }, g.chat_delivery, g.chat_link, g.chat_devices, g.chat_menu, g.chat_ctx, g.chat_game) catch g.content_h.*;
             // SCREEN EFFECT overlay: seed a queued show now the viewport size
             // (design_w × lh) is known, then compose the live particles ON TOP of
             // the thread. `chat_animating` (set while the pool is non-empty) keeps
@@ -16427,7 +16428,7 @@ fn paintFrameGpu(
             // read the height they are given as "the screen"; handing them the
             // visible slice keeps every one of them — eggs and picker alike —
             // playing where it can actually be seen.
-            const vis_h: u16 = @intCast(@max(120, @as(i32, @intCast(lh)) - (if (g.kbd_visible) feed_view.keyboard_h + @as(i32, @intCast(gs.inset_bottom_l)) else 0)));
+            const vis_h: u16 = @intCast(@max(120, @as(i32, @intCast(lh)) - (if (g.kbd_visible) feed_view.keyboard_h + ui_insets.safeBottom(@intCast(gs.inset_bottom_l), 0) else 0)));
             // A MANUALLY-picked ("Send with…") effect wins over the auto-detected one.
             if (gs.sfx_manual != .none) {
                 screen_fx.seedShow(gpa, &gs.sfx_pool, gs.sfx_manual, @intCast(gs.design_w), vis_h, gs.chat_clock_ns) catch {};
@@ -17375,7 +17376,7 @@ fn drawSdfIcons(g: Grid, gs: *GpuState, items: []const feed_core.TimelineItem, v
     // icon whose centre lands under it would bleed through onto the keys
     // (the on-device space-bar bleed, 2026-07-10). The cartridge-sheet rule
     // at panel scale: skip them, tab-bar nav icons included.
-    const kbd_top: i32 = if (g.kbd_visible) logical_h - feed_view.keyboard_h - gs.inset_bottom_l else std.math.maxInt(i32);
+    const kbd_top: i32 = if (g.kbd_visible) logical_h - feed_view.keyboard_h - ui_insets.safeBottom(@intCast(gs.inset_bottom_l), 0) else std.math.maxInt(i32);
     const clipped = struct {
         fn f(r: feed_view.Region, top: i32, bot: i32) bool {
             const c = @as(i32, r.y) + @divTrunc(@as(i32, r.h), 2);
@@ -17520,7 +17521,7 @@ fn drawEngagementHearts(g: Grid, gs: *GpuState, items: []const feed_core.Timelin
     // so bottom_clip misses it). Phone only. Same box source as drawSdfIcons.
     const fab = feed_view.composeFabBox(@intCast(gs.design_w), logical_h, gs.inset_bottom_l);
     // And the Zat4 keyboard band — the same bleed rule as drawSdfIcons.
-    const kbd_top: i32 = if (g.kbd_visible) logical_h - feed_view.keyboard_h - gs.inset_bottom_l else std.math.maxInt(i32);
+    const kbd_top: i32 = if (g.kbd_visible) logical_h - feed_view.keyboard_h - ui_insets.safeBottom(@intCast(gs.inset_bottom_l), 0) else std.math.maxInt(i32);
     for (g.regions.items) |r| {
         if (r.kind != .like or r.post >= items.len) continue;
         const row_c = @as(i32, r.y) + @divTrunc(@as(i32, r.h), 2);
