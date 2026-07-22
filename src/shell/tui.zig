@@ -5921,31 +5921,16 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             const over_search = if (feed_view.hitTest(g.regions.items, rx, ry)) |sh| (sh.kind == .zone_search or kbdRegion(sh.kind)) else false;
                             if (!over_search) rs.gzones_q_focus = false;
                         }
-                        // The chat input blurs the same way: a tap anywhere off the
-                        // composer strip (input / send / pay) drops focus — and with
-                        // it the phone keyboard ("not being able to tap off the
-                        // keyboard is driving me nuts", owner 2026-07-09).
-                        // While the "Send with…" PICKER is open, NOTHING blurs the
-                        // input: the picker is a modal over the composer and every
-                        // tap in it (a tab, a tile) is part of sending — the
-                        // keyboard must stay up through the whole flow (owner: it
-                        // dropped when switching tabs). Picking a tile re-asserts
-                        // focus itself; dismissing the picker leaves focus be.
-                        const picker_open = rs.gcmenu.open and (rs.gcmenu.kind == .send or rs.gcmenu.kind == .attach);
-                        if (rs.gchat_input_focus and rs.gscreen == feed_view.screen_messages and !picker_open) {
-                            // The EDIT BAR's buttons keep focus: Copy/Cut/
-                            // Paste/Select-all act ON the focused draft —
-                            // blurring them closed the keyboard and made
-                            // select-all → delete impossible (owner,
-                            // 2026-07-12).
-                            const over_composer = if (feed_view.hitTest(g.regions.items, rx, ry)) |sh|
-                                (sh.kind == .chat_input or sh.kind == .chat_send or sh.kind == .pay_open or
-                                    sh.kind == .chat_copy or sh.kind == .chat_cut or sh.kind == .chat_paste or
-                                    sh.kind == .chat_selall or sh.kind == .chat_handle or kbdRegion(sh.kind))
-                            else
-                                false;
-                            if (!over_composer) rs.gchat_input_focus = false;
-                        }
+                        // THE CHAT KEYBOARD NO LONGER DROPS ON A TAP-OFF (owner,
+                        // 2026-07-22). Tapping anywhere off the composer used to blur
+                        // the input and close the keyboard — and it kept catching the
+                        // owner mid-interaction (every tab, every tile, every stray
+                        // tap). Now the keyboard is dismissed DELIBERATELY, by the
+                        // back gesture (the back handler blurs the chat input first —
+                        // the same Android IME convention the Zat4 keyboard already
+                        // used), which the working swipe-back makes natural. This is
+                        // also how iMessage/Signal behave: the keyboard stays until
+                        // you choose to put it away.
                         if (rs.gchat_q_focus and rs.gscreen == feed_view.screen_messages) {
                             const over_q = if (feed_view.hitTest(g.regions.items, rx, ry)) |sh|
                                 (sh.kind == .chat_search or kbdRegion(sh.kind))
@@ -6703,6 +6688,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         // Opens over the composer, grows up from the "+".
                                         .chat_attach => if (dev_chat) {
                                             rs.gcmenu = .{ .open = true, .kind = .attach, .x = @as(i32, hit.x) + @divTrunc(@as(i32, hit.w), 2), .y = hit.y };
+                                            rs.gcmenu_ns = clock_shell.monotonicNanos(); // the fade-in clock (was blank without it)
                                         },
                                         .chat_attach_game => if (dev_chat) {
                                             rs.gcmenu = .{};
@@ -10130,6 +10116,25 @@ fn chatInitStep(
             error.DirectoryUnreadable => .offline,
             else => rs.gdev_state,
         };
+        // DIAG (boot-to-gate, owner 2026-07-22): this gate firing on EVERY launch
+        // for a device that was working means the account's device directory does
+        // not list this device. Log the verdict + our identity so a relaunch shows
+        // whether our key is stable and what the directory concluded.
+        {
+            var apub: [32]u8 = undefined;
+            const have = if (cache_shell.loadOrCreateAnchorSeed(gpa, io, env, rs.session.did)) |al| blk: {
+                var seed = al.seed;
+                defer std.crypto.secureZero(u8, &seed);
+                const pk = anchor_core.publicKey(seed) catch break :blk false;
+                apub = pk;
+                break :blk true;
+            } else false;
+            if (have) {
+                chatLog("[gate] verdict={s} anchor={x}{x}{x}{x} did={s}", .{ @errorName(err), apub[0], apub[1], apub[2], apub[3], rs.session.did });
+            } else {
+                chatLog("[gate] verdict={s} anchor=UNREADABLE did={s}", .{ @errorName(err), rs.session.did });
+            }
+        }
         return;
     };
     job.state = null;
@@ -15994,7 +15999,7 @@ fn paintFrameGpu(
         // Keep frames coming while anything is in motion (a focused input keeps
         // them for the caret's breath; the pay sheet always holds focus, M5 A4).
         chat_animating = gs.chat_anims.items.len > 0 or gs.chat_reflow != null or
-            gs.chat_typing_t > 0.01 or g.chat_typing or
+            gs.chat_typing_t > 0.01 or g.chat_typing or g.chat_menu.open or
             g.chat_input_focus or g.chat_composing or g.chat_pay.open or g.chat_recv.open;
         // Tick the screen-effect show and keep the frame rebuilding while it plays
         // (a per-frame animation must never cache — the standing GPU-rebuild law).
