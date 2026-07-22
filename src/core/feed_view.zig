@@ -6888,6 +6888,11 @@ fn lightFill(c: u32) u32 {
         icon_grey => return light_ink, // engagement icons (incl. the rect "more" dots) go near-black
         else => {},
     }
+    // Avatar identity tints are deliberately PASTEL (sat ~0.2), which falls below
+    // the keep-hue threshold below — so without this they inverted to dark grey and
+    // every profile picture went black in light mode. They read fine on white; keep
+    // them verbatim in both themes.
+    for (avatar_tints) |t| if (c == t) return c;
     const a = (c >> 24) & 0xFF;
     if (retroSat(c) > 0.32 and a >= 0x80) return c; // accent / avatar / like: keep
     return (a << 24) | lightNeutral(c);

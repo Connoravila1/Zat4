@@ -4980,6 +4980,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             rs.kbd_flash_held = false;
                             if (dev_chat and rs.gscreen == feed_view.screen_messages and rs.gchat_sel != null) {
                                 rs.gpay_open = true;
+                                rs.gpay_focus = 0; // opened from the ₿ key with the keyboard already up: land in the amount
                                 m.haptic_pending = 2;
                             }
                         },
@@ -6963,7 +6964,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                                 // Set up → the pay sheet (request/send).
                                                 rs.gpay_open = !rs.gpay_open;
                                                 rs.gpay_status = "";
-                                                rs.gpay_focus = 0;
+                                                rs.gpay_focus = 255; // no field focused: the sheet opens WITHOUT the keyboard; a tap on a field raises it (tap-to-focus, like every app)
                                                 rs.gpay_step = .compose;
                                                 rs.grecv_open = false;
                                             } else {
@@ -6986,7 +6987,8 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                                     rs.gpay_amount_len = s.len;
                                                 }
                                                 rs.gpay_unit = .sats; // the chips are sats amounts
-                                                rs.gpay_focus = 0;
+                                                // A chip FILLS the amount; it does not grab the
+                                                // keyboard (leave focus as-is — tap the field to type).
                                             }
                                         },
                                         .pay_amount => if (dev_chat) {
@@ -8960,7 +8962,7 @@ fn typingOwnsKeyboard(rs: *const RunState) bool {
     // exists to be shortcut TO.
     if (rs.gscreen == feed_view.screen_enroll) return rs.genroll_state.focus != .none;
     if (rs.gscreen == feed_view.screen_messages and
-        (rs.gchat_composing or rs.gchat_input_focus or rs.gchat_q_focus or rs.gpay_open or
+        (rs.gchat_composing or rs.gchat_input_focus or rs.gchat_q_focus or (rs.gpay_open and rs.gpay_focus != 255) or
             // The receive flow only TYPES on its paste face (the address
             // field). Its other faces — the branch, the wallet list, the
             // capability review — have no text input at all, and raising the
