@@ -2283,6 +2283,10 @@ pub fn drawKeyboard(
     /// fits; the shell maps the drag through the band curve and springs
     /// it home on release.
     nav_scroll: i32,
+    /// The present-transition slide (Rover `ui/reveal`, driven by the shell): px to
+    /// push the whole panel DOWN. 0 = seated; `keyboard_h + reserve` = fully off the
+    /// bottom edge. Keys/picker/popups all derive from `top`, so they slide together.
+    slide_px: i32,
 ) error{OutOfMemory}!void {
     // Reserve the SWIPE-UP-HOME gesture strip at the bottom (Rover `ui/insets`):
     // the whole keyboard sits `reserve` above the screen edge instead of the bare
@@ -2291,7 +2295,7 @@ pub fn drawKeyboard(
     // (`0` = the system-gesture inset is not plumbed yet; the primitive falls back
     // to a safe default until it is.)
     const reserve = ui_insets.safeBottom(bottom_inset, 0);
-    const top = view_h - keyboard_h - reserve;
+    const top = view_h - keyboard_h - reserve + slide_px;
     // The panel: opaque (nothing ghosts through chrome), filling to the screen edge.
     try rect(gpa, dl, 0, top, width, keyboard_h + reserve, bg, 0);
     try rect(gpa, dl, 0, top, width, keyboard_h + reserve, 0x14FFFFFF, 0);

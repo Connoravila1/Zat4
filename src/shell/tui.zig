@@ -14666,6 +14666,10 @@ const GpuState = struct {
     /// The game overlay's present transition (Rover `ui/reveal`): springs toward
     /// 1 while the board is open, 0 while closed, so the overlay slides in and out.
     game_reveal: reveal.Reveal = .{},
+    /// The soft keyboard's slide transition (Rover `ui/reveal`): springs toward 1
+    /// while a field wants keys, 0 otherwise, so the panel slides in and out (and
+    /// the composer rides its animated height) instead of the keyboard popping.
+    kbd_reveal: reveal.Reveal = .{},
 };
 
 /// One in-flight bubble's spring binding (U6b). A7.2: cold-ish — a handful live
@@ -15650,10 +15654,16 @@ fn paintComposeGpu(
     // 2026-07-10): the composer lays out ABOVE the panel (its footer lifts
     // clear), the keys draw over the bottom band + inset, and their regions
     // land last so they win the taps.
-    const kbd_lift: u32 = if (g.kbd_visible) @intCast(feed_view.keyboard_h + ui_insets.safeBottom(@intCast(gs.inset_bottom_l), 0)) else 0;
+    // The keyboard SLIDE (Rover `ui/reveal`): the panel eases in/out and the
+    // composer rides its animated height (`kbd_lift`) rather than jumping.
+    reveal.advance(&gs.kbd_reveal, g.kbd_visible, 1.0 / 60.0);
+    const kbd_reserve = ui_insets.safeBottom(@intCast(gs.inset_bottom_l), 0);
+    const kbd_full = feed_view.keyboard_h + kbd_reserve;
+    const kbd_slide_px: i32 = @intFromFloat(reveal.slideUp(gs.kbd_reveal, @floatFromInt(kbd_full)));
+    const kbd_lift: u32 = @intCast(@max(0, kbd_full - kbd_slide_px)); // 0 hidden … kbd_full seated
     feed_view.layoutCompose(gpa, g.engine, @intCast(gs.design_w), @intCast(lh - kbd_lift), g.accent, ctx, reply_handle, quoting, draft, caret, sel_start, sel_end, blink_on, status, segments, tag_bar, g.draw, g.regions) catch {};
-    if (g.kbd_visible)
-        feed_view.drawKeyboard(gpa, g.draw, g.engine, g.regions, @intCast(gs.design_w), @intCast(lh), @intCast(gs.inset_bottom_l), g.accent, g.kbd_shift, g.kbd_page, g.kbd_caps, g.kbd_flash_key, g.kbd_flash_a, gs.t, toggleOn(g.settings_toggles, settings_view.act_kbd_pulses), toggleOn(g.settings_toggles, settings_view.act_kbd_pop), g.kbd_popup, g.kbd_emoji_open, g.kbd_emoji_scroll, g.kbd_picker_mode, g.kbd_nav_t, g.kbd_nav_scroll) catch {};
+    if (!reveal.dismissed(gs.kbd_reveal))
+        feed_view.drawKeyboard(gpa, g.draw, g.engine, g.regions, @intCast(gs.design_w), @intCast(lh), @intCast(gs.inset_bottom_l), g.accent, g.kbd_shift, g.kbd_page, g.kbd_caps, g.kbd_flash_key, g.kbd_flash_a, gs.t, toggleOn(g.settings_toggles, settings_view.act_kbd_pulses), toggleOn(g.settings_toggles, settings_view.act_kbd_pop), g.kbd_popup, g.kbd_emoji_open, g.kbd_emoji_scroll, g.kbd_picker_mode, g.kbd_nav_t, g.kbd_nav_scroll, kbd_slide_px) catch {};
     if (g.julia) feed_view.juliaRemapText(g.draw); // light theme: dark text
     if (g.light) feed_view.rethemeLight(gpa, g.draw) catch {};
     gpu.feedBuild(&gs.feed, gpa, g.engine, g.draw.slice(), scale) catch {};
@@ -15792,6 +15802,18 @@ fn paintFrameGpu(
     // unchanged, so its height cache stays warm (cheap, like a scroll).
     springGeom(&gs.search_open, &gs.search_v, if (gs.search_want) 1.0 else 0.0, 1.0 / 60.0);
     const search_animating = @abs(gs.search_open - (if (gs.search_want) @as(f32, 1.0) else 0.0)) > 0.004 or @abs(gs.search_v) > 0.004;
+
+    // THE KEYBOARD SLIDE (Rover `ui/reveal`): step the panel toward shown/hidden,
+    // once per frame here (before the signature) so its progress folds in and the
+    // verts rebuild while it moves. `kbd_slide_px` pushes the panel down; `kbd_lift`
+    // is the animated visible height the content above must reserve.
+    reveal.advance(&gs.kbd_reveal, g.kbd_visible, 1.0 / 60.0);
+    const kbd_animating = reveal.active(gs.kbd_reveal, g.kbd_visible);
+    const kbd_reserve = ui_insets.safeBottom(@intCast(gs.inset_bottom_l), 0);
+    const kbd_full = feed_view.keyboard_h + kbd_reserve;
+    const kbd_slide_px: i32 = @intFromFloat(reveal.slideUp(gs.kbd_reveal, @floatFromInt(kbd_full)));
+    const kbd_render = !reveal.dismissed(gs.kbd_reveal);
+    const kbd_lift: i32 = @max(0, kbd_full - kbd_slide_px);
 
     // ZONES TEST: on the Zones tab the nav rail relocates to the RIGHT — a
     // custom per-page tile-move. `zones_t` springs 0→1 when on a zones screen;
@@ -16239,7 +16261,7 @@ fn paintFrameGpu(
     // card, on the field. Fifth surface the rebuild law has bitten, and I wrote
     // the warning about it two commits ago.
     const enroll_animating = g.screen.* == feed_view.screen_enroll;
-    if (sig != gs.feed_sig or gs.feed.verts.items.len == 0 or g.socket_ui.drag_active != null or search_animating or zones_animating or drawer_animating or rail_hover_animating or algo_animating or chat_animating or enroll_animating or g.screen.* == feed_view.screen_loadout or g.frametiming_on or gs.shatter_active or g.pet or feed_animating) {
+    if (sig != gs.feed_sig or gs.feed.verts.items.len == 0 or g.socket_ui.drag_active != null or search_animating or zones_animating or drawer_animating or rail_hover_animating or algo_animating or chat_animating or enroll_animating or kbd_animating or g.screen.* == feed_view.screen_loadout or g.frametiming_on or gs.shatter_active or g.pet or feed_animating) {
         gs.feed_sig = sig;
         // An empty timeline renders the chrome with no posts (no placeholders).
         const feed_posts = if (chat_app and g.screen.* == feed_view.screen_profile)
@@ -16417,7 +16439,7 @@ fn paintFrameGpu(
                 }
             } else |_| {}
             const reflow_t: f32 = if (gs.chat_reflow) |rh| (gs.chat_world.position(rh) orelse 1.0) else 1.0;
-            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.games, cf.sel, cf.peer, g.chat_draft, g.chat_edit, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t, .sheet_t = gs.sheet_t }, xforms, g.chat_recv, .{ .top = @intCast(gs.inset_top_l), .bottom = @intCast(@max(gs.inset_bottom_l, @max(gs.ime_bottom_l, if (g.kbd_visible) feed_view.keyboard_h + ui_insets.safeBottom(@intCast(gs.inset_bottom_l), 0) else 0))), .left = @intCast(gs.inset_left_l), .right = @intCast(gs.inset_right_l) }, .{ .q = g.chat_q, .focus = g.chat_q_focus, .caret_on = g.chat_q_caret }, g.chat_delivery, g.chat_link, g.chat_devices, g.chat_menu, g.chat_ctx, g.chat_game) catch g.content_h.*;
+            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.games, cf.sel, cf.peer, g.chat_draft, g.chat_edit, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t, .sheet_t = gs.sheet_t }, xforms, g.chat_recv, .{ .top = @intCast(gs.inset_top_l), .bottom = @intCast(@max(@as(i32, @intCast(gs.inset_bottom_l)), @max(@as(i32, @intCast(gs.ime_bottom_l)), kbd_lift))), .left = @intCast(gs.inset_left_l), .right = @intCast(gs.inset_right_l) }, .{ .q = g.chat_q, .focus = g.chat_q_focus, .caret_on = g.chat_q_caret }, g.chat_delivery, g.chat_link, g.chat_devices, g.chat_menu, g.chat_ctx, g.chat_game) catch g.content_h.*;
             // SCREEN EFFECT overlay: seed a queued show now the viewport size
             // (design_w × lh) is known, then compose the live particles ON TOP of
             // the thread. `chat_animating` (set while the pool is non-empty) keeps
@@ -16795,8 +16817,8 @@ fn paintFrameGpu(
             // person was shown a form they could not fill in. Draw the keyboard,
             // and nothing else.
             g.draw.len = 0;
-            if (g.kbd_visible)
-                feed_view.drawKeyboard(gpa, g.draw, g.engine, g.regions, @intCast(gs.design_w), @intCast(lh), @intCast(gs.inset_bottom_l), g.accent, g.kbd_shift, g.kbd_page, g.kbd_caps, g.kbd_flash_key, g.kbd_flash_a, gs.t, toggleOn(g.settings_toggles, settings_view.act_kbd_pulses), toggleOn(g.settings_toggles, settings_view.act_kbd_pop), g.kbd_popup, g.kbd_emoji_open, g.kbd_emoji_scroll, g.kbd_picker_mode, g.kbd_nav_t, g.kbd_nav_scroll) catch {};
+            if (kbd_render)
+                feed_view.drawKeyboard(gpa, g.draw, g.engine, g.regions, @intCast(gs.design_w), @intCast(lh), @intCast(gs.inset_bottom_l), g.accent, g.kbd_shift, g.kbd_page, g.kbd_caps, g.kbd_flash_key, g.kbd_flash_a, gs.t, toggleOn(g.settings_toggles, settings_view.act_kbd_pulses), toggleOn(g.settings_toggles, settings_view.act_kbd_pop), g.kbd_popup, g.kbd_emoji_open, g.kbd_emoji_scroll, g.kbd_picker_mode, g.kbd_nav_t, g.kbd_nav_scroll, kbd_slide_px) catch {};
             gpu.feedBuild(&gs.rail, gpa, g.engine, g.draw.slice(), scale) catch {};
         } else if (gs.shatter_active and gs.design_w > feed_view.phone_max) {
             // The desktop rail was folded INTO the shattered feed buffer above, so
@@ -16821,8 +16843,8 @@ fn paintFrameGpu(
             // the modal sheets), covering the tab bar + inset while a text
             // input wants keys. Its taps feed the same byte stream the system
             // IME's fallback feeds — one input path (MC.4d).
-            if (g.kbd_visible)
-                feed_view.drawKeyboard(gpa, g.draw, g.engine, g.regions, @intCast(gs.design_w), @intCast(lh), @intCast(gs.inset_bottom_l), g.accent, g.kbd_shift, g.kbd_page, g.kbd_caps, g.kbd_flash_key, g.kbd_flash_a, gs.t, toggleOn(g.settings_toggles, settings_view.act_kbd_pulses), toggleOn(g.settings_toggles, settings_view.act_kbd_pop), g.kbd_popup, g.kbd_emoji_open, g.kbd_emoji_scroll, g.kbd_picker_mode, g.kbd_nav_t, g.kbd_nav_scroll) catch {};
+            if (kbd_render)
+                feed_view.drawKeyboard(gpa, g.draw, g.engine, g.regions, @intCast(gs.design_w), @intCast(lh), @intCast(gs.inset_bottom_l), g.accent, g.kbd_shift, g.kbd_page, g.kbd_caps, g.kbd_flash_key, g.kbd_flash_a, gs.t, toggleOn(g.settings_toggles, settings_view.act_kbd_pulses), toggleOn(g.settings_toggles, settings_view.act_kbd_pop), g.kbd_popup, g.kbd_emoji_open, g.kbd_emoji_scroll, g.kbd_picker_mode, g.kbd_nav_t, g.kbd_nav_scroll, kbd_slide_px) catch {};
             // The cartridge DETAIL sheet (item 5) is chrome-topmost: it lives in
             // THIS tile (drawn after the feed buffer), not the feed buffer, or the
             // tab bar + FAB paint over its scrim (the on-device bleed, 2026-07-09).
