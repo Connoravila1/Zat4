@@ -16732,7 +16732,14 @@ fn paintFrameGpu(
             const pw_s = @as(f32, @floatFromInt(feed_view.pet_w)) * pscale;
             const ph_s = @as(f32, @floatFromInt(feed_view.pet_h)) * pscale;
             const wf: f32 = @floatFromInt(gs.design_w);
-            const floor_y: f32 = @as(f32, @floatFromInt(lh)) - 30.0; // the cushion from the bottom
+            // The pet stands ON the nav-bar LINE, not behind the tab bar. On phone
+            // the floor is the top of the bottom tab bar (else the pet fell into the
+            // tab-bar band and was hidden + un-grabbable); desktop keeps a 30px cushion.
+            const on_phone_pet = gs.design_w <= feed_view.phone_max;
+            const floor_y: f32 = @as(f32, @floatFromInt(lh)) - (if (on_phone_pet)
+                @as(f32, @floatFromInt(feed_view.tab_bar_h + @as(i32, @intCast(gs.inset_bottom_l))))
+            else
+                30.0);
             if (!gs.pet_seeded) {
                 gs.pet_px = wf - pw_s - 26.0;
                 gs.pet_py = floor_y - ph_s;

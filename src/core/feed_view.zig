@@ -10072,7 +10072,7 @@ fn drawGameCard(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, reg
     const thumb = h - 2 * pad;
     try drawGameThumb(gpa, dl, card.state.board, x + pad, y + pad, thumb, accent);
     const tx = x + thumb + pad + 14;
-    _ = try str(gpa, dl, e, .semibold, tx, y + @divTrunc(h, 2) - 8, on_accent_ink, 18, "Tic-Tac-Toe");
+    _ = try str(gpa, dl, e, .semibold, tx, y + @divTrunc(h, 2) - 8, ink, 18, "Tic-Tac-Toe"); // `ink` remaps in light mode (on_accent_ink vanished on the white card)
     const status = gameStatusLine(card.state, card.my_seat);
     _ = try str(gpa, dl, e, .regular, tx, y + @divTrunc(h, 2) + 16, softA(0xEDEAE0, 0xBB), 14, status);
     // A chevron hinting "opens".
@@ -10110,7 +10110,7 @@ fn drawGameStagedChip(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engin
     const thumb = h - 20;
     try drawGameThumb(gpa, dl, @splat(.none), x + 12, y + 10, thumb, accent);
     const tx = x + thumb + 24;
-    _ = try str(gpa, dl, e, .semibold, tx, y + 26, on_accent_ink, 15, "Tic-Tac-Toe");
+    _ = try str(gpa, dl, e, .semibold, tx, y + 26, ink, 15, "Tic-Tac-Toe"); // `ink` remaps in light mode
     _ = try str(gpa, dl, e, .regular, tx, y + 44, softA(0xEDEAE0, 0xAA), 12, "Ready to send");
     // The ✕ — remove the staged game.
     const bx = x + w - 30;
@@ -10125,14 +10125,23 @@ fn drawGameStagedChip(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engin
 /// next message). A dim scrim (tap-outside closes), a large centred board whose
 /// empty cells are tappable ONLY when it is our turn, the staged move drawn as a
 /// ghost mark, and a Send bar. Draws LAST so it sits over the whole chat.
-fn drawGameOverlay(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, regions: ?*Regions, width: i32, height: i32, game: ChatGame, accent: u32, reveal_t: f32) !void {
+fn drawGameOverlay(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, regions: ?*Regions, width: i32, height: i32, game: ChatGame, accent: u32, reveal_t: f32, top_inset: i32) !void {
+    // The overlay is an IMMERSIVE dark surface in BOTH themes — wrap it in the
+    // theme_keep sentinels so `rethemeLight` leaves it alone (its dark scrim was
+    // being remapped to a pale wash that let the chat bleed through, and its dark
+    // Send bar was turning white-on-pale). The markers are 0×0 rects (invisible in
+    // dark mode); rethemeLight strips them and passes everything between untouched.
+    try rect(gpa, dl, 0, 0, 0, 0, lens_socket.theme_keep_begin, 0);
+    defer rect(gpa, dl, 0, 0, 0, 0, lens_socket.theme_keep_end, 0) catch {};
     // The present transition (Rover `ui/reveal`): the scrim fades in with progress
     // and the whole panel rises `dy` px into place — it slides up, never pops.
     const rt = std.math.clamp(reveal_t, 0.0, 1.0);
-    const dy: i32 = @intFromFloat((1.0 - rt) * 56.0);
+    const dy: i32 = @as(i32, @intFromFloat((1.0 - rt) * 56.0)) + top_inset; // + the top safe-area inset so the title clears the status bar
     const scrim_a: u8 = @intFromFloat(rt * 255.0);
-    // Scrim: eats every tap; a tap anywhere but the board/Send closes the overlay.
-    try rect(gpa, dl, 0, 0, width, height, scaleAlpha(0xE6101012, scrim_a), 0);
+    // Scrim: a FULLY-OPAQUE dark cover (it is a full-screen game, not a peek-through
+    // modal) — fades in with the transition. Eats every tap; a tap anywhere but the
+    // board/Send closes the overlay.
+    try rect(gpa, dl, 0, 0, width, height, scaleAlpha(0xFF101012, scrim_a), 0);
     try emitRegion(gpa, regions, 0, 0, width, @intCast(height), 0, .game_close);
 
     const st = game.state;
@@ -11135,9 +11144,10 @@ pub fn layoutChat(
     // messages (the owner's reorg: this column is only the conversation). ──
     if (peer.len == 0) {
         if (!phone) _ = try str(gpa, dl, e, .regular, detail_x + 20, top + 26, faint, 15, "Select a conversation");
-        // Phone: the list IS the page — return its true content extent so the
-        // shell can clamp the scroll. Desktop: the list is a fixed sidebar.
-        return if (phone) @max(height, list_content_h) else height;
+        // Phone: the list IS the page — return its TRUE content extent (NOT maxed
+        // with the viewport, or the shell thinks a screenful is scrollable and the
+        // list scrolls off even when it fits). Desktop: the list is a fixed sidebar.
+        return if (phone) list_content_h else height;
     }
     const thread_top = if (phone) insets.top + 64 else top + 52;
     // The composer GROWS DOWNWARD as the draft wraps (hard word-break
@@ -11580,7 +11590,8 @@ pub fn layoutChat(
         try rect(gpa, dl, input_x - 1, comp_y - 1, input_w + 2, comp_h + 2, ring_c, 24);
     }
     try rect(gpa, dl, input_x, comp_y, input_w, comp_h, skinPanel(accent), in_rad);
-    try rect(gpa, dl, input_x, comp_y, input_w, 1, 0x14EDEAE0, in_rad);
+    // (removed the input's faint top-edge highlight — it read as a stray line
+    //  above the message bar; the pill fill + focus ring define the field enough.)
     if (!phone and input_focus) {
         // Focus ring: a one-pixel accent outline (the rounded fill draws
         // first, so four thin edge rects read as a ring at this radius).
@@ -12200,14 +12211,21 @@ pub fn layoutChat(
     // every tap that is not one of its own (the standing overlay law: three surfaces
     // have bled through an overlay in this codebase, and each time the cause was a
     // draw that happened too early or an input that was never consumed).
-    try drawChatMenu(gpa, dl, e, regions, width, height, menu, accent);
+    // The chat menu (attach / message-actions / send-with grid) is a dark popover
+    // in BOTH themes — keep it dark so light mode doesn't remap its panel to a
+    // muddy tan. (theme_keep markers are 0×0, invisible in dark mode.)
+    {
+        try rect(gpa, dl, 0, 0, 0, 0, lens_socket.theme_keep_begin, 0);
+        defer rect(gpa, dl, 0, 0, 0, 0, lens_socket.theme_keep_end, 0) catch {};
+        try drawChatMenu(gpa, dl, e, regions, width, height, menu, accent);
+    }
 
     // THE GAME OVERLAY, LAST OF ALL — a full-screen modal board over even the menu
     // (opening a game closes the menu, but the overlay law says draw it on top and
     // let it eat every stray tap regardless). Drawn while the present transition is
     // in flight (reveal_t > 0), so it slides in AND out rather than popping.
     if (game.reveal_t > 0.001)
-        try drawGameOverlay(gpa, dl, e, regions, width, height, game, accent, game.reveal_t);
+        try drawGameOverlay(gpa, dl, e, regions, width, height, game, accent, game.reveal_t, insets.top);
 
     return height + @max(0, total - (thread_bot - thread_top));
 }
