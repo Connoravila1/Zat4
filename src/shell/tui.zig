@@ -6553,7 +6553,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                                 chatArmReadReceipt(rs, io, conv, now);
                                                 // M2: read-state survives a relaunch too.
                                                 chatPersistHistory(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
-                                                rs.gchat_input_focus = true;
+                                                rs.gchat_input_focus = false; // open WITHOUT the keyboard — tap the field to type (tap-to-focus, like every messenger)
                                                 rs.gchat_q_focus = false; // opening a thread leaves the search
                                                 rs.gchat_composing = false; // a row tap leaves the compose flow
                                                 rs.gpay_open = false; // the sheet belongs to one conversation

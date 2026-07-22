@@ -11046,12 +11046,15 @@ pub fn layoutChat(
     // Phone rows breathe: taller, bigger avatar, a hairline between rows. ──
     const row_h: i32 = if (phone) 78 else 64;
     // PHONE: the conversation list is its own full screen, so it scrolls with the
-    // shared scroll offset (and gets the existing momentum + rubber-band bounce for
-    // free). DESKTOP keeps the list a fixed sidebar — there `scroll` drives the
-    // thread pane, not the list. The content height returned below lets the shell
-    // clamp the scroll; without it the list reported the viewport height and was
-    // effectively unscrollable.
-    var ly = body_y + (if (phone) scroll else 0);
+    // shared scroll offset. On the messages screen with NO conversation open the
+    // drag sign is NOT inverted (only the bottom-anchored thread inverts it, see
+    // tui.zig), so a TOP-anchored list subtracts the scroll — `+scroll` ran it
+    // backwards. DESKTOP keeps the list a fixed sidebar (scroll drives the thread).
+    // `list_top` clips rows to below the header so a scrolled row never rides over
+    // the E2EE banner.
+    const list_top = body_y;
+    const list_bot = if (phone) height - insets.bottom - tab_bar_h else height;
+    var ly = body_y - (if (phone) scroll else 0);
     if (list.len == 0) {
         // A DEVICE THAT HAS JUST BEEN LET IN starts empty — that is the honest
         // default, and it is what we told the person would happen. But the past is
@@ -11065,6 +11068,12 @@ pub fn layoutChat(
         }
     }
     for (list, 0..) |row, i| {
+        // CLIP: a row scrolled above the header or below the tab bar isn't drawn
+        // (and emits no tap target) — otherwise it rides over the E2EE banner.
+        if (phone and (ly + row_h <= list_top or ly >= list_bot)) {
+            ly += row_h;
+            continue;
+        }
         const on = !phone and i == sel; // no persistent selection wash on phone
         if (on) try rect(gpa, dl, x0, ly, list_w, row_h - 6, (0x1F << 24) | (accent & 0x00FFFFFF), 12);
         const av: i32 = if (phone) 50 else 40;
@@ -11118,7 +11127,7 @@ pub fn layoutChat(
         try emitRegion(gpa, regions, x0, ly, list_w, @intCast(row_h - 6), @intCast(i), .chat_conv);
         ly += row_h;
     }
-    list_content_h = ly - scroll; // natural bottom (ly carries the scroll offset)
+    list_content_h = ly + scroll; // natural bottom (ly = list_top - scroll + rows)
     } // (phone_thread skips the whole list block)
 
     // ── Right: the open thread + the composer strip. The peer header sits at
