@@ -188,6 +188,16 @@ pub fn replay(moves: []const Move) State {
     return s;
 }
 
+/// The INVITE move: opens a game with an empty board. Its cell (15) is out of
+/// range, so `apply` skips it and the board stays empty — but it is still the
+/// FIRST move of the game, so it seats the sender as X (`currentGame`/`replaySent`
+/// take X from the first move's sender). One tap on "Games" sends this; the board
+/// then appears for both, the inviter to move first.
+pub const invite_cell: u8 = 15;
+pub fn inviteMove() Move {
+    return .{ .game = .tictactoe, .cell = invite_cell };
+}
+
 /// A move as it actually ARRIVES in a thread: the move, plus who sent it.
 ///
 /// `mine` is the store's own "did I send this" bit — the one fact the wire cannot

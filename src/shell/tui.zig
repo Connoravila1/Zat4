@@ -45,6 +45,7 @@ const timeline_ui = @import("../core/timeline_ui.zig");
 const feed_core = @import("../core/feed.zig");
 const chat_core = @import("../core/chat.zig");
 const chat_view_core = @import("../core/chat_view.zig");
+const chat_games = @import("../core/chat_games.zig");
 const spring = @import("../core/spring.zig");
 const chat_effects = @import("../core/chat_effects.zig");
 const screen_fx = @import("../core/screen_fx.zig");
@@ -6705,10 +6706,20 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         },
                                         .chat_attach_game => if (dev_chat) {
                                             rs.gcmenu = .{};
-                                            // The board renderer + tap→move is the next
-                                            // slice; for now this is the wired entry
-                                            // point (the skeleton the owner asked for).
-                                            rs.status = "games: board coming next";
+                                            if (rs.gchat_sel) |sc| {
+                                                // Open a tic-tac-toe: the invite seats us
+                                                // as X and shows an empty board to both.
+                                                chatSendGameMove(rs, gpa, io, environ, sc, chat_games.inviteMove().encode());
+                                                rs.gchat_input_focus = false; // let the board breathe
+                                                rs.status = "games: tic-tac-toe started";
+                                            }
+                                        },
+                                        // A tap on an empty board cell: send that move.
+                                        .game_cell => if (dev_chat) {
+                                            if (rs.gchat_sel) |sc| {
+                                                const mv = chat_games.Move{ .cell = @intCast(@min(hit.post, 8)) };
+                                                chatSendGameMove(rs, gpa, io, environ, sc, mv.encode());
+                                            }
                                         },
                                         // Photos/Videos emit no region yet (drawn "Soon"),
                                         // so these arms exist only for completeness.
@@ -9946,6 +9957,8 @@ const ChatFrame = struct {
     thread: []const chat_view_core.BubbleRow = &.{},
     /// The thread's payment cards, addressed by `BubbleRow.pay` (M5 A4).
     cards: []chat_view_core.PayCard = &.{},
+    /// The thread's game boards, addressed by `BubbleRow.game`.
+    games: []chat_view_core.GameCard = &.{},
     sel: u16 = std.math.maxInt(u16),
     peer: []const u8 = "",
     /// The open thread's stable message keys, parallel to `thread` (U6b): the
@@ -9972,6 +9985,21 @@ fn chatSend(gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, st
     // nothing leaves, and nobody is told. Say it.
     chat_e2ee.send(gpa, io, env, state, l, peer_did, .text, text, effect, bubble) catch |err|
         chatLog("[chat] SEND FAILED -> {s}: {s}", .{ peer_did, @errorName(err) });
+}
+
+/// Append a game move to OUR store and transmit it: one encoded byte, kind
+/// `.game_move`, empty text. The board is derived from these on both ends
+/// (`chat_view.buildThread`), so recording it locally IS showing it.
+fn chatSendGameMove(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, conv: chat_core.ConvIndex, encoded: u8) void {
+    const now = clock_shell.unixSeconds();
+    const mi = chat_core.appendMessage(gpa, &rs.gchat_store, conv, .game_move, "", now, true) catch return;
+    chat_core.setGameMove(&rs.gchat_store, @intFromEnum(mi), encoded);
+    chatPersistHistory(gpa, io, env, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
+    const state = if (rs.gchat_e2ee) |*st| st else return;
+    const l = rs.gchat_link orelse return;
+    const peer_did = chat_core.conversationDid(&rs.gchat_store, conv);
+    chat_e2ee.sendGameMove(gpa, io, env, state, l, peer_did, encoded) catch |err|
+        chatLog("[chat] GAME SEND FAILED -> {s}: {s}", .{ peer_did, @errorName(err) });
 }
 
 /// Read the persisted transcript from DISK, before any crypto or network.
@@ -13387,6 +13415,7 @@ fn buildChatFrame(arena: Allocator, cs: *const chat_core.Store, sel: ?chat_core.
         const th = chat_view_core.buildThread(arena, cs, sc, now) catch chat_view_core.Thread{};
         out.thread = th.rows;
         out.cards = th.cards;
+        out.games = th.games;
         // Fold on what the settlement watcher knows. `th.cards` is arena-owned
         // and ours to mark.
         if (watching.len > 0) {
@@ -15263,7 +15292,7 @@ fn paintFrame(
                 // Zat Chat (U3, dev-gated): the Messages surface. -scroll maps the
                 // shared ≤0 scroll state onto layoutChat's positive history offset.
                 const cf = buildChatFrame(arena, g.chat_store.?, g.chat_sel, now, g.chat_q, g.verify_ids);
-                g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_edit, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{}, &.{}, g.chat_recv, .{}, .{}, g.chat_delivery, g.chat_link, g.chat_devices, g.chat_menu, g.chat_ctx) catch g.content_h.*;
+                g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, -g.scroll.*, false, false, null, cf.list, cf.thread, cf.cards, cf.games, cf.sel, cf.peer, g.chat_draft, g.chat_edit, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{}, &.{}, g.chat_recv, .{}, .{}, g.chat_delivery, g.chat_link, g.chat_devices, g.chat_menu, g.chat_ctx) catch g.content_h.*;
             } else if (g.screen.* == feed_view.screen_loadout) {
                 const ft = g.socket_tray orelse lens_socket.TrayView{ .cards = &.{}, .text = "", .seated = 0 };
                 g.content_h.* = feed_view.layoutLoadout(gpa, g.engine, @intCast(win.fb.width), @intCast(win.fb.height), g.draw, g.regions, g.accent, g.scroll.*, g.loadout_tab, g.loadout_geoms, ft, g.socket_ui, g.socket_hits, g.reply_tray, g.reply_ui, g.reply_hits, g.zone_tray, g.zone_ui, g.zone_hits, false, false, null, g.market, g.bench_pick, g.bench_drag, g.published, g.create, g.dev, g.bench, .{}, g.loadout_lib_y) catch g.content_h.*; // software: draw line-art nav
@@ -16262,7 +16291,7 @@ fn paintFrameGpu(
                 }
             } else |_| {}
             const reflow_t: f32 = if (gs.chat_reflow) |rh| (gs.chat_world.position(rh) orelse 1.0) else 1.0;
-            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.sel, cf.peer, g.chat_draft, g.chat_edit, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t, .sheet_t = gs.sheet_t }, xforms, g.chat_recv, .{ .top = @intCast(gs.inset_top_l), .bottom = @intCast(@max(gs.inset_bottom_l, @max(gs.ime_bottom_l, if (g.kbd_visible) feed_view.keyboard_h + gs.inset_bottom_l else 0))), .left = @intCast(gs.inset_left_l), .right = @intCast(gs.inset_right_l) }, .{ .q = g.chat_q, .focus = g.chat_q_focus, .caret_on = g.chat_q_caret }, g.chat_delivery, g.chat_link, g.chat_devices, g.chat_menu, g.chat_ctx) catch g.content_h.*;
+            g.content_h.* = feed_view.layoutChat(gpa, g.engine, @intCast(gs.design_w), @intCast(lh), g.draw, g.regions, g.accent, -g.scroll.*, true, true, lg, cf.list, cf.thread, cf.cards, cf.games, cf.sel, cf.peer, g.chat_draft, g.chat_edit, g.chat_input_focus, g.chat_composing, g.chat_compose, g.chat_compose_status, g.chat_pay, .{ .typing_t = gs.chat_typing_t, .typing_phase = gs.chat_typing_phase, .caret_phase = caret_phase, .reflow_t = reflow_t, .sheet_t = gs.sheet_t }, xforms, g.chat_recv, .{ .top = @intCast(gs.inset_top_l), .bottom = @intCast(@max(gs.inset_bottom_l, @max(gs.ime_bottom_l, if (g.kbd_visible) feed_view.keyboard_h + gs.inset_bottom_l else 0))), .left = @intCast(gs.inset_left_l), .right = @intCast(gs.inset_right_l) }, .{ .q = g.chat_q, .focus = g.chat_q_focus, .caret_on = g.chat_q_caret }, g.chat_delivery, g.chat_link, g.chat_devices, g.chat_menu, g.chat_ctx) catch g.content_h.*;
             // SCREEN EFFECT overlay: seed a queued show now the viewport size
             // (design_w × lh) is known, then compose the live particles ON TOP of
             // the thread. `chat_animating` (set while the pool is non-empty) keeps

@@ -624,3 +624,25 @@ test "buildThread: a peer moving out of turn does not advance the board" {
     try std.testing.expectEqual(chat_games.Seat.o, th.games[1].state.turn);
     try std.testing.expectEqual(chat_games.Seat.o, th.games[1].my_seat);
 }
+
+test "buildThread: an invite opens an empty, live board and seats us as X" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var store: chat.Store = .{};
+    defer chat.deinitStore(gpa, &store);
+    const c = try chat.openConversation(gpa, &store, "did:plc:aaa", "amy.zat4.com");
+
+    // WE send the invite (cell 15) — an out-of-range move apply() skips.
+    const mi = try chat.appendMessage(gpa, &store, c, .game_move, "", 100, true);
+    chat.setGameMove(&store, @intFromEnum(mi), chat_games.inviteMove().encode());
+
+    const th = try buildThread(arena, &store, c, 200);
+    try std.testing.expectEqual(@as(usize, 1), th.games.len);
+    const card = th.games[0];
+    try std.testing.expect(card.live);
+    try std.testing.expectEqual(chat_games.Seat.x, card.my_seat); // we invited → X
+    try std.testing.expectEqual(@as(u8, 0), card.state.moves); // empty board
+    try std.testing.expectEqual(chat_games.Seat.x, card.state.turn); // X to move (us)
+}

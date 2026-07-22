@@ -50,6 +50,7 @@ const settings_view = @import("settings_view.zig");
 const transp = @import("transparency.zig");
 const algo_docs = @import("algo_docs.zig");
 const chat_view = @import("chat_view.zig");
+const chat_games = @import("chat_games.zig");
 const chat_effects = @import("chat_effects.zig");
 const chat_msg = @import("chat.zig");
 const wallet_caps = @import("wallet_caps.zig");
@@ -304,7 +305,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_send_fx, chat_send_bubble, chat_send_cat, chat_attach, chat_attach_game, chat_attach_photo, chat_attach_video, chat_new, chat_restart, chat_identity_reset, chat_device_add, chat_device_approve, chat_device_refuse, chat_device_help, chat_help_close, chat_history_get, chat_consent_receipts, chat_consent_typing, chat_consent_done, chat_msg_copy, chat_msg_reply, chat_msg_edit, chat_msg_delete_me, chat_conv_pin, chat_conv_mute, chat_conv_unread, chat_conv_delete, chat_ctx_cancel, chat_msg_react, chat_msg_delete_all, chat_menu_dismiss, chat_msg, recv_clip, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, recv_back, recv_use, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_send_fx, chat_send_bubble, chat_send_cat, chat_attach, game_cell, chat_attach_game, chat_attach_photo, chat_attach_video, chat_new, chat_restart, chat_identity_reset, chat_device_add, chat_device_approve, chat_device_refuse, chat_device_help, chat_help_close, chat_history_get, chat_consent_receipts, chat_consent_typing, chat_consent_done, chat_msg_copy, chat_msg_reply, chat_msg_edit, chat_msg_delete_me, chat_conv_pin, chat_conv_mute, chat_conv_unread, chat_conv_delete, chat_ctx_cancel, chat_msg_react, chat_msg_delete_all, chat_menu_dismiss, chat_msg, recv_clip, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, recv_back, recv_use, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -9967,6 +9968,86 @@ fn bubbleEffectIcon(gpa: Allocator, dl: *raster.DrawList, fx: chat_effects.Bubbl
     }
 }
 
+pub const game_board_w: i32 = 240; // the tic-tac-toe card's side, phone-friendly
+
+/// Draw a tic-tac-toe board from a `GameCard` at (x,y) in a `w`-wide square.
+/// Marks come from the derived state (X = the initiator, O = the other); a status
+/// line reads whose turn / who won. Empty cells on the LIVE board that it is OUR
+/// turn to play emit a `.game_cell` region (post = cell 0..8) so a tap sends the
+/// move — older boards are inert history.
+fn drawGameBoard(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, regions: ?*Regions, accent: u32, x: i32, y: i32, w: i32, card: chat_view.GameCard, mine: bool) !void {
+    const st = card.state;
+    const pad: i32 = 12;
+    const head_h: i32 = 26;
+    const grid = w - 2 * pad;
+    const gx = x + pad;
+    const gy = y + pad + head_h;
+    const cell = @divTrunc(grid, 3);
+
+    // The card.
+    try cardBox(gpa, dl, x, y, w, w, 16, skinPanel(accent));
+    // Header: whose turn, or the result.
+    const my_turn = card.live and st.outcome == .ongoing and st.turn == card.my_seat;
+    const head: []const u8 = switch (st.outcome) {
+        .x_wins => if (card.my_seat == .x) "You won" else "They won",
+        .o_wins => if (card.my_seat == .o) "You won" else "They won",
+        .draw => "Draw",
+        .ongoing => if (my_turn) "Your turn" else "Their turn",
+    };
+    const hw: i32 = @intCast(text.measure(e, .semibold, head, 13));
+    _ = try str(gpa, dl, e, .semibold, x + @divTrunc(w - hw, 2), y + 20, softA(0xEDEAE0, 0xDD), 13, head);
+
+    // Grid lines.
+    const line_c = softA(0xEDEAE0, 0x33);
+    var g: i32 = 1;
+    while (g < 3) : (g += 1) {
+        try rect(gpa, dl, gx + g * cell - 1, gy, 2, grid, line_c, 0); // vertical
+        try rect(gpa, dl, gx, gy + g * cell - 1, grid, 2, line_c, 0); // horizontal
+    }
+
+    // Cells: marks + tap targets.
+    var i: usize = 0;
+    while (i < 9) : (i += 1) {
+        const cx = gx + @as(i32, @intCast(i % 3)) * cell;
+        const cy = gy + @as(i32, @intCast(i / 3)) * cell;
+        const seat = st.board[i];
+        const m: i32 = @divTrunc(cell, 4); // mark inset
+        if (seat == .x) {
+            // an X: two crossing strokes
+            const xc: u32 = accent | 0xFF000000;
+            try line(gpa, dl, cx + m, cy + m, cx + cell - m, cy + cell - m, xc, 4);
+            try line(gpa, dl, cx + cell - m, cy + m, cx + m, cy + cell - m, xc, 4);
+        } else if (seat == .o) {
+            // an O: a ring (a filled disc minus a smaller one)
+            const oc: u32 = 0xFFE0705C;
+            const r = @divTrunc(cell, 2) - m;
+            try circleRing(gpa, dl, cx + @divTrunc(cell, 2), cy + @divTrunc(cell, 2), r, 4, oc);
+        } else if (my_turn) {
+            // an empty cell we may play: a tap target (post = the cell index).
+            try emitRegion(gpa, regions, cx, cy, cell, @intCast(cell), @intCast(i), .game_cell);
+        }
+    }
+    _ = mine;
+}
+
+/// A ring (hollow circle) of `thick` px at radius `r`, from short chord strokes —
+/// the draw vocabulary has no circle primitive, and a tic-tac-toe O wants to read
+/// as a ring, not a disc.
+fn circleRing(gpa: Allocator, dl: *raster.DrawList, cx: i32, cy: i32, r: i32, thick: u8, c: u32) !void {
+    const seg: usize = 16;
+    var i: usize = 0;
+    var px: i32 = cx + r;
+    var py: i32 = cy;
+    while (i < seg) : (i += 1) {
+        const a = @as(f32, @floatFromInt(i + 1)) / @as(f32, @floatFromInt(seg)) * 6.2831853;
+        const nx = cx + fxi(@cos(a) * @as(f32, @floatFromInt(r)));
+        const ny = cy + fxi(@sin(a) * @as(f32, @floatFromInt(r)));
+        try line(gpa, dl, px, py, nx, ny, c, thick);
+        px = nx;
+        py = ny;
+    }
+}
+
 /// THE "SEND WITH…" GRID. A curated shelf of effects — a Screen/Bubble toggle and
 /// a 3-wide grid of icon+label tiles — that grows UP from the Send button and
 /// rolls its tiles in on a stagger. Sized so ~15 effects fit without scrolling;
@@ -10500,6 +10581,9 @@ pub fn layoutChat(
     thread: []const chat_view.BubbleRow,
     /// The thread's payment cards, addressed by `BubbleRow.pay` (M5 A4).
     cards: []const chat_view.PayCard,
+    /// The thread's game boards, addressed by `BubbleRow.game` — one per game
+    /// move, each the board as of that move (only the newest is interactive).
+    games: []const chat_view.GameCard,
     /// Ordinal (into `list`) of the selected conversation; ≥ list.len = none.
     sel: u16,
     /// Display name of the open conversation's counterparty ("" = none).
@@ -10924,6 +11008,10 @@ pub fn layoutChat(
             hslot.* = 24;
         } else if (b.pay != chat_view.no_pay and b.pay < cards.len) {
             hslot.* = try payCardHeight(gpa, dl, e, b, cards[b.pay], @min(pay_card_w_max, bub_max));
+        } else if (b.game != chat_view.no_game and b.game < games.len) {
+            // Only the LIVE (newest) board draws full; older moves collapse to a
+            // one-line note, so a finished game is one board, not a stack of ten.
+            hslot.* = if (games[b.game].live) @min(game_board_w, bub_max) else 22;
         } else {
             const quote_h: i32 = if (b.quote.len > 0 and !b.deleted) 26 else 0;
             const react_pad: i32 = if (b.reacts_n > 0) 16 else 0; // room for the chips
@@ -11009,6 +11097,18 @@ pub fn layoutChat(
             if (b.kind == .system) {
                 const sw2: i32 = @intCast(text.measure(e, .regular, b.body, 12));
                 _ = try str(gpa, dl, e, .regular, detail_x + @divTrunc(detail_w - sw2, 2), by + 16, faint, 12, b.body);
+            } else if (b.game != chat_view.no_game and b.game < games.len) {
+                if (games[b.game].live) {
+                    const gwid = @min(game_board_w, bub_max);
+                    const gbx = if (b.mine) detail_x + detail_w - gwid else detail_x;
+                    try drawGameBoard(gpa, dl, e, regions, accent, gbx, by, gwid, games[b.game], b.mine);
+                } else {
+                    // An older move: a quiet centred note, so the thread shows the
+                    // play history without a wall of boards.
+                    const note = if (b.mine) "you played tic-tac-toe" else "they played tic-tac-toe";
+                    const nw: i32 = @intCast(text.measure(e, .regular, note, 11));
+                    _ = try str(gpa, dl, e, .regular, detail_x + @divTrunc(detail_w - nw, 2), by + 14, faint, 11, note);
+                }
             } else if (b.pay != chat_view.no_pay and b.pay < cards.len) {
                 const cw2 = @min(pay_card_w_max, bub_max);
                 const cbx = if (b.mine) detail_x + detail_w - cw2 else detail_x;
@@ -12503,7 +12603,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // rail regions, so the counts are exactly the surface's own — one region
     // per conversation row + the composer pair + the "+ New" pill. (460 now
     // exercises the PHONE single-pane shape — its own test below.)
-    const h = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{}, .{}, .{});
+    const h = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{}, .{}, .{});
     var n_conv: usize = 0;
     var n_input: usize = 0;
     var n_send: usize = 0;
@@ -12554,7 +12654,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // once, on the strip.
     dl.clearRetainingCapacity();
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .needs_reconnect, .authenticated, .{}, .{}, .{});
+    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .needs_reconnect, .authenticated, .{}, .{}, .{});
     var n_restart_broken: usize = 0;
     for (regions.items) |r| {
         if (r.kind == .chat_restart) n_restart_broken += 1;
@@ -12567,7 +12667,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // no thread pane and no composer to arm. The "+ New" pill is always there.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    const h2 = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{}, .{}, .{});
+    const h2 = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, &.{}, 255, "", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{}, .{}, .{});
     try std.testing.expectEqual(@as(i32, 940), h2);
     var n2_conv: usize = 0;
     var n2_new: usize = 0;
@@ -12586,7 +12686,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // line draws when the shell hands one over.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", .{}, false, true, "chattest.zat4.com", "Couldn't resolve that handle", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{}, .{}, .{});
+    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, &.{}, 255, "", "", .{}, false, true, "chattest.zat4.com", "Couldn't resolve that handle", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{}, .{}, .{});
     var n3_compose: usize = 0;
     for (regions.items) |r| {
         if (r.kind == .chat_compose_input) n3_compose += 1;
@@ -12599,12 +12699,12 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // (motion never moves a tap target).
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{}, .{}, .{});
+    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{}, .{}, .{});
     const rest_items = dl.len;
     const rest_regions = regions.items.len;
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{ .typing_t = 1, .typing_phase = 0.7 }, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{}, .{}, .{});
+    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{ .typing_t = 1, .typing_phase = 0.7 }, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{}, .{}, .{});
     try std.testing.expect(dl.len > rest_items);
     try std.testing.expectEqual(rest_regions, regions.items.len);
 
@@ -12615,13 +12715,13 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // it adds exactly one tap target (the only re-establish affordance there is now).
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .waiting, .authenticated, .{}, .{}, .{});
+    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .waiting, .authenticated, .{}, .{}, .{});
     const waiting_items = dl.len;
     try std.testing.expect(waiting_items > rest_items);
     try std.testing.expectEqual(rest_regions, regions.items.len); // patience, no control
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .undelivered, .authenticated, .{}, .{}, .{});
+    _ = try layoutChat(gpa, &engine, 700, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .undelivered, .authenticated, .{}, .{}, .{});
     try std.testing.expect(dl.len > rest_items);
     try std.testing.expectEqual(rest_regions + 1, regions.items.len); // + the repair tap target
 }
@@ -12648,7 +12748,7 @@ test "messages screen: chat published from another device says so, and offers ON
     const brows = [_]chat_view.BubbleRow{
         .{ .body = "hey", .age = "2h", .mine = true, .stamp = true, .kind = .text, .tail = true },
     };
-    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{ .state = .elsewhere }, .{}, .{});
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, &.{}, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{ .state = .elsewhere }, .{}, .{});
 
     // Exactly one tap target on the whole surface: the choice. No conversation
     // rows, no composer, no send — none of them mean anything without an
@@ -12666,7 +12766,7 @@ test "messages screen: chat published from another device says so, and offers ON
     // And with a normal identity the panel is gone and the list is back.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{}, .{}, .{});
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, &.{}, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{}, .{}, .{});
     var convs: usize = 0;
     for (regions.items) |r| {
         try std.testing.expect(r.kind != .chat_identity_reset);
@@ -12694,7 +12794,7 @@ test "messages screen: the phone shape — list page, then an immersive thread w
 
     // LIST page (no peer): full-width rows + the new-conversation button; no
     // composer, no thread chrome, no back — the tab bar is the way out.
-    _ = try layoutChat(gpa, &engine, 430, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, 255, "", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{ .top = 48 }, .{}, .confirmed, .authenticated, .{}, .{}, .{});
+    _ = try layoutChat(gpa, &engine, 430, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &.{}, &.{}, &.{}, 255, "", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{ .top = 48 }, .{}, .confirmed, .authenticated, .{}, .{}, .{});
     var l_conv: usize = 0;
     var l_new: usize = 0;
     var l_back: usize = 0;
@@ -12711,7 +12811,7 @@ test "messages screen: the phone shape — list page, then an immersive thread w
     // app-bar's back region + the composer trio are the page's controls.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 430, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{ .top = 48, .bottom = 34 }, .{}, .confirmed, .authenticated, .{}, .{}, .{});
+    _ = try layoutChat(gpa, &engine, 430, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, &.{}, 0, "maya.zat4.com", "", .{}, true, false, "", "", .{}, .{}, &.{}, .{}, .{ .top = 48, .bottom = 34 }, .{}, .confirmed, .authenticated, .{}, .{}, .{});
     var t_conv: usize = 0;
     var t_new: usize = 0;
     var t_back: usize = 0;
@@ -12764,7 +12864,7 @@ test "messages screen: payment cards and the pay sheet emit their regions (M5 A4
     };
 
     // Sheet closed: the card buttons carry their thread ordinals.
-    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{}, .{}, .{});
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, &.{}, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{}, .{}, .{});
     var pay_at: u16 = 999;
     var received_at: u16 = 999;
     var decline_at: u16 = 999;
@@ -12793,7 +12893,7 @@ test "messages screen: payment cards and the pay sheet emit their regions (M5 A4
     // and the amber status line renders without disturbing the regions.
     dl.len = 0;
     regions.clearRetainingCapacity();
-    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{ .open = true, .rail = .onchain, .amount = "5000", .note = "dinner", .status = "They haven't set up payments" }, .{}, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{}, .{}, .{});
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &cards, &.{}, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{ .open = true, .rail = .onchain, .amount = "5000", .note = "dinner", .status = "They haven't set up payments" }, .{}, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{}, .{}, .{});
     var n_rail: usize = 0;
     var n_chip: usize = 0;
     var n_amount: usize = 0;
@@ -13003,7 +13103,7 @@ test "a WATCHED card says it is being watched, and stops asking for a confirmati
     const watched = [_]chat_view.PayCard{
         .{ .payment_id = 7, .amount_sat = 5000, .rail = .lightning, .status = .pending, .confirmations = 0, .watching = true },
     };
-    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &watched, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{}, .{}, .{});
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &watched, &.{}, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{}, .{}, .{});
 
     // The card is still cancellable — a payment you have not approved yet is
     // still yours to abandon.
@@ -13155,4 +13255,33 @@ test "standalone gate: every LISTED nav row is reachable" {
         if (sc == 2) continue; // the Activity placeholder has no surface yet
         try std.testing.expect(reachable(sc));
     }
+}
+
+test "game board: a live board on our turn emits a tap region per empty cell" {
+    const gpa = std.testing.allocator;
+    var engine = try text.initEngine();
+    defer text.deinitEngine(gpa, &engine);
+    var dl: raster.DrawList = .empty;
+    defer dl.deinit(gpa);
+    var regions: Regions = .empty;
+    defer regions.deinit(gpa);
+
+    // A live, empty board, our turn (we are X).
+    const card = chat_view.GameCard{ .state = chat_games.init(), .my_seat = .x, .live = true };
+    try drawGameBoard(gpa, &dl, &engine, &regions, accent_house, 0, 0, game_board_w, card, true);
+    var cells: usize = 0;
+    for (regions.items) |r| if (r.kind == .game_cell) {
+        cells += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 9), cells); // all nine open
+
+    // A finished board (or not our turn) offers no cells.
+    regions.clearRetainingCapacity();
+    const done = chat_view.GameCard{ .state = .{ .board = @splat(.x), .turn = .none, .outcome = .x_wins, .moves = 9 }, .my_seat = .x, .live = true };
+    try drawGameBoard(gpa, &dl, &engine, &regions, accent_house, 0, 0, game_board_w, done, true);
+    var cells2: usize = 0;
+    for (regions.items) |r| if (r.kind == .game_cell) {
+        cells2 += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 0), cells2);
 }
