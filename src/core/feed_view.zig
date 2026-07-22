@@ -2758,7 +2758,7 @@ pub fn drawKeyboard(
                     3 => .kbd_page,
                     else => .kbd_key, // enter emits '\r'; the dead emoji key emits 0
                 };
-                try emitRegion(gpa, regions, rx0, ry0, rx1 - rx0, @intCast(@min(ry1 - ry0, 32767)), switch (k.ctrl) {
+                try emitRegion(gpa, regions, rx0, ry0, rx1 - rx0, @intCast(@max(0, @min(ry1 - ry0, 32767))), switch (k.ctrl) {
                     4 => '\r',
                     3 => k.lo, // the layer key's target page
                     else => 0,
@@ -2780,7 +2780,7 @@ pub fn drawKeyboard(
                 else
                     y + 34;
                 _ = try str(gpa, dl, e, .regular, x + @divTrunc(kw - gw, 2), kbase, ink, 19, gb[0..gn]);
-                try emitRegion(gpa, regions, rx0, ry0, rx1 - rx0, @intCast(@min(ry1 - ry0, 32767)), cp, .kbd_key);
+                try emitRegion(gpa, regions, rx0, ry0, rx1 - rx0, @intCast(@max(0, @min(ry1 - ry0, 32767))), cp, .kbd_key);
             }
         }
         y += kbd_key_h + kbd_gap;
