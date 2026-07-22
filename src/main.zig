@@ -1207,6 +1207,10 @@ pub fn main(init: std.process.Init) !void {
 test {
     _ = @import("ui/reveal.zig"); // Rover: portable UI primitives (src/ui/README.md)
     _ = @import("ui/insets.zig");
+    _ = @import("ui/ease.zig");
+    _ = @import("ui/scroll.zig");
+    _ = @import("ui/anchor.zig");
+    _ = @import("ui/timing.zig");
     // Pull every source file into the test build so its tests run and its
     // comptime guards (A7) are semantically analyzed on every `zig build test`.
     _ = @import("core/identity.zig");
