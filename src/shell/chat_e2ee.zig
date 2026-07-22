@@ -337,6 +337,18 @@ pub fn init(
     // same footgun wearing a different hat. Refused, quietly — our local
     // conversations still load, which is what this best-effort call is for.
     if (!minted_now and owns_singleton) _ = chat_keys.ensurePublished(gpa, arena, io, environ, session, adopt) catch {};
+
+    // "START FRESH" MUST BE TERMINAL (owner, 2026-07-22). adopt rewrote only the
+    // legacy singleton — but the boot check (`ensureDevice`) reads the DEVICE SET,
+    // so a fresh device that never got a device record kept failing the check and
+    // re-showing the gate on EVERY launch. Registering this device as the ROOT of
+    // the device directory is what makes the choice stick: next launch resolves it
+    // in the set → `.root` → chat comes up, no gate. This is safe here precisely
+    // because it is NOT the silent auto-claim the A3 invariant guards against — it
+    // is the person's explicit "I don't have my other device; I am this device
+    // now," exactly like linking-less Signal reinstall. The `.root` bring-up path
+    // already does this for a device that WAS root; adopt is the same act, chosen.
+    if (adopt) _ = chat_keys.publishDevice(gpa, arena, io, environ, session, deviceName(environ), true, "") catch {};
     return st;
 }
 
