@@ -1488,25 +1488,28 @@ pub fn send(
     peer_did: []const u8,
     kind: chat.Kind,
     text: []const u8,
-    /// The screen effect the sender PICKED for this message (0 = none). Only a
-    /// manual pick travels: the phrase-triggered effects are re-derived from the
-    /// text by the same pure function on both ends.
+    /// The SCREEN effect the sender PICKED (0 = none) and the BUBBLE effect (0 =
+    /// none) — the two axes of "Send with…". Only a manual pick travels; the
+    /// phrase-triggered screen effects are re-derived from the text on both ends.
     effect: u8,
+    bubble: u8,
 ) SendError!void {
     assert(!chat.isPaymentKind(kind));
-    // With no effect the bytes are EXACTLY what they were before this feature
-    // existed — one kind byte and the text. Only an effect-carrying message
-    // takes the wider frame, so ordinary delivery is untouched (and a peer on an
-    // older build keeps receiving every ordinary message).
-    const head: usize = if (effect == 0) 1 else 2;
+    // With NEITHER axis set the bytes are EXACTLY what they were before effects
+    // existed — one kind byte and the text — so ordinary delivery is untouched
+    // (and an older peer keeps receiving every ordinary message). A decorated
+    // message takes the wider frame: [kind_text_fx][screen][bubble][text].
+    const decorated = effect != 0 or bubble != 0;
+    const head: usize = if (decorated) 3 else 1;
     if (text.len + head > max_payload) return error.TooLong; // ciphertext ≥ plaintext; cheap early cut
     var plaintext_buf: [1024]u8 = undefined;
     if (text.len + head > plaintext_buf.len) return error.TooLong;
-    if (effect == 0) {
+    if (!decorated) {
         plaintext_buf[0] = @intFromEnum(kind);
     } else {
         plaintext_buf[0] = chat.kind_text_fx_wire;
         plaintext_buf[1] = effect;
+        plaintext_buf[2] = bubble;
     }
     @memcpy(plaintext_buf[head..][0..text.len], text);
     const plaintext = plaintext_buf[0 .. head + text.len];
@@ -1695,7 +1698,7 @@ fn sendPaymentBytes(
 /// What one inbox bucket became. `peer_did`/`text` are gpa-owned by the
 /// event; release with `freeIncoming`. A7.2: cold union, transient.
 pub const Incoming = union(enum) {
-    message: struct { peer_did: []u8, kind: chat.Kind, text: []u8, effect: u8 = 0 },
+    message: struct { peer_did: []u8, kind: chat.Kind, text: []u8, effect: u8 = 0, bubble: u8 = 0 },
     /// One move of an in-thread game. Separate from `.message` because it is not
     /// a message anybody reads — it carries no text, and the thread renders it as
     /// a board rather than a bubble.
@@ -2211,14 +2214,15 @@ pub fn onBucket(
                     // Every consumer keeps working unchanged; only the ones that
                     // care read `effect`.
                     if (data[0] == chat.kind_text_fx_wire) {
-                        if (data.len < 2) return null; // no room for the effect byte
-                        const fx_text = try gpa.dupe(u8, data[2..]);
+                        if (data.len < 3) return null; // [11][screen][bubble][text]
+                        const fx_text = try gpa.dupe(u8, data[3..]);
                         errdefer gpa.free(fx_text);
                         return .{ .message = .{
                             .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]),
                             .kind = .text,
                             .text = fx_text,
                             .effect = data[1],
+                            .bubble = data[2],
                         } };
                     }
                     // A GAME MOVE. Exactly two bytes; anything else claiming this
@@ -2253,6 +2257,7 @@ pub fn onBucket(
                         .kind = kind,
                         .text = text,
                         .effect = 0, // a plain message was sent with nothing
+                        .bubble = 0,
                     } };
                 },
             }

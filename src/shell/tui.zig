@@ -2303,6 +2303,10 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                             // this is exactly the sender's intent and
                                             // nothing inferred.
                                             if (msg.effect != 0) chat_core.setEffect(&rs.gchat_store, @intFromEnum(mi), msg.effect);
+                                            // The BUBBLE effect: how their bubble arrives.
+                                            // Transient — set now, played once by the spawn
+                                            // animation, never stored.
+                                            if (msg.bubble != 0) chat_core.setBubbleFx(&rs.gchat_store, @intFromEnum(mi), msg.bubble);
                                         }
                                         chat_mutated = true;
                                     }
@@ -5920,7 +5924,14 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         // composer strip (input / send / pay) drops focus — and with
                         // it the phone keyboard ("not being able to tap off the
                         // keyboard is driving me nuts", owner 2026-07-09).
-                        if (rs.gchat_input_focus and rs.gscreen == feed_view.screen_messages) {
+                        // While the "Send with…" PICKER is open, NOTHING blurs the
+                        // input: the picker is a modal over the composer and every
+                        // tap in it (a tab, a tile) is part of sending — the
+                        // keyboard must stay up through the whole flow (owner: it
+                        // dropped when switching tabs). Picking a tile re-asserts
+                        // focus itself; dismissing the picker leaves focus be.
+                        const picker_open = rs.gcmenu.open and rs.gcmenu.kind == .send;
+                        if (rs.gchat_input_focus and rs.gscreen == feed_view.screen_messages and !picker_open) {
                             // The EDIT BAR's buttons keep focus: Copy/Cut/
                             // Paste/Select-all act ON the focused draft —
                             // blurring them closed the keyboard and made
@@ -6669,7 +6680,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                                 // sender's history says what it was sent
                                                 // with — not just the recipient's.
                                                 chat_core.setEffect(&rs.gchat_store, @intFromEnum(mi), @intFromEnum(fx));
-                                                chatSend(gpa, io, environ, if (rs.gchat_e2ee) |*st| st else null, rs.gchat_link, &rs.gchat_store, sc, body, @intFromEnum(fx));
+                                                chatSend(gpa, io, environ, if (rs.gchat_e2ee) |*st| st else null, rs.gchat_link, &rs.gchat_store, sc, body, @intFromEnum(fx), 0);
                                                 chatPersistHistory(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
                                                 rs.gchat_draft_len = 0;
                                                 rs.gchat_caret = 0;
@@ -6682,6 +6693,29 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                                 // only when you picked an effect.
                                                 rs.gchat_input_focus = true;
                                                 if (rs.gpu_state) |*gs2| gs2.sfx_manual = fx; // play the picked effect
+                                            };
+                                        },
+                                        // Switch the picker's category tab (Screen/Bubble);
+                                        // the menu STAYS OPEN — this is just a view flip.
+                                        .chat_send_cat => rs.gcmenu.send_cat = @intCast(@min(hit.post, 1)),
+                                        // Send WITH A BUBBLE effect (how the bubble arrives).
+                                        // Same shape as chat_send_fx, but the bubble axis.
+                                        .chat_send_bubble => if (dev_chat) {
+                                            const be: chat_effects.BubbleEffect = @enumFromInt(@as(u8, @truncate(hit.post)));
+                                            rs.gcmenu = .{};
+                                            const body = std.mem.trimEnd(u8, rs.gchat_draft_buf[0..rs.gchat_draft_len], " \n");
+                                            if (body.len > 0) if (rs.gchat_sel) |sc| {
+                                                const mi = chat_core.appendMessage(gpa, &rs.gchat_store, sc, .text, body, now, true) catch continue;
+                                                chat_core.setBubbleFx(&rs.gchat_store, @intFromEnum(mi), @intFromEnum(be));
+                                                chatSend(gpa, io, environ, if (rs.gchat_e2ee) |*st| st else null, rs.gchat_link, &rs.gchat_store, sc, body, 0, @intFromEnum(be));
+                                                chatPersistHistory(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
+                                                rs.gchat_draft_len = 0;
+                                                rs.gchat_caret = 0;
+                                                chatCollapseSel(rs);
+                                                rs.gchat_input_focus = true;
+                                                // The bubble effect plays on OUR just-sent
+                                                // bubble as it spawns (spawnBubbleAnim reads
+                                                // the stored bubble effect).
                                             };
                                         },
                                         // ── CONVERSATION ACTIONS (press-and-hold a row) ──
@@ -6826,7 +6860,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                                     chat_core.setReplyTo(&rs.gchat_store, @intFromEnum(mi), rs.gchat_reply_to);
                                                     chatSendReply(rs, gpa, io, environ, sc, rs.gchat_reply_to, body);
                                                     rs.gchat_reply_to = no_reply;
-                                                } else chatSend(gpa, io, environ, if (rs.gchat_e2ee) |*st| st else null, rs.gchat_link, &rs.gchat_store, sc, body, 0);
+                                                } else chatSend(gpa, io, environ, if (rs.gchat_e2ee) |*st| st else null, rs.gchat_link, &rs.gchat_store, sc, body, 0, 0);
                                                 // THE PIGGYBACK: a reply already tells
                                                 // them we read it. Drop the pending
                                                 // receipt rather than spend a second
@@ -7959,7 +7993,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         const body = std.mem.trimEnd(u8, rs.gchat_draft_buf[0..rs.gchat_draft_len], " \n");
                         if (body.len > 0) if (rs.gchat_sel) |sc| {
                             _ = chat_core.appendMessage(gpa, &rs.gchat_store, sc, .text, body, now, true) catch {};
-                            chatSend(gpa, io, environ, if (rs.gchat_e2ee) |*st| st else null, rs.gchat_link, &rs.gchat_store, sc, body, 0);
+                            chatSend(gpa, io, environ, if (rs.gchat_e2ee) |*st| st else null, rs.gchat_link, &rs.gchat_store, sc, body, 0, 0);
                             chatPersistHistory(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
                             rs.gchat_draft_len = 0;
                             rs.gscroll_px = 0; // re-anchor to the newest message
@@ -9914,14 +9948,14 @@ const ChatFrame = struct {
 /// session/link (no ZAT4_RELAY) keeps the send local-only — the bubble still
 /// shows, it just doesn't transmit. A crypto/relay error is a status line,
 /// never a crash (E2). `env` feeds the persist-after-send.
-fn chatSend(gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, st: ?*chat_e2ee.State, link: ?*chat_relay.ChatRelay, cs: *const chat_core.Store, conv: chat_core.ConvIndex, text: []const u8, effect: u8) void {
+fn chatSend(gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, st: ?*chat_e2ee.State, link: ?*chat_relay.ChatRelay, cs: *const chat_core.Store, conv: chat_core.ConvIndex, text: []const u8, effect: u8, bubble: u8) void {
     const state = st orelse return;
     const l = link orelse return;
     chatLog("[chat] send -> {s} ({d} bytes)", .{ chat_core.conversationDid(cs, conv), text.len });
     const peer_did = chat_core.conversationDid(cs, conv);
     // A swallowed send error is how a message "disappears": the bubble appears,
     // nothing leaves, and nobody is told. Say it.
-    chat_e2ee.send(gpa, io, env, state, l, peer_did, .text, text, effect) catch |err|
+    chat_e2ee.send(gpa, io, env, state, l, peer_did, .text, text, effect, bubble) catch |err|
         chatLog("[chat] SEND FAILED -> {s}: {s}", .{ peer_did, @errorName(err) });
 }
 
@@ -14492,6 +14526,10 @@ const ChatAnim = struct {
     /// arrival it drives the uniform `grow` pop (0.92→1). `mine` selects which.
     scale: spring.Handle,
     off: spring.Handle, // rises it from below the seat (px → 0)
+    /// The BUBBLE effect (0 = none). When set, the `scale` spring drives the GROW
+    /// channel (a real size pop) even for an OWN send, instead of the composer
+    /// morph — a slam/loud/gentle is a different arrival than the normal one.
+    bubble: u8 = 0,
     /// Own send vs counterparty arrival — decides how the springs map to the
     /// bubble transform (morph vs pop) at the xform-build site.
     mine: bool,
@@ -14723,6 +14761,12 @@ const chat_scale_them = spring.springConstants(0.20, 0.35);
 const chat_off_c = spring.springConstants(0.15, 0.40);
 const chat_send_c = spring.springConstants(0.0, 0.30); // send morph: brisk, no overshoot
 const send_start_emerge: f32 = 0.0; // 0 = born on the composer input, → 1 seated
+// BUBBLE EFFECTS — how the one bubble ARRIVES (chat_effects.BubbleEffect). Each is
+// a start scale for the scale channel + a spring: slam overshoots (the shake),
+// the rest settle. Read by spawnBubbleAnim when a message carries a bubble effect.
+const bubble_slam_c = spring.springConstants(0.16, 0.62); // slow + underdamped → a visible drop, overshoot, settle
+const bubble_loud_c = spring.springConstants(0.38, 0.60); // slow, weighty settle from huge
+const bubble_gentle_c = spring.springConstants(0.60, 0.46); // soft, slow grow from tiny
 const send_start_rise: f32 = 40.0; // (kept for the shared spawn; mine's vertical now rides `emerge`)
 const chat_reflow_c = spring.springConstants(0.0, 0.40); // critical: a reflow must not overshoot
 const chat_fade_ns: f32 = 0.18 * 1_000_000_000.0; // opacity ramp duration
@@ -14763,20 +14807,35 @@ fn sfxMarkPlayed(gpa: Allocator, gs: *GpuState, key: u32) void {
     gs.sfx_played.append(gpa, key) catch {};
 }
 
-fn spawnBubbleAnim(gpa: Allocator, gs: *GpuState, key: u32, mine: bool, born_ns: u64) void {
+fn spawnBubbleAnim(gpa: Allocator, gs: *GpuState, key: u32, mine: bool, born_ns: u64, bubble: u8) void {
     for (gs.chat_anims.items) |a| if (a.key == key) return;
+    // A BUBBLE EFFECT overrides the ordinary arrival: it decides how big the
+    // bubble is born and how it springs to rest (slam shakes in from oversized,
+    // loud booms in from huge, gentle grows from tiny). Applies to OUR send and
+    // THEIR arrival alike — the effect belongs to the message, not the sender.
+    const be: chat_effects.BubbleEffect = chat_effects.bubbleFromWire(bubble);
     // MINE: the send morph — `scale` drives `emerge` (0 → 1, born at composer
     // width), both channels critically damped. THEM: the uniform arrival pop.
-    const c_scale = if (mine) chat_send_c else chat_scale_them;
+    const c_scale = switch (be) {
+        .slam => bubble_slam_c,
+        .loud => bubble_loud_c,
+        .gentle => bubble_gentle_c,
+        else => if (mine) chat_send_c else chat_scale_them,
+    };
     const c_off = if (mine) chat_send_c else chat_off_c;
-    const start_scale: f32 = if (mine) send_start_emerge else 0.92;
+    const start_scale: f32 = switch (be) {
+        .slam => 2.3, // drops in big, overshoots past normal (squash), shakes
+        .loud => 2.0, // arrives big and vibrates
+        .gentle => 0.1, // a dot, then blooms up to full size
+        else => if (mine) send_start_emerge else 0.92,
+    };
     const start_rise: f32 = if (mine) send_start_rise else 20.0;
     const sh = gs.chat_world.spawn(gpa, start_scale, 1.0, c_scale) catch return;
     const oh = gs.chat_world.spawn(gpa, start_rise, 0.0, c_off) catch {
         gs.chat_world.release(sh);
         return;
     };
-    gs.chat_anims.append(gpa, .{ .key = key, .scale = sh, .off = oh, .mine = mine, .born_ns = born_ns }) catch {
+    gs.chat_anims.append(gpa, .{ .key = key, .scale = sh, .off = oh, .mine = mine, .born_ns = born_ns, .bubble = bubble }) catch {
         gs.chat_world.release(sh);
         gs.chat_world.release(oh);
     };
@@ -15857,7 +15916,7 @@ fn paintFrameGpu(
                 }
             } else if (order.len > 0 and newest > gs.chat_seen_key) {
                 const msg = order[order.len - 1];
-                spawnBubbleAnim(gpa, gs, newest, chat_core.isMine(cs, msg), spring_now);
+                spawnBubbleAnim(gpa, gs, newest, chat_core.isMine(cs, msg), spring_now, chat_core.bubbleFxOf(cs, newest));
                 startChatReflow(gpa, gs);
                 gs.chat_seen_key = newest;
                 // SCREEN EFFECT: if the new message's TEXT triggers one, queue it to
@@ -16146,7 +16205,39 @@ fn paintFrameGpu(
                             // OPAQUE — the input is turning into the message; its text
                             // fades in at the render). An arrival drives the uniform
                             // `grow` pop with the alpha ramp.
-                            xforms[ri] = if (a.mine)
+                            if (a.bubble != 0) {
+                                // A BUBBLE EFFECT: the whole message group-scales by
+                                // `grow` about its anchor (the render does the
+                                // transform), plus a per-effect SHAKE — slam jolts
+                                // hard and briefly, loud vibrates while big, gentle
+                                // does not shake. The shake decays with a fast sine
+                                // off the spawn age.
+                                const be2 = chat_effects.bubbleFromWire(a.bubble);
+                                const age_s: f32 = @as(f32, @floatFromInt(gs.chat_clock_ns -| a.born_ns)) / 1_000_000_000.0;
+                                var shx: f32 = 0;
+                                var shy: f32 = 0;
+                                switch (be2) {
+                                    .slam => {
+                                        // A hard impact that rides the first ~0.5s of
+                                        // the drop, dying as the bubble settles.
+                                        const d = std.math.clamp(1.0 - age_s / 0.5, 0.0, 1.0);
+                                        const amp = 20.0 * d * d;
+                                        shx = @sin(age_s * 70.0) * amp;
+                                        shy = @cos(age_s * 82.0) * amp;
+                                    },
+                                    .loud => {
+                                        // A sustained vibration while the bubble is
+                                        // still oversized (grow > ~1.08).
+                                        if (s > 1.08) {
+                                            const amp = 6.0 * std.math.clamp((s - 1.0) * 1.5, 0.0, 1.0);
+                                            shx = @sin(age_s * 140.0) * amp;
+                                            shy = @sin(age_s * 121.0) * amp;
+                                        }
+                                    },
+                                    else => {},
+                                }
+                                xforms[ri] = .{ .grow = s, .emerge = 1.0, .rise = 0, .alpha = if (a.mine) 1.0 else ramp, .bubble = a.bubble, .shake_x = shx, .shake_y = shy };
+                            } else xforms[ri] = if (a.mine)
                                 .{ .grow = 1.0, .emerge = s, .rise = rise, .alpha = 1.0 }
                             else
                                 .{ .grow = s, .emerge = 1.0, .rise = rise, .alpha = ramp };

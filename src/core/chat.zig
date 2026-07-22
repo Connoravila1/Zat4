@@ -328,6 +328,11 @@ pub const ChatMsg = struct {
     /// For a `.game_move`, the encoded `chat_games.Move` byte. Meaningless (and
     /// zero) for every other kind — the KIND is what says whether to read it.
     game: u8 = 0,
+    /// The BUBBLE effect this message arrived with (a `chat_effects.BubbleEffect`
+    /// ordinal; 0 = none). TRANSIENT: set from the wire on arrival, played once by
+    /// the spawn animation, and deliberately NOT serialized — a bubble effect is a
+    /// moment, not a property, so re-opening history must not re-slam every bubble.
+    bubble: u8 = 0,
 
     comptime {
         // A7.1 — budget raised 24 → 32 for `reply_to` (u32), which is what makes a
@@ -338,9 +343,9 @@ pub const ChatMsg = struct {
         // pins the honest @sizeOf of the declared struct, which is what forces this
         // decision to be made on purpose.
         //
-        // `effect` and `game` (u8 each) were then added for FREE: they land in
-        // that existing tail padding, so the budget is unchanged at 32 and the SoA
-        // cost is one byte per message each. Had either not fit, it would have
+        // `effect`, `game` and `bubble` (u8 each) were then added for FREE: they
+        // land in that existing tail padding, so the budget is unchanged at 32 and
+        // the SoA cost is one byte per message each. Had any not fit, it would have
         // been a real decision rather than a free one.
         assert(@sizeOf(ChatMsg) == 32);
     }
@@ -750,6 +755,7 @@ fn appendRecord(
         .reply_to = no_reply, // set by `setReplyTo` when this message answers one
         .effect = 0, // set by `setEffect` when this message was sent with one
         .game = 0, // set by `setGameMove` for a `.game_move`
+        .bubble = 0, // set by `setBubbleFx` on arrival (transient)
     });
     try store.mine.resize(gpa, store.msgs.len, false);
     store.mine.setValue(index, mine);
@@ -911,6 +917,17 @@ pub fn setEffect(store: *Store, msg: u32, effect: u8) void {
 pub fn effectOf(store: *const Store, msg: u32) u8 {
     if (msg >= store.msgs.len) return 0;
     return store.msgs.items(.effect)[msg];
+}
+
+/// The BUBBLE effect a message arrived with (transient; see the field note).
+pub fn setBubbleFx(store: *Store, msg: u32, bubble: u8) void {
+    if (msg >= store.msgs.len) return;
+    store.msgs.items(.bubble)[msg] = bubble;
+}
+
+pub fn bubbleFxOf(store: *const Store, msg: u32) u8 {
+    if (msg >= store.msgs.len) return 0;
+    return store.msgs.items(.bubble)[msg];
 }
 
 /// Record the encoded move byte on a `.game_move` message.

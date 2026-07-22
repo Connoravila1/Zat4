@@ -47,6 +47,7 @@ pub const BubbleEffect = enum(u8) {
     loud, // arrives huge, booming
     gentle, // arrives tiny, whispered
     invisible, // "invisible ink": blurred until the reader swipes to reveal
+    _, // forward-compat: an unknown id from a newer peer degrades to "no effect"
 };
 
 /// A full-thread SCREEN effect — the celebration that takes over the conversation
@@ -79,6 +80,16 @@ pub const ScreenEffect = enum(u8) {
     eg_hurricane = 16, // "roger mccrary" — a hurricane across the screen
     _, // forward-compat: an unknown id from a newer peer degrades to "no effect"
 };
+
+/// A WIRE byte → a BUBBLE effect this build can play (untrusted-input boundary,
+/// like fromWire: a value this build does not know degrades to `.none`).
+pub fn bubbleFromWire(b: u8) BubbleEffect {
+    const fx: BubbleEffect = @enumFromInt(b);
+    return switch (fx) {
+        .none, .slam, .loud, .gentle, .invisible => fx,
+        _ => .none,
+    };
+}
 
 /// A WIRE byte → an effect this build can actually play.
 ///
@@ -139,6 +150,31 @@ pub fn screenName(fx: ScreenEffect) []const u8 {
         _ => "None",
     };
 }
+
+/// THE "SEND WITH…" PICKER CATALOGUE — the effects the grid offers, and the ONLY
+/// source of what it shows. The name eggs are deliberately absent: they are typed,
+/// not picked. Add an effect to messaging = add a row here (and its recipe).
+///
+/// SCREEN effects (full-thread celebrations) — only ones with a real recipe.
+// A7.2: cold config row (a handful, comptime, never in a hot loop), waived.
+pub const ScreenPick = struct { effect: ScreenEffect, label: []const u8 };
+pub const screen_picks = [_]ScreenPick{
+    .{ .effect = .balloons, .label = "Balloons" },
+    .{ .effect = .confetti, .label = "Confetti" },
+    .{ .effect = .fireworks, .label = "Fireworks" },
+    .{ .effect = .hearts, .label = "Hearts" },
+    .{ .effect = .lasers, .label = "Lasers" },
+};
+
+/// BUBBLE effects (how the one bubble ARRIVES) — the iMessage set, all four.
+// A7.2: cold config row, waived.
+pub const BubblePick = struct { effect: BubbleEffect, label: []const u8 };
+pub const bubble_picks = [_]BubblePick{
+    .{ .effect = .slam, .label = "Slam" },
+    .{ .effect = .loud, .label = "Loud" },
+    .{ .effect = .gentle, .label = "Gentle" },
+    .{ .effect = .invisible, .label = "Invisible Ink" },
+};
 
 /// A phrase that auto-proposes a screen effect. A7.2: cold config — a small
 /// comptime table, read on send, never held in a hot loop; size guard waived.
@@ -274,4 +310,11 @@ test "name eggs: a full name fires its effect, case-insensitively; a bare first 
     // A first name alone must NOT trigger — full name only, so ordinary talk is safe.
     try testing.expectEqual(ScreenEffect.none, detectAuto("hi connor"));
     try testing.expectEqual(ScreenEffect.none, detectAuto("julia said hi"));
+}
+
+test "bubbleFromWire: named effects survive; unknown degrades to none" {
+    try testing.expectEqual(BubbleEffect.slam, bubbleFromWire(1));
+    try testing.expectEqual(BubbleEffect.invisible, bubbleFromWire(4));
+    try testing.expectEqual(BubbleEffect.none, bubbleFromWire(5));
+    try testing.expectEqual(BubbleEffect.none, bubbleFromWire(255));
 }

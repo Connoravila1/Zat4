@@ -304,7 +304,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_send_fx, chat_new, chat_restart, chat_identity_reset, chat_device_add, chat_device_approve, chat_device_refuse, chat_device_help, chat_help_close, chat_history_get, chat_consent_receipts, chat_consent_typing, chat_consent_done, chat_msg_copy, chat_msg_reply, chat_msg_edit, chat_msg_delete_me, chat_conv_pin, chat_conv_mute, chat_conv_unread, chat_conv_delete, chat_ctx_cancel, chat_msg_react, chat_msg_delete_all, chat_menu_dismiss, chat_msg, recv_clip, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, recv_back, recv_use, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_send_fx, chat_send_bubble, chat_send_cat, chat_new, chat_restart, chat_identity_reset, chat_device_add, chat_device_approve, chat_device_refuse, chat_device_help, chat_help_close, chat_history_get, chat_consent_receipts, chat_consent_typing, chat_consent_done, chat_msg_copy, chat_msg_reply, chat_msg_edit, chat_msg_delete_me, chat_conv_pin, chat_conv_mute, chat_conv_unread, chat_conv_delete, chat_ctx_cancel, chat_msg_react, chat_msg_delete_all, chat_menu_dismiss, chat_msg, recv_clip, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, recv_back, recv_use, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -8232,13 +8232,21 @@ pub const BubbleXform = struct {
     /// Opacity 0..1. NOT a spring (an overshooting opacity flickers): a short
     /// monotonic ramp the shell derives from the spawn clock.
     alpha: f32 = 1,
+    /// A BUBBLE EFFECT (chat_effects.BubbleEffect ordinal; 0 = none). When set,
+    /// the whole bubble — rect AND text — is drawn at rest and then GROUP-SCALED
+    /// by `grow` about its anchored edge via `transformDlRange`, so the message
+    /// zooms as one object (the iMessage look). `shake_x/shake_y` add the impact
+    /// jolt (slam) or vibration (loud) as a pixel offset on that group.
+    bubble: u8 = 0,
+    shake_x: f32 = 0,
+    shake_y: f32 = 0,
 
     comptime {
-        // A7.1 — budget raised 12 → 16: the send morph needs a width channel
-        // (`emerge`, a right-anchored contraction) distinct from the uniform
-        // `grow` scale. Four f32, no padding. One per visible in-flight bubble —
-        // a handful animate at once, never a bulk collection — so 16 stays tight.
-        assert(@sizeOf(BubbleXform) == 16);
+        // A7.1 — budget raised 16 → 24: bubble effects group-scale the whole
+        // message (rect + text) about its anchor, which needs the effect id and a
+        // 2-axis shake offset alongside the four motion channels. Still a handful
+        // in flight at once, never a bulk collection.
+        assert(@sizeOf(BubbleXform) == 28);
     }
 };
 
@@ -9767,6 +9775,10 @@ pub const ChatMenu = struct {
     /// 0→1 as it arrives (a menu that appears fully formed feels like a glitch;
     /// one that grows from the point you pressed feels like an answer).
     t: f32 = 0,
+    /// "Send with…" only: which category tab is showing — 0 = Screen, 1 = Bubble
+    /// (the two axes iMessage splits, a full-thread effect vs. how the one bubble
+    /// arrives). Persists across taps so switching tabs is sticky.
+    send_cat: u8 = 0,
 };
 
 /// THE SIX. Every messenger converges on roughly this set because it covers almost
@@ -9854,6 +9866,178 @@ fn chatMenuAction(it: ChatMenuItem) Action {
 
 /// Draw the menu, and NOTHING under it can be tapped while it is up (the shell
 /// stops feeding taps to the thread — see the new-overlay law).
+/// A small vector mark for a SCREEN effect, drawn in a `s`-px box at (x,y). Kept
+/// as line/shape art (not emoji) so the tiles read as one calm system rather than
+/// a wall of wiggling glyphs — the reference-research verdict on what scales.
+fn screenEffectIcon(gpa: Allocator, dl: *raster.DrawList, fx: chat_effects.ScreenEffect, x: i32, y: i32, s: i32, c: u32) !void {
+    const cx = x + @divTrunc(s, 2);
+    const cy = y + @divTrunc(s, 2);
+    switch (fx) {
+        .balloons => {
+            // a rounded body + a string
+            try rect(gpa, dl, cx - @divTrunc(s, 5), y + @divTrunc(s, 6), @intCast(@divTrunc(s * 2, 5)), @intCast(@divTrunc(s, 2)), c, @intCast(@divTrunc(s, 5)));
+            try line(gpa, dl, cx, y + @divTrunc(s * 2, 3), cx, y + s - 2, c, 1);
+        },
+        .confetti => {
+            // three tumbling chips
+            try rect(gpa, dl, x + @divTrunc(s, 5), y + @divTrunc(s, 4), 4, 6, c, 1);
+            try rect(gpa, dl, cx, y + @divTrunc(s, 6), 4, 6, c, 1);
+            try rect(gpa, dl, x + @divTrunc(s * 3, 5), y + @divTrunc(s, 3), 4, 6, c, 1);
+            try rect(gpa, dl, x + @divTrunc(s, 3), cy + @divTrunc(s, 6), 4, 6, c, 1);
+        },
+        .fireworks => {
+            // a radial burst
+            var a: usize = 0;
+            while (a < 8) : (a += 1) {
+                const ang = @as(f32, @floatFromInt(a)) * 0.785;
+                const r0: f32 = @floatFromInt(@divTrunc(s, 6));
+                const r1: f32 = @floatFromInt(@divTrunc(s, 2) - 2);
+                try line(gpa, dl, cx + fxi(@cos(ang) * r0), cy + fxi(@sin(ang) * r0), cx + fxi(@cos(ang) * r1), cy + fxi(@sin(ang) * r1), c, 1);
+            }
+        },
+        .hearts => {
+            const l = @divTrunc(s, 5);
+            const r: u8 = @intCast(@divTrunc(s, 8));
+            try rect(gpa, dl, cx - l, cy - @divTrunc(l, 2), @intCast(l), @intCast(l), c, r);
+            try rect(gpa, dl, cx, cy - @divTrunc(l, 2), @intCast(l), @intCast(l), c, r);
+            try tri(gpa, dl, cx - l, cy + @divTrunc(l, 3), cx + l, cy + @divTrunc(l, 3), cx, cy + l, c);
+        },
+        .lasers => {
+            // crossing beams
+            try line(gpa, dl, x + 4, y + 4, x + s - 4, y + s - 4, c, 1);
+            try line(gpa, dl, x + s - 4, y + 4, x + 4, y + s - 4, c, 1);
+            try line(gpa, dl, x + 3, cy, x + s - 3, cy, c, 1);
+        },
+        else => {
+            try rect(gpa, dl, cx - 3, cy - 3, 6, 6, c, 3);
+        },
+    }
+}
+
+/// A small vector mark for a BUBBLE effect (how the one bubble arrives). Each is a
+/// rounded rect (the bubble) with a hint of its motion.
+fn bubbleEffectIcon(gpa: Allocator, dl: *raster.DrawList, fx: chat_effects.BubbleEffect, x: i32, y: i32, s: i32, c: u32) !void {
+    const cx = x + @divTrunc(s, 2);
+    const cy = y + @divTrunc(s, 2);
+    const bw = @divTrunc(s * 3, 5);
+    const bh = @divTrunc(s, 3);
+    switch (fx) {
+        .slam => {
+            // a big bubble + impact ticks below it
+            try rect(gpa, dl, cx - @divTrunc(bw, 2), y + @divTrunc(s, 5), @intCast(bw), @intCast(bh), c, @intCast(@divTrunc(bh, 2)));
+            try line(gpa, dl, cx - @divTrunc(s, 3), y + s - 6, cx - @divTrunc(s, 4), y + s - 2, c, 1);
+            try line(gpa, dl, cx, y + s - 7, cx, y + s - 2, c, 1);
+            try line(gpa, dl, cx + @divTrunc(s, 3), y + s - 6, cx + @divTrunc(s, 4), y + s - 2, c, 1);
+        },
+        .loud => {
+            // bubble + expanding sound arcs
+            try rect(gpa, dl, cx - @divTrunc(bw, 2), cy - @divTrunc(bh, 2), @intCast(bw), @intCast(bh), c, @intCast(@divTrunc(bh, 2)));
+            try line(gpa, dl, x + s - 8, cy - @divTrunc(s, 5), x + s - 5, cy, c, 1);
+            try line(gpa, dl, x + s - 8, cy + @divTrunc(s, 5), x + s - 5, cy, c, 1);
+        },
+        .gentle => {
+            // a small bubble, low
+            const sw = @divTrunc(s, 3);
+            try rect(gpa, dl, cx - @divTrunc(sw, 2), cy + @divTrunc(s, 8), @intCast(sw), @intCast(@divTrunc(sw, 2)), c, @intCast(@divTrunc(sw, 4)));
+        },
+        .invisible => {
+            // bubble outline + shimmer dots
+            try rect(gpa, dl, cx - @divTrunc(bw, 2) - 1, cy - @divTrunc(bh, 2) - 1, @intCast(bw + 2), @intCast(bh + 2), softA(c & 0x00FFFFFF, 0x55), @intCast(@divTrunc(bh, 2)));
+            var d: i32 = 0;
+            while (d < 3) : (d += 1) try rect(gpa, dl, cx - @divTrunc(bw, 2) + 4 + d * @divTrunc(bw, 3), cy - 1, 2, 2, c, 1);
+        },
+        .none, _ => {},
+    }
+}
+
+/// THE "SEND WITH…" GRID. A curated shelf of effects — a Screen/Bubble toggle and
+/// a 3-wide grid of icon+label tiles — that grows UP from the Send button and
+/// rolls its tiles in on a stagger. Sized so ~15 effects fit without scrolling;
+/// the research verdict was to give effects an OVERVIEW (a grid) rather than
+/// iMessage's one-per-swipe pager, which does not scale.
+fn drawSendGrid(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, regions: ?*Regions, width: i32, height: i32, m: ChatMenu, accent: u32) !void {
+    const grid_w: i32 = 274;
+    const pad: i32 = 12;
+    const cols: i32 = 3;
+    const tile_w = @divTrunc(grid_w - 2 * pad, cols);
+    const tile_h: i32 = 84;
+    const tab_h: i32 = 44;
+
+    const n: i32 = if (m.send_cat == 1) @intCast(chat_effects.bubble_picks.len) else @intCast(chat_effects.screen_picks.len);
+    const rows = @divTrunc(n + cols - 1, cols);
+    const card_h = tab_h + rows * tile_h + pad;
+
+    const t = std.math.clamp(m.t, 0.0, 1.0);
+    const ease = 1.0 - (1.0 - t) * (1.0 - t);
+    const a: u8 = @intFromFloat(255.0 * ease);
+
+    const x = std.math.clamp(m.x - @divTrunc(grid_w, 2), 8, @max(8, width - grid_w - 8));
+    // Grows UP from Send, clear of the keyboard.
+    const y = std.math.clamp(m.y - card_h - 12, 8, @max(8, height - card_h - 8));
+
+    // Dismiss-eater FIRST (reverse hit-test order), so a tap off the card closes it.
+    try emitRegion(gpa, regions, 0, 0, width, @intCast(@max(0, @min(height, std.math.maxInt(u16)))), 0, .chat_menu_dismiss);
+
+    // The card.
+    try cardBox(gpa, dl, x + 2, y + 6, grid_w, card_h, 16, softA(0x000000, @intCast(@as(u32, a) / 3)));
+    try cardBox(gpa, dl, x, y, grid_w, card_h, 16, (@as(u32, a) << 24) | 0x232326);
+    try rect(gpa, dl, x, y, grid_w, card_h, softA(0xEDEAE0, @intCast(@as(u32, a) / 6)), 16);
+
+    // ── The two category TABS ──
+    const tabs = [_][]const u8{ "Screen", "Bubble" };
+    const tab_w = @divTrunc(grid_w - 2 * pad, 2);
+    for (tabs, 0..) |label, i| {
+        const on = @as(u8, @intCast(i)) == m.send_cat;
+        const tx = x + pad + @as(i32, @intCast(i)) * tab_w;
+        if (on) try rect(gpa, dl, tx, y + 8, tab_w, tab_h - 14, softA(accent & 0x00FFFFFF, @intCast(@as(u32, a) / 4)), 9);
+        const tw: i32 = @intCast(text.measure(e, .semibold, label, 14));
+        const col: u32 = if (on) (@as(u32, a) << 24) | (accent & 0x00FFFFFF) else softA(0xEDEAE0, @intCast(@as(u32, a) * 3 / 5));
+        _ = try str(gpa, dl, e, .semibold, tx + @divTrunc(tab_w - tw, 2), y + 8 + @divTrunc(tab_h - 14, 2) + 5, col, 14, label);
+        try emitRegion(gpa, regions, tx, y + 6, tab_w, tab_h - 10, @intCast(i), .chat_send_cat);
+    }
+    try rect(gpa, dl, x + pad, y + tab_h - 2, grid_w - 2 * pad, 1, softA(0xEDEAE0, 0x14), 0);
+
+    // ── The TILES, rolled in on a stagger ──
+    var i: usize = 0;
+    while (i < @as(usize, @intCast(n))) : (i += 1) {
+        const col_i: i32 = @intCast(@mod(i, @as(usize, @intCast(cols))));
+        const row_i: i32 = @intCast(@divTrunc(i, @as(usize, @intCast(cols))));
+        // per-tile entrance: each starts a beat after the last.
+        const delay = @as(f32, @floatFromInt(i)) * 0.06;
+        const lt = std.math.clamp((t - delay) / 0.4, 0.0, 1.0);
+        if (lt <= 0.001) continue;
+        const le = 1.0 - (1.0 - lt) * (1.0 - lt);
+        const la: u8 = @intFromFloat(255.0 * le);
+
+        const tx = x + pad + col_i * tile_w;
+        const ty = y + tab_h + 6 + row_i * tile_h;
+        // a subtle rise as it eases in
+        const rise: i32 = @intFromFloat((1.0 - le) * 10.0);
+        const icon_box: i32 = 40;
+        const ix = tx + @divTrunc(tile_w - icon_box, 2);
+        const iy = ty + 6 + rise;
+
+        const label = if (m.send_cat == 1) chat_effects.bubble_picks[i].label else chat_effects.screen_picks[i].label;
+        // icon
+        const icol = (@as(u32, la) << 24) | (accent & 0x00FFFFFF);
+        if (m.send_cat == 1) {
+            try bubbleEffectIcon(gpa, dl, chat_effects.bubble_picks[i].effect, ix, iy, icon_box, icol);
+        } else {
+            try screenEffectIcon(gpa, dl, chat_effects.screen_picks[i].effect, ix, iy, icon_box, icol);
+        }
+        // label, centered under the icon
+        const lw: i32 = @intCast(text.measure(e, .regular, label, 11));
+        _ = try str(gpa, dl, e, .regular, tx + @divTrunc(tile_w - lw, 2), iy + icon_box + 16, softA(0xEDEAE0, la), 11, label);
+
+        // tap target: the whole tile. Post = the effect ordinal, action per category.
+        const ord: usize = if (m.send_cat == 1)
+            @intFromEnum(chat_effects.bubble_picks[i].effect)
+        else
+            @intFromEnum(chat_effects.screen_picks[i].effect);
+        try emitRegion(gpa, regions, tx + 2, ty, tile_w - 4, tile_h - 4, @intCast(ord), if (m.send_cat == 1) .chat_send_bubble else .chat_send_fx);
+    }
+}
+
 fn drawChatMenu(
     gpa: Allocator,
     dl: *raster.DrawList,
@@ -9862,8 +10046,15 @@ fn drawChatMenu(
     width: i32,
     height: i32,
     m: ChatMenu,
+    accent: u32,
 ) error{OutOfMemory}!void {
     if (!m.open) return;
+    // "Send with…" is a GRID, not a list — a curated shelf of effects with a
+    // Screen/Bubble toggle, sized to stay ≤ ~15 without scrolling. Its own path.
+    if (m.kind == .send) {
+        try drawSendGrid(gpa, dl, e, regions, width, height, m, accent);
+        return;
+    }
     var buf: [6]ChatMenuItem = undefined;
     const items = chatMenuItems(m, &buf);
     const h = chat_menu_row_h * @as(i32, @intCast(items.len)) + 12 + (if (m.kind == .message) @as(i32, 52) else 0);
@@ -10826,7 +11017,13 @@ pub fn layoutChat(
                 // back to the message through the very same query it built these rows
                 // from, so the two orderings cannot disagree.
                 try emitRegion(gpa, regions, bx, by, bw, @intCast(@max(0, @min(hh, std.math.maxInt(u16)))), @intCast(@min(idx, std.math.maxInt(u16))), .chat_msg);
-                if (!is_fly) {
+                // A BUBBLE EFFECT draws the FULL bubble at rest, then group-scales
+                // the whole thing (rect + text) about its anchor — the iMessage
+                // zoom. So it takes the same draw path as a resting bubble; the
+                // transform is applied to the recorded range just after.
+                const bfx_group = xf.bubble != 0;
+                const bfx_start = dl.len;
+                if (!is_fly or bfx_group) {
                     if (b.tail) try bubbleTail(gpa, dl, b.mine, bx, by, bw, hh, fill);
                     try rect(gpa, dl, bx, by, bw, hh, fill, bub_rad);
                     // A DELETED message is a ghost: no fill weight, no confusion with
@@ -10879,13 +11076,32 @@ pub fn layoutChat(
                         const ew: i32 = @intCast(text.measure(e, .regular, em, 10));
                         _ = try str(gpa, dl, e, .regular, bx + bw - pad_x - ew, by + hh - 6, softA(0xEDEAE0, 0x66), 10, em);
                     }
-                } else if (b.mine) {
+                    // THE ZOOM: scale the whole bubble group about its anchored
+                    // edge (right for a mine bubble, left for theirs) and vertical
+                    // centre, plus the effect's shake. text.px scales with it, so
+                    // the message zooms as one object rather than a rect with tiny
+                    // text rattling inside — which is what made the old attempt look
+                    // like nothing.
+                    if (bfx_group) {
+                        const pivot_x: f32 = if (b.mine) @floatFromInt(bx + bw) else @floatFromInt(bx);
+                        // Anchor at the bubble's BOTTOM so the zoom grows UPWARD into
+                        // the visible thread, not downward behind the composer where
+                        // the peak was hidden (seen on-device: only the top of the
+                        // slam poked out above the keyboard).
+                        const pivot_y: f32 = @floatFromInt(by + hh);
+                        transformDlRange(dl, bfx_start, dl.len, xf.grow, pivot_x, pivot_y, xf.shake_x, xf.shake_y);
+                    }
+                } else if (b.mine and xf.grow == 1.0) {
                     // THE OWN SEND — deferred and drawn ON TOP of the composer
                     // (below): the bubble is born exactly on the input pill (so the
                     // input appears to BECOME the message) and its whole rect glides
                     // up-and-in to this seat while the empty input is revealed
                     // beneath. Record the destination seat + payload; `emerge` (0→1,
                     // critically damped) drives the morph after the composer draws.
+                    //
+                    // A BUBBLE EFFECT (slam/loud/gentle) drives `grow` instead of
+                    // `emerge`, so it falls through to the in-place scale-pop branch
+                    // below — a slam happens AT the seat, not as a composer morph.
                     send_flight = .{
                         .bx = bx,
                         .by = by,
@@ -10904,15 +11120,21 @@ pub fn layoutChat(
                     // the composer instead — the branch above.)
                     const fade = xf.alpha;
                     const grow = xf.grow;
-                    const seat_bot: f32 = @floatFromInt(y + hh);
-                    const bot_a = seat_bot + xf.rise;
                     const bw_a: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(bw)) * grow));
                     const hh_a: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(hh)) * grow));
-                    const by_a = @as(i32, @intFromFloat(@round(bot_a))) - hh_a;
+                    // SCALE ABOUT THE BUBBLE'S ANCHOR, not its top-left corner. A
+                    // mine bubble is right-aligned, so it grows LEFTWARD from its
+                    // right edge (else a 2× slam shoots off the right of the screen
+                    // and you only see a normal-looking sliver — the whole reason
+                    // the effect "did nothing"). Vertically it scales about the
+                    // seat's centre so it swells in place rather than only upward.
+                    const bx_a: i32 = if (b.mine) (bx + bw) - bw_a else bx;
+                    const cy_seat: f32 = @floatFromInt(y + @divTrunc(hh, 2));
+                    const by_a = @as(i32, @intFromFloat(@round(cy_seat + xf.rise))) - @divTrunc(hh_a, 2);
                     const fill_a = scaleAlpha(fill, fade);
-                    if (b.tail) try bubbleTail(gpa, dl, b.mine, bx, by_a, bw_a, hh_a, fill_a);
-                    try rect(gpa, dl, bx, by_a, bw_a, hh_a, fill_a, bub_rad);
-                    _ = try wrapBody(gpa, dl, e, bx + pad_x, by_a + pad_y + 14, bub_max - 2 * pad_x, scaleAlpha(ink, fade), chat_px, b.body, line_h, true, null);
+                    if (b.tail) try bubbleTail(gpa, dl, b.mine, bx_a, by_a, bw_a, hh_a, fill_a);
+                    try rect(gpa, dl, bx_a, by_a, bw_a, hh_a, fill_a, bub_rad);
+                    _ = try wrapBody(gpa, dl, e, bx_a + pad_x, by_a + pad_y + 14, bub_max - 2 * pad_x, scaleAlpha(ink, fade), chat_px, b.body, line_h, true, null);
                 }
             }
         }
@@ -11634,7 +11856,7 @@ pub fn layoutChat(
     // every tap that is not one of its own (the standing overlay law: three surfaces
     // have bled through an overlay in this codebase, and each time the cause was a
     // draw that happened too early or an input that was never consumed).
-    try drawChatMenu(gpa, dl, e, regions, width, height, menu);
+    try drawChatMenu(gpa, dl, e, regions, width, height, menu, accent);
 
     return height + @max(0, total - (thread_bot - thread_top));
 }
