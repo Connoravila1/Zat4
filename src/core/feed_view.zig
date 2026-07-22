@@ -304,7 +304,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_send_fx, chat_send_bubble, chat_send_cat, chat_new, chat_restart, chat_identity_reset, chat_device_add, chat_device_approve, chat_device_refuse, chat_device_help, chat_help_close, chat_history_get, chat_consent_receipts, chat_consent_typing, chat_consent_done, chat_msg_copy, chat_msg_reply, chat_msg_edit, chat_msg_delete_me, chat_conv_pin, chat_conv_mute, chat_conv_unread, chat_conv_delete, chat_ctx_cancel, chat_msg_react, chat_msg_delete_all, chat_menu_dismiss, chat_msg, recv_clip, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, recv_back, recv_use, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_send_fx, chat_send_bubble, chat_send_cat, chat_attach, chat_attach_game, chat_attach_photo, chat_attach_video, chat_new, chat_restart, chat_identity_reset, chat_device_add, chat_device_approve, chat_device_refuse, chat_device_help, chat_help_close, chat_history_get, chat_consent_receipts, chat_consent_typing, chat_consent_done, chat_msg_copy, chat_msg_reply, chat_msg_edit, chat_msg_delete_me, chat_conv_pin, chat_conv_mute, chat_conv_unread, chat_conv_delete, chat_ctx_cancel, chat_msg_react, chat_msg_delete_all, chat_menu_dismiss, chat_msg, recv_clip, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, recv_back, recv_use, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -9711,7 +9711,7 @@ fn drawPendingDeviceCard(
 // its state into the rebuild signature.
 
 /// What the open menu is about: a message, or a whole conversation.
-pub const ChatMenuKind = enum(u8) { message, conversation, send };
+pub const ChatMenuKind = enum(u8) { message, conversation, send, attach };
 
 pub const ChatMenuItem = enum(u8) {
     // conversation
@@ -9739,6 +9739,11 @@ pub const ChatMenuItem = enum(u8) {
     fx_confetti,
     fx_fireworks,
     fx_lasers,
+    // "+" attachment menu (games / photos / videos). Games is the first real one;
+    // photos/videos are scaffold ("Soon") until their pipelines land.
+    att_games,
+    att_photos,
+    att_videos,
 };
 
 /// The ScreenEffect a "Send with…" menu row stands for (the row's posted ordinal).
@@ -9797,6 +9802,12 @@ fn chatMenuItems(m: ChatMenu, out: *[6]ChatMenuItem) []const ChatMenuItem {
         out[3] = .fx_lasers;
         return out[0..4];
     }
+    if (m.kind == .attach) {
+        out[0] = .att_games;
+        out[1] = .att_photos;
+        out[2] = .att_videos;
+        return out[0..3];
+    }
     if (m.kind == .conversation) {
         out[0] = if (m.pinned) .unpin else .pin;
         out[1] = if (m.muted) .unmute else .mute;
@@ -9846,6 +9857,9 @@ fn chatMenuLabel(it: ChatMenuItem) []const u8 {
         .fx_confetti => "Confetti",
         .fx_fireworks => "Fireworks",
         .fx_lasers => "Lasers",
+        .att_games => "Games",
+        .att_photos => "Photos",
+        .att_videos => "Videos",
     };
 }
 
@@ -9861,6 +9875,9 @@ fn chatMenuAction(it: ChatMenuItem) Action {
         .delete_me => .chat_msg_delete_me,
         .delete_all => .chat_msg_delete_all,
         .fx_balloons, .fx_confetti, .fx_fireworks, .fx_lasers => .chat_send_fx,
+        .att_games => .chat_attach_game,
+        .att_photos => .chat_attach_photo,
+        .att_videos => .chat_attach_video,
     };
 }
 
@@ -10066,7 +10083,7 @@ fn drawChatMenu(
     // load-bearing on the phone, that keeps it clear of the soft keyboard, which
     // covers the bottom of the screen and was clipping a downward menu. Every
     // other menu opens under the press point where the finger already is.
-    const y = if (m.kind == .send)
+    const y = if (m.kind == .send or m.kind == .attach)
         std.math.clamp(m.y - h - 10, 8, @max(8, height - h - 8))
     else
         std.math.clamp(m.y, 8, @max(8, height - h - 8));
@@ -10109,12 +10126,21 @@ fn drawChatMenu(
         const iy = y + 6 + react_h + @as(i32, @intCast(i)) * chat_menu_row_h;
         if (iy + chat_menu_row_h > y + hh) break; // still growing: do not spill
         const destructive = it == .delete_me or it == .delete_all or it == .delete_conv;
-        const col: u32 = if (destructive) (@as(u32, a) << 24) | 0xE0705C else (@as(u32, a) << 24) | (ink & 0x00FFFFFF);
+        // Unbuilt attachment kinds are dimmed and tagged "Soon" — visible so the
+        // shape of the feature reads, inert so a tap on them does nothing.
+        const soon = it == .att_photos or it == .att_videos;
+        const base: u32 = if (destructive) 0xE0705C else (ink & 0x00FFFFFF);
+        const col: u32 = if (soon) softA(base, @intCast(@as(u32, a) / 3)) else (@as(u32, a) << 24) | base;
         _ = try str(gpa, dl, e, .regular, x + 16, iy + 28, col, 14, chatMenuLabel(it));
+        if (soon) {
+            const sw: i32 = @intCast(text.measure(e, .regular, "Soon", 11));
+            _ = try str(gpa, dl, e, .regular, x + chat_menu_w - sw - 16, iy + 27, softA(0xEDEAE0, @intCast(@as(u32, a) / 4)), 11, "Soon");
+        }
         // A "Send with…" row posts the EFFECT it stands for; a message/conversation
         // row posts its message index (the shell reads gcmenu for the rest).
         const post: u16 = if (m.kind == .send) @intFromEnum(fxItemEffect(it)) else @intCast(@min(m.msg, std.math.maxInt(u16)));
-        try emitRegion(gpa, regions, x, iy, chat_menu_w, @intCast(chat_menu_row_h), post, chatMenuAction(it));
+        // A "Soon" row emits no region — it is inert until its pipeline lands.
+        if (!soon) try emitRegion(gpa, regions, x, iy, chat_menu_w, @intCast(chat_menu_row_h), post, chatMenuAction(it));
     }
 }
 
@@ -10857,6 +10883,12 @@ pub fn layoutChat(
     // running off it; the thread above yields the space. Enter sends,
     // Shift+Enter breaks the line ('\n' in the draft is a real line).
     const send_w: i32 = if (phone) 46 else 84; // phone: a round send button
+    // SIGNAL-STYLE morph: with no draft the right button is a "+" (attachments);
+    // once you type it becomes Send and the "+" slides into the input's right
+    // edge. `armed_draft` gates the whole dance; `inline_attach_w` is the room
+    // the in-input "+" needs so text never runs under it.
+    const armed_draft = draft.len > 0;
+    const inline_attach_w: i32 = if (armed_draft) (if (phone) 42 else 38) else 0;
     // The pay button (M5 A4) sits left of the input; the input yields it room.
     const pay_btn: i32 = if (phone) 46 else 40;
     const input_x = detail_x + pay_btn + 8;
@@ -11291,7 +11323,7 @@ pub fn layoutChat(
         // machinery): the shell moves `draft_caret` with arrow keys and the
         // keyboard's space-hold slide, and the caret pen lands wherever
         // that byte offset wrapped to.
-        const pens = try wrapDraft(gpa, dl, e, input_x + 14, comp_y + 31, input_w - 28, ink, chat_px, draft, input_line_h, @min(edit.caret, draft.len), @min(edit.sel_a, draft.len), @min(edit.sel_b, draft.len));
+        const pens = try wrapDraft(gpa, dl, e, input_x + 14, comp_y + 31, input_w - 28 - inline_attach_w, ink, chat_px, draft, input_line_h, @min(edit.caret, draft.len), @min(edit.sel_a, draft.len), @min(edit.sel_b, draft.len));
         caret_x = pens.caret.x;
         caret_base = pens.caret.baseline;
         if (edit.sel_b > edit.sel_a) {
@@ -11309,6 +11341,16 @@ pub fn layoutChat(
         try rect(gpa, dl, caret_x + 1, caret_base - 16, 2, 20, scaleAlpha((0xE0 << 24) | (accent & 0x00FFFFFF), ca), 0);
     }
     try emitRegion(gpa, regions, input_x, comp_y, input_w, @intCast(comp_h), 0, .chat_input);
+    // The in-input "+" (armed): sits at the input's right edge where Signal keeps
+    // its camera/mic, so attachments stay one tap away while you type. A round
+    // hit target; the region wins over the input's because it is pushed after.
+    if (armed_draft) {
+        const ax = input_x + input_w - inline_attach_w - 2;
+        const ay = comp_y + comp_h - 42;
+        const acx = ax + @divTrunc(inline_attach_w, 2);
+        _ = try str(gpa, dl, e, .semibold, acx - 7, ay + 27, softA(0xEDEAE0, 0xCC), 24, "+");
+        try emitRegion(gpa, regions, ax, ay - 2, inline_attach_w + 4, 46, 0, .chat_attach);
+    }
 
     // WHAT YOU ARE ANSWERING (or editing), directly above the composer, with a way
     // OUT of it. A reply state you cannot see is a reply state you will send by
@@ -11385,17 +11427,34 @@ pub fn layoutChat(
     // fills accent, resting it sits as a quiet disc; the tap target stays 46.
     const sx = detail_x + detail_w - send_w;
     const sy = comp_y + comp_h - 46;
-    const armed = draft.len > 0;
-    if (phone) {
-        try rect(gpa, dl, sx, sy, send_w, 46, if (armed) accent else skinPanel(accent), 23);
-        const aw3: i32 = @intCast(text.measure(e, .semibold, "\u{2191}", 22));
-        _ = try str(gpa, dl, e, .semibold, sx + @divTrunc(send_w - aw3, 2), sy + 31, if (armed) 0xFF20201A else faint, 22, "\u{2191}");
+    const armed = armed_draft;
+    if (!armed) {
+        // EMPTY: the right button is the "+" (attachments) — a filled accent disc
+        // with a plus, the messenger's resting affordance when there is nothing
+        // to send yet.
+        if (phone) {
+            try rect(gpa, dl, sx, sy, send_w, 46, accent, 23);
+            const pw: i32 = @intCast(text.measure(e, .semibold, "+", 26));
+            _ = try str(gpa, dl, e, .semibold, sx + @divTrunc(send_w - pw, 2), sy + 32, 0xFF20201A, 26, "+");
+        } else {
+            try rect(gpa, dl, sx, sy, send_w, 46, skinPanel(accent), 14);
+            const pw: i32 = @intCast(text.measure(e, .semibold, "+", 20));
+            _ = try str(gpa, dl, e, .semibold, sx + @divTrunc(send_w - pw, 2), sy + 30, faint, 20, "+");
+        }
+        try emitRegion(gpa, regions, sx, sy, send_w, 46, 0, .chat_attach);
     } else {
-        try rect(gpa, dl, sx, sy, send_w, 46, if (armed) accent else skinPanel(accent), 14);
-        const sw3: i32 = @intCast(text.measure(e, .semibold, "Send", 14));
-        _ = try str(gpa, dl, e, .semibold, sx + @divTrunc(send_w - sw3, 2), sy + 29, if (armed) 0xFF20201A else faint, 14, "Send");
+        // ARMED: the right button is Send.
+        if (phone) {
+            try rect(gpa, dl, sx, sy, send_w, 46, accent, 23);
+            const aw3: i32 = @intCast(text.measure(e, .semibold, "\u{2191}", 22));
+            _ = try str(gpa, dl, e, .semibold, sx + @divTrunc(send_w - aw3, 2), sy + 31, 0xFF20201A, 22, "\u{2191}");
+        } else {
+            try rect(gpa, dl, sx, sy, send_w, 46, accent, 14);
+            const sw3: i32 = @intCast(text.measure(e, .semibold, "Send", 14));
+            _ = try str(gpa, dl, e, .semibold, sx + @divTrunc(send_w - sw3, 2), sy + 29, 0xFF20201A, 14, "Send");
+        }
+        try emitRegion(gpa, regions, sx, sy, send_w, 46, 0, .chat_send);
     }
-    try emitRegion(gpa, regions, sx, sy, send_w, 46, 0, .chat_send);
 
     // ── THE OWN-SEND MORPH (drawn here, ON TOP of the composer, so the bubble
     // emerges FROM the input). A shared-element transition: at emerge = 0 the
@@ -12448,6 +12507,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     var n_conv: usize = 0;
     var n_input: usize = 0;
     var n_send: usize = 0;
+    var n_attach: usize = 0;
     var n_new: usize = 0;
     var n_pay: usize = 0;
     var n_restart: usize = 0;
@@ -12458,6 +12518,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
         if (r.kind == .chat_conv) n_conv += 1;
         if (r.kind == .chat_input) n_input += 1;
         if (r.kind == .chat_send) n_send += 1;
+        if (r.kind == .chat_attach) n_attach += 1;
         if (r.kind == .chat_new) n_new += 1;
         if (r.kind == .pay_open) n_pay += 1;
         if (r.kind == .chat_msg) n_msg += 1;
@@ -12470,7 +12531,10 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     try std.testing.expectEqual(brows.len, n_msg);
     try std.testing.expectEqual(@as(usize, 2), n_conv);
     try std.testing.expectEqual(@as(usize, 1), n_input);
-    try std.testing.expectEqual(@as(usize, 1), n_send);
+    // Empty draft ⇒ the right button is the "+" (attachments), not Send (Signal
+    // morph). No inline "+" either, since that only appears once you type.
+    try std.testing.expectEqual(@as(usize, 0), n_send);
+    try std.testing.expectEqual(@as(usize, 1), n_attach);
     try std.testing.expectEqual(@as(usize, 1), n_new);
     try std.testing.expectEqual(@as(usize, 1), n_pay); // the pay button (M5 A4)
     // The REPAIR is CONTEXTUAL now: it appears only when a conversation actually
@@ -12483,7 +12547,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // working Messages screen (the onboarding links vanish once a device is set up,
     // so this is the only standing way back to "How Zat Chat works").
     try std.testing.expectEqual(@as(usize, 1), n_help);
-    try std.testing.expectEqual(regions.items.len, n_conv + n_input + n_send + n_new + n_pay + n_restart + n_msg + n_help);
+    try std.testing.expectEqual(regions.items.len, n_conv + n_input + n_send + n_attach + n_new + n_pay + n_restart + n_msg + n_help);
 
     // ...and when it IS needed, the delivery strip is the single tap target. Re-lay
     // the same surface with a drifted conversation and the repair reappears, exactly
@@ -12653,18 +12717,22 @@ test "messages screen: the phone shape — list page, then an immersive thread w
     var t_back: usize = 0;
     var t_input: usize = 0;
     var t_send: usize = 0;
+    var t_attach: usize = 0;
     for (regions.items) |r| {
         if (r.kind == .chat_conv) t_conv += 1;
         if (r.kind == .chat_new) t_new += 1;
         if (r.kind == .back) t_back += 1;
         if (r.kind == .chat_input) t_input += 1;
         if (r.kind == .chat_send) t_send += 1;
+        if (r.kind == .chat_attach) t_attach += 1;
     }
     try std.testing.expectEqual(@as(usize, 0), t_conv);
     try std.testing.expectEqual(@as(usize, 0), t_new);
     try std.testing.expectEqual(@as(usize, 1), t_back);
     try std.testing.expectEqual(@as(usize, 1), t_input);
-    try std.testing.expectEqual(@as(usize, 1), t_send);
+    // Empty draft ⇒ the right button is "+" (attach), not Send (the morph).
+    try std.testing.expectEqual(@as(usize, 0), t_send);
+    try std.testing.expectEqual(@as(usize, 1), t_attach);
 }
 
 test "messages screen: payment cards and the pay sheet emit their regions (M5 A4)" {

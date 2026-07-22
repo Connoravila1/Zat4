@@ -5930,7 +5930,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         // keyboard must stay up through the whole flow (owner: it
                         // dropped when switching tabs). Picking a tile re-asserts
                         // focus itself; dismissing the picker leaves focus be.
-                        const picker_open = rs.gcmenu.open and rs.gcmenu.kind == .send;
+                        const picker_open = rs.gcmenu.open and (rs.gcmenu.kind == .send or rs.gcmenu.kind == .attach);
                         if (rs.gchat_input_focus and rs.gscreen == feed_view.screen_messages and !picker_open) {
                             // The EDIT BAR's buttons keep focus: Copy/Cut/
                             // Paste/Select-all act ON the focused draft —
@@ -6698,6 +6698,21 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         // Switch the picker's category tab (Screen/Bubble);
                                         // the menu STAYS OPEN — this is just a view flip.
                                         .chat_send_cat => rs.gcmenu.send_cat = @intCast(@min(hit.post, 1)),
+                                        // THE "+" ATTACHMENT MENU: games / photos / videos.
+                                        // Opens over the composer, grows up from the "+".
+                                        .chat_attach => if (dev_chat) {
+                                            rs.gcmenu = .{ .open = true, .kind = .attach, .x = @as(i32, hit.x) + @divTrunc(@as(i32, hit.w), 2), .y = hit.y };
+                                        },
+                                        .chat_attach_game => if (dev_chat) {
+                                            rs.gcmenu = .{};
+                                            // The board renderer + tap→move is the next
+                                            // slice; for now this is the wired entry
+                                            // point (the skeleton the owner asked for).
+                                            rs.status = "games: board coming next";
+                                        },
+                                        // Photos/Videos emit no region yet (drawn "Soon"),
+                                        // so these arms exist only for completeness.
+                                        .chat_attach_photo, .chat_attach_video => {},
                                         // Send WITH A BUBBLE effect (how the bubble arrives).
                                         // Same shape as chat_send_fx, but the bubble axis.
                                         .chat_send_bubble => if (dev_chat) {
