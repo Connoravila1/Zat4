@@ -1211,6 +1211,7 @@ test {
     _ = @import("ui/scroll.zig");
     _ = @import("ui/anchor.zig");
     _ = @import("ui/timing.zig");
+    _ = @import("ui/feedback.zig");
     // Pull every source file into the test build so its tests run and its
     // comptime guards (A7) are semantically analyzed on every `zig build test`.
     _ = @import("core/identity.zig");

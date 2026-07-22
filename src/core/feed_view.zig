@@ -10952,6 +10952,9 @@ pub fn layoutChat(
     // against a global observer (vision §8).
     const ban_y = if (phone) top + 62 else top + 74;
     const ban_h: i32 = 22;
+    // The conversation list's content extent (phone), hoisted out of the block
+    // below so the return can hand it to the shell as the scroll clamp height.
+    var list_content_h: i32 = 0;
     if (phone_thread) {
         // No list chrome in the open thread; fall through to the thread pane.
     } else {
@@ -11042,7 +11045,13 @@ pub fn layoutChat(
     // ── Left: the conversation list (avatar + name + preview / age + unread).
     // Phone rows breathe: taller, bigger avatar, a hairline between rows. ──
     const row_h: i32 = if (phone) 78 else 64;
-    var ly = body_y;
+    // PHONE: the conversation list is its own full screen, so it scrolls with the
+    // shared scroll offset (and gets the existing momentum + rubber-band bounce for
+    // free). DESKTOP keeps the list a fixed sidebar — there `scroll` drives the
+    // thread pane, not the list. The content height returned below lets the shell
+    // clamp the scroll; without it the list reported the viewport height and was
+    // effectively unscrollable.
+    var ly = body_y + (if (phone) scroll else 0);
     if (list.len == 0) {
         // A DEVICE THAT HAS JUST BEEN LET IN starts empty — that is the honest
         // default, and it is what we told the person would happen. But the past is
@@ -11109,6 +11118,7 @@ pub fn layoutChat(
         try emitRegion(gpa, regions, x0, ly, list_w, @intCast(row_h - 6), @intCast(i), .chat_conv);
         ly += row_h;
     }
+    list_content_h = ly - scroll; // natural bottom (ly carries the scroll offset)
     } // (phone_thread skips the whole list block)
 
     // ── Right: the open thread + the composer strip. The peer header sits at
@@ -11116,7 +11126,9 @@ pub fn layoutChat(
     // messages (the owner's reorg: this column is only the conversation). ──
     if (peer.len == 0) {
         if (!phone) _ = try str(gpa, dl, e, .regular, detail_x + 20, top + 26, faint, 15, "Select a conversation");
-        return height; // phone: the list IS the page
+        // Phone: the list IS the page — return its true content extent so the
+        // shell can clamp the scroll. Desktop: the list is a fixed sidebar.
+        return if (phone) @max(height, list_content_h) else height;
     }
     const thread_top = if (phone) insets.top + 64 else top + 52;
     // The composer GROWS DOWNWARD as the draft wraps (hard word-break
