@@ -1993,7 +1993,10 @@ pub fn drawBackHint(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine,
 /// few notches above the inset like the platform keyboard's (the owner's
 /// side-by-side, 2026-07-12: ours ran nearly flush to the screen bottom,
 /// which also parks the bottom row under the thumb's least accurate zone).
-pub const keyboard_h: i32 = 4 * (kbd_key_h + kbd_gap) + 8 + 24; // 4 rows now (the number row is gone; numbers live on the ?123 page)
+/// A slim ACCESS STRIP above the four key rows — it holds the emoji button (top,
+/// where the number row used to be), so the bottom row stays uncrowded next to ₿.
+const kbd_strip_h: i32 = 44;
+pub const keyboard_h: i32 = kbd_strip_h + 4 * (kbd_key_h + kbd_gap) + 24; // slim strip + 4 rows
 const kbd_key_h: i32 = 52;
 const kbd_gap: i32 = 7;
 
@@ -2309,6 +2312,31 @@ pub fn drawKeyboard(
     const row_w = width - 2 * m;
     const n_rows: usize = 4;
 
+    // THE EMOJI ACCESS STRIP — a slim bar at the very top (where the number row
+    // was) holding just the emoji button, so the bottom row keeps ₿ to itself. The
+    // key rows begin BELOW it (`content_top`). The button emits `.kbd_key` post 0,
+    // the same toggle the old number-row emoji key used.
+    const content_top = top + kbd_strip_h;
+    {
+        const eb_w: i32 = 60;
+        const eb_h: i32 = 32;
+        const eb_x = width - m - eb_w;
+        const eb_y = top + 6;
+        // Highlight the button while the picker is open, so the strip shows it is
+        // active; the picker keeps its own `abc` exit, so this stays a smiley (no
+        // duplicate "abc"). A drawn face — the embedded font carries no emoji.
+        const face_bg: u32 = if (emoji_open) (0x40 << 24) | (accent & 0x00FFFFFF) else 0x22FFFFFF;
+        try rect(gpa, dl, eb_x, eb_y, eb_w, eb_h, face_bg, 9);
+        const ecx = eb_x + @divTrunc(eb_w, 2);
+        const ecy = eb_y + @divTrunc(eb_h, 2);
+        try rect(gpa, dl, ecx - 11, ecy - 11, 22, 22, 0x30EDEAE0, 11);
+        try rect(gpa, dl, ecx - 9, ecy - 9, 18, 18, 0xE0212019, 9);
+        try rect(gpa, dl, ecx - 4, ecy - 4, 2, 4, ink, 1);
+        try rect(gpa, dl, ecx + 2, ecy - 4, 2, 4, ink, 1);
+        try rect(gpa, dl, ecx - 4, ecy + 4, 8, 2, ink, 1);
+        try emitRegion(gpa, regions, eb_x, eb_y, eb_w, @intCast(eb_h), 0, .kbd_key); // post 0 → toggle picker
+    }
+
     // THE CIRCUIT LATTICE (the owner's tron lines, done as a board, not as
     // dashes on keys — the pass-1 miss): the accent runs through the GUTTERS
     // between rows and keys, a soft wide trace with a bright 1px core, so the
@@ -2316,7 +2344,7 @@ pub fn drawKeyboard(
     // here; vertical traces per key boundary inside the loop below.
     var gr: usize = 1;
     while (gr < n_rows) : (gr += 1) {
-        const gy = top + 8 + @as(i32, @intCast(gr)) * (kbd_key_h + kbd_gap) - @divTrunc(kbd_gap + 1, 2);
+        const gy = content_top + @as(i32, @intCast(gr)) * (kbd_key_h + kbd_gap) - @divTrunc(kbd_gap + 1, 2);
         try rect(gpa, dl, m, gy, row_w, 1, (0x1E << 24) | (accent & 0x00FFFFFF), 0);
     }
 
@@ -2335,7 +2363,7 @@ pub fn drawKeyboard(
         const gy = if (p.row < 0)
             top + 1
         else
-            top + 8 + p.row * (kbd_key_h + kbd_gap) - @divTrunc(kbd_gap + 1, 2);
+            content_top + p.row * (kbd_key_h + kbd_gap) - @divTrunc(kbd_gap + 1, 2);
         const u = @mod(t * p.speed + p.phase, 1.0);
         const ux = if (p.dirn > 0) u else 1.0 - u;
         const hx: i32 = m + @as(i32, @intFromFloat(ux * rw_f));
@@ -2355,7 +2383,7 @@ pub fn drawKeyboard(
     if (emoji_open) {
         const grid_cols = emoji_grid_cols;
         const cw = @divTrunc(row_w - (grid_cols - 1) * kbd_gap, grid_cols);
-        const vt = top + 8; // viewport top
+        const vt = content_top; // viewport top (below the emoji strip)
         const vb = vt + emoji_view_h; // viewport bottom
         const rh = emoji_row_h;
         const sc = std.math.clamp(emoji_scroll, 0, emojiScrollMax());
@@ -2535,7 +2563,7 @@ pub fn drawKeyboard(
     var pop_w: i32 = 0;
     var pop_y: i32 = 0;
     var pop_cp: u16 = 0;
-    var y = top + 8;
+    var y = content_top;
     var row_i: usize = 0;
     while (row_i < n_rows) : (row_i += 1) {
         // Assemble the row. NO number row — numbers live on the ?123 page (the
@@ -2592,18 +2620,16 @@ pub fn drawKeyboard(
                 nk += 1;
             },
             else => {
-                // Bottom row: [layer][emoji][,][₿][space][.][enter] — the emoji
-                // key sits next to ?123 (its platform seat); comma and period
-                // flank the space bar. Space narrows to w6 to make room.
+                // Bottom row: [layer][,][₿][space][.][enter] — comma and period
+                // flank the space bar; ₿ has this row to itself (the emoji key
+                // lives in the top strip, so the bottom stays uncrowded).
                 keys_buf[nk] = .{ .lo = if (page == 0) 1 else 0, .ctrl = 3, .w = 3 }; // ?123 / abc
-                nk += 1;
-                keys_buf[nk] = .{ .lo = 0, .ctrl = 5, .w = 2 }; // emoji (toggles the picker)
                 nk += 1;
                 keys_buf[nk] = .{ .lo = ',', .hi = ',', .w = 2 };
                 nk += 1;
                 keys_buf[nk] = .{ .lo = 0x20BF, .hi = 0x20BF, .w = 2 }; // ₿
                 nk += 1;
-                keys_buf[nk] = .{ .lo = ' ', .hi = ' ', .w = 6 }; // space
+                keys_buf[nk] = .{ .lo = ' ', .hi = ' ', .w = 7 }; // space
                 nk += 1;
                 keys_buf[nk] = .{ .lo = '.', .hi = '.', .w = 2 };
                 nk += 1;
