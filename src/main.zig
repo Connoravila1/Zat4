@@ -1320,6 +1320,9 @@ test {
     _ = @import("core/call.zig"); // Zat Chat calling: state machine + signaling wire (Phase V0)
     _ = @import("core/media_keys.zig"); // Zat Chat calling: MLS-derived media keys
     _ = @import("core/call_decision.zig"); // Zat Chat calling: the adaptive brain (§4)
+    _ = @import("core/rtp.zig"); // Zat Chat calling: RTP packetization (RFC 3550)
+    _ = @import("core/srtp.zig"); // Zat Chat calling: SRTP AES-GCM (RFC 7714), MLS-keyed
+    _ = @import("core/jitter.zig"); // Zat Chat calling: jitter buffer + decode-skip
     _ = @import("core/x11.zig");
     _ = @import("core/win32.zig");
     _ = @import("core/textinput.zig");
