@@ -3371,9 +3371,17 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
         if (rs.pull_refresh_requested) {
             rs.pull_refresh_requested = false;
             if (rs.refresher) |w| {
-                rs.status = "refreshing...";
-                if (refresh_worker.submit(w, .pull, 30)) rs.refresh_inflight += 1;
-                if (rs.sfxp) |p| sfx_player.play(p, .refresh);
+                // Only start (and voice) a pull when none is already running —
+                // a vigorous scroll-up crosses the overscroll threshold many
+                // times, and without this each crossing stacked another fetch
+                // AND another refresh sound, which droned on after scrolling.
+                if (rs.refresh_inflight == 0) {
+                    rs.status = "refreshing...";
+                    if (refresh_worker.submit(w, .pull, 30)) {
+                        rs.refresh_inflight += 1;
+                        if (rs.sfxp) |p| sfx_player.play(p, .refresh);
+                    }
+                }
             } else rs.status = "refresh unavailable (r refreshes)";
         }
 

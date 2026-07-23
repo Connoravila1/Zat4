@@ -153,8 +153,17 @@ fn threadMain(p: *Player) void {
             continue;
         };
 
+        // Coalesce a flood: play each DISTINCT event at most once per drained
+        // batch. A spammed trigger (a vigorous pull-to-refresh, a stuck key)
+        // otherwise queues a backlog the single voice would grind through long
+        // after the input stopped — the "sound droning on" bug. Ordinary input
+        // puts at most one of each event in a frame, so nothing real is lost.
+        var seen = [_]bool{false} ** sfx.Event.count;
         for (batch.items) |event| {
             if (p.stop.load(.acquire)) break;
+            const idx = @intFromEnum(event);
+            if (seen[idx]) continue;
+            seen[idx] = true;
             if (allowed(p, event)) voice(p, &dev, &scratch, event);
         }
 
