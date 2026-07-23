@@ -1283,6 +1283,7 @@ test {
     _ = @import("core/zone_pins.zig");
     _ = @import("core/settings_view.zig");
     _ = @import("core/prefs.zig");
+    _ = @import("core/sfx.zig");
     _ = @import("core/lens_socket.zig");
     _ = @import("core/lens_catalog.zig");
     _ = @import("core/algo_library.zig");
@@ -1342,6 +1343,7 @@ test {
     _ = @import("shell/write.zig");
     _ = @import("shell/write_worker.zig");
     _ = @import("shell/refresh_worker.zig");
+    _ = @import("shell/sfx_player.zig");
     _ = @import("shell/view_worker.zig");
     _ = @import("shell/mobile_host.zig");
     _ = @import("core/pow.zig");

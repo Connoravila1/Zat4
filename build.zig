@@ -362,6 +362,21 @@ pub fn build(b: *std.Build) void {
     const gpu_step = b.step("gpu-smoke", "Bring up an EGL/GLES context on the window and clear it (GPU smoke test)");
     gpu_step.dependOn(&run_gpu.step);
 
+    // SFX audition (`zig build sfx-smoke`): play the whole curated sound set
+    // through the real player worker + ALSA. Needs an audio device; the
+    // build links only libc (ALSA is dlopen'd at runtime, like EGL/GLES).
+    const sfx_mod = b.createModule(.{
+        .root_source_file = b.path("src/sfx_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addFontEngine(b, sfx_mod); // brings libc + the sound byte-modules (addSounds)
+    const sfx_exe = b.addExecutable(.{ .name = "zat-sfx-smoke", .root_module = sfx_mod });
+    const run_sfx = b.addRunArtifact(sfx_exe);
+    if (b.args) |args| run_sfx.addArgs(args);
+    const sfx_step = b.step("sfx-smoke", "Play the curated UI sound set through the player + ALSA (audio smoke test)");
+    sfx_step.dependOn(&run_sfx.step);
+
     // ICE loopback smoke (calling): two UDP agents run a STUN Binding check on
     // 127.0.0.1 over shell/call_ice.zig — proves the datagram send/recv +
     // MESSAGE-INTEGRITY path the offline test can't. No display, no GPU; posix
@@ -581,6 +596,7 @@ fn addFontEngine(b: *std.Build, mod: *std.Build.Module) void {
     // split it into the comptime pool. PUBLIC by design (entropy is in the
     // pick, not the list — CREDENTIAL_GEN_DESIGN §0).
     mod.addImport("roots_4096_txt", b.createModule(.{ .root_source_file = b.path("assets/roots_4096.txt") }));
+    addSounds(b, mod);
     mod.addIncludePath(b.path("vendor"));
     mod.addCSourceFile(.{
         .file = b.path("vendor/stb_impl.c"),
@@ -589,4 +605,21 @@ fn addFontEngine(b: *std.Build, mod: *std.Build.Module) void {
         .flags = &.{"-fno-sanitize=undefined"},
     });
     mod.link_libc = true;
+}
+
+/// Wire the curated UI sound clips as byte modules so core/sfx.zig can
+/// @embedFile them — the same bundled-data pattern as the fonts (CC-BY 4.0,
+/// attribution in assets/sounds/LICENSE.md; not a dependency). Ride alongside
+/// addFontEngine so any module whose graph reaches sfx.zig has the bytes; an
+/// import a module never references costs nothing (@embedFile only pulls the
+/// clips actually named in source).
+fn addSounds(b: *std.Build, mod: *std.Build.Module) void {
+    const names = [_][]const u8{
+        "tap",     "key",         "hover",  "nav_forward", "nav_back",
+        "like",    "unlike",      "send",   "refresh",     "unavailable",
+        "success", "msg_receive", "notify", "error",       "ringtone",
+    };
+    inline for (names) |n| {
+        mod.addImport("sfx_" ++ n, b.createModule(.{ .root_source_file = b.path("assets/sounds/" ++ n ++ ".wav") }));
+    }
 }
