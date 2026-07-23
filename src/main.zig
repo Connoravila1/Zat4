@@ -1323,6 +1323,7 @@ test {
     _ = @import("core/rtp.zig"); // Zat Chat calling: RTP packetization (RFC 3550)
     _ = @import("core/srtp.zig"); // Zat Chat calling: SRTP AES-GCM (RFC 7714), MLS-keyed
     _ = @import("core/jitter.zig"); // Zat Chat calling: jitter buffer + decode-skip
+    _ = @import("core/congestion.zig"); // Zat Chat calling: bandwidth estimation (GCC-style)
     _ = @import("core/x11.zig");
     _ = @import("core/win32.zig");
     _ = @import("core/textinput.zig");
