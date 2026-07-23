@@ -421,6 +421,22 @@ pub fn build(b: *std.Build) void {
     const audio_step = b.step("audio-smoke", "Play a 1s 440Hz tone through the desktop speaker (ALSA)");
     audio_step.dependOn(&run_audio.step);
 
+    // Audible call harness: mic → full media stack → speaker. Two endpoints on a
+    // LAN (or loopback) carry live voice through ICE + SRTP + jitter.
+    //   b (receiver): zig build call-audio -- b 50002 127.0.0.1 50001
+    //   a (sender):   zig build call-audio -- a 50001 127.0.0.1 50002
+    const ca_mod = b.createModule(.{
+        .root_source_file = b.path("src/call_audio.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true, // ALSA is dlopen'd; dlopen/dlsym live in libc
+    });
+    const ca_exe = b.addExecutable(.{ .name = "zat-call-audio", .root_module = ca_mod });
+    const run_ca = b.addRunArtifact(ca_exe);
+    if (b.args) |args| run_ca.addArgs(args);
+    const ca_step = b.step("call-audio", "Audible call endpoint: mic↔speaker over the encrypted media stack (args: <a|b> <bind-port> <peer-ip> <peer-port>)");
+    ca_step.dependOn(&run_ca.step);
+
     // GPU preview (Phase 6.1): render the SAME draw list as `zig build
     // preview` — static ambient field + premium feed — through the GPU
     // renderer on the real window, to confirm parity with the software path.
