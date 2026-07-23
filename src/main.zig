@@ -1210,6 +1210,7 @@ test {
     _ = @import("ui/layout.zig");
     _ = @import("ui/input.zig");
     _ = @import("ui/typeset.zig");
+    _ = @import("ui/overlay.zig");
     _ = @import("ui/insets.zig");
     _ = @import("ui/ease.zig");
     _ = @import("ui/scroll.zig");
