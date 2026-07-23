@@ -69,6 +69,7 @@ const anchor = @import("../core/anchor.zig");
 const keydir = @import("../core/keydir.zig");
 const relay = @import("../core/relay.zig");
 const chat = @import("../core/chat.zig");
+const call = @import("../core/call.zig");
 const mobile_host = @import("mobile_host.zig");
 
 // ---------------------------------------------------------------------------
@@ -1550,6 +1551,23 @@ pub fn sendGameMove(
     return depositAll(gpa, io, environ, st, link, peer_did, &buf);
 }
 
+/// Send a pre-serialized call signaling frame to `peer_did` over the same E2EE
+/// channel as a text message. `frame` is already `[kind_call_*_wire][payload]`
+/// (produced by `core/call.zig`'s serialize* helpers): the call layer owns the
+/// contents and the wire vocabulary; this only transmits, exactly like a text
+/// message. Wire-only — never stored (the call kind bytes are not `parseKind`d).
+pub fn sendCallFrame(
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    st: *State,
+    link: *chat_relay.ChatRelay,
+    peer_did: []const u8,
+    frame: []const u8,
+) SendError!void {
+    return depositAll(gpa, io, environ, st, link, peer_did, frame);
+}
+
 /// Send a message that ANSWERS another one.
 pub fn sendReply(
     gpa: Allocator,
@@ -1791,6 +1809,11 @@ pub const Incoming = union(enum) {
         ref: [32]u8,
         status: chat.PayStatus,
     },
+    /// A CALL signaling frame (offer/answer/ice/hangup/busy/decline) arrived on
+    /// the E2EE channel. Kept opaque here — `bytes` is the full
+    /// `[kind_call_*_wire][payload]` frame; the call layer (`core/call.zig`)
+    /// parses it. Wire-only: never enters the message store.
+    call_signal: struct { peer_did: []u8, bytes: []u8 },
 };
 
 pub fn freeIncoming(gpa: Allocator, inc: Incoming) void {
@@ -1833,6 +1856,10 @@ pub fn freeIncoming(gpa: Allocator, inc: Incoming) void {
             gpa.free(p.note);
         },
         .payment_update => |u| gpa.free(u.peer_did),
+        .call_signal => |c| {
+            gpa.free(c.peer_did);
+            gpa.free(c.bytes);
+        },
     }
 }
 
@@ -2245,6 +2272,14 @@ pub fn onBucket(
                             .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]),
                             .encoded = data[1],
                         } };
+                    }
+                    // A CALL signaling frame (reserved wire bytes 24..29). Surfaced
+                    // opaque for the call layer to parse; never stored.
+                    if (data[0] >= call.kind_call_offer_wire and data[0] <= call.kind_call_decline_wire) {
+                        const cpd = try gpa.dupe(u8, st.peer_dids.items[idx]);
+                        errdefer gpa.free(cpd);
+                        const cbytes = try gpa.dupe(u8, data);
+                        return .{ .call_signal = .{ .peer_did = cpd, .bytes = cbytes } };
                     }
                     const kind = chat.parseKind(data[0]) catch return null; // reserved kinds refused until their milestone
                     if (chat.isPaymentKind(kind)) {

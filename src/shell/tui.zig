@@ -44,6 +44,7 @@ const tui = @import("../core/tui.zig");
 const timeline_ui = @import("../core/timeline_ui.zig");
 const feed_core = @import("../core/feed.zig");
 const chat_core = @import("../core/chat.zig");
+const call = @import("../core/call.zig");
 const chat_view_core = @import("../core/chat_view.zig");
 const chat_games = @import("../core/chat_games.zig");
 const spring = @import("../core/spring.zig");
@@ -2329,6 +2330,14 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                     // The message supersedes its typing bubble.
                                     if (std.mem.eql(u8, msg.peer_did, rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]))
                                         rs.gchat_typing_deadline = 0;
+                                },
+                                // A CALL signaling frame (offer/answer/ice/hangup) —
+                                // for now, logged; the call session coordinator that
+                                // acts on it is the next slice.
+                                .call_signal => |c| {
+                                    const kb = if (c.bytes.len > 0) c.bytes[0] else 0;
+                                    const evt = call.eventForKind(kb);
+                                    chatLog("[call] signal from {s}: byte={d} ({s}), {d} bytes", .{ c.peer_did, kb, if (evt) |e| @tagName(e) else "unknown", c.bytes.len });
                                 },
                                 // A GAME MOVE. Stored as an ordinary message of
                                 // kind `.game_move` carrying the encoded byte —
