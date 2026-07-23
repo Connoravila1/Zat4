@@ -24,7 +24,7 @@ surfaced in-app under Settings → About / Licenses.
 | `hover.wav`       | `navigation_hover-tap` |
 | `nav_forward.wav` | `navigation_forward-selection-minimal` |
 | `nav_back.wav`    | `navigation_backward-selection-minimal` |
-| `like.wav`        | `state-change_confirm-up` |
+| `like.wav`        | `ui_tap-variant-03` |
 | `unlike.wav`      | `state-change_confirm-down` |
 | `send.wav`        | `navigation_selection-complete-celebration` |
 | `msg_receive.wav` | `notification_simple-01` |
