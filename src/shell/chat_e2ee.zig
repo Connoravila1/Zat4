@@ -462,6 +462,16 @@ fn conversationIndex(st: *const State, peer_did: []const u8) ?usize {
     return null;
 }
 
+/// The MLS epoch exporter secret for the conversation with `peer_did` — the
+/// shared secret from which a call derives its media + ICE keys (both ends of
+/// the same group compute the identical value; the calling layer never touches
+/// MLS internals beyond this one plain value). Null when there is no
+/// conversation with that peer. Mirrors how `mailboxId` reads the exporter.
+pub fn exporterFor(st: *const State, peer_did: []const u8) ?[32]u8 {
+    const idx = conversationIndex(st, peer_did) orelse return null;
+    return st.groups.items[idx].secrets.exporter;
+}
+
 /// EVERY session with this peer — one per device of theirs. The buffer is the
 /// device cap (`keydir.max_devices`) with headroom, so this never allocates on a
 /// send path.

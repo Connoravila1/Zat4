@@ -45,6 +45,17 @@ const timeline_ui = @import("../core/timeline_ui.zig");
 const feed_core = @import("../core/feed.zig");
 const chat_core = @import("../core/chat.zig");
 const call = @import("../core/call.zig");
+// The call stack (call_ctl → call_session → call_ice) speaks raw Linux socket
+// syscalls, so it is gated to Linux/Android (its target set). Off Linux the
+// client uses an inert stub, so the Windows/macOS cross-compile guard (CLAUDE.md
+// §3) stays clean — the same posture as the audio shims. `builtin.os.tag ==
+// .linux` is true for Android too, so the phone build gets the real thing.
+const call_ctl = if (builtin.os.tag == .linux) @import("call_ctl.zig") else struct {
+    pub const CallCtl = struct {};
+    pub fn startOutgoing(_: *CallCtl, _: Allocator, _: std.Io, _: ?*const std.process.Environ.Map, _: anytype, _: anytype, _: []const u8) void {}
+    pub fn onSignal(_: *CallCtl, _: Allocator, _: std.Io, _: ?*const std.process.Environ.Map, _: anytype, _: anytype, _: []const u8, _: []const u8) void {}
+    pub fn shutdown(_: *CallCtl) void {}
+};
 const chat_view_core = @import("../core/chat_view.zig");
 const chat_games = @import("../core/chat_games.zig");
 const spring = @import("../core/spring.zig");
@@ -764,6 +775,10 @@ const RunState = struct {
     gchat_link: ?*chat_relay.ChatRelay,
     gchat_e2ee: ?chat_e2ee.State,
     gchat_mail: std.ArrayList(chat_relay.Mail),
+    /// Voice/video call control for the open conversation (offer/answer over the
+    /// chat channel → an ICE+media session worker). Idle until a call is placed
+    /// or received. Torn down in `deinitRunState`.
+    gcall: call_ctl.CallCtl = .{},
     /// Next second at which the unacknowledged-Welcome pump runs (A1). The
     /// pump itself is a walk of a handful of rows against a pure backoff, but
     /// there is no reason to do it 60 times a second.
@@ -1935,6 +1950,9 @@ fn initRunState(
 /// frame body mutates — live_stream, gpu_state, socket_cards … — read
 /// their exit-time values).
 fn deinitRunState(rs: *RunState) void {
+    // A live/pending call owns a worker thread + socket — stop it before the
+    // state it points at dies (same rule as the other workers below).
+    call_ctl.shutdown(&rs.gcall);
     // The front door's hit list is gpa-owned (enroll_view.pushHit appends into
     // it every layout). The leak checker caught it on the very first run-through,
     // which is exactly what it is for.
@@ -2352,13 +2370,14 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                     if (std.mem.eql(u8, msg.peer_did, rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]))
                                         rs.gchat_typing_deadline = 0;
                                 },
-                                // A CALL signaling frame (offer/answer/ice/hangup) —
-                                // for now, logged; the call session coordinator that
-                                // acts on it is the next slice.
+                                // A CALL signaling frame (offer/answer/ice/hangup):
+                                // the controller auto-answers an offer / starts the
+                                // session on an answer / tears down on a hangup.
                                 .call_signal => |c| {
                                     const kb = if (c.bytes.len > 0) c.bytes[0] else 0;
                                     const evt = call.eventForKind(kb);
                                     chatLog("[call] signal from {s}: byte={d} ({s}), {d} bytes", .{ c.peer_did, kb, if (evt) |e| @tagName(e) else "unknown", c.bytes.len });
+                                    call_ctl.onSignal(&rs.gcall, gpa, io, environ, st, rs.gchat_link.?, c.peer_did, c.bytes);
                                 },
                                 // A GAME MOVE. Stored as an ordinary message of
                                 // kind `.game_move` carrying the encoded byte —
@@ -6754,7 +6773,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                                 // sender's history says what it was sent
                                                 // with — not just the recipient's.
                                                 chat_core.setEffect(&rs.gchat_store, @intFromEnum(mi), @intFromEnum(fx));
-                                                chatSend(gpa, io, environ, if (rs.gchat_e2ee) |*st| st else null, rs.gchat_link, &rs.gchat_store, sc, body, @intFromEnum(fx), 0);
+                                                chatSend(gpa, io, environ, if (rs.gchat_e2ee) |*st| st else null, rs.gchat_link, &rs.gchat_store, sc, body, @intFromEnum(fx), 0, &rs.gcall);
                                                 chatPersistHistory(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
                                                 rs.gchat_draft_len = 0;
                                                 rs.gchat_caret = 0;
@@ -6835,7 +6854,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                             if (body.len > 0) if (rs.gchat_sel) |sc| {
                                                 const mi = chat_core.appendMessage(gpa, &rs.gchat_store, sc, .text, body, now, true) catch continue;
                                                 chat_core.setBubbleFx(&rs.gchat_store, @intFromEnum(mi), @intFromEnum(be));
-                                                chatSend(gpa, io, environ, if (rs.gchat_e2ee) |*st| st else null, rs.gchat_link, &rs.gchat_store, sc, body, 0, @intFromEnum(be));
+                                                chatSend(gpa, io, environ, if (rs.gchat_e2ee) |*st| st else null, rs.gchat_link, &rs.gchat_store, sc, body, 0, @intFromEnum(be), &rs.gcall);
                                                 chatPersistHistory(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
                                                 rs.gchat_draft_len = 0;
                                                 rs.gchat_caret = 0;
@@ -7007,7 +7026,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                                     chat_core.setReplyTo(&rs.gchat_store, @intFromEnum(mi), rs.gchat_reply_to);
                                                     chatSendReply(rs, gpa, io, environ, sc, rs.gchat_reply_to, body);
                                                     rs.gchat_reply_to = no_reply;
-                                                } else chatSend(gpa, io, environ, if (rs.gchat_e2ee) |*st| st else null, rs.gchat_link, &rs.gchat_store, sc, body, 0, 0);
+                                                } else chatSend(gpa, io, environ, if (rs.gchat_e2ee) |*st| st else null, rs.gchat_link, &rs.gchat_store, sc, body, 0, 0, &rs.gcall);
                                                 // THE PIGGYBACK: a reply already tells
                                                 // them we read it. Drop the pending
                                                 // receipt rather than spend a second
@@ -8146,7 +8165,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         const body = std.mem.trimEnd(u8, rs.gchat_draft_buf[0..rs.gchat_draft_len], " \n");
                         if (body.len > 0) if (rs.gchat_sel) |sc| {
                             _ = chat_core.appendMessage(gpa, &rs.gchat_store, sc, .text, body, now, true) catch {};
-                            chatSend(gpa, io, environ, if (rs.gchat_e2ee) |*st| st else null, rs.gchat_link, &rs.gchat_store, sc, body, 0, 0);
+                            chatSend(gpa, io, environ, if (rs.gchat_e2ee) |*st| st else null, rs.gchat_link, &rs.gchat_store, sc, body, 0, 0, &rs.gcall);
                             chatPersistHistory(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
                             rs.gchat_draft_len = 0;
                             rs.gscroll_px = 0; // re-anchor to the newest message
@@ -10161,11 +10180,20 @@ const ChatFrame = struct {
 /// session/link (no ZAT4_RELAY) keeps the send local-only — the bubble still
 /// shows, it just doesn't transmit. A crypto/relay error is a status line,
 /// never a crash (E2). `env` feeds the persist-after-send.
-fn chatSend(gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, st: ?*chat_e2ee.State, link: ?*chat_relay.ChatRelay, cs: *const chat_core.Store, conv: chat_core.ConvIndex, text: []const u8, effect: u8, bubble: u8) void {
+fn chatSend(gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, st: ?*chat_e2ee.State, link: ?*chat_relay.ChatRelay, cs: *const chat_core.Store, conv: chat_core.ConvIndex, text: []const u8, effect: u8, bubble: u8, gcall: *call_ctl.CallCtl) void {
     const state = st orelse return;
     const l = link orelse return;
-    chatLog("[chat] send -> {s} ({d} bytes)", .{ chat_core.conversationDid(cs, conv), text.len });
     const peer_did = chat_core.conversationDid(cs, conv);
+    // Dev call trigger: typing "/call" in the open conversation places a voice
+    // call over this same E2EE channel instead of sending it as a message. A
+    // real call button replaces this later; for on-device bring-up a typed
+    // command needs no UI surgery.
+    if (std.mem.eql(u8, text, "/call")) {
+        chatLog("[call] /call typed → placing a call to {s}", .{peer_did});
+        call_ctl.startOutgoing(gcall, gpa, io, env, state, l, peer_did);
+        return;
+    }
+    chatLog("[chat] send -> {s} ({d} bytes)", .{ peer_did, text.len });
     // A swallowed send error is how a message "disappears": the bubble appears,
     // nothing leaves, and nobody is told. Say it.
     chat_e2ee.send(gpa, io, env, state, l, peer_did, .text, text, effect, bubble) catch |err|
