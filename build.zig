@@ -407,6 +407,20 @@ pub fn build(b: *std.Build) void {
     const peer_step = b.step("call-peer", "One endpoint of a direct-LAN call (dev harness; args: <a|b> <bind-port> <peer-ip> <peer-port>)");
     peer_step.dependOn(&run_peer.step);
 
+    // ALSA playback smoke (calling audio): play a 1s tone through the desktop
+    // speaker via the runtime-dlopen'd libasound shim. Audible check that the
+    // desktop audio half works before it joins the media pipeline.
+    const audio_mod = b.createModule(.{
+        .root_source_file = b.path("src/audio_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true, // dlopen/dlsym live in libc
+    });
+    const audio_exe = b.addExecutable(.{ .name = "zat-audio-smoke", .root_module = audio_mod });
+    const run_audio = b.addRunArtifact(audio_exe);
+    const audio_step = b.step("audio-smoke", "Play a 1s 440Hz tone through the desktop speaker (ALSA)");
+    audio_step.dependOn(&run_audio.step);
+
     // GPU preview (Phase 6.1): render the SAME draw list as `zig build
     // preview` — static ambient field + premium feed — through the GPU
     // renderer on the real window, to confirm parity with the software path.
