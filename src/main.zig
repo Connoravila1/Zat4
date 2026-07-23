@@ -1207,6 +1207,7 @@ pub fn main(init: std.process.Init) !void {
 test {
     _ = @import("ui/reveal.zig"); // Rover: portable UI primitives (src/ui/README.md)
     _ = @import("ui/tokens.zig");
+    _ = @import("ui/layout.zig");
     _ = @import("ui/insets.zig");
     _ = @import("ui/ease.zig");
     _ = @import("ui/scroll.zig");
