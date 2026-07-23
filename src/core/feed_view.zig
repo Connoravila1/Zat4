@@ -1993,7 +1993,7 @@ pub fn drawBackHint(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine,
 /// few notches above the inset like the platform keyboard's (the owner's
 /// side-by-side, 2026-07-12: ours ran nearly flush to the screen bottom,
 /// which also parks the bottom row under the thumb's least accurate zone).
-pub const keyboard_h: i32 = 5 * (kbd_key_h + kbd_gap) + 8 + 24;
+pub const keyboard_h: i32 = 4 * (kbd_key_h + kbd_gap) + 8 + 24; // 4 rows now (the number row is gone; numbers live on the ?123 page)
 const kbd_key_h: i32 = 52;
 const kbd_gap: i32 = 7;
 
@@ -2004,10 +2004,10 @@ const kbd_gap: i32 = 7;
 /// scrolled vertically over a 4-row viewport above the space/backspace
 /// row.
 const emoji_grid_cols: i32 = 8;
-const emoji_row_h: i32 = @divTrunc(4 * (kbd_key_h + kbd_gap) - 4, 4);
+const emoji_row_h: i32 = @divTrunc(3 * (kbd_key_h + kbd_gap) - 4, 3);
 /// Public: the picker viewport height doubles as the nav column's full
-/// reveal — the shell's rubber-band dimension.
-pub const emoji_view_h: i32 = 4 * emoji_row_h;
+/// reveal — the shell's rubber-band dimension. 3 rows now (one fewer key row).
+pub const emoji_view_h: i32 = 3 * emoji_row_h;
 pub fn emojiScrollMax() i32 {
     const slots: i32 = @intCast(emoji_atlas.count + 1);
     const rows: i32 = @divTrunc(slots + emoji_grid_cols - 1, emoji_grid_cols);
@@ -2307,7 +2307,7 @@ pub fn drawKeyboard(
 
     const m: i32 = 6; // outer margin
     const row_w = width - 2 * m;
-    const n_rows: usize = 5;
+    const n_rows: usize = 4;
 
     // THE CIRCUIT LATTICE (the owner's tron lines, done as a board, not as
     // dashes on keys — the pass-1 miss): the accent runs through the GUTTERS
@@ -2421,7 +2421,7 @@ pub fn drawKeyboard(
         // so the band these sit on is clean panel — the old picker drew
         // its 5th sprite row UNDER the translucent faces (the owner's
         // "weird half transparent thing", 2026-07-12).
-        const bot_y = vt + 4 * (kbd_key_h + kbd_gap);
+        const bot_y = vt + 3 * (kbd_key_h + kbd_gap);
         const nav_w: i32 = kbd_key_h; // one square, bottom-left
         // The nav square: key face + a 2x2 grid glyph; the face brightens
         // while the rollout is out.
@@ -2538,21 +2538,15 @@ pub fn drawKeyboard(
     var y = top + 8;
     var row_i: usize = 0;
     while (row_i < n_rows) : (row_i += 1) {
-        // Assemble the row: the number row (1–9 + emoji) rides both pages;
-        // pages 0/1 share the frame below it — mids swap, the bottom row is
-        // common ([?123/abc][bitcoin][space][enter]).
+        // Assemble the row. NO number row — numbers live on the ?123 page (the
+        // platform grammar); the four rows are qwerty, asdf, [shift · zxcv ·
+        // backspace], and the common bottom row [?123/abc · 🙂 · , · ₿ · space ·
+        // . · enter]. The emoji key moved from the old number row into that
+        // bottom row so it stays one tap away.
         var keys_buf: [12]KbdKey = undefined;
         var nk: usize = 0;
         switch (row_i) {
             0 => {
-                for (kbd_num) |k| {
-                    keys_buf[nk] = k;
-                    nk += 1;
-                }
-                keys_buf[nk] = .{ .lo = 0, .ctrl = 5, .w = 2 }; // emoji (dead for now)
-                nk += 1;
-            },
-            1 => {
                 const src = switch (page) {
                     0 => kbd_r0[0..],
                     1 => kbd_s0[0..],
@@ -2563,7 +2557,7 @@ pub fn drawKeyboard(
                     nk += 1;
                 }
             },
-            2 => {
+            1 => {
                 const src = switch (page) {
                     0 => kbd_r1[0..],
                     1 => kbd_s1[0..],
@@ -2574,7 +2568,7 @@ pub fn drawKeyboard(
                     nk += 1;
                 }
             },
-            3 => {
+            2 => {
                 // Page 0 keeps shift here; the symbols pages use the slot the
                 // standard way — a layer hop ("=\\<" deeper, "?123" back).
                 // A ctrl-3 key carries its TARGET page in `lo`.
@@ -2598,16 +2592,18 @@ pub fn drawKeyboard(
                 nk += 1;
             },
             else => {
-                // Every page: [layer][₿][,][space][.][enter] — comma and
-                // period flank the space bar, the standard seats (they were
-                // simply MISSING in v1; owner, 2026-07-11).
+                // Bottom row: [layer][emoji][,][₿][space][.][enter] — the emoji
+                // key sits next to ?123 (its platform seat); comma and period
+                // flank the space bar. Space narrows to w6 to make room.
                 keys_buf[nk] = .{ .lo = if (page == 0) 1 else 0, .ctrl = 3, .w = 3 }; // ?123 / abc
+                nk += 1;
+                keys_buf[nk] = .{ .lo = 0, .ctrl = 5, .w = 2 }; // emoji (toggles the picker)
                 nk += 1;
                 keys_buf[nk] = .{ .lo = ',', .hi = ',', .w = 2 };
                 nk += 1;
-                keys_buf[nk] = .{ .lo = 0x20BF, .hi = 0x20BF, .w = 2 }; // ₿ — the emoji's Gboard seat, ours
+                keys_buf[nk] = .{ .lo = 0x20BF, .hi = 0x20BF, .w = 2 }; // ₿
                 nk += 1;
-                keys_buf[nk] = .{ .lo = ' ', .hi = ' ', .w = 7 }; // space
+                keys_buf[nk] = .{ .lo = ' ', .hi = ' ', .w = 6 }; // space
                 nk += 1;
                 keys_buf[nk] = .{ .lo = '.', .hi = '.', .w = 2 };
                 nk += 1;
@@ -2625,7 +2621,8 @@ pub fn drawKeyboard(
         const unit_kw = @divTrunc(row_w - 9 * kbd_gap, 10);
         var kx_buf: [12]i32 = undefined;
         var kww_buf: [12]i32 = undefined;
-        if (row_i == 4) {
+        if (row_i == 3) {
+            // Bottom row: flex layout by key weight.
             var units: i32 = 0;
             for (keys) |k| units += k.w;
             const kw_num = row_w - @as(i32, @intCast(nk - 1)) * kbd_gap;
@@ -2635,7 +2632,8 @@ pub fn drawKeyboard(
                 kww_buf[kidx] = @divTrunc(kw_num * k.w, units);
                 xx += kww_buf[kidx] + kbd_gap;
             }
-        } else if (row_i == 3) {
+        } else if (row_i == 2) {
+            // Shift row: [shift] + centred mids + [backspace] absorbing the margins.
             const n_mid: i32 = @intCast(nk - 2);
             const mid_total = n_mid * unit_kw + (n_mid - 1) * kbd_gap;
             const mid_x0 = m + @divTrunc(row_w - mid_total, 2);
@@ -2650,19 +2648,6 @@ pub fn drawKeyboard(
             }
             kx_buf[nk - 1] = xx;
             kww_buf[nk - 1] = m + row_w - xx;
-        } else if (row_i == 0) {
-            // The number row seats ELEVEN keys (1–9, 0, emoji): each is a
-            // fraction narrower than the letter unit so the zero fits —
-            // the uniform-width rule stays a letters-rows property.
-            const nk_i: i32 = @intCast(nk);
-            const kw0 = @divTrunc(row_w - (nk_i - 1) * kbd_gap, nk_i);
-            const total = nk_i * kw0 + (nk_i - 1) * kbd_gap;
-            var xx = m + @divTrunc(row_w - total, 2);
-            for (0..nk) |kidx| {
-                kx_buf[kidx] = xx;
-                kww_buf[kidx] = kw0;
-                xx += kw0 + kbd_gap;
-            }
         } else {
             const nk_i: i32 = @intCast(nk);
             const total = nk_i * unit_kw + (nk_i - 1) * kbd_gap;
