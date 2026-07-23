@@ -64,15 +64,19 @@ pub const Event = enum(u8) {
     pub const count = @typeInfo(Event).@"enum".fields.len;
 };
 
-/// How an event is gated. UI feedback is silenced wholesale by the "Sound
-/// effects" toggle; alerts follow notification/ringer policy instead (and on
-/// phone, later, the system silent switch). Kept as plain data so the shell's
-/// gating is a lookup, not a scattered set of special cases.
+/// How an event is gated. FEEDBACK is silenced wholesale by the "Sound effects"
+/// toggle; an ALERT ignores it and follows notification/ringer policy instead.
+/// Kept as plain data so the shell's gating is a lookup, not scattered cases.
+///
+/// v1 posture: only the incoming-CALL ringtone is an alert — a call must be
+/// able to ring even with UI sound off. Chat receive / social notifications are
+/// FEEDBACK for now (the "Sound effects" toggle mutes them too), until a
+/// dedicated Notifications control exists to own them separately.
 pub const Class = enum(u8) { feedback, alert };
 
 pub fn class(e: Event) Class {
     return switch (e) {
-        .msg_receive, .notify, .ringtone => .alert,
+        .ringtone => .alert,
         else => .feedback,
     };
 }
@@ -229,8 +233,10 @@ test "sfx: every event has non-empty bytes and decodes to our house format" {
 test "sfx: classes and looping are assigned as designed" {
     try testing.expectEqual(Class.feedback, class(.key));
     try testing.expectEqual(Class.feedback, class(.like));
+    // v1: chat/social sounds are feedback (muted by the toggle); only a call rings through.
+    try testing.expectEqual(Class.feedback, class(.msg_receive));
+    try testing.expectEqual(Class.feedback, class(.notify));
     try testing.expectEqual(Class.alert, class(.ringtone));
-    try testing.expectEqual(Class.alert, class(.msg_receive));
     try testing.expect(loops(.ringtone));
     try testing.expect(!loops(.tap));
 }

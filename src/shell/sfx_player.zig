@@ -242,10 +242,9 @@ test "sfx_player: gating — fx toggle silences feedback but never alerts" {
 
     try testing.expect(!allowed(&p, .key)); // feedback: silenced
     try testing.expect(!allowed(&p, .like));
-    try testing.expect(allowed(&p, .notify)); // alert: still plays
-    try testing.expect(allowed(&p, .ringtone));
+    try testing.expect(!allowed(&p, .msg_receive)); // feedback now: silenced too
+    try testing.expect(allowed(&p, .ringtone)); // alert: a call still rings through
 
     setAllOn(&p, false); // master kill
-    try testing.expect(!allowed(&p, .notify));
     try testing.expect(!allowed(&p, .ringtone));
 }

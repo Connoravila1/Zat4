@@ -2332,6 +2332,9 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                 .message => |msg| {
                                     if (chat_core.openConversation(gpa, &rs.gchat_store, msg.peer_did, "") catch null) |c| {
                                         if (chat_core.appendMessage(gpa, &rs.gchat_store, c, msg.kind, msg.text, now, false) catch null) |mi| {
+                                            // A genuinely new inbound message just landed
+                                            // (this is the relay drain, not history) — ding.
+                                            if (rs.sfxp) |p| sfx_player.play(p, .msg_receive);
                                             // What they SENT it with. Only a manual
                                             // pick rides the wire; the phrase effects
                                             // are re-derived from the text locally, so
@@ -3934,6 +3937,16 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
             rs.loadout_dirty = false;
         }
         rs.socket_was_open = rs.gsocket_ui.open;
+        // Navigation sound: any settled screen change this frame is voiced from
+        // this one point (every push/pop/tab path funnels through gscreen).
+        // Going DEEPER — into a thread/profile/detail — rises; coming back out
+        // falls. Gated by "Sound effects" in the player.
+        if (rs.gscreen != rs.prev_screen) {
+            if (rs.sfxp) |p| {
+                const fwd = screenDepth(rs.gscreen) >= screenDepth(rs.prev_screen);
+                sfx_player.play(p, if (fwd) .nav_forward else .nav_back);
+            }
+        }
         rs.prev_screen = rs.gscreen;
         // The feed-socket hit list is rebuilt every frame by layout()/
         // layoutLoadout() (both clear it at entry). Zat Chat and the transparency
@@ -9832,6 +9845,23 @@ fn freeChain(gpa: Allocator, cs: ChainSend) void {
 // Input handling only mutates draft/compose state and QUEUES network writes
 // (pending_send / pending_profile_save) for the loop to run after the
 // optimistic UI is on screen — so it takes no I/O args of its own.
+/// Navigation depth of a screen — 0 for a top-level destination (Home, Messages,
+/// Zones, the loadout/marketplace, Settings), 1 for a screen you drill INTO from
+/// one (a thread, a profile, an algorithm detail/docs, transparency, zone browse).
+/// The nav-sound direction is decided by comparing two of these across a frame.
+fn screenDepth(s: u8) u8 {
+    return switch (s) {
+        feed_view.screen_thread,
+        feed_view.screen_profile,
+        feed_view.screen_transparency,
+        feed_view.screen_algo_detail,
+        feed_view.screen_algo_docs,
+        feed_view.screen_zones_browse,
+        => 1,
+        else => 0,
+    };
+}
+
 fn handleComposeInput(
     gpa: Allocator,
     session: *auth.Session,
@@ -13221,7 +13251,12 @@ fn kbdAction(rs: *RunState, gpa: Allocator, kind: feed_view.Action, post: u16) v
             }
             var kb: [4]u8 = undefined;
             const kn = std.unicode.utf8Encode(@intCast(post), &kb) catch 0;
-            if (kn > 0) rs.kbd_bytes.appendSlice(gpa, kb[0..kn]) catch {};
+            if (kn > 0) {
+                rs.kbd_bytes.appendSlice(gpa, kb[0..kn]) catch {};
+                // The on-screen keyboard's keystroke tick (the same clip the
+                // physical composer uses; gated by "Sound effects").
+                if (rs.sfxp) |p| sfx_player.play(p, .key);
+            }
             // The decoder context: letters push their class; boundaries
             // collapse. (kbd_lm.classOf maps anything non-letter to 26.)
             if (post < 256) {
