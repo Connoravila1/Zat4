@@ -8864,6 +8864,13 @@ pub fn mobileSetImeInset(mr: *MobileRun, bottom_px: i32) void {
     }
 }
 
+/// The phone silent-switch → the SFX player's master gate. On silent, no app
+/// sound plays (feedback or alert); the "Sound effects" toggle still governs
+/// feedback independently when the phone is not silenced.
+pub fn mobileSetSilenced(mr: *MobileRun, silenced: bool) void {
+    if (mr.rs.sfxp) |p| sfx_player.setAllOn(p, !silenced);
+}
+
 pub fn mobileSetInsets(mr: *MobileRun, top: i32, bottom: i32, left: i32, right: i32) void {
     if (mr.rs.gpu_state) |*gs| {
         const s: f32 = if (gs.scale > 0) gs.scale else 1.0;

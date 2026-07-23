@@ -538,6 +538,27 @@ fn imeInsetPx(activity: *Activity) i32 {
     return v;
 }
 
+/// The system ringer mode, for the SFX silent-switch:
+/// `(AudioManager) getSystemService("audio")).getRingerMode()`.
+/// Returns 0 SILENT, 1 VIBRATE, 2 NORMAL. FAIL-SAFE: any JNI failure returns
+/// NORMAL (2), so a wrong lookup leaves UI sound ON rather than wedging it off.
+fn ringerMode(activity: *Activity) i32 {
+    const normal: i32 = 2;
+    const vm: JavaVm = @ptrCast(@alignCast(activity.vm));
+    var env: JniEnv = undefined;
+    const attach: AttachFn = @ptrCast(@alignCast(vm.*.slots[vm_attach_current_thread].?));
+    if (attach(vm, &env, null) != 0) return normal;
+    defer _ = @as(DetachFn, @ptrCast(@alignCast(vm.*.slots[vm_detach_current_thread].?)))(vm);
+    const svc = jniFn(env, jni_new_string_utf, NewStringUtfFn)(env, "audio");
+    if (jniFailed(env) or svc == null) return normal;
+    const get_svc = jniMethod(env, activity.clazz, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;") orelse return normal;
+    const am = jniCallObj(env, activity.clazz, get_svc, &[_]jvalue{.{ .l = svc }}) orelse return normal;
+    const grm = jniMethod(env, am, "getRingerMode", "()I") orelse return normal;
+    const mode = jniFn(env, jni_call_int_method_a, CallIntMethodAFn)(env, am, grm, &no_args);
+    if (jniFailed(env)) return normal;
+    return mode;
+}
+
 /// The activity's half of the clipboard seam: resolve the OS
 /// ClipboardManager once per call (render-lap rate is copy/paste taps —
 /// human-rare). `text` -> setPrimaryClip; read -> the primary clip's first
@@ -822,6 +843,7 @@ fn renderThread() void {
     };
 
     var attached_gen: u32 = 0;
+    var last_ringer_ns: u64 = 0; // throttle for the silent-switch JNI poll
     // The FEED leg (MC.4d): attempted once per surface attach — a false
     // (no cached session / bring-up failure) leaves the field-only render
     // for that surface, never a dead screen (E2). While live, the loop is
@@ -1098,6 +1120,16 @@ fn renderThread() void {
         const now_ns = clock.monotonicNanos();
         seam.zat_step(ctx, now_ns -| last_ns);
         last_ns = now_ns;
+        // Silent-switch: mirror the ringer mode onto the SFX master gate. A JNI
+        // hop, so ~once a second (not per frame) — the switch changes rarely and
+        // this also catches a flip made while backgrounded on the next resume.
+        // SILENT/VIBRATE (mode != NORMAL) mutes UI sound.
+        if (app.activity) |act| {
+            if (now_ns -| last_ringer_ns > 1_000_000_000) {
+                last_ringer_ns = now_ns;
+                seam.zat_set_silenced(ctx, if (ringerMode(act) != 2) 1 else 0);
+            }
+        }
         if (attached_gen != 0) {
             seam.zat_render(ctx); // eglSwapBuffers vsync-paces the loop
         } else {

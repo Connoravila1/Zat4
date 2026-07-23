@@ -962,6 +962,15 @@ pub export fn zat_set_ime_inset(ctx_ptr: ?*anyopaque, bottom_px: i32) void {
     if (ctx.feed) |*f| tui.mobileSetImeInset(f.run, bottom_px);
 }
 
+/// The activity's silent-switch state (from the ringer mode) → the SFX master
+/// gate. Non-zero silences all app sound; the ringtone alert obeys it too, so a
+/// phone on silent stays silent.
+pub export fn zat_set_silenced(ctx_ptr: ?*anyopaque, silenced: u32) void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return));
+    if (comptime !mobile_config.have_gpu) return;
+    if (ctx.feed) |*f| tui.mobileSetSilenced(f.run, silenced != 0);
+}
+
 /// A URL the APP wants opened in the OS (a wallet's site, a Lightning
 /// hand-off). Non-null exactly ONCE per request — the activity fires an
 /// ACTION_VIEW intent for it. Distinct from `zat_login_url`, which is the
