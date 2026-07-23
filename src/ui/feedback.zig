@@ -16,6 +16,18 @@
 //! of `dt` and N steps summing to `dt` reach the same value (up to float slack),
 //! so the same wall-clock produces the same fade at 60 Hz, 144 Hz, or across a
 //! dropped frame.
+//!
+//! COMPOSITION (kept as documentation, not imports — both stay single-file liftable):
+//!   · with `input`: for a control id, fill `Interaction` from an `input.Event`/State
+//!     as `.{ .hovered = e.hover == id, .pressed = e.active == id, .focused =
+//!     e.focus == id and st.focus_visible, .disabled = <host> }`. Note `pressed`
+//!     maps to input's ACTIVE (pressed AND still over it), so dragging off releases
+//!     the pushed-in look; and `focused` gates on `focus_visible`, so a ring shows
+//!     only for keyboard focus — exactly the browser's `:focus-visible`.
+//!   · with `tokens`: the alphas here are OVERLAY opacities. The host draws a wash
+//!     of a token color at that alpha (e.g. `tokens.withAlpha(role_color, a)`); a
+//!     disabled control additionally scales its content alpha by
+//!     `disabled_content_alpha`. This module never names a color.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -72,6 +84,12 @@ pub fn state(i: Interaction) State {
 pub const hover_alpha: u8 = 20; // ~0.08 * 255
 pub const focus_alpha: u8 = 28; // ~0.11 * 255
 pub const pressed_alpha: u8 = 40; // ~0.16 * 255
+
+/// A disabled control is dimmed by scaling its CONTENT alpha (ink + fill) to this,
+/// in addition to showing no state layer — material's ~38% disabled emphasis. This
+/// is the one place "how dim is disabled" lives; the host multiplies the control's
+/// content alpha by `disabled_content_alpha / 255` when the state is `.disabled`.
+pub const disabled_content_alpha: u8 = 97; // ~0.38 * 255
 
 /// The state-layer overlay alpha [0, 255] for a resolved state. Ordering holds:
 /// pressed > focused > hover > rest == disabled == 0.
@@ -195,6 +213,14 @@ test "feedback: overlayAlpha ordering (pressed > focused > hover > rest, disable
     // interactionAlpha resolves flags then maps.
     try std.testing.expectEqual(pressed_alpha, interactionAlpha(.{ .pressed = true }));
     try std.testing.expectEqual(@as(u8, 0), interactionAlpha(.{ .disabled = true, .pressed = true }));
+}
+
+test "feedback: disabled dims content (inert + partial content alpha)" {
+    // Disabled shows no state layer (inert) but is not invisible — it dims content.
+    try std.testing.expectEqual(@as(u8, 0), overlayAlpha(.disabled));
+    try std.testing.expect(disabled_content_alpha > 0 and disabled_content_alpha < 255);
+    // Dimmer than a fully-opaque enabled control.
+    try std.testing.expect(disabled_content_alpha < 255);
 }
 
 test "feedback: press starts full and decays to inactive with alpha 0" {
