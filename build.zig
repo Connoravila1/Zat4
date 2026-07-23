@@ -389,6 +389,24 @@ pub fn build(b: *std.Build) void {
     const call_step = b.step("call-smoke", "Media loopback smoke: encrypted tone frames flow A→B through the full pipeline");
     call_step.dependOn(&run_call.step);
 
+    // Cross-device call peer (dev harness): one endpoint of a direct-LAN call,
+    // driven from argv so the SAME source runs native on the desktop and, cross-
+    // compiled static for aarch64, on an Android phone over `adb shell` — proving
+    // the media stack works between two real devices with no accounts/relay/APK.
+    //   Desktop:  zig build call-peer -- a 50001 <phone-ip> 50002
+    //   Phone:    zig build-exe src/call_peer.zig -target aarch64-linux-musl \
+    //             -O ReleaseSafe -femit-bin=call-peer-arm64   (adb push + shell)
+    const peer_mod = b.createModule(.{
+        .root_source_file = b.path("src/call_peer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const peer_exe = b.addExecutable(.{ .name = "zat-call-peer", .root_module = peer_mod });
+    const run_peer = b.addRunArtifact(peer_exe);
+    if (b.args) |args| run_peer.addArgs(args);
+    const peer_step = b.step("call-peer", "One endpoint of a direct-LAN call (dev harness; args: <a|b> <bind-port> <peer-ip> <peer-port>)");
+    peer_step.dependOn(&run_peer.step);
+
     // GPU preview (Phase 6.1): render the SAME draw list as `zig build
     // preview` — static ambient field + premium feed — through the GPU
     // renderer on the real window, to confirm parity with the software path.
