@@ -23,10 +23,10 @@
 //! a device without it degrades to "unavailable" (null) rather than a link or
 //! load failure. It deals only in interleaved signed 16-bit PCM.
 //!
-//! It exposes the SAME playback surface as `audio_alsa` (`stream_playback`,
-//! `Pcm`, `open`/`close`/`play`) so `sfx_player` selects one or the other at
-//! comptime by target and uses it through one name. Capture is not implemented
-//! here — the SFX player only plays; the calling engine owns call capture.
+//! It exposes the SAME surface as `audio_alsa` (`stream_playback`/
+//! `stream_capture`, `Pcm`, `open`/`close`/`play`/`capture`) so `sfx_player`
+//! (playback only) and the calling engine (which also captures the mic) select
+//! one backend or the other at comptime by target and use it through one name.
 //!
 //! The `dlopen`/`dlsym` CALLS live behind a comptime `is_android` branch, so on
 //! any other target this module is present but inert (open returns Unavailable)
@@ -53,6 +53,7 @@ pub const stream_capture: c_int = 1;
 // aaudio constants (aaudio/AAudio.h)
 const AAUDIO_OK: i32 = 0;
 const AAUDIO_DIRECTION_OUTPUT: i32 = 0;
+const AAUDIO_DIRECTION_INPUT: i32 = 1;
 const AAUDIO_FORMAT_PCM_I16: i32 = 1;
 const AAUDIO_PERFORMANCE_MODE_LOW_LATENCY: i32 = 12;
 
@@ -62,6 +63,7 @@ const OpenStreamFn = *const fn (*AAudioStreamBuilder, **AAudioStream) callconv(.
 const BuilderResultFn = *const fn (*AAudioStreamBuilder) callconv(.c) i32;
 const StreamResultFn = *const fn (*AAudioStream) callconv(.c) i32;
 const WriteFn = *const fn (*AAudioStream, *const anyopaque, i32, i64) callconv(.c) i32;
+const ReadFn = *const fn (*AAudioStream, *anyopaque, i32, i64) callconv(.c) i32;
 
 /// A7.2: cold struct, size guard waived — the resolved libaaudio entry points,
 /// one process-wide instance.
@@ -78,6 +80,7 @@ const Lib = struct {
     request_stop: StreamResultFn,
     stream_close: StreamResultFn,
     write: WriteFn,
+    read: ReadFn,
 };
 
 var cached: ?Lib = null;
@@ -104,6 +107,7 @@ fn load() ?Lib {
             .request_stop = @ptrCast(@alignCast(dlsym(lib, "AAudioStream_requestStop") orelse return null)),
             .stream_close = @ptrCast(@alignCast(dlsym(lib, "AAudioStream_close") orelse return null)),
             .write = @ptrCast(@alignCast(dlsym(lib, "AAudioStream_write") orelse return null)),
+            .read = @ptrCast(@alignCast(dlsym(lib, "AAudioStream_read") orelse return null)),
         };
         return cached;
     }
@@ -125,11 +129,12 @@ pub const Pcm = struct {
 
 pub const OpenError = error{ Unavailable, OpenFailed, ConfigFailed };
 
-/// Open an output stream at `rate` Hz / `channels`, interleaved S16. `stream`
-/// (direction) and `latency_us` are accepted for interface parity with the ALSA
-/// shim; AAudio picks its own buffer from the performance-mode hint.
+/// Open a playback OR capture stream at `rate` Hz / `channels`, interleaved
+/// S16. `stream` selects the direction (`stream_playback` / `stream_capture`);
+/// `latency_us` is accepted for interface parity with the ALSA shim (AAudio
+/// picks its own buffer from the performance-mode hint). Capture is what the
+/// calling engine uses for the mic; the SFX player only ever opens playback.
 pub fn open(stream: c_int, rate: u32, channels: u32, latency_us: u32) OpenError!Pcm {
-    _ = stream;
     _ = latency_us;
     const lib = load() orelse return error.Unavailable;
 
@@ -137,7 +142,7 @@ pub fn open(stream: c_int, rate: u32, channels: u32, latency_us: u32) OpenError!
     if (lib.create_builder(&builder) != AAUDIO_OK) return error.OpenFailed;
     // The builder is finished with the moment the stream opens; deleted on
     // every path below.
-    lib.set_direction(builder, AAUDIO_DIRECTION_OUTPUT);
+    lib.set_direction(builder, if (stream == stream_capture) AAUDIO_DIRECTION_INPUT else AAUDIO_DIRECTION_OUTPUT);
     lib.set_format(builder, AAUDIO_FORMAT_PCM_I16);
     lib.set_sample_rate(builder, @intCast(rate));
     lib.set_channel_count(builder, @intCast(channels));
@@ -174,4 +179,16 @@ pub fn play(p: *Pcm, buf: []const i16, frames: usize) void {
         if (wrote <= 0) return; // error or timeout → drop the rest of this clip
         off += @intCast(wrote);
     }
+}
+
+/// Capture up to `frames` of interleaved S16 into `buf` (a blocking read with a
+/// bounded timeout). Returns the frames actually read (0 on error/timeout — the
+/// caller sends silence rather than crashing, E2). The calling engine's mic path
+/// on Android; the ALSA shim has the matching `capture` on the desktop.
+pub fn capture(p: *Pcm, buf: []i16, frames: usize) usize {
+    const timeout_ns: i64 = 200_000_000; // 200ms: well over one 10ms frame
+    const ptr: *anyopaque = @ptrCast(buf.ptr);
+    const got = p.lib.read(p.stream, ptr, @intCast(frames), timeout_ns);
+    if (got <= 0) return 0;
+    return @intCast(got);
 }
