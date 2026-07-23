@@ -376,6 +376,19 @@ pub fn build(b: *std.Build) void {
     const call_ice_step = b.step("call-ice-smoke", "ICE loopback smoke: two UDP agents run an authenticated STUN Binding check");
     call_ice_step.dependOn(&run_call_ice.step);
 
+    // Media loopback smoke (calling): two engines ICE-connect on 127.0.0.1 then
+    // flow synthetic tone frames through RTP + SRTP(AES-256-GCM) + jitter, and
+    // verify in-order decrypted playout. The end-to-end media-path proof.
+    const call_mod = b.createModule(.{
+        .root_source_file = b.path("src/call_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const call_exe = b.addExecutable(.{ .name = "zat-call-smoke", .root_module = call_mod });
+    const run_call = b.addRunArtifact(call_exe);
+    const call_step = b.step("call-smoke", "Media loopback smoke: encrypted tone frames flow A→B through the full pipeline");
+    call_step.dependOn(&run_call.step);
+
     // GPU preview (Phase 6.1): render the SAME draw list as `zig build
     // preview` — static ambient field + premium feed — through the GPU
     // renderer on the real window, to confirm parity with the software path.

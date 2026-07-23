@@ -1326,6 +1326,7 @@ test {
     _ = @import("core/congestion.zig"); // Zat Chat calling: bandwidth estimation (GCC-style)
     _ = @import("core/ice.zig"); // Zat Chat calling: STUN/ICE codec (RFC 5389/8445)
     _ = @import("shell/call_ice.zig"); // Zat Chat calling: ICE agent I/O (UDP over the codec)
+    _ = @import("shell/call_engine.zig"); // Zat Chat calling: media engine glue (RTP+SRTP+jitter over ICE)
     _ = @import("core/x11.zig");
     _ = @import("core/win32.zig");
     _ = @import("core/textinput.zig");

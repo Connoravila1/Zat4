@@ -163,6 +163,40 @@ pub fn poll(a: *Agent, timeout_ms: i32, pwd: []const u8, peer_out: *ice.Address)
     return .ignored;
 }
 
+/// A received datagram's length and source address. A7.2: cold struct, size
+/// guard waived — a transient return value.
+pub const Datagram = struct {
+    len: usize,
+    ip: [4]u8,
+    port: u16,
+};
+
+/// Send raw bytes to `ip:port` on the agent's socket (used for media once ICE
+/// has validated a path — RTP/SRTP shares the same port as STUN, demuxed by the
+/// first byte at the receiver).
+pub fn sendRaw(a: *Agent, ip: [4]u8, port: u16, data: []const u8) IoError!void {
+    var dst = sockaddrV4(ip, port);
+    _ = try checkRc(linux.sendto(a.fd, data.ptr, data.len, 0, @ptrCast(&dst), addr_len));
+}
+
+/// Receive one datagram (up to `timeout_ms`) into `buf`. Returns null on
+/// timeout. The caller demuxes STUN vs RTP/SRTP by the first byte.
+pub fn recvRaw(a: *Agent, timeout_ms: i32, buf: []u8) ?Datagram {
+    var pfd = [_]linux.pollfd{.{ .fd = a.fd, .events = linux.POLL.IN, .revents = 0 }};
+    const ready = checkRc(linux.poll(&pfd, 1, timeout_ms)) catch return null;
+    if (ready == 0) return null;
+    var from: linux.sockaddr.in = undefined;
+    var flen: linux.socklen_t = addr_len;
+    const rc = checkRc(linux.recvfrom(a.fd, buf.ptr, buf.len, 0, @ptrCast(&from), &flen)) catch return null;
+    return .{ .len = rc, .ip = ipOf(from), .port = std.mem.bigToNative(u16, from.port) };
+}
+
+/// True if the first byte marks an RTP/SRTP packet (version 2, top bits 10)
+/// rather than a STUN message (top bits 00) — RFC 5761 multiplexing demux.
+pub fn isRtp(first_byte: u8) bool {
+    return (first_byte & 0xC0) == 0x80;
+}
+
 fn replySuccess(a: *Agent, to: linux.sockaddr.in, txid: [ice.txid_len]u8, peer_ip: [4]u8, peer_port: u16, pwd: []const u8) !void {
     var buf: [128]u8 = undefined;
     // header (success response) + XOR-MAPPED-ADDRESS(peer) + MESSAGE-INTEGRITY
