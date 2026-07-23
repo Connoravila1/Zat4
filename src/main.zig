@@ -1211,6 +1211,7 @@ test {
     _ = @import("ui/input.zig");
     _ = @import("ui/typeset.zig");
     _ = @import("ui/overlay.zig");
+    _ = @import("ui/compose_test.zig"); // Rover: spine composition proof (host-side integration test)
     _ = @import("ui/insets.zig");
     _ = @import("ui/ease.zig");
     _ = @import("ui/scroll.zig");
