@@ -49,6 +49,10 @@ pub const MsgIndex = enum(u32) { _ };
 /// payment that morphs in place — its live state is the payment row's
 /// `status`, never a second bubble. The settlement wire bytes 18/19 flip an
 /// existing card and are never stored (see `kind_pay_settled_wire`).
+/// Bytes 24..31 are RESERVED for the call signaling wire vocabulary, which the
+/// call module owns (see `core/call.zig`'s `kind_call_*_wire`): they ride this
+/// same E2EE channel but are consumed at the call layer and never stored, so
+/// `parseKind` keeps rejecting them.
 /// Unbuilt bytes stay rejected by `parseKind` (E3).
 pub const Kind = enum(u8) {
     text = 0,

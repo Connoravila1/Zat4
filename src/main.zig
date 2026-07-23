@@ -1317,6 +1317,9 @@ test {
     _ = @import("core/shatter.zig");
     _ = @import("core/pet.zig");
     _ = @import("core/gesture.zig");
+    _ = @import("core/call.zig"); // Zat Chat calling: state machine + signaling wire (Phase V0)
+    _ = @import("core/media_keys.zig"); // Zat Chat calling: MLS-derived media keys
+    _ = @import("core/call_decision.zig"); // Zat Chat calling: the adaptive brain (§4)
     _ = @import("core/x11.zig");
     _ = @import("core/win32.zig");
     _ = @import("core/textinput.zig");
