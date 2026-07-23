@@ -86,7 +86,8 @@ fn alignCross(anchor_start: i32, anchor_size: i32, content_size: i32, alignment:
 }
 
 /// Position content of `cw`×`ch` on `side` of `anchor`, offset by `gap`, aligned per
-/// `alignment` on the cross axis. Pure placement — no viewport clamping yet.
+/// `alignment` on the cross axis. This is the PRE-CLAMP placement helper; `place()`
+/// layers flip + shift + viewport clamp on top of it (see `place`).
 fn positionOnSide(side: Side, anchor: Rect, cw: i32, ch: i32, gap: i32, alignment: Align) Rect {
     return switch (side) {
         .top => .{
