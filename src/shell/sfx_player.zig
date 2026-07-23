@@ -37,9 +37,18 @@
 //! is a later upgrade, not a correctness gap.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const sfx = @import("../core/sfx.zig");
-const alsa = @import("audio_alsa.zig");
+// The audio device is target-selected: AAudio on the phone, ALSA on the Linux
+// desktop. Both expose the same playback surface (stream_playback / Pcm /
+// open / close / play), so the worker below speaks to one name. Windows/macOS
+// fall to the ALSA shim, which is inert off Linux → those clients are silent
+// until a WASAPI/CoreAudio backend is added the same way.
+const audio = if (builtin.abi.isAndroid())
+    @import("audio_aaudio.zig")
+else
+    @import("audio_alsa.zig");
 const clock = @import("clock.zig");
 const write_worker = @import("write_worker.zig");
 
@@ -135,8 +144,8 @@ fn threadMain(p: *Player) void {
 
     // Open the device once. Absent ALSA -> `dev` stays null and every play is
     // a silent no-op, but the mailbox is still drained so it cannot grow.
-    var dev: ?alsa.Pcm = alsa.open(alsa.stream_playback, rate_hz, channels, 40_000) catch null;
-    defer if (dev) |*d| alsa.close(d);
+    var dev: ?audio.Pcm = audio.open(audio.stream_playback, rate_hz, channels, 40_000) catch null;
+    defer if (dev) |*d| audio.close(d);
 
     // Worker-owned scratch: decoded+gained samples for the current clip. Grown
     // as needed, freed at exit (C4/C5).
@@ -182,7 +191,7 @@ fn threadMain(p: *Player) void {
 /// Decode one clip, apply per-event × master gain into `scratch`, and hand it
 /// to the device. Blocks for the clip's duration — that is the whole reason
 /// this runs off the render thread. A malformed clip is skipped, not fatal.
-fn voice(p: *Player, dev: *?alsa.Pcm, scratch: *std.ArrayList(i16), event: sfx.Event) void {
+fn voice(p: *Player, dev: *?audio.Pcm, scratch: *std.ArrayList(i16), event: sfx.Event) void {
     var d = dev.* orelse return; // no device -> silent (mutable copy: play recovers on it)
     const f = sfx.decode(sfx.wavBytes(event)) catch return;
     const frames = sfx.frameCount(f);
@@ -196,7 +205,7 @@ fn voice(p: *Player, dev: *?alsa.Pcm, scratch: *std.ArrayList(i16), event: sfx.E
         const scaled = @divTrunc(@as(i32, s) * @as(i32, @intCast(gain)), 256);
         scratch.items[i] = @intCast(std.math.clamp(scaled, -32768, 32767));
     }
-    alsa.play(&d, scratch.items, frames);
+    audio.play(&d, scratch.items, frames);
 }
 
 // ── tests (C6) — the boundary logic; no device, no sound ────────────────────

@@ -1344,6 +1344,7 @@ test {
     _ = @import("shell/write_worker.zig");
     _ = @import("shell/refresh_worker.zig");
     _ = @import("shell/sfx_player.zig");
+    _ = @import("shell/audio_aaudio.zig"); // Android SFX backend (inert off Android)
     _ = @import("shell/view_worker.zig");
     _ = @import("shell/mobile_host.zig");
     _ = @import("core/pow.zig");
