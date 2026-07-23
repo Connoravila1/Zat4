@@ -439,6 +439,11 @@ pub const rows = [_]Row{
     .{ .section = sec_about, .group = 0, .kind = .info, .action = act_none, .flags = 0, .label = "Build", .value = "main" },
     .{ .section = sec_about, .group = 1, .kind = .disclosure, .action = act_none, .flags = flag_wip, .label = "Open-source licenses", .value = "" },
     .{ .section = sec_about, .group = 1, .kind = .disclosure, .action = act_none, .flags = flag_wip, .label = "Acknowledgements", .value = "" },
+    // CC-BY 4.0 requires the attribution to ship visibly with the app. The full
+    // notice (creator, license link, modifications) is in assets/sounds/
+    // LICENSE.md, bundled with the binary; this is its in-app surface until the
+    // licenses screen above is real.
+    .{ .section = sec_about, .group = 1, .kind = .info, .action = act_none, .flags = 0, .label = "Sounds", .value = "Material Design · CC-BY 4.0" },
 };
 
 comptime {

@@ -3263,6 +3263,17 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     continue;
                 }
             }
+            // A failed write (post/like/repost/loadout/publish) earns one error
+            // tone. Skip the secondary "ChainStopped" — the first failed segment
+            // of a chain already sounded, and its message is the one kept.
+            if (rs.sfxp) |p| {
+                const failed = switch (res.outcome) {
+                    .refused => true,
+                    .net_error => |n| !std.mem.eql(u8, n, "ChainStopped"),
+                    else => false,
+                };
+                if (failed) sfx_player.play(p, .@"error");
+            }
             switch (res.outcome) {
                 .ok => |uri| {
                     // A finished algorithm publish: land it on the bench and
@@ -9931,6 +9942,7 @@ fn handleComposeInput(
         .insert => |cp| {
             if (timeline_ui.countCodepoints(textedit.view(compose)) >= 300) {
                 status.* = "300 character limit";
+                if (sfxp) |p| sfx_player.play(p, .unavailable);
             } else {
                 var utf8_buf: [4]u8 = undefined;
                 const len = std.unicode.utf8Encode(cp, &utf8_buf) catch 0;
@@ -9953,6 +9965,7 @@ fn handleComposeInput(
             if (compose_kind == .profile) {
                 if (active.len == 0) {
                     status.* = "name can't be empty";
+                    if (sfxp) |p| sfx_player.play(p, .unavailable);
                     return;
                 }
                 // 0ms: set the display name locally NOW (guarded against a stale
@@ -9971,6 +9984,7 @@ fn handleComposeInput(
             const total = chain_segments.items.len + @as(usize, if (active.len > 0) 1 else 0);
             if (total == 0) {
                 status.* = "nothing to post";
+                if (sfxp) |p| sfx_player.play(p, .unavailable);
                 return;
             }
             // A post is leaving — voice it. Fires on the optimistic send (the

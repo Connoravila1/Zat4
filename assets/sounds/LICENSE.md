@@ -25,7 +25,7 @@ surfaced in-app under Settings → About / Licenses.
 | `nav_forward.wav` | `navigation_forward-selection-minimal` |
 | `nav_back.wav`    | `navigation_backward-selection-minimal` |
 | `like.wav`        | `ui_tap-variant-03` |
-| `unlike.wav`      | `state-change_confirm-down` |
+| `unlike.wav`      | `ui_tap-variant-02` |
 | `send.wav`        | `navigation_selection-complete-celebration` |
 | `msg_receive.wav` | `notification_simple-01` |
 | `notify.wav`      | `notification_decorative-01` |
