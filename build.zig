@@ -362,6 +362,20 @@ pub fn build(b: *std.Build) void {
     const gpu_step = b.step("gpu-smoke", "Bring up an EGL/GLES context on the window and clear it (GPU smoke test)");
     gpu_step.dependOn(&run_gpu.step);
 
+    // ICE loopback smoke (calling): two UDP agents run a STUN Binding check on
+    // 127.0.0.1 over shell/call_ice.zig — proves the datagram send/recv +
+    // MESSAGE-INTEGRITY path the offline test can't. No display, no GPU; posix
+    // UDP only, so it runs anywhere (unlike gpu-smoke).
+    const call_ice_mod = b.createModule(.{
+        .root_source_file = b.path("src/call_ice_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const call_ice_exe = b.addExecutable(.{ .name = "zat-call-ice-smoke", .root_module = call_ice_mod });
+    const run_call_ice = b.addRunArtifact(call_ice_exe);
+    const call_ice_step = b.step("call-ice-smoke", "ICE loopback smoke: two UDP agents run an authenticated STUN Binding check");
+    call_ice_step.dependOn(&run_call_ice.step);
+
     // GPU preview (Phase 6.1): render the SAME draw list as `zig build
     // preview` — static ambient field + premium feed — through the GPU
     // renderer on the real window, to confirm parity with the software path.
