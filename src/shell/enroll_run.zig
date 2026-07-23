@@ -154,6 +154,10 @@ pub const State = struct {
     card_h: f32 = 0.0, // eased card height (0 = not yet initialised)
     info: enroll_view.Info = .none, // which info bubble is open
     connect_failed: bool = false, // .connecting: the browser OAuth flow failed → retry card
+    /// How the account-creation leg finished. `.done` renders from this, so a
+    /// FAILED create no longer collapses into the "You're in ✓" success card —
+    /// which it did before, telling a person they had joined when they had not.
+    create_outcome: enroll_view.CreateOutcome = .pending,
     // ── the existing-account fork: WHO HOSTS THIS HANDLE? (FRONT_DOOR_ROADMAP §2b) ──
     /// The handle→PDS lookup is in flight. Until it lands we do not know whether
     /// this person types a password here or goes to their provider's website.
@@ -668,6 +672,7 @@ pub fn snapshot(s: *const State, blink_on: bool) enroll_view.EnrollView {
         .body_dx = @intFromFloat((1.0 - s.trans_t) * trans_slide_px * @as(f32, @floatFromInt(s.trans_dir))),
         .info = s.info,
         .connect_failed = s.connect_failed,
+        .create_outcome = s.create_outcome,
         .rehearsal = dist_config.enroll_rehearsal,
         // The card asks "do we KNOW yet?", not "is a worker running?" — the gap
         // between the two (a stale lookup still being reaped) must not flash the
@@ -1280,25 +1285,36 @@ fn powWorker(job: *PowJob) void {
                 );
             }
 
-            // ── BOOTSTRAP FALLBACK, and it is deliberately loud ──
-            // While the gate is not yet routed publicly, a hand-distributed
-            // ZAT_INVITE_CODE is still how a developer signs up. Falling back
-            // to it means this enrollment was NOT observed by the
-            // constellation — which is exactly the bypass the gate exists to
-            // close, so it announces itself every time.
-            // MUST BE REMOVED before the gate is the real front door.
+            // ── DEV-ONLY GATE BYPASS — off by default, opt-in, and loud ──
+            // Before the gate is routed publicly, a developer testing signup
+            // needs a way through when the exchange cannot reach the gate. The
+            // hand-distributed ZAT_INVITE_CODE still works — but ONLY when the
+            // developer also sets ZAT_GATE_ALLOW_ENV_FALLBACK, because using it
+            // means this enrollment was NOT observed by the constellation, which
+            // is exactly the bypass the gate exists to close.
+            //
+            // The bypass is no longer the default (it was, during initial
+            // wiring): a real user hitting an unreachable gate now gets an
+            // honest failure, not a silent side-door. The whole block is
+            // TEMPORARY and comes out entirely once the gate is the front door
+            // (Caddy routed) — at which point the exchange simply succeeds.
             if (f.why != .canceled) {
-                if (job.environ) |e| {
-                    if (e.get("ZAT_INVITE_CODE")) |env_code| {
-                        if (job.gpa.dupe(u8, env_code)) |owned| {
-                            job.invite_code = owned;
-                            job.ok = true;
-                            std.debug.print(
-                                "[enroll] ⚠ GATE BYPASSED — using ZAT_INVITE_CODE. " ++
-                                    "This signup was NOT observed by the constellation.\n",
-                                .{},
-                            );
-                        } else |_| {}
+                const allow = if (job.environ) |e| e.get("ZAT_GATE_ALLOW_ENV_FALLBACK") != null else false;
+                if (allow) {
+                    if (job.environ) |e| {
+                        if (e.get("ZAT_INVITE_CODE")) |env_code| {
+                            if (job.gpa.dupe(u8, env_code)) |owned| {
+                                job.invite_code = owned;
+                                job.ok = true;
+                                job.failure = null;
+                                std.debug.print(
+                                    "[enroll] ⚠ DEV GATE BYPASS — using ZAT_INVITE_CODE. " ++
+                                        "This signup was NOT observed by the constellation. " ++
+                                        "Remove ZAT_GATE_ALLOW_ENV_FALLBACK for real enrollment.\n",
+                                    .{},
+                                );
+                            } else |_| {}
+                        }
                     }
                 }
             }
@@ -1355,6 +1371,14 @@ fn freeInvite(job: *PowJob) void {
 /// The invite code from the finished exchange, or null. Read after `done`.
 pub fn issuedInvite(job: *const PowJob) ?[]const u8 {
     return job.invite_code;
+}
+
+/// Whether the gate exchange failed specifically because its invite pool was
+/// dry (§9.5). This is the one failure that is not the user's fault, so the UI
+/// tells them "come back shortly" rather than "something went wrong". Read
+/// after `done`.
+pub fn gatePoolWasEmpty(job: *const PowJob) bool {
+    return job.failure == .no_invite_available;
 }
 
 /// Cancel + join any in-flight solve (cooperative; the worker checks `cancel`

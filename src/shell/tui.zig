@@ -11464,13 +11464,19 @@ fn enrollVerify(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.proc
     if (s.seal_t >= 1.0 and !rs.genroll_create.active and rs.genroll_create.thread == null and s.branch == .new) {
         rs.genroll_create.done.store(false, .monotonic);
         rs.genroll_create.session = null;
+        s.create_outcome = .pending; // in flight — not yet a success or a failure
         // Carry across the code the gate exchange just earned. Read after the
         // gate job's `done` (which `seal_t` reaching 1.0 implies), so the plain
         // field write is fenced.
         rs.genroll_create.invite = enroll_run.issuedInvite(&rs.genroll_pow);
         rs.genroll_create.thread = std.Thread.spawn(.{}, createWorker, .{ &rs.genroll_create, gpa, io, env, s }) catch null;
         rs.genroll_create.active = rs.genroll_create.thread != null;
-        if (!rs.genroll_create.active) s.step = .done; // could not even start: say so
+        if (!rs.genroll_create.active) {
+            // Could not even start the worker — that is a failure, so mark it as
+            // one rather than dropping onto the success card.
+            s.create_outcome = .failed;
+            s.step = .done;
+        }
     }
     if (rs.genroll_create.thread) |th| {
         if (rs.genroll_create.done.load(.acquire)) {
@@ -11482,11 +11488,20 @@ fn enrollVerify(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.proc
                 // WE ARE SOMEBODY NOW. The loop asks to be restarted with this
                 // session — it cannot hot-swap an identity mid-frame, because
                 // every worker, cache and store in it was built for "nobody".
+                s.create_outcome = .created;
                 rs.genroll_session = sess;
                 enroll_run.stopPow(&rs.genroll_pow);
                 rs.genroll_pow.active = false;
             } else {
-                // It failed. SAY SO — do not sit on a sealed ring forever.
+                // It failed. SAY SO — do not sit on a sealed ring forever, and do
+                // NOT fall through to the "You're in ✓" card (which this step
+                // otherwise renders). Distinguish a dry invite pool — not the
+                // user's fault — from a genuine error, reading the reason from
+                // the gate job (fenced by its `done`, which sealing implies).
+                s.create_outcome = if (enroll_run.gatePoolWasEmpty(&rs.genroll_pow))
+                    .no_invite
+                else
+                    .failed;
                 s.step = .done;
                 s.pow_t = 0;
                 s.seal_t = 0;

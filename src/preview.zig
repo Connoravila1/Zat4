@@ -921,7 +921,12 @@ pub fn main(init: std.process.Init) !void {
         .{ .name = "enroll_4_confirm_checking", .view = .{ .step = .confirm, .branch = .new, .confirm_stage = .full, .full = "River-Anchor-Velvet-Tide", .confirm_checking = true } },
         .{ .name = "enroll_4_confirm_error", .view = .{ .step = .confirm, .branch = .new, .confirm_stage = .spot, .spot_positions = .{ 1, 3, 5 }, .confirm_error = true } },
         .{ .name = "enroll_4b_recovery", .view = .{ .step = .recovery, .branch = .new, .use_email = false, .recovery_key = "8F2A 1C9B 44D7 E013 A6B5 2F8C 90D1 7E4A 3C5D 6E2F 18A0 BB47 92E1 04CF D6A3 5B19", .rec_saved = true } },
-        .{ .name = "enroll_5_done", .view = .{ .step = .done, .branch = .new, .did = "did:plc:7mock4example", .final_handle = "connor.zat4.com" } },
+        .{ .name = "enroll_5_done", .view = .{ .step = .done, .branch = .new, .did = "did:plc:7mock4example", .final_handle = "connor.zat4.com", .create_outcome = .created } },
+        // The two ways account creation can fail — the done step must show these
+        // rather than the "You're in ✓" card (Constellation Gate: pool dry vs a
+        // genuine error).
+        .{ .name = "enroll_5_done_no_invite", .view = .{ .step = .done, .branch = .new, .create_outcome = .no_invite } },
+        .{ .name = "enroll_5_done_failed", .view = .{ .step = .done, .branch = .new, .create_outcome = .failed } },
         .{ .name = "enroll_6_verifying", .view = .{ .step = .verifying, .pow_t = 0.62, .bar_phase = 2.0 } },
         .{ .name = "enroll_6_verified", .view = .{ .step = .verifying, .pow_t = 1.0 } },
         .{ .name = "enroll_6_seal", .view = .{ .step = .verifying, .pow_t = 1.0, .seal_t = 0.74 } },

@@ -125,6 +125,15 @@ pub const Focus = enum(u8) { none, handle, username, email, spot0, spot1, spot2,
 /// server said the password is wrong; `network` = we could not reach it at all.
 pub const SignInError = enum(u8) { none, not_found, refused, network };
 
+/// How the `.done` step's account-creation leg finished (new accounts only).
+///   • `pending`   — still working, or an existing-account/rehearsal path that
+///                   does not create anything (the "You're in" card is right).
+///   • `created`   — the account exists. "You're in ✓".
+///   • `no_invite` — the Constellation Gate's pool is dry. NOT the user's fault;
+///                   they did the work and there is nothing to give them.
+///   • `failed`    — createAccount refused, or the gate was unreachable. Retry.
+pub const CreateOutcome = enum(u8) { pending, created, no_invite, failed };
+
 /// The confirm step runs in two stages: a random spot-check (type a few words
 /// at CSPRNG-chosen positions — minor anti-form-fill friction), then a full
 /// entry (type the whole password, normalized compare). Both are a human
@@ -219,6 +228,14 @@ pub const EnrollView = struct {
     /// the spinner becomes a "couldn't sign in" card with a retry. False while the
     /// wait is still live.
     connect_failed: bool = false,
+    /// `.done` only: how the account-creation leg finished. The done card renders
+    /// from this so a FAILURE is shown as a failure — before this existed, a
+    /// failed create set `step = .done` and the card said "You're in ✓" to
+    /// someone who had not joined. `.no_invite` is called out separately from a
+    /// generic failure because it is NOT the user's fault: the gate's invite pool
+    /// is dry, they did the work, and the right message is "come back shortly",
+    /// not "something went wrong".
+    create_outcome: CreateOutcome = .pending,
     // ── the existing-account fork (who hosts this handle?) ──
     /// `.connecting`: the handle is being resolved to its PDS. Until that lands we
     /// do not know which road we are on, so the card says so ("Checking your
@@ -709,6 +726,18 @@ fn stepRecovery(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, ix:
 
 fn stepDone(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, ix: i32, iw: i32, y0: i32, view: EnrollView, hits: ?*HitList) !void {
     var y = y0 + 6;
+
+    // A FAILED creation lands here too (the flow has nowhere else to go), so the
+    // card must not blindly celebrate. Only a real, non-rehearsal NEW account
+    // that did not create is a failure to show; existing-account sign-in and
+    // rehearsal never create, so they keep the success card.
+    if (view.branch == .new and !view.rehearsal and
+        (view.create_outcome == .no_invite or view.create_outcome == .failed))
+    {
+        try stepCreateFailed(gpa, dl, e, ix, iw, y, view, hits);
+        return;
+    }
+
     // a soft check medallion, centred
     const d: i32 = 56;
     const mx = ix + @divTrunc(iw - d, 2);
@@ -733,6 +762,39 @@ fn stepDone(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, ix: i32
     try pillRow(gpa, dl, e, ix, iw, y, did, hh);
     y += 34 + 18;
     try primaryButton(gpa, dl, e, ix, iw, y, brand.enter, true, hits);
+}
+
+/// The account did NOT get created. Shown on `.done` instead of the success
+/// medallion when `create_outcome` is a failure. Two messages, because the two
+/// causes call for opposite framings:
+///   • `.no_invite` — the gate's invite pool is dry. The person did the work and
+///     there is simply nothing to give them right now. That is OUR problem, not
+///     theirs, and the copy says come back shortly — not "something went wrong".
+///   • `.failed` — the gate was unreachable or the PDS refused. A genuine error,
+///     so it offers a retry (which restarts the flow — a fresh handle/password,
+///     because the previous credential may be half-committed).
+fn stepCreateFailed(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, ix: i32, iw: i32, y0: i32, view: EnrollView, hits: ?*HitList) !void {
+    var y = y0 + 6;
+    // A calm warm medallion — not the green check, not an alarming red X.
+    const d: i32 = 56;
+    const mx = ix + @divTrunc(iw - d, 2);
+    try rect(gpa, dl, mx, y, d, d, soft(0xE0705C, 0x22), @intCast(d / 2));
+    try centerStr(gpa, dl, e, ix, iw, y + 37, warn_c, 26, "!");
+    y += d + 18;
+
+    if (view.create_outcome == .no_invite) {
+        try centerStr(gpa, dl, e, ix, iw, y, ink, 21, "We're at capacity right now");
+        y += 30;
+        y = try wrapCenter(gpa, dl, e, ix, y, iw, muted, 14, "Zat4 is invite-limited while it's small, and there are no spots open this moment. Your place isn't lost — try again in a little while.");
+        y += 18;
+        try labelButton(gpa, dl, e, ix, iw, y, "Back to start", false, hits, .restart);
+    } else {
+        try centerStr(gpa, dl, e, ix, iw, y, ink, 21, "That didn't go through");
+        y += 30;
+        y = try wrapCenter(gpa, dl, e, ix, y, iw, muted, 14, "We couldn't finish creating your account — the connection dropped or the server turned it down. Nothing was charged and no account was made. Try again.");
+        y += 18;
+        try labelButton(gpa, dl, e, ix, iw, y, "Try again", true, hits, .restart);
+    }
 }
 
 /// THE PROOF-OF-WORK GATE — shown after "Enter Zat4." A clockwise-filling ring
