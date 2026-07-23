@@ -145,6 +145,7 @@ pub const act_kbd_lm: u8 = 27; // Keyboard: smart tap targeting (the letter-trig
 pub const act_chat_receipts: u8 = 28; // send read receipts
 pub const act_chat_typing: u8 = 29; // send typing indicators
 pub const act_chat_disappearing: u8 = 30; // disappearing messages (M3 — not built yet)
+pub const act_sfx: u8 = 31; // Appearance: UI sound effects (taps, likes, keystroke tick, send)
 
 /// Optional one-line explainer shown as a HOVER TOOLTIP over a row — opt-in per
 /// action, empty for the rest. Kept out of band (a switch, not a `Row` field) so
@@ -359,6 +360,7 @@ pub const rows = [_]Row{
     // ── Appearance ───────────────────────────────────────────────────────
     // Zat Chat is a LIGHT app by default (owner, 2026-07-18); Zat4 stays dark.
     .{ .section = sec_appearance, .group = 0, .kind = .toggle, .action = act_light, .flags = if (chat_app) flag_on else 0, .label = "Light mode", .value = "" },
+    .{ .section = sec_appearance, .group = 0, .kind = .toggle, .action = act_sfx, .flags = flag_on, .label = "Sound effects", .value = "" },
     .{ .section = sec_appearance, .group = 0, .kind = .toggle, .action = act_zat_kbd, .flags = flag_on, .label = "Zat4 keyboard", .value = "" },
     .{ .section = sec_appearance, .group = 0, .kind = .toggle, .action = act_kbd_pulses, .flags = flag_on, .label = "Keyboard circuit pulses", .value = "" },
     .{ .section = sec_appearance, .group = 0, .kind = .toggle, .action = act_kbd_haptic, .flags = flag_on, .label = "Keyboard haptics", .value = "" },

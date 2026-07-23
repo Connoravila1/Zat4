@@ -30,6 +30,15 @@
 //! link failure.
 
 const std = @import("std");
+const builtin = @import("builtin");
+
+// ALSA + the `dl` loader are Linux-only. On any other target this shim is
+// present but inert (`load` returns null → `available()` is false → no audio),
+// so the client — which now reaches this module via the SFX player — links
+// clean when cross-compiled for Windows/macOS. The `dlopen`/`dlsym` CALLS live
+// behind a comptime `is_linux` branch below so they are never codegen'd off
+// Linux (an unreferenced extern declaration creates no linker dependency).
+const is_linux = builtin.os.tag == .linux;
 
 extern fn dlopen(path: [*:0]const u8, mode: c_int) callconv(.c) ?*anyopaque;
 extern fn dlsym(handle: ?*anyopaque, symbol: [*:0]const u8) callconv(.c) ?*anyopaque;
@@ -74,18 +83,24 @@ fn load() ?Lib {
     if (cached) |l| return l;
     if (tried) return null;
     tried = true;
-    const lib = dlopen("libasound.so.2", RTLD_NOW) orelse return null;
-    cached = .{
-        .open = @ptrCast(@alignCast(dlsym(lib, "snd_pcm_open") orelse return null)),
-        .set_params = @ptrCast(@alignCast(dlsym(lib, "snd_pcm_set_params") orelse return null)),
-        .writei = @ptrCast(@alignCast(dlsym(lib, "snd_pcm_writei") orelse return null)),
-        .readi = @ptrCast(@alignCast(dlsym(lib, "snd_pcm_readi") orelse return null)),
-        .recover = @ptrCast(@alignCast(dlsym(lib, "snd_pcm_recover") orelse return null)),
-        .prepare = @ptrCast(@alignCast(dlsym(lib, "snd_pcm_prepare") orelse return null)),
-        .drain = @ptrCast(@alignCast(dlsym(lib, "snd_pcm_drain") orelse return null)),
-        .close = @ptrCast(@alignCast(dlsym(lib, "snd_pcm_close") orelse return null)),
-    };
-    return cached;
+    // Comptime-false off Linux → this whole branch is never analyzed or
+    // codegen'd there, so `dlopen`/`dlsym` are not referenced and the
+    // Windows/macOS client links clean.
+    if (is_linux) {
+        const lib = dlopen("libasound.so.2", RTLD_NOW) orelse return null;
+        cached = .{
+            .open = @ptrCast(@alignCast(dlsym(lib, "snd_pcm_open") orelse return null)),
+            .set_params = @ptrCast(@alignCast(dlsym(lib, "snd_pcm_set_params") orelse return null)),
+            .writei = @ptrCast(@alignCast(dlsym(lib, "snd_pcm_writei") orelse return null)),
+            .readi = @ptrCast(@alignCast(dlsym(lib, "snd_pcm_readi") orelse return null)),
+            .recover = @ptrCast(@alignCast(dlsym(lib, "snd_pcm_recover") orelse return null)),
+            .prepare = @ptrCast(@alignCast(dlsym(lib, "snd_pcm_prepare") orelse return null)),
+            .drain = @ptrCast(@alignCast(dlsym(lib, "snd_pcm_drain") orelse return null)),
+            .close = @ptrCast(@alignCast(dlsym(lib, "snd_pcm_close") orelse return null)),
+        };
+        return cached;
+    }
+    return null;
 }
 
 /// True if ALSA is present on this machine.

@@ -122,6 +122,8 @@ const write = @import("write.zig");
 const write_worker = @import("write_worker.zig");
 const refresh_worker = @import("refresh_worker.zig");
 const view_worker = @import("view_worker.zig");
+const sfx = @import("../core/sfx.zig");
+const sfx_player = @import("sfx_player.zig");
 const auth = @import("auth.zig");
 const lexicon = @import("../core/lexicon.zig");
 const moderation = @import("../core/moderation.zig");
@@ -477,6 +479,11 @@ const RunState = struct {
     refresher: ?*refresh_worker.Worker,
     refresh_results: std.ArrayList(refresh_worker.Result),
     refresh_inflight: u32,
+    // The SFX player — the desktop voice of UI events. Its mailbox lives on the
+    // run state (owned here); the worker drains it off-thread so a play() never
+    // blocks the render loop. Null if the worker failed to spawn (no sound).
+    sfx_in: sfx_player.Inbox,
+    sfxp: ?*sfx_player.Player,
     viewload_in: view_worker.RequestBox,
     viewload_out: view_worker.ResultBox,
     viewloader: ?*view_worker.Worker,
@@ -1237,6 +1244,12 @@ fn initRunState(
     // Auto ticks in flight: the interval clock never stacks a second fetch on
     // an unanswered one (a slow network otherwise queues a burst).
     rs.refresh_inflight = 0;
+    // The SFX player: starts regardless of sign-in (sound is a UI concern, not
+    // a network one). Seeded from the "Sound effects" toggle's current bit;
+    // saved prefs are re-applied to it just below (setFxOn) once loaded. A
+    // failed spawn degrades to silence (E2).
+    rs.sfx_in = .{};
+    rs.sfxp = sfx_player.start(gpa, &rs.sfx_in, toggleOn(rs.toggle_bits, settings_view.act_sfx)) catch null;
     // The VIEW-LOAD worker — the same actor pattern for the view-ENTRY
     // fetches (profile/thread/zone/…). Entering a view used to run its fetch
     // inline on this thread — a frozen frame per entry, and a guaranteed ANR
@@ -1809,6 +1822,9 @@ fn initRunState(
         rs.toggle_bits = prefs.applyToggles(&saved, rs.toggle_bits);
         prefs.applyChoices(&saved, &rs.choice_sel);
     }
+    // The player was seeded from the default toggle bit above; now that the
+    // saved "Sound effects" choice is folded in, mirror it onto the worker.
+    if (rs.sfxp) |p| sfx_player.setFxOn(p, toggleOn(rs.toggle_bits, settings_view.act_sfx));
     // The last state written to disk. Seeded from the state we just loaded so a
     // launch that changes nothing writes nothing.
     rs.prefs_sig = prefsSignature(rs);
@@ -2098,6 +2114,8 @@ fn deinitRunState(rs: *RunState) void {
     if (rs.viewloader) |w| view_worker.shutdown(w);
     rs.viewload_out.deinit(gpa);
     rs.viewload_in.deinit(gpa);
+    if (rs.sfxp) |p| sfx_player.shutdown(p);
+    rs.sfx_in.deinit(gpa);
     rs.refresh_results.deinit(gpa);
     if (rs.refresher) |w| refresh_worker.shutdown(w);
     rs.refresh_out.deinit(gpa);
@@ -3352,6 +3370,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
             if (rs.refresher) |w| {
                 rs.status = "refreshing...";
                 if (refresh_worker.submit(w, .pull, 30)) rs.refresh_inflight += 1;
+                if (rs.sfxp) |p| sfx_player.play(p, .refresh);
             } else rs.status = "refresh unavailable (r refreshes)";
         }
 
@@ -6091,7 +6110,11 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         // updates the same record Home shows (ZONES inv. 4).
                                         .like => if (hit.post < view_items.len) {
                                             rs.state.selected = hit.post;
+                                            // Voice the toggle by its DIRECTION: the pre-tap state
+                                            // decides it (liking rises, unliking falls).
+                                            const was_liked = view_items[hit.post].item_flags.viewer_liked;
                                             const r = try engageSelected(.like, gpa, arena, session, store, view_items[hit.post], hit.post, rs.gscreen, rs.profile_target_did, rs.thread_focus_cid, rs.zone_tag, rs.thread_rerooted, rs.gcollapsed.items, feed_config, reply_config, &rs.state, rs.revealed.items, now, rs.out, &rs.prev, &rs.next, backend, pix, rs.writer, &rs.deferred_unlike, &rs.deferred_unrepost);
+                                            if (rs.sfxp) |p| sfx_player.play(p, if (was_liked) .unlike else .like);
                                             if (r.status.len > 0) rs.status = r.status;
                                         },
                                         // Repost button → OPEN the Repost/Quote menu for
@@ -7540,6 +7563,11 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                                         rs.gchat_typing_on = !rs.gchat_typing_on;
                                                         chatPersistHistory(gpa, io, environ, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
                                                     },
+                                                    // "Sound effects": mirror the freshly-flipped bit
+                                                    // onto the player so feedback sounds mute/unmute live.
+                                                    settings_view.act_sfx => {
+                                                        if (rs.sfxp) |p| sfx_player.setFxOn(p, (rs.toggle_bits >> @intCast(hit.post)) & 1 != 0);
+                                                    },
                                                     else => {},
                                                 }
                                                 // Layout-owning toys are mutually exclusive (they all
@@ -7934,7 +7962,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     rs.caret_anchor_ns = clock_shell.monotonicNanos();
                     continue;
                 };
-                try handleComposeInput(gpa, session, &rs.status, &rs.mode, store, &rs.compose, &rs.chain_segments, &rs.reply_target, &rs.reply_handle, &rs.quote_target, &rs.quoting_handle, rs.compose_kind, &rs.gtagbar, pix, &rs.pending_send, &rs.pending_profile_save, decoded.event, now);
+                try handleComposeInput(gpa, session, &rs.status, &rs.mode, store, &rs.compose, &rs.chain_segments, &rs.reply_target, &rs.reply_handle, &rs.quote_target, &rs.quoting_handle, rs.compose_kind, &rs.gtagbar, pix, &rs.pending_send, &rs.pending_profile_save, rs.sfxp, decoded.event, now);
                 if (rs.mode != .compose) rs.compose_drag = false; // composer closed → end any drag
                 rs.caret_anchor_ns = clock_shell.monotonicNanos(); // keystroke/move → solid caret
                 continue;
@@ -9837,6 +9865,10 @@ fn handleComposeInput(
     /// Set by a profile-edit save: the display name to putProfile, run by the
     /// loop after the name is optimistically shown. gpa-owned; null when idle.
     pending_profile_save: *?[]const u8,
+    /// The SFX player: the keystroke tick and the send chirp fire from here,
+    /// where the composer's insert/send intents are actually decoded. Null =
+    /// no audio (the caller's worker failed to spawn).
+    sfxp: ?*sfx_player.Player,
     ev: tui.InputEvent,
     now: i64,
 ) !void {
@@ -9864,7 +9896,12 @@ fn handleComposeInput(
             } else {
                 var utf8_buf: [4]u8 = undefined;
                 const len = std.unicode.utf8Encode(cp, &utf8_buf) catch 0;
-                if (len > 0) textedit.insert(compose, utf8_buf[0..len]);
+                if (len > 0) {
+                    textedit.insert(compose, utf8_buf[0..len]);
+                    // The keystroke tick — one soft click per committed character
+                    // (gated by "Sound effects"; the quietest clip in the set).
+                    if (sfxp) |p| sfx_player.play(p, .key);
+                }
             }
         },
         .send => {
@@ -9888,6 +9925,7 @@ fn handleComposeInput(
                 textedit.clear(compose);
                 mode.* = .timeline;
                 status.* = "name updated";
+                if (sfxp) |p| sfx_player.play(p, .success);
                 return;
             }
             // The ordered segment texts: the finalized chain, then the active box
@@ -9897,6 +9935,9 @@ fn handleComposeInput(
                 status.* = "nothing to post";
                 return;
             }
+            // A post is leaving — voice it. Fires on the optimistic send (the
+            // post is about to seat in the store this frame), not on delivery.
+            if (sfxp) |p| sfx_player.play(p, .send);
             const base = reply_target.*;
             const quote = quote_target.*; // attaches to segment 0 only
             // The tag bar's record-level tags (the locked zone tag + the
