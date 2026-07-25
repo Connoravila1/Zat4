@@ -56,6 +56,9 @@ const AAUDIO_DIRECTION_OUTPUT: i32 = 0;
 const AAUDIO_DIRECTION_INPUT: i32 = 1;
 const AAUDIO_FORMAT_PCM_I16: i32 = 1;
 const AAUDIO_PERFORMANCE_MODE_LOW_LATENCY: i32 = 12;
+// Input preset — many devices only actually deliver mic audio with a voice
+// preset set; the default can open an input stream that reads silence.
+const AAUDIO_INPUT_PRESET_VOICE_COMMUNICATION: i32 = 7;
 
 const CreateBuilderFn = *const fn (**AAudioStreamBuilder) callconv(.c) i32;
 const SetI32Fn = *const fn (*AAudioStreamBuilder, i32) callconv(.c) void;
@@ -76,6 +79,7 @@ const Lib = struct {
     set_performance_mode: SetI32Fn,
     open_stream: OpenStreamFn,
     builder_delete: BuilderResultFn,
+    set_input_preset: SetI32Fn,
     request_start: StreamResultFn,
     request_stop: StreamResultFn,
     stream_close: StreamResultFn,
@@ -101,6 +105,7 @@ fn load() ?Lib {
             .set_sample_rate = @ptrCast(@alignCast(dlsym(lib, "AAudioStreamBuilder_setSampleRate") orelse return null)),
             .set_channel_count = @ptrCast(@alignCast(dlsym(lib, "AAudioStreamBuilder_setChannelCount") orelse return null)),
             .set_performance_mode = @ptrCast(@alignCast(dlsym(lib, "AAudioStreamBuilder_setPerformanceMode") orelse return null)),
+            .set_input_preset = @ptrCast(@alignCast(dlsym(lib, "AAudioStreamBuilder_setInputPreset") orelse return null)),
             .open_stream = @ptrCast(@alignCast(dlsym(lib, "AAudioStreamBuilder_openStream") orelse return null)),
             .builder_delete = @ptrCast(@alignCast(dlsym(lib, "AAudioStreamBuilder_delete") orelse return null)),
             .request_start = @ptrCast(@alignCast(dlsym(lib, "AAudioStream_requestStart") orelse return null)),
@@ -147,6 +152,7 @@ pub fn open(stream: c_int, rate: u32, channels: u32, latency_us: u32) OpenError!
     lib.set_sample_rate(builder, @intCast(rate));
     lib.set_channel_count(builder, @intCast(channels));
     lib.set_performance_mode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+    if (stream == stream_capture) lib.set_input_preset(builder, AAUDIO_INPUT_PRESET_VOICE_COMMUNICATION);
 
     var s: *AAudioStream = undefined;
     const rc = lib.open_stream(builder, &s);

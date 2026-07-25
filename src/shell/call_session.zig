@@ -187,16 +187,41 @@ fn threadMain(s: *Session) void {
     var play_i16: [frame_samples]i16 = undefined;
     const play_bytes = std.mem.sliceAsBytes(play_i16[0..]);
 
+    // Diagnostics: per-second counts of the four stages so a lopsided call is
+    // visible in the log (which stage has zero is where audio dies). Also a
+    // rough peak amplitude of the captured frame — near-zero means the mic
+    // source is silent/wrong, not merely quiet.
+    const clog = std.log.scoped(.call);
+    const role = if (s.is_caller) "caller" else "callee";
+    var n_cap: usize = 0;
+    var n_recv: usize = 0;
+    var n_play: usize = 0;
+    var loops: usize = 0;
+    var last_peak: u32 = 0;
+
     // Capture-clocked full duplex: the mic read paces the loop at ~100 fps; each
     // pass we send one captured frame, drain whatever media has arrived, and
     // play it out. Blocking lives here, off the render thread.
     while (!s.stop.load(.acquire)) {
         const n = audio.capture(&mic, &cap, frame_samples);
-        if (n > 0) call_engine.sendFrame(&eng, std.mem.sliceAsBytes(cap[0..n])) catch {};
-        while (call_engine.pump(&eng, 0) == .media) {}
+        if (n > 0) {
+            var peak: u32 = 0;
+            for (cap[0..n]) |sample| {
+                const a: u32 = @abs(@as(i32, sample));
+                if (a > peak) peak = a;
+            }
+            last_peak = peak;
+            call_engine.sendFrame(&eng, std.mem.sliceAsBytes(cap[0..n])) catch {};
+            n_cap += 1;
+        }
+        while (call_engine.pump(&eng, 0) == .media) n_recv += 1;
         while (call_engine.playout(&eng, play_bytes)) |bytes| {
             audio.play(&spk, play_i16[0 .. bytes.len / 2], bytes.len / 2);
+            n_play += 1;
         }
+        loops += 1;
+        if (loops % 100 == 0)
+            clog.info("[call {s}] cap={d} recv={d} play={d} mic_peak={d}", .{ role, n_cap, n_recv, n_play, last_peak });
     }
     s.state.store(@intFromEnum(State.ended), .release);
 }
