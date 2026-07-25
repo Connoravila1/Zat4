@@ -1329,6 +1329,8 @@ test {
     _ = @import("shell/call_ice.zig"); // Zat Chat calling: ICE agent I/O (UDP over the codec)
     _ = @import("shell/call_engine.zig"); // Zat Chat calling: media engine glue (RTP+SRTP+jitter over ICE)
     _ = @import("shell/call_session.zig"); // Zat Chat calling: call session worker (ICE + engine + audio)
+    _ = @import("shell/opus_codec.zig"); // Zat Chat calling: the sealed audio codec (vendored Opus)
+    _ = @import("shell/device_power.zig"); // Zat Chat calling: battery + thermal sensors for the adaptive brain
     _ = @import("core/x11.zig");
     _ = @import("core/win32.zig");
     _ = @import("core/textinput.zig");

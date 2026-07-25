@@ -64,6 +64,16 @@ pub const Engine = struct {
     recv_started: bool,
     replay: srtp.ReplayWindow,
 
+    // What the adaptive brain measures the path by. Free-running totals, never
+    // reset here — a sampler takes differences between two reads, so it cannot
+    // race with this thread over a "clear" (E1: it reads values, it does not
+    // reach in and mutate).
+    recv_packets: u64,
+    recv_bytes: u64,
+    /// Sequence of the FIRST packet accepted, so a sampler can compute how many
+    /// packets should have arrived across any interval and subtract what did.
+    recv_first_seq: u16,
+
     jb: jitter.JitterBuffer,
 };
 
@@ -99,6 +109,9 @@ pub fn init(
         .recv_highest_seq = 0,
         .recv_started = false,
         .replay = .{},
+        .recv_packets = 0,
+        .recv_bytes = 0,
+        .recv_first_seq = 0,
         .jb = undefined,
     };
     try jitter.init(gpa, &e.jb, 32, max_packet, 3);
@@ -149,9 +162,12 @@ pub fn pump(e: *Engine, timeout_ms: i32) PumpResult {
     const rtp_len = srtp.unprotect(pkt, e.recv_keys, est, &plain) catch return .ignored;
     if (!srtp.accept(&e.replay, srtp.packetIndex(est, seq))) return .ignored; // replay / stale
 
+    if (!e.recv_started) e.recv_first_seq = seq;
     e.recv_roc = est;
     e.recv_highest_seq = seq;
     e.recv_started = true;
+    e.recv_packets += 1;
+    e.recv_bytes += pkt.len;
 
     const dparsed = rtp.parse(plain[0..rtp_len]) catch return .ignored;
     _ = jitter.insert(&e.jb, seq, dparsed.header.timestamp, dparsed.payload);

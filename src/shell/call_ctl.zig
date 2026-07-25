@@ -40,6 +40,12 @@ const chat_relay = @import("chat_relay.zig");
 /// connect-getsockname (no packet is sent). Any routable address works.
 const route_probe: [4]u8 = .{ 8, 8, 8, 8 };
 
+/// The longest DID we will remember as a call peer. `did:plc:` is 32 bytes and
+/// `did:web:` is bounded by the hostname; 128 covers both with room to spare,
+/// and a longer one simply doesn't get a courtesy hangup (E4 — an absent peer
+/// name is an ordinary result, not an error).
+const peer_cap = 128;
+
 /// PLAIN DATA (A1). The controller's state. A7.2: cold struct, size guard
 /// waived — one per session (lives on RunState), never in a collection.
 pub const CallCtl = struct {
@@ -50,7 +56,23 @@ pub const CallCtl = struct {
     pending_id: u64 = 0,
     pending_agent: call_ice.Agent = undefined,
     pending_exporter: [32]u8 = undefined,
+    /// Who the pending-or-live call is with, and its id — kept so a teardown can
+    /// send the peer a hangup instead of going silent on them.
+    peer_buf: [peer_cap]u8 = undefined,
+    peer_len: u8 = 0,
+    live_id: u64 = 0,
 };
+
+/// Remember the call's peer for the courtesy hangup. Silently keeps nothing for
+/// an over-long DID — the call still works, it just ends without notice.
+fn rememberPeer(ctl: *CallCtl, peer_did: []const u8) void {
+    if (peer_did.len > peer_cap) {
+        ctl.peer_len = 0;
+        return;
+    }
+    @memcpy(ctl.peer_buf[0..peer_did.len], peer_did);
+    ctl.peer_len = @intCast(peer_did.len);
+}
 
 /// A7.2: cold struct, size guard waived — a transient parsed address.
 const Addr = struct { ip: [4]u8, port: u16 };
@@ -119,6 +141,22 @@ pub fn startOutgoing(
     ctl.pending_id = call_id;
     ctl.pending_agent = agent;
     ctl.pending_exporter = exporter;
+    ctl.live_id = call_id;
+    rememberPeer(ctl, peer_did);
+}
+
+/// Reap a call whose worker has finished. The session thread exits on its own
+/// when ICE fails or the media loop stops, setting only its state — without
+/// this the controller would keep a dead `sess` forever and `busy()` would stay
+/// true, so every later offer was ignored until the app restarted. Called once
+/// per frame from the render loop; cheap (one atomic load).
+pub fn poll(ctl: *CallCtl) void {
+    const s = ctl.sess orelse return;
+    if (call_session.state(s) != .ended) return;
+    call_session.shutdown(s);
+    ctl.sess = null;
+    ctl.peer_len = 0;
+    ctl.live_id = 0;
 }
 
 /// Handle an inbound call signaling frame (`bytes` = `[kind][payload]`). On an
@@ -165,6 +203,8 @@ pub fn onSignal(
                 call_ice.close(&agent);
                 return;
             };
+            ctl.live_id = offer.call_id;
+            rememberPeer(ctl, peer_did);
         },
         call.kind_call_answer_wire => {
             if (!ctl.pending) return;
@@ -178,12 +218,36 @@ pub fn onSignal(
                 return;
             };
             ctl.pending = false;
+            ctl.live_id = answer.call_id;
+            rememberPeer(ctl, peer_did);
         },
         else => shutdown(ctl), // hangup / busy / decline
     }
 }
 
-/// Tear down any live or pending call.
+/// End the call from THIS side: tell the peer first, then tear down. Separate
+/// from `shutdown` because only this path has the chat channel to speak over —
+/// `shutdown` is the resource teardown and is also what runs at app exit.
+pub fn hangup(
+    ctl: *CallCtl,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: ?*const std.process.Environ.Map,
+    st: *chat_e2ee.State,
+    link: *chat_relay.ChatRelay,
+) void {
+    if (!busy(ctl)) return;
+    if (ctl.peer_len > 0) {
+        var frame: [64]u8 = undefined;
+        if (call.serializeBye(call.kind_call_hangup_wire, .{ .call_id = ctl.live_id, .reason = 0 }, &frame)) |n| {
+            chat_e2ee.sendCallFrame(gpa, io, env, st, link, ctl.peer_buf[0..ctl.peer_len], frame[0..n]) catch {};
+        } else |_| {}
+    }
+    shutdown(ctl);
+}
+
+/// Tear down any live or pending call, releasing the worker + socket. Sends
+/// nothing — use `hangup` when the peer should be told.
 pub fn shutdown(ctl: *CallCtl) void {
     if (ctl.sess) |s| {
         call_session.shutdown(s);
@@ -193,4 +257,6 @@ pub fn shutdown(ctl: *CallCtl) void {
         call_ice.close(&ctl.pending_agent);
         ctl.pending = false;
     }
+    ctl.peer_len = 0;
+    ctl.live_id = 0;
 }

@@ -27,21 +27,22 @@
 //!   call-audio <a|b> <bind-port> <peer-ip> <peer-port>
 //!     a = capture mic → send      b = receive → play speaker
 //!
-//! Raw 48 kHz mono S16, 10 ms frames (480 samples / 960 bytes) — no Opus yet, so
-//! it is bandwidth-heavy but fine on a LAN; the codec is a later slice.
+//! 48 kHz mono, 20 ms Opus frames — the same codec, frame size and settings the
+//! live call uses, so what this harness proves is what the app ships.
 
 const std = @import("std");
 const call_ice = @import("shell/call_ice.zig");
 const call_engine = @import("shell/call_engine.zig");
 const audio = @import("shell/audio_alsa.zig");
+const opus = @import("shell/opus_codec.zig");
 const media_keys = @import("core/media_keys.zig");
 const ice = @import("core/ice.zig");
 
 const pwd = "debug-call-credential";
 const call_id: u64 = 0xA0D10_CA11;
-const rate: u32 = 48000;
-const frame_samples: usize = 480; // 10 ms mono
-const total_frames: usize = 800; // ~8 s of talk time
+const rate: u32 = opus.sample_rate;
+const frame_samples: usize = opus.frame_samples; // 20 ms mono
+const total_frames: usize = 400; // ~8 s of talk time
 
 fn parseIp(s: []const u8) ![4]u8 {
     var out: [4]u8 = undefined;
@@ -104,28 +105,52 @@ pub fn main(init: std.process.Init) !void {
     if (is_sender) {
         var mic = try audio.open(audio.stream_capture, rate, 1, 40_000);
         defer audio.close(&mic);
+        var enc: opus.Encoder = undefined;
+        try opus.encoderInit(gpa, &enc, 1, 32_000);
+        defer opus.encoderDeinit(gpa, &enc);
+
         std.debug.print("[call-audio a] SPEAK NOW — streaming mic for ~8s…\n", .{});
-        var pcm: [frame_samples]i16 = undefined;
+        var pending: [frame_samples]i16 = undefined;
+        var scratch: [frame_samples]i16 = undefined;
+        var packet: [opus.max_packet_bytes]u8 = undefined;
+        var have: usize = 0;
         var sent: usize = 0;
-        while (sent < total_frames) : (sent += 1) {
-            const n = audio.capture(&mic, &pcm, frame_samples);
-            call_engine.sendFrame(&eng, std.mem.sliceAsBytes(pcm[0..n])) catch {};
+        var coded_bytes: usize = 0;
+        // Opus takes a whole frame or nothing, so partial captures accumulate
+        // — the same shape as the live session's tx loop.
+        while (sent < total_frames) {
+            const n = audio.capture(&mic, &scratch, frame_samples - have);
+            if (n == 0) continue;
+            @memcpy(pending[have .. have + n], scratch[0..n]);
+            have += n;
+            if (have < frame_samples) continue;
+            have = 0;
+            const coded = opus.encode(&enc, &pending, &packet) catch continue;
+            call_engine.sendFrame(&eng, coded) catch {};
+            coded_bytes += coded.len;
+            sent += 1;
             _ = call_engine.pump(&eng, 0); // non-blocking: drain any keepalive
         }
-        std.debug.print("[call-audio a] done — sent {d} frames.\n", .{total_frames});
+        std.debug.print("[call-audio a] done — sent {d} frames, {d} bytes ({d} kbps avg; raw PCM would have been 768).\n", .{
+            total_frames, coded_bytes, coded_bytes * 8 * 50 / total_frames / 1000,
+        });
     } else {
         var spk = try audio.open(audio.stream_playback, rate, 1, 60_000);
         defer audio.close(&spk);
+        var dec: opus.Decoder = undefined;
+        try opus.decoderInit(gpa, &dec, 1);
+        defer opus.decoderDeinit(gpa, &dec);
+
         std.debug.print("[call-audio b] playing received audio to the speaker…\n", .{});
         var played: usize = 0;
         var guard: usize = 0;
-        var pbuf_i16: [frame_samples]i16 = undefined; // i16-aligned; play out of it directly
-        const out_bytes = std.mem.sliceAsBytes(pbuf_i16[0..]);
+        var coded: [opus.max_packet_bytes]u8 = undefined;
+        var pbuf_i16: [frame_samples]i16 = undefined;
         while (played < total_frames and guard < total_frames * 4) : (guard += 1) {
             _ = call_engine.pump(&eng, 50);
-            while (call_engine.playout(&eng, out_bytes)) |bytes| {
-                const nsamp = bytes.len / 2;
-                audio.play(&spk, pbuf_i16[0..nsamp], nsamp);
+            while (call_engine.playout(&eng, &coded)) |payload| {
+                const pcm = opus.decode(&dec, payload, &pbuf_i16) catch continue;
+                audio.play(&spk, pcm, pcm.len);
                 played += 1;
             }
         }

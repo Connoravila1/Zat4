@@ -54,6 +54,8 @@ const call_ctl = if (builtin.os.tag == .linux) @import("call_ctl.zig") else stru
     pub const CallCtl = struct {};
     pub fn startOutgoing(_: *CallCtl, _: Allocator, _: std.Io, _: ?*const std.process.Environ.Map, _: anytype, _: anytype, _: []const u8) void {}
     pub fn onSignal(_: *CallCtl, _: Allocator, _: std.Io, _: ?*const std.process.Environ.Map, _: anytype, _: anytype, _: []const u8, _: []const u8) void {}
+    pub fn poll(_: *CallCtl) void {}
+    pub fn hangup(_: *CallCtl, _: Allocator, _: std.Io, _: ?*const std.process.Environ.Map, _: anytype, _: anytype) void {}
     pub fn shutdown(_: *CallCtl) void {}
 };
 const chat_view_core = @import("../core/chat_view.zig");
@@ -2335,6 +2337,12 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
             }
             chatLog("[auth] rotated tokens persisted", .{});
         }
+
+        // Reap a finished call. The session worker ends itself (ICE timeout,
+        // media stop) by setting its state; nothing else clears the controller's
+        // handle, so without this the endpoint stays "busy" and ignores every
+        // later offer until restart. One atomic load per frame.
+        call_ctl.poll(&rs.gcall);
 
         // Drain the chat relay's mailbox (M1): each delivered bucket is an
         // MLS message the E2EE session routes — a decrypted application
