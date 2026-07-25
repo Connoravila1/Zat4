@@ -779,6 +779,11 @@ const RunState = struct {
     /// chat channel → an ICE+media session worker). Idle until a call is placed
     /// or received. Torn down in `deinitRunState`.
     gcall: call_ctl.CallCtl = .{},
+    /// `--call-auto` (env `ZAT_CALL_AUTO`) bring-up: place a call to the first
+    /// conversation's peer as soon as chat is ready, once. For hands-free
+    /// on-device testing; a real call button is the product path.
+    gcall_auto: bool = false,
+    gcall_auto_fired: bool = false,
     /// Next second at which the unacknowledged-Welcome pump runs (A1). The
     /// pump itself is a walk of a handful of rows against a pure backoff, but
     /// there is no reason to do it 60 times a second.
@@ -1090,6 +1095,11 @@ fn initRunState(
     rs.gpa = gpa;
     rs.io = io;
     rs.environ = environ;
+    // Call state (the struct defaults don't apply after `rs.* = undefined`, so
+    // set them explicitly — a garbage CallCtl would make deinit's shutdown crash).
+    rs.gcall = .{};
+    rs.gcall_auto = if (environ) |e| e.get("ZAT_CALL_AUTO") != null else false;
+    rs.gcall_auto_fired = false;
     rs.session = session;
     rs.appview_url = appview_url;
     rs.store = store;
@@ -2703,6 +2713,17 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
             // M2.1: a drained bucket may have advanced an epoch or opened a
             // conversation — re-arm the rotated traffic mailboxes.
             if (saw_bucket) chatEnsureSubs(gpa, st, rs.gchat_link.?);
+
+            // --call-auto bring-up: once chat has a conversation, place a call to
+            // its peer, exactly once. Hands-free on-device testing (a real call
+            // button is the product path).
+            if (rs.gcall_auto and !rs.gcall_auto_fired) {
+                if (chat_e2ee.firstPeer(st)) |pd| {
+                    chatLog("[call] --call-auto: placing a call to {s}", .{pd});
+                    call_ctl.startOutgoing(&rs.gcall, gpa, io, environ, st, rs.gchat_link.?, pd);
+                    rs.gcall_auto_fired = true;
+                }
+            }
 
             // A1 — the unacknowledged-Welcome pump. A Welcome is one shot into
             // a relay whose store is in-memory: lose it to a restart, a

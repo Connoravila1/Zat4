@@ -472,6 +472,12 @@ pub fn exporterFor(st: *const State, peer_did: []const u8) ?[32]u8 {
     return st.groups.items[idx].secrets.exporter;
 }
 
+/// The first conversation's peer DID, or null if chat has no conversation yet.
+/// Used by the `--call-auto` bring-up path to place a call without UI input.
+pub fn firstPeer(st: *const State) ?[]const u8 {
+    return if (st.peer_dids.items.len > 0) st.peer_dids.items[0] else null;
+}
+
 /// EVERY session with this peer — one per device of theirs. The buffer is the
 /// device cap (`keydir.max_devices`) with headroom, so this never allocates on a
 /// send path.
