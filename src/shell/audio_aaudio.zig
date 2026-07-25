@@ -192,7 +192,8 @@ pub fn play(p: *Pcm, buf: []const i16, frames: usize) void {
 /// caller sends silence rather than crashing, E2). The calling engine's mic path
 /// on Android; the ALSA shim has the matching `capture` on the desktop.
 pub fn capture(p: *Pcm, buf: []i16, frames: usize) usize {
-    const timeout_ns: i64 = 200_000_000; // 200ms: well over one 10ms frame
+    const timeout_ns: i64 = 40_000_000; // 40ms: real-time input returns in ~10ms; a
+    // shorter timeout keeps the capture thread from stalling when the mic is starved
     const ptr: *anyopaque = @ptrCast(buf.ptr);
     const got = p.lib.read(p.stream, ptr, @intCast(frames), timeout_ns);
     if (got <= 0) return 0;

@@ -47,6 +47,21 @@ const audio = if (builtin.abi.isAndroid())
 else
     @import("audio_alsa.zig");
 
+// Android routes logs through liblog (stderr is dropped); the desktop uses
+// stderr. `callLog` picks the right one so the call's diagnostics show on both
+// (mirrors `android_dns.trace`). The extern is only referenced under the
+// comptime-android branch, so off-Android nothing links against liblog.
+extern fn __android_log_write(prio: c_int, tag: [*:0]const u8, text: [*:0]const u8) c_int;
+fn callLog(comptime fmt: []const u8, args: anytype) void {
+    var buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrintZ(&buf, fmt, args) catch return;
+    if (comptime builtin.abi.isAndroid()) {
+        _ = __android_log_write(4, "zat4", msg);
+    } else {
+        std.debug.print("{s}\n", .{msg});
+    }
+}
+
 const rate: u32 = 48000;
 const channels: u32 = 1;
 const frame_samples: usize = 480; // 10 ms mono @ 48 kHz
@@ -183,27 +198,55 @@ fn threadMain(s: *Session) void {
     };
     defer audio.close(&spk);
 
-    var cap: [frame_samples]i16 = undefined;
+    const role = if (s.is_caller) "caller" else "callee";
+
+    // FULL DUPLEX ON TWO THREADS. Capture→send runs on its own thread so a
+    // blocking/slow mic read can't stall playout, and receive→play runs here so
+    // a playout backlog can't stall capture. The engine's send state (seq/ts/
+    // ROC) is touched only by the tx thread and its receive state (jitter/replay)
+    // only by this thread — disjoint, so no lock is needed; the shared UDP socket
+    // does concurrent sendto/recvfrom, which is safe.
+    var tx = TxThread{ .eng = &eng, .mic = &mic, .stop = &s.stop, .role = role };
+    const tx_handle = std.Thread.spawn(.{}, txLoop, .{&tx}) catch {
+        s.state.store(@intFromEnum(State.ended), .release);
+        return;
+    };
+
     var play_i16: [frame_samples]i16 = undefined;
     const play_bytes = std.mem.sliceAsBytes(play_i16[0..]);
-
-    // Diagnostics: per-second counts of the four stages so a lopsided call is
-    // visible in the log (which stage has zero is where audio dies). Also a
-    // rough peak amplitude of the captured frame — near-zero means the mic
-    // source is silent/wrong, not merely quiet.
-    const clog = std.log.scoped(.call);
-    const role = if (s.is_caller) "caller" else "callee";
-    var n_cap: usize = 0;
     var n_recv: usize = 0;
     var n_play: usize = 0;
     var loops: usize = 0;
-    var last_peak: u32 = 0;
-
-    // Capture-clocked full duplex: the mic read paces the loop at ~100 fps; each
-    // pass we send one captured frame, drain whatever media has arrived, and
-    // play it out. Blocking lives here, off the render thread.
     while (!s.stop.load(.acquire)) {
-        const n = audio.capture(&mic, &cap, frame_samples);
+        if (call_engine.pump(&eng, 20) == .media) n_recv += 1; // blocks ≤20ms for a packet
+        while (call_engine.playout(&eng, play_bytes)) |bytes| {
+            audio.play(&spk, play_i16[0 .. bytes.len / 2], bytes.len / 2);
+            n_play += 1;
+        }
+        loops += 1;
+        if (loops % 200 == 0) callLog("[call {s} rx] recv={d} play={d}", .{ role, n_recv, n_play });
+    }
+    tx_handle.join(); // BEFORE the audio/engine defers free what tx points at
+    s.state.store(@intFromEnum(State.ended), .release);
+}
+
+/// Capture→send worker state (the tx thread). Points at threadMain's engine +
+/// mic, which outlive it (threadMain joins before its defers run). A7.2: cold
+/// struct, size guard waived — one per call, never in a collection.
+const TxThread = struct {
+    eng: *call_engine.Engine,
+    mic: *audio.Pcm,
+    stop: *std.atomic.Value(bool),
+    role: []const u8,
+};
+
+fn txLoop(t: *TxThread) void {
+    var cap: [frame_samples]i16 = undefined;
+    var n_cap: usize = 0;
+    var loops: usize = 0;
+    var last_peak: u32 = 0;
+    while (!t.stop.load(.acquire)) {
+        const n = audio.capture(t.mic, &cap, frame_samples);
         if (n > 0) {
             var peak: u32 = 0;
             for (cap[0..n]) |sample| {
@@ -211,17 +254,10 @@ fn threadMain(s: *Session) void {
                 if (a > peak) peak = a;
             }
             last_peak = peak;
-            call_engine.sendFrame(&eng, std.mem.sliceAsBytes(cap[0..n])) catch {};
+            call_engine.sendFrame(t.eng, std.mem.sliceAsBytes(cap[0..n])) catch {};
             n_cap += 1;
         }
-        while (call_engine.pump(&eng, 0) == .media) n_recv += 1;
-        while (call_engine.playout(&eng, play_bytes)) |bytes| {
-            audio.play(&spk, play_i16[0 .. bytes.len / 2], bytes.len / 2);
-            n_play += 1;
-        }
         loops += 1;
-        if (loops % 100 == 0)
-            clog.info("[call {s}] cap={d} recv={d} play={d} mic_peak={d}", .{ role, n_cap, n_recv, n_play, last_peak });
+        if (loops % 100 == 0) callLog("[call {s} tx] cap={d} mic_peak={d}", .{ t.role, n_cap, last_peak });
     }
-    s.state.store(@intFromEnum(State.ended), .release);
 }
