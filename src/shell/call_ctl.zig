@@ -46,22 +46,53 @@ const route_probe: [4]u8 = .{ 8, 8, 8, 8 };
 /// name is an ordinary result, not an error).
 const peer_cap = 128;
 
+/// Where a call is in its life, as the UI needs to show it.
+pub const Phase = enum(u8) {
+    /// Nothing happening.
+    idle,
+    /// Someone is calling US and we have NOT answered. The microphone is not
+    /// open and no media socket exists — see `onSignal`.
+    ringing_in,
+    /// We called someone and are waiting for them to pick up.
+    ringing_out,
+    /// A session worker is up: connecting, or connected and carrying media.
+    active,
+};
+
 /// PLAIN DATA (A1). The controller's state. A7.2: cold struct, size guard
 /// waived — one per session (lives on RunState), never in a collection.
 pub const CallCtl = struct {
+    phase: Phase = .idle,
+
     /// The live call, once ICE addresses are exchanged and the worker is up.
     sess: ?*call_session.Session = null,
-    /// Outgoing call we placed, waiting for the peer's answer.
-    pending: bool = false,
+
+    /// Outgoing call we placed, waiting for the peer's answer. The socket is
+    /// already open and gathering, because the candidate had to go in the offer.
     pending_id: u64 = 0,
     pending_agent: call_ice.Agent = undefined,
     pending_exporter: [32]u8 = undefined,
-    /// Who the pending-or-live call is with, and its id — kept so a teardown can
-    /// send the peer a hangup instead of going silent on them.
+
+    /// An UNANSWERED inbound offer. Deliberately just the plain facts of it —
+    /// no socket, no worker, no capture device. Nothing that touches hardware
+    /// happens until `accept`.
+    incoming_id: u64 = 0,
+    incoming_ip: [4]u8 = .{ 0, 0, 0, 0 },
+    incoming_port: u16 = 0,
+    incoming_exporter: [32]u8 = undefined,
+
+    /// Who the call is with, and its id — kept so a teardown can send the peer a
+    /// hangup instead of going silent on them.
     peer_buf: [peer_cap]u8 = undefined,
     peer_len: u8 = 0,
     live_id: u64 = 0,
 };
+
+/// The peer this call is with, for the UI to name. Empty when there is no call
+/// (or the DID was too long to keep — see `rememberPeer`).
+pub fn peerDid(ctl: *const CallCtl) []const u8 {
+    return ctl.peer_buf[0..ctl.peer_len];
+}
 
 /// Remember the call's peer for the courtesy hangup. Silently keeps nothing for
 /// an over-long DID — the call still works, it just ends without notice.
@@ -92,9 +123,9 @@ fn fmtCandidate(agent: *call_ice.Agent, buf: []u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}:{d}", .{ cand.addr[0], cand.addr[1], cand.addr[2], cand.addr[3], cand.port }) catch null;
 }
 
-/// True while a call is being set up or is live.
+/// True while a call is being set up, ringing, or live.
 pub fn busy(ctl: *const CallCtl) bool {
-    return ctl.sess != null or ctl.pending;
+    return ctl.phase != .idle;
 }
 
 /// Place a call to `peer_did`: open a socket, gather our host candidate, and
@@ -137,12 +168,92 @@ pub fn startOutgoing(
     };
     chat_e2ee.sendCallFrame(gpa, io, env, st, link, peer_did, frame[0..n]) catch {};
 
-    ctl.pending = true;
+    ctl.phase = .ringing_out;
     ctl.pending_id = call_id;
     ctl.pending_agent = agent;
     ctl.pending_exporter = exporter;
     ctl.live_id = call_id;
     rememberPeer(ctl, peer_did);
+}
+
+/// ANSWER the call that is ringing. THIS is the only path that opens the
+/// microphone. Gathers our candidate, sends the answer, and starts the session
+/// worker. A no-op unless something is actually ringing.
+pub fn accept(
+    ctl: *CallCtl,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: ?*const std.process.Environ.Map,
+    st: *chat_e2ee.State,
+    link: *chat_relay.ChatRelay,
+) void {
+    if (ctl.phase != .ringing_in) return;
+
+    var agent = call_ice.open(0) catch {
+        ctl.phase = .idle;
+        return;
+    };
+    var cand_buf: [32]u8 = undefined;
+    const sdp = fmtCandidate(&agent, &cand_buf) orelse {
+        call_ice.close(&agent);
+        ctl.phase = .idle;
+        return;
+    };
+
+    var frame: [256]u8 = undefined;
+    const n = call.serializeAnswer(.{
+        .call_id = ctl.incoming_id,
+        .fingerprint = [_]u8{0} ** call.fingerprint_len,
+        .accept_video = false,
+        .sdp = sdp,
+    }, &frame) catch {
+        call_ice.close(&agent);
+        ctl.phase = .idle;
+        return;
+    };
+    chat_e2ee.sendCallFrame(gpa, io, env, st, link, peerDid(ctl), frame[0..n]) catch {};
+
+    ctl.sess = call_session.start(gpa, agent, ctl.incoming_ip, ctl.incoming_port, ctl.incoming_exporter, ctl.incoming_id, false) catch {
+        call_ice.close(&agent);
+        ctl.phase = .idle;
+        return;
+    };
+    ctl.phase = .active;
+}
+
+/// REFUSE the call that is ringing: tell the peer, and go back to idle without
+/// ever having opened a device.
+pub fn decline(
+    ctl: *CallCtl,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: ?*const std.process.Environ.Map,
+    st: *chat_e2ee.State,
+    link: *chat_relay.ChatRelay,
+) void {
+    if (ctl.phase != .ringing_in) return;
+    var frame: [64]u8 = undefined;
+    if (call.serializeBye(call.kind_call_decline_wire, .{ .call_id = ctl.incoming_id, .reason = 0 }, &frame)) |n| {
+        chat_e2ee.sendCallFrame(gpa, io, env, st, link, peerDid(ctl), frame[0..n]) catch {};
+    } else |_| {}
+    ctl.phase = .idle;
+    ctl.peer_len = 0;
+    ctl.live_id = 0;
+}
+
+/// Is the microphone currently being sent to the peer? False while ringing —
+/// there is nothing to mute yet.
+pub fn muted(ctl: *const CallCtl) bool {
+    const s = ctl.sess orelse return false;
+    return call_session.muted(s);
+}
+
+/// Stop or resume sending our microphone. The capture device stays open and the
+/// media clock keeps running; only the transmission stops, so the peer hears
+/// silence rather than a stalled stream.
+pub fn setMuted(ctl: *CallCtl, on: bool) void {
+    const s = ctl.sess orelse return;
+    call_session.setMuted(s, on);
 }
 
 /// Reap a call whose worker has finished. The session thread exits on its own
@@ -155,6 +266,7 @@ pub fn poll(ctl: *CallCtl) void {
     if (call_session.state(s) != .ended) return;
     call_session.shutdown(s);
     ctl.sess = null;
+    ctl.phase = .idle;
     ctl.peer_len = 0;
     ctl.live_id = 0;
 }
@@ -176,48 +288,48 @@ pub fn onSignal(
     if (bytes.len == 0) return;
     switch (bytes[0]) {
         call.kind_call_offer_wire => {
-            if (busy(ctl)) return; // v1: ignore a second call while in one
+            if (busy(ctl)) {
+                // Already in or setting up a call. Tell them rather than
+                // letting the offer vanish into silence.
+                const other = call.parseOffer(bytes) catch return;
+                var frame: [64]u8 = undefined;
+                if (call.serializeBye(call.kind_call_busy_wire, .{ .call_id = other.call_id, .reason = 0 }, &frame)) |n| {
+                    chat_e2ee.sendCallFrame(gpa, io, env, st, link, peer_did, frame[0..n]) catch {};
+                } else |_| {}
+                return;
+            }
             const offer = call.parseOffer(bytes) catch return;
             const peer = parseAddr(offer.sdp) orelse return;
             const exporter = chat_e2ee.exporterFor(st, peer_did) orelse return;
 
-            var agent = call_ice.open(0) catch return;
-            var cand_buf: [32]u8 = undefined;
-            const sdp = fmtCandidate(&agent, &cand_buf) orelse {
-                call_ice.close(&agent);
-                return;
-            };
-            var frame: [256]u8 = undefined;
-            const n = call.serializeAnswer(.{
-                .call_id = offer.call_id,
-                .fingerprint = [_]u8{0} ** call.fingerprint_len,
-                .accept_video = false,
-                .sdp = sdp,
-            }, &frame) catch {
-                call_ice.close(&agent);
-                return;
-            };
-            chat_e2ee.sendCallFrame(gpa, io, env, st, link, peer_did, frame[0..n]) catch {};
-
-            ctl.sess = call_session.start(gpa, agent, peer.ip, peer.port, exporter, offer.call_id, false) catch {
-                call_ice.close(&agent);
-                return;
-            };
+            // RING. Do NOT answer, do NOT open a socket, do NOT open the
+            // microphone. An inbound offer is a REQUEST; until a person accepts
+            // it, the only thing that happens is that we remember it.
+            //
+            // This used to auto-answer, which meant any peer in a conversation
+            // could open this device's microphone silently and with no
+            // indication. That was a bring-up convenience and it had no business
+            // outliving bring-up.
+            ctl.phase = .ringing_in;
+            ctl.incoming_id = offer.call_id;
+            ctl.incoming_ip = peer.ip;
+            ctl.incoming_port = peer.port;
+            ctl.incoming_exporter = exporter;
             ctl.live_id = offer.call_id;
             rememberPeer(ctl, peer_did);
         },
         call.kind_call_answer_wire => {
-            if (!ctl.pending) return;
+            if (ctl.phase != .ringing_out) return;
             const answer = call.parseAnswer(bytes) catch return;
             if (answer.call_id != ctl.pending_id) return;
             const peer = parseAddr(answer.sdp) orelse return;
             // The session takes ownership of the pending socket.
             ctl.sess = call_session.start(gpa, ctl.pending_agent, peer.ip, peer.port, ctl.pending_exporter, answer.call_id, true) catch {
                 call_ice.close(&ctl.pending_agent);
-                ctl.pending = false;
+                ctl.phase = .idle;
                 return;
             };
-            ctl.pending = false;
+            ctl.phase = .active;
             ctl.live_id = answer.call_id;
             rememberPeer(ctl, peer_did);
         },
@@ -253,10 +365,11 @@ pub fn shutdown(ctl: *CallCtl) void {
         call_session.shutdown(s);
         ctl.sess = null;
     }
-    if (ctl.pending) {
-        call_ice.close(&ctl.pending_agent);
-        ctl.pending = false;
-    }
+    // An outgoing call still holds the socket it gathered its candidate on; a
+    // ringing INBOUND call holds nothing, which is the whole point of the
+    // consent gate.
+    if (ctl.phase == .ringing_out) call_ice.close(&ctl.pending_agent);
+    ctl.phase = .idle;
     ctl.peer_len = 0;
     ctl.live_id = 0;
 }

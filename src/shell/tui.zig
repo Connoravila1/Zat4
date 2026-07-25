@@ -51,12 +51,19 @@ const call = @import("../core/call.zig");
 // §3) stays clean — the same posture as the audio shims. `builtin.os.tag ==
 // .linux` is true for Android too, so the phone build gets the real thing.
 const call_ctl = if (builtin.os.tag == .linux) @import("call_ctl.zig") else struct {
-    pub const CallCtl = struct {};
+    pub const Phase = enum(u8) { idle, ringing_in, ringing_out, active };
+    pub const CallCtl = struct { phase: Phase = .idle };
     pub fn startOutgoing(_: *CallCtl, _: Allocator, _: std.Io, _: ?*const std.process.Environ.Map, _: anytype, _: anytype, _: []const u8) void {}
     pub fn onSignal(_: *CallCtl, _: Allocator, _: std.Io, _: ?*const std.process.Environ.Map, _: anytype, _: anytype, _: []const u8, _: []const u8) void {}
     pub fn poll(_: *CallCtl) void {}
+    pub fn accept(_: *CallCtl, _: Allocator, _: std.Io, _: ?*const std.process.Environ.Map, _: anytype, _: anytype) void {}
+    pub fn decline(_: *CallCtl, _: Allocator, _: std.Io, _: ?*const std.process.Environ.Map, _: anytype, _: anytype) void {}
     pub fn hangup(_: *CallCtl, _: Allocator, _: std.Io, _: ?*const std.process.Environ.Map, _: anytype, _: anytype) void {}
     pub fn shutdown(_: *CallCtl) void {}
+    pub fn busy(_: *const CallCtl) bool { return false; }
+    pub fn peerDid(_: *const CallCtl) []const u8 { return ""; }
+    pub fn muted(_: *const CallCtl) bool { return false; }
+    pub fn setMuted(_: *CallCtl, _: bool) void {}
 };
 const chat_view_core = @import("../core/chat_view.zig");
 const chat_games = @import("../core/chat_games.zig");
@@ -2731,6 +2738,14 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     call_ctl.startOutgoing(&rs.gcall, gpa, io, environ, st, rs.gchat_link.?, pd);
                     rs.gcall_auto_fired = true;
                 }
+            }
+            // ...and, on the RECEIVING end of the same bring-up rig, answer
+            // without a person present. DEV ONLY, and only under this explicit
+            // switch: an inbound call otherwise rings and waits, because
+            // answering opens the microphone and that is a person's decision.
+            if (rs.gcall_auto and rs.gcall.phase == .ringing_in) {
+                chatLog("[call] --call-auto: answering the inbound call", .{});
+                call_ctl.accept(&rs.gcall, gpa, io, environ, st, rs.gchat_link.?);
             }
 
             // A1 — the unacknowledged-Welcome pump. A Welcome is one shot into

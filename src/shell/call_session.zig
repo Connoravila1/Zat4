@@ -123,7 +123,22 @@ pub const Session = struct {
     /// What the brain wants the encoder set to next.
     want_bitrate_bps: std.atomic.Value(u32),
     want_loss_percent: std.atomic.Value(u32),
+
+    /// Set by the render thread, read by tx. Mute is DTX held permanently on:
+    /// the capture device stays open and the media clock keeps advancing, but
+    /// nothing goes on the wire, so the peer hears the same comfort noise they
+    /// would during a natural pause rather than a stream that has stalled.
+    mute: std.atomic.Value(bool),
 };
+
+/// Is the microphone being withheld from the peer?
+pub fn muted(s: *const Session) bool {
+    return s.mute.load(.acquire);
+}
+
+pub fn setMuted(s: *Session, on: bool) void {
+    s.mute.store(on, .release);
+}
 
 /// The short-term ICE credential (STUN MESSAGE-INTEGRITY key), derived from the
 /// shared MLS-exporter material so both ends agree without a separate exchange.
@@ -170,6 +185,7 @@ pub fn start(
         .mic_peak = .init(0),
         .want_bitrate_bps = .init(@intCast(initial_bitrate_bps)),
         .want_loss_percent = .init(0),
+        .mute = .init(false),
     };
     s.thread = try std.Thread.spawn(.{}, threadMain, .{s});
     return s;
@@ -549,7 +565,9 @@ fn txLoop(t: *TxThread) void {
             if (a > peak) peak = a;
         }
         last_peak = peak;
-        t.sess.mic_peak.store(peak, .release);
+        // While muted, report no level: the brain must not read a muted mic as
+        // "this person is speaking", and a UI level meter must not move.
+        t.sess.mic_peak.store(if (t.sess.mute.load(.acquire)) 0 else peak, .release);
 
         // Apply whatever the brain decided since the last frame. Opus takes a
         // new bitrate mid-stream with no glitch and no renegotiation, which is
@@ -577,7 +595,11 @@ fn txLoop(t: *TxThread) void {
         // wire (see `opus_codec.isSuppressible`). Only the media clock advances,
         // so the receiver still learns exactly how much time passed and its
         // loss accounting sees an unbroken run of sequence numbers.
-        if (opus.isSuppressible(coded)) {
+        //
+        // MUTE takes the identical path — it is simply silence we chose. The
+        // frame is still encoded, so the encoder's state stays continuous and
+        // unmuting resumes without a glitch.
+        if (t.sess.mute.load(.acquire) or opus.isSuppressible(coded)) {
             call_engine.skipFrame(t.eng);
             n_silent += 1;
             silent_run = true;
