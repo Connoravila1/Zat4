@@ -283,11 +283,15 @@ fn threadMain(s: *Session) void {
 
     var sampler = Sampler{
         .bandwidth = congestion.init(@intCast(initial_bitrate_bps / 1000)),
+        .delay = .{},
         .last_ns = clock_shell.monotonicNanos(),
         .last_packets = 0,
         .last_bytes = 0,
         .last_seq = 0,
         .remote_active = false,
+        .prev_arrival_ns = 0,
+        .prev_media_ts = 0,
+        .have_prev = false,
     };
 
     // The speaker must be fed at real time whether or not packets arrive. A
@@ -300,7 +304,10 @@ fn threadMain(s: *Session) void {
     const frame_ns: u64 = @as(u64, frame_samples) * 1_000_000_000 / rate;
 
     while (!s.stop.load(.acquire)) {
-        if (call_engine.pump(&eng, 20) == .media) n_recv += 1; // blocks ≤20ms for a packet
+        if (call_engine.pump(&eng, 20) == .media) { // blocks ≤20ms for a packet
+            n_recv += 1;
+            observePacket(&sampler, &eng, clock_shell.monotonicNanos());
+        }
         while (call_engine.playout(&eng, &coded)) |payload| {
             const pcm = opus.decode(&dec, payload, &play_i16) catch continue;
             audio.play(&spk, pcm, pcm.len);
@@ -344,12 +351,35 @@ fn threadMain(s: *Session) void {
 /// thread's stack, never in a collection.
 const Sampler = struct {
     bandwidth: congestion.Controller,
+    delay: congestion.DelayTracker,
     last_ns: u64,
     last_packets: u64,
     last_bytes: u64,
     last_seq: u16,
     remote_active: bool,
+    /// When the previous media packet arrived, and what media time it carried —
+    /// the pair the delay tracker compares.
+    prev_arrival_ns: u64,
+    prev_media_ts: u32,
+    have_prev: bool,
 };
+
+/// Fold one arrived packet into the delay trend. Called the moment `pump`
+/// reports media, because the measurement IS the arrival time — deferring it to
+/// the once-a-second sampler would measure when we got around to looking.
+fn observePacket(sm: *Sampler, eng: *const call_engine.Engine, arrival_ns: u64) void {
+    const media_ts = eng.recv_last_ts;
+    if (sm.have_prev) {
+        const arrival_delta_ms = @as(f32, @floatFromInt(arrival_ns -% sm.prev_arrival_ns)) / 1_000_000.0;
+        // RTP timestamps advance at the sample rate, so the difference converts
+        // to milliseconds by dividing by samples-per-millisecond.
+        const media_delta_ms = @as(f32, @floatFromInt(media_ts -% sm.prev_media_ts)) / (@as(f32, @floatFromInt(rate)) / 1000.0);
+        _ = congestion.observeArrival(&sm.delay, arrival_delta_ms, media_delta_ms);
+    }
+    sm.prev_arrival_ns = arrival_ns;
+    sm.prev_media_ts = media_ts;
+    sm.have_prev = true;
+}
 
 /// ONE INTERVAL OF THE ADAPTIVE LOOP (ZAT_CHAT_CALLING_ROADMAP §4).
 ///
@@ -402,10 +432,18 @@ fn decide(s: *Session, sm: *Sampler, eng: *call_engine.Engine, role: []const u8)
     // reported as "no evidence of a problem" and the estimator runs on its loss
     // controller alone. Wiring the ICE keepalive RTT in is the next slice; it
     // changes only these two lines.
+    // The delay gradient comes from `observePacket`, which compares each
+    // packet's arrival against the media clock it carries — a queue building on
+    // the path shows up here well before it costs a single dropped packet.
+    //
+    // RTT is still reported as zero: it needs RTCP receiver reports or an ICE
+    // keepalive round trip, and NOTHING CURRENTLY READS IT (neither this
+    // controller nor the decision function), so plumbing it would produce a
+    // number with no consumer. Recorded rather than quietly filled with a guess.
     const bandwidth_kbps = congestion.update(&sm.bandwidth, .{
         .rtt_ms = 0,
         .loss_fraction = loss_fraction,
-        .delay_gradient_ms = 0,
+        .delay_gradient_ms = sm.delay.gradient_ms,
         .acked_bitrate_kbps = acked_kbps,
     });
 
@@ -445,10 +483,11 @@ fn decide(s: *Session, sm: *Sampler, eng: *call_engine.Engine, role: []const u8)
     s.want_bitrate_bps.store(@as(u32, cfg.audio_bitrate_kbps) * 1000, .release);
     s.want_loss_percent.store(@intFromFloat(@round(loss_fraction * 100.0)), .release);
 
-    callLog("[call {s} brain] rx={d}kbps loss={d}% est={d}kbps batt={d}% therm={d} -> audio {d}kbps", .{
+    callLog("[call {s} brain] rx={d}kbps loss={d}% delay={d}ms est={d}kbps batt={d}% therm={d} -> audio {d}kbps", .{
         role,
         acked_kbps,
         @as(u32, @intFromFloat(@round(loss_fraction * 100.0))),
+        @as(i32, @intFromFloat(@round(sm.delay.gradient_ms))),
         bandwidth_kbps,
         battery,
         @as(u32, @intFromFloat(@round(headroom * 100.0))),

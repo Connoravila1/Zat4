@@ -130,6 +130,70 @@ pub fn update(c: *Controller, fb: Feedback) u32 {
     return c.target_kbps;
 }
 
+// ---------------------------------------------------------------------------
+// Inter-arrival delay tracking — where `Feedback.delay_gradient_ms` comes from
+// ---------------------------------------------------------------------------
+
+/// How much weight a single new observation carries. Low, because inter-arrival
+/// deltas are noisy at packet granularity — one descheduled thread produces a
+/// 20 ms spike that means nothing about the path. The detector should respond
+/// to a queue that is genuinely filling over a few hundred milliseconds, not to
+/// a single late packet.
+const delay_smoothing: f32 = 0.10;
+
+/// A jump larger than this between two packets' media timestamps means they are
+/// not adjacent — a DTX silence gap, or a stretch of loss. The delay variation
+/// across such a gap says nothing about queueing, so it is discarded rather than
+/// smoothed in. (Two frame times; anything within that is an ordinary pair.)
+const max_adjacent_media_ms: f32 = 45.0;
+
+/// PLAIN DATA (A1). The smoothed one-way delay trend for a receiving stream.
+/// Positive means packets are arriving progressively later than the media clock
+/// says they should — a queue building somewhere on the path, which is the
+/// earliest available signal that the link is about to congest, well before any
+/// packet is actually dropped.
+pub const DelayTracker = struct {
+    gradient_ms: f32 = 0,
+    started: bool = false,
+    _pad: [3]u8 = [_]u8{0} ** 3, // A6: explicit pad to the 4-byte boundary
+
+    comptime {
+        // Budget: f32 = 4, then bool + pad[3] = 4. 8 exact, align 4.
+        assert(@sizeOf(DelayTracker) == 8);
+    }
+};
+
+/// Fold one packet pair into the delay trend and return the current gradient,
+/// ready to hand to `update` as `Feedback.delay_gradient_ms`.
+///
+/// `arrival_delta_ms` is how long actually elapsed between receiving the two
+/// packets; `media_delta_ms` is how much media time separates them, from their
+/// RTP timestamps. On an uncongested path those agree and the difference is
+/// zero. When a queue builds, packets bunch up and then arrive late, so arrival
+/// outpaces media and the difference goes positive.
+///
+/// PURE (B2): the caller reads the clock and does the subtraction; this decides
+/// nothing about time itself.
+pub fn observeArrival(dt: *DelayTracker, arrival_delta_ms: f32, media_delta_ms: f32) f32 {
+    // Not adjacent packets — a silence gap or a loss run. Comparing across it
+    // would read the gap itself as delay. Skip, and keep what we had.
+    if (media_delta_ms <= 0 or media_delta_ms > max_adjacent_media_ms) return dt.gradient_ms;
+
+    const variation = arrival_delta_ms - media_delta_ms;
+
+    // The first observation seeds the average outright; blending it toward a
+    // zero that was never measured would make the tracker read healthy for its
+    // first several hundred milliseconds regardless of the path.
+    if (!dt.started) {
+        dt.gradient_ms = variation;
+        dt.started = true;
+        return dt.gradient_ms;
+    }
+
+    dt.gradient_ms += delay_smoothing * (variation - dt.gradient_ms);
+    return dt.gradient_ms;
+}
+
 fn scale(v: u32, factor: f32) u32 {
     const r = @as(f32, @floatFromInt(v)) * factor;
     if (r <= 0) return 0;
@@ -201,4 +265,64 @@ test "update is deterministic (B2)" {
     const fb: Feedback = .{ .rtt_ms = 55, .loss_fraction = 0.05, .delay_gradient_ms = 3.0, .acked_bitrate_kbps = 680 };
     try testing.expectEqual(update(&a, fb), update(&b, fb));
     try testing.expectEqual(a.target_kbps, b.target_kbps);
+}
+
+// --- inter-arrival delay tracking ------------------------------------------
+
+test "a steady path shows no delay trend" {
+    var dt: DelayTracker = .{};
+    // Packets arriving exactly on the media clock: 20 ms apart, 20 ms of media.
+    var g: f32 = 0;
+    for (0..100) |_| g = observeArrival(&dt, 20.0, 20.0);
+    try testing.expect(@abs(g) < 0.5);
+}
+
+test "a filling queue drives the gradient positive" {
+    var dt: DelayTracker = .{};
+    // Each packet arrives 3 ms later than the media clock accounts for — the
+    // signature of a queue growing somewhere on the path.
+    var g: f32 = 0;
+    for (0..200) |_| g = observeArrival(&dt, 23.0, 20.0);
+    try testing.expect(g > 2.5);
+
+    // ...and the controller must actually react to it, not merely record it.
+    var c = init(1000);
+    _ = update(&c, .{ .rtt_ms = 40, .loss_fraction = 0.0, .delay_gradient_ms = g * 5, .acked_bitrate_kbps = 900 });
+    try testing.expectEqual(BandwidthUsage.overusing, c.delay_state);
+}
+
+test "a draining queue drives the gradient negative" {
+    var dt: DelayTracker = .{};
+    var g: f32 = 0;
+    for (0..200) |_| g = observeArrival(&dt, 17.0, 20.0);
+    try testing.expect(g < -2.5);
+}
+
+test "a single late packet does not move the trend much" {
+    var dt: DelayTracker = .{};
+    for (0..100) |_| _ = observeArrival(&dt, 20.0, 20.0);
+    // One descheduled thread, 40 ms late. That is noise, not congestion.
+    const g = observeArrival(&dt, 60.0, 20.0);
+    try testing.expect(g < 5.0);
+}
+
+test "a DTX silence gap is skipped, not read as delay" {
+    var dt: DelayTracker = .{};
+    for (0..100) |_| _ = observeArrival(&dt, 20.0, 20.0);
+    const before = dt.gradient_ms;
+    // 400 ms of suppressed silence: both clocks jump together, but the pair is
+    // not adjacent and says nothing about queueing.
+    const after = observeArrival(&dt, 400.0, 400.0);
+    try testing.expectEqual(before, after);
+    // Even an asymmetric gap must be ignored — this is the case that would
+    // otherwise read as a huge positive spike and crash the bitrate every time
+    // someone stopped talking.
+    const after2 = observeArrival(&dt, 500.0, 400.0);
+    try testing.expectEqual(before, after2);
+}
+
+test "the first observation seeds rather than blends toward an unmeasured zero" {
+    var dt: DelayTracker = .{};
+    const g = observeArrival(&dt, 30.0, 20.0);
+    try testing.expectApproxEqAbs(@as(f32, 10.0), g, 0.001);
 }

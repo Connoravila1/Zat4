@@ -73,6 +73,10 @@ pub const Engine = struct {
     /// Sequence of the FIRST packet accepted, so a sampler can compute how many
     /// packets should have arrived across any interval and subtract what did.
     recv_first_seq: u16,
+    /// Media timestamp of the most recently accepted packet. Paired with the
+    /// wall clock at the moment `pump` returned `.media`, this is what the delay
+    /// tracker compares: media time against real time.
+    recv_last_ts: u32,
 
     jb: jitter.JitterBuffer,
 };
@@ -112,6 +116,7 @@ pub fn init(
         .recv_packets = 0,
         .recv_bytes = 0,
         .recv_first_seq = 0,
+        .recv_last_ts = 0,
         .jb = undefined,
     };
     try jitter.init(gpa, &e.jb, 32, max_packet, 3);
@@ -188,6 +193,7 @@ pub fn pump(e: *Engine, timeout_ms: i32) PumpResult {
     e.recv_bytes += pkt.len;
 
     const dparsed = rtp.parse(plain[0..rtp_len]) catch return .ignored;
+    e.recv_last_ts = dparsed.header.timestamp;
     _ = jitter.insert(&e.jb, seq, dparsed.header.timestamp, dparsed.payload);
     return .media;
 }
