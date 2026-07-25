@@ -290,21 +290,50 @@ fn threadMain(s: *Session) void {
         .remote_active = false,
     };
 
+    // The speaker must be fed at real time whether or not packets arrive. A
+    // sender in DTX transmits nothing for hundreds of milliseconds at a stretch,
+    // and an unfed output device reads to the listener as a dropped call rather
+    // than a quiet one. `last_play_ns` paces the fill so it happens only when
+    // the stream has genuinely run dry, not merely because `pump` returned early.
+    var last_play_ns = clock_shell.monotonicNanos();
+    var n_conceal: usize = 0;
+    const frame_ns: u64 = @as(u64, frame_samples) * 1_000_000_000 / rate;
+
     while (!s.stop.load(.acquire)) {
         if (call_engine.pump(&eng, 20) == .media) n_recv += 1; // blocks ≤20ms for a packet
         while (call_engine.playout(&eng, &coded)) |payload| {
             const pcm = opus.decode(&dec, payload, &play_i16) catch continue;
             audio.play(&spk, pcm, pcm.len);
             n_play += 1;
-            // A 1–2 byte packet is the peer's DTX comfort noise: they are not
-            // talking. Anything larger is speech. This is the cheapest honest
-            // read of "is the remote party active" available without decoding
-            // energy, and it costs one comparison.
-            sampler.remote_active = payload.len > 2;
+            last_play_ns = clock_shell.monotonicNanos();
+            // Every packet that arrives is speech now: the peer's silence is
+            // suppressed before it reaches the wire, so arrival itself is the
+            // activity signal. Cheaper and more honest than inspecting energy.
+            sampler.remote_active = true;
         }
+
+        // Nothing played for longer than a frame's worth of time — the peer is
+        // silent (or a packet was lost). Opus generates comfort noise matching
+        // the last update it received, which is what keeps a quiet call sounding
+        // like an open line instead of dead air.
+        const now_ns = clock_shell.monotonicNanos();
+        if (now_ns -% last_play_ns > frame_ns + frame_ns / 2) {
+            if (opus.decode(&dec, null, &play_i16)) |pcm| {
+                audio.play(&spk, pcm, pcm.len);
+                n_conceal += 1;
+                // Advance by exactly one frame rather than to `now`, so a late
+                // wake-up is made up over the following iterations instead of
+                // being silently swallowed.
+                last_play_ns +%= frame_ns;
+                sampler.remote_active = false;
+            } else |_| {
+                last_play_ns = now_ns;
+            }
+        }
+
         decide(s, &sampler, &eng, role);
         loops += 1;
-        if (loops % 200 == 0) callLog("[call {s} rx] recv={d} play={d}", .{ role, n_recv, n_play });
+        if (loops % 200 == 0) callLog("[call {s} rx] recv={d} play={d} conceal={d}", .{ role, n_recv, n_play, n_conceal });
     }
     tx_handle.join(); // BEFORE the audio/engine defers free what tx points at
     s.state.store(@intFromEnum(State.ended), .release);
@@ -457,7 +486,10 @@ fn txLoop(t: *TxThread) void {
     var scratch: [frame_samples]i16 = undefined;
     var packet: [opus.max_packet_bytes]u8 = undefined;
 
-    var n_cap: usize = 0;
+    var n_cap: usize = 0; // frames captured + encoded
+    var n_sent: usize = 0; // frames that reached the wire
+    var n_silent: usize = 0; // frames suppressed by DTX
+    var silent_run = false; // was the previous frame suppressed?
     var coded_bytes: usize = 0;
     var loops: usize = 0;
     var last_peak: u32 = 0;
@@ -500,18 +532,35 @@ fn txLoop(t: *TxThread) void {
         have = 0;
 
         const coded = opus.encode(t.enc, &pending, &packet) catch continue;
-        // A 1–2 byte packet is Opus's DTX comfort-noise update, not a failure:
-        // it means "still silent." It is still transmitted — the decoder needs
-        // it to keep its comfort noise in step — and at 2 bytes per 20 ms the
-        // silent direction of a conversation costs under a kilobit per second.
-        call_engine.sendFrame(t.eng, coded) catch {};
         n_cap += 1;
+
+        // DTX: a 1–2 byte frame means "still silent" and does NOT go on the
+        // wire (see `opus_codec.isSuppressible`). Only the media clock advances,
+        // so the receiver still learns exactly how much time passed and its
+        // loss accounting sees an unbroken run of sequence numbers.
+        if (opus.isSuppressible(coded)) {
+            call_engine.skipFrame(t.eng);
+            n_silent += 1;
+            silent_run = true;
+            continue;
+        }
+
+        // First packet after a silence gap carries the marker bit — the
+        // receiver reads it as "the jump you are about to see was deliberate."
+        call_engine.sendFrame(t.eng, coded, silent_run) catch {};
+        silent_run = false;
+        n_sent += 1;
         coded_bytes += coded.len;
 
         loops += 1;
-        if (n_cap % 50 == 0) callLog(
-            "[call {s} tx] frames={d} mic_peak={d} avg_bytes={d} kbps~{d}",
-            .{ t.role, n_cap, last_peak, coded_bytes / n_cap, (coded_bytes / n_cap) * 8 * 50 / 1000 },
-        );
+        if (n_sent % 50 == 0) {
+            // Averaged over frames CAPTURED, not frames sent — that is the rate
+            // the link actually carries, and it is the number the DTX saving
+            // shows up in.
+            const kbps = coded_bytes * 8 * 50 / n_cap / 1000;
+            callLog("[call {s} tx] frames={d} sent={d} silent={d} mic_peak={d} kbps~{d}", .{
+                t.role, n_cap, n_sent, n_silent, last_peak, kbps,
+            });
+        }
     }
 }

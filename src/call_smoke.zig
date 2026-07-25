@@ -81,7 +81,7 @@ pub fn main(init: std.process.Init) !void {
     while (i < frames) : (i += 1) {
         var payload: [20]u8 = undefined;
         @memset(&payload, i);
-        try call_engine.sendFrame(&ea, &payload);
+        try call_engine.sendFrame(&ea, &payload, false);
     }
     std.debug.print("[call] A sent {d} encrypted frames.\n", .{frames});
 

@@ -123,14 +123,24 @@ pub fn deinit(gpa: Allocator, e: *Engine) void {
 }
 
 /// Packetize + encrypt + send one media frame to the peer.
-pub fn sendFrame(e: *Engine, payload: []const u8) !void {
+///
+/// `marker` flags the first packet after a silence gap (RFC 3551's talkspurt
+/// convention), so the receiver knows the timestamp jump it is about to see is
+/// deliberate silence rather than a stalled sender.
+///
+/// SEQUENCE COUNTS PACKETS, TIMESTAMP COUNTS TIME. That distinction is what
+/// makes DTX suppression work: `skipFrame` advances the clock without burning a
+/// sequence number, so a receiver measuring loss from the sequence span sees a
+/// perfect run of packets, not a hole, while still learning exactly how much
+/// time the silence covered.
+pub fn sendFrame(e: *Engine, payload: []const u8, marker: bool) !void {
     var rtp_buf: [max_packet]u8 = undefined;
     const rtp_len = try rtp.serialize(.{
         .timestamp = e.ts,
         .ssrc = e.ssrc,
         .sequence = e.seq,
         .payload_type = rtp.opus_payload_type,
-        .marker = false,
+        .marker = marker,
     }, payload, &rtp_buf);
 
     var srtp_buf: [max_packet + 16]u8 = undefined;
@@ -140,6 +150,14 @@ pub fn sendFrame(e: *Engine, payload: []const u8) !void {
     const prev = e.seq;
     e.seq +%= 1;
     e.send_roc = srtp.senderRoc(e.send_roc, prev, e.seq);
+    e.ts +%= samples_per_frame;
+}
+
+/// Account for a frame that was encoded but deliberately NOT transmitted — a
+/// DTX silence frame. Advances the media clock only. Nothing goes on the wire,
+/// which is the entire point: it is the gap, not the byte count, that lets the
+/// radio sleep.
+pub fn skipFrame(e: *Engine) void {
     e.ts +%= samples_per_frame;
 }
 

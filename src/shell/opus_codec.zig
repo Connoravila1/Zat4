@@ -26,20 +26,24 @@
 //! dominant battery cost (ZAT_CHAT_CALLING_ROADMAP §5), and leaves no gaps for
 //! any of the pacing work in §5/§10 to exploit.
 //!
-//! MEASURED (G1), 48 kHz mono, per 20 ms of speech at the 32 kbps default:
+//! MEASURED (G1), 48 kHz mono at the 32 kbps default. Every figure below is
+//! ON THE WIRE — it counts the fixed 56 B of RTP + SRTP tag + UDP + IP that
+//! rides every packet, not just the payload, and it accounts for the packet
+//! RATE (the old path sent 10 ms frames, this one sends 20 ms).
 //!
-//!     payload    raw 1920 B  ->  coded 77 B          24.9x
-//!     on-wire    812.8 kbps  ->  53.2 kbps           15.3x
-//!     in silence               ->  23.2 kbps (DTX)   35.0x
+//!     raw S16 PCM, as shipped before        812.8 kbps
+//!     coded, continuous speech               53.2 kbps      15.3x
+//!     coded, realistic conversation          25.0 kbps      32.5x
+//!     coded, one side silent                  1.3 kbps     600x+
 //!
-//! The on-wire figure counts the fixed 56 B of RTP + SRTP tag + UDP + IP that
-//! rides every packet, and the halving of the packet RATE (10 ms frames became
-//! 20 ms ones). It is deliberately the smaller, honest number: the payload
-//! shrinks 25x but the headers do not, so the wire only shrinks 15x.
+//! "Realistic conversation" is a 20 s run alternating 2 s of speech with 2 s of
+//! listening — one direction is silent about half the time. 515 of those 1000
+//! frames reached the wire; DTX suppressed the rest (see `isSuppressible`).
 //!
-//! That residue is itself the signpost for what comes next — 56 of every 133
-//! bytes is now header, so batching packets (§5, §10.1) has real leverage where
-//! against an 810 kbps stream it had almost none.
+//! The payload alone shrinks 25x (1920 B -> 77 B per frame) but the headers do
+//! not, so continuous speech only improves 15x. It is DTX that takes a real
+//! call the rest of the way — and it does it by not transmitting at all, which
+//! is worth more to the radio than any number of saved bytes.
 //!
 //! C1/C2 — NO HIDDEN ALLOCATION. Opus offers `opus_encoder_create`, which
 //! mallocs behind our back. We deliberately use the `get_size` + `init` pair
@@ -69,6 +73,12 @@ pub const frame_samples: u32 = 960;
 /// size their scratch buffer with this; a 48 kbps voice frame is nearer 120
 /// bytes, so this is a ceiling, not an expectation.
 pub const max_packet_bytes: usize = 1275;
+
+/// What every media packet costs beyond its payload: RTP header 12 + SRTP
+/// AES-GCM tag 16 + UDP 8 + IPv4 20. Recorded here because at Opus bitrates it
+/// is no longer a rounding error — it is 42% of a speech packet, and it is the
+/// reason DTX (not transmitting) beats compression (transmitting less).
+pub const wire_overhead_bytes: usize = 56;
 
 /// Opus state wants the alignment of the widest scalar it stores. 16 covers
 /// every target we build for, and over-aligning costs a handful of bytes once
@@ -156,12 +166,31 @@ pub fn setExpectedLoss(e: *Encoder, percent: u8) void {
     _ = opus_encoder_ctl(e.state.ptr, c.OPUS_SET_PACKET_LOSS_PERC_REQUEST, @as(i32, @min(percent, 100)));
 }
 
+/// Is this coded frame one the sender should DROP rather than transmit?
+///
+/// THE SINGLE BIGGEST RADIO WIN IN AN AUDIO CALL. With DTX enabled, Opus signals
+/// "nothing has changed, still silent" by returning a 1–2 byte frame. Those are
+/// not meant to go on the wire: the decoder reconstructs the gap as comfort
+/// noise from the last real update it received. Opus refreshes that update on
+/// its own about every 21 frames, so the sender keeps talking to the peer often
+/// enough for NAT bindings and liveness without any timer of ours.
+///
+/// MEASURED over 150 frames (3 s) of quiet-room input: 16 frames exceeded 2
+/// bytes, 134 did not. Dropping those takes the silent direction of a call from
+/// 50 packets per second to about 2.4 — and, because the roadmap's §5 radio
+/// story is really about GAPS rather than bytes, it hands the modem ~420 ms of
+/// continuous quiet between transmissions, which is deep in long-DRX territory.
+/// A conversation is half silence per direction, so this applies most of the
+/// time.
+pub fn isSuppressible(packet: []const u8) bool {
+    return packet.len <= 2;
+}
+
 /// Compress exactly one frame. `pcm` must be `frame_samples * channels` long.
 /// Returns the slice of `out` that was written.
 ///
-/// A return of 1..2 bytes is NOT an error: that is Opus's DTX comfort-noise
-/// packet, meaning "still silent." Whether to put it on the wire is the
-/// caller's decision, not the codec's.
+/// A return of 1..2 bytes is NOT an error — see `isSuppressible`. Whether to put
+/// it on the wire is the caller's decision, not the codec's.
 pub fn encode(e: *Encoder, pcm: []const i16, out: []u8) Error![]const u8 {
     if (pcm.len != frame_samples * e.channels) return Error.OpusBadArgument;
     const n = opus_encode(e.state.ptr, pcm.ptr, @intCast(frame_samples), out.ptr, @intCast(@min(out.len, max_packet_bytes)));
@@ -298,4 +327,111 @@ test "a wrong-length frame is refused rather than misread" {
     var short: [frame_samples / 2]i16 = @splat(0);
     var packet: [max_packet_bytes]u8 = undefined;
     try testing.expectError(Error.OpusBadArgument, encode(&enc, &short, &packet));
+}
+
+
+test "DTX suppresses the overwhelming majority of silent frames" {
+    const gpa = testing.allocator;
+
+    var enc: Encoder = undefined;
+    try encoderInit(gpa, &enc, 1, 32_000);
+    defer encoderDeinit(gpa, &enc);
+    var packet: [max_packet_bytes]u8 = undefined;
+
+    // 3 seconds of a QUIET ROOM rather than digital zero — a tiny deterministic
+    // dither, because real silence from a microphone is never all-zero and a
+    // codec can treat the two differently.
+    var quiet: [frame_samples]i16 = undefined;
+    for (&quiet, 0..) |*s, i| s.* = @intCast(@as(i32, @intCast(i % 7)) - 3);
+
+    var transmitted: usize = 0;
+    var suppressed: usize = 0;
+    for (0..150) |_| {
+        const p = try encode(&enc, &quiet, &packet);
+        if (isSuppressible(p)) suppressed += 1 else transmitted += 1;
+    }
+
+    // Pins the property the battery claim rests on: the vast majority of silent
+    // frames never reach the wire. Measured 134/150 suppressed; the bound is
+    // loose enough to survive an Opus version bump but tight enough to fail
+    // loudly if DTX ever stops being applied.
+    try testing.expect(suppressed > 100);
+
+    // ...and the sender still speaks up periodically, so the peer and any NAT
+    // on the path know the call is alive. Never zero, never every frame.
+    try testing.expect(transmitted > 2);
+    try testing.expect(transmitted < 40);
+}
+
+test "the decoder conceals a DTX gap with comfort noise, not a hole" {
+    const gpa = testing.allocator;
+
+    var enc: Encoder = undefined;
+    try encoderInit(gpa, &enc, 1, 32_000);
+    defer encoderDeinit(gpa, &enc);
+    var dec: Decoder = undefined;
+    try decoderInit(gpa, &dec, 1);
+    defer decoderDeinit(gpa, &dec);
+
+    var pcm: [frame_samples]i16 = undefined;
+    toneFrame(&pcm);
+    var packet: [max_packet_bytes]u8 = undefined;
+    var out: [frame_samples]i16 = undefined;
+
+    for (0..5) |_| {
+        const p = try encode(&enc, &pcm, &packet);
+        if (!isSuppressible(p)) _ = try decode(&dec, p, &out);
+    }
+
+    // A suppressed sender transmits nothing at all for a stretch. The receiver
+    // must still produce a full frame of audio for every one of those slots, or
+    // the speaker starves and the call sounds dropped rather than quiet.
+    for (0..20) |_| {
+        const concealed = try decode(&dec, null, &out);
+        try testing.expectEqual(@as(usize, frame_samples), concealed.len);
+    }
+}
+
+test "a realistic conversation costs a fraction of the raw stream" {
+    const gpa = testing.allocator;
+    var enc: Encoder = undefined;
+    try encoderInit(gpa, &enc, 1, 32_000);
+    defer encoderDeinit(gpa, &enc);
+    var packet: [max_packet_bytes]u8 = undefined;
+
+    var speech: [frame_samples]i16 = undefined;
+    toneFrame(&speech);
+    var quiet: [frame_samples]i16 = undefined;
+    for (&quiet, 0..) |*s, i| s.* = @intCast(@as(i32, @intCast(i % 7)) - 3);
+
+    // 20 s of ONE SIDE of a conversation: 2 s talking, 2 s listening, repeated.
+    // A single direction is silent roughly half the time, which is what makes
+    // DTX worth having.
+    var wire_bytes: usize = 0;
+    var frames: usize = 0;
+    var sent: usize = 0;
+    for (0..10) |block| {
+        const talking = block % 2 == 0;
+        for (0..100) |_| {
+            const p = try encode(&enc, if (talking) &speech else &quiet, &packet);
+            frames += 1;
+            if (isSuppressible(p)) continue;
+            wire_bytes += p.len + wire_overhead_bytes;
+            sent += 1;
+        }
+    }
+
+    const seconds = frames * 20 / 1000;
+    const kbps = wire_bytes * 8 / seconds / 1000;
+
+    // MEASURED: 25 kbps, 515 of 1000 frames transmitted. The bounds are wide
+    // enough to survive codec-version drift and tight enough that losing DTX,
+    // losing the codec, or misconfiguring the bitrate all fail here.
+    try testing.expect(kbps > 5); // a call that costs nothing is a call carrying nothing
+    try testing.expect(kbps < 60);
+
+    // Roughly half the frames must never reach the wire. THIS is the radio win:
+    // it is the gaps, not the bytes, that let the modem sleep.
+    try testing.expect(sent < frames * 7 / 10);
+    try testing.expect(sent > frames / 4);
 }

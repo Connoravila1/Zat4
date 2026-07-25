@@ -102,7 +102,7 @@ pub fn main(init: std.process.Init) !void {
         while (i < frames) : (i += 1) {
             var payload: [20]u8 = undefined;
             @memset(&payload, i);
-            call_engine.sendFrame(&eng, &payload) catch {};
+            call_engine.sendFrame(&eng, &payload, false) catch {};
             _ = call_engine.pump(&eng, 20); // pace ~20 ms and drain any keepalive
         }
         std.debug.print("[peer a] PASS: sent {d} encrypted tone frames.\n", .{frames});

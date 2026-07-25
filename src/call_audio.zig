@@ -115,6 +115,9 @@ pub fn main(init: std.process.Init) !void {
         var packet: [opus.max_packet_bytes]u8 = undefined;
         var have: usize = 0;
         var sent: usize = 0;
+        var on_wire: usize = 0;
+        var silent: usize = 0;
+        var silent_run = false;
         var coded_bytes: usize = 0;
         // Opus takes a whole frame or nothing, so partial captures accumulate
         // — the same shape as the live session's tx loop.
@@ -126,13 +129,24 @@ pub fn main(init: std.process.Init) !void {
             if (have < frame_samples) continue;
             have = 0;
             const coded = opus.encode(&enc, &pending, &packet) catch continue;
-            call_engine.sendFrame(&eng, coded) catch {};
-            coded_bytes += coded.len;
             sent += 1;
+            // DTX: silent frames never reach the wire — only the media clock
+            // moves. Same suppression the live session does, so what this
+            // harness measures is what the app costs.
+            if (opus.isSuppressible(coded)) {
+                call_engine.skipFrame(&eng);
+                silent += 1;
+                silent_run = true;
+                continue;
+            }
+            call_engine.sendFrame(&eng, coded, silent_run) catch {};
+            silent_run = false;
+            coded_bytes += coded.len;
+            on_wire += 1;
             _ = call_engine.pump(&eng, 0); // non-blocking: drain any keepalive
         }
-        std.debug.print("[call-audio a] done — sent {d} frames, {d} bytes ({d} kbps avg; raw PCM would have been 768).\n", .{
-            total_frames, coded_bytes, coded_bytes * 8 * 50 / total_frames / 1000,
+        std.debug.print("[call-audio a] done — {d} frames encoded, {d} sent, {d} suppressed by DTX; {d} bytes = {d} kbps payload (raw PCM would have been 768).\n", .{
+            sent, on_wire, silent, coded_bytes, coded_bytes * 8 * 50 / sent / 1000,
         });
     } else {
         var spk = try audio.open(audio.stream_playback, rate, 1, 60_000);
