@@ -1331,6 +1331,7 @@ test {
     _ = @import("shell/call_session.zig"); // Zat Chat calling: call session worker (ICE + engine + audio)
     _ = @import("shell/opus_codec.zig"); // Zat Chat calling: the sealed audio codec (vendored Opus)
     _ = @import("shell/device_power.zig"); // Zat Chat calling: battery + thermal sensors for the adaptive brain
+    _ = @import("core/call_view.zig"); // Zat Chat calling: the true-black call surface (§8.1)
     _ = @import("core/x11.zig");
     _ = @import("core/win32.zig");
     _ = @import("core/textinput.zig");
