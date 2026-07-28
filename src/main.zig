@@ -1205,6 +1205,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test {
+    _ = @import("ui/runtime.zig"); // Rover: unified geometry/clip/input contract
     _ = @import("ui/reveal.zig"); // Rover: portable UI primitives (src/ui/README.md)
     _ = @import("ui/tokens.zig");
     _ = @import("ui/layout.zig");
