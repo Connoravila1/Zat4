@@ -88,6 +88,15 @@ pub const Event = struct {
     // A7.2: cold — a per-frame return value.
 };
 
+/// Geometry-independent hit result for composition runtimes. `updateHit` accepts
+/// this directly so a runtime can resolve clipping/stacking without rebuilding a
+/// parallel `Region` array.
+pub const Hit = struct {
+    id: Id = none,
+    focusable: bool = false,
+    // A7.2: transient per-frame input value.
+};
+
 inline fn contains(r: Region, px: f32, py: f32) bool {
     return px >= r.x and px < r.x + r.w and py >= r.y and py < r.y + r.h;
 }
@@ -126,6 +135,17 @@ fn isFocusable(regions: []const Region, id: Id) bool {
 /// (state, regions, pointer): the same inputs always produce the same transition.
 pub fn update(s: *State, regions: []const Region, p: Pointer) Event {
     const raw = hitTest(regions, p.x, p.y); // real control under the pointer
+    return updateHit(s, .{
+        .id = raw,
+        .focusable = isFocusable(regions, raw),
+    }, p);
+}
+
+/// Advance interaction state from a target already resolved by a composition
+/// runtime. This is the authoritative transition logic shared by legacy flat
+/// regions and the unified Rover scene.
+pub fn updateHit(s: *State, raw_hit: Hit, p: Pointer) Event {
+    const raw = raw_hit.id;
     // While captured, the target stays the captured control (pointer capture).
     const target: Id = if (s.capture != none) s.capture else raw;
     s.hover = target;
@@ -141,7 +161,7 @@ pub fn update(s: *State, regions: []const Region, p: Pointer) Event {
             // Pressed empty space: blur.
             s.focus = none;
             s.focus_visible = false;
-        } else if (isFocusable(regions, target)) {
+        } else if (raw_hit.focusable) {
             // Pointer focus: focus the control, but no ring (ring is for keyboard nav).
             s.focus = target;
             s.focus_visible = false;

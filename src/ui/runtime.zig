@@ -56,8 +56,9 @@ pub const Flags = packed struct(u8) {
     visible: bool = true,
     hittable: bool = false,
     focusable: bool = false,
+    keyboard: bool = false,
     disabled: bool = false,
-    _pad: u4 = 0,
+    _pad: u3 = 0,
 
     comptime {
         assert(@sizeOf(Flags) == 1);
@@ -69,8 +70,9 @@ pub const ResolvedFlags = packed struct(u8) {
     visible: bool = false,
     hittable: bool = false,
     focusable: bool = false,
+    keyboard: bool = false,
     disabled: bool = false,
-    _pad: u4 = 0,
+    _pad: u3 = 0,
 
     comptime {
         assert(@sizeOf(ResolvedFlags) == 1);
@@ -279,6 +281,7 @@ pub const Scene = struct {
                 .visible = visible,
                 .hittable = visible and declared.hittable and !declared.disabled,
                 .focusable = visible and declared.focusable and !declared.disabled,
+                .keyboard = visible and declared.focusable and declared.keyboard and !declared.disabled,
                 .disabled = declared.disabled,
             };
         }
@@ -299,6 +302,62 @@ pub const Scene = struct {
         };
     }
 
+    /// Topmost resolved control at a point. Effective clipping, inherited
+    /// visibility, disabled state, z, and paint order all come from this scene;
+    /// no caller-maintained hit rectangles participate.
+    pub fn hitTest(s: *const Scene, x: f32, y: f32) Id {
+        if (!s.resolved) return .none;
+        var best: Id = .none;
+        var best_z: i16 = std.math.minInt(i16);
+        var best_order: u32 = 0;
+        var seen = false;
+        for (s.ids.items, 0..) |id, i| {
+            if (!s.resolved_flags.items[i].hittable) continue;
+            const visible_rect = intersection(s.world.items[i], s.clips.items[i]);
+            if (!contains(visible_rect, x, y)) continue;
+            const z = s.zs.items[i];
+            const order = s.paint_order.items[i];
+            if (!seen or z > best_z or (z == best_z and order >= best_order)) {
+                best = id;
+                best_z = z;
+                best_order = order;
+                seen = true;
+            }
+        }
+        return best;
+    }
+
+    pub fn flagsForId(s: *const Scene, id: Id) ?ResolvedFlags {
+        if (!s.resolved or id == .none) return null;
+        for (s.ids.items, 0..) |candidate, i| {
+            if (candidate == id) return s.resolved_flags.items[i];
+        }
+        return null;
+    }
+
+    /// Next focusable id in deterministic paint order, wrapping once.
+    pub fn nextFocusable(s: *const Scene, current: Id, forward: bool) Id {
+        if (!s.resolved or s.ids.items.len == 0) return .none;
+        const n = s.ids.items.len;
+        var current_index: ?usize = null;
+        for (s.ids.items, 0..) |candidate, i| {
+            if (candidate == current) {
+                current_index = i;
+                break;
+            }
+        }
+        var step: usize = 0;
+        while (step < n) : (step += 1) {
+            const offset = step + 1;
+            const i: usize = if (current_index) |at|
+                (if (forward) (at + offset) % n else (at + n * n - offset) % n)
+            else
+                (if (forward) (offset - 1) % n else (n - offset) % n);
+            if (s.resolved_flags.items[i].focusable) return s.ids.items[i];
+        }
+        return .none;
+    }
+
     /// Deterministic structural diagnostics. One line per resolved node, in paint
     /// order. Intended for golden tests and the host's debug overlay/log.
     pub fn dump(s: *const Scene, out: *std.Io.Writer) !void {
@@ -308,7 +367,7 @@ pub const Scene = struct {
             const c = s.clips.items[i];
             const f = s.resolved_flags.items[i];
             try out.print(
-                "node id={d} parent={d} world=({d},{d},{d},{d}) clip=({d},{d},{d},{d}) order={d} z={d} visible={} hit={} focus={} disabled={}\n",
+                "node id={d} parent={d} world=({d},{d},{d},{d}) clip=({d},{d},{d},{d}) order={d} z={d} visible={} hit={} focus={} keyboard={} disabled={}\n",
                 .{
                     @intFromEnum(id),
                     s.parents.items[i],
@@ -325,6 +384,7 @@ pub const Scene = struct {
                     f.visible,
                     f.hittable,
                     f.focusable,
+                    f.keyboard,
                     f.disabled,
                 },
             );
@@ -536,4 +596,72 @@ test "runtime: rectangle intersection and half-open containment" {
     try std.testing.expect(approx(c.w, 10) and approx(c.h, 5));
     try std.testing.expect(contains(c, 10, 5));
     try std.testing.expect(!contains(c, 20, 5));
+}
+
+test "runtime: hit testing uses effective clips, z, and paint-order ties" {
+    var scene = Scene.init(std.testing.allocator);
+    defer scene.deinit();
+
+    const root = try scene.addRoot(.{
+        .id = testId(1),
+        .rect = .{ .w = 100, .h = 100 },
+        .overflow = .clip,
+    });
+    _ = try scene.addChild(root, .{
+        .id = testId(2),
+        .rect = .{ .x = 10, .y = 10, .w = 80, .h = 80 },
+        .flags = .{ .hittable = true },
+        .z = 2,
+    });
+    _ = try scene.addChild(root, .{
+        .id = testId(3),
+        .rect = .{ .x = 10, .y = 10, .w = 80, .h = 80 },
+        .flags = .{ .hittable = true },
+        .z = 2,
+    });
+    _ = try scene.addChild(root, .{
+        .id = testId(4),
+        .rect = .{ .x = 20, .y = 20, .w = 20, .h = 20 },
+        .flags = .{ .hittable = true },
+        .z = 3,
+    });
+    _ = try scene.addChild(root, .{
+        .id = testId(5),
+        .rect = .{ .x = 120, .y = 10, .w = 20, .h = 20 },
+        .flags = .{ .hittable = true },
+        .z = 9,
+    });
+    try scene.resolve(.{ .w = 500, .h = 500 });
+
+    try std.testing.expectEqual(testId(4), scene.hitTest(25, 25)); // higher z
+    try std.testing.expectEqual(testId(3), scene.hitTest(60, 60)); // equal z, later paint
+    try std.testing.expectEqual(Id.none, scene.hitTest(125, 15)); // clipped by root
+}
+
+test "runtime: focus and keyboard capabilities use resolved state" {
+    var scene = Scene.init(std.testing.allocator);
+    defer scene.deinit();
+
+    _ = try scene.addRoot(.{
+        .id = testId(1),
+        .rect = .{ .w = 20, .h = 20 },
+        .flags = .{ .hittable = true, .focusable = true },
+    });
+    _ = try scene.addRoot(.{
+        .id = testId(2),
+        .rect = .{ .x = 30, .w = 20, .h = 20 },
+        .flags = .{ .hittable = true, .focusable = true, .keyboard = true },
+    });
+    _ = try scene.addRoot(.{
+        .id = testId(3),
+        .rect = .{ .x = 60, .w = 20, .h = 20 },
+        .flags = .{ .hittable = true, .focusable = true, .disabled = true },
+    });
+    try scene.resolve(.{ .w = 100, .h = 100 });
+
+    try std.testing.expectEqual(testId(1), scene.nextFocusable(.none, true));
+    try std.testing.expectEqual(testId(2), scene.nextFocusable(testId(1), true));
+    try std.testing.expectEqual(testId(1), scene.nextFocusable(testId(2), true));
+    try std.testing.expect(scene.flagsForId(testId(2)).?.keyboard);
+    try std.testing.expect(!scene.flagsForId(testId(3)).?.focusable);
 }
