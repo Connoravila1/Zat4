@@ -73,6 +73,7 @@ pub const Spec = struct {
     w: f32 = 0, // fixed width, or leaf content width when w_fit == .hug
     h: f32 = 0, // fixed height, or leaf content height when h_fit == .hug
     grow: f32 = 1, // weight among grow siblings on the main axis
+    shrink: f32 = 1, // CSS-like shrink weight; 0 preserves the base size
     gap: f32 = 0, // space between children (main axis)
     pad_l: f32 = 0,
     pad_t: f32 = 0,
@@ -84,10 +85,10 @@ pub const Spec = struct {
     max_h: f32 = big,
 
     comptime {
-        // A7.1: a layout node — 12 geometry f32 (size/grow/gap/4×pad/4×min-max) plus
-        // 5 mode enums packed into the leading alignment pad. 56 bytes packed; this
-        // is the whole per-node budget and it never grows in a loop beyond node count.
-        assert(@sizeOf(Spec) == 56);
+        // A7.1: 13 geometry f32 plus five mode enums. The budget rises from 56
+        // to 60 bytes for explicit flex-shrink: silent overflow created visible
+        // overlap, so shrink policy must live in the node rather than host glue.
+        assert(@sizeOf(Spec) == 60);
     }
 };
 
@@ -264,22 +265,32 @@ fn arrange(t: *Tree, n: u32, rect: Rect) void {
     const main = if (s.axis == .row) cw else ch;
     const cross = if (s.axis == .row) ch else cw;
 
-    // Pass A: base main sizes, grow weights, count.
+    // Pass A: base main sizes and count.
     var sum_base: f32 = 0;
-    var total_weight: f32 = 0;
     var count: f32 = 0;
     var c = kids;
     while (c != nil) : (c = t.next.items[c]) {
         const cs = t.spec.items[c];
         sum_base += childBaseMain(t, c, cs, s.axis);
-        if (childMainFit(cs, s.axis) == .grow) total_weight += cs.grow;
         count += 1;
     }
     const gaps = if (count > 1) s.gap * (count - 1) else 0;
-    const extra = @max(0.0, main - sum_base - gaps);
+    const available = @max(0.0, main - gaps);
+    const grow_extra = @max(0.0, available - sum_base);
+    const shrink_deficit = @max(0.0, sum_base - available);
 
-    // Total of final main sizes (base + distributed grow), for justify spacing.
-    const sum_final = sum_base + (if (total_weight > 0) extra else 0);
+    // Water-filling units account for min/max saturation. If one grow child hits
+    // max, its unused share is redistributed; if one shrinking child hits min,
+    // the remaining deficit is taken from siblings that still have capacity.
+    const grow_unit = growUnit(t, kids, s.axis, grow_extra);
+    const shrink_unit = shrinkUnit(t, kids, s.axis, shrink_deficit);
+
+    var sum_final: f32 = 0;
+    c = kids;
+    while (c != nil) : (c = t.next.items[c]) {
+        const cs = t.spec.items[c];
+        sum_final += resolvedChildMain(t, c, cs, s.axis, grow_unit, shrink_unit);
+    }
     const free = @max(0.0, main - sum_final - gaps);
 
     // Justify: starting cursor + spacing between children.
@@ -306,12 +317,7 @@ fn arrange(t: *Tree, n: u32, rect: Rect) void {
     c = kids;
     while (c != nil) : (c = t.next.items[c]) {
         const cs = t.spec.items[c];
-        var cm = childBaseMain(t, c, cs, s.axis);
-        if (childMainFit(cs, s.axis) == .grow and total_weight > 0) {
-            const share = extra * (cs.grow / total_weight);
-            const max_main = mainOf(cs.max_w, cs.max_h, s.axis);
-            cm = clamp(cm + share, mainOf(cs.min_w, cs.min_h, s.axis), max_main);
-        }
+        const cm = resolvedChildMain(t, c, cs, s.axis, grow_unit, shrink_unit);
 
         // Cross size: container `stretch` (or a child `grow` on the cross axis)
         // fills the cross box; otherwise the child keeps its own cross size.
@@ -357,6 +363,110 @@ fn childBaseMain(t: *const Tree, c: u32, cs: Spec, axis: Axis) f32 {
         .grow => mainOf(cs.min_w, cs.min_h, axis),
     };
     return clamp(v, mainOf(cs.min_w, cs.min_h, axis), mainOf(cs.max_w, cs.max_h, axis));
+}
+
+/// Extra pixels per unit of grow weight. Binary-searching the monotone allocation
+/// function is allocation-free and naturally redistributes shares from children
+/// capped by max constraints.
+fn growUnit(t: *const Tree, kids: u32, axis: Axis, extra: f32) f32 {
+    if (extra <= 0) return 0;
+    var total_capacity: f32 = 0;
+    var upper: f32 = 0;
+    var min_weight: f32 = big;
+    var c = kids;
+    while (c != nil) : (c = t.next.items[c]) {
+        const cs = t.spec.items[c];
+        if (childMainFit(cs, axis) != .grow or cs.grow <= 0) continue;
+        const base = childBaseMain(t, c, cs, axis);
+        const capacity = @max(0.0, mainOf(cs.max_w, cs.max_h, axis) - base);
+        total_capacity += capacity;
+        upper = @max(upper, capacity / cs.grow);
+        min_weight = @min(min_weight, cs.grow);
+    }
+    if (total_capacity <= 0) return 0;
+    upper = @min(upper, extra / min_weight);
+    if (extra >= total_capacity) return upper;
+
+    var lo: f32 = 0;
+    var hi = upper;
+    var pass: u8 = 0;
+    while (pass < 24) : (pass += 1) {
+        const unit = (lo + hi) / 2;
+        var used: f32 = 0;
+        c = kids;
+        while (c != nil) : (c = t.next.items[c]) {
+            const cs = t.spec.items[c];
+            if (childMainFit(cs, axis) != .grow or cs.grow <= 0) continue;
+            const base = childBaseMain(t, c, cs, axis);
+            const capacity = @max(0.0, mainOf(cs.max_w, cs.max_h, axis) - base);
+            used += @min(capacity, unit * cs.grow);
+        }
+        if (used < extra) lo = unit else hi = unit;
+    }
+    return (lo + hi) / 2;
+}
+
+/// Deficit pixels per weighted base-size unit. This mirrors CSS flex shrink:
+/// larger children surrender proportionally more space, while min constraints
+/// saturate and redistribute the unresolved deficit to remaining siblings.
+fn shrinkUnit(t: *const Tree, kids: u32, axis: Axis, deficit: f32) f32 {
+    if (deficit <= 0) return 0;
+    var total_capacity: f32 = 0;
+    var upper: f32 = 0;
+    var min_weight: f32 = big;
+    var c = kids;
+    while (c != nil) : (c = t.next.items[c]) {
+        const cs = t.spec.items[c];
+        const base = childBaseMain(t, c, cs, axis);
+        const weight = @max(0.0, cs.shrink) * base;
+        if (weight <= 0) continue;
+        const capacity = @max(0.0, base - mainOf(cs.min_w, cs.min_h, axis));
+        total_capacity += capacity;
+        upper = @max(upper, capacity / weight);
+        min_weight = @min(min_weight, weight);
+    }
+    if (total_capacity <= 0) return 0;
+    upper = @min(upper, deficit / min_weight);
+    if (deficit >= total_capacity) return upper;
+
+    var lo: f32 = 0;
+    var hi = upper;
+    var pass: u8 = 0;
+    while (pass < 24) : (pass += 1) {
+        const unit = (lo + hi) / 2;
+        var removed: f32 = 0;
+        c = kids;
+        while (c != nil) : (c = t.next.items[c]) {
+            const cs = t.spec.items[c];
+            const base = childBaseMain(t, c, cs, axis);
+            const weight = @max(0.0, cs.shrink) * base;
+            if (weight <= 0) continue;
+            const capacity = @max(0.0, base - mainOf(cs.min_w, cs.min_h, axis));
+            removed += @min(capacity, unit * weight);
+        }
+        if (removed < deficit) lo = unit else hi = unit;
+    }
+    return (lo + hi) / 2;
+}
+
+fn resolvedChildMain(
+    t: *const Tree,
+    c: u32,
+    cs: Spec,
+    axis: Axis,
+    grow_unit: f32,
+    shrink_unit: f32,
+) f32 {
+    const base = childBaseMain(t, c, cs, axis);
+    const min_main = mainOf(cs.min_w, cs.min_h, axis);
+    const max_main = mainOf(cs.max_w, cs.max_h, axis);
+    if (grow_unit > 0 and childMainFit(cs, axis) == .grow and cs.grow > 0) {
+        return clamp(base + grow_unit * cs.grow, min_main, max_main);
+    }
+    if (shrink_unit > 0 and cs.shrink > 0) {
+        return clamp(base - shrink_unit * cs.shrink * base, min_main, max_main);
+    }
+    return base;
 }
 
 // --- pixel snapping (host convenience) --------------------------------------
@@ -489,6 +599,92 @@ test "layout: min/max clamp the resolved size" {
     t.child(root, g);
     t.solve(root, 200, 200);
     try expect(approx(t.rectOf(g).w, 25));
+}
+
+test "layout: grow redistributes space when a sibling reaches max" {
+    var t = Tree.init(std.testing.allocator);
+    defer t.deinit();
+    const root = try t.add(.{
+        .axis = .row,
+        .w_fit = .fixed,
+        .h_fit = .fixed,
+        .w = 100,
+        .h = 10,
+    });
+    const capped = try t.add(.{
+        .w_fit = .grow,
+        .h_fit = .fixed,
+        .h = 10,
+        .max_w = 20,
+    });
+    const remainder = try t.add(.{
+        .w_fit = .grow,
+        .h_fit = .fixed,
+        .h = 10,
+    });
+    t.child(root, capped);
+    t.child(root, remainder);
+    t.solve(root, 100, 10);
+    try expect(approx(t.rectOf(capped).w, 20));
+    try expect(approx(t.rectOf(remainder).w, 80));
+    try expect(approx(t.rectOf(remainder).x + t.rectOf(remainder).w, 100));
+}
+
+test "layout: overflow shrinks children proportionally without overlap" {
+    var t = Tree.init(std.testing.allocator);
+    defer t.deinit();
+    const root = try t.add(.{
+        .axis = .row,
+        .w_fit = .fixed,
+        .h_fit = .fixed,
+        .w = 100,
+        .h = 10,
+    });
+    const a = try t.add(.{
+        .w_fit = .fixed,
+        .h_fit = .fixed,
+        .w = 80,
+        .h = 10,
+        .min_w = 60,
+    });
+    const b = try t.add(.{
+        .w_fit = .fixed,
+        .h_fit = .fixed,
+        .w = 80,
+        .h = 10,
+        .min_w = 0,
+    });
+    t.child(root, a);
+    t.child(root, b);
+    t.solve(root, 100, 10);
+    // Equal initial bases would each surrender 30, but A saturates at its 20px
+    // capacity; B absorbs the remaining 40px deficit.
+    try expect(approx(t.rectOf(a).w, 60));
+    try expect(approx(t.rectOf(b).w, 40));
+    try expect(approx(t.rectOf(b).x, 60));
+    try expect(approx(t.rectOf(b).x + t.rectOf(b).w, 100));
+}
+
+test "layout: shrink zero makes overflow explicit" {
+    var t = Tree.init(std.testing.allocator);
+    defer t.deinit();
+    const root = try t.add(.{
+        .axis = .row,
+        .w_fit = .fixed,
+        .h_fit = .fixed,
+        .w = 50,
+        .h = 10,
+    });
+    const fixed = try t.add(.{
+        .w_fit = .fixed,
+        .h_fit = .fixed,
+        .w = 80,
+        .h = 10,
+        .shrink = 0,
+    });
+    t.child(root, fixed);
+    t.solve(root, 50, 10);
+    try expect(approx(t.rectOf(fixed).w, 80));
 }
 
 test "layout: intrinsic sizing lets a button hug label + padding" {
