@@ -71,6 +71,7 @@ const chat_games = @import("../core/chat_games.zig");
 const spring = @import("../core/spring.zig");
 const reveal = @import("../ui/reveal.zig"); // Rover: portable present/dismiss transition
 const ui_insets = @import("../ui/insets.zig"); // Rover: safe-area / gesture-inset math
+const scroll_container = @import("../ui/scroll_container.zig"); // Rover: one range rule for every screen
 const chat_effects = @import("../core/chat_effects.zig");
 const screen_fx = @import("../core/screen_fx.zig");
 const shatter = @import("../core/shatter.zig");
@@ -148,6 +149,46 @@ const sfx_player = @import("sfx_player.zig");
 const auth = @import("auth.zig");
 const lexicon = @import("../core/lexicon.zig");
 const moderation = @import("../core/moderation.zig");
+
+/// Zat's live shell still stores the rendered content translation as a
+/// non-positive integer. Rover stores the equivalent scroll position as a
+/// positive float. Keep that compatibility boundary here so every screen uses
+/// Rover's one viewport/content range rule while the renderer migrates in
+/// vertical slices. The trailing 24 px preserves Zat's existing breathing room.
+fn globalScrollMetrics(view_h: i32, content_h: i32) scroll_container.Metrics {
+    const safe_view: i64 = @max(@as(i64, 0), @as(i64, view_h));
+    const safe_content: i64 = @max(@as(i64, 0), @as(i64, content_h));
+    return .{
+        .viewport = @floatFromInt(safe_view),
+        .content = @floatFromInt(safe_content + 24),
+    };
+}
+
+fn globalMinScroll(view_h: i32, content_h: i32) i32 {
+    const max_position = scroll_container.maxPosition(globalScrollMetrics(view_h, content_h));
+    // Largest f32 below maxInt(i32); keeps the compatibility conversion defined
+    // even if corrupt layout data reports an implausibly tall surface.
+    const bounded = @min(max_position, @as(f32, 2_147_483_520.0));
+    return -@as(i32, @intFromFloat(bounded));
+}
+
+fn clampGlobalScroll(scroll: *i32, view_h: i32, content_h: i32) void {
+    scroll.* = std.math.clamp(scroll.*, globalMinScroll(view_h, content_h), 0);
+}
+
+test "universal Rover scroll range preserves Zat shell convention" {
+    try std.testing.expectEqual(@as(i32, 0), globalMinScroll(100, 50));
+    try std.testing.expectEqual(@as(i32, 0), globalMinScroll(100, 76));
+    try std.testing.expectEqual(@as(i32, -24), globalMinScroll(100, 100));
+
+    var before_top: i32 = 40;
+    clampGlobalScroll(&before_top, 100, 300);
+    try std.testing.expectEqual(@as(i32, 0), before_top);
+
+    var past_end: i32 = -400;
+    clampGlobalScroll(&past_end, 100, 300);
+    try std.testing.expectEqual(@as(i32, -224), past_end);
+}
 
 /// DIAGNOSTIC flag (temporary): when true, `fireEngageEffect` prints one
 /// stderr line per effect actually fired, so the fire count of a single click
@@ -4329,7 +4370,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 const scale: f32 = if (rs.gpu_state) |*gs| gs.scale else 1.0;
                 const view_h: i32 = @intFromFloat(@as(f32, @floatFromInt(m.height_px)) / scale);
                 const view_h_f: f32 = @floatFromInt(view_h);
-                const min_scroll: i32 = @min(0, view_h - rs.gcontent_h - 24);
+                const min_scroll = globalMinScroll(view_h, rs.gcontent_h);
                 const min_scroll_f: f32 = @floatFromInt(min_scroll);
                 // The gesture core's sample clock: one shell stamp per drained
                 // batch (B4 — the core only subtracts these). Same-frame
@@ -5581,8 +5622,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             @intFromFloat(@as(f32, @floatFromInt(fb_h)) / gpu_scale)
                         else
                             @intCast(fb_h);
-                        const min_scroll: i32 = @min(0, view_h - g.content_h.* - 24);
-                        g.scroll.* = @max(min_scroll, @min(0, g.scroll.*));
+                        clampGlobalScroll(g.scroll, view_h, g.content_h.*);
                         effect_core.shiftY(g.active, -delta);
                         // Pull-to-refresh: a wheel-up (button 4 → delta < 0)
                         // that lands while already pinned at the top of Home
@@ -16042,7 +16082,7 @@ fn paintFrameGpu(
         }
         if (measured) {
             const lh_view = logicalHFor(w, h, gs.design_w);
-            const min_scroll: i32 = @min(0, @as(i32, @intCast(lh_view)) - g.content_h.* - 24);
+            const min_scroll = globalMinScroll(@intCast(lh_view), g.content_h.*);
             g.scroll.* = @max(min_scroll, @min(0, -off));
             gs.scroll_to_focus = false; // applied; wait for heights next frame otherwise
         }
