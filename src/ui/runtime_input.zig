@@ -65,18 +65,18 @@ test "runtime input: transformed clipped geometry is the only hit source" {
     var scene = runtime.Scene.init(std.testing.allocator);
     defer scene.deinit();
 
-    const viewport = try scene.addRoot(.{
+    const viewport = try scene.addRoot(std.testing.allocator, .{
         .id = testId(1),
         .rect = .{ .w = 100, .h = 100 },
         .translation = .{ .x = 20 },
         .overflow = .clip,
     });
-    _ = try scene.addChild(viewport, .{
+    _ = try scene.addChild(std.testing.allocator, viewport, .{
         .id = testId(2),
         .rect = .{ .x = 10, .y = 10, .w = 30, .h = 30 },
         .flags = .{ .hittable = true },
     });
-    _ = try scene.addChild(viewport, .{
+    _ = try scene.addChild(std.testing.allocator, viewport, .{
         .id = testId(3),
         .rect = .{ .x = 110, .y = 10, .w = 30, .h = 30 },
         .flags = .{ .hittable = true },
@@ -96,7 +96,7 @@ test "runtime input: transformed clipped geometry is the only hit source" {
 test "runtime input: click, capture, and focus share the resolved target" {
     var scene = runtime.Scene.init(std.testing.allocator);
     defer scene.deinit();
-    _ = try scene.addRoot(.{
+    _ = try scene.addRoot(std.testing.allocator, .{
         .id = testId(7),
         .rect = .{ .x = 10, .y = 10, .w = 40, .h = 40 },
         .flags = .{ .hittable = true, .focusable = true },
@@ -121,17 +121,17 @@ test "runtime input: click, capture, and focus share the resolved target" {
 test "runtime input: focus traversal and keyboard ownership use resolved flags" {
     var scene = runtime.Scene.init(std.testing.allocator);
     defer scene.deinit();
-    _ = try scene.addRoot(.{
+    _ = try scene.addRoot(std.testing.allocator, .{
         .id = testId(1),
         .rect = .{ .w = 20, .h = 20 },
         .flags = .{ .hittable = true, .focusable = true },
     });
-    _ = try scene.addRoot(.{
+    _ = try scene.addRoot(std.testing.allocator, .{
         .id = testId(2),
         .rect = .{ .x = 30, .w = 20, .h = 20 },
         .flags = .{ .hittable = true, .focusable = true, .keyboard = true },
     });
-    _ = try scene.addRoot(.{
+    _ = try scene.addRoot(std.testing.allocator, .{
         .id = testId(3),
         .rect = .{ .x = 60, .w = 20, .h = 20 },
         .flags = .{ .hittable = true, .focusable = true, .keyboard = true, .disabled = true },
@@ -152,7 +152,7 @@ test "runtime input: focus traversal and keyboard ownership use resolved flags" 
 test "runtime input: removing focused and captured ids clears stale state" {
     var scene = runtime.Scene.init(std.testing.allocator);
     defer scene.deinit();
-    _ = try scene.addRoot(.{
+    _ = try scene.addRoot(std.testing.allocator, .{
         .id = testId(9),
         .rect = .{ .w = 20, .h = 20 },
         .flags = .{ .hittable = true, .focusable = true },
@@ -165,7 +165,7 @@ test "runtime input: removing focused and captured ids clears stale state" {
     try std.testing.expectEqual(@as(input.Id, 9), state.focus);
 
     scene.reset();
-    _ = try scene.addRoot(.{ .id = testId(10), .rect = .{ .w = 20, .h = 20 } });
+    _ = try scene.addRoot(std.testing.allocator, .{ .id = testId(10), .rect = .{ .w = 20, .h = 20 } });
     try scene.resolve(.{ .w = 100, .h = 100 });
     _ = update(&scene, &state, .{ .x = 80, .y = 80, .down = true });
     try std.testing.expectEqual(input.none, state.capture);

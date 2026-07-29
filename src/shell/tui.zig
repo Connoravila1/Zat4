@@ -73,6 +73,7 @@ const reveal = @import("../ui/reveal.zig"); // Rover: portable present/dismiss t
 const ui_insets = @import("../ui/insets.zig"); // Rover: safe-area / gesture-inset math
 const scroll_container = @import("../ui/scroll_container.zig"); // Rover: one range rule for every screen
 const home_scene = @import("home_scene.zig"); // Zat binding: Home paint/input share Rover geometry
+const algorithm_scene = @import("algorithm_scene.zig"); // Algorithms: page + three sockets, one scene
 const chat_effects = @import("../core/chat_effects.zig");
 const screen_fx = @import("../core/screen_fx.zig");
 const shatter = @import("../core/shatter.zig");
@@ -180,16 +181,26 @@ fn clampGlobalScroll(scroll: *i32, view_h: i32, content_h: i32) void {
 fn gridHitTest(g: Grid, x: i32, y: i32) ?feed_view.Region {
     if (g.screen.* == feed_view.screen_home)
         return home_scene.hitTest(g.home, g.regions.items, x, y);
+    if (algorithm_scene.isScreen(g.screen.*))
+        return algorithm_scene.pageHitTest(g.algorithms, g.regions.items, x, y);
     return feed_view.hitTest(g.regions.items, x, y);
 }
 
 fn runHitTest(rs: *const RunState, x: i32, y: i32) ?feed_view.Region {
     if (rs.gscreen == feed_view.screen_home)
         return home_scene.hitTest(&rs.ghome_scene, rs.gregions.items, x, y);
+    if (algorithm_scene.isScreen(rs.gscreen))
+        return algorithm_scene.pageHitTest(&rs.galgorithm_scene, rs.gregions.items, x, y);
     return feed_view.hitTest(rs.gregions.items, x, y);
 }
 
-fn rebuildHomeScene(g: Grid, width: i32, height: i32, top_inset: i32, bottom_inset: i32) void {
+fn gridSocketHitTest(g: Grid, surface: u8, hits: []const lens_socket.HitRect, x: i32, y: i32) ?lens_socket.SocketAction {
+    if (g.screen.* == feed_view.screen_loadout)
+        return algorithm_scene.socketHitTest(g.algorithms, surface, hits, x, y);
+    return lens_socket.hitTest(hits, x, y);
+}
+
+fn rebuildHomeScene(gpa: Allocator, g: Grid, width: i32, height: i32, top_inset: i32, bottom_inset: i32) void {
     if (g.screen.* != feed_view.screen_home) {
         g.home.clear();
         return;
@@ -197,8 +208,30 @@ fn rebuildHomeScene(g: Grid, width: i32, height: i32, top_inset: i32, bottom_ins
     const phone = width <= feed_view.phone_max;
     const body_top = feed_view.homeSocketBottom(g.socket_tray, g.socket_ui) + top_inset;
     const body_bottom = height - if (phone) feed_view.tab_bar_h + bottom_inset else 0;
-    home_scene.rebuild(g.home, g.regions.items, width, height, body_top, body_bottom, g.scroll.*) catch
+    home_scene.rebuild(g.home, gpa, g.regions.items, width, height, body_top, body_bottom, g.scroll.*) catch
         g.home.clear();
+}
+
+fn rebuildAlgorithmScene(gpa: Allocator, g: Grid, width: i32, height: i32, top_inset: i32, bottom_inset: i32) void {
+    if (!algorithm_scene.isScreen(g.screen.*)) {
+        g.algorithms.clear();
+        return;
+    }
+    const phone = width <= feed_view.phone_max;
+    const body_top = if (g.screen.* == feed_view.screen_loadout) 130 + top_inset else 0;
+    const body_bottom = height - if (phone) feed_view.tab_bar_h + bottom_inset else 0;
+    algorithm_scene.rebuild(
+        g.algorithms,
+        gpa,
+        g.screen.*,
+        g.regions.items,
+        .{ g.socket_hits.items, g.reply_hits.items, g.zone_hits.items },
+        width,
+        height,
+        body_top,
+        body_bottom,
+        g.scroll.*,
+    ) catch g.algorithms.clear();
 }
 
 test "universal Rover scroll range preserves Zat shell convention" {
@@ -597,6 +630,7 @@ const RunState = struct {
     pull_refresh_requested: bool,
     gregions: feed_view.Regions,
     ghome_scene: home_scene.Scene,
+    galgorithm_scene: algorithm_scene.Scene,
     empty_cards: [0]lens_socket.LensCard,
     socket_cards: []lens_socket.LensCard,
     socket_blob: []const u8,
@@ -1427,6 +1461,7 @@ fn initRunState(
     rs.pull_refresh_requested = false;
     rs.gregions = .empty;
     rs.ghome_scene = home_scene.Scene.init(gpa);
+    rs.galgorithm_scene = algorithm_scene.Scene.init(gpa);
     // THE LENS SOCKET loadouts — THREE surfaces (feed / reply / zone),
     // SOCKET_LOADOUT §10. The FEED surface is interactive in the home header;
     // reply/zone are held so a save writes the whole record without clobbering
@@ -2213,6 +2248,7 @@ fn deinitRunState(rs: *RunState) void {
     if (rs.reply_cards.len > 0) gpa.free(rs.reply_cards);
     if (rs.socket_blob.len > 0) gpa.free(rs.socket_blob);
     if (rs.socket_cards.len > 0) gpa.free(rs.socket_cards);
+    rs.galgorithm_scene.deinit();
     rs.ghome_scene.deinit();
     rs.gregions.deinit(gpa);
     rs.gspawn.deinit(gpa);
@@ -4190,7 +4226,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        var pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .home = &rs.ghome_scene, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = .{ .cards = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .q_focus = rs.gmarket_q_focus, .loading = rs.market_loading, .filter = rs.gmarket_filter, .hover_x = rs.ghover_x, .hover_y = rs.ghover_y }, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .call = callViewOf(rs), .call_hits = &rs.call_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_delivery = chatDeliveryOf(rs), .chat_identity_elsewhere = rs.gchat_identity_elsewhere, .chat_link = chatLinkOf(rs), .chat_devices = chatDevicesOf(rs, arena), .chat_menu = chatMenuOf(rs), .chat_ctx = chatComposeCtxOf(rs), .chat_game = chatGameOf(rs, arena), .enroll = enroll_run.snapshot(&rs.genroll_state, composeBlinkOn(rs.caret_anchor_ns)), .enroll_hits = &rs.genroll_hits, .boot_on = bootIntroOn(rs), .boot_t = bootIntroT(rs), .kbd_visible = softKeyboardWanted(rs), .kbd_shift = rs.kbd_shift, .kbd_page = rs.kbd_page, .kbd_caps = rs.kbd_caps, .kbd_flash_key = rs.kbd_flash_key, .kbd_flash_a = kbdFlashAlpha(rs), .kbd_popup = .{ .opts = rs.kbd_popup_opts[0..rs.kbd_popup_n], .anchor_x = rs.kbd_popup_ax, .anchor_y = rs.kbd_popup_ay, .anchor_w = rs.kbd_popup_aw, .sel = rs.kbd_popup_sel }, .kbd_emoji_open = rs.kbd_emoji_open, .kbd_emoji_scroll = @intFromFloat(rs.kbd_emoji_scroll), .kbd_picker_mode = rs.kbd_picker_mode, .kbd_nav_t = rs.kbd_nav_t, .kbd_nav_scroll = @intFromFloat(rs.kbd_nav_scroll), .chat_q = rs.gchat_q_buf[0..rs.gchat_q_len], .chat_q_focus = rs.gchat_q_focus, .chat_q_caret = composeBlinkOn(rs.caret_anchor_ns), .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_edit = .{ .caret = @min(rs.gchat_caret, rs.gchat_draft_len), .sel_a = @min(rs.gchat_sel_a, rs.gchat_draft_len), .sel_b = @min(rs.gchat_sel_b, rs.gchat_draft_len), .bar = rs.gchat_edit_bar }, .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .step = rs.gpay_step, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents, .busy = rs.gpay_busy }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved, .rooted = rs.grecv_set, .set = rs.grecv_set, .known = rs.grecv_known, .probing = rs.grecv_probing, .caps = rs.gcaps, .saving = rs.gpublish_busy }, .wallet_remove_armed = rs.gwallet_remove_armed, .verify_ids = verifyIdsOf(arena, rs), .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
+        var pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .home = &rs.ghome_scene, .algorithms = &rs.galgorithm_scene, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = .{ .cards = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .q_focus = rs.gmarket_q_focus, .loading = rs.market_loading, .filter = rs.gmarket_filter, .hover_x = rs.ghover_x, .hover_y = rs.ghover_y }, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .call = callViewOf(rs), .call_hits = &rs.call_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_delivery = chatDeliveryOf(rs), .chat_identity_elsewhere = rs.gchat_identity_elsewhere, .chat_link = chatLinkOf(rs), .chat_devices = chatDevicesOf(rs, arena), .chat_menu = chatMenuOf(rs), .chat_ctx = chatComposeCtxOf(rs), .chat_game = chatGameOf(rs, arena), .enroll = enroll_run.snapshot(&rs.genroll_state, composeBlinkOn(rs.caret_anchor_ns)), .enroll_hits = &rs.genroll_hits, .boot_on = bootIntroOn(rs), .boot_t = bootIntroT(rs), .kbd_visible = softKeyboardWanted(rs), .kbd_shift = rs.kbd_shift, .kbd_page = rs.kbd_page, .kbd_caps = rs.kbd_caps, .kbd_flash_key = rs.kbd_flash_key, .kbd_flash_a = kbdFlashAlpha(rs), .kbd_popup = .{ .opts = rs.kbd_popup_opts[0..rs.kbd_popup_n], .anchor_x = rs.kbd_popup_ax, .anchor_y = rs.kbd_popup_ay, .anchor_w = rs.kbd_popup_aw, .sel = rs.kbd_popup_sel }, .kbd_emoji_open = rs.kbd_emoji_open, .kbd_emoji_scroll = @intFromFloat(rs.kbd_emoji_scroll), .kbd_picker_mode = rs.kbd_picker_mode, .kbd_nav_t = rs.kbd_nav_t, .kbd_nav_scroll = @intFromFloat(rs.kbd_nav_scroll), .chat_q = rs.gchat_q_buf[0..rs.gchat_q_len], .chat_q_focus = rs.gchat_q_focus, .chat_q_caret = composeBlinkOn(rs.caret_anchor_ns), .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_edit = .{ .caret = @min(rs.gchat_caret, rs.gchat_draft_len), .sel_a = @min(rs.gchat_sel_a, rs.gchat_draft_len), .sel_b = @min(rs.gchat_sel_b, rs.gchat_draft_len), .bar = rs.gchat_edit_bar }, .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .step = rs.gpay_step, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents, .busy = rs.gpay_busy }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved, .rooted = rs.grecv_set, .set = rs.grecv_set, .known = rs.grecv_known, .probing = rs.grecv_probing, .caps = rs.gcaps, .saving = rs.gpublish_busy }, .wallet_remove_armed = rs.gwallet_remove_armed, .verify_ids = verifyIdsOf(arena, rs), .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
         switch (rs.mode) {
             .timeline => try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status),
             .compose => {
@@ -5711,10 +5747,10 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         // cursor and the click always agree on what is tappable.
                         const over_clickable =
                             gridHitTest(g, rx, ry) != null or
-                            (rs.gbench_pick == null and lens_socket.hitTest(g.socket_hits.items, rx, ry) != null) or
+                            (rs.gbench_pick == null and gridSocketHitTest(g, 0, g.socket_hits.items, rx, ry) != null) or
                             (rs.gscreen == feed_view.screen_loadout and rs.gbench_pick == null and
-                                (lens_socket.hitTest(rs.reply_hits.items, rx, ry) != null or
-                                    lens_socket.hitTest(rs.zone_hits.items, rx, ry) != null)) or
+                                (gridSocketHitTest(g, 1, rs.reply_hits.items, rx, ry) != null or
+                                    gridSocketHitTest(g, 2, rs.zone_hits.items, rx, ry) != null)) or
                             field_hit != null;
                         // A live text-selection drag over the rooted post:
                         // extend the selection to the caret under the pointer.
@@ -5828,7 +5864,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                 // Loadout page: edit the surface under the cursor (feed /
                                 // reply / zone). A handle press (.reorder) starts a drag for
                                 // that surface; everything else is a click edit.
-                                if (lens_socket.hitTest(g.socket_hits.items, rx, ry)) |sact| {
+                                if (gridSocketHitTest(g, 0, g.socket_hits.items, rx, ry)) |sact| {
                                     switch (sact) {
                                         .reorder => |r| {
                                             rs.page_drag_surface = 0;
@@ -5849,7 +5885,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         else => applyLoadoutAction(sact, rs.socket_cards, rs.socket_blob, &rs.gseated, &rs.gsocket_ui, &rs.loadout_dirty),
                                     }
                                     socket_handled = true;
-                                } else if (lens_socket.hitTest(rs.reply_hits.items, rx, ry)) |sact| {
+                                } else if (gridSocketHitTest(g, 1, rs.reply_hits.items, rx, ry)) |sact| {
                                     switch (sact) {
                                         .reorder => |r| {
                                             rs.page_drag_surface = 1;
@@ -5870,7 +5906,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         else => applyLoadoutAction(sact, rs.reply_cards, rs.reply_blob, &rs.reply_seated, &rs.reply_ui, &rs.loadout_dirty),
                                     }
                                     socket_handled = true;
-                                } else if (lens_socket.hitTest(rs.zone_hits.items, rx, ry)) |sact| {
+                                } else if (gridSocketHitTest(g, 2, rs.zone_hits.items, rx, ry)) |sact| {
                                     switch (sact) {
                                         .reorder => |r| {
                                             rs.page_drag_surface = 2;
@@ -5896,7 +5932,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                 // The inline REPLY socket on a thread: a switcher over the
                                 // reply loadout (shared with the Algorithms page). Order-only,
                                 // no view retint. Reorder lives on the Algorithms page.
-                                if (lens_socket.hitTest(g.socket_hits.items, rx, ry)) |sact| {
+                                if (gridSocketHitTest(g, 0, g.socket_hits.items, rx, ry)) |sact| {
                                     socket_handled = true;
                                     switch (sact) {
                                         .toggle_tray => rs.reply_ui.open = !rs.reply_ui.open,
@@ -5926,7 +5962,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                 // loadout (shared with the Algorithms page). Order-only;
                                 // no real ranking power yet (the discover engine is
                                 // unbuilt). Reorder lives on the Algorithms page.
-                                if (lens_socket.hitTest(g.socket_hits.items, rx, ry)) |sact| {
+                                if (gridSocketHitTest(g, 0, g.socket_hits.items, rx, ry)) |sact| {
                                     socket_handled = true;
                                     switch (sact) {
                                         .toggle_tray => rs.zone_ui.open = !rs.zone_ui.open,
@@ -5951,7 +5987,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         else => applyLoadoutAction(sact, rs.zone_cards, rs.zone_blob, &rs.zone_seated, &rs.zone_ui, &rs.loadout_dirty),
                                     }
                                 }
-                            } else if (lens_socket.hitTest(g.socket_hits.items, rx, ry)) |sact| {
+                            } else if (gridSocketHitTest(g, 0, g.socket_hits.items, rx, ry)) |sact| {
                                 socket_handled = true;
                                 // Any socket action other than opening/using the picker
                                 // closes it (the open/set arms re-open or keep as needed).
@@ -14436,6 +14472,7 @@ const Grid = struct {
     content_h: *i32,
     regions: *feed_view.Regions,
     home: *home_scene.Scene,
+    algorithms: *algorithm_scene.Scene,
     /// The active top-level Screen (index into feed_view.nav_labels): 0 = Home
     /// (the feed); the rail switches it on a click. Shared (a pointer to a run()
     /// local) so paint and the click handler agree on the same value.
@@ -15813,7 +15850,8 @@ fn paintFrame(
             // there are no safe-area insets: just the bar.
             if (win.fb.width <= feed_view.phone_max)
                 g.content_h.* += feed_view.tab_bar_h;
-            rebuildHomeScene(g, @intCast(win.fb.width), @intCast(win.fb.height), 0, 0);
+            rebuildHomeScene(gpa, g, @intCast(win.fb.width), @intCast(win.fb.height), 0, 0);
+            rebuildAlgorithmScene(gpa, g, @intCast(win.fb.width), @intCast(win.fb.height), 0, 0);
             // The cartridge DETAIL sheet (item 5): topmost overlay when open.
             if (g.cart_detail) |cd| if (g.detail_hits) |dh| {
                 dh.clearRetainingCapacity();
@@ -16949,7 +16987,8 @@ fn paintFrameGpu(
         // no bottom bar, nothing reserved.
         if (gs.design_w <= feed_view.phone_max)
             g.content_h.* += feed_view.tab_bar_h + @as(i32, @intCast(gs.inset_bottom_l));
-        rebuildHomeScene(g, @intCast(gs.design_w), @intCast(lh), gs.inset_top_l, gs.inset_bottom_l);
+        rebuildHomeScene(gpa, g, @intCast(gs.design_w), @intCast(lh), gs.inset_top_l, gs.inset_bottom_l);
+        rebuildAlgorithmScene(gpa, g, @intCast(gs.design_w), @intCast(lh), gs.inset_top_l, gs.inset_bottom_l);
         if (g.julia) feed_view.juliaRemapText(g.draw); // light theme: dark text
         // "Show frame timing": ride the fps/ms badge on the feed buffer. The gate
         // above forces a per-frame rebuild while this is on, so the number is live

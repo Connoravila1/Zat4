@@ -44,6 +44,7 @@ pub const BuildError = rover.AddError || rover.ResolveError;
 
 pub fn rebuild(
     s: *Scene,
+    gpa: std.mem.Allocator,
     regions: []const feed_view.Region,
     width: i32,
     height: i32,
@@ -58,17 +59,17 @@ pub fn rebuild(
     const safe_h = @max(0, height);
     const top = std.math.clamp(body_top, 0, safe_h);
     const bottom = std.math.clamp(body_bottom, top, safe_h);
-    const root = try s.runtime.addRoot(.{
+    const root = try s.runtime.addRoot(gpa, .{
         .id = root_id,
         .rect = rectOf(0, 0, safe_w, safe_h),
         .overflow = .clip,
     });
-    const body = try s.runtime.addChild(root, .{
+    const body = try s.runtime.addChild(gpa, root, .{
         .id = body_id,
         .rect = rectOf(0, top, safe_w, bottom - top),
         .overflow = .scroll,
     });
-    const content = try s.runtime.addChild(body, .{
+    const content = try s.runtime.addChild(gpa, body, .{
         .id = content_id,
         .rect = rectOf(0, -top, safe_w, @max(safe_h, bottom - scroll)),
         .translation = .{ .y = @floatFromInt(scroll) },
@@ -80,7 +81,7 @@ pub fn rebuild(
         const parent = if (content_control) content else root;
         const z: i16 = if (isOverlay(region.kind)) 20 else if (content_control) 0 else 10;
         const y = if (content_control) @as(i32, region.y) - scroll else @as(i32, region.y);
-        _ = try s.runtime.addChild(parent, .{
+        _ = try s.runtime.addChild(gpa, parent, .{
             .id = id,
             .rect = rectOf(region.x, y, region.w, region.h),
             .flags = .{ .hittable = true, .focusable = true },
@@ -170,7 +171,7 @@ test "Home scene clips scrolled post input under sticky and bottom chrome" {
         testRegion(20, 275, 80, 30, 2, .reply),
         testRegion(10, 10, 100, 40, 0, .nav),
     };
-    try rebuild(&scene, &regions, 320, 300, 120, 270, -60);
+    try rebuild(&scene, std.testing.allocator, &regions, 320, 300, 120, 270, -60);
 
     try std.testing.expect(hitTest(&scene, &regions, 40, 100) == null);
     try std.testing.expectEqual(feed_view.Action.post_body, hitTest(&scene, &regions, 40, 160).?.kind);
@@ -188,6 +189,6 @@ test "Home chrome wins over content by resolved z order" {
         testRegion(20, 150, 100, 40, 4, .post_body),
         testRegion(20, 150, 100, 40, 0, .nav),
     };
-    try rebuild(&scene, &regions, 320, 300, 120, 300, 0);
+    try rebuild(&scene, std.testing.allocator, &regions, 320, 300, 120, 300, 0);
     try std.testing.expectEqual(feed_view.Action.nav, hitTest(&scene, &regions, 40, 160).?.kind);
 }

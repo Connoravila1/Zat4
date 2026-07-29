@@ -1140,21 +1140,28 @@ pub fn hitTest(hits: []const HitRect, px: i32, py: i32) ?SocketAction {
         i -= 1;
         const r = hits[i];
         if (px >= r.x and px < @as(i32, r.x) + r.w and py >= r.y and py < @as(i32, r.y) + r.h) {
-            return switch (r.target) {
-                .toggle, .caret => .toggle_tray,
-                .seat => .{ .seat = r.cid },
-                .expand => .{ .expand = r.cid },
-                .collapse => .collapse,
-                .get_more => .get_more,
-                .reorder_handle => .{ .reorder = .{ .lens = r.cid, .to_rank = 0 } },
-                .swatch_open => .{ .open_swatch = r.cid },
-                .swatch => .{ .set_color = .{ .lens = r.cid, .color = r.color } },
-                .detail_close => .close_detail,
-                .detail_panel => .noop_detail,
-            };
+            return actionForHit(r);
         }
     }
     return null;
+}
+
+/// Convert one resolved hit rectangle into its value-level intent. Structural
+/// scene binders call this after resolving clipping/z order; lens_socket remains
+/// the sole owner of target semantics and CID-bearing action construction (D6).
+pub fn actionForHit(r: HitRect) SocketAction {
+    return switch (r.target) {
+        .toggle, .caret => .toggle_tray,
+        .seat => .{ .seat = r.cid },
+        .expand => .{ .expand = r.cid },
+        .collapse => .collapse,
+        .get_more => .get_more,
+        .reorder_handle => .{ .reorder = .{ .lens = r.cid, .to_rank = 0 } },
+        .swatch_open => .{ .open_swatch = r.cid },
+        .swatch => .{ .set_color = .{ .lens = r.cid, .color = r.color } },
+        .detail_close => .close_detail,
+        .detail_panel => .noop_detail,
+    };
 }
 
 // ---------------------------------------------------------------------------

@@ -177,17 +177,19 @@ pub const Scene = struct {
         return s.ids.items.len;
     }
 
-    pub fn addRoot(s: *Scene, spec: Spec) AddError!Node {
-        return s.append(nil, spec);
+    pub fn addRoot(s: *Scene, gpa: std.mem.Allocator, spec: Spec) AddError!Node {
+        assert(gpa.ptr == s.gpa.ptr and gpa.vtable == s.gpa.vtable);
+        return s.append(spec, nil);
     }
 
-    pub fn addChild(s: *Scene, parent: Node, spec: Spec) AddError!Node {
+    pub fn addChild(s: *Scene, gpa: std.mem.Allocator, parent: Node, spec: Spec) AddError!Node {
+        assert(gpa.ptr == s.gpa.ptr and gpa.vtable == s.gpa.vtable);
         const p = @intFromEnum(parent);
         if (p >= s.ids.items.len) return error.InvalidParent;
-        return s.append(p, spec);
+        return s.append(spec, p);
     }
 
-    fn append(s: *Scene, parent: u32, spec: Spec) AddError!Node {
+    fn append(s: *Scene, spec: Spec, parent: u32) AddError!Node {
         if (spec.id == .none) return error.InvalidId;
         for (s.ids.items) |existing| {
             if (existing == spec.id) return error.DuplicateId;
@@ -438,18 +440,18 @@ test "runtime: nested transforms and clips resolve from one tree" {
     var scene = Scene.init(std.testing.allocator);
     defer scene.deinit();
 
-    const root = try scene.addRoot(.{
+    const root = try scene.addRoot(std.testing.allocator, .{
         .id = testId(1),
         .rect = .{ .x = 0, .y = 0, .w = 200, .h = 120 },
         .overflow = .clip,
     });
-    const row = try scene.addChild(root, .{
+    const row = try scene.addChild(std.testing.allocator, root, .{
         .id = testId(2),
         .rect = .{ .x = 10, .y = 20, .w = 180, .h = 80 },
         .translation = .{ .y = -30 },
         .overflow = .clip,
     });
-    const button = try scene.addChild(row, .{
+    const button = try scene.addChild(std.testing.allocator, row, .{
         .id = testId(3),
         .rect = .{ .x = 20, .y = 60, .w = 80, .h = 40 },
         .flags = .{ .hittable = true, .focusable = true },
@@ -470,12 +472,12 @@ test "runtime: clipped-off descendants neither show nor receive input" {
     var scene = Scene.init(std.testing.allocator);
     defer scene.deinit();
 
-    const root = try scene.addRoot(.{
+    const root = try scene.addRoot(std.testing.allocator, .{
         .id = testId(1),
         .rect = .{ .w = 100, .h = 100 },
         .overflow = .clip,
     });
-    const child = try scene.addChild(root, .{
+    const child = try scene.addChild(std.testing.allocator, root, .{
         .id = testId(2),
         .rect = .{ .x = 120, .y = 20, .w = 30, .h = 30 },
         .flags = .{ .hittable = true, .focusable = true },
@@ -492,12 +494,12 @@ test "runtime: visible overflow is not clipped by the parent" {
     var scene = Scene.init(std.testing.allocator);
     defer scene.deinit();
 
-    const root = try scene.addRoot(.{
+    const root = try scene.addRoot(std.testing.allocator, .{
         .id = testId(1),
         .rect = .{ .w = 100, .h = 100 },
         .overflow = .visible,
     });
-    const child = try scene.addChild(root, .{
+    const child = try scene.addChild(std.testing.allocator, root, .{
         .id = testId(2),
         .rect = .{ .x = 120, .y = 20, .w = 30, .h = 30 },
         .flags = .{ .hittable = true },
@@ -512,17 +514,17 @@ test "runtime: hidden ancestors and disabled nodes suppress interaction" {
     var scene = Scene.init(std.testing.allocator);
     defer scene.deinit();
 
-    const hidden = try scene.addRoot(.{
+    const hidden = try scene.addRoot(std.testing.allocator, .{
         .id = testId(1),
         .rect = .{ .w = 100, .h = 100 },
         .flags = .{ .visible = false },
     });
-    const child = try scene.addChild(hidden, .{
+    const child = try scene.addChild(std.testing.allocator, hidden, .{
         .id = testId(2),
         .rect = .{ .w = 20, .h = 20 },
         .flags = .{ .hittable = true },
     });
-    const disabled = try scene.addRoot(.{
+    const disabled = try scene.addRoot(std.testing.allocator, .{
         .id = testId(3),
         .rect = .{ .w = 20, .h = 20 },
         .flags = .{ .hittable = true, .focusable = true, .disabled = true },
@@ -539,22 +541,22 @@ test "runtime: invalid ids, duplicate ids, parents, and geometry fail explicitly
     var scene = Scene.init(std.testing.allocator);
     defer scene.deinit();
 
-    try std.testing.expectError(error.InvalidId, scene.addRoot(.{
+    try std.testing.expectError(error.InvalidId, scene.addRoot(std.testing.allocator, .{
         .id = .none,
         .rect = .{},
     }));
-    _ = try scene.addRoot(.{ .id = testId(1), .rect = .{ .w = 10, .h = 10 } });
-    try std.testing.expectError(error.DuplicateId, scene.addRoot(.{
+    _ = try scene.addRoot(std.testing.allocator, .{ .id = testId(1), .rect = .{ .w = 10, .h = 10 } });
+    try std.testing.expectError(error.DuplicateId, scene.addRoot(std.testing.allocator, .{
         .id = testId(1),
         .rect = .{},
     }));
-    try std.testing.expectError(error.InvalidParent, scene.addChild(@enumFromInt(99), .{
+    try std.testing.expectError(error.InvalidParent, scene.addChild(std.testing.allocator, @enumFromInt(99), .{
         .id = testId(2),
         .rect = .{},
     }));
 
     scene.reset();
-    _ = try scene.addRoot(.{
+    _ = try scene.addRoot(std.testing.allocator, .{
         .id = testId(1),
         .rect = .{ .w = -1, .h = 10 },
     });
@@ -566,7 +568,7 @@ test "runtime: diagnostic dump is deterministic and reset reuses the scene" {
     var scene = Scene.init(std.testing.allocator);
     defer scene.deinit();
 
-    _ = try scene.addRoot(.{
+    _ = try scene.addRoot(std.testing.allocator, .{
         .id = testId(7),
         .rect = .{ .x = 2, .y = 3, .w = 40, .h = 20 },
         .flags = .{ .hittable = true },
@@ -583,7 +585,7 @@ test "runtime: diagnostic dump is deterministic and reset reuses the scene" {
 
     scene.reset();
     try std.testing.expectEqual(@as(usize, 0), scene.count());
-    const root = try scene.addRoot(.{ .id = testId(9), .rect = .{ .w = 10, .h = 10 } });
+    const root = try scene.addRoot(std.testing.allocator, .{ .id = testId(9), .rect = .{ .w = 10, .h = 10 } });
     try scene.resolve(.{ .w = 100, .h = 100 });
     try std.testing.expectEqual(@as(u32, 9), @intFromEnum(scene.result(root).?.id));
 }
@@ -602,30 +604,30 @@ test "runtime: hit testing uses effective clips, z, and paint-order ties" {
     var scene = Scene.init(std.testing.allocator);
     defer scene.deinit();
 
-    const root = try scene.addRoot(.{
+    const root = try scene.addRoot(std.testing.allocator, .{
         .id = testId(1),
         .rect = .{ .w = 100, .h = 100 },
         .overflow = .clip,
     });
-    _ = try scene.addChild(root, .{
+    _ = try scene.addChild(std.testing.allocator, root, .{
         .id = testId(2),
         .rect = .{ .x = 10, .y = 10, .w = 80, .h = 80 },
         .flags = .{ .hittable = true },
         .z = 2,
     });
-    _ = try scene.addChild(root, .{
+    _ = try scene.addChild(std.testing.allocator, root, .{
         .id = testId(3),
         .rect = .{ .x = 10, .y = 10, .w = 80, .h = 80 },
         .flags = .{ .hittable = true },
         .z = 2,
     });
-    _ = try scene.addChild(root, .{
+    _ = try scene.addChild(std.testing.allocator, root, .{
         .id = testId(4),
         .rect = .{ .x = 20, .y = 20, .w = 20, .h = 20 },
         .flags = .{ .hittable = true },
         .z = 3,
     });
-    _ = try scene.addChild(root, .{
+    _ = try scene.addChild(std.testing.allocator, root, .{
         .id = testId(5),
         .rect = .{ .x = 120, .y = 10, .w = 20, .h = 20 },
         .flags = .{ .hittable = true },
@@ -642,17 +644,17 @@ test "runtime: focus and keyboard capabilities use resolved state" {
     var scene = Scene.init(std.testing.allocator);
     defer scene.deinit();
 
-    _ = try scene.addRoot(.{
+    _ = try scene.addRoot(std.testing.allocator, .{
         .id = testId(1),
         .rect = .{ .w = 20, .h = 20 },
         .flags = .{ .hittable = true, .focusable = true },
     });
-    _ = try scene.addRoot(.{
+    _ = try scene.addRoot(std.testing.allocator, .{
         .id = testId(2),
         .rect = .{ .x = 30, .w = 20, .h = 20 },
         .flags = .{ .hittable = true, .focusable = true, .keyboard = true },
     });
-    _ = try scene.addRoot(.{
+    _ = try scene.addRoot(std.testing.allocator, .{
         .id = testId(3),
         .rect = .{ .x = 60, .w = 20, .h = 20 },
         .flags = .{ .hittable = true, .focusable = true, .disabled = true },
