@@ -141,6 +141,11 @@ pub const MobileHost = struct {
     touch_cancel: bool = false,
     /// The press began on the Zat4 keyboard: taps type; never scroll/swipe.
     press_in_kbd: bool = false,
+    /// A6 exception: MobileHost is one cold shell owner; keeping gesture flags
+    /// directly addressable avoids packed-field pointer restrictions.
+    /// The press began while a declared overlay owned input. It may still
+    /// synthesize a tap for that overlay, but never becomes page scroll/swipe.
+    overlay_press: bool = false,
     /// Backspace auto-repeat: deletes this press has fired from the pump's
     /// hold timer. Nonzero swallows the release tap (the run already typed);
     /// reset on the next touch-down.

@@ -180,11 +180,16 @@ fn clampGlobalScroll(scroll: *i32, view_h: i32, content_h: i32) void {
 }
 
 fn gridHitTest(g: Grid, x: i32, y: i32) ?feed_view.Region {
-    if (g.screen.* == feed_view.screen_home)
-        return home_scene.hitTest(g.home, g.regions.items, x, y);
-    if (algorithm_scene.isScreen(g.screen.*))
-        return algorithm_scene.pageHitTest(g.algorithms, g.regions.items, x, y);
-    return feed_view.hitTest(g.regions.items, x, y);
+    const hit = if (g.screen.* == feed_view.screen_home)
+        home_scene.hitTest(g.home, g.regions.items, x, y)
+    else if (algorithm_scene.isScreen(g.screen.*))
+        algorithm_scene.pageHitTest(g.algorithms, g.regions.items, x, y)
+    else
+        feed_view.hitTest(g.regions.items, x, y);
+    if (hit) |region| {
+        if (!overlay_order.allowsAction(g.overlay_kind, region.kind)) return null;
+    }
+    return hit;
 }
 
 fn runHitTest(rs: *const RunState, x: i32, y: i32) ?feed_view.Region {
@@ -196,6 +201,7 @@ fn runHitTest(rs: *const RunState, x: i32, y: i32) ?feed_view.Region {
 }
 
 fn gridSocketHitTest(g: Grid, surface: u8, hits: []const lens_socket.HitRect, x: i32, y: i32) ?lens_socket.SocketAction {
+    if (g.overlay_kind != .none and g.overlay_kind != .pending_game) return null;
     if (g.screen.* == feed_view.screen_loadout)
         return algorithm_scene.socketHitTest(g.algorithms, surface, hits, x, y);
     return lens_socket.hitTest(hits, x, y);
@@ -4227,7 +4233,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 bench_tray = .{ .cards = res[0], .text = res[1], .seated = 0 };
             } else |_| {}
         }
-        var pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .home = &rs.ghome_scene, .algorithms = &rs.galgorithm_scene, .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = .{ .cards = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .q_focus = rs.gmarket_q_focus, .loading = rs.market_loading, .filter = rs.gmarket_filter, .hover_x = rs.ghover_x, .hover_y = rs.ghover_y }, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .call = callViewOf(rs), .call_hits = &rs.call_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_delivery = chatDeliveryOf(rs), .chat_identity_elsewhere = rs.gchat_identity_elsewhere, .chat_link = chatLinkOf(rs), .chat_devices = chatDevicesOf(rs, arena), .chat_menu = chatMenuOf(rs), .chat_ctx = chatComposeCtxOf(rs), .chat_game = chatGameOf(rs, arena), .enroll = enroll_run.snapshot(&rs.genroll_state, composeBlinkOn(rs.caret_anchor_ns)), .enroll_hits = &rs.genroll_hits, .boot_on = bootIntroOn(rs), .boot_t = bootIntroT(rs), .kbd_visible = softKeyboardWanted(rs), .kbd_shift = rs.kbd_shift, .kbd_page = rs.kbd_page, .kbd_caps = rs.kbd_caps, .kbd_flash_key = rs.kbd_flash_key, .kbd_flash_a = kbdFlashAlpha(rs), .kbd_popup = .{ .opts = rs.kbd_popup_opts[0..rs.kbd_popup_n], .anchor_x = rs.kbd_popup_ax, .anchor_y = rs.kbd_popup_ay, .anchor_w = rs.kbd_popup_aw, .sel = rs.kbd_popup_sel }, .kbd_emoji_open = rs.kbd_emoji_open, .kbd_emoji_scroll = @intFromFloat(rs.kbd_emoji_scroll), .kbd_picker_mode = rs.kbd_picker_mode, .kbd_nav_t = rs.kbd_nav_t, .kbd_nav_scroll = @intFromFloat(rs.kbd_nav_scroll), .chat_q = rs.gchat_q_buf[0..rs.gchat_q_len], .chat_q_focus = rs.gchat_q_focus, .chat_q_caret = composeBlinkOn(rs.caret_anchor_ns), .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_edit = .{ .caret = @min(rs.gchat_caret, rs.gchat_draft_len), .sel_a = @min(rs.gchat_sel_a, rs.gchat_draft_len), .sel_b = @min(rs.gchat_sel_b, rs.gchat_draft_len), .bar = rs.gchat_edit_bar }, .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .step = rs.gpay_step, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents, .busy = rs.gpay_busy }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved, .rooted = rs.grecv_set, .set = rs.grecv_set, .known = rs.grecv_known, .probing = rs.grecv_probing, .caps = rs.gcaps, .saving = rs.gpublish_busy }, .wallet_remove_armed = rs.gwallet_remove_armed, .verify_ids = verifyIdsOf(arena, rs), .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
+        var pix: ?Grid = if (rs.engine) |*e| .{ .engine = e, .field = &rs.gfield, .particles = &rs.gparticles, .active = &rs.gactive, .draw = &rs.gdraw, .hr = &rs.ghr, .hearts = &rs.ghearts, .view = &rs.gview, .spawn_buf = &rs.gspawn, .last_nanos = &rs.glast_nanos, .zoom = &rs.gzoom, .scroll = &rs.gscroll_px, .content_h = &rs.gcontent_h, .regions = &rs.gregions, .home = &rs.ghome_scene, .algorithms = &rs.galgorithm_scene, .overlay_kind = topOverlay(rs), .screen = &rs.gscreen, .gpu = if (rs.gpu_state) |*gs| gs else null, .pending_new = feed_core.pendingCount(store), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .socket_tray = cur_socket_tray, .socket_ui = cur_socket_ui, .socket_hits = cur_socket_hits, .accent = if (julia_on) lens_socket.julia_pink else (accent_override orelse lens_socket.seatedAccent(home_tray)), .reply_tray = .{ .cards = rs.reply_cards, .text = rs.reply_blob, .seated = rs.reply_seated }, .reply_ui = rs.reply_ui, .reply_hits = &rs.reply_hits, .zone_tray = .{ .cards = rs.zone_cards, .text = rs.zone_blob, .seated = rs.zone_seated }, .zone_ui = rs.zone_ui, .zone_hits = &rs.zone_hits, .loadout_tab = rs.gloadout_tab, .market = .{ .cards = if (rs.gscreen == feed_view.screen_loadout and rs.gloadout_tab == 1) rs.market_cards.items else &.{}, .q = rs.gmarket_q_buf[0..rs.gmarket_q_len], .q_focus = rs.gmarket_q_focus, .loading = rs.market_loading, .filter = rs.gmarket_filter, .hover_x = rs.ghover_x, .hover_y = rs.ghover_y }, .bench_pick = benchPickViewOf(rs), .bench_drag = benchDragViewOf(rs), .cart_detail = if (detailCardOf(rs)) |dt| dt.card else null, .back_hint = clock_shell.monotonicNanos() < rs.back_hint_until, .cart_detail_blob = if (detailCardOf(rs)) |dt| dt.blob else "", .detail_hits = &rs.detail_hits, .call = callViewOf(rs), .call_hits = &rs.call_hits, .published = publishedRowsOf(arena, rs), .docs_kind = rs.gdocs_kind, .detail = detailViewOf(rs), .create = .{ .step = rs.gcreate_step, .answers = rs.gcreate_answers, .config = rs.gcreate_config, .name = rs.gcreate_name_buf[0..rs.gcreate_name_len], .color = rs.gcreate_color, .naming = rs.gcreate_step == .name, .prepare_t = create_prepare_t }, .dev = devViewOf(rs), .bench = bench_tray, .inspect_bytes = rs.inspect_bytes orelse "", .inspect_src = rs.inspect_src orelse "", .inspect_name = rs.inspect_name, .inspect_ref = rs.inspect_ref, .inspect_source = rs.gtransp_source, .inspect_loading = rs.inspect_loading, .loadout_geoms = &rs.page_geoms, .loadout_lib_y = &rs.page_lib_y, .zone_title = if (on_zone_screen) rs.zone_tag else "", .zones = .{ .cards = if (rs.gscreen == feed_view.screen_zones_browse) rs.zone_catalog.items else &.{}, .tab = rs.gzones_tab, .query = rs.gzones_q_buf[0..rs.gzones_q_len], .q_focus = rs.gzones_q_focus, .caret_on = composeBlinkOn(rs.caret_anchor_ns), .hover_x = rs.ghover_x, .hover_y = rs.ghover_y, .now = now, .tab_t = rs.gzones_tab_t, .enter_t = rs.gzones_enter_t, .people = rs.zone_people, .pinned = if (on_zone_screen) pin_store.has(&rs.zone_pins, rs.zone_tag) else false, .last_at = rs.zone_last_at }, .settings_section = rs.gsettings_section, .settings_toggles = rs.toggle_bits, .settings_account = settings_account, .settings_choices = settings_choices_packed, .settings_picking = rs.gsettings_picking, .chat_store = if (dev_chat) &rs.gchat_store else null, .chat_sel = rs.gchat_sel, .chat_delivery = chatDeliveryOf(rs), .chat_identity_elsewhere = rs.gchat_identity_elsewhere, .chat_link = chatLinkOf(rs), .chat_devices = chatDevicesOf(rs, arena), .chat_menu = chatMenuOf(rs), .chat_ctx = chatComposeCtxOf(rs), .chat_game = chatGameOf(rs, arena), .enroll = enroll_run.snapshot(&rs.genroll_state, composeBlinkOn(rs.caret_anchor_ns)), .enroll_hits = &rs.genroll_hits, .boot_on = bootIntroOn(rs), .boot_t = bootIntroT(rs), .kbd_visible = softKeyboardWanted(rs), .kbd_shift = rs.kbd_shift, .kbd_page = rs.kbd_page, .kbd_caps = rs.kbd_caps, .kbd_flash_key = rs.kbd_flash_key, .kbd_flash_a = kbdFlashAlpha(rs), .kbd_popup = .{ .opts = rs.kbd_popup_opts[0..rs.kbd_popup_n], .anchor_x = rs.kbd_popup_ax, .anchor_y = rs.kbd_popup_ay, .anchor_w = rs.kbd_popup_aw, .sel = rs.kbd_popup_sel }, .kbd_emoji_open = rs.kbd_emoji_open, .kbd_emoji_scroll = @intFromFloat(rs.kbd_emoji_scroll), .kbd_picker_mode = rs.kbd_picker_mode, .kbd_nav_t = rs.kbd_nav_t, .kbd_nav_scroll = @intFromFloat(rs.kbd_nav_scroll), .chat_q = rs.gchat_q_buf[0..rs.gchat_q_len], .chat_q_focus = rs.gchat_q_focus, .chat_q_caret = composeBlinkOn(rs.caret_anchor_ns), .chat_draft = rs.gchat_draft_buf[0..rs.gchat_draft_len], .chat_edit = .{ .caret = @min(rs.gchat_caret, rs.gchat_draft_len), .sel_a = @min(rs.gchat_sel_a, rs.gchat_draft_len), .sel_b = @min(rs.gchat_sel_b, rs.gchat_draft_len), .bar = rs.gchat_edit_bar }, .chat_input_focus = rs.gchat_input_focus, .chat_composing = rs.gchat_composing, .chat_compose = rs.gchat_peer_buf[0..rs.gchat_peer_len], .chat_compose_status = rs.gchat_compose_status, .chat_typing = rs.gscreen == feed_view.screen_messages and now < rs.gchat_typing_deadline and rs.gchat_sel != null and std.mem.eql(u8, chat_core.conversationDid(&rs.gchat_store, rs.gchat_sel.?), rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]), .chat_key_ns = rs.gchat_key_ns, .chat_pay = .{ .open = rs.gpay_open, .rail = rs.gpay_rail, .amount = rs.gpay_amount_buf[0..rs.gpay_amount_len], .note = rs.gpay_note_buf[0..rs.gpay_note_len], .focus = rs.gpay_focus, .status = rs.gpay_status, .step = rs.gpay_step, .first_send = rs.gpay_first_send, .unit = rs.gpay_unit, .usd_cents_per_btc = rs.gprice_cents, .busy = rs.gpay_busy }, .chat_recv = .{ .open = rs.grecv_open, .mode = rs.grecv_mode, .lightning = rs.grecv_ln_buf[0..rs.grecv_ln_len], .bitcoin = rs.grecv_btc_buf[0..rs.grecv_btc_len], .focus = rs.grecv_focus, .status = rs.grecv_status, .saved = rs.grecv_saved, .rooted = rs.grecv_set, .set = rs.grecv_set, .known = rs.grecv_known, .probing = rs.grecv_probing, .caps = rs.gcaps, .saving = rs.gpublish_busy }, .wallet_remove_armed = rs.gwallet_remove_armed, .verify_ids = verifyIdsOf(arena, rs), .expanded = rs.gexpanded.items, .repost_menu = if (rs.grepost_menu) |m| @as(usize, m) else null, .field_gain = field_gain, .julia = julia_on, .you_handle = session.handle, .ripples_on = ripples_on, .field_on = field_on, .crt_on = crt_on, .frametiming_on = frametiming_on, .pet = pet_on, .xp = xp_on, .light = light_on, .xp_hour = xp_hm.hour, .xp_min = xp_hm.minute, .toys = .{ .feed_toy = if (gravity_on) feed_view.ToyKind.gravity else if (tectonic_on) feed_view.ToyKind.tectonic else if (depth_on) feed_view.ToyKind.depth else if (zerog_on) feed_view.ToyKind.zero_g else if (liquid_on) feed_view.ToyKind.liquid else .none, .t = if (rs.gpu_state) |*gs| gs.t else 0, .flow = if (rs.gpu_state) |*gs| gs.flow else 0 } } else null;
         switch (rs.mode) {
             .timeline => try paintFrame(gpa, rs.out, arena, &rs.prev, &rs.next, backend, pix, view_items, profile_header, &rs.state, rs.revealed.items, now, session.handle, rs.status),
             .compose => {
@@ -4456,6 +4462,8 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         // finger — two-thumb typing stops dropping the
                         // second key (the recorded single-pointer limit).
                         if (tev.button == 2) {
+                            const aux_owner = topOverlay(rs);
+                            if (aux_owner != .none and aux_owner != .pending_game) continue;
                             m.kbd_multi = true; // renumbering ahead: slides stand down
                             if (if (pix) |gv| gv.kbd_visible else false) {
                                 if (rs.gpu_state) |*gsd| {
@@ -4507,6 +4515,8 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             }
                         }
                         m.press_in_kbd = false;
+                        const press_owner = topOverlay(rs);
+                        m.overlay_press = press_owner != .none and press_owner != .pending_game;
                         m.kbd_bs_repeats = 0;
                         m.kbd_press_cp = 0;
                         m.kbd_multi = false;
@@ -4520,7 +4530,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         m.kbd_nav_drag = false;
                         m.kbd_nav_raw = 0;
                         rs.kbd_nav_scroll_v = 0; // a touch catches the banded column
-                        if (if (pix) |gv| gv.kbd_visible else false) {
+                        if (!m.overlay_press and (if (pix) |gv| gv.kbd_visible else false)) {
                             if (rs.gpu_state) |*gsd| {
                                 const klx: i32 = @intFromFloat(@as(f32, @floatFromInt(tev.x)) / gsd.scale);
                                 const kly: i32 = @intFromFloat(@as(f32, @floatFromInt(tev.y)) / gsd.scale);
@@ -4784,7 +4794,9 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         // the nav-drawer swipe (resolved on release). One
                         // commitment per press; a committed swipe never
                         // scrolls the feed under the moving finger.
-                        if (!m.scrolling and !m.hswipe and !m.socket_swipe and !m.press_in_kbd and m.chat_hnd == 0) {
+                        if (!m.scrolling and !m.hswipe and !m.socket_swipe and !m.press_in_kbd and
+                            !m.overlay_press and !m.hold_menu and m.chat_hnd == 0)
+                        {
                             const adx = @abs(@as(i32, tev.x) - m.down_x);
                             const ady = @abs(@as(i32, tev.y) - m.down_y);
                             if (ady > touch_slop and ady >= adx) {
@@ -5313,6 +5325,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 // release suppresses its tap via `hold_menu`.
                 if (dev_chat and m.down_x >= 0 and !m.hold_fired and !m.hold_menu and
                     !m.scrolling and !m.hswipe and !m.socket_swipe and !m.press_in_kbd and
+                    (topOverlay(rs) == .none or topOverlay(rs) == .pending_game) and
                     rs.gscreen == feed_view.screen_messages and !rs.gcmenu.open and
                     (now_ms -% m.down_ms) >= chat_hold_ms)
                 {
@@ -5334,6 +5347,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 const hold_ms: u32 = 300;
                 if (m.down_x >= 0 and !m.hold_fired and !m.scrolling and !m.hswipe and !m.socket_swipe and
                     rs.gbench_drag == null and rs.gbench_pick == null and
+                    (topOverlay(rs) == .none or topOverlay(rs) == .pending_game) and
                     rs.gscreen == feed_view.screen_loadout and (now_ms -% m.down_ms) >= hold_ms)
                 {
                     const hx: i32 = @intFromFloat(@as(f32, @floatFromInt(m.down_x)) / scale);
@@ -5518,7 +5532,8 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
         // the one and only path (timeline_ui.keyFor — round-trip
         // tested against actionFor). Hit rects are last frame's:
         // immediate-mode's standard one-frame contract.
-        if (rs.mode == .timeline) if (pix) |g| {
+        if (rs.mode == .timeline) if (pix) |frame_grid| {
+            var g = frame_grid;
             // Pointer coords are PIXELS; the grid thinks in cells.
             // Use the SAME zoom-derived cell size the renderer
             // used, so clicks land on the cell under the cursor at
@@ -5531,6 +5546,10 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
             // logical for GPU (÷scale), pass it through for software.
             const gpu_scale: f32 = if (g.gpu) |gs| gs.scale else 1.0;
             for (pointer_events.items) |pev| {
+                // An earlier event in this same pump may have opened/closed a
+                // layer. Refresh ownership per event so its paired release
+                // cannot fall through using the frame's stale snapshot.
+                g.overlay_kind = topOverlay(rs);
                 const cx: u16 = pev.x / pcell.w;
                 const cy: u16 = pev.y / pcell.h;
                 const rx: i32 = if (g.gpu != null) @intFromFloat(@as(f32, @floatFromInt(pev.x)) / gpu_scale) else @intCast(pev.x);
@@ -5544,13 +5563,13 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 // ringing phone outranks every sheet and menu, and its controls
                 // are the only thing that may be pressed while it is up — so
                 // resolve here and CONSUME every event unconditionally.
-                if (rs.gcall.phase != .idle) {
+                if (g.overlay_kind == .call) {
                     if (pev.kind == .button_down and pev.button == 1) {
                         if (call_view.hitTest(rs.call_hits.items, rx, ry)) |cact| callAction(rs, cact);
                     }
                     continue;
                 }
-                if (rs.gcart_detail != null) {
+                if (g.overlay_kind == .detail) {
                     if (pev.kind == .button_down and pev.button == 1) {
                         if (lens_socket.hitTest(rs.detail_hits.items, rx, ry)) |dact| switch (dact) {
                             .close_detail => rs.gcart_detail = null,
@@ -5560,10 +5579,18 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     }
                     continue;
                 }
+                if (pev.kind == .button_down and pev.button == 1 and
+                    (g.overlay_kind == .repost or g.overlay_kind == .settings_picker) and
+                    gridHitTest(g, rx, ry) == null)
+                {
+                    _ = dismissTopOverlay(rs); // outside-click closes one popover
+                    continue; // and never activates the surface underneath
+                }
                 // Toy Box: Gravity SHATTER owns the pointer while the page is broken —
                 // grab/fling tiles, tap the highlighted OFF toggle to stop, and NOTHING
                 // else is clickable (nav + settings are locked out). Consume the event.
-                if (rs.gpu_state) |*gs| if (gs.shatter_active) {
+                if (g.overlay_kind == .none or g.overlay_kind == .pending_game)
+                    if (rs.gpu_state) |*gs| if (gs.shatter_active) {
                     // The fixed EXIT box (top-right) ends it instantly, wherever the
                     // debris is — checked before any grab.
                     const ex = feed_view.shatterExitX(@intCast(gs.design_w));
@@ -5610,7 +5637,8 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 // Toy Box: Pet — any input keeps it awake; scrolling feeds the
                 // doom-scroll signal; grab it to toss it (a tap pets it); and while
                 // it's out you can drag a profile picture from the feed to feed it.
-                if (rs.gpu_state) |*gs| if (toggleOn(rs.toggle_bits, settings_view.act_pet)) {
+                if (g.overlay_kind == .none or g.overlay_kind == .pending_game)
+                    if (rs.gpu_state) |*gs| if (toggleOn(rs.toggle_bits, settings_view.act_pet)) {
                     gs.pet_interacted = true;
                     if (pev.kind == .wheel) gs.pet_scroll_ms +|= 120;
                     if (pev.kind == .move and gs.avatar_drag) {
@@ -5661,6 +5689,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 };
                 switch (pev.kind) {
                     .wheel => {
+                        if (g.overlay_kind != .none and g.overlay_kind != .pending_game) continue;
                         if (g.gpu) |gs| gs.menu_open = false; // scrolling dismisses the menu
                         rs.grepost_menu = null; // …and the Repost/Quote popover
                         // Wheel-down (5) / wheel-right (7) advance; wheel-up (4) /
@@ -5798,6 +5827,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         // post body. Left-click while the menu is open hits
                         // an item or dismisses it (never the feed beneath).
                         if (pev.button == 3) {
+                            if (g.overlay_kind != .none and g.overlay_kind != .pending_game) continue;
                             // RIGHT-CLICK ON A MESSAGE = the same menu the phone's
                             // press-and-hold opens. One menu, two ways in.
                             if (rs.gscreen == feed_view.screen_messages) {
@@ -6109,7 +6139,9 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         rs.armed_kind = hit.kind;
                                         rs.armed_post = hit.post;
                                     }
-                                } else if (field_ui.hitTest(cx, cy, g.hr.slice())) |_| {
+                                } else if ((g.overlay_kind == .none or g.overlay_kind == .pending_game) and
+                                    field_ui.hitTest(cx, cy, g.hr.slice()) != null)
+                                {
                                     rs.armed_legacy = true;
                                     rs.armed_cx = cx;
                                     rs.armed_cy = cy;
@@ -7842,7 +7874,10 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                     }
                                 }
                             }
-                        } else if (rs.armed_legacy and cx == rs.armed_cx and cy == rs.armed_cy) {
+                        } else if (rs.armed_legacy and
+                            (g.overlay_kind == .none or g.overlay_kind == .pending_game) and
+                            cx == rs.armed_cx and cy == rs.armed_cy)
+                        {
                             // Legacy (software cell) tap: same target on release.
                             if (field_ui.hitTest(cx, cy, g.hr.slice())) |hit| {
                                 if (hit.target != field_ui.no_target and hit.target < view_items.len) rs.state.selected = hit.target;
@@ -14422,6 +14457,7 @@ const Grid = struct {
     regions: *feed_view.Regions,
     home: *home_scene.Scene,
     algorithms: *algorithm_scene.Scene,
+    overlay_kind: overlay_order.Kind = .none,
     /// The active top-level Screen (index into feed_view.nav_labels): 0 = Home
     /// (the feed); the rail switches it on a click. Shared (a pointer to a run()
     /// local) so paint and the click handler agree on the same value.
