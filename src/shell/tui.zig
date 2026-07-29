@@ -74,6 +74,7 @@ const ui_insets = @import("../ui/insets.zig"); // Rover: safe-area / gesture-ins
 const scroll_container = @import("../ui/scroll_container.zig"); // Rover: one range rule for every screen
 const home_scene = @import("home_scene.zig"); // Zat binding: Home paint/input share Rover geometry
 const algorithm_scene = @import("algorithm_scene.zig"); // Algorithms: page + three sockets, one scene
+const overlay_order = @import("overlay_order.zig"); // Zat binding: one Back/modal precedence
 const chat_effects = @import("../core/chat_effects.zig");
 const screen_fx = @import("../core/screen_fx.zig");
 const shatter = @import("../core/shatter.zig");
@@ -9693,6 +9694,51 @@ fn callAction(rs: *RunState, act: call_view.Action) void {
     }
 }
 
+fn topOverlay(rs: *const RunState) overlay_order.Kind {
+    const drawer = if (rs.gpu_state) |*gsd| gsd.drawer_want or gsd.drawer_t > 0.3 else false;
+    const money = rs.gscreen == feed_view.screen_messages and payModalOpen(rs);
+    return overlay_order.top(.{
+        .consent = rs.gchat_consent_open,
+        .help = rs.gdev_help,
+        .receive = rs.grecv_open and !money,
+        .settings_picker = rs.gsettings_picking != 255,
+        .money = money,
+        .pending_game = rs.gscreen == feed_view.screen_messages and rs.gchat_pending_game,
+        .chat_menu = rs.gcmenu.open,
+        .game = rs.gscreen == feed_view.screen_messages and rs.gchat_game_open,
+        .repost = rs.grepost_menu != null,
+        .detail = rs.gcart_detail != null,
+        .call = rs.gcall.phase != .idle,
+        .drawer = drawer,
+    });
+}
+
+/// Dismiss exactly the top declared overlay. Rover determines precedence; this
+/// shell switch owns Zat's state transition for each value-level layer kind.
+fn dismissTopOverlay(rs: *RunState) bool {
+    switch (topOverlay(rs)) {
+        .none => return false,
+        .drawer => {
+            if (rs.gpu_state) |*gsd| gsd.drawer_want = false;
+        },
+        .call => callAction(rs, if (rs.gcall.phase == .ringing_in) .decline else .hangup),
+        .detail => rs.gcart_detail = null,
+        .repost => rs.grepost_menu = null,
+        .game => {
+            rs.gchat_game_open = false;
+            rs.gchat_game_staged = 255;
+        },
+        .chat_menu => rs.gcmenu = .{},
+        .pending_game => rs.gchat_pending_game = false,
+        .money => return payModalBack(rs),
+        .settings_picker => rs.gsettings_picking = 255,
+        .receive => rs.grecv_open = false,
+        .help => rs.gdev_help = false,
+        .consent => rs.gchat_consent_open = false,
+    }
+    return true;
+}
+
 fn backNavigate(rs: *RunState) bool {
     const gpa = rs.gpa;
     // THE FRONT DOOR answers the system back button. On a phone, back is how a
@@ -9715,59 +9761,9 @@ fn backNavigate(rs: *RunState) bool {
         }
         return false;
     }
-    if (rs.gpu_state) |*gsd| {
-        if (gsd.drawer_want or gsd.drawer_t > 0.3) {
-            gsd.drawer_want = false;
-            return true;
-        }
-    }
-    // THE CALL SURFACE is the topmost overlay, so back peels it first. Back on
-    // a ringing call DECLINES it, and on a live one ENDS it — the same thing the
-    // on-screen control does. An overlay the back handler cannot see is an
-    // overlay that closes the app (the 5th item of the overlay law), and one
-    // that back merely HID would leave the microphone open with nothing on
-    // screen to say so.
-    if (rs.gcall.phase != .idle) {
-        callAction(rs, if (rs.gcall.phase == .ringing_in) .decline else .hangup);
-        return true;
-    }
-    if (rs.gcart_detail != null) {
-        rs.gcart_detail = null;
-        return true;
-    }
-    if (rs.grepost_menu != null) {
-        rs.grepost_menu = null;
-        return true;
-    }
-    // THE GAME FLOW answers back before anything else on Messages: the full-screen
-    // board closes first, then the "+" menu, then the staged chip — each is a
-    // modal layer the person expects back to peel, one at a time (the overlay law).
-    if (rs.gscreen == feed_view.screen_messages) {
-        if (rs.gchat_game_open) {
-            rs.gchat_game_open = false;
-            rs.gchat_game_staged = 255;
-            return true;
-        }
-        if (rs.gcmenu.open) {
-            rs.gcmenu = .{};
-            return true;
-        }
-        if (rs.gchat_pending_game) {
-            rs.gchat_pending_game = false;
-            return true;
-        }
-    }
-    // A money modal owns "back" while it is up — BEFORE the keyboard-blur step
-    // below, not after.
-    //
-    // The old order was the bug: blur ran first, cleared a focus bit the modal
-    // did not even own (the conversation-search field keeps `gchat_q_focus` set
-    // behind an open sheet), returned "consumed" — and back appeared to do
-    // nothing at all. One press, swallowed, no visible change. `payModalBack`
-    // walks the same edge as Escape, the ×, the scrim and the chevron.
-    if (rs.gscreen == feed_view.screen_messages and payModalOpen(rs)) {
-        return payModalBack(rs);
-    }
+    // Overlay flags are not screens. Declare them all, let Rover select the
+    // topmost, and peel exactly one before keyboard or page navigation.
+    if (dismissTopOverlay(rs)) return true;
     // The Zat4 keyboard: back DISMISSES the panel first when a plain text
     // field raised it (blur the field; the next back navigates) — the
     // Android IME convention; without this the panel stuck to the screen
@@ -9811,53 +9807,6 @@ fn backNavigate(rs: *RunState) bool {
         rs.gchat_sel = null; // the phone chat thread pops to the conversation list
         return true;
     }
-    // ── OVERLAYS CLOSE BEFORE PAGES MOVE ──────────────────────────────────
-    // Back "worked on some pages but not others" (owner, on-device). The reason:
-    // everything above dispatches on `gscreen`, but an OVERLAY is not a screen —
-    // it is a FLAG over one. So on any overlay, back fell past every case here,
-    // reached the root test, concluded "you are at the root", and armed
-    // exit-the-app. Reading the help page and swiping back closed the whole app.
-    //
-    // Ordered TOPMOST first, because they nest: a picker sits over a sheet, a
-    // sheet over a page. Each closes exactly one layer, which is what back means.
-    //
-    // LAW (joins the new-overlay checklist): a new overlay must draw in the nav
-    // tile, gate the SDF passes, join the rebuild signature, consume input — AND
-    // be listed here. An overlay the back handler cannot see is an overlay that
-    // closes the app.
-    if (rs.gsettings_picking != 255) {
-        rs.gsettings_picking = 255; // the choice popover
-        return true;
-    }
-    if (rs.gcmenu.open) {
-        rs.gcmenu = .{}; // the message / conversation context menu
-        return true;
-    }
-    if (rs.grepost_menu != null) {
-        rs.grepost_menu = null;
-        return true;
-    }
-    if (rs.gpay_open) {
-        rs.gpay_open = false; // the send-money sheet
-        return true;
-    }
-    if (rs.grecv_open) {
-        rs.grecv_open = false; // the receive-address sheet
-        return true;
-    }
-    if (rs.gdev_help) {
-        rs.gdev_help = false; // "How Zat Chat works"
-        return true;
-    }
-    if (rs.gchat_consent_open) {
-        rs.gchat_consent_open = false; // the one-time privacy setup
-        return true;
-    }
-    if (rs.gpu_state) |*gsd| if (gsd.drawer_want) {
-        gsd.drawer_want = false; // the phone nav drawer
-        return true;
-    };
-
     // THE ROOT differs by product: Zat4's is the feed, Zat Chat's is the
     // conversation list. Backing out of Settings in the chat app used to land on
     // the Zat4 timeline — a screen with no nav row to leave by, so the way out

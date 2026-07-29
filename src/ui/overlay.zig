@@ -55,7 +55,7 @@ pub const Layer = struct {
 
 /// Maximum simultaneously-open layers. Overlays rarely nest past a few (a sheet, a
 /// menu on it, a confirm on that); a small fixed cap avoids any allocation.
-pub const max_layers: usize = 8;
+pub const max_layers: usize = 16;
 
 /// The z-order gap between stacked layers, leaving room for a scrim just under each
 /// layer's content (`content z - 1`).
