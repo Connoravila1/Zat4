@@ -8,15 +8,22 @@ const std = @import("std");
 const assert = std.debug.assert;
 const feed_view = @import("../core/feed_view.zig");
 const lens_socket = @import("../core/lens_socket.zig");
+const overlay = @import("../ui/overlay.zig");
 const rover = @import("../ui/runtime.zig");
 
 const page_base: u32 = 0x1000;
 const socket_base = [_]u32{ 0x100000, 0x200000, 0x300000 };
+const content_z: i16 = 0;
+const socket_z: i16 = 5;
+const chrome_z: i16 = 20;
+const modal_z: i16 = 30;
+const modal_id: u32 = 1;
 
 pub const Scene = struct {
     runtime: rover.Scene,
     page_count: usize = 0,
     socket_count: [3]usize = .{ 0, 0, 0 },
+    overlays: overlay.Stack = .{},
     active: bool = false,
 
     // A7.2: cold owner, exactly one retained Algorithms surface.
@@ -34,6 +41,7 @@ pub const Scene = struct {
         s.runtime.reset();
         s.page_count = 0;
         s.socket_count = .{ 0, 0, 0 };
+        overlay.clear(&s.overlays);
         s.active = false;
     }
 };
@@ -67,6 +75,24 @@ pub fn rebuild(
     const safe_h = @max(0, height);
     const top = std.math.clamp(body_top, 0, safe_h);
     const bottom = std.math.clamp(body_bottom, top, safe_h);
+    var has_modal = false;
+    for (page) |r| {
+        if (screen == feed_view.screen_loadout and isOverlayAction(r.kind)) {
+            has_modal = true;
+            break;
+        }
+    }
+    if (has_modal) {
+        assert(overlay.push(
+            &s.overlays,
+            modal_id,
+            0,
+            0,
+            @floatFromInt(safe_w),
+            @floatFromInt(safe_h),
+            .{ .modal = true },
+        ));
+    }
     const root = try s.runtime.addRoot(gpa, .{
         .id = @enumFromInt(1),
         .rect = rectOf(0, 0, safe_w, safe_h),
@@ -85,13 +111,13 @@ pub fn rebuild(
 
     for (page, 0..) |r, i| {
         const fixed = screen == feed_view.screen_loadout and isFixedPageAction(r.kind);
-        const overlay = screen == feed_view.screen_loadout and isOverlayAction(r.kind);
-        const y = if (fixed or overlay) @as(i32, r.y) else @as(i32, r.y) - scroll;
-        _ = try s.runtime.addChild(gpa, if (fixed or overlay) root else content, .{
+        const is_overlay = screen == feed_view.screen_loadout and isOverlayAction(r.kind);
+        const y = if (fixed or is_overlay) @as(i32, r.y) else @as(i32, r.y) - scroll;
+        _ = try s.runtime.addChild(gpa, if (fixed or is_overlay) root else content, .{
             .id = idAt(page_base, i),
             .rect = rectOf(r.x, y, r.w, r.h),
             .flags = .{ .hittable = true, .focusable = true },
-            .z = if (overlay) 30 else if (fixed) 20 else 0,
+            .z = if (is_overlay) modal_z else if (fixed) chrome_z else content_z,
         });
     }
 
@@ -102,7 +128,7 @@ pub fn rebuild(
                 .rect = rectOf(r.x, @as(i32, r.y) - scroll, r.w, r.h),
                 .flags = .{ .hittable = true, .focusable = true },
                 // Socket controls are painted after their page card and beat it.
-                .z = 5,
+                .z = socket_z,
             });
         }
     }
@@ -119,6 +145,7 @@ pub fn pageHitTest(s: *const Scene, page: []const feed_view.Region, x: i32, y: i
     if (raw < page_base or raw >= socket_base[0]) return null;
     const i = raw - page_base;
     if (i >= s.page_count or i >= page.len) return null;
+    if (overlay.isOpen(s.overlays) and !isOverlayAction(page[i].kind)) return null;
     return page[i];
 }
 
@@ -137,6 +164,7 @@ pub fn socketHitTest(
     if (raw < base or raw >= limit) return null;
     const i = raw - base;
     if (i >= s.socket_count[surface] or i >= hits.len) return null;
+    if (overlay.isOpen(s.overlays)) return null;
     return lens_socket.actionForHit(hits[i]);
 }
 
