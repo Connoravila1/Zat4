@@ -153,6 +153,17 @@ fn stripQuotes(lit: []const u8) []const u8 {
     return if (lit.len >= 2) lit[1 .. lit.len - 1] else lit;
 }
 
+/// The LAST top-level function named `name`, if the program declares one. Shared
+/// by `compileEntry` (which body to walk) and the `learn()` refusal below (does
+/// the program declare one at all), so "is this entry present" is asked one way.
+fn findTop(ast: *const Ast, name: []const u8) ?NodeIndex {
+    var found: ?NodeIndex = null;
+    for (ast.top) |f| {
+        if (std.mem.eql(u8, ast.tokenText(f), name)) found = f;
+    }
+    return found;
+}
+
 const Local = struct { name: []const u8, slot: u16 };
 
 // A7.2: cold — one instance per compile; holds the emit state. Waived.
@@ -455,10 +466,7 @@ const Compiler = struct {
     /// `retrieve()` share one tag-constant pool and their `push_const(index)` indices
     /// agree with it (`compileArtifact`). Errors accumulate on the shared list.
     fn compileEntry(c: *Compiler, entry_name: []const u8) Allocator.Error!?[]const Instr {
-        var entry: ?NodeIndex = null;
-        for (c.ast.top) |f| {
-            if (std.mem.eql(u8, c.ast.tokenText(f), entry_name)) entry = f;
-        }
+        const entry = findTop(c.ast, entry_name);
         if (entry == null) return null;
         c.code.clearRetainingCapacity();
         c.locals.clearRetainingCapacity();
@@ -538,6 +546,20 @@ pub fn compileArtifact(arena: Allocator, ast: *const Ast) Allocator.Error!Artifa
     // arrange() is optional; absent ⇒ the score order stands (the pool-visible
     // stage, POOL_VISIBILITY_ROADMAP).
     const arrange_prog: []const Instr = (try c.compileEntry("arrange")) orelse &.{};
+    // `learn()` is DECLARED in the ABI (`guest_abi.EntryPoint.learn`) but NOTHING
+    // RUNS IT yet: there is no `learn` field on this artifact and no `guest_learn`
+    // slot on `FeedConfig`, so its bytecode would be published and never executed.
+    // Dropping it silently — the behaviour until 2026-08-02 — is the worse of the
+    // two failures: the author ships a model that never learns and is told nothing
+    // (E3: no silent failure). Refuse by name instead. Emitting dead bytecode
+    // would only move the silence one layer down. Lifted by ZAL_PHASE_2_ROADMAP
+    // Slice 11, which lands the learn runtime and the persistent-state host.
+    if (findTop(ast, "learn")) |n| {
+        try c.err(
+            "learn() is not executed yet — the learn runtime has not landed, so this function would never run; keep the logic in score() for now",
+            ast.nodes[n].tok_start,
+        );
+    }
     if (c.errors.items.len > 0) {
         return .{ .score = &.{}, .errors = try c.errors.toOwnedSlice(arena) };
     }
@@ -702,6 +724,32 @@ test "compileArtifact: score and retrieve compile together, sharing one tag pool
     const ast3 = try parse.parse(arena, "fn retrieve() num { return 0.0; }");
     const art3 = try compileArtifact(arena, &ast3);
     try t.expect(!art3.ok());
+}
+
+test "compileArtifact: learn() is REFUSED by name, never dropped silently (Phase 2 Slice 0)" {
+    var a = std.heap.ArenaAllocator.init(t.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    // Until the learn runtime lands (roadmap Slice 11) nothing executes learn().
+    // The old behaviour compiled score() and dropped learn() with no diagnostic,
+    // so an author shipped a model that never learned and was told nothing.
+    const src =
+        \\fn score() num { return like_count; }
+        \\fn learn() num { state_write(0, attention_dwell()); return 0.0; }
+    ;
+    const ast = try parse.parse(arena, src);
+    try t.expect(ast.ok()); // it PARSES — the refusal is a compile decision, not a syntax error
+    const art = try compileArtifact(arena, &ast);
+    try t.expect(!art.ok());
+    try t.expectEqual(@as(usize, 1), art.errors.len);
+    try t.expect(std.mem.indexOf(u8, art.errors[0].msg, "learn()") != null);
+    try t.expectEqual(@as(usize, 0), art.score.len); // fail-closed: no bytecode ships
+    // The diagnostic points AT the offending function, not at offset 0.
+    try t.expect(art.errors[0].start > 0);
+    try t.expectEqualStrings("learn", src[art.errors[0].start..][0.."learn".len]);
+    // A program without learn() is unaffected — the common path stays clean.
+    const ok_ast = try parse.parse(arena, "fn score() num { return like_count; }");
+    try t.expect((try compileArtifact(arena, &ok_ast)).ok());
 }
 
 test "compile: the entry-capability wall — sources only in retrieve(), candidate reads only in score()" {

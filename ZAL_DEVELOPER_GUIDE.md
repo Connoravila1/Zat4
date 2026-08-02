@@ -234,8 +234,13 @@ identity. That absence is a guarantee, not a gap — see §9.
 
 Every callable is a *capability* — a numbered door in a fixed, audited table.
 The full table with permissions is in §6. There are no user-defined function
-calls yet: only `score`/`retrieve`/`arrange`/`learn` are compiled, and they
-cannot call each other or your other `fn` declarations — keep logic inline.
+calls yet: only `score`/`retrieve`/`arrange` are compiled, and they cannot call
+each other or your other `fn` declarations — keep logic inline.
+
+`learn()` is **not compiled yet** — the entry point is defined in the ABI but no
+runtime executes it, so a program that declares `learn()` is refused at compile
+time by name rather than silently ignored. Keep adaptive logic in `score()` until
+the learn runtime lands (`ZAL_PHASE_2_ROADMAP.md` Slice 11).
 
 ---
 
