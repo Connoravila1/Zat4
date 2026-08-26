@@ -34,6 +34,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const text = @import("text.zig");
+const keydir = @import("keydir.zig"); // device standings: the gate explains itself from these
 const raster = @import("raster.zig");
 const ui_insets = @import("../ui/insets.zig"); // Rover: safe-area / gesture-inset math
 const lens_socket = @import("lens_socket.zig");
@@ -9408,8 +9409,11 @@ pub const HistoryState = enum(u8) { none = 0, offered = 1, asking = 2, done = 3 
 pub const ChatDeviceState = enum(u8) {
     /// This device is part of the account (or chat is simply off). Nothing shows.
     ok = 0,
-    /// Chat lives elsewhere and we have not asked to join it.
-    elsewhere = 1,
+    /// We are not part of the account's chat, and ASKING is the way in. It used
+    /// to be called `elsewhere`, and it used to offer a takeover — a choice whose
+    /// "No" did nothing it appeared to do, because the transcript on this device
+    /// was never what it gated.
+    may_join = 1,
     /// We have asked. Somebody has to say yes.
     pending = 2,
     /// WE COULD NOT READ THE ACCOUNT'S DIRECTORY. Not a wall, not a wait — an
@@ -9440,6 +9444,11 @@ pub const PendingDeviceView = struct {
 pub const ChatDevices = struct {
     // A7.2: cold struct (one per frame, config-shaped), size guard waived.
     state: ChatDeviceState = .ok,
+    /// WHY, when `state` is `.may_join`. Four situations share that one remedy,
+    /// and they do not share a sentence: "you have never asked" and "you belong
+    /// to a device set that was replaced" need different words, and the screen
+    /// had no way to tell them apart before (CHAT_DEVICE_MODEL_REDESIGN 4.3).
+    reason: keydir.Reason = .none,
     /// Devices asking to join THIS account. Never more than one at a time by
     /// construction (the shell caps it) — a stack of prompts is how you train
     /// somebody to tap "yes" without reading.
@@ -9545,6 +9554,8 @@ fn drawDeviceGate(
         "Can't reach your account"
     else if (waiting)
         "Waiting for your other device"
+    else if (d.reason == .superseded_generation or d.reason == .conflicting_root)
+        (if (phone) "Let this phone back in" else "Let this device back in")
     else if (phone)
         "Add this phone to your chats"
     else
@@ -9560,13 +9571,37 @@ fn drawDeviceGate(
     } else if (waiting) &[_][]const u8{
         "Open Zat4 on the device where you already use chat.",
         "It will ask you to approve this one. This page updates itself.",
-    } else &[_][]const u8{
+    } else switch (d.reason) {
+        // THIS DEVICE WAS IN, AND IS NOT ANY MORE. Somebody started chat over on
+        // another device, which is exactly what starting over means — and saying
+        // so is the difference between a screen a person understands and one that
+        // looks like a bug. The last line is there because the old prompt implied
+        // a choice about the messages on THIS device that it never actually made:
+        // the transcript is stored separately and nothing here touches it.
+        .superseded_generation, .conflicting_root => &[_][]const u8{
+            "Chat was set up fresh on one of your devices, so this one",
+            "needs to be let back in. Nothing here has been deleted \u{2014} the",
+            "messages on this device stay whether you do this or not.",
+        },
+        // The device that vouched for this one is no longer part of the account.
+        .approver_not_trusted => &[_][]const u8{
+            "The device that let this one in isn't part of your account",
+            "any more, so this one needs a fresh yes from a device that is.",
+        },
+        // Our own record does not hold up (expired, damaged, or a claim we cannot
+        // read). Asking republishes it, which is the repair.
+        .failed_validation, .unrecognized_claim, .claim_not_signed => &[_][]const u8{
+            "This device's entry in your account needs rewriting \u{2014} asking",
+            "again does exactly that. Nothing on this device is affected.",
+        },
         // TWO lines, not four. The full key explanation is genuinely good, but it
         // belongs behind "How Zat Chat works" (right there at the foot) — a first
         // run should say what to do and why in a breath, not teach the protocol
         // before offering the button.
-        "Your messages are encrypted with keys that never leave your",
-        "devices, so a device you already use has to let this one in.",
+        .none, .no_current_root => &[_][]const u8{
+            "Your messages are encrypted with keys that never leave your",
+            "devices, so a device you already use has to let this one in.",
+        },
     };
     for (body) |ln| {
         const lw: i32 = @intCast(text.measure(e, .regular, ln, 14));
@@ -13034,7 +13069,7 @@ test "messages screen: chat published from another device says so, and offers ON
     const brows = [_]chat_view.BubbleRow{
         .{ .body = "hey", .age = "2h", .mine = true, .stamp = true, .kind = .text, .tail = true },
     };
-    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, &.{}, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{ .state = .elsewhere }, .{}, .{}, .{});
+    _ = try layoutChat(gpa, &engine, 900, 940, &dl, &regions, accent_house, 0, false, false, null, &lrows, &brows, &.{}, &.{}, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, .authenticated, .{ .state = .may_join }, .{}, .{}, .{});
 
     // Exactly one tap target on the whole surface: the choice. No conversation
     // rows, no composer, no send — none of them mean anything without an

@@ -82,7 +82,8 @@ const pet_core = @import("../core/pet.zig");
 const gesture = @import("../core/gesture.zig");
 const chat_relay = @import("chat_relay.zig");
 const chat_e2ee = @import("chat_e2ee.zig");
-const chat_keys = @import("chat_keys.zig"); // multi-device: ask / approve / who is waiting
+const chat_keys = @import("chat_keys.zig");
+const keydir = @import("../core/keydir.zig"); // multi-device: ask / approve / who is waiting
 const enroll_view = @import("../core/enroll_view.zig");
 const boot_intro = @import("../core/boot_intro.zig"); // the signed-out boot entrance (§5)
 const enroll_run = @import("enroll_run.zig");
@@ -994,6 +995,14 @@ const RunState = struct {
     /// `pending`: what this account's repo says is asking to join (refreshed off
     /// the render thread, like every other network fact).
     gdev_state: feed_view.ChatDeviceState,
+    /// WHY we are in that state. `gdev_state` picks the surface; this picks the
+    /// words — "you belong to a device set that was replaced" and "you have never
+    /// asked" are the same remedy and very different sentences, and the screen had
+    /// no way to tell them apart before.
+    gdev_reason: keydir.Reason,
+    /// The generation to ask to join. Asking for the wrong one produces a record
+    /// nobody can approve.
+    gdev_generation: u32,
     gdev_busy: bool,
     gdev_error: []const u8,
     gdev_added_ns: u64, // when an approval landed (drives the confirmation + its fade)
@@ -1774,6 +1783,8 @@ fn initRunState(
     rs.glogin_asked = false;
     rs.genroll_signin_started = false;
     rs.gdev_state = .ok;
+    rs.gdev_reason = .none;
+    rs.gdev_generation = 0;
     rs.gdev_busy = false;
     rs.gdev_error = "";
     rs.gdev_added_ns = 0;
@@ -10547,7 +10558,7 @@ fn chatInitWorker(job: *ChatInitJob, gpa: Allocator) void {
         job.done.store(true, .release);
         return;
     };
-    if (chat_e2ee.init(gpa, arena_state.allocator(), job.io, job.env, session, job.adopt)) |st| {
+    if (chat_e2ee.init(gpa, arena_state.allocator(), job.io, job.env, session, job.adopt, &job.standing)) |st| {
         job.state = st;
     } else |err| {
         job.err = err;
@@ -10576,18 +10587,24 @@ fn chatInitStep(
         // cannot be copied here; that is exactly what makes it worth having.
         // The Messages screen says so, and offers the only honest way forward.
         rs.gchat_identity_elsewhere = (err == error.IdentityElsewhere);
-        // MULTI-DEVICE: the wall is now a question with THREE answers. "We asked and
-        // are waiting" is not the same screen as "chat lives elsewhere and you have
-        // not asked" — one waits, the other offers a button — and NEITHER is the
-        // same as "we could not read your directory", which offers nothing at all
-        // and keeps trying. A screen that guesses which of the three it is in is how
-        // the owner's chat identity got taken (2026-07-14).
+        // MULTI-DEVICE: the wall is a question with several answers, and the screen
+        // must never guess which — guessing is how the owner's chat identity got
+        // taken (2026-07-14). "We asked and are waiting" waits; "you may join"
+        // offers one button; "we could not read your directory" offers nothing and
+        // keeps trying.
+        //
+        // The REASON rides alongside, so `may_join` can say which of its four
+        // situations this is instead of offering everyone the same takeover it
+        // used to. The generation is kept because asking to join requires knowing
+        // which one to ask for.
         rs.gdev_state = switch (err) {
             error.DeviceApprovalPending => .pending,
-            error.IdentityElsewhere => .elsewhere,
+            error.MayJoinChat => .may_join,
             error.DirectoryUnreadable => .offline,
             else => rs.gdev_state,
         };
+        rs.gdev_reason = job.standing.reason;
+        rs.gdev_generation = job.standing.generation;
         return;
     };
     job.state = null;
@@ -10712,6 +10729,11 @@ const ChatInitJob = struct {
     /// `err` is WHICH of the honest screens to show.
     state: ?chat_e2ee.State = null,
     err: ?anyerror = null,
+    /// Where this device stands with the account. The error picks the surface;
+    /// this picks the WORDS — a device that is out because its generation was
+    /// replaced needs a different sentence from one that has simply never asked,
+    /// and before this the screen had no way to tell them apart.
+    standing: chat_keys.Standing = .{ .status = .offline },
 };
 
 /// Re-establish, in flight. Repairing a drifted conversation reads the PEER'S
@@ -10768,8 +10790,8 @@ const DeviceJob = struct {
     thread: ?std.Thread = null,
     done: std.atomic.Value(bool) = .init(false),
     kind: enum { none, ask, approve, refuse, poll, status } = .none,
-    /// `status`: where this device now stands with the account.
-    status: chat_keys.DeviceStatus = .not_asked,
+    /// `status`: where this device now stands with the account, and why.
+    standing: chat_keys.Standing = .{ .status = .offline },
     ok: bool = false,
     /// `poll`: what the repo says is waiting. Copied out as bytes — the worker's
     /// arena dies with it, so nothing it allocated escapes.
@@ -10792,6 +10814,14 @@ const DeviceJob = struct {
     target_sig_len: u8 = 0,
     target_na: [32]u8 = undefined,
     target_na_len: u8 = 0,
+    /// The generation being joined/approved into. An approval is signed FOR a
+    /// generation, so neither asking nor approving can be done without it.
+    generation: u32 = 0,
+    /// The asking device's own claim signature, carried through untouched when
+    /// the approval is written into its record — we cannot make it, and dropping
+    /// it would leave a record that no longer proves its own generation.
+    target_claim: [128]u8 = undefined,
+    target_claim_len: u8 = 0,
     io: std.Io = undefined,
     env: ?*const std.process.Environ.Map = null,
     session: ?*auth.Session = null,
@@ -11363,6 +11393,7 @@ fn chatDevicesOf(rs: *RunState, arena: Allocator) feed_view.ChatDevices {
     }
     return .{
         .state = rs.gdev_state,
+        .reason = rs.gdev_reason,
         .pending = pend,
         .busy = rs.gdev_busy,
         .error_line = rs.gdev_error,
@@ -11490,7 +11521,9 @@ fn chatDevicesStep(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.p
                 } else rs.gdev_error = "Couldn't refuse it. Try again.";
             },
             .status => if (job.ok) {
-                switch (job.status) {
+                rs.gdev_reason = job.standing.reason;
+                rs.gdev_generation = job.standing.generation;
+                switch (job.standing.status) {
                     // Approved. Bring chat up right here: the person is looking at
                     // the waiting screen, and the next thing they should see is
                     // their conversations — not a prompt to restart the app. The
@@ -11504,12 +11537,14 @@ fn chatDevicesStep(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.p
                     },
                     // Still waiting on a human. Nothing to say that the screen is
                     // not already saying.
-                    .pending => rs.gdev_state = .pending,
+                    .awaiting_approval => rs.gdev_state = .pending,
                     // We could not read the directory. Say so — and keep asking. The
                     // one thing we do NOT do is decide what it would have said.
                     .offline => rs.gdev_state = .offline,
-                    // We are outside the account and have not asked to join.
-                    .not_asked => rs.gdev_state = .elsewhere,
+                    // We are outside the account, and asking is the way in. WHICH of
+                    // the four situations it is lives in `gdev_reason`, so the screen
+                    // explains instead of offering everyone the same takeover.
+                    .may_join => rs.gdev_state = .may_join,
                 }
             },
             .poll => {
@@ -11598,7 +11633,7 @@ fn deviceWorker(job: *DeviceJob, gpa: Allocator) void {
 
     switch (job.kind) {
         .ask => {
-            chat_keys.requestJoin(gpa, arena, job.io, job.env, session, deviceLabel(job.env)) catch {
+            chat_keys.requestJoin(gpa, arena, job.io, job.env, session, deviceLabel(job.env), job.generation) catch {
                 job.done.store(true, .release);
                 return;
             };
@@ -11619,6 +11654,8 @@ fn deviceWorker(job: *DeviceJob, gpa: Allocator) void {
                     .key_package_b64 = job.target_kp[0..job.target_kp_len],
                     .anchor_sig_b64 = job.target_sig[0..job.target_sig_len],
                     .not_after = job.target_na[0..job.target_na_len],
+                    .generation = job.generation,
+                    .claim_sig_b64 = job.target_claim[0..job.target_claim_len],
                 }) catch {
                     job.done.store(true, .release);
                     return;
@@ -11630,29 +11667,20 @@ fn deviceWorker(job: *DeviceJob, gpa: Allocator) void {
             // HAS ANYBODY SAID YES YET? The waiting screen asks this on a worker,
             // never on the thread that draws — a screen that freezes while it waits
             // is worse than one that says nothing.
-            job.status = chat_keys.ensureDevice(gpa, arena, job.io, job.env, session, deviceLabel(job.env)) catch {
+            job.standing = chat_keys.ensureDevice(gpa, arena, job.io, job.env, session, deviceLabel(job.env)) catch {
                 job.done.store(true, .release);
                 return;
             };
             job.ok = true;
         },
         .poll => {
-            // Who is asking? Only devices our OWN trusted set does not already
-            // contain, and only records that actually validate — junk must never be
-            // able to put a prompt in front of a person.
-            const set = chat_keys.fetchPeerDevices(gpa, arena, job.io, job.env, session.did) catch null;
-            var trusted_buf: [16][32]u8 = undefined;
-            var trusted: []const [32]u8 = &.{};
-            if (set) |s| {
-                var n: usize = 0;
-                for (s.devices) |d| {
-                    if (n == trusted_buf.len) break;
-                    trusted_buf[n] = d.anchor_pub;
-                    n += 1;
-                }
-                trusted = trusted_buf[0..n];
-            }
-            const pending = chat_keys.fetchPending(gpa, arena, job.io, job.env, session.did, trusted) catch &.{};
+            // Who is asking? `fetchPending` asks the pure classifier and returns
+            // exactly the records standing at `.awaiting_approval`. It used to be
+            // handed a trusted set assembled HERE, which meant this file held a
+            // second, hand-rolled copy of the membership rules — and two copies of
+            // those rules is how the relay and the client came to disagree about
+            // who was a member, twice. There is one copy now, in `keydir`.
+            const pending = chat_keys.fetchPending(gpa, arena, job.io, job.env, session.did) catch &.{};
             if (pending.len > 0) {
                 const p = pending[0];
                 job.found = true;
@@ -11675,6 +11703,10 @@ fn deviceWorker(job: *DeviceJob, gpa: Allocator) void {
                 const an = @min(p.not_after.len, job.target_na.len);
                 @memcpy(job.target_na[0..an], p.not_after[0..an]);
                 job.target_na_len = @intCast(an);
+                const cn = @min(p.claim_sig_b64.len, job.target_claim.len);
+                @memcpy(job.target_claim[0..cn], p.claim_sig_b64[0..cn]);
+                job.target_claim_len = @intCast(cn);
+                job.generation = p.generation;
                 job.fp_len = @intCast(deviceFingerprint(&job.fp, p.anchor_pub).len);
             }
             job.ok = true;
@@ -12532,7 +12564,11 @@ fn saveReceiveAddress(
             error.NoAddresses => "Add a Lightning or Bitcoin address first",
             error.BadLightning => "That Lightning address isn't valid",
             error.BadBitcoin => "That Bitcoin address isn't valid",
-            error.NoAnchor => "Couldn't sign \u{2014} chat identity missing",
+            // NOT "chat identity missing", which is what this said before and
+            // which invites a person to set one up again. An unreadable anchor
+            // may well be an identity that is still there, behind a keyring that
+            // failed to open — so the words say wait, not replace.
+            error.AnchorUnreadable => "Couldn't read this device's chat identity \u{2014} nothing was changed",
             error.SignFailed => "Couldn't sign the address record",
             else => "Couldn't save \u{2014} check your connection",
         };

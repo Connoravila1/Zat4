@@ -104,7 +104,7 @@ pub fn ensurePublished(
     replace_foreign: bool,
 ) !Published {
     const did = session.did;
-    var anchor_load = cache.loadOrCreateAnchorSeed(gpa, io, environ, did) orelse return error.NoAnchor;
+    var anchor_load = try cache.requireAnchor(gpa, io, environ, did);
     defer std.crypto.secureZero(u8, &anchor_load.seed);
 
     // A3 — DO NOT HIJACK AN IDENTITY THAT LIVES SOMEWHERE ELSE.
@@ -355,19 +355,35 @@ pub fn deviceId(buf: *[32]u8, anchor_pub: [anchor.pk_len]u8) []const u8 {
 }
 
 /// The WRITE shape. A7.2: cold record struct, size guard waived.
+///
+/// `root: bool` USED TO LIVE HERE, and it is the reason this subsystem produced
+/// six bugs of one species: one bit had to mean both "the first device this
+/// account ever had" and "I am deliberately starting over", and the reader had
+/// to guess which. `generation` + `claim` say it outright
+/// (CHAT_DEVICE_MODEL_REDESIGN §4.1).
 const DeviceRecordOut = struct {
     @"$type": []const u8 = lexicon.collection.chat_device,
     did: []const u8,
     cipherSuite: u16,
     keyPackage: []const u8, // base64(MLSMessage(KeyPackage)) — this device's own
     anchorKeySig: []const u8, // base64(this device's anchor signature over the DID)
-    /// The first device of the account. A root self-attests; every other device
-    /// must show an approval.
-    root: bool,
-    /// base64(an already-trusted device's signature over this device's key + the
-    /// DID). Empty on the root. We do NOT say WHO signed: the reader tests it
-    /// against every device it already trusts, so the record carries no claim it
-    /// could lie about.
+    /// Which device-set generation this record belongs to. Highest wins.
+    generation: u32,
+    /// `anchor.Claim`: 1 founding · 2 joined · 3 recovery.
+    claim: u8,
+    /// base64(the root key this generation supersedes) — `.recovery` only.
+    supersededRoot: []const u8 = "",
+    /// base64(this device's own signature over generation+claim+supersededRoot).
+    /// Without it the generation would be unsigned metadata, and repo-write alone
+    /// would be enough to promote a record and evict every other device.
+    claimSig: []const u8,
+    /// base64(the anchor key of the device that approved this one). NAMED, and
+    /// named inside `approvalSig`'s signed message — so it is proved, never
+    /// believed, and a forged name simply fails to verify. Empty when there is
+    /// no approval.
+    approvalBy: []const u8 = "",
+    /// base64(the approver's signature over generation+approver+this key+DID).
+    /// Empty on a record that roots a generation.
     approvalSig: []const u8 = "",
     /// A human name for the approval prompt ("Pixel 10 Pro"). Cosmetic, and
     /// treated as such — it is unsigned, so it may be a lie, and nothing but the
@@ -383,7 +399,11 @@ const DeviceRecordIn = struct {
     cipherSuite: u16 = 0,
     keyPackage: []const u8 = "",
     anchorKeySig: []const u8 = "",
-    root: bool = false,
+    generation: u32 = 0,
+    claim: u8 = 0, // 0 is not a valid Claim ⇒ classified `.unrecognized_claim`
+    supersededRoot: []const u8 = "",
+    claimSig: []const u8 = "",
+    approvalBy: []const u8 = "",
     approvalSig: []const u8 = "",
     deviceName: []const u8 = "",
     notAfter: []const u8 = "",
@@ -402,9 +422,20 @@ fn ListingOf(comptime Value: type) type {
     };
 }
 
-/// Publish THIS device's record. `approval_sig` is empty for the root device (the
-/// first ever to use chat on this account) and otherwise carries the signature an
-/// already-approved device made over this device's key.
+/// WHERE THIS DEVICE IS PUTTING ITSELF. Passed as one value so the call site
+/// reads as a sentence and so a new field cannot be silently defaulted at one of
+/// several call sites. A7.2: cold, one per publish.
+pub const Placement = struct {
+    generation: keydir.Generation,
+    claim: anchor.Claim,
+    /// `.recovery` only: the root this generation supersedes.
+    superseded_root: [anchor.pk_len]u8 = [_]u8{0} ** anchor.pk_len,
+    /// `.joined` only: who vouched, and their signature.
+    approval_by: [anchor.pk_len]u8 = [_]u8{0} ** anchor.pk_len,
+    approval_sig: []const u8 = "",
+};
+
+/// Publish THIS device's record, in the place `placement` says it belongs.
 ///
 /// Unlike `ensurePublished`, this cannot clobber anybody: the rkey is derived from
 /// our own key, so we write only our own slot. There is no A3 gate here because
@@ -416,11 +447,10 @@ pub fn publishDevice(
     environ: ?*const std.process.Environ.Map,
     session: *auth.Session,
     device_name: []const u8,
-    is_root: bool,
-    approval_sig: []const u8,
+    placement: Placement,
 ) !Published {
     const did = session.did;
-    var anchor_load = cache.loadOrCreateAnchorSeed(gpa, io, environ, did) orelse return error.NoAnchor;
+    var anchor_load = try cache.requireAnchor(gpa, io, environ, did);
     defer std.crypto.secureZero(u8, &anchor_load.seed);
 
     const now = clock.unixSeconds();
@@ -462,9 +492,34 @@ pub fn publishDevice(
     _ = Enc.encode(kp_b64, stored.kp_bytes);
     const sig_b64 = try arena.alloc(u8, Enc.calcSize(sig.len));
     _ = Enc.encode(sig_b64, &sig);
-    const appr_b64 = if (approval_sig.len == 0) "" else blk: {
-        const b = try arena.alloc(u8, Enc.calcSize(approval_sig.len));
-        _ = Enc.encode(b, approval_sig);
+    const appr_b64 = if (placement.approval_sig.len == 0) "" else blk: {
+        const b = try arena.alloc(u8, Enc.calcSize(placement.approval_sig.len));
+        _ = Enc.encode(b, placement.approval_sig);
+        break :blk b;
+    };
+
+    // The device signs its OWN placement. This is what makes `generation` a
+    // claim only this key could have made, rather than metadata anyone holding
+    // the account's password could rewrite.
+    const claim_sig = try anchor.signDeviceClaim(
+        anchor_load.seed,
+        did,
+        placement.generation,
+        placement.claim,
+        placement.superseded_root,
+    );
+    const claim_b64 = try arena.alloc(u8, Enc.calcSize(claim_sig.len));
+    _ = Enc.encode(claim_b64, &claim_sig);
+
+    const zero_key = [_]u8{0} ** anchor.pk_len;
+    const sup_b64 = if (std.mem.eql(u8, &placement.superseded_root, &zero_key)) "" else blk: {
+        const b = try arena.alloc(u8, Enc.calcSize(anchor.pk_len));
+        _ = Enc.encode(b, &placement.superseded_root);
+        break :blk b;
+    };
+    const by_b64 = if (std.mem.eql(u8, &placement.approval_by, &zero_key)) "" else blk: {
+        const b = try arena.alloc(u8, Enc.calcSize(anchor.pk_len));
+        _ = Enc.encode(b, &placement.approval_by);
         break :blk b;
     };
 
@@ -476,7 +531,11 @@ pub fn publishDevice(
         .cipherSuite = mls.cipher_suite_id,
         .keyPackage = kp_b64,
         .anchorKeySig = sig_b64,
-        .root = is_root,
+        .generation = placement.generation,
+        .claim = @intFromEnum(placement.claim),
+        .supersededRoot = sup_b64,
+        .claimSig = claim_b64,
+        .approvalBy = by_b64,
         .approvalSig = appr_b64,
         .deviceName = device_name,
         .notAfter = feed_core.formatTimestamp(&na_buf, @intCast(info.not_after)),
@@ -511,44 +570,74 @@ pub fn publishDevice(
 // simplification cannot quietly reintroduce it.)
 // ---------------------------------------------------------------------------
 
-/// WHERE THIS DEVICE STANDS with the account's chat identity. The old model had
-/// exactly two answers — "it's mine" or `IdentityElsewhere` — which is why the
-/// phone's only door was to take chat away from the desktop.
+/// WHERE THIS DEVICE STANDS with the account's chat identity — ONE VALUE PER
+/// DISTINCT REMEDY, and no more.
+///
+/// The first model had two answers ("it's mine" / `IdentityElsewhere`), which is
+/// why a phone's only door was to take chat away from the desktop. The second had
+/// five, but two of them — "has not asked" and "asked and is waiting" — turned on
+/// a bool that could not tell a join request from a superseded record, so a
+/// device holding stale state was shown a door that led nowhere.
+///
+/// These four are what a person can actually DO about it. Why they are in that
+/// state is `reason`, kept separate on purpose (REDESIGN §4.3).
 pub const DeviceStatus = enum {
-    /// The first device: it self-attests, and its key IS the account's chat
-    /// identity. (Also the answer for every account that has only ever had one.)
+    /// This device roots the current generation. Its key IS the account's chat
+    /// identity. (Also the answer for an account that has only ever had one.)
     root,
-    /// A device an already-trusted device has vouched for. It is fully part of the
-    /// account: peers address it like any other.
+    /// Vouched into the current generation. Fully part of the account: peers
+    /// address it like any other.
     approved,
-    /// We have ASKED and nobody has answered yet. The screen says so, and waits —
-    /// it does not pretend to be broken.
-    pending,
-    /// Chat lives elsewhere and this device has not asked to join it. This is the
-    /// A3 wall — but it is now a door: the person may ask, and their other device
-    /// may say yes.
-    not_asked,
-    /// WE COULD NOT READ THE DIRECTORY. Not "you are not in" — we do not know, and
-    /// saying we do not know is the whole point of this answer existing. A device
-    /// that cannot read the directory publishes NOTHING (see the note above
-    /// `ensureDevice`), shows a screen that says so, and asks again in a moment.
+    /// We have asked and nobody has answered yet. The screen says so and waits —
+    /// it does not pretend to be broken, and it does not offer a button that
+    /// would do what has already been done.
+    awaiting_approval,
+    /// We are not part of the account's chat, and asking is the way in. Covers
+    /// "never asked", "belongs to a generation that was replaced", "vouched by a
+    /// key nobody trusts", and "our record does not hold up" — four situations,
+    /// one remedy, and `reason` says which it was.
+    may_join,
+    /// WE COULD NOT READ THE DIRECTORY. Not "you are not in" — we do not know,
+    /// and saying we do not know is the whole point of this answer existing. A
+    /// device that cannot read the directory publishes NOTHING, shows a screen
+    /// that says so, and asks again in a moment.
     offline,
+};
+
+/// Where this device stands, and why, and in which generation. A7.2: cold, one
+/// per bring-up.
+pub const Standing = struct {
+    status: DeviceStatus,
+    /// `.none` unless the status needs explaining. This is what ends the
+    /// forensics: the app can say which state it is in instead of a person
+    /// having to read the directory and the source to find out.
+    reason: keydir.Reason = .none,
+    /// The generation in force, 0 when the account has no device set. What
+    /// `requestJoin` must be told in order to ask to join the RIGHT one.
+    generation: keydir.Generation = 0,
 };
 
 /// Publish this device where it belongs and report where it stands. The ONE call
 /// chat start-up makes, and the only place that decides whether this device may
 /// speak for the account.
 ///
-/// The order matters: a device that is genuinely part of the account refreshes its
-/// own record and NEVER touches the legacy singleton — writing that would clobber
-/// the root's, which is the exact bug this whole project exists to end.
+/// **THE ONE THING THIS FUNCTION MAY NOT DO IS START OVER.** Publishing a new
+/// generation orphans every device in the old one, and that is a destructive,
+/// irreversible act. It used to be reachable by INFERENCE — read a directory,
+/// find nothing, conclude "I must be the root" — and on 2026-07-14 that
+/// inference fired against a directory that had simply failed to load, and took
+/// the owner's chat identity. The read was then hardened, but the shape stayed:
+/// a destructive act gated on reading an absence.
 ///
-/// AND SO IS THIS ONE. Every read below used to be `catch null`, which handed a
-/// failed read and an empty directory the same answer — so a device that could not
-/// reach the PDS concluded the account had no chat, declared itself the root, and
-/// republished the singleton over the other device's key. It fired for real
-/// (2026-07-14). The rule now, and it does not bend: **an unreadable directory is
-/// never permission to claim anything.** We say `.offline` and we write nothing.
+/// Now the two cases are separate things with separate names. FOUNDING
+/// generation 1 into an empty directory destroys nothing and stays automatic —
+/// there is no device set to orphan, and asking a person "are you the first
+/// device?" on their first launch would be absurd. RECOVERY — every other
+/// generation — is `startOver()`, and it is only ever called because somebody
+/// said so in words.
+///
+/// AND STILL: an unreadable directory is never permission to claim anything. We
+/// say `.offline` and we write nothing.
 pub fn ensureDevice(
     gpa: Allocator,
     arena: Allocator,
@@ -556,119 +645,109 @@ pub fn ensureDevice(
     environ: ?*const std.process.Environ.Map,
     session: *auth.Session,
     device_name: []const u8,
-) !DeviceStatus {
+) !Standing {
     const did = session.did;
-    var anchor_load = cache.loadOrCreateAnchorSeed(gpa, io, environ, did) orelse return error.NoAnchor;
+    var anchor_load = try cache.requireAnchor(gpa, io, environ, did);
     defer std.crypto.secureZero(u8, &anchor_load.seed);
     const mine = try anchor.publicKey(anchor_load.seed);
 
-    const set = fetchPeerDevices(gpa, arena, io, environ, did) catch |err| switch (err) {
+    const decoded = fetchDecodedDevices(gpa, arena, io, environ, did) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return .offline, // could not read ⇒ claim nothing, ask again later
+        else => return .{ .status = .offline }, // could not read ⇒ claim nothing
     };
 
-    // NOBODY HAS PUBLISHED A DEVICE RECORD YET — every account alive today. The
-    // device that already owns chat (or an account with no chat at all) becomes the
-    // ROOT, which is what makes it possible for anything else to be approved.
-    //
-    // This is the branch the hijack came through, so it is the one that gets the
+    // NOBODY HAS PUBLISHED A DEVICE RECORD YET — every account alive before the
+    // device model. This is the branch the hijack came through, so it gets the
     // strictest reading: we may only conclude "the account has no chat" from a
     // directory that ANSWERED and answered empty.
-    if (set == null) {
+    if (decoded == null) {
         const legacy = fetchPeer(gpa, arena, io, environ, did) catch |err| blk: {
             if (err == error.OutOfMemory) return error.OutOfMemory;
-            // A record that is BROKEN (junk base64, expired, a binding that does not
-            // verify) is ours to repair, and the root path below republishes it.
+            // A record that is BROKEN (junk base64, expired, a binding that does
+            // not verify) is ours to repair, and founding below republishes it.
             if (brokenRecord(err)) break :blk null;
-            // Anything else — a refused read, a reset connection, a DNS failure — is
-            // a singleton we did not SEE. The account may well have chat on another
-            // device; we simply cannot tell. Claim nothing. This is the exact step
-            // that took the owner's chat identity, and the default now falls the
-            // other way.
-            return .offline;
+            // Anything else — a refused read, a reset connection, a DNS failure —
+            // is a singleton we did not SEE. Claim nothing.
+            return .{ .status = .offline };
         };
         const chat_is_ours = if (legacy) |l| std.mem.eql(u8, &l.anchor_pub, &mine) else true;
         if (chat_is_ours) {
-            _ = try publishDevice(gpa, arena, io, environ, session, device_name, true, "");
-            // The ROOT also keeps the legacy singleton alive, because every peer
-            // running an older client still reads that and nothing else. Dropping
-            // it the day the device model shipped would have taken chat away from
-            // everyone we have in order to serve devices nobody has yet.
+            // FOUNDING. Generation 1, into an empty directory: nothing exists to
+            // be orphaned, which is the entire reason this may happen without
+            // asking anyone.
+            _ = try publishDevice(gpa, arena, io, environ, session, device_name, .{
+                .generation = 1,
+                .claim = .founding,
+            });
+            // The root also keeps the legacy singleton alive, because every peer
+            // running an older client still reads that and nothing else.
             _ = ensurePublished(gpa, arena, io, environ, session, false) catch {};
-            return .root;
+            return .{ .status = .root, .generation = 1 };
         }
-        // Chat lives on another device, and that device has not upgraded to the
-        // device model yet. We can still ASK — our record simply waits until it
-        // does. (Asking is `publishDevice(root=false, approval="")`; the caller
-        // does it when the person taps, never on our own initiative.)
-        return waitingOrAtTheGate(gpa, arena, io, environ, did, mine);
+        // Chat lives on another device that has not upgraded to the device model.
+        // We can still ask; our record waits until it does.
+        return .{ .status = .may_join, .reason = .no_current_root, .generation = 0 };
     }
 
-    const devices = set.?;
-    for (devices.devices) |d| {
-        if (!std.mem.eql(u8, &d.anchor_pub, &mine)) continue;
-        // We are part of the account, and here is where a real bug lived: an APPROVED
-        // (non-root) device used to `publishDevice(..., "")` on every bring-up — with
-        // an EMPTY approval — which OVERWRITES its own record and ERASES the signature
-        // another device made over it. It fired on the first two-device test
-        // (2026-07-14): the phone came up approved, republished, and wiped its own
-        // membership; the directory then showed it unapproved and it bounced back to
-        // "waiting" on the next read. An approval can only be MADE by another device;
-        // this one cannot reconstruct it, so it must not touch a record that already
-        // carries it. Being in the resolved set IS the record already being right.
-        if (d.root) {
-            // The root has no approval to lose — it self-attests, so re-asserting is
-            // safe and heals a wiped root record.
-            _ = try publishDevice(gpa, arena, io, environ, session, device_name, true, "");
-            return .root;
+    const recs = decoded.?;
+    var c = try keydir.classifyDevices(arena, did, recs, clock.unixSeconds());
+    defer keydir.freeClassification(arena, &c);
+
+    for (c.standings, 0..) |st, i| {
+        if (!std.mem.eql(u8, &c.pub_keys[i], &mine)) continue;
+        switch (st.standing) {
+            .active => {
+                if (!std.mem.eql(u8, &c.root_pub, &mine)) {
+                    // An APPROVED device MUST NOT republish: doing so overwrites
+                    // its own record and ERASES the approval another device made
+                    // over it. It fired on the first two-device test
+                    // (2026-07-14) — the phone came up approved, republished,
+                    // wiped its own membership and bounced back to waiting. An
+                    // approval can only be MADE by another device; being in the
+                    // set IS the record already being right.
+                    return .{ .status = .approved, .generation = c.generation };
+                }
+                // The root re-asserts — it has no approval to lose. It republishes
+                // its OWN claim verbatim: re-founding at a generation it does not
+                // hold would be a lie its own key would refuse to sign.
+                const claim = std.enums.fromInt(anchor.Claim, recs[i].claim_raw) orelse .founding;
+                _ = try publishDevice(gpa, arena, io, environ, session, device_name, .{
+                    .generation = recs[i].generation,
+                    .claim = claim,
+                    .superseded_root = recs[i].superseded_root,
+                });
+                return .{ .status = .root, .generation = c.generation };
+            },
+            .awaiting_approval => return .{ .status = .awaiting_approval, .generation = c.generation },
+            // WE HAVE A RECORD AND IT IS NOT GOOD ENOUGH. Before, these fell into
+            // the same silent "not in the set" as having no record at all, and
+            // the difference decided which screen a person saw — so a device
+            // holding a superseded record was shown "waiting for your other
+            // device" forever, and one with a fresh key was offered a takeover it
+            // did not need. Now the remedy is the same (ask) and the wording
+            // comes from the reason.
+            .orphaned, .invalid => return .{
+                .status = .may_join,
+                .reason = st.reason,
+                .generation = c.generation,
+            },
         }
-        return .approved;
     }
-    return waitingOrAtTheGate(gpa, arena, io, environ, did, mine);
+
+    // No record of ours in the directory at all.
+    return .{ .status = .may_join, .generation = c.generation };
 }
 
-/// Have we asked already, or have we not? A read failure answers NEITHER — and
-/// showing "you have not asked" to a device that asked ten seconds ago would put a
-/// button in front of a person that does the one thing they have already done.
-fn waitingOrAtTheGate(
-    gpa: Allocator,
-    arena: Allocator,
-    io: std.Io,
-    environ: ?*const std.process.Environ.Map,
-    did: []const u8,
-    mine: [anchor.pk_len]u8,
-) !DeviceStatus {
-    const asked = hasOwnRecord(gpa, arena, io, environ, did, mine) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return .offline,
-    };
-    return if (asked) .pending else .not_asked;
-}
-
-/// Have we already published a record for THIS device (approved or not)? The
-/// difference between "waiting" and "has not asked", which is the difference
-/// between a screen that waits and a screen that offers a button.
-fn hasOwnRecord(
-    gpa: Allocator,
-    arena: Allocator,
-    io: std.Io,
-    environ: ?*const std.process.Environ.Map,
-    did: []const u8,
-    mine: [anchor.pk_len]u8,
-) !bool {
-    const records = (try fetchDeviceListing(gpa, arena, io, environ, did)) orelse return false;
-    var rkey_buf: [32]u8 = undefined;
-    const ours = deviceId(&rkey_buf, mine);
-    for (records) |r| {
-        if (std.mem.eql(u8, rkeyOf(r.uri), ours)) return true;
-    }
-    return false;
-}
-
-/// ASK to join: publish this device's record with no approval on it. That record IS
-/// the request (there is no second kind of thing, and no inbox a stranger could
-/// post to). It waits, inert, until a device that is already part of the account
-/// signs for it.
+/// ASK to join: publish this device's record into `generation` with no approval
+/// on it. That record IS the request — there is no second kind of thing, and no
+/// inbox a stranger could post to. It waits, inert, until a device that is
+/// already part of the account signs for it.
+///
+/// This is also the way OUT of every `may_join` reason: a superseded record, a
+/// record vouched by a key nobody trusts, a record that no longer holds up — all
+/// of them are repaired by republishing at the current generation, and this is
+/// that republish. The old model had no such exit, which is why a device could
+/// loop on the same prompt forever.
 pub fn requestJoin(
     gpa: Allocator,
     arena: Allocator,
@@ -676,12 +755,65 @@ pub fn requestJoin(
     environ: ?*const std.process.Environ.Map,
     session: *auth.Session,
     device_name: []const u8,
+    generation: keydir.Generation,
 ) !void {
-    _ = try publishDevice(gpa, arena, io, environ, session, device_name, false, "");
+    _ = try publishDevice(gpa, arena, io, environ, session, device_name, .{
+        // Generation 0 means the account has no device set we could read yet (a
+        // peer still on the pre-device model). Asking to join generation 1 is
+        // right: the moment they found it, our record is already waiting.
+        .generation = @max(1, generation),
+        .claim = .joined,
+    });
 }
 
-/// A device of ours that has asked to join and nobody has vouched for. Arena-owned.
-/// A7.2: cold, transient — a handful at most, and normally none.
+/// START OVER — the deliberate fresh start, and the ONLY road to a new
+/// generation. It orphans every device in the current set, and that is exactly
+/// what it is for: the person has lost the devices that could have vouched for
+/// this one, and is saying so.
+///
+/// It is never called by start-up logic, never inferred from an empty read, and
+/// never the fallback of a failed anything. A caller reaching for this must have
+/// a person's explicit instruction behind it — that distinction is the whole
+/// lesson of 2026-07-14.
+pub fn startOver(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    session: *auth.Session,
+    device_name: []const u8,
+) !Standing {
+    const did = session.did;
+    var anchor_load = try cache.requireAnchor(gpa, io, environ, did);
+    defer std.crypto.secureZero(u8, &anchor_load.seed);
+
+    // What are we superseding? An unreadable directory is not permission to
+    // supersede anything — not even here, where the person asked.
+    const decoded = try fetchDecodedDevices(gpa, arena, io, environ, did);
+    var generation: keydir.Generation = 1;
+    var claim: anchor.Claim = .founding;
+    var superseded = [_]u8{0} ** anchor.pk_len;
+    if (decoded) |recs| {
+        var c = try keydir.classifyDevices(arena, did, recs, clock.unixSeconds());
+        defer keydir.freeClassification(arena, &c);
+        if (c.generation > 0) {
+            generation = c.generation + 1;
+            claim = .recovery;
+            superseded = c.root_pub;
+        }
+    }
+
+    _ = try publishDevice(gpa, arena, io, environ, session, device_name, .{
+        .generation = generation,
+        .claim = claim,
+        .superseded_root = superseded,
+    });
+    _ = ensurePublished(gpa, arena, io, environ, session, true) catch {};
+    return .{ .status = .root, .generation = generation };
+}
+
+/// A device of ours that has asked to join and nobody has vouched for.
+/// Arena-owned. A7.2: cold, transient — a handful at most, and normally none.
 pub const PendingDevice = struct {
     /// The device's own anchor key: what an approval SIGNS. Everything else here
     /// is for the prompt to have words in it.
@@ -696,77 +828,74 @@ pub const PendingDevice = struct {
     key_package_b64: []const u8,
     anchor_sig_b64: []const u8,
     not_after: []const u8,
+    /// The generation it is asking to join. An approval is signed FOR a
+    /// generation, so approving without this would mint a signature that
+    /// verifies in no generation at all.
+    generation: keydir.Generation,
+    /// Its own claim signature, carried through untouched when we write the
+    /// approval in — we cannot produce it and must not drop it.
+    claim_sig_b64: []const u8,
 };
 
-/// Devices of OUR OWN account that are asking to join: records that are
-/// structurally valid but that the trusted set does not contain.
+/// Devices of OUR OWN account that are asking to join: records the pure
+/// classifier says are `.awaiting_approval`.
 ///
-/// A record that fails validation is not "pending" — it is junk, and junk must not
-/// be able to put a prompt in front of a person.
+/// It no longer takes a trusted set and re-derives membership from it. That
+/// second copy of the rules is what let the relay and the client disagree about
+/// who was a member, twice (REDESIGN D5) — the verdict comes from `keydir` and
+/// from nowhere else.
 pub fn fetchPending(
     gpa: Allocator,
     arena: Allocator,
     io: std.Io,
     environ: ?*const std.process.Environ.Map,
     did: []const u8,
-    trusted: []const [anchor.pk_len]u8,
 ) ![]const PendingDevice {
     const listing = (try fetchDeviceListing(gpa, arena, io, environ, did)) orelse return &.{};
-    var out = try std.ArrayListUnmanaged(PendingDevice).initCapacity(arena, listing.len);
-    const now = clock.unixSeconds();
 
-    // A DEVICE NEVER ASKS TO JOIN ITSELF. This is defence in depth behind the
-    // approval-persistence fix: if anything ever leaves our OWN record looking
-    // unapproved (a wiped approval, an expiry, a half-write), the trusted-set check
-    // below would classify it as "pending" and we would prompt a person to approve
-    // their own device — which is nonsense, and is exactly what the owner saw on the
-    // phone on the first two-device test (2026-07-14). Our own anchor is excluded
-    // outright, so no directory state can ever put that prompt in front of anyone.
+    var recs = try std.ArrayListUnmanaged(keydir.DeviceRecord).initCapacity(arena, listing.len);
+    var rows = try std.ArrayListUnmanaged(usize).initCapacity(arena, listing.len);
+    for (listing, 0..) |r, i| {
+        const rec = decodeDeviceRecord(arena, r.value) catch continue;
+        recs.appendAssumeCapacity(rec);
+        rows.appendAssumeCapacity(i);
+    }
+
+    var c = try keydir.classifyDevices(arena, did, recs.items, clock.unixSeconds());
+    defer keydir.freeClassification(arena, &c);
+
+    // A DEVICE NEVER ASKS TO JOIN ITSELF. Defence in depth: if anything ever left
+    // our OWN record looking unapproved (a wiped approval, an expiry, a half
+    // write), we would prompt a person to approve their own device — which is
+    // nonsense, and is exactly what the owner saw on the phone on the first
+    // two-device test (2026-07-14). Our own anchor is excluded outright, so no
+    // directory state can put that prompt in front of anyone.
     const own: ?[anchor.pk_len]u8 = blk: {
-        var anchor_load = cache.loadOrCreateAnchorSeed(gpa, io, environ, did) orelse break :blk null;
+        // Null here only costs us the self-exclusion below, so "we could not
+        // read it" and "there is none" genuinely do share a response — one of
+        // the few places that is true.
+        var anchor_load = cache.requireAnchor(gpa, io, environ, did) catch break :blk null;
         defer std.crypto.secureZero(u8, &anchor_load.seed);
         break :blk anchor.publicKey(anchor_load.seed) catch null;
     };
 
-    for (listing) |r| {
-        const v = r.value;
-        if (v.root) continue; // the root vouches for itself; it is never pending
-        const decoded = decodeDevice(arena, v) catch continue;
-        // It must at least be a real device record — its own key, its own binding.
-        const peer = keydir.validate(arena, did, .{
-            .did = v.did,
-            .cipher_suite = v.cipherSuite,
-            .key_package = decoded.key_package,
-            .anchor_sig = decoded.anchor_sig,
-            .not_after = decoded.not_after,
-        }, now) catch continue;
+    var out = try std.ArrayListUnmanaged(PendingDevice).initCapacity(arena, recs.items.len);
+    for (c.standings, 0..) |st, k| {
+        if (st.standing != .awaiting_approval) continue;
+        const key = c.pub_keys[k];
+        if (own) |mine| if (std.mem.eql(u8, &mine, &key)) continue;
 
-        // Never us. (See the note at the top: a device does not approve itself.)
-        if (own) |mine| if (std.mem.eql(u8, &mine, &peer.anchor_pub)) continue;
-
-        // Already vouched for by somebody we trust? Then it is not asking — it is
-        // in, and a prompt about it would be a prompt about nothing.
-        var approved = false;
-        for (trusted) |t| {
-            if (std.mem.eql(u8, &t, &peer.anchor_pub)) {
-                approved = true; // it IS one of the trusted devices
-                break;
-            }
-            if (decoded.approval_sig.len == 0) continue; // asking, with no proof yet
-            anchor.verifyDeviceApproval(t, did, peer.anchor_pub, decoded.approval_sig) catch continue;
-            approved = true; // a trusted device has already vouched for it
-            break;
-        }
-        if (approved) continue;
-
+        const v = listing[rows.items[k]].value;
         out.appendAssumeCapacity(.{
-            .anchor_pub = peer.anchor_pub,
+            .anchor_pub = key,
             .name = v.deviceName,
-            .created_at = feed_core.parseTimestamp(v.createdAt) catch 0,
-            .rkey = rkeyOf(r.uri),
+            .created_at = recs.items[k].created_at,
+            .rkey = rkeyOf(listing[rows.items[k]].uri),
             .key_package_b64 = v.keyPackage,
             .anchor_sig_b64 = v.anchorKeySig,
             .not_after = v.notAfter,
+            .generation = recs.items[k].generation,
+            .claim_sig_b64 = v.claimSig,
         });
     }
     return out.items;
@@ -776,8 +905,13 @@ pub fn fetchPending(
 /// the signature into its record. From here every peer that resolves the account's
 /// devices will see it, and will address it like any other.
 ///
-/// The approval signs the device's KEY, not its name or its rkey — so nothing a
-/// liar could put in the record changes what was agreed to.
+/// The approval signs the device's KEY and the GENERATION, not its name or its
+/// rkey — so nothing a liar could put in the record changes what was agreed to,
+/// and an approval cannot be carried into a generation it was not made for.
+///
+/// We also write ourselves in as `approvalBy`. That is not a claim anyone has to
+/// believe: it is inside the signed message, so a record naming a different
+/// approver simply fails to verify (REDESIGN §4.2).
 pub fn approveDevice(
     gpa: Allocator,
     arena: Allocator,
@@ -787,13 +921,16 @@ pub fn approveDevice(
     pending: PendingDevice,
 ) !void {
     const did = session.did;
-    var anchor_load = cache.loadOrCreateAnchorSeed(gpa, io, environ, did) orelse return error.NoAnchor;
+    var anchor_load = try cache.requireAnchor(gpa, io, environ, did);
     defer std.crypto.secureZero(u8, &anchor_load.seed);
+    const mine = try anchor.publicKey(anchor_load.seed);
 
-    const sig = try anchor.signDeviceApproval(anchor_load.seed, did, pending.anchor_pub);
+    const sig = try anchor.signDeviceApproval(anchor_load.seed, did, pending.generation, pending.anchor_pub);
     const Enc = std.base64.standard.Encoder;
     const sig_b64 = try arena.alloc(u8, Enc.calcSize(sig.len));
     _ = Enc.encode(sig_b64, &sig);
+    const by_b64 = try arena.alloc(u8, Enc.calcSize(anchor.pk_len));
+    _ = Enc.encode(by_b64, &mine);
 
     var ca_buf: [24]u8 = undefined;
     const record = DeviceRecordOut{
@@ -801,7 +938,13 @@ pub fn approveDevice(
         .cipherSuite = mls.cipher_suite_id,
         .keyPackage = pending.key_package_b64, // unchanged: it is THEIR key, not ours to restate
         .anchorKeySig = pending.anchor_sig_b64,
-        .root = false,
+        .generation = pending.generation,
+        .claim = @intFromEnum(anchor.Claim.joined),
+        // Their own claim signature, carried through untouched — we cannot make
+        // it and must not drop it, or the record we write would no longer prove
+        // the generation it belongs to.
+        .claimSig = pending.claim_sig_b64,
+        .approvalBy = by_b64,
         .approvalSig = sig_b64, // …and this is the whole of what we are adding
         .deviceName = pending.name,
         .notAfter = pending.not_after,
@@ -850,7 +993,7 @@ pub const Reclaim = struct {
     devices_removed: u8,
     /// Where this device stands afterwards. Anything but `.root` means the repair
     /// did not take, and the operator must be told so rather than reassured.
-    status: DeviceStatus,
+    standing: Standing,
 };
 
 /// THIS DEVICE TAKES CHAT BACK — the repair, and it exists because the account
@@ -881,7 +1024,7 @@ pub fn reclaim(
     device_name: []const u8,
 ) !Reclaim {
     const did = session.did;
-    var anchor_load = cache.loadOrCreateAnchorSeed(gpa, io, environ, did) orelse return error.NoAnchor;
+    var anchor_load = try cache.requireAnchor(gpa, io, environ, did);
     defer std.crypto.secureZero(u8, &anchor_load.seed);
     const mine = try anchor.publicKey(anchor_load.seed);
     var rkey_buf: [32]u8 = undefined;
@@ -897,16 +1040,18 @@ pub fn reclaim(
         }
     }
 
-    // `replace_foreign = true` is precisely what this operation IS: a person at the
-    // keyboard saying the account's chat key is the one on THIS device. It is the
-    // only caller in the codebase that passes it without a human having read what it
-    // costs — because here the human typed the command.
-    _ = try ensurePublished(gpa, arena, io, environ, session, true);
-
-    // And where do we stand now? Say it out loud rather than assuming: with no other
-    // devices and our own singleton, this must come back `.root`.
-    const status = try ensureDevice(gpa, arena, io, environ, session, device_name);
-    return .{ .devices_removed = removed, .status = status };
+    // AND THEN THE DELIBERATE FRESH START. This is the human-instructed road to a
+    // new generation — the only one there is. `startOver` re-asserts the singleton
+    // (`replace_foreign = true`: a person at the keyboard saying the account's chat
+    // key is the one on THIS device) and publishes this device as the root of a
+    // generation that supersedes, by name, the one it replaces.
+    //
+    // The old version reached the same end by calling `ensureDevice` and trusting it
+    // to infer "I must be the root" from the emptiness this function had just
+    // created. That inference is gone, and with it the shape that caused the
+    // incident this repair exists for.
+    const standing = try startOver(gpa, arena, io, environ, session, device_name);
+    return .{ .devices_removed = removed, .standing = standing };
 }
 
 /// The rkey is the last path segment of an at:// URI.
@@ -915,31 +1060,62 @@ fn rkeyOf(uri: []const u8) []const u8 {
     return uri[slash + 1 ..];
 }
 
-const DecodedDevice = struct {
-    // A7.2: cold, transient decode result.
-    key_package: []const u8,
-    anchor_sig: []const u8,
-    approval_sig: []const u8,
-    not_after: i64,
-};
-
-fn decodeDevice(arena: Allocator, v: DeviceRecordIn) !DecodedDevice {
+/// THE ONE DECODER. There used to be two — this one, and a second copy inlined in
+/// `fetchPeerDevices` — and two copies of a wire decoder is two places for the
+/// membership rules to drift apart, which is exactly how the relay and the client
+/// came to disagree about who was a member (REDESIGN D5). Everything that reads a
+/// device record now comes through here and then through `keydir.classify`.
+fn decodeDeviceRecord(arena: Allocator, v: DeviceRecordIn) !keydir.DeviceRecord {
     const Dec = std.base64.standard.Decoder;
     const kp = try arena.alloc(u8, try Dec.calcSizeForSlice(v.keyPackage));
     try Dec.decode(kp, v.keyPackage);
     const sig = try arena.alloc(u8, try Dec.calcSizeForSlice(v.anchorKeySig));
     try Dec.decode(sig, v.anchorKeySig);
+
     var appr: []const u8 = "";
     if (v.approvalSig.len > 0) {
         const a = try arena.alloc(u8, try Dec.calcSizeForSlice(v.approvalSig));
         try Dec.decode(a, v.approvalSig);
         appr = a;
     }
+    var claim_sig: []const u8 = "";
+    if (v.claimSig.len > 0) {
+        const c = try arena.alloc(u8, try Dec.calcSizeForSlice(v.claimSig));
+        try Dec.decode(c, v.claimSig);
+        claim_sig = c;
+    }
+
+    // A key field that is present but not exactly 32 bytes is junk, and junk
+    // reads as absent here — `keydir` then refuses the record by name, which is
+    // where every "this does not hold up" verdict belongs.
+    var superseded = [_]u8{0} ** anchor.pk_len;
+    if (v.supersededRoot.len > 0) {
+        const s_len = Dec.calcSizeForSlice(v.supersededRoot) catch 0;
+        if (s_len == anchor.pk_len) Dec.decode(&superseded, v.supersededRoot) catch {
+            superseded = [_]u8{0} ** anchor.pk_len;
+        };
+    }
+    var approval_by = [_]u8{0} ** anchor.pk_len;
+    if (v.approvalBy.len > 0) {
+        const b_len = Dec.calcSizeForSlice(v.approvalBy) catch 0;
+        if (b_len == anchor.pk_len) Dec.decode(&approval_by, v.approvalBy) catch {
+            approval_by = [_]u8{0} ** anchor.pk_len;
+        };
+    }
+
     return .{
+        .did = v.did,
+        .cipher_suite = v.cipherSuite,
         .key_package = kp,
         .anchor_sig = sig,
-        .approval_sig = appr,
         .not_after = try feed_core.parseTimestamp(v.notAfter),
+        .generation = v.generation,
+        .claim_raw = v.claim,
+        .superseded_root = superseded,
+        .claim_sig = claim_sig,
+        .approval_by = approval_by,
+        .approval_sig = appr,
+        .created_at = feed_core.parseTimestamp(v.createdAt) catch 0,
     };
 }
 
@@ -982,46 +1158,33 @@ pub fn fetchPeerDevices(
     environ: ?*const std.process.Environ.Map,
     did: []const u8,
 ) !?keydir.DeviceSet {
-    const records = (try fetchDeviceListing(gpa, arena, io, environ, did)) orelse return null;
-
-    const Dec = std.base64.standard.Decoder;
-    var decoded = try std.ArrayListUnmanaged(keydir.DeviceRecord).initCapacity(arena, records.len);
-    for (records) |r| {
-        const v = r.value;
-        // A record we cannot even decode is DROPPED, not fatal: one piece of junk
-        // in the repo must not take an account's whole chat identity offline.
-        const kp_len = Dec.calcSizeForSlice(v.keyPackage) catch continue;
-        const kp_bytes = try arena.alloc(u8, kp_len);
-        Dec.decode(kp_bytes, v.keyPackage) catch continue;
-        const sig_len = Dec.calcSizeForSlice(v.anchorKeySig) catch continue;
-        const sig_bytes = try arena.alloc(u8, sig_len);
-        Dec.decode(sig_bytes, v.anchorKeySig) catch continue;
-        var appr: []const u8 = "";
-        if (v.approvalSig.len > 0) {
-            const a_len = Dec.calcSizeForSlice(v.approvalSig) catch continue;
-            const a_bytes = try arena.alloc(u8, a_len);
-            Dec.decode(a_bytes, v.approvalSig) catch continue;
-            appr = a_bytes;
-        }
-        const not_after = feed_core.parseTimestamp(v.notAfter) catch continue;
-        const created_at = feed_core.parseTimestamp(v.createdAt) catch 0;
-
-        decoded.appendAssumeCapacity(.{
-            .did = v.did,
-            .cipher_suite = v.cipherSuite,
-            .key_package = kp_bytes,
-            .anchor_sig = sig_bytes,
-            .not_after = not_after,
-            .root = v.root,
-            .approval_sig = appr,
-            .created_at = created_at,
-        });
-    }
+    const decoded = (try fetchDecodedDevices(gpa, arena, io, environ, did)) orelse return null;
 
     // The verdict is the CORE's (D3): who is vouched for, and by whom.
-    const set = try keydir.resolveDevices(arena, did, decoded.items, clock.unixSeconds());
+    const set = try keydir.resolveDevices(arena, did, decoded, clock.unixSeconds());
     if (set.devices.len == 0) return null;
     return set;
+}
+
+/// Every device record in the repo, decoded but NOT judged — the input the pure
+/// classifier takes. Null = the repo answered and holds no device records.
+/// A record we cannot even decode is dropped here (one piece of junk must not
+/// take an account's chat offline); everything that decodes gets a verdict, with
+/// a reason, from `keydir`.
+fn fetchDecodedDevices(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    did: []const u8,
+) !?[]const keydir.DeviceRecord {
+    const records = (try fetchDeviceListing(gpa, arena, io, environ, did)) orelse return null;
+    var decoded = try std.ArrayListUnmanaged(keydir.DeviceRecord).initCapacity(arena, records.len);
+    for (records) |r| {
+        const rec = decodeDeviceRecord(arena, r.value) catch continue;
+        decoded.appendAssumeCapacity(rec);
+    }
+    return decoded.items;
 }
 
 // ---------------------------------------------------------------------------
@@ -1109,8 +1272,8 @@ test "chat_keys: a connection that failed is not a broken record" {
 test "chat_keys: 'I could not read it' is its own answer, distinct from every claim" {
     try testing.expect(DeviceStatus.offline != DeviceStatus.root);
     try testing.expect(DeviceStatus.offline != DeviceStatus.approved);
-    try testing.expect(DeviceStatus.offline != DeviceStatus.pending);
-    try testing.expect(DeviceStatus.offline != DeviceStatus.not_asked);
+    try testing.expect(DeviceStatus.offline != DeviceStatus.awaiting_approval);
+    try testing.expect(DeviceStatus.offline != DeviceStatus.may_join);
     // And the enum is exhaustive: a new state cannot be added without a human
     // deciding, here, whether it may publish.
     try testing.expectEqual(5, @typeInfo(DeviceStatus).@"enum".fields.len);
@@ -1170,9 +1333,10 @@ test "chat_keys: a device record round-trips the wire and its approval survives 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const did = "did:plc:deviceroundtripaaaaaaaa";
-    const root_seed: [anchor.seed_len]u8 = [_]u8{0x21} ** 32;
-    const phone_seed: [anchor.seed_len]u8 = [_]u8{0x32} ** 32;
+    const did = "did:plc:deviceroundtripaaaaaaa";
+    const root_seed: [anchor.seed_len]u8 = [_]u8{0x31} ** 32;
+    const root_pub = try anchor.publicKey(root_seed);
+    const phone_seed: [anchor.seed_len]u8 = [_]u8{0x42} ** 32;
     const phone_pub = try anchor.publicKey(phone_seed);
 
     const bundle = try mls.generateKeyPackage(arena, did, phone_seed, 0, 4102444800, .{
@@ -1180,8 +1344,11 @@ test "chat_keys: a device record round-trips the wire and its approval survives 
         .enc_seed = [_]u8{0x50} ** 32,
     });
     const binding = try anchor.signDidBinding(phone_seed, did);
-    // The desktop vouches for the phone — the signature this whole slice turns on.
-    const approval = try anchor.signDeviceApproval(root_seed, did, phone_pub);
+    // The desktop vouches for the phone, IN GENERATION 1 — the signature this
+    // whole slice turns on, and it now names its own signer.
+    const approval = try anchor.signDeviceApproval(root_seed, did, 1, phone_pub);
+    // …and the phone says, in its own hand, which generation it is joining.
+    const phone_claim = try anchor.signDeviceClaim(phone_seed, did, 1, .joined, [_]u8{0} ** anchor.pk_len);
 
     const Enc = std.base64.standard.Encoder;
     const kp_b64 = try arena.alloc(u8, Enc.calcSize(bundle.bytes.len));
@@ -1190,13 +1357,20 @@ test "chat_keys: a device record round-trips the wire and its approval survives 
     _ = Enc.encode(sig_b64, &binding);
     const appr_b64 = try arena.alloc(u8, Enc.calcSize(approval.len));
     _ = Enc.encode(appr_b64, &approval);
+    const claim_b64 = try arena.alloc(u8, Enc.calcSize(phone_claim.len));
+    _ = Enc.encode(claim_b64, &phone_claim);
+    const by_b64 = try arena.alloc(u8, Enc.calcSize(anchor.pk_len));
+    _ = Enc.encode(by_b64, &root_pub);
 
     const out = DeviceRecordOut{
         .did = did,
         .cipherSuite = mls.cipher_suite_id,
         .keyPackage = kp_b64,
         .anchorKeySig = sig_b64,
-        .root = false,
+        .generation = 1,
+        .claim = @intFromEnum(anchor.Claim.joined),
+        .claimSig = claim_b64,
+        .approvalBy = by_b64,
         .approvalSig = appr_b64,
         .deviceName = "Pixel 10 Pro",
         .notAfter = "2099-12-31T00:00:00Z",
@@ -1205,14 +1379,11 @@ test "chat_keys: a device record round-trips the wire and its approval survives 
     const json = try std.json.Stringify.valueAlloc(arena, out, .{ .emit_null_optional_fields = false });
     const back = try std.json.parseFromSliceLeaky(DeviceRecordIn, arena, json, .{ .ignore_unknown_fields = true });
 
-    // Decode exactly as fetchPeerDevices does, then let the CORE decide who is real.
-    const Dec = std.base64.standard.Decoder;
-    const kp_bytes = try arena.alloc(u8, try Dec.calcSizeForSlice(back.keyPackage));
-    try Dec.decode(kp_bytes, back.keyPackage);
-    const sig_bytes = try arena.alloc(u8, try Dec.calcSizeForSlice(back.anchorKeySig));
-    try Dec.decode(sig_bytes, back.anchorKeySig);
-    const appr_bytes = try arena.alloc(u8, try Dec.calcSizeForSlice(back.approvalSig));
-    try Dec.decode(appr_bytes, back.approvalSig);
+    // Decode through THE decoder — the same one every reader uses. This test used
+    // to hand-roll the decode inline, which meant it could pass while the real
+    // path was wrong; a second copy of the wire rules is what let the relay and
+    // the client disagree about membership, twice.
+    const phone_rec = try decodeDeviceRecord(arena, back);
 
     // The root's own record, so the phone has somebody to be vouched for BY.
     const root_bundle = try mls.generateKeyPackage(arena, did, root_seed, 0, 4102444800, .{
@@ -1220,34 +1391,38 @@ test "chat_keys: a device record round-trips the wire and its approval survives 
         .enc_seed = [_]u8{0x70} ** 32,
     });
     const root_binding = try anchor.signDidBinding(root_seed, did);
+    const root_claim = try anchor.signDeviceClaim(root_seed, did, 1, .founding, [_]u8{0} ** anchor.pk_len);
 
-    const set = try keydir.resolveDevices(arena, did, &.{
+    const recs = [_]keydir.DeviceRecord{
         .{
             .did = did,
             .cipher_suite = mls.cipher_suite_id,
             .key_package = root_bundle.bytes,
             .anchor_sig = &root_binding,
             .not_after = 4_102_444_800,
-            .root = true,
+            .generation = 1,
+            .claim_raw = @intFromEnum(anchor.Claim.founding),
+            .superseded_root = [_]u8{0} ** anchor.pk_len,
+            .claim_sig = &root_claim,
+            .approval_by = [_]u8{0} ** anchor.pk_len,
             .approval_sig = "",
             .created_at = 100,
         },
-        .{
-            .did = back.did,
-            .cipher_suite = back.cipherSuite,
-            .key_package = kp_bytes,
-            .anchor_sig = sig_bytes,
-            .not_after = try feed_core.parseTimestamp(back.notAfter),
-            .root = back.root,
-            .approval_sig = appr_bytes,
-            .created_at = try feed_core.parseTimestamp(back.createdAt),
-        },
-    }, 1_751_400_000);
+        phone_rec,
+    };
+    const set = try keydir.resolveDevices(arena, did, &recs, 1_751_400_000);
 
     // Both devices survive the wire: the account has a desktop AND a phone.
     try testing.expectEqual(@as(usize, 2), set.devices.len);
-    try testing.expectEqualSlices(u8, &(try anchor.publicKey(root_seed)), &set.root_pub);
+    try testing.expectEqual(@as(keydir.Generation, 1), set.generation);
+    try testing.expectEqualSlices(u8, &root_pub, &set.root_pub);
     try testing.expectEqualStrings("Pixel 10 Pro", back.deviceName);
+
+    // And the audit trail survived it too: the phone knows who let it in.
+    for (set.devices) |d| {
+        if (!std.mem.eql(u8, &d.anchor_pub, &phone_pub)) continue;
+        try testing.expectEqualSlices(u8, &root_pub, &d.approved_by);
+    }
 }
 
 test "chat_keys: a device's rkey is derived from its own key, and is its own" {

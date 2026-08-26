@@ -153,7 +153,59 @@ pub fn put(gpa: Allocator, key: []const u8, blob: []const u8) bool {
     return std.mem.eql(u8, got, blob);
 }
 
+/// WHAT THE KEYSTORE HAS TO SAY. Four answers, because `?[]u8` had only two and
+/// the missing distinction is the one that matters: "this keyring says the item
+/// is not here" and "this keyring failed to answer" cannot share a value when a
+/// caller's next move on absence is to MINT A NEW IDENTITY.
+///
+/// That is the 2026-07-14 law — a refusal is not an absence — applied at the
+/// layer below the one it was originally applied to.
+/// A7.2: cold, one per lookup.
+pub const Read = union(enum) {
+    /// The keyring returned the item. `gpa`-owned.
+    found: []u8,
+    /// The keyring answered, and it does not hold this item. Look elsewhere.
+    absent,
+    /// There is no keyring on this machine at all — it has no opinion, and the
+    /// file fallback is the real store here (every Android build). Look elsewhere.
+    unavailable,
+    /// A keyring IS here and the lookup FAILED. We do not know what it holds.
+    /// Never treat this as absence.
+    unreadable,
+};
+
+/// Fetch the blob stored under `key`, saying WHICH of the four it is.
+pub fn read(gpa: Allocator, key: []const u8) Read {
+    const lib = load() orelse return .unavailable;
+    var key_buf: [256]u8 = undefined;
+    if (key.len >= key_buf.len) return .unreadable; // we cannot even ask
+    @memcpy(key_buf[0..key.len], key);
+    key_buf[key.len] = 0;
+    const key_z: [*:0]const u8 = @ptrCast(&key_buf);
+
+    var gerr: ?*anyopaque = null;
+    const pw = lib.lookup(&schema, null, &gerr, @as(?[*:0]const u8, "key"), @as(?[*:0]const u8, key_z), @as(?[*:0]const u8, null));
+    if (gerr) |e| {
+        if (lib.err_free) |f| f(e);
+        return .unreadable; // the keyring is here and it broke
+    }
+    const pw_ptr = pw orelse return .absent; // it answered: not here
+    defer lib.free(pw);
+
+    const b64 = std.mem.span(pw_ptr);
+    const Dec = std.base64.standard.Decoder;
+    const dec_len = Dec.calcSizeForSlice(b64) catch return .unreadable;
+    const out = gpa.alloc(u8, dec_len) catch return .unreadable;
+    Dec.decode(out, b64) catch {
+        gpa.free(out);
+        return .unreadable; // stored, but not something we can use
+    };
+    return .{ .found = out };
+}
+
 /// Fetch the blob stored under `key` (gpa-owned), or null if absent / no keyring.
+/// Collapses `read`'s four answers into two — correct only where the caller's
+/// response to "we could not tell" is the same as to "it is not there".
 pub fn get(gpa: Allocator, key: []const u8) ?[]u8 {
     const lib = load() orelse return null;
     var key_buf: [256]u8 = undefined;

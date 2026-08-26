@@ -49,6 +49,12 @@ const dc = struct {
     const O_WRONLY: c_int = 1;
     const O_CREAT: c_int = 0x200;
     const O_TRUNC: c_int = 0x400;
+    /// The absence probe needs to read errno, and on darwin errno is a function.
+    extern "c" fn __error() *c_int;
+    fn errnoValue() c_int {
+        return __error().*;
+    }
+    const ENOENT: c_int = 2;
 };
 
 /// Windows file primitives (kernel32) — the OS ABI, the same doctrine as
@@ -70,6 +76,9 @@ const k32 = struct {
     const attr_normal: u32 = 0x80;
     const movefile_replace: u32 = 1;
     const invalid_handle: usize = std.math.maxInt(usize);
+    extern "kernel32" fn GetLastError() callconv(.winapi) u32;
+    const ERROR_FILE_NOT_FOUND: u32 = 2;
+    const ERROR_PATH_NOT_FOUND: u32 = 3;
 };
 
 fn utf16Path(buf: *[520]u16, path: []const u8) ?[:0]const u16 {
@@ -196,6 +205,46 @@ fn joinFile(buf: []u8, dir: []const u8, name: []const u8) ?[]const u8 {
 // ---------------------------------------------------------------------------
 // Kernel-surface file primitives
 // ---------------------------------------------------------------------------
+
+/// Is there PROVABLY no file at `path`? True only for a definitive "no such
+/// file"; every other failure (permissions, a broken mount, a path we could not
+/// even form) answers FALSE, because it means we do not know.
+///
+/// The default falls toward "we do not know" on purpose: a caller uses this to
+/// decide whether it may mint a new identity, and the safe direction for that
+/// question is always to refuse.
+fn fileAbsent(path: []const u8) bool {
+    if (comptime is_darwin) {
+        var z: [512]u8 = undefined;
+        const zp = zPath(&z, path) orelse return false;
+        const fd = dc.open(zp, dc.O_RDONLY);
+        if (fd >= 0) {
+            _ = dc.close(fd);
+            return false;
+        }
+        return dc.errnoValue() == dc.ENOENT;
+    }
+    if (comptime is_windows) {
+        if (winOpen(path, false)) |h| {
+            _ = k32.CloseHandle(h);
+            return false;
+        }
+        const err = k32.GetLastError();
+        return err == k32.ERROR_FILE_NOT_FOUND or err == k32.ERROR_PATH_NOT_FOUND;
+    }
+    var z: [512]u8 = undefined;
+    const zp = zPath(&z, path) orelse return false;
+    const rc = linux.open(zp, .{ .ACCMODE = .RDONLY }, 0);
+    const signed: isize = @bitCast(rc);
+    if (signed >= 0) {
+        _ = linux.close(@intCast(signed));
+        return false;
+    }
+    // A failed raw syscall returns the NEGATED errno; the codebase reads them
+    // through the same @bitCast idiom rather than a wrapper (window.zig,
+    // gate_pool.zig). Only ENOENT is absence.
+    return -signed == @intFromEnum(linux.E.NOENT);
+}
 
 fn readFileAlloc(gpa: Allocator, path: []const u8) ?[]u8 {
     if (comptime is_darwin) {
@@ -860,28 +909,75 @@ pub fn saveAnchorSeedAt(gpa: Allocator, path: []const u8, did: []const u8, seed:
     return writeFileAtomic(path, out.items, 0o600);
 }
 
-/// The anchor seed for `did`, or null if none is stored (first chat use) or
-/// the stored blob is damaged / for a different DID. Keystore first, then the
-/// 0600 file.
-pub fn loadAnchorSeedAt(gpa: Allocator, path: []const u8, did: []const u8) ?[anchor_seed_len]u8 {
+/// WHAT WE KNOW ABOUT THIS DEVICE'S CHAT IDENTITY. Three answers, and the third
+/// is the whole point of the type existing.
+///
+/// The anchor seed IS this device's identity: its public key derives the rkey its
+/// directory record lives at, so a device that mints a fresh one becomes, to the
+/// account and to every peer, a device that has never been seen before. That
+/// makes "is a seed stored here?" a question whose wrong answer costs an
+/// identity — and the old signature could only say seed-or-null, so an
+/// unreadable keyring and a first-ever launch came back identical and both minted.
+///
+/// This is the 2026-07-14 law — A REFUSAL IS NOT AN ABSENCE — applied one layer
+/// below where it was first applied. The directory layer was hardened; this one
+/// was not, and it is the layer that decides who this device IS.
+/// A7.2: cold, one per bring-up.
+pub const AnchorRead = union(enum) {
+    /// A stored seed, read and verified as belonging to this DID.
+    found: [anchor_seed_len]u8,
+    /// PROVED: nothing is stored here. Minting is correct — this is a first run.
+    absent,
+    /// We could not tell. A keyring that failed, a file we could not read, or a
+    /// blob that is there and does not parse. NEVER mint over this: an identity
+    /// may well be sitting behind it, and replacing it is unrecoverable (the
+    /// old seed is device-bound and gone).
+    unreadable,
+};
+
+/// The anchor seed for `did`. Keystore first, then the 0600 file — and a
+/// definite "not here" from BOTH is the only thing that counts as `.absent`.
+pub fn readAnchorSeedAt(gpa: Allocator, path: []const u8, did: []const u8) AnchorRead {
     if (keystore_supported) {
         var key_buf: [255]u8 = undefined;
-        if (anchorKeystoreKey(&key_buf, did)) |key| {
-            if (keystore.get(gpa, key)) |blob| {
+        if (anchorKeystoreKey(&key_buf, did)) |key| switch (keystore.read(gpa, key)) {
+            .found => |blob| {
                 defer {
                     std.crypto.secureZero(u8, blob);
                     gpa.free(blob);
                 }
-                if (parseAnchorSeed(blob, did)) |seed| return seed;
-            }
+                // Stored, but not something we can use: an identity WAS here.
+                // Saying "absent" would mint over it.
+                return if (parseAnchorSeed(blob, did)) |seed| .{ .found = seed } else .unreadable;
+            },
+            // The keyring is here and it broke. We know nothing.
+            .unreadable => return .unreadable,
+            // It answered "not mine", or there is no keyring at all. On every
+            // Android build there is none, and the file below is the real store.
+            .absent, .unavailable => {},
+        };
+    }
+    if (readFileAlloc(gpa, path)) |bytes| {
+        defer {
+            std.crypto.secureZero(u8, bytes);
+            gpa.free(bytes);
         }
+        return if (parseAnchorSeed(bytes, did)) |seed| .{ .found = seed } else .unreadable;
     }
-    const bytes = readFileAlloc(gpa, path) orelse return null;
-    defer {
-        std.crypto.secureZero(u8, bytes);
-        gpa.free(bytes);
-    }
-    return parseAnchorSeed(bytes, did);
+    // No bytes. Only a definitive "no such file" is absence; a permissions
+    // failure or a broken mount is us not knowing, and the difference is an
+    // identity.
+    return if (fileAbsent(path)) .absent else .unreadable;
+}
+
+/// The two-valued reading, kept for callers whose response to "we could not
+/// tell" is genuinely the same as to "it is not there". NOT for anything that
+/// would mint.
+pub fn loadAnchorSeedAt(gpa: Allocator, path: []const u8, did: []const u8) ?[anchor_seed_len]u8 {
+    return switch (readAnchorSeedAt(gpa, path, did)) {
+        .found => |seed| seed,
+        .absent, .unreadable => null,
+    };
 }
 
 fn parseAnchorSeed(bytes: []const u8, did: []const u8) ?[anchor_seed_len]u8 {
@@ -1293,17 +1389,57 @@ pub const AnchorLoad = struct {
 /// — a caller must treat that as "chat identity unavailable", NEVER mint an
 /// ephemeral key, because an unpersisted anchor would silently become a new
 /// identity on every launch.
-pub fn loadOrCreateAnchorSeed(gpa: Allocator, io: std.Io, environ: ?*const std.process.Environ.Map, did: []const u8) ?AnchorLoad {
+/// The anchor seed for `did`, MINTING ONE ONLY IF THERE PROVABLY IS NONE.
+///
+/// `.unreadable` is passed straight through and never becomes a mint. That is
+/// the whole contract: a device that had an identity and cannot read it must
+/// stop and say so, not quietly become somebody new — see `AnchorRead`.
+/// Either this device's identity, or an admission that we could not establish
+/// one. There is no third answer and, deliberately, no null: a null is what let
+/// "we could not read it" and "there is none" share a value.
+/// A7.2: cold, one per bring-up.
+pub const AnchorOutcome = union(enum) {
+    ready: AnchorLoad,
+    /// We could not tell whether this device already has an identity, so we did
+    /// not mint one. The caller stops and says so.
+    unreadable,
+};
+
+pub fn loadOrCreateAnchorSeed(gpa: Allocator, io: std.Io, environ: ?*const std.process.Environ.Map, did: []const u8) AnchorOutcome {
     var path_buf: [512]u8 = undefined;
-    const path = anchorPath(&path_buf, environ, did) orelse return null;
-    if (loadAnchorSeedAt(gpa, path, did)) |seed| return .{ .seed = seed, .created = false };
+    // No cache directory at all: we cannot read one and could not persist one
+    // either, and an unpersisted anchor would be a new identity every launch.
+    const path = anchorPath(&path_buf, environ, did) orelse return .unreadable;
+    switch (readAnchorSeedAt(gpa, path, did)) {
+        .found => |seed| return .{ .ready = .{ .seed = seed, .created = false } },
+        .unreadable => return .unreadable,
+        .absent => {},
+    }
     var seed: [anchor_seed_len]u8 = undefined;
-    io.randomSecure(&seed) catch return null;
+    io.randomSecure(&seed) catch return .unreadable;
     if (!saveAnchorSeedAt(gpa, path, did, seed)) {
         std.crypto.secureZero(u8, &seed);
-        return null;
+        return .unreadable; // never hand out a seed we could not keep
     }
-    return .{ .seed = seed, .created = true };
+    return .{ .ready = .{ .seed = seed, .created = true } };
+}
+
+/// The same thing as an error union, for the many callers whose only sane
+/// response to `.unreadable` is to stop. `error.AnchorUnreadable` is NOT
+/// `error.NoAnchor`: one means "this device has no identity and cannot get
+/// one", the other means "it may well have one and we could not see it", and a
+/// screen that shows the same words for both is a screen that will one day
+/// invite somebody to replace an identity they still have.
+pub fn requireAnchor(
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    did: []const u8,
+) error{AnchorUnreadable}!AnchorLoad {
+    return switch (loadOrCreateAnchorSeed(gpa, io, environ, did)) {
+        .ready => |a| a,
+        .unreadable => error.AnchorUnreadable,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -1450,6 +1586,55 @@ test "cache: anchor seed round-trips per DID behind 0600 and refuses mismatches"
     // Absence means "no anchor yet".
     unlink(path);
     try testing.expectEqual(@as(?[anchor_seed_len]u8, null), loadAnchorSeedAt(gpa, path, did));
+}
+
+test "cache: A DAMAGED ANCHOR IS NOT AN ABSENT ONE — and is never minted over" {
+    // THE LAW OF 2026-07-14, APPLIED WHERE IT DECIDES WHO THIS DEVICE IS.
+    //
+    // The anchor seed derives this device's public key, which derives the rkey
+    // its directory record lives at. So a device that mints a fresh seed becomes,
+    // to its own account and to every peer, a device nobody has ever seen —
+    // which is a device that gets shown a join prompt on every single launch.
+    //
+    // `loadAnchorSeedAt` answered seed-or-null, so a blob that was THERE and
+    // unreadable came back the same as a first-ever launch, and the caller
+    // minted. These are the two answers that had to stop being one.
+    const gpa = testing.allocator; // C6
+    var path_buf: [128]u8 = undefined;
+    const path = tmpPath(&path_buf, "anchor3");
+    defer unlink(path);
+
+    const did = "did:plc:threevaluedaaaaaaaaaaaa";
+    var seed: [anchor_seed_len]u8 = undefined;
+    for (&seed, 0..) |*b, i| b.* = @intCast((i * 7 + 1) & 0xff);
+
+    // Stored and readable.
+    try testing.expect(saveAnchorSeedAt(gpa, path, did, seed));
+    switch (readAnchorSeedAt(gpa, path, did)) {
+        .found => |got| try testing.expectEqualSlices(u8, &seed, &got),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // PRESENT BUT DAMAGED. An identity was here. Saying "absent" would invite the
+    // caller to replace it, and the seed it replaced is device-bound and gone.
+    try testing.expect(writeFileAtomic(path, "not an anchor", 0o600));
+    try testing.expectEqual(AnchorRead.unreadable, readAnchorSeedAt(gpa, path, did));
+
+    // PRESENT BUT ANOTHER DID'S. Same reasoning: something is stored here.
+    try testing.expect(saveAnchorSeedAt(gpa, path, did, seed));
+    try testing.expectEqual(
+        AnchorRead.unreadable,
+        readAnchorSeedAt(gpa, path, "did:plc:ffffffffffffffffffffffff"),
+    );
+
+    // GENUINELY NOTHING. Only this is absence, and only this may mint.
+    unlink(path);
+    try testing.expectEqual(AnchorRead.absent, readAnchorSeedAt(gpa, path, did));
+
+    // And the probe underneath it defaults the safe way: a path it cannot even
+    // form is "we do not know", never "there is nothing there".
+    try testing.expect(fileAbsent(path));
+    try testing.expect(!fileAbsent(""));
 }
 
 test "cache: chat keyPackage privates round-trip per DID and refuse mismatches" {

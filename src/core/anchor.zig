@@ -153,42 +153,164 @@ pub fn verifyRelayAuth(
 // approval.
 // ---------------------------------------------------------------------------
 
-const approval_label = "Zat4 Chat 1.0 DeviceApproval";
+/// WHAT A DEVICE RECORD CLAIMS ABOUT ITS PLACE IN THE ACCOUNT. This used to be
+/// a `root: bool`, and that one bit had to carry two different meanings —
+/// "the first device this account ever had" and "I am deliberately starting
+/// over" — which is precisely the ambiguity that let a device enter the
+/// destructive path by INFERENCE instead of by intent
+/// (CHAT_DEVICE_MODEL_REDESIGN D1).
+pub const Claim = enum(u8) {
+    /// Generation 1: the first device set this account ever had.
+    founding = 1,
+    /// Vouched into an existing generation by a device already in it.
+    joined = 2,
+    /// A DELIBERATE fresh start: a new generation that supersedes the last.
+    /// Only ever written because a person said so in words — never because a
+    /// read came back empty.
+    recovery = 3,
+};
 
-fn approvalMessage(
-    buf: *[approval_label.len + pk_len + max_did_len]u8,
+/// The generation a record belongs to. Highest generation wins, which is what
+/// replaced "newest `createdAt` wins" — an identity should not change hands on
+/// a timestamp race.
+pub const Generation = u32;
+
+const claim_label = "Zat4 Chat 1.1 DeviceClaim";
+
+/// THE CLAIM SIGNATURE — and the attack it closes. `generation` decides who
+/// owns the account's chat identity, so if it were unsigned metadata, anybody
+/// holding the account's password could take a device's OWN record, republish
+/// it verbatim with a higher generation, and evict every other device without
+/// holding a single key. (The same hole exists today with the unsigned
+/// `createdAt` tie-break, which is what this replaces.) Signing the claim under
+/// the record's own anchor key means the generation a record asserts is one
+/// only that device could have asserted.
+fn claimMessage(
+    buf: *[claim_label.len + 4 + 1 + pk_len + max_did_len]u8,
     did: []const u8,
-    device_pub: [pk_len]u8,
+    generation: Generation,
+    claim: Claim,
+    superseded_root: [pk_len]u8,
 ) AnchorError![]const u8 {
     if (did.len > max_did_len) return error.DidTooLong;
-    @memcpy(buf[0..approval_label.len], approval_label);
-    @memcpy(buf[approval_label.len..][0..pk_len], &device_pub);
-    @memcpy(buf[approval_label.len + pk_len ..][0..did.len], did);
-    return buf[0 .. approval_label.len + pk_len + did.len];
+    var n: usize = 0;
+    @memcpy(buf[n..][0..claim_label.len], claim_label);
+    n += claim_label.len;
+    std.mem.writeInt(u32, buf[n..][0..4], generation, .little);
+    n += 4;
+    buf[n] = @intFromEnum(claim);
+    n += 1;
+    @memcpy(buf[n..][0..pk_len], &superseded_root);
+    n += pk_len;
+    @memcpy(buf[n..][0..did.len], did);
+    n += did.len;
+    return buf[0..n];
 }
 
-/// An approved device says: "this other device belongs to this account too."
-/// The DID is signed alongside the key, so an approval minted for one account
-/// cannot be lifted onto another.
-pub fn signDeviceApproval(seed: [seed_len]u8, did: []const u8, device_pub: [pk_len]u8) AnchorError![sig_len]u8 {
-    var buf: [approval_label.len + pk_len + max_did_len]u8 = undefined;
-    const msg = try approvalMessage(&buf, did, device_pub);
+/// A device states its own place: which generation it belongs to, on what
+/// grounds, and (for a recovery) which root it supersedes. `superseded_root` is
+/// all-zero for `.founding` and `.joined`.
+pub fn signDeviceClaim(
+    seed: [seed_len]u8,
+    did: []const u8,
+    generation: Generation,
+    claim: Claim,
+    superseded_root: [pk_len]u8,
+) AnchorError![sig_len]u8 {
+    var buf: [claim_label.len + 4 + 1 + pk_len + max_did_len]u8 = undefined;
+    const msg = try claimMessage(&buf, did, generation, claim, superseded_root);
     const kp = Ed25519.KeyPair.generateDeterministic(seed) catch return error.BadKey;
     const sig = kp.sign(msg, null) catch return error.BadKey;
     return sig.toBytes();
 }
 
-/// The peer's half: does an ALREADY-TRUSTED device of this account vouch for
-/// this one? Untrusted wire bytes throughout (E3).
+/// The reader's half: this record's own key really did assert this generation.
+pub fn verifyDeviceClaim(
+    device_pub: [pk_len]u8,
+    did: []const u8,
+    generation: Generation,
+    claim: Claim,
+    superseded_root: [pk_len]u8,
+    sig: []const u8,
+) AnchorError!void {
+    if (sig.len != sig_len) return error.BadSignature;
+    var buf: [claim_label.len + 4 + 1 + pk_len + max_did_len]u8 = undefined;
+    const msg = try claimMessage(&buf, did, generation, claim, superseded_root);
+    const pk = Ed25519.PublicKey.fromBytes(device_pub) catch return error.BadKey;
+    Ed25519.Signature.fromBytes(sig[0..sig_len].*).verify(msg, pk) catch return error.BadSignature;
+}
+
+const approval_label = "Zat4 Chat 1.1 DeviceApproval";
+
+/// THE APPROVER IS NAMED, AND NAMED INSIDE THE SIGNATURE. The previous version
+/// deliberately omitted the approver — "the record carries no claim it could
+/// lie about" — and made the reader trial-verify against every trusted key. The
+/// instinct was right and the conclusion overshot: a field that is part of the
+/// SIGNED MESSAGE is proved, not believed, so naming the approver costs nothing
+/// in security and buys three things the old shape could not give —
+/// O(n) resolution instead of O(n²) trial verification, an audit trail
+/// ("approved by Desktop"), and `approver_no_longer_trusted` as a state a
+/// reader can actually distinguish and explain (REDESIGN D4).
+///
+/// A forged `by` simply fails to verify. The forgery tests in `keydir.zig`
+/// (self-signed, and an approval lifted from an honest one) are unchanged and
+/// still refuse exactly what they always refused.
+///
+/// The GENERATION is bound in too, so an approval made in one generation can
+/// never be replayed into the next. That makes the "a fresh start orphans the
+/// old device set" property explicit in the cryptography rather than an
+/// emergent side effect of how the resolver happens to walk the chain.
+fn approvalMessage(
+    buf: *[approval_label.len + 4 + pk_len + pk_len + max_did_len]u8,
+    did: []const u8,
+    generation: Generation,
+    approver_pub: [pk_len]u8,
+    device_pub: [pk_len]u8,
+) AnchorError![]const u8 {
+    if (did.len > max_did_len) return error.DidTooLong;
+    var n: usize = 0;
+    @memcpy(buf[n..][0..approval_label.len], approval_label);
+    n += approval_label.len;
+    std.mem.writeInt(u32, buf[n..][0..4], generation, .little);
+    n += 4;
+    @memcpy(buf[n..][0..pk_len], &approver_pub);
+    n += pk_len;
+    @memcpy(buf[n..][0..pk_len], &device_pub);
+    n += pk_len;
+    @memcpy(buf[n..][0..did.len], did);
+    n += did.len;
+    return buf[0..n];
+}
+
+/// An approved device says: "this other device belongs to this account too, in
+/// this generation." The DID is signed alongside the keys, so an approval
+/// minted for one account cannot be lifted onto another.
+pub fn signDeviceApproval(
+    seed: [seed_len]u8,
+    did: []const u8,
+    generation: Generation,
+    device_pub: [pk_len]u8,
+) AnchorError![sig_len]u8 {
+    var buf: [approval_label.len + 4 + pk_len + pk_len + max_did_len]u8 = undefined;
+    const kp = Ed25519.KeyPair.generateDeterministic(seed) catch return error.BadKey;
+    const approver_pub = kp.public_key.toBytes();
+    const msg = try approvalMessage(&buf, did, generation, approver_pub, device_pub);
+    const sig = kp.sign(msg, null) catch return error.BadKey;
+    return sig.toBytes();
+}
+
+/// The peer's half: does the named, ALREADY-TRUSTED device of this account
+/// vouch for this one, in this generation? Untrusted wire bytes throughout (E3).
 pub fn verifyDeviceApproval(
     approver_pub: [pk_len]u8,
     did: []const u8,
+    generation: Generation,
     device_pub: [pk_len]u8,
     sig: []const u8,
 ) AnchorError!void {
     if (sig.len != sig_len) return error.BadSignature;
-    var buf: [approval_label.len + pk_len + max_did_len]u8 = undefined;
-    const msg = try approvalMessage(&buf, did, device_pub);
+    var buf: [approval_label.len + 4 + pk_len + pk_len + max_did_len]u8 = undefined;
+    const msg = try approvalMessage(&buf, did, generation, approver_pub, device_pub);
     const pk = Ed25519.PublicKey.fromBytes(approver_pub) catch return error.BadKey;
     Ed25519.Signature.fromBytes(sig[0..sig_len].*).verify(msg, pk) catch return error.BadSignature;
 }
@@ -308,34 +430,86 @@ test "anchor: relay auth binds the challenge, the DID, and the key — and nothi
 test "anchor: a device approval verifies, and every substitution fails" {
     const approver_seed = test_seed;
     const approver_pub = try publicKey(approver_seed);
+    const gen: Generation = 1;
 
     // The device being approved (its own keys — nothing is copied to it).
     const device_seed: [seed_len]u8 = [_]u8{0x5c} ** 32;
     const device_pub = try publicKey(device_seed);
 
-    const sig = try signDeviceApproval(approver_seed, test_did, device_pub);
-    try verifyDeviceApproval(approver_pub, test_did, device_pub, &sig);
+    const sig = try signDeviceApproval(approver_seed, test_did, gen, device_pub);
+    try verifyDeviceApproval(approver_pub, test_did, gen, device_pub, &sig);
 
     // A DIFFERENT device key: this is the attack the signature exists to stop —
     // a thief who can write to the repo swapping their own key into an approval
     // an honest device made for a device the owner actually approved.
     const thief_pub = try publicKey([_]u8{0x9e} ** 32);
-    try testing.expectError(error.BadSignature, verifyDeviceApproval(approver_pub, test_did, thief_pub, &sig));
+    try testing.expectError(error.BadSignature, verifyDeviceApproval(approver_pub, test_did, gen, thief_pub, &sig));
 
     // Another account's DID: an approval cannot be lifted between accounts.
-    try testing.expectError(error.BadSignature, verifyDeviceApproval(approver_pub, "did:plc:someoneelseaaaaaaaaaaaaaaaa", device_pub, &sig));
+    try testing.expectError(error.BadSignature, verifyDeviceApproval(approver_pub, "did:plc:someoneelseaaaaaaaaaaaaaaaa", gen, device_pub, &sig));
 
-    // A key nobody approved with: an unapproved device is simply not approved.
-    try testing.expectError(error.BadSignature, verifyDeviceApproval(thief_pub, test_did, device_pub, &sig));
+    // A FORGED `by`: the record names an approver it did not have. The name is
+    // inside the signed message, so presenting the signature under any other
+    // approver key builds a different message and fails. This is what makes it
+    // safe to record who signed (REDESIGN §4.2) — the field is proved, never
+    // believed.
+    try testing.expectError(error.BadSignature, verifyDeviceApproval(thief_pub, test_did, gen, device_pub, &sig));
+
+    // ANOTHER GENERATION: an approval made before a fresh start must not carry
+    // into the generation that superseded it. "Starting over orphans the old
+    // device set" is now enforced by the signature itself, not by the order the
+    // resolver happens to walk the chain in.
+    try testing.expectError(error.BadSignature, verifyDeviceApproval(approver_pub, test_did, gen + 1, device_pub, &sig));
 
     // A tampered signature.
     var bad = sig;
     bad[0] ^= 0x01;
-    try testing.expectError(error.BadSignature, verifyDeviceApproval(approver_pub, test_did, device_pub, &bad));
-    try testing.expectError(error.BadSignature, verifyDeviceApproval(approver_pub, test_did, device_pub, sig[0 .. sig_len - 1]));
+    try testing.expectError(error.BadSignature, verifyDeviceApproval(approver_pub, test_did, gen, device_pub, &bad));
+    try testing.expectError(error.BadSignature, verifyDeviceApproval(approver_pub, test_did, gen, device_pub, sig[0 .. sig_len - 1]));
 }
 
-test "anchor: the three signatures are domain-separated — none is replayable as another" {
+test "anchor: A DEVICE CANNOT BE PROMOTED INTO A GENERATION IT DID NOT CLAIM" {
+    // The attack the claim signature exists to stop, and the reason `generation`
+    // is not plain metadata. Whoever holds the account's password can rewrite any
+    // record in the repo. If the generation were unsigned, they could take an
+    // honest device's own record — valid KeyPackage, valid DID binding, every
+    // piece of it genuine — republish it verbatim with a higher generation, and
+    // evict every other device without holding a single private key.
+    //
+    // (The same hole is open TODAY behind the unsigned `createdAt` tie-break this
+    // replaces. It is closed here rather than carried forward.)
+    const device_seed = test_seed;
+    const device_pub = try publicKey(device_seed);
+    const none = [_]u8{0} ** pk_len;
+
+    const sig = try signDeviceClaim(device_seed, test_did, 1, .founding, none);
+    try verifyDeviceClaim(device_pub, test_did, 1, .founding, none, &sig);
+
+    // Promoted to a later generation: refused.
+    try testing.expectError(error.BadSignature, verifyDeviceClaim(device_pub, test_did, 2, .founding, none, &sig));
+
+    // Re-labelled as a deliberate fresh start: refused. Only the device itself
+    // can say it is starting over.
+    try testing.expectError(error.BadSignature, verifyDeviceClaim(device_pub, test_did, 1, .recovery, none, &sig));
+
+    // Pointed at a different superseded root: refused.
+    const other_root = try publicKey([_]u8{0x77} ** 32);
+    try testing.expectError(error.BadSignature, verifyDeviceClaim(device_pub, test_did, 1, .founding, other_root, &sig));
+
+    // Presented as another device's claim: refused.
+    const thief_pub = try publicKey([_]u8{0x9e} ** 32);
+    try testing.expectError(error.BadSignature, verifyDeviceClaim(thief_pub, test_did, 1, .founding, none, &sig));
+
+    // Lifted onto another account: refused.
+    try testing.expectError(error.BadSignature, verifyDeviceClaim(device_pub, "did:plc:someoneelseaaaaaaaaaaaaaaaa", 1, .founding, none, &sig));
+
+    // A recovery names the root it supersedes, and that naming is signed too.
+    const rec = try signDeviceClaim(device_seed, test_did, 2, .recovery, other_root);
+    try verifyDeviceClaim(device_pub, test_did, 2, .recovery, other_root, &rec);
+    try testing.expectError(error.BadSignature, verifyDeviceClaim(device_pub, test_did, 2, .recovery, none, &rec));
+}
+
+test "anchor: the four signatures are domain-separated — none is replayable as another" {
     // The security of every one of them rests on this. An approval presented as a
     // relay login, or a published DID binding presented as an approval, must not
     // verify — which is what the distinct labels buy.
@@ -343,13 +517,25 @@ test "anchor: the three signatures are domain-separated — none is replayable a
     const pub_key = try publicKey(seed);
     const device_pub = try publicKey([_]u8{0x33} ** 32);
     const challenge: [challenge_len]u8 = [_]u8{0x44} ** challenge_len;
+    const none = [_]u8{0} ** pk_len;
+    const gen: Generation = 1;
 
     const binding = try signDidBinding(seed, test_did);
     const relay = try signRelayAuth(seed, challenge, test_did);
-    const approval = try signDeviceApproval(seed, test_did, device_pub);
+    const approval = try signDeviceApproval(seed, test_did, gen, device_pub);
+    const claim = try signDeviceClaim(seed, test_did, gen, .founding, none);
 
-    try testing.expectError(error.BadSignature, verifyDeviceApproval(pub_key, test_did, device_pub, &binding));
-    try testing.expectError(error.BadSignature, verifyDeviceApproval(pub_key, test_did, device_pub, &relay));
+    try testing.expectError(error.BadSignature, verifyDeviceApproval(pub_key, test_did, gen, device_pub, &binding));
+    try testing.expectError(error.BadSignature, verifyDeviceApproval(pub_key, test_did, gen, device_pub, &relay));
+    try testing.expectError(error.BadSignature, verifyDeviceApproval(pub_key, test_did, gen, device_pub, &claim));
     try testing.expectError(error.BadSignature, verifyDidBinding(pub_key, test_did, &approval));
     try testing.expectError(error.BadSignature, verifyRelayAuth(pub_key, challenge, test_did, &approval));
+
+    // The claim signature joins the family: nothing else verifies as one, and it
+    // verifies as nothing else.
+    try testing.expectError(error.BadSignature, verifyDeviceClaim(pub_key, test_did, gen, .founding, none, &binding));
+    try testing.expectError(error.BadSignature, verifyDeviceClaim(pub_key, test_did, gen, .founding, none, &relay));
+    try testing.expectError(error.BadSignature, verifyDeviceClaim(pub_key, test_did, gen, .founding, none, &approval));
+    try testing.expectError(error.BadSignature, verifyDidBinding(pub_key, test_did, &claim));
+    try testing.expectError(error.BadSignature, verifyRelayAuth(pub_key, challenge, test_did, &claim));
 }

@@ -138,8 +138,7 @@ pub fn publish(
         payaddr.validateBitcoin(bitcoin) catch return error.BadBitcoin;
 
     const did = session.did;
-    var anchor_load = cache.loadOrCreateAnchorSeed(gpa, io, environ, did) orelse
-        return error.NoAnchor;
+    var anchor_load = try cache.requireAnchor(gpa, io, environ, did);
     defer std.crypto.secureZero(u8, &anchor_load.seed);
 
     var ca_buf: [24]u8 = undefined;

@@ -207,6 +207,12 @@ pub const State = struct {
 
 pub const InitError = error{
     NoAnchor,
+    /// WE COULD NOT READ THIS DEVICE'S OWN IDENTITY. Distinct from `NoAnchor`
+    /// on purpose: that one means this device has no chat identity and cannot
+    /// get one; this one means it may well HAVE one, sitting behind a keyring
+    /// or a cache directory that failed to open — and minting over it would
+    /// destroy it (the seed is device-bound and unrecoverable). We stop instead.
+    AnchorUnreadable,
     NoCacheDir,
     PublishFailed,
     OutOfMemory,
@@ -214,6 +220,16 @@ pub const InitError = error{
     /// a device that is already in it to say yes. Not a failure and not the A3 wall
     /// — a screen that waits, with something true to say while it does.
     DeviceApprovalPending,
+    /// THIS DEVICE IS NOT PART OF THE ACCOUNT'S CHAT, AND ASKING IS THE WAY IN.
+    /// It covers four situations that share one remedy — never asked, belongs to
+    /// a generation that was replaced, vouched by a key nobody trusts, or a
+    /// record that no longer holds up — and the standing handed back alongside
+    /// says which, so the screen can explain rather than guess.
+    ///
+    /// It replaced a use of `IdentityElsewhere`, whose name promised a takeover
+    /// that joining does not require and whose decline did nothing it appeared
+    /// to do.
+    MayJoinChat,
     /// A3: this account already publishes a chat key, and it is not this
     /// device's. Chat was set up somewhere else, and the anchor key that owns
     /// it cannot be copied here (that is what makes it worth anything). We
@@ -237,6 +253,12 @@ pub fn init(
     environ: ?*const std.process.Environ.Map,
     session: *@import("auth.zig").Session,
     adopt: bool,
+    /// Where this device stands with the account, written before any of the
+    /// statuses below turns into an error. The ERROR says what happened; this
+    /// says WHY, and the screen needs both — one to pick the surface, one to
+    /// pick the words. Optional so a caller that only wants the state (a test,
+    /// a repair path) need not carry one.
+    standing_out: ?*chat_keys.Standing,
 ) !State {
     // LOCAL-FIRST. The old order ran the keyPackage PUBLISH (a network
     // write) before anything else, so ANY auth/network failure aborted
@@ -246,7 +268,7 @@ pub fn init(
     // truth (E2/E4): local state loads unconditionally; the publish runs
     // last and is fatal only on a FIRST RUN, where the keyPackage must be
     // minted before Welcomes can ever arrive.
-    var anchor_load = cache.loadOrCreateAnchorSeed(gpa, io, environ, session.did) orelse return error.NoAnchor;
+    var anchor_load = try cache.requireAnchor(gpa, io, environ, session.did);
     errdefer std.crypto.secureZero(u8, &anchor_load.seed);
     var kp_path_buf: [512]u8 = undefined;
     const kp_path = cache.chatKeyPackagePath(&kp_path_buf, environ, session.did) orelse return error.NoCacheDir;
@@ -267,13 +289,14 @@ pub fn init(
         // "something went wrong, carry on" and let it fall through to a publish. It
         // is turned back into an error below, deliberately, where the four real
         // answers are read.
-        const status = chat_keys.ensureDevice(gpa, arena, io, environ, session, deviceName(environ)) catch |err| switch (err) {
+        const standing = chat_keys.ensureDevice(gpa, arena, io, environ, session, deviceName(environ)) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.NoAnchor => return error.NoAnchor,
+            error.AnchorUnreadable => return error.AnchorUnreadable,
             error.NoCacheDir => return error.NoCacheDir,
             else => return error.PublishFailed,
         };
-        switch (status) {
+        if (standing_out) |o| o.* = standing;
+        switch (standing.status) {
             // We are part of the account: chat comes up, and our own device record
             // is published. The legacy singleton is NOT touched — it belongs to the
             // root, and writing it is the clobber this project exists to end.
@@ -287,8 +310,8 @@ pub fn init(
             // and the surface says which — a screen that WAITS is not the same as a
             // screen that offers a button, and telling them apart is the whole
             // difference between a door and a wall.
-            .pending => return error.DeviceApprovalPending,
-            .not_asked => return error.IdentityElsewhere,
+            .awaiting_approval => return error.DeviceApprovalPending,
+            .may_join => return error.MayJoinChat,
             // We could not read the directory, so we know NOTHING about where this
             // device stands — least of all that it may claim the account. Chat does
             // not come up, nothing is published, and the screen says exactly that
@@ -307,7 +330,7 @@ pub fn init(
         minted_now = true;
         _ = chat_keys.ensurePublished(gpa, arena, io, environ, session, adopt) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.NoAnchor => return error.NoAnchor,
+            error.AnchorUnreadable => return error.AnchorUnreadable,
             error.NoCacheDir => return error.NoCacheDir,
             // A3: the account's chat identity is on another device. Do not
             // publish, do not mint over it, do not pretend chat is up.
@@ -349,7 +372,14 @@ pub fn init(
     // is the person's explicit "I don't have my other device; I am this device
     // now," exactly like linking-less Signal reinstall. The `.root` bring-up path
     // already does this for a device that WAS root; adopt is the same act, chosen.
-    if (adopt) _ = chat_keys.publishDevice(gpa, arena, io, environ, session, deviceName(environ), true, "") catch {};
+    //
+    // AND IT IS EXACTLY `startOver`. This used to publish a bare `root: true`
+    // record, which put a SECOND root in the directory at the same generation and
+    // left the old one lying there competing on a timestamp — the debris the
+    // 2026-08-26 read found. `startOver` is the same act said properly: it bumps
+    // the generation, NAMES the root it supersedes, and signs the claim, so every
+    // peer can tell that a person chose this rather than that a race resolved it.
+    if (adopt) _ = chat_keys.startOver(gpa, arena, io, environ, session, deviceName(environ)) catch {};
     return st;
 }
 

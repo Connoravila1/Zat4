@@ -958,10 +958,10 @@ pub fn main(init: std.process.Init) !void {
     // MULTI-DEVICE (slice 2): the gate, the wait, the approval card, the explainer.
     {
         const md = [_]struct { name: []const u8, w: u32, dev: feed_view.ChatDevices }{
-            .{ .name = "md_gate_phone", .w = 430, .dev = .{ .state = .elsewhere } },
-            .{ .name = "md_gate_busy", .w = 430, .dev = .{ .state = .elsewhere, .busy = true } },
+            .{ .name = "md_gate_phone", .w = 430, .dev = .{ .state = .may_join } },
+            .{ .name = "md_gate_busy", .w = 430, .dev = .{ .state = .may_join, .busy = true } },
             .{ .name = "md_wait_phone", .w = 430, .dev = .{ .state = .pending, .t = 1.2 } },
-            .{ .name = "md_help", .w = 430, .dev = .{ .state = .elsewhere, .help_open = true } },
+            .{ .name = "md_help", .w = 430, .dev = .{ .state = .may_join, .help_open = true } },
             .{ .name = "md_approve", .w = 700, .dev = .{ .pending = &[_]feed_view.PendingDeviceView{
                 .{ .name = "Pixel 10 Pro", .fingerprint = "a41f 9c02 7bd3 e158", .age = "just now" },
             } } },

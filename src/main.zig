@@ -633,8 +633,12 @@ pub fn main(init: std.process.Init) !void {
     // Zat Chat C6 proof: the device-bound anchor key survives relaunches and
     // its DID binding self-verifies. Purely local — no network, no session.
     if (chat_anchor_did) |did| {
-        var res = cache_shell.loadOrCreateAnchorSeed(gpa, io, env, did) orelse {
-            try out.print("--chat-anchor: could not create or persist an anchor (no keystore, no writable cache dir, or no entropy)\n", .{});
+        var res = cache_shell.requireAnchor(gpa, io, env, did) catch {
+            // NOT "there is no anchor" — "we could not tell", which is a very
+            // different thing to print at somebody. An identity may be sitting
+            // right there behind a keyring that failed to open.
+            try out.print("--chat-anchor: could not READ this device's anchor, and refused to mint over it.\n" ++
+                "  (An unreadable keyring or cache dir is not proof there is nothing there. Nothing was changed.)\n", .{});
             try out.flush();
             return;
         };
@@ -924,10 +928,10 @@ pub fn main(init: std.process.Init) !void {
             try out.print(
                 \\[chat] reclaimed — this device is the account's chat device again
                 \\[chat]   other device records removed: {d}
-                \\[chat]   this device now stands: {s}
+                \\[chat]   this device now stands: {s} (generation {d})
                 \\
-            , .{ rep.devices_removed, @tagName(rep.status) });
-            if (rep.status != .root) {
+            , .{ rep.devices_removed, @tagName(rep.standing.status), rep.standing.generation });
+            if (rep.standing.status != .root) {
                 // Say it plainly rather than reassure: the repair did not take, and
                 // the operator needs to know that BEFORE they trust the account.
                 try out.print("[chat] WARNING: expected 'root'. The directory did not end up where it should — do not assume chat is repaired.\n", .{});
@@ -955,10 +959,10 @@ pub fn main(init: std.process.Init) !void {
             , .{ pub_result.uri, pub_result.cid });
             try out.flush();
 
-            var own = cache_shell.loadOrCreateAnchorSeed(gpa, io, env, session.did) orelse {
-                try out.print("[pay] fetch-back skipped: no anchor available\n", .{});
+            var own = cache_shell.requireAnchor(gpa, io, env, session.did) catch |err| {
+                try out.print("[pay] fetch-back skipped: this device's anchor could not be read\n", .{});
                 try out.flush();
-                return error.NoAnchor;
+                return err;
             };
             defer std.crypto.secureZero(u8, &own.seed);
             const own_pub = try anchor_core.publicKey(own.seed);
