@@ -71,7 +71,8 @@ const chat_games = @import("../core/chat_games.zig");
 const spring = @import("../core/spring.zig");
 const reveal = @import("../ui/reveal.zig"); // Rover: portable present/dismiss transition
 const ui_insets = @import("../ui/insets.zig");
-const ui_timing = @import("../ui/timing.zig"); // Rover: long-press / repeat, one clock rule // Rover: safe-area / gesture-inset math
+const ui_timing = @import("../ui/timing.zig"); // Rover: long-press / repeat, one clock rule
+const ui_scroll = @import("../ui/scroll.zig"); // Rover: scroll physics (its frame-clamp is used here) // Rover: safe-area / gesture-inset math
 const scroll_container = @import("../ui/scroll_container.zig"); // Rover: one range rule for every screen
 const home_scene = @import("home_scene.zig"); // Zat binding: Home paint/input share Rover geometry
 const algorithm_scene = @import("algorithm_scene.zig"); // Algorithms: page + three sockets, one scene
@@ -1206,6 +1207,11 @@ const RunState = struct {
     /// whatever happened next.
     gpress_x: i32,
     gpress_y: i32,
+    /// Wall clock of the last scroll-physics step. The fling and the edge bounce
+    /// integrate against REAL elapsed time; both used to advance once per frame
+    /// with a hardcoded 1/60, which made the feed glide twice as far per second
+    /// on a 120 Hz phone as on the 60 Hz it was tuned at.
+    gscroll_clock_ns: u64,
     gpu_state: ?GpuState,
 };
 
@@ -2076,6 +2082,7 @@ fn initRunState(
     rs.ghover_x = -1;
     rs.gpress_x = -1;
     rs.gpress_y = -1;
+    rs.gscroll_clock_ns = 0;
     rs.ghover_y = -1;
 
     // Phase 6.4: the GPU render path, brought up additively when the window is
@@ -5497,21 +5504,47 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         rs.kbd_nav_scroll_v = 0;
                     }
                 }
+                // THE SCROLL RUNS ON THE CLOCK, NOT ON THE FRAME.
+                //
+                // Everything below used to advance exactly once per frame — the
+                // glide stepped by `fling_v` px, the friction multiplied once, and
+                // the edge spring was handed a hardcoded 1/60. That is a scroll
+                // tuned for 60 Hz and only 60 Hz: on a 120 Hz phone every one of
+                // those happened twice as often, so the same flick travelled about
+                // twice as far and settled on a different curve. The owner's phone
+                // is 120 Hz, and "scroll speed and fluidity" was on the punch list
+                // from the device pass.
+                //
+                // `ticks` is the frame expressed in 60ths of a second, so every
+                // constant here keeps the exact value it was tuned to and the
+                // arithmetic reduces to the old code precisely at 60 fps. The
+                // clamp is Rover's (`max_accum`): a long stall must not teleport
+                // the feed on the frame after it.
+                const step_now = clock_shell.monotonicNanos();
+                const raw_dt: f32 = if (rs.gscroll_clock_ns == 0)
+                    1.0 / 60.0
+                else
+                    @as(f32, @floatFromInt(step_now -| rs.gscroll_clock_ns)) / 1_000_000_000.0;
+                rs.gscroll_clock_ns = step_now;
+                const sdt = std.math.clamp(raw_dt, 1.0 / 1000.0, ui_scroll.max_accum);
+                const ticks = sdt * 60.0;
+
                 const fling_friction: f32 = 0.966; // softer decay → the flick carries further
                 const fling_rest: f32 = 0.5;
                 if (m.scrolling or m.down_x >= 0) {
-                    m.fling_v = m.fling_v * 0.6 + frame_dy * 0.4;
+                    m.fling_v = gesture.sampleFlingVelocity(m.fling_v, frame_dy, ticks, 0.6);
                 } else if (@abs(m.fling_v) > fling_rest) {
-                    const pos = @as(f32, @floatFromInt(rs.gscroll_px)) + m.fling_v;
+                    const glide = gesture.stepFling(m.fling_v, ticks, fling_friction);
+                    const pos = @as(f32, @floatFromInt(rs.gscroll_px)) + glide.moved;
                     if (pos > 0 or pos < min_scroll_f) {
                         const edge: f32 = if (pos > 0) 0 else min_scroll_f;
                         rs.gscroll_px = @intFromFloat(edge);
                         m.bounce_px = pos - edge; // the overshoot step, displayed px
-                        m.bounce_v = m.fling_v * 60.0; // px/frame -> px/s
+                        m.bounce_v = m.fling_v * 60.0; // px/60th -> px/s
                         m.fling_v = 0;
                     } else {
                         rs.gscroll_px = @intFromFloat(pos);
-                        m.fling_v *= fling_friction;
+                        m.fling_v = glide.velocity;
                     }
                 } else m.fling_v = 0;
                 // THE EDGE EPISODE writes the frame's scroll: while the finger
@@ -5524,7 +5557,8 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     rs.gscroll_px = edge_i + @as(i32, @intFromFloat(gesture.rubberBand(m.over_px, view_h_f)));
                 } else if (m.bounce_px != 0 or @abs(m.bounce_v) > 1.0) {
                     const scroll_bounce = comptime spring.springConstants(0.0, 0.35);
-                    spring.stepScalar(&m.bounce_px, &m.bounce_v, 0.0, scroll_bounce, 1.0 / 60.0);
+                    // Real elapsed time, for the same reason as the glide above.
+                    spring.stepScalar(&m.bounce_px, &m.bounce_v, 0.0, scroll_bounce, sdt);
                     const edge_i: i32 = if (m.bounce_px > 0 or (m.bounce_px == 0 and m.bounce_v > 0)) 0 else min_scroll;
                     if (@abs(m.bounce_px) < 0.5 and @abs(m.bounce_v) < 5.0) {
                         m.bounce_px = 0;

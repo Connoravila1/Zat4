@@ -212,6 +212,62 @@ pub fn settleOpen(t: f32, vel_t_per_s: f32) bool {
 /// asymptotic curve d·(1 − 1/(|x|·c/d + 1)), sign-preserving. Zero at zero,
 /// monotone, and bounded by `dim` (the view dimension) — the finger can pull
 /// forever and the content approaches but never passes one screen of give.
+/// The flick glide, ADVANCED OVER TIME rather than once per frame.
+///
+/// The shell used to do this inline: add `v` to the scroll and multiply `v` by
+/// the friction constant, once per frame, with the edge spring handed a
+/// hardcoded 1/60. That is a scroll tuned for exactly 60 Hz — at 120 it happened
+/// twice as often, so the same flick travelled about twice as far and settled on
+/// a different curve, and the phone this app is developed on is 120 Hz.
+///
+/// `ticks` is the elapsed frame expressed in SIXTIETHS OF A SECOND, so every
+/// constant the feel was tuned with keeps the number it was tuned to. The glide
+/// is integrated in fixed sub-steps, which is what makes it genuinely rate
+/// independent: 8ms then 8ms lands where one 16ms step lands, rather than
+/// somewhere near it (a single Euler step of a decaying velocity does not
+/// compose, and that error is the difference between two devices).
+/// A7.2: cold, one per frame.
+pub const Fling = struct {
+    /// How far the content should move this frame (logical px).
+    moved: f32,
+    /// The velocity that is left, in px per sixtieth.
+    velocity: f32,
+};
+
+/// A quarter of a sixtieth — 1/240 s, matching Rover `scroll`'s sub-step, which
+/// is smaller than any real frame so every frame takes at least one.
+pub const fling_sub_ticks: f32 = 0.25;
+
+pub fn stepFling(v0: f32, ticks: f32, friction: f32) Fling {
+    var v = v0;
+    var moved: f32 = 0;
+    var left = ticks;
+    // A guard, not a policy: a pathological `ticks` must not spin here. The
+    // caller already clamps the frame; this makes the function total on its own.
+    var guard: u32 = 0;
+    while (left > 0 and guard < 4096) : (guard += 1) {
+        const t = @min(fling_sub_ticks, left);
+        moved += v * t;
+        v *= std.math.pow(f32, friction, t);
+        left -= t;
+    }
+    return .{ .moved = moved, .velocity = v };
+}
+
+/// The velocity SAMPLE, likewise a rate rather than a per-frame quantity. The
+/// frame's finger travel is normalised to a sixtieth before it enters the
+/// running average, and the average's own weight decays over time — otherwise a
+/// 120 Hz device averages half-sized samples twice as often and arrives
+/// somewhere else entirely.
+///
+/// `keep` is the weight the old value held per sixtieth (the tuned constant).
+pub fn sampleFlingVelocity(prev: f32, frame_travel: f32, ticks: f32, keep: f32) f32 {
+    if (ticks <= 0) return prev;
+    const per_tick = frame_travel / ticks;
+    const a = 1.0 - std.math.pow(f32, keep, ticks);
+    return prev * (1.0 - a) + per_tick * a;
+}
+
 pub fn rubberBand(offset: f32, dim: f32) f32 {
     if (offset == 0 or dim <= 0) return 0;
     const mag = @abs(offset);
@@ -356,4 +412,72 @@ test "rubber-band inverse round-trips and the slope matches the curve" {
     const h: f32 = 1.0;
     const fd = (rubberBand(500 + h, dim) - rubberBand(500 - h, dim)) / (2 * h);
     try testing.expectApproxEqRel(fd, rubberBandSlope(500, dim), 0.005);
+}
+
+test "gesture: a flick travels the same distance at 60 Hz and at 120 Hz" {
+    // THE DEFECT THIS EXISTS TO CLOSE. The old glide advanced once per frame, so
+    // the same flick covered about twice the ground on a 120 Hz phone as on the
+    // 60 Hz it was tuned at — and the phone this is developed on is 120 Hz.
+    const friction: f32 = 0.966;
+    const v0: f32 = 40.0; // px per sixtieth
+
+    // Glide for one second at three refresh rates and compare total distance.
+    const rates = [_]struct { hz: f32, frames: u32 }{
+        .{ .hz = 60, .frames = 60 },
+        .{ .hz = 120, .frames = 120 },
+        .{ .hz = 144, .frames = 144 },
+    };
+    var distances: [rates.len]f32 = undefined;
+    for (rates, 0..) |r, i| {
+        const ticks = 60.0 / r.hz; // sixtieths per frame at this rate
+        var v = v0;
+        var total: f32 = 0;
+        var n: u32 = 0;
+        while (n < r.frames) : (n += 1) {
+            const st = stepFling(v, ticks, friction);
+            total += st.moved;
+            v = st.velocity;
+        }
+        distances[i] = total;
+    }
+    // Within a per-mille of each other — the residual is float slack in the
+    // sub-step remainder, not a difference a finger could feel. Before this the
+    // 120 Hz figure was very nearly DOUBLE the 60 Hz one.
+    for (distances[1..]) |d| {
+        const rel = @abs(d - distances[0]) / distances[0];
+        try testing.expect(rel < 0.001);
+    }
+
+    // And the velocity left over agrees too, which is what makes the handoff to
+    // the edge spring land in the same place.
+    var v60 = v0;
+    var v120 = v0;
+    var k: u32 = 0;
+    while (k < 60) : (k += 1) v60 = stepFling(v60, 1.0, friction).velocity;
+    k = 0;
+    while (k < 120) : (k += 1) v120 = stepFling(v120, 0.5, friction).velocity;
+    try testing.expect(@abs(v60 - v120) / v60 < 0.001);
+}
+
+test "gesture: the velocity sample is a rate, not a per-frame quantity" {
+    // A finger moving at a steady speed must read as the same velocity whatever
+    // the refresh rate. At 120 Hz each frame sees HALF the travel, so a running
+    // average over raw per-frame numbers converges to half the right answer —
+    // which then gets flick-boosted and flung half as far.
+    const keep: f32 = 0.6;
+    const speed_per_tick: f32 = 12.0; // px per sixtieth, steady
+
+    var v60: f32 = 0;
+    var n: u32 = 0;
+    while (n < 200) : (n += 1) v60 = sampleFlingVelocity(v60, speed_per_tick * 1.0, 1.0, keep);
+
+    var v120: f32 = 0;
+    n = 0;
+    while (n < 400) : (n += 1) v120 = sampleFlingVelocity(v120, speed_per_tick * 0.5, 0.5, keep);
+
+    try testing.expect(@abs(v60 - speed_per_tick) < 0.01);
+    try testing.expect(@abs(v120 - speed_per_tick) < 0.01);
+
+    // A zero-length frame cannot divide, and must not poison the average.
+    try testing.expectEqual(v60, sampleFlingVelocity(v60, 5.0, 0.0, keep));
 }
