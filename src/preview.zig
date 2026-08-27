@@ -138,6 +138,7 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     try writePpm(io, gpa, &fb, "/tmp/zat_preview.ppm");
     try previewGames(io, gpa, &engine);
+    try previewGameSurfaces(io, gpa, &engine);
 
     // PHONE proof (the locked mobile shape): the same real feed at the phone
     // design width — narrow single column, no rail/sidebar, the bottom tab
@@ -1139,6 +1140,59 @@ fn previewGames(io: std.Io, gpa: std.mem.Allocator, engine: *text.Engine) !void 
     try raster.paint(gpa, engine, dl.slice(), &fb, bg);
     try writePpm(io, gpa, &fb, "/tmp/zat_games.ppm");
     std.debug.print("wrote /tmp/zat_games.ppm (every game board, mid-game)\n", .{});
+}
+
+/// The two GAME SURFACES on a phone-shaped frame: the shelf you pick from and
+/// the full-screen board you play on. These are what a thumb actually touches,
+/// so they get looked at rather than assumed.
+fn previewGameSurfaces(io: std.Io, gpa: std.mem.Allocator, engine: *text.Engine) !void {
+    const PW: i32 = 430;
+    const PH: i32 = 932;
+    var fb = raster.Framebuffer{};
+    defer raster.deinit(gpa, &fb);
+    const bg: u32 = 0xFF000000;
+    try raster.resize(gpa, &fb, @intCast(PW), @intCast(PH), bg);
+    var dl: raster.DrawList = .empty;
+    defer dl.deinit(gpa);
+
+    const shots = [_]struct { name: []const u8, g: feed_view.ChatGame }{
+        .{ .name = "/tmp/zat_games_shelf.ppm", .g = .{ .picking = true } },
+        .{ .name = "/tmp/zat_games_chess.ppm", .g = .{
+            .open = true,
+            .reveal_t = 1,
+            .my_seat = .x,
+            .kind = .chess,
+            .from = 62,
+            .peer = "maya.zat4.com",
+            .tally = .{ .mine = 2, .theirs = 1, .draws = 1, .played = 4 },
+        } },
+        .{ .name = "/tmp/zat_games_darts.ppm", .g = .{
+            .open = true,
+            .reveal_t = 1,
+            .my_seat = .x,
+            .kind = .darts,
+            .aim_t = 0.22,
+            .peer = "maya.zat4.com",
+        } },
+    };
+    for (shots) |shot| {
+        var g = shot.g;
+        if (g.open) {
+            g.state = chat_games.init(g.kind);
+            // One move in, so the board is not showing an opening position.
+            if (chat_games.apply(g.state, .{ .game = g.kind, .cell = if (g.kind == .chess) 0x924 else 0 })) |ns|
+                if (g.kind == .chess) {
+                    g.state = ns;
+                    g.state.turn = .x;
+                };
+        }
+        @memset(fb.pixels, bg);
+        dl.len = 0;
+        _ = try feed_view.layoutChat(gpa, engine, PW, PH, &dl, null, feed_view.accent_house, 0, false, false, null, &.{}, &.{}, &.{}, &.{}, 0, "maya.zat4.com", "", .{}, false, false, "", "", .{}, .{}, &.{}, .{}, .{}, .{}, .confirmed, .connected, .{}, .{}, .{}, g);
+        try raster.paint(gpa, engine, dl.slice(), &fb, bg);
+        try writePpm(io, gpa, &fb, shot.name);
+        std.debug.print("wrote {s}\n", .{shot.name});
+    }
 }
 
 fn writePpm(io: std.Io, gpa: std.mem.Allocator, fb: *const raster.Framebuffer, path: []const u8) !void {

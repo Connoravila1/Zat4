@@ -10446,7 +10446,7 @@ fn drawGameStagedChip(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engin
 fn drawGamePicker(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, regions: ?*Regions, width: i32, height: i32, accent: u32, top_inset: i32) !void {
     try rect(gpa, dl, 0, 0, 0, 0, lens_socket.theme_keep_begin, 0);
     defer rect(gpa, dl, 0, 0, 0, 0, lens_socket.theme_keep_end, 0) catch {};
-    try rect(gpa, dl, 0, 0, width, height, 0xF210101296 & 0xFF101012 | 0xF2000000, 0);
+    try rect(gpa, dl, 0, 0, width, height, 0xFF101012, 0); // opaque: the shelf is a place, not a peek at the thread
     try emitRegion(gpa, regions, 0, 0, width, @intCast(height), 0, .game_close);
 
     const top = top_inset + 54;
@@ -10459,17 +10459,26 @@ fn drawGamePicker(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, r
     const pad: i32 = 20;
     const gap: i32 = 12;
     const tile_w = @divTrunc(width - 2 * pad - (cols - 1) * gap, cols);
-    const tile_h: i32 = tile_w + 44;
+    const grid_top = top + 44;
+    // EVERY game fits, always. The shelf does not scroll, so the tile height is
+    // taken from the room there actually is rather than from the tile width —
+    // sized the other way round, a tall phone silently dropped the last row and
+    // two of the eight games simply did not exist.
+    const n_rows: i32 = @intCast((chat_games.catalog.len + @as(usize, @intCast(cols)) - 1) / @as(usize, @intCast(cols)));
+    const room = height - grid_top - 20;
+    const tile_h = @max(96, @min(tile_w + 44, @divTrunc(room - (n_rows - 1) * gap, n_rows)));
+    const label_h: i32 = 44;
     var i: i32 = 0;
     for (chat_games.catalog) |g| {
         const col = @mod(i, cols);
         const row = @divTrunc(i, cols);
         const tx = pad + col * (tile_w + gap);
-        const ty = top + 44 + row * (tile_h + gap);
-        if (ty + tile_h > height) break; // the shelf never scrolls off the bottom
+        const ty = grid_top + row * (tile_h + gap);
         try cardBox(gpa, dl, tx, ty, tile_w, tile_h, 16, skinPanel(accent));
-        const bs = tile_w - 28;
-        try game_board.thumb(gpa, dl, e, chat_games.init(g), tx + 14, ty + 12, bs, accent);
+        const bs = @max(40, @min(tile_w - 28, tile_h - label_h - 14));
+        // The board is centred in what is left above the label, so a short tile
+        // and a wide one both look composed.
+        try game_board.thumb(gpa, dl, e, game_board.demoState(g), tx + @divTrunc(tile_w - bs, 2), ty + 10, bs, accent);
         _ = try str(gpa, dl, e, .semibold, tx + 14, ty + tile_h - 22, ink, 15, chat_games.name(g));
         _ = try str(gpa, dl, e, .regular, tx + 14, ty + tile_h - 7, softA(0xEDEAE0, 0x99), 12, chat_games.blurb(g));
         try emitRegion(gpa, regions, tx, ty, tile_w, @intCast(tile_h), @intFromEnum(g), .game_pick);
@@ -10525,11 +10534,21 @@ fn drawGameOverlay(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, 
     _ = try str(gpa, dl, e, .semibold, width - 44, 58 + dy, softA(0xEDEAE0, 0xCC), 22, "\u{00D7}");
     try emitRegion(gpa, regions, width - 60, 30 + dy, 60, 60, 0, .game_close);
 
-    // The board: a large square, centred, leaving room for the Send bar.
-    const board_max = @min(width - 56, height - 260);
-    const s = @max(180, board_max);
+    // THE PHONE LAYOUT. The action bar sits a thumb's reach from the bottom
+    // rather than floating wherever the board happens to end, the status line
+    // sits just above it, and the board takes the room between the header and
+    // that. Laid out top-down instead, a tall phone put the board up under the
+    // notch and left a third of the screen blank below the button you press
+    // every turn.
+    const bar_h: i32 = 52;
+    const promo_h: i32 = if (!finished and st.game == .chess and game.staged != game_board.no_stage and promotes(st, game.staged)) 50 else 0;
+    const head_bot = 108 + dy;
+    const bar_y = @max(head_bot + 200, height - 92 - bar_h);
+    const stat_y = bar_y - promo_h - 24;
+    const room = stat_y - 28 - head_bot;
+    const s = @max(180, @min(width - 56, room));
     const bx = @divTrunc(width - s, 2);
-    const by = 116 + dy;
+    const by = head_bot + @divTrunc(@max(0, room - s), 2);
 
     var targets: [128]game_board.Target = undefined;
     const hits = try game_board.full(gpa, dl, e, st, .{
@@ -10550,37 +10569,38 @@ fn drawGameOverlay(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, 
     var sbuf: [80]u8 = undefined;
     const stat = gameStatusLine(st, game.my_seat, &sbuf);
     const sw: i32 = @intCast(text.measure(e, .regular, stat, 15));
-    _ = try str(gpa, dl, e, .regular, @divTrunc(width - sw, 2), by + s + 40, softA(0xEDEAE0, 0xCC), 15, stat);
+    // The status belongs UNDER THE BOARD, not floating above the bar — it is a
+    // caption for the position, and on a tall phone the two are far apart.
+    _ = try str(gpa, dl, e, .regular, @divTrunc(width - sw, 2), @min(by + s + 40, stat_y), softA(0xEDEAE0, 0xCC), 15, stat);
 
     const bar_w = @min(width - 48, 420);
     const bar_x = @divTrunc(width - bar_w, 2);
-    var bar_y = by + s + 66;
 
     // A PROMOTION strip, only when the staged move actually promotes a pawn —
     // the one chess choice that is not a square.
-    if (!finished and st.game == .chess and game.staged != game_board.no_stage and promotes(st, game.staged)) {
+    if (promo_h > 0) {
         const names = [4][]const u8{ "Queen", "Rook", "Bishop", "Knight" };
         const codes = [4]u8{ 5, 4, 3, 2 };
         const cw = @divTrunc(bar_w, 4);
+        const py = bar_y - promo_h;
         for (names, codes, 0..) |nm, cd, i| {
             const px = bar_x + @as(i32, @intCast(i)) * cw;
             const on = (game.promo == cd) or (game.promo == 0 and cd == 5);
-            try rect(gpa, dl, px + 2, bar_y, cw - 4, 40, if (on) accent else skinPanel(accent), 12);
+            try rect(gpa, dl, px + 2, py, cw - 4, 40, if (on) accent else skinPanel(accent), 12);
             const lw: i32 = @intCast(text.measure(e, .semibold, nm, 13));
-            _ = try str(gpa, dl, e, .semibold, px + @divTrunc(cw - lw, 2), bar_y + 26, if (on) on_accent_ink else softA(0xEDEAE0, 0xAA), 13, nm);
-            try emitRegion(gpa, regions, px + 2, bar_y, cw - 4, 40, cd, .game_promo);
+            _ = try str(gpa, dl, e, .semibold, px + @divTrunc(cw - lw, 2), py + 26, if (on) on_accent_ink else softA(0xEDEAE0, 0xAA), 13, nm);
+            try emitRegion(gpa, regions, px + 2, py, cw - 4, 40, cd, .game_promo);
         }
-        bar_y += 50;
     }
 
     // The action bar. A finished board offers a REMATCH instead of a move — the
     // thread outlives the game, so the board must too.
     if (finished) {
-        try rect(gpa, dl, bar_x, bar_y, bar_w, 52, accent, 26);
+        try rect(gpa, dl, bar_x, bar_y, bar_w, bar_h, accent, 26);
         const lbl = "New game";
         const lw: i32 = @intCast(text.measure(e, .semibold, lbl, 16));
         _ = try str(gpa, dl, e, .semibold, bar_x + @divTrunc(bar_w - lw, 2), bar_y + 33, on_accent_ink, 16, lbl);
-        try emitRegion(gpa, regions, bar_x, bar_y, bar_w, 52, 0, .game_rematch);
+        try emitRegion(gpa, regions, bar_x, bar_y, bar_w, @intCast(bar_h), 0, .game_rematch);
         return;
     }
 
@@ -10592,7 +10612,7 @@ fn drawGameOverlay(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, 
     const releasing = skill and my_turn and !can_send;
     const armed = can_send or releasing;
     const send_c = if (armed) accent else skinPanel(accent);
-    try rect(gpa, dl, bar_x, bar_y, bar_w, 52, send_c, 26);
+    try rect(gpa, dl, bar_x, bar_y, bar_w, bar_h, send_c, 26);
     const lbl = if (releasing)
         (if (st.game == .darts) "Throw" else "Loose")
     else if (can_send)
@@ -10609,7 +10629,7 @@ fn drawGameOverlay(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, 
     const lc = if (armed) on_accent_ink else softA(0xEDEAE0, 0x88);
     const lw: i32 = @intCast(text.measure(e, .semibold, lbl, 16));
     _ = try str(gpa, dl, e, .semibold, bar_x + @divTrunc(bar_w - lw, 2), bar_y + 33, lc, 16, lbl);
-    if (armed) try emitRegion(gpa, regions, bar_x, bar_y, bar_w, 52, 0, if (releasing) .game_cell else .game_send);
+    if (armed) try emitRegion(gpa, regions, bar_x, bar_y, bar_w, @intCast(bar_h), 0, if (releasing) .game_cell else .game_send);
 }
 
 /// Would this staged chess move promote a pawn? Only then is the promotion strip

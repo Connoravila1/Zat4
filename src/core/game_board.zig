@@ -443,7 +443,10 @@ fn drawMancala(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, st: 
 // --- dots & boxes ----------------------------------------------------------
 
 fn drawDots(gpa: Allocator, dl: *raster.DrawList, st: State, v: View, out: []Target, n: *usize) !void {
-    const step = @divTrunc(v.size, dots.grid);
+    // FIVE dots span the box, not four: the grid is `grid` boxes wide, so the
+    // dots at both ends need the extra step. Sized as `size / grid` the whole
+    // lattice ran an eighth of its width past the frame.
+    const step = @divTrunc(v.size, dots.grid + 1);
     const pad = @divTrunc(step, 2);
     const ox = v.x + pad;
     const oy = v.y + pad;
@@ -784,12 +787,17 @@ fn drawArchery(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, st: 
 }
 
 fn drawDarts(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, st: State, v: View, out: []Target, n: *usize) !void {
-    const r_px = @divTrunc(v.size, 2);
-    const cx = v.x + r_px;
-    const cy = v.y + r_px;
+    // The sector numbers ride OUTSIDE the wire ring, so the board proper is
+    // inset by enough to keep them in the box — at thumbnail size they were
+    // spilling over the card and onto its label.
+    const num_px: u16 = @intCast(std.math.clamp(@divTrunc(v.size, 26), 8, 14));
+    const num_pad = @max(10, @divTrunc(v.size, 14));
+    const r_px = @divTrunc(v.size, 2) - num_pad;
+    const cx = v.x + @divTrunc(v.size, 2);
+    const cy = v.y + @divTrunc(v.size, 2);
     const rf = @as(f32, @floatFromInt(r_px));
 
-    try disc(gpa, dl, cx, cy, r_px + 8, 0xFF14100C);
+    try disc(gpa, dl, cx, cy, r_px + @max(3, @divTrunc(r_px, 24)), 0xFF14100C);
     // Twenty sectors, each a fan of triangles, alternating cream and black, with
     // the treble and double rings picked out in red and green.
     for (0..20) |i| {
@@ -820,15 +828,17 @@ fn drawDarts(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, st: St
         const am = @as(f32, @floatFromInt(i)) * 18.0 * std.math.pi / 180.0;
         var buf: [4]u8 = undefined;
         const txt = std.fmt.bufPrint(&buf, "{d}", .{darts.sectors[i]}) catch "";
+        const nw = labelWidth(e, .semibold, num_px, txt);
+        const ring_r = rf + @as(f32, @floatFromInt(@divTrunc(num_pad * 2, 3)));
         try label(
             gpa,
             dl,
             e,
             .semibold,
-            cx + fxi(@sin(am) * (rf + 14.0)) - 7,
-            cy - fxi(@cos(am) * (rf + 14.0)) + 5,
+            cx + fxi(@sin(am) * ring_r) - @divTrunc(nw, 2),
+            cy - fxi(@cos(am) * ring_r) + @divTrunc(num_px, 3),
             alpha(chalk, 0xCC),
-            13,
+            num_px,
             txt,
         );
     }
@@ -862,6 +872,29 @@ pub fn thumb(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, st: St
         .accent = accent,
         .interactive = false,
     }, &scratch);
+}
+
+/// A SHELF POSITION — a few moves played into a fresh board, so the tile you
+/// pick from shows a game rather than an empty grid. Three of the eight open
+/// blank, and a blank tic-tac-toe grid beside a full chess set reads as the
+/// broken one rather than the simple one.
+pub fn demoState(g: Game) State {
+    var st = games.init(g);
+    const seeds: []const u16 = switch (g) {
+        .tictactoe => &.{ 4, 0, 8, 2, 6 },
+        .connect4 => &.{ 3, 3, 4, 2, 5, 4, 2 },
+        .dots => &.{ 0, 20, 4, 21, 1, 24, 25, 5 },
+        .mancala => &.{ 2, 8, 1, 10, 4 },
+        .checkers => &.{ checkers.move(45, 36), checkers.move(18, 27), checkers.move(36, 29) },
+        .chess => &.{ chess.move(52, 36, 0), chess.move(12, 28, 0), chess.move(62, 45, 0), chess.move(1, 18, 0) },
+        .archery => &.{ archery.shot(134, 122), archery.shot(96, 150), archery.shot(126, 131) },
+        .darts => &.{ releaseMove(.darts, 0.11), releaseMove(.darts, 0.42) },
+        else => &.{},
+    };
+    for (seeds) |m| {
+        if (games.apply(st, .{ .game = g, .cell = m })) |ns| st = ns;
+    }
+    return st;
 }
 
 // ---------------------------------------------------------------------------
