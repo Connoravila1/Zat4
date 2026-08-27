@@ -32,6 +32,12 @@ pub const ListRow = struct {
     /// mute the person cannot trust.
     pinned: bool = false,
     muted: bool = false,
+    /// GROUPS: this row is a group, so the renderer can draw it as one (a stacked
+    /// avatar, a member count) rather than as a person.
+    group: bool = false,
+    /// How many participants, for a group. Zero for a direct chat — which has a
+    /// counterparty, not a membership.
+    members: u16 = 0,
 
     comptime {
         // Budget 56: 3 slices (48) + u32 (4) = 52, padded to pointer
@@ -39,7 +45,19 @@ pub const ListRow = struct {
         // A7: still 56 — the two flags land in padding the three slices already
         // owned. A pin and a mute the list does not SHOW are ones a person cannot
         // trust, so they have to reach the view; happily they cost nothing to carry.
-        assert(@sizeOf(ListRow) == 56);
+        // A7: STILL 56 with `group` + `members` — the same padding had room. A
+        // group that the list draws as a person is a group nobody can tell apart
+        // from a DM with an odd name.
+        // A7.1 — budget raised 56 → 64 for GROUPS. `group` was free (it landed in
+        // padding the flags already owned); `members` was not, and the guard is
+        // what made me find that out rather than assume it.
+        //
+        // Paid: a group the list cannot COUNT is a group the list draws exactly
+        // like a direct chat with an unusual name. The alternative is the renderer
+        // reaching back into the store for it, which puts store lookups inside the
+        // draw and undoes the reason this row exists. List rows are built per
+        // frame for the VISIBLE conversations — a screenful.
+        assert(@sizeOf(ListRow) == 64);
     }
 };
 
@@ -75,6 +93,13 @@ pub const BubbleRow = struct {
     /// A tombstone: the text is gone and the bubble says so. Rendered rather than
     /// removed — removing the row would renumber every index above it.
     deleted: bool = false,
+    /// GROUPS: who said it, drawn above the FIRST bubble of their run. Empty for
+    /// our own and for a direct chat, where the two sides are the whole cast and
+    /// naming them on every run would be noise.
+    sender: []const u8 = "",
+    /// The first bubble of a same-sender run — where the name goes. The mirror of
+    /// `tail`, which is where the speech tail goes.
+    head: bool = false,
     /// The words changed after they were sent. The bubble SAYS so — a message that
     /// was quietly rewritten after you read it is how somebody edits the past.
     edited: bool = false,
@@ -107,7 +132,20 @@ pub const BubbleRow = struct {
         // message it is acting on, and the alternative — re-deriving the mapping in
         // the shell from a parallel query — is the kind of implicit coupling that
         // breaks the first time the two orderings disagree.
-        assert(@sizeOf(BubbleRow) == 88); // read_mark landed in existing padding
+        // A7.1 — budget raised 88 → 112 for GROUPS. Neither `sender` (a slice) nor
+        // `head` fit the existing padding; I guessed 104 and the guard corrected
+        // me, which is the entire point of an exact assertion.
+        //
+        // Paid deliberately, and the cheaper shapes are worse. A seat NUMBER
+        // instead of the label would be 2 bytes, but then the renderer holds a
+        // store index (A5) and has to resolve it per row anyway. Resolving the
+        // name only for groups would leave the field empty in a DM — and the run
+        // rule below COMPARES it, so a sometimes-filled field is a comparison
+        // that is only sometimes right.
+        //
+        // Thread rows are built per frame for the VISIBLE bubbles only (a
+        // screenful, not a history), so this is tens of rows, not thousands.
+        assert(@sizeOf(BubbleRow) == 112);
     }
 };
 
@@ -246,6 +284,9 @@ pub fn buildList(
         const did = chat.sliceSpan(store, convs.items(.did)[ci]);
         const last = convs.items(.last_activity)[ci];
 
+        const is_group = chat.isGroup(store, conv);
+        const title = chat.groupTitle(store, conv);
+
         var preview: []const u8 = "";
         if (newest[ci] != none) {
             const mi = newest[ci];
@@ -255,20 +296,44 @@ pub fn buildList(
                 body = try paymentLine(arena, store, @enumFromInt(mi), mkind, body);
             preview = if (store.mine.isSet(mi))
                 try std.fmt.allocPrint(arena, "You: {s}", .{body})
-            else
-                body;
+            else if (is_group) blk: {
+                // IN A GROUP, "who" is half the line. A preview that reads only
+                // "on my way" tells you a group is awake and nothing else — and
+                // the row is often all somebody reads before deciding to open it.
+                const who = senderLabel(store, @enumFromInt(mi));
+                break :blk if (who.len > 0)
+                    try std.fmt.allocPrint(arena, "{s}: {s}", .{ who, body })
+                else
+                    body;
+            } else body;
         }
 
         row.* = .{
-            .name = if (handle.len > 0) handle else did,
+            // A group is named by its title. Falling back to the counterparty
+            // would name it after nobody, since a group has none.
+            .name = if (is_group)
+                (if (title.len > 0) title else "Group")
+            else if (handle.len > 0) handle else did,
             .preview = preview,
             .age = if (last > 0) try ageStr(arena, now, last) else "",
             .unread = convs.items(.unread)[ci],
             .pinned = convs.items(.pinned)[ci],
             .muted = convs.items(.muted)[ci],
+            .group = is_group,
+            .members = if (is_group) chat.memberCount(store, conv) else 0,
         };
     }
     return out;
+}
+
+/// WHO SAID IT, as a person reads it: the handle when it is known, else the DID,
+/// and "" for our own (the bubble's side already says so). One place, because the
+/// list preview and the thread's sender line must never disagree about somebody's
+/// name.
+fn senderLabel(store: *const chat.Store, msg: chat.MsgIndex) []const u8 {
+    const handle = chat.senderHandle(store, msg);
+    if (handle.len > 0) return handle;
+    return chat.senderDid(store, msg);
 }
 
 /// One conversation's bubbles, oldest first, with time dividers computed
@@ -364,6 +429,12 @@ pub fn buildThread(
             .body = if (gone) "Message deleted" else chat.sliceSpan(store, store.msgs.items(.text)[mi]),
             .age = try ageStr(arena, now, at),
             .mine = chat.isMine(store, msg),
+            // Resolved for every conversation, not only groups: the run rule
+            // below compares it, and a field that is only sometimes filled is a
+            // field the comparison is only sometimes right about. In a DM it is
+            // the one counterparty on every row, which groups them exactly as the
+            // `mine` bit used to.
+            .sender = senderLabel(store, msg),
             .stamp = i == 0 or at - prev_at >= stamp_gap,
             .kind = kind,
             .pay = pay,
@@ -417,10 +488,31 @@ pub fn buildThread(
         }
     }
 
-    // Close each same-sender run: the tail goes on its last bubble (a sender
-    // change, a time-divider gap, or the end of the thread ends a run).
+    // Close each same-sender run: the tail goes on its last bubble, the name on
+    // its first (a sender change, a time-divider gap, or either end of the thread
+    // closes a run).
+    //
+    // "Same sender" USED TO MEAN the same `mine` bit, which is exactly right while
+    // a conversation has two sides and quietly wrong the moment it has three: in a
+    // group, everybody else shares `mine == false`, so two people talking in turn
+    // would merge into one run and wear one tail and one name. The run is keyed on
+    // the SEAT now, which is the same answer in a DM (one counterparty, one seat)
+    // and the right one in a group.
+    const in_group = chat.isGroup(store, conv);
     for (out, 0..) |*row, i| {
-        row.tail = i + 1 == out.len or out[i + 1].mine != row.mine or out[i + 1].stamp;
+        const same_next = i + 1 < out.len and
+            out[i + 1].mine == row.mine and
+            std.mem.eql(u8, out[i + 1].sender, row.sender) and
+            !out[i + 1].stamp;
+        row.tail = !same_next;
+        const same_prev = i > 0 and
+            out[i - 1].mine == row.mine and
+            std.mem.eql(u8, out[i - 1].sender, row.sender) and
+            !row.stamp;
+        // Only a group ever draws the name: in a DM the two sides are the whole
+        // cast, and labelling every run would be noise about something the
+        // bubble's side already says.
+        row.head = in_group and !row.mine and !same_prev;
     }
     return .{ .rows = out, .cards = cards[0..next_card], .games = games[0..next_game] };
 }
@@ -645,4 +737,101 @@ test "buildThread: an invite opens an empty, live board and seats us as X" {
     try std.testing.expectEqual(chat_games.Seat.x, card.my_seat); // we invited → X
     try std.testing.expectEqual(@as(u8, 0), card.state.moves); // empty board
     try std.testing.expectEqual(chat_games.Seat.x, card.state.turn); // X to move (us)
+}
+
+test "groups: the list names a group by its title and says how many are in it" {
+    const gpa = std.testing.allocator;
+    var store: chat.Store = .{};
+    defer chat.deinitStore(gpa, &store);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const g = try chat.startGroup(
+        gpa,
+        &store,
+        "Weekend",
+        &.{ "did:plc:aaa", "did:plc:bbb" },
+        &.{ "maya.zat4.com", "bob.zat4.com" },
+    );
+    const m = try chat.appendMessage(gpa, &store, g, .text, "on my way", 1000, false);
+    chat.setSenderSeat(&store, m, 1);
+
+    const rows = try buildList(arena, &store, 1060);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings("Weekend", rows[0].name);
+    try std.testing.expect(rows[0].group);
+    try std.testing.expectEqual(@as(u16, 2), rows[0].members);
+    // IN A GROUP, "who" is half the line: "on my way" alone says a group is
+    // awake and nothing else, and the row is often all somebody reads.
+    try std.testing.expectEqualStrings("bob.zat4.com: on my way", rows[0].preview);
+}
+
+test "groups: two people talking in turn are two runs, not one" {
+    // THE BUG THE SEAT EXISTS TO PREVENT. Runs used to be keyed on the `mine`
+    // bit, which is exactly right with two sides and quietly wrong with three:
+    // everybody else shares `mine == false`, so Bob and Carol would merge into a
+    // single run wearing one tail and one name.
+    const gpa = std.testing.allocator;
+    var store: chat.Store = .{};
+    defer chat.deinitStore(gpa, &store);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const g = try chat.startGroup(
+        gpa,
+        &store,
+        "Weekend",
+        &.{ "did:plc:bbb", "did:plc:ccc" },
+        &.{ "bob.zat4.com", "carol.zat4.com" },
+    );
+    const m0 = try chat.appendMessage(gpa, &store, g, .text, "bob one", 1000, false);
+    chat.setSenderSeat(&store, m0, 0);
+    const m1 = try chat.appendMessage(gpa, &store, g, .text, "bob two", 1001, false);
+    chat.setSenderSeat(&store, m1, 0);
+    const m2 = try chat.appendMessage(gpa, &store, g, .text, "carol", 1002, false);
+    chat.setSenderSeat(&store, m2, 1);
+
+    const th = try buildThread(arena, &store, g, 1100);
+    try std.testing.expectEqual(@as(usize, 3), th.rows.len);
+
+    // Bob's two bubbles are ONE run: a name on the first, a tail on the last.
+    try std.testing.expect(th.rows[0].head);
+    try std.testing.expect(!th.rows[0].tail);
+    try std.testing.expect(!th.rows[1].head);
+    try std.testing.expect(th.rows[1].tail);
+    try std.testing.expectEqualStrings("bob.zat4.com", th.rows[0].sender);
+
+    // Carol starts her own — which the old rule would have swallowed into Bob's.
+    try std.testing.expect(th.rows[2].head);
+    try std.testing.expect(th.rows[2].tail);
+    try std.testing.expectEqualStrings("carol.zat4.com", th.rows[2].sender);
+}
+
+test "groups: a direct chat draws no sender names — the sides are the whole cast" {
+    const gpa = std.testing.allocator;
+    var store: chat.Store = .{};
+    defer chat.deinitStore(gpa, &store);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const d = try chat.openConversation(gpa, &store, "did:plc:aaa", "maya.zat4.com");
+    _ = try chat.appendMessage(gpa, &store, d, .text, "hello", 1000, false);
+    _ = try chat.appendMessage(gpa, &store, d, .text, "hi", 1001, true);
+
+    const th = try buildThread(arena, &store, d, 1100);
+    for (th.rows) |row| try std.testing.expect(!row.head);
+
+    // …and the run rule still separates the two sides exactly as it always did:
+    // one counterparty means one seat, so the seat comparison and the old `mine`
+    // comparison agree on every row.
+    try std.testing.expect(th.rows[0].tail);
+    try std.testing.expect(th.rows[1].tail);
+
+    const rows = try buildList(arena, &store, 1100);
+    try std.testing.expect(!rows[0].group);
+    try std.testing.expectEqualStrings("maya.zat4.com", rows[0].name);
+    try std.testing.expectEqualStrings("You: hi", rows[0].preview);
 }
