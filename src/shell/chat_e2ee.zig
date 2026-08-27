@@ -1547,6 +1547,98 @@ fn depositAll(
     if (delivered == 0) return last orelse error.RelayDown;
 }
 
+/// HOW A GROUP SEND WENT. Not an error union, because "three of five got it" is
+/// an ordinary outcome for a fan-out and the person is entitled to be told it
+/// rather than shown a failure or a success that isn't one (E4).
+/// A7.2: cold, one per send.
+pub const GroupSend = struct {
+    /// Members whose devices took the message.
+    delivered: u16,
+    /// Members it was addressed to (ourselves excluded — we do not post to our
+    /// own mailbox; our copy is the local echo).
+    addressed: u16,
+
+    pub fn complete(g: GroupSend) bool {
+        return g.addressed > 0 and g.delivered == g.addressed;
+    }
+};
+
+/// SEND TO A GROUP: one plaintext, encrypted once per member, over the pairwise
+/// sessions that already exist.
+///
+/// This is the whole of the fan-out, and it is deliberately not clever. There is
+/// no group ratchet and no group key — a group is N−1 of the ordinary two-member
+/// sessions this module has always had, and every property they have (and every
+/// one they lack) is inherited unchanged.
+///
+/// `inner` is the payload a direct message would carry: `[kind][…]`. It is
+/// wrapped ONCE, so every member receives byte-identical ciphertext input and
+/// nothing about the group can differ per recipient.
+///
+/// Our own DID is skipped: a message to a group is not a message to yourself, and
+/// our copy of it is the local echo the sender already sees.
+pub fn sendGroup(
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    st: *State,
+    link: *chat_relay.ChatRelay,
+    group_id: [chat.group_id_len]u8,
+    member_dids: []const []const u8,
+    inner: []const u8,
+) SendError!GroupSend {
+    var frame_buf: [1024]u8 = undefined;
+    const framed = blk: {
+        var body: [1024]u8 = undefined;
+        if (1 + chat.group_id_len + inner.len > body.len) return error.TooLong;
+        body[0] = chat.kind_group_msg_wire;
+        const wrapped = chat.writeGroupFrame(body[1..], group_id, inner) catch return error.TooLong;
+        const total = 1 + wrapped.len;
+        @memcpy(frame_buf[0..total], body[0..total]);
+        break :blk frame_buf[0..total];
+    };
+    defer std.crypto.secureZero(u8, framed);
+
+    var out: GroupSend = .{ .delivered = 0, .addressed = 0 };
+    for (member_dids) |did| {
+        if (std.mem.eql(u8, did, st.my_did)) continue;
+        out.addressed +|= 1;
+        // ONE MEMBER BEING UNREACHABLE IS NOT THE SEND FAILING. Their phone is
+        // off, or their session was never opened; the other four still get it,
+        // and the count above is what says so.
+        depositAll(gpa, io, environ, st, link, did, framed) catch continue;
+        out.delivered +|= 1;
+    }
+    return out;
+}
+
+/// Tell every member who is in a group and what it is called. Sent on creation
+/// and whenever the roster or the title changes.
+pub fn sendGroupMeta(
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    st: *State,
+    link: *chat_relay.ChatRelay,
+    group_id: [chat.group_id_len]u8,
+    title: []const u8,
+    member_dids: []const []const u8,
+) SendError!GroupSend {
+    var body: [1024]u8 = undefined;
+    body[0] = chat.kind_group_meta_wire;
+    const written = chat.writeGroupMeta(body[1..], group_id, title, member_dids) catch return error.TooLong;
+    const framed = body[0 .. 1 + written.len];
+
+    var out: GroupSend = .{ .delivered = 0, .addressed = 0 };
+    for (member_dids) |did| {
+        if (std.mem.eql(u8, did, st.my_did)) continue;
+        out.addressed +|= 1;
+        depositAll(gpa, io, environ, st, link, did, framed) catch continue;
+        out.delivered +|= 1;
+    }
+    return out;
+}
+
 /// Encrypt one message ([kind][text]) into the peer's mailbox. Payment
 /// kinds carry a structured frame and go through `sendPayment`.
 pub fn send(
@@ -1817,6 +1909,18 @@ pub const Incoming = union(enum) {
     /// A piece of the backlog, from our own device. Adopted only when every piece
     /// has arrived — a half a history is not a history.
     history_chunk: struct { seq: u16, total: u16, bytes: []u8 },
+    /// A GROUP MESSAGE, arriving over the pairwise session with ONE member.
+    /// `inner` is exactly what the payload would have been in a direct chat, so
+    /// the shell files it against the group and decodes it the same way.
+    ///
+    /// `peer_did` is who physically sent it — which in a group is also WHO SAID
+    /// IT, and the store needs that: "not mine" names nobody once there are three
+    /// of you.
+    group_message: struct { peer_did: []u8, group_id: [chat.group_id_len]u8, inner: []u8 },
+    /// A GROUP ROSTER: who is in it and what it is called. The first one for an
+    /// unknown id is an invitation; every later one is an update, and the shell
+    /// believes it only from somebody already in the group.
+    group_meta: struct { peer_did: []u8, group_id: [chat.group_id_len]u8, title: []u8, dids: []u8 },
     /// ANOTHER DEVICE OF OURS handed us the list of people we talk to (slice 3):
     /// newline-joined DIDs, gpa-owned. Only ever produced for a session with our
     /// OWN did — a roster from anyone else is refused before it gets here.
@@ -1884,6 +1988,15 @@ pub fn freeIncoming(gpa: Allocator, inc: Incoming) void {
         .restarted => |s| gpa.free(s.peer_did),
         .typing => |t| gpa.free(t.peer_did),
         .roster => |r| gpa.free(r.dids),
+        .group_message => |g| {
+            gpa.free(g.peer_did);
+            gpa.free(g.inner);
+        },
+        .group_meta => |g| {
+            gpa.free(g.peer_did);
+            gpa.free(g.title);
+            gpa.free(g.dids);
+        },
         .unsend => |u| {
             gpa.free(u.peer_did);
             gpa.free(u.conv_did);
@@ -2195,6 +2308,40 @@ pub fn onBucket(
                         if (!std.mem.eql(u8, st.peer_dids.items[idx], st.my_did)) return null;
                         if (data.len < 2) return null;
                         return .{ .roster = .{ .dids = try gpa.dupe(u8, data[1..]) } };
+                    }
+                    // A GROUP MESSAGE. Unwrap the id and hand the inner bytes on;
+                    // the sender is whoever this pairwise session belongs to,
+                    // which in a group is also who SAID it.
+                    if (data[0] == chat.kind_group_msg_wire) {
+                        const gf = chat.parseGroupFrame(data[1..]) catch return null;
+                        const inner = try gpa.dupe(u8, gf.inner);
+                        errdefer gpa.free(inner);
+                        return .{ .group_message = .{
+                            .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]),
+                            .group_id = gf.id,
+                            .inner = inner,
+                        } };
+                    }
+                    // A GROUP ROSTER. Re-flattened to newline-joined DIDs, the
+                    // same shape the device roster already travels in, so the
+                    // shell has one way of reading a list of people rather than
+                    // two.
+                    if (data[0] == chat.kind_group_meta_wire) {
+                        var meta = chat.parseGroupMeta(data[1..]) catch return null;
+                        const title = try gpa.dupe(u8, meta.title);
+                        errdefer gpa.free(title);
+                        var joined: std.ArrayListUnmanaged(u8) = .empty;
+                        errdefer joined.deinit(gpa);
+                        while (meta.next()) |did| {
+                            if (joined.items.len > 0) try joined.append(gpa, '\n');
+                            try joined.appendSlice(gpa, did);
+                        }
+                        return .{ .group_meta = .{
+                            .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]),
+                            .group_id = meta.id,
+                            .title = title,
+                            .dids = try joined.toOwnedSlice(gpa),
+                        } };
                     }
                     // A READ RECEIPT.
                     if (data[0] == chat.kind_read_wire) {

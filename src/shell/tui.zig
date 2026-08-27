@@ -2543,6 +2543,42 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                     if (std.mem.eql(u8, msg.peer_did, rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]))
                                         rs.gchat_typing_deadline = 0;
                                 },
+                                // A GROUP MESSAGE, arriving over the pairwise
+                                // session with ONE member. It is filed against the
+                                // GROUP, not against the DM it physically travelled
+                                // in — that redirection is the entire reason the
+                                // frame carries an id.
+                                .group_message => |g| {
+                                    if (chat_core.conversationByGroupId(&rs.gchat_store, g.group_id)) |conv| {
+                                        // WHO SAID IT. A seat, because "not mine"
+                                        // names nobody once there are three of you.
+                                        // Somebody not in our roster is not in the
+                                        // group as far as this device knows, and we
+                                        // do not file words under a name we cannot
+                                        // account for.
+                                        if (chat_core.seatOf(&rs.gchat_store, conv, g.peer_did)) |seat| {
+                                            const kind = if (g.inner.len > 0) chat_core.parseKind(g.inner[0]) catch null else null;
+                                            if (kind) |k| {
+                                                const body = g.inner[1..];
+                                                if (chat_core.appendMessage(gpa, &rs.gchat_store, conv, k, body, now, false) catch null) |mi| {
+                                                    chat_core.setSenderSeat(&rs.gchat_store, mi, seat);
+                                                    if (rs.sfxp) |p| sfx_player.play(p, .msg_receive);
+                                                }
+                                                chat_mutated = true;
+                                            }
+                                        } else chatLog("[chat] group message from a non-member, dropped", .{});
+                                    } else chatLog("[chat] group message for an unknown group, dropped", .{});
+                                },
+                                // A GROUP ROSTER. The first one for an id we do not
+                                // know is an INVITATION; a later one is an update,
+                                // and an update is believed only from somebody
+                                // already in the group — the device directory's rule,
+                                // because a group has no cryptographic membership to
+                                // enforce it with.
+                                .group_meta => |g| {
+                                    chatGroupMeta(rs, gpa, g.group_id, g.title, g.dids, g.peer_did, st.my_did);
+                                    chat_mutated = true;
+                                },
                                 // A CALL signaling frame (offer/answer/ice/hangup):
                                 // the controller auto-answers an offer / starts the
                                 // session on an answer / tears down on a hangup.
@@ -11598,6 +11634,69 @@ fn deviceAge(arena: Allocator, at: i64) []const u8 {
 
 /// Every frame Messages is up: keep the device gate's facts current, and drain any
 /// worker that has landed. All of the network is on the worker; none of it is here.
+/// A GROUP ROSTER ARRIVED. Create the group, or update the one we have.
+///
+/// THE TRUST RULE, and it is the device directory's: an update is believed only
+/// from somebody already in the group. There is no cryptographic membership in
+/// the pairwise model — a group is N−1 ordinary sessions — so agreement is an
+/// application fact, and the honest thing is to enforce it here in the open
+/// rather than imply the maths is doing it.
+///
+/// The FIRST roster for an unknown id is an invitation, and an invitation can
+/// come from anybody. That is not a hole this function should plug: it is exactly
+/// the same exposure as a first message from a stranger, and it belongs behind
+/// the same guardrail rather than a second, different one invented here.
+fn chatGroupMeta(
+    rs: *RunState,
+    gpa: Allocator,
+    group_id: [chat_core.group_id_len]u8,
+    title: []const u8,
+    dids_joined: []const u8,
+    from_did: []const u8,
+    my_did: []const u8,
+) void {
+    const existing = chat_core.conversationByGroupId(&rs.gchat_store, group_id);
+    if (existing) |conv| {
+        if (chat_core.seatOf(&rs.gchat_store, conv, from_did) == null) {
+            chatLog("[chat] group roster from a non-member, ignored", .{});
+            return;
+        }
+        // ADD whoever is new. Nobody is removed here: a seat carries message
+        // attribution, and dropping one would re-point every word above it. A
+        // member who is gone is MARKED gone, which is a later slice — until then
+        // the roster only ever grows, which is the safe direction.
+        var it = std.mem.splitScalar(u8, dids_joined, '\n');
+        while (it.next()) |did| {
+            if (did.len == 0) continue;
+            if (chat_core.seatOf(&rs.gchat_store, conv, did) != null) continue;
+            _ = chat_core.addMember(gpa, &rs.gchat_store, conv, did, "") catch break;
+        }
+        return;
+    }
+
+    // AN INVITATION. Seat everybody the roster names except ourselves — a group's
+    // members are the OTHER people in it, exactly as a direct chat's one member is
+    // the counterparty and never you.
+    var dids: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer dids.deinit(gpa);
+    var it = std.mem.splitScalar(u8, dids_joined, '\n');
+    while (it.next()) |did| {
+        if (did.len == 0) continue;
+        if (std.mem.eql(u8, did, my_did)) continue;
+        dids.append(gpa, did) catch return;
+    }
+    if (dids.items.len == 0) return; // a group of nobody is not a group
+
+    const handles = gpa.alloc([]const u8, dids.items.len) catch return;
+    defer gpa.free(handles);
+    @memset(handles, "");
+    _ = chat_core.startGroup(gpa, &rs.gchat_store, group_id, title, dids.items, handles) catch |err| {
+        chatLog("[chat] could not open the group: {s}", .{@errorName(err)});
+        return;
+    };
+    chatLog("[chat] joined group \"{s}\" ({d} members)", .{ title, dids.items.len });
+}
+
 fn chatDevicesStep(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, session: *auth.Session) void {
     const job = &rs.gdev_job;
 
