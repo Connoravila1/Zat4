@@ -68,6 +68,14 @@ pub const Kind = enum(u8) {
     /// as the payment card's state is derived from its row. The move byte itself
     /// lives in `ChatMsg.game`; the text span is empty.
     game_move = 12,
+    /// A PHOTO. The bytes do not live on the message — they live in their own
+    /// sparse row (`Attachment`), because most messages have none and a column
+    /// nobody fills is a column everybody pays for (A6). The text span is the
+    /// caption, empty when there is none.
+    ///
+    /// 24 is past the payment block (16..23) and outside the reserved control
+    /// range; the collision table proves it free.
+    image = 24,
 };
 
 /// True for the kinds that carry a game move (there is one today; the shape
@@ -361,6 +369,7 @@ const wire_kinds = [_]u8{
     kind_group_msg_wire,
     kind_group_meta_wire,
     kind_read_wire,
+    @intFromEnum(Kind.image),
     @intFromEnum(Kind.payment_request),
     @intFromEnum(Kind.payment_sent),
     kind_pay_settled_wire,
@@ -387,6 +396,7 @@ pub fn parseKind(byte: u8) KindError!Kind {
         0 => .text,
         1 => .system,
         12 => .game_move,
+        24 => .image,
         16 => .payment_request,
         17 => .payment_sent,
         else => error.UnknownKind,
@@ -572,6 +582,48 @@ pub const Conversation = struct {
 // of band in `SettlementRef` (A6). ZAT_CHAT_ROADMAP PART II §8.
 // ---------------------------------------------------------------------------
 
+/// Index into `Store.attachments`.
+pub const AttachIndex = enum(u32) { _ };
+
+/// What kind of picture it is. The DECODER is told by this rather than sniffing
+/// the bytes: a decoder that guesses from content is a decoder somebody feeds
+/// something else. Values are FROZEN — the history codec persists this byte.
+pub const Mime = enum(u8) { jpeg = 0, png = 1, webp = 2 };
+
+/// A PICTURE ON A MESSAGE. Sparse by nature — most messages have none — so it is
+/// its own row rather than a column on every message, exactly as reactions and
+/// payment cards are (A3/A6: you do not pay for a thing on the messages that do
+/// not have it).
+///
+/// The bytes live in `Store.blobs`, NOT in `string_bytes`: that blob's invariant
+/// is NUL-terminated strings with no interior NUL, and an image respects neither.
+pub const Attachment = struct {
+    /// The message this belongs to (a store index; it never leaves this module).
+    msg: u32,
+    /// Where the encoded bytes are, in `Store.blobs`.
+    offset: u32,
+    len: u32,
+    /// Pixel dimensions, so the thread can lay the bubble out BEFORE decoding —
+    /// a picture that resizes the moment it decodes makes the whole thread jump.
+    width: u16,
+    height: u16,
+    mime: Mime,
+
+    comptime {
+        // Budget: 4 + 4 + 4 + 2 + 2 + 1 = 17, padded to 20. Held in the dozens
+        // and walked per thread build, so the guard stays (A7).
+        assert(@sizeOf(Attachment) == 20);
+    }
+};
+
+/// The largest picture that may ride the chat transport, encoded.
+///
+/// Not a preference: every byte is chunked, encrypted per recipient and fanned
+/// out to every device of every member, so a 20 MB photo in a group of five is
+/// a hundred megabytes across the relay. Downscaling before send is the fix, and
+/// a cap is what forces it to exist rather than be discovered in production.
+pub const max_attachment_bytes: u32 = 2 * 1024 * 1024;
+
 /// Index into `Store.payments`.
 pub const PayIndex = enum(u32) { _ };
 
@@ -748,6 +800,11 @@ pub const Store = struct {
     /// one counterparty; in a group "not mine" names no one.
     senders: std.ArrayListUnmanaged(u16) = .empty,
     reactions: std.MultiArrayList(Reaction) = .empty,
+    /// PICTURE BYTES, out of band from the text blob for the reason stated on
+    /// `Attachment`. One arena for all of them; a row names its slice.
+    blobs: std.ArrayListUnmanaged(u8) = .empty,
+    /// One row per picture (A3/A6 — sparse, like reactions).
+    attachments: std.MultiArrayList(Attachment) = .empty,
     /// One row per payment card (card ⇔ row; M5 A1).
     payments: std.MultiArrayList(PaymentRow) = .empty,
     /// Cold settlement detail, at most one row per payment (A6).
@@ -765,6 +822,8 @@ pub fn deinitStore(gpa: Allocator, store: *Store) void {
     store.senders.deinit(gpa);
     store.mine.deinit(gpa);
     store.reactions.deinit(gpa);
+    store.blobs.deinit(gpa);
+    store.attachments.deinit(gpa);
     store.deleted.deinit(gpa);
     store.edited.deinit(gpa);
     store.payments.deinit(gpa);
@@ -1842,6 +1901,87 @@ pub fn writeGroupMeta(
     return out[0..at];
 }
 
+// ---------------------------------------------------------------------------
+// PICTURES. Sparse rows, one arena of bytes, and a lookup — the same shape
+// reactions and payment cards already use.
+// ---------------------------------------------------------------------------
+
+pub const AttachError = error{ OutOfMemory, TooLarge, NoSuchMessage };
+
+/// Attach a picture to a message. The bytes are COPIED into the store's arena:
+/// the caller's buffer is a decode scratch or a network chunk and will not
+/// outlive the frame, and a span into freed memory is a picture that renders as
+/// whatever is there now.
+pub fn attachImage(
+    gpa: Allocator,
+    store: *Store,
+    msg: MsgIndex,
+    bytes: []const u8,
+    width: u16,
+    height: u16,
+    mime: Mime,
+) AttachError!AttachIndex {
+    const mi = @intFromEnum(msg);
+    if (mi >= store.msgs.len) return error.NoSuchMessage;
+    if (bytes.len > max_attachment_bytes) return error.TooLarge;
+
+    const offset: u32 = @intCast(store.blobs.items.len);
+    try store.blobs.appendSlice(gpa, bytes);
+    errdefer store.blobs.shrinkRetainingCapacity(offset);
+    const index: u32 = @intCast(store.attachments.len);
+    try store.attachments.append(gpa, .{
+        .msg = mi,
+        .offset = offset,
+        .len = @intCast(bytes.len),
+        .width = width,
+        .height = height,
+        .mime = mime,
+    });
+    return @enumFromInt(index);
+}
+
+/// The picture on a message, or null. Linear over the attachment rows, which are
+/// as sparse as the pictures themselves.
+pub fn attachmentOf(store: *const Store, msg: MsgIndex) ?AttachIndex {
+    const mi = @intFromEnum(msg);
+    const owners = store.attachments.items(.msg);
+    for (owners, 0..) |m, i| {
+        if (m == mi) return @enumFromInt(i);
+    }
+    return null;
+}
+
+/// Its encoded bytes, borrowed from the store.
+pub fn attachmentBytes(store: *const Store, att: AttachIndex) []const u8 {
+    const ai = @intFromEnum(att);
+    if (ai >= store.attachments.len) return &.{};
+    const off = store.attachments.items(.offset)[ai];
+    const len = store.attachments.items(.len)[ai];
+    if (@as(u64, off) + len > store.blobs.items.len) return &.{};
+    return store.blobs.items[off..][0..len];
+}
+
+/// What the thread needs to lay the bubble out BEFORE the bytes are decoded — a
+/// picture that resizes the instant it decodes makes the whole thread jump.
+/// A7.2: cold, transient.
+pub const ImageInfo = struct {
+    width: u16,
+    height: u16,
+    mime: Mime,
+    bytes: u32,
+};
+
+pub fn attachmentInfo(store: *const Store, att: AttachIndex) ?ImageInfo {
+    const ai = @intFromEnum(att);
+    if (ai >= store.attachments.len) return null;
+    return .{
+        .width = store.attachments.items(.width)[ai],
+        .height = store.attachments.items(.height)[ai],
+        .mime = store.attachments.items(.mime)[ai],
+        .bytes = store.attachments.items(.len)[ai],
+    };
+}
+
 /// The group's id on the wire, or all-zero for a direct chat (which is addressed
 /// by its counterparty and has none).
 pub fn groupId(store: *const Store, conv: ConvIndex) [group_id_len]u8 {
@@ -1957,7 +2097,7 @@ const codec_magic = [4]u8{ 'Z', 'A', 'T', 'H' };
 /// sections so every v2 blob still reads (a version gate is a compatibility
 /// contract and is written as a RANGE — the day we wrote it as a LIST, a v3 bump
 /// orphaned every conversation on the owner's phone).
-const codec_version: u16 = 11; // v11: groups — the member table, the conversation's kind/title/span, the sender column
+const codec_version: u16 = 12; // v12: pictures — the blob arena + one sparse attachment row per picture
 const conv_rec_len = 28; // did span 8 + handle span 8 + i64 8 + u32 4
 const member_rec_len = 17; // did span 8 + handle span 8 + left u8 1
 /// The v11 per-conversation block: kind 1 + title span 8 + member span (4 + 2) +
@@ -1965,6 +2105,10 @@ const member_rec_len = 17; // did span 8 + handle span 8 + left u8 1
 /// `versionTailLen` and the round-trip test — and the last codec bump broke two
 /// damage tests precisely by leaving that arithmetic written out four times.
 const conv_v11_rec_len = 1 + 8 + 4 + 2 + group_id_len;
+/// The v12 per-attachment row: msg 4 + offset 4 + len 4 + w 2 + h 2 + mime 1.
+/// Named for the same reason `conv_v11_rec_len` is — the last two bumps each
+/// broke a test that had the sum written out by hand.
+const attach_rec_len = 4 + 4 + 4 + 2 + 2 + 1;
 const msg_rec_len = 21; // i64 8 + text span 8 + conv 4 + kind 1
 const pay_rec_len = 23; // id 8 + amount 8 + msg 4 + rail 1 + status 1 + conf 1
 const ref_rec_len = 36; // pay 4 + ref 32
@@ -1994,9 +2138,8 @@ pub fn serializeStore(gpa: Allocator, store: *const Store) error{OutOfMemory}![]
         m_count + // v9: effect, one u8 per message
         m_count + // v10: game move, one u8 per message
         // v11: GROUPS.
-        4 + store.members.len * member_rec_len + // the member table
-        c_count * conv_v11_rec_len + // per conversation: kind, title span, member span, group id
-        2 * m_count; // per message: the sender's seat
+        v11TailLen(store) + // v11: the member table, the conversation blocks, the sender column
+        v12TailLen(store); // v12: the picture arena + one row per picture
     const out = try gpa.alloc(u8, total);
     errdefer gpa.free(out);
 
@@ -2181,8 +2324,48 @@ pub fn serializeStore(gpa: Allocator, store: *const Store) error{OutOfMemory}![]
         at += 2;
     }
 
+    // v12: PICTURES. The arena first, then the rows that name slices of it.
+    std.mem.writeInt(u32, out[at..][0..4], @intCast(store.blobs.items.len), .little);
+    at += 4;
+    @memcpy(out[at..][0..store.blobs.items.len], store.blobs.items);
+    at += store.blobs.items.len;
+    std.mem.writeInt(u32, out[at..][0..4], @intCast(store.attachments.len), .little);
+    at += 4;
+    const atts = store.attachments.slice();
+    for (0..store.attachments.len) |i| {
+        std.mem.writeInt(u32, out[at..][0..4], atts.items(.msg)[i], .little);
+        at += 4;
+        std.mem.writeInt(u32, out[at..][0..4], atts.items(.offset)[i], .little);
+        at += 4;
+        std.mem.writeInt(u32, out[at..][0..4], atts.items(.len)[i], .little);
+        at += 4;
+        std.mem.writeInt(u16, out[at..][0..2], atts.items(.width)[i], .little);
+        at += 2;
+        std.mem.writeInt(u16, out[at..][0..2], atts.items(.height)[i], .little);
+        at += 2;
+        out[at] = @intFromEnum(atts.items(.mime)[i]);
+        at += 1;
+    }
+
     assert(at == total);
     return out;
+}
+
+/// EACH VERSION'S APPENDED SECTION, NAMED ONCE.
+///
+/// The v9, v11 and v12 bumps each broke a test that had this arithmetic written
+/// out by hand — three times, the same way, because a sum copied into four places
+/// is a sum that will disagree with itself. Nothing computes these inline any
+/// more: the serializer, the reader, `versionTailLen` and the tests all ask here.
+fn v11TailLen(store: *const Store) usize {
+    return 4 + store.members.len * member_rec_len +
+        store.convs.len * conv_v11_rec_len +
+        2 * store.msgs.len;
+}
+
+fn v12TailLen(store: *const Store) usize {
+    return 4 + store.blobs.items.len +
+        4 + store.attachments.len * attach_rec_len;
 }
 
 /// The byte length of the v3..v11 per-record tail — everything appended AFTER the
@@ -2205,11 +2388,8 @@ fn versionTailLen(store: *const Store) usize {
         8 * c + // v8 read_up_to
         m + // v9 effect
         m + // v10 game move
-        // v11 GROUPS: the member table, then per conversation kind + title span +
-        // member span, then the sender's seat per message.
-        4 + store.members.len * member_rec_len +
-        c * conv_v11_rec_len +
-        2 * m;
+        v11TailLen(store) + // v11 groups: members, conversation blocks, senders
+        v12TailLen(store); // v12 pictures: the arena + one row each
 }
 
 /// True when `span` names a real NUL-terminated string inside `bytes` (the
@@ -2630,6 +2810,54 @@ pub fn deserializeStore(gpa: Allocator, bytes: []const u8) DeserializeError!Stor
         // One counterparty means seat 0 for everything they said.
         try store.senders.resize(gpa, m_count);
         for (0..m_count) |i| store.senders.items[i] = 0;
+    }
+
+    // v12: PICTURES. A blob written before they existed simply has none — that IS
+    // an absence (no picture was ever attached), unlike the member table, whose
+    // absence had to be migrated because every old conversation genuinely had a
+    // counterparty. Nothing to invent here, so nothing is invented.
+    if (version >= 12) {
+        if (bytes.len - at < 4) return error.Malformed;
+        const blob_len = std.mem.readInt(u32, bytes[at..][0..4], .little);
+        at += 4;
+        if (blob_len > bytes.len - at) return error.Malformed;
+        try store.blobs.appendSlice(gpa, bytes[at..][0..blob_len]);
+        at += blob_len;
+
+        if (bytes.len - at < 4) return error.Malformed;
+        const att_count = std.mem.readInt(u32, bytes[at..][0..4], .little);
+        at += 4;
+        if (@as(u64, att_count) * attach_rec_len > bytes.len - at) return error.Malformed;
+        try store.attachments.ensureTotalCapacity(gpa, att_count);
+        for (0..att_count) |_| {
+            const msg = std.mem.readInt(u32, bytes[at..][0..4], .little);
+            at += 4;
+            const off = std.mem.readInt(u32, bytes[at..][0..4], .little);
+            at += 4;
+            const len = std.mem.readInt(u32, bytes[at..][0..4], .little);
+            at += 4;
+            const w = std.mem.readInt(u16, bytes[at..][0..2], .little);
+            at += 2;
+            const h = std.mem.readInt(u16, bytes[at..][0..2], .little);
+            at += 2;
+            const mime_raw = bytes[at];
+            at += 1;
+            // Every one of these is load-bearing on a hostile blob: a row naming
+            // a message that does not exist, or a slice that leaves the arena,
+            // is a picture that renders whatever happens to be there.
+            if (msg >= store.msgs.len) return error.Malformed;
+            if (@as(u64, off) + len > store.blobs.items.len) return error.Malformed;
+            if (len > max_attachment_bytes) return error.Malformed;
+            const mime = std.enums.fromInt(Mime, mime_raw) orelse return error.Malformed;
+            store.attachments.appendAssumeCapacity(.{
+                .msg = msg,
+                .offset = off,
+                .len = len,
+                .width = w,
+                .height = h,
+                .mime = mime,
+            });
+        }
     }
 
     if (at != bytes.len) return error.Malformed; // exact tail — no trailing bytes
@@ -3505,8 +3733,7 @@ test "store codec v11: groups round-trip, and pre-group history is MIGRATED" {
     const legacy_blob = try serializeStore(gpa, &legacy_src);
     defer gpa.free(legacy_blob);
     // The v11 tail is: member table + per-conversation block + sender column.
-    const v11_tail = 4 + legacy_src.members.len * member_rec_len +
-        legacy_src.convs.len * conv_v11_rec_len + 2 * legacy_src.msgs.len;
+    const v11_tail = v11TailLen(&legacy_src) + v12TailLen(&legacy_src);
     std.mem.writeInt(u16, legacy_blob[4..6], 10, .little);
     var legacy = try deserializeStore(gpa, legacy_blob[0 .. legacy_blob.len - v11_tail]);
     defer deinitStore(gpa, &legacy);
@@ -3524,8 +3751,7 @@ test "store codec v11: groups round-trip, and pre-group history is MIGRATED" {
     var forged = try gpa.dupe(u8, blob);
     defer gpa.free(forged);
     std.mem.writeInt(u16, forged[4..6], 10, .little);
-    const forged_tail = 4 + back.members.len * member_rec_len +
-        back.convs.len * conv_v11_rec_len + 2 * back.msgs.len;
+    const forged_tail = v11TailLen(&back) + v12TailLen(&back);
     try std.testing.expectError(
         error.Malformed,
         deserializeStore(gpa, forged[0 .. forged.len - forged_tail]),
@@ -3654,4 +3880,97 @@ test "groups: a group id resolves to exactly one conversation" {
     try std.testing.expectEqual(@as(?ConvIndex, null), conversationByGroupId(&store, [_]u8{0xCC} ** group_id_len));
     // And a direct chat is never matched, whatever its zeroed id looks like.
     try std.testing.expectEqual(@as(?ConvIndex, null), conversationByGroupId(&store, [_]u8{0} ** group_id_len));
+}
+
+test "pictures: a photo rides its own sparse row and survives a relaunch" {
+    const gpa = std.testing.allocator;
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+
+    const conv = try openConversation(gpa, &store, "did:plc:alice", "alice.zat4.com");
+    const plain = try appendMessage(gpa, &store, conv, .text, "no picture here", 100, true);
+    const withpic = try appendMessage(gpa, &store, conv, .image, "at the beach", 200, true);
+
+    // Not real JPEG bytes — the store does not decode, and a store that sniffed
+    // content to decide what it was holding would be a store somebody feeds
+    // something else.
+    const bytes = [_]u8{ 0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3, 4, 5 };
+    _ = try attachImage(gpa, &store, withpic, &bytes, 1600, 1200, .jpeg);
+
+    // Sparse: the message WITHOUT a picture has no row, and pays nothing for it.
+    try std.testing.expectEqual(@as(?AttachIndex, null), attachmentOf(&store, plain));
+    const att = attachmentOf(&store, withpic) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, &bytes, attachmentBytes(&store, att));
+
+    const info = attachmentInfo(&store, att) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u16, 1600), info.width);
+    try std.testing.expectEqual(@as(u16, 1200), info.height);
+    try std.testing.expectEqual(Mime.jpeg, info.mime);
+
+    // The caption is the message's own text — a picture with words under it is
+    // one message, not two.
+    try std.testing.expectEqualStrings("at the beach", sliceSpan(&store, store.msgs.items(.text)[@intFromEnum(withpic)]));
+
+    // ROUND TRIP. A picture that does not survive a relaunch is a picture the
+    // person will scroll back to and not find.
+    const blob = try serializeStore(gpa, &store);
+    defer gpa.free(blob);
+    var back = try deserializeStore(gpa, blob);
+    defer deinitStore(gpa, &back);
+
+    const att2 = attachmentOf(&back, withpic) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, &bytes, attachmentBytes(&back, att2));
+    const info2 = attachmentInfo(&back, att2) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u16, 1600), info2.width);
+    try std.testing.expectEqual(Mime.jpeg, info2.mime);
+    try std.testing.expectEqual(@as(?AttachIndex, null), attachmentOf(&back, plain));
+}
+
+test "pictures: the cap is enforced, and a corrupt row is refused rather than rendered" {
+    const gpa = std.testing.allocator;
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+    const conv = try openConversation(gpa, &store, "did:plc:alice", "");
+    const msg = try appendMessage(gpa, &store, conv, .image, "", 100, true);
+
+    // THE CAP IS NOT A PREFERENCE. Every byte is chunked, encrypted per recipient
+    // and fanned out to every device of every member — a 20 MB photo in a group
+    // of five is a hundred megabytes across the relay.
+    const huge = try gpa.alloc(u8, max_attachment_bytes + 1);
+    defer gpa.free(huge);
+    @memset(huge, 0xAB);
+    try std.testing.expectError(error.TooLarge, attachImage(gpa, &store, msg, huge, 1, 1, .png));
+
+    // A row on a message that does not exist is refused at the door.
+    try std.testing.expectError(
+        error.NoSuchMessage,
+        attachImage(gpa, &store, @enumFromInt(9999), "x", 1, 1, .png),
+    );
+
+    // A BLOB WHOSE ROW POINTS OUT OF THE ARENA. Every field of an attachment row
+    // is load-bearing on hostile input: a slice that leaves the arena is a
+    // picture that renders whatever happens to be next to it in memory.
+    _ = try attachImage(gpa, &store, msg, "abc", 4, 4, .png);
+    const good = try serializeStore(gpa, &store);
+    defer gpa.free(good);
+
+    // The row's `len` is the last u32 before w/h/mime at the very end of the blob.
+    var bad = try gpa.dupe(u8, good);
+    defer gpa.free(bad);
+    const len_at = bad.len - (2 + 2 + 1) - 4;
+    std.mem.writeInt(u32, bad[len_at..][0..4], 4096, .little); // claims far more than the arena holds
+    try std.testing.expectError(error.Malformed, deserializeStore(gpa, bad));
+
+    // …and one naming a message that is not there.
+    var bad2 = try gpa.dupe(u8, good);
+    defer gpa.free(bad2);
+    const msg_at = bad2.len - (2 + 2 + 1) - 4 - 4 - 4;
+    std.mem.writeInt(u32, bad2[msg_at..][0..4], 4242, .little);
+    try std.testing.expectError(error.Malformed, deserializeStore(gpa, bad2));
+
+    // …and a mime byte from a version we do not speak.
+    var bad3 = try gpa.dupe(u8, good);
+    defer gpa.free(bad3);
+    bad3[bad3.len - 1] = 200;
+    try std.testing.expectError(error.Malformed, deserializeStore(gpa, bad3));
 }
