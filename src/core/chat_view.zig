@@ -750,6 +750,7 @@ test "groups: the list names a group by its title and says how many are in it" {
     const g = try chat.startGroup(
         gpa,
         &store,
+        [_]u8{0xC3} ** chat.group_id_len,
         "Weekend",
         &.{ "did:plc:aaa", "did:plc:bbb" },
         &.{ "maya.zat4.com", "bob.zat4.com" },
@@ -782,6 +783,7 @@ test "groups: two people talking in turn are two runs, not one" {
     const g = try chat.startGroup(
         gpa,
         &store,
+        [_]u8{0xC3} ** chat.group_id_len,
         "Weekend",
         &.{ "did:plc:bbb", "did:plc:ccc" },
         &.{ "bob.zat4.com", "carol.zat4.com" },

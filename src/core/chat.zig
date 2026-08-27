@@ -209,6 +209,43 @@ pub const kind_react_wire: u8 = 10;
 /// therefore do work — keep their byte and keep working.
 pub const kind_text_fx_wire: u8 = 13;
 
+/// A GROUP MESSAGE, riding a PAIRWISE session.
+///
+/// `[14][group_id: 16][inner kind][inner payload…]` — the inner bytes are exactly
+/// what the same message would have been in a direct chat, so every kind that
+/// works in a DM works in a group without a second encoding of itself.
+///
+/// It has to say which group because of what a group IS here: N−1 of the ordinary
+/// two-member sessions, fanned out. A message physically arrives over the pairwise
+/// channel with ONE person, and without this byte the receiver would file it as a
+/// DM from them — the group would look like a series of private conversations
+/// that happen to say the same thing.
+///
+/// The id is opaque: 16 bytes the creator minted (the shell owns randomness, B3).
+/// It is not secret and not a capability — knowing it does not admit you, because
+/// nobody encrypts to a non-member. What keeps a stranger out is that no member's
+/// client ever fans out to them.
+pub const kind_group_msg_wire: u8 = 14;
+
+/// THE ROSTER OF A GROUP: `[15][group_id: 16][title len u8][title][count u8][(did
+/// len u8, did)…]`.
+///
+/// Sent to every member over their pairwise session when a group is created and
+/// whenever its membership or title changes. This is the whole of "who is in this
+/// group" — there is no cryptographic membership in the pairwise model, so
+/// agreement is an application fact, and the honest thing is to say so rather than
+/// to imply the maths is enforcing it.
+///
+/// THE TRUST RULE, and it is the same one the device directory uses: a roster is
+/// believed only from somebody ALREADY in the group. The first one is the
+/// invitation, and it can come from anybody — exactly like a first message from a
+/// stranger, and it belongs behind the same guardrail rather than a new one.
+pub const kind_group_meta_wire: u8 = 15;
+
+/// Length of a group id, in bytes. 16 is the same width as a UUID and far past
+/// what a birthday collision needs at any believable number of groups.
+pub const group_id_len = 16;
+
 /// How many times an unacknowledged Welcome is re-sent before the client
 /// stops and says so. With the ladder below this is ~1 hour of trying; a
 /// relaunch starts the ladder over (`restoreGroups`), so a peer who comes
@@ -321,6 +358,8 @@ const wire_kinds = [_]u8{
     kind_react_wire,
     @intFromEnum(Kind.game_move),
     kind_text_fx_wire,
+    kind_group_msg_wire,
+    kind_group_meta_wire,
     kind_read_wire,
     @intFromEnum(Kind.payment_request),
     @intFromEnum(Kind.payment_sent),
@@ -496,6 +535,14 @@ pub const Conversation = struct {
     /// The group's name. Empty for a direct chat, which is named by its
     /// counterparty and has nothing to store here.
     title: TextSpan = TextSpan.empty,
+    /// THE GROUP'S IDENTITY ON THE WIRE. Zero for a direct chat, which is
+    /// addressed by its counterparty and needs none.
+    ///
+    /// Held as bytes rather than a span into `string_bytes`, because that blob's
+    /// invariant is NUL-terminated strings with no interior NUL and a random 16
+    /// bytes respects neither. A span would have meant either a second blob or a
+    /// hex encoding, and both are more moving parts than sixteen bytes.
+    group_id: [group_id_len]u8 = [_]u8{0} ** group_id_len,
 
     comptime {
         // A7.1 — budget raised 40 → 56 for GROUPS. `member_first`+`member_count`
@@ -505,7 +552,14 @@ pub const Conversation = struct {
         // a lookup plus a way for the two to disagree. Conversations are held in the
         // dozens, and in the SoA store each field is its own array, so a column
         // nobody reads is a column nobody pays to touch.
-        assert(@sizeOf(Conversation) == 56);
+        //
+        // A7.1 — 56 → 72 for `group_id`. Sixteen bytes on every conversation
+        // including the direct ones that do not use them, and paid anyway: a group
+        // with no stable id cannot be addressed on the wire at all, and the
+        // alternative (a side table keyed by conversation) is the same bytes plus
+        // a lookup plus a way for the two to disagree — the same trade already
+        // refused for the member span, refused again for the same reason.
+        assert(@sizeOf(Conversation) == 72);
     }
 };
 
@@ -976,6 +1030,7 @@ pub fn seatOf(store: *const Store, conv: ConvIndex, did: []const u8) ?u16 {
 pub fn startGroup(
     gpa: Allocator,
     store: *Store,
+    id: [group_id_len]u8,
     title: []const u8,
     dids: []const []const u8,
     handles: []const []const u8,
@@ -994,6 +1049,7 @@ pub fn startGroup(
         .member_first = member_first,
         .member_count = 0,
         .title = title_span,
+        .group_id = id,
     });
     const conv: ConvIndex = @enumFromInt(index);
     for (dids, 0..) |did, i| {
@@ -1674,6 +1730,132 @@ pub fn parsePaymentFrame(bytes: []const u8) FrameError!PaymentFrame {
 }
 
 // ---------------------------------------------------------------------------
+// GROUP FRAMES (pure). Encode and decode only — who may SEND one is the shell's
+// business, and what to believe about it is stated at the wire kinds above.
+// ---------------------------------------------------------------------------
+
+/// A group message, unwrapped: which group, and the bytes that would have been
+/// the whole payload in a direct chat.
+/// A7.2: cold, transient — one per delivered message.
+pub const GroupFrame = struct {
+    id: [group_id_len]u8,
+    /// `[inner kind][inner payload…]` — handed straight to the same decoder a
+    /// direct message goes through.
+    inner: []const u8,
+};
+
+/// Parse `[group_id][inner…]` (the leading kind byte already consumed).
+///
+/// An EMPTY inner is refused: a group frame that carries nothing is not a message
+/// with no text, it is a frame that lost its kind byte, and guessing which kind it
+/// meant is how a parser starts inventing messages.
+pub fn parseGroupFrame(bytes: []const u8) FrameError!GroupFrame {
+    if (bytes.len < group_id_len + 1) return error.Malformed;
+    var id: [group_id_len]u8 = undefined;
+    @memcpy(&id, bytes[0..group_id_len]);
+    return .{ .id = id, .inner = bytes[group_id_len..] };
+}
+
+/// Write one. `out` must hold `group_id_len + inner.len` bytes; returns the
+/// written slice.
+pub fn writeGroupFrame(out: []u8, id: [group_id_len]u8, inner: []const u8) FrameError![]u8 {
+    if (inner.len == 0) return error.Malformed; // see `parseGroupFrame`
+    if (out.len < group_id_len + inner.len) return error.Malformed;
+    @memcpy(out[0..group_id_len], &id);
+    @memcpy(out[group_id_len..][0..inner.len], inner);
+    return out[0 .. group_id_len + inner.len];
+}
+
+/// A roster, unwrapped. The DIDs are walked with `next` rather than collected,
+/// so parsing allocates nothing and a hostile count cannot make us reserve for it.
+/// A7.2: cold, transient.
+pub const GroupMeta = struct {
+    id: [group_id_len]u8,
+    title: []const u8,
+    /// How many DIDs the frame CLAIMS. Believe the iterator, not this — a frame
+    /// can say twelve and carry three, and `next` simply runs out.
+    claimed: u8,
+    rest: []const u8,
+
+    /// The next DID, or null at the end. Total on hostile input: a length that
+    /// overruns ends the walk rather than reading past the frame.
+    pub fn next(m: *GroupMeta) ?[]const u8 {
+        if (m.rest.len < 1) return null;
+        const n = m.rest[0];
+        if (n == 0 or m.rest.len < 1 + @as(usize, n)) {
+            m.rest = m.rest[0..0];
+            return null;
+        }
+        const did = m.rest[1..][0..n];
+        m.rest = m.rest[1 + @as(usize, n) ..];
+        return did;
+    }
+};
+
+/// Parse `[group_id][title len][title][count][(did len, did)…]`.
+pub fn parseGroupMeta(bytes: []const u8) FrameError!GroupMeta {
+    if (bytes.len < group_id_len + 2) return error.Malformed;
+    var id: [group_id_len]u8 = undefined;
+    @memcpy(&id, bytes[0..group_id_len]);
+    var at: usize = group_id_len;
+    const tlen = bytes[at];
+    at += 1;
+    if (bytes.len < at + tlen + 1) return error.Malformed;
+    const title = bytes[at..][0..tlen];
+    at += tlen;
+    const count = bytes[at];
+    at += 1;
+    return .{ .id = id, .title = title, .claimed = count, .rest = bytes[at..] };
+}
+
+/// Write one. Returns the written slice, or `Malformed` when it will not fit or a
+/// field is too long to describe in its one length byte.
+pub fn writeGroupMeta(
+    out: []u8,
+    id: [group_id_len]u8,
+    title: []const u8,
+    dids: []const []const u8,
+) FrameError![]u8 {
+    if (title.len > 255 or dids.len > 255) return error.Malformed;
+    var need: usize = group_id_len + 1 + title.len + 1;
+    for (dids) |d| {
+        if (d.len == 0 or d.len > 255) return error.Malformed;
+        need += 1 + d.len;
+    }
+    if (out.len < need) return error.Malformed;
+
+    var at: usize = 0;
+    @memcpy(out[0..group_id_len], &id);
+    at += group_id_len;
+    out[at] = @intCast(title.len);
+    at += 1;
+    @memcpy(out[at..][0..title.len], title);
+    at += title.len;
+    out[at] = @intCast(dids.len);
+    at += 1;
+    for (dids) |d| {
+        out[at] = @intCast(d.len);
+        at += 1;
+        @memcpy(out[at..][0..d.len], d);
+        at += d.len;
+    }
+    return out[0..at];
+}
+
+/// Find the conversation carrying this group id, or null. Linear over the
+/// conversations, which are held in dozens — and it is the ONE place a wire id
+/// becomes a local conversation, so a group that arrives twice cannot become two.
+pub fn conversationByGroupId(store: *const Store, id: [group_id_len]u8) ?ConvIndex {
+    const kinds = store.convs.items(.kind);
+    const ids = store.convs.items(.group_id);
+    for (kinds, ids, 0..) |k, gid, i| {
+        if (k != .group) continue;
+        if (std.mem.eql(u8, &gid, &id)) return @enumFromInt(i);
+    }
+    return null;
+}
+
+// ---------------------------------------------------------------------------
 // Queries — views over the one store (B5: plain arrays out)
 // ---------------------------------------------------------------------------
 
@@ -1770,6 +1952,11 @@ const codec_magic = [4]u8{ 'Z', 'A', 'T', 'H' };
 const codec_version: u16 = 11; // v11: groups — the member table, the conversation's kind/title/span, the sender column
 const conv_rec_len = 28; // did span 8 + handle span 8 + i64 8 + u32 4
 const member_rec_len = 17; // did span 8 + handle span 8 + left u8 1
+/// The v11 per-conversation block: kind 1 + title span 8 + member span (4 + 2) +
+/// group id. NAMED because the same sum is needed by the serializer, the reader,
+/// `versionTailLen` and the round-trip test — and the last codec bump broke two
+/// damage tests precisely by leaving that arithmetic written out four times.
+const conv_v11_rec_len = 1 + 8 + 4 + 2 + group_id_len;
 const msg_rec_len = 21; // i64 8 + text span 8 + conv 4 + kind 1
 const pay_rec_len = 23; // id 8 + amount 8 + msg 4 + rail 1 + status 1 + conf 1
 const ref_rec_len = 36; // pay 4 + ref 32
@@ -1800,7 +1987,7 @@ pub fn serializeStore(gpa: Allocator, store: *const Store) error{OutOfMemory}![]
         m_count + // v10: game move, one u8 per message
         // v11: GROUPS.
         4 + store.members.len * member_rec_len + // the member table
-        c_count * (1 + 8 + 4 + 2) + // per conversation: kind, title span, member span
+        c_count * conv_v11_rec_len + // per conversation: kind, title span, member span, group id
         2 * m_count; // per message: the sender's seat
     const out = try gpa.alloc(u8, total);
     errdefer gpa.free(out);
@@ -1977,6 +2164,8 @@ pub fn serializeStore(gpa: Allocator, store: *const Store) error{OutOfMemory}![]
         at += 4;
         std.mem.writeInt(u16, out[at..][0..2], convs.items(.member_count)[i], .little);
         at += 2;
+        @memcpy(out[at..][0..group_id_len], &convs.items(.group_id)[i]);
+        at += group_id_len;
     }
     for (0..m_count) |i| {
         const seat: u16 = if (i < store.senders.items.len) store.senders.items[i] else 0;
@@ -2011,7 +2200,7 @@ fn versionTailLen(store: *const Store) usize {
         // v11 GROUPS: the member table, then per conversation kind + title span +
         // member span, then the sender's seat per message.
         4 + store.members.len * member_rec_len +
-        c * (1 + 8 + 4 + 2) +
+        c * conv_v11_rec_len +
         2 * m;
 }
 
@@ -2360,7 +2549,7 @@ pub fn deserializeStore(gpa: Allocator, bytes: []const u8) DeserializeError!Stor
             store.members.appendAssumeCapacity(.{ .did = spans[0], .handle = spans[1], .left = left });
         }
 
-        if (bytes.len - at < c_count * (1 + 8 + 4 + 2)) return error.Malformed;
+        if (bytes.len - at < c_count * conv_v11_rec_len) return error.Malformed;
         const cs2 = store.convs.slice();
         for (0..c_count) |i| {
             const kind_raw = bytes[at];
@@ -2382,15 +2571,24 @@ pub fn deserializeStore(gpa: Allocator, bytes: []const u8) DeserializeError!Stor
             if (@as(u64, first) + count > store.members.len) return error.Malformed;
             cs2.items(.member_first)[i] = first;
             cs2.items(.member_count)[i] = count;
+            @memcpy(&cs2.items(.group_id)[i], bytes[at..][0..group_id_len]);
+            at += group_id_len;
 
             // NOW the kind is known, so each sort answers for itself: a direct
             // conversation must have the counterparty DID it is addressed by, and
             // a group must not pretend to have one. Checked here rather than
             // above because above there was nothing to tell them apart.
             const has_did = cs2.items(.did)[i].len > 0;
+            const zero_id = [_]u8{0} ** group_id_len;
+            const has_id = !std.mem.eql(u8, &cs2.items(.group_id)[i], &zero_id);
             switch (cs2.items(.kind)[i]) {
-                .direct => if (!has_did) return error.Malformed,
-                .group => if (has_did) return error.Malformed,
+                .direct => if (!has_did or has_id) return error.Malformed,
+                // A group with no id could never be addressed on the wire again:
+                // every message for it arrives over a pairwise session naming an
+                // id, and there would be nothing to match. Restoring it would be
+                // restoring a conversation that can only ever be read, never
+                // continued — so it is damage, and damage is named (E3).
+                .group => if (has_did or !has_id) return error.Malformed,
             }
         }
 
@@ -2417,6 +2615,7 @@ pub fn deserializeStore(gpa: Allocator, bytes: []const u8) DeserializeError!Stor
             });
             cs2.items(.kind)[i] = .direct;
             cs2.items(.title)[i] = TextSpan.empty;
+            cs2.items(.group_id)[i] = [_]u8{0} ** group_id_len;
             cs2.items(.member_first)[i] = first;
             cs2.items(.member_count)[i] = 1;
         }
@@ -3200,6 +3399,7 @@ test "groups: members are seated, attributed, and survive somebody leaving" {
     const conv = try startGroup(
         gpa,
         &store,
+        [_]u8{0xA1} ** group_id_len,
         "Weekend",
         &.{ "did:plc:alice", "did:plc:bob" },
         &.{ "alice.zat4.com", "bob.zat4.com" },
@@ -3238,8 +3438,8 @@ test "groups: adding a member does not disturb another conversation's seats" {
     var store: Store = .{};
     defer deinitStore(gpa, &store);
 
-    const first = try startGroup(gpa, &store, "First", &.{"did:plc:alice"}, &.{"alice.zat4.com"});
-    const second = try startGroup(gpa, &store, "Second", &.{"did:plc:bob"}, &.{"bob.zat4.com"});
+    const first = try startGroup(gpa, &store, [_]u8{0x01} ** group_id_len, "First", &.{"did:plc:alice"}, &.{"alice.zat4.com"});
+    const second = try startGroup(gpa, &store, [_]u8{0x02} ** group_id_len, "Second", &.{"did:plc:bob"}, &.{"bob.zat4.com"});
     const direct = try openConversation(gpa, &store, "did:plc:dave", "dave.zat4.com");
 
     // Insert into the FIRST group, whose span sits below both of the others.
@@ -3261,7 +3461,7 @@ test "store codec v11: groups round-trip, and pre-group history is MIGRATED" {
     defer deinitStore(gpa, &store);
     const direct = try openConversation(gpa, &store, "did:plc:alice", "alice.zat4.com");
     _ = try appendMessage(gpa, &store, direct, .text, "just us", 100, false);
-    const group = try startGroup(gpa, &store, "Weekend", &.{ "did:plc:bob", "did:plc:carol" }, &.{ "bob.zat4.com", "" });
+    const group = try startGroup(gpa, &store, [_]u8{0xB2} ** group_id_len, "Weekend", &.{ "did:plc:bob", "did:plc:carol" }, &.{ "bob.zat4.com", "" });
     const gm = try appendMessage(gpa, &store, group, .text, "all of us", 200, false);
     setSenderSeat(&store, gm, 1);
     setMemberLeft(&store, group, 0, true);
@@ -3298,7 +3498,7 @@ test "store codec v11: groups round-trip, and pre-group history is MIGRATED" {
     defer gpa.free(legacy_blob);
     // The v11 tail is: member table + per-conversation block + sender column.
     const v11_tail = 4 + legacy_src.members.len * member_rec_len +
-        legacy_src.convs.len * (1 + 8 + 4 + 2) + 2 * legacy_src.msgs.len;
+        legacy_src.convs.len * conv_v11_rec_len + 2 * legacy_src.msgs.len;
     std.mem.writeInt(u16, legacy_blob[4..6], 10, .little);
     var legacy = try deserializeStore(gpa, legacy_blob[0 .. legacy_blob.len - v11_tail]);
     defer deinitStore(gpa, &legacy);
@@ -3317,7 +3517,7 @@ test "store codec v11: groups round-trip, and pre-group history is MIGRATED" {
     defer gpa.free(forged);
     std.mem.writeInt(u16, forged[4..6], 10, .little);
     const forged_tail = 4 + back.members.len * member_rec_len +
-        back.convs.len * (1 + 8 + 4 + 2) + 2 * back.msgs.len;
+        back.convs.len * conv_v11_rec_len + 2 * back.msgs.len;
     try std.testing.expectError(
         error.Malformed,
         deserializeStore(gpa, forged[0 .. forged.len - forged_tail]),
@@ -3345,4 +3545,105 @@ test "wire: no two kinds share a first byte" {
     // The two that collided, named explicitly: a test that only walks the table
     // would still pass if somebody quietly dropped one of them from it.
     try std.testing.expect(kind_text_fx_wire != kind_read_wire);
+}
+
+test "group frames: a message says which group it belongs to" {
+    // WHY THIS BYTE EXISTS. A group here is N−1 ordinary pairwise sessions, so a
+    // group message physically arrives over the private channel with ONE person.
+    // Without the id the receiver files it as a DM from them, and the group looks
+    // like several private conversations that happen to say the same thing.
+    const id = [_]u8{0x7F} ** group_id_len;
+    var buf: [64]u8 = undefined;
+    const inner = [_]u8{ @intFromEnum(Kind.text), 'h', 'i' };
+    const framed = try writeGroupFrame(&buf, id, &inner);
+
+    const back = try parseGroupFrame(framed);
+    try std.testing.expectEqualSlices(u8, &id, &back.id);
+    try std.testing.expectEqualSlices(u8, &inner, back.inner);
+
+    // The inner bytes are EXACTLY what the same message is in a DM, so every kind
+    // that works in a direct chat works in a group with no second encoding.
+    try std.testing.expectEqual(Kind.text, try parseKind(back.inner[0]));
+
+    // An empty inner is refused: that is not a message with no text, it is a frame
+    // that lost its kind byte, and guessing which kind it meant is how a parser
+    // starts inventing messages.
+    try std.testing.expectError(error.Malformed, writeGroupFrame(&buf, id, ""));
+    try std.testing.expectError(error.Malformed, parseGroupFrame(&id)); // id, nothing after
+    try std.testing.expectError(error.Malformed, parseGroupFrame(id[0 .. group_id_len - 1]));
+    var tiny: [4]u8 = undefined;
+    try std.testing.expectError(error.Malformed, writeGroupFrame(&tiny, id, &inner));
+}
+
+test "group frames: a roster survives the wire, and hostile ones do not read past it" {
+    const id = [_]u8{0x11} ** group_id_len;
+    var buf: [256]u8 = undefined;
+    const dids = [_][]const u8{ "did:plc:alice", "did:plc:bob", "did:plc:carol" };
+    const framed = try writeGroupMeta(&buf, id, "Weekend", &dids);
+
+    var m = try parseGroupMeta(framed);
+    try std.testing.expectEqualSlices(u8, &id, &m.id);
+    try std.testing.expectEqualStrings("Weekend", m.title);
+    try std.testing.expectEqual(@as(u8, 3), m.claimed);
+    for (dids) |want| try std.testing.expectEqualStrings(want, m.next().?);
+    try std.testing.expectEqual(@as(?[]const u8, null), m.next());
+
+    // A frame that CLAIMS more than it carries. Believe the walk, not the count —
+    // and the walk simply runs out rather than reading past the frame.
+    var lying = try gpaLessCopy(&buf, framed.len);
+    lying[group_id_len + 1 + "Weekend".len] = 200; // count says 200
+    var m2 = try parseGroupMeta(lying);
+    try std.testing.expectEqual(@as(u8, 200), m2.claimed);
+    var seen: usize = 0;
+    while (m2.next() != null) seen += 1;
+    try std.testing.expectEqual(@as(usize, 3), seen);
+
+    // A DID length that overruns the frame ends the walk instead of reading past.
+    var overrun = try gpaLessCopy(&buf, framed.len);
+    overrun[group_id_len + 1 + "Weekend".len + 1] = 255; // first did claims 255 bytes
+    var m3 = try parseGroupMeta(overrun);
+    try std.testing.expectEqual(@as(?[]const u8, null), m3.next());
+
+    // Truncations are refused rather than half-read.
+    try std.testing.expectError(error.Malformed, parseGroupMeta(framed[0 .. group_id_len + 1]));
+    try std.testing.expectError(error.Malformed, parseGroupMeta(framed[0..3]));
+
+    // A title or roster too long to describe in one length byte is refused at the
+    // WRITE, so a truncated field can never reach the wire in the first place.
+    const long_title = [_]u8{'x'} ** 300;
+    try std.testing.expectError(error.Malformed, writeGroupMeta(&buf, id, &long_title, &dids));
+    const empty_did = [_][]const u8{""};
+    try std.testing.expectError(error.Malformed, writeGroupMeta(&buf, id, "t", &empty_did));
+}
+
+/// A stack copy of the first `n` bytes of `src`, for tamper tests that must not
+/// disturb the original frame.
+fn gpaLessCopy(src: []const u8, n: usize) ![]u8 {
+    const S = struct {
+        var scratch: [256]u8 = undefined;
+    };
+    if (n > S.scratch.len) return error.Malformed;
+    @memcpy(S.scratch[0..n], src[0..n]);
+    return S.scratch[0..n];
+}
+
+test "groups: a group id resolves to exactly one conversation" {
+    const gpa = std.testing.allocator;
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+
+    const id_a = [_]u8{0xA0} ** group_id_len;
+    const id_b = [_]u8{0xB0} ** group_id_len;
+    const a = try startGroup(gpa, &store, id_a, "A", &.{"did:plc:x"}, &.{""});
+    const b = try startGroup(gpa, &store, id_b, "B", &.{"did:plc:y"}, &.{""});
+    _ = try openConversation(gpa, &store, "did:plc:z", "z.zat4.com");
+
+    try std.testing.expectEqual(@as(?ConvIndex, a), conversationByGroupId(&store, id_a));
+    try std.testing.expectEqual(@as(?ConvIndex, b), conversationByGroupId(&store, id_b));
+    // An id nobody has is nobody's — an ordinary answer, not an error (E4). It is
+    // what tells the receive path this is an INVITATION rather than a message for
+    // a group it already knows.
+    try std.testing.expectEqual(@as(?ConvIndex, null), conversationByGroupId(&store, [_]u8{0xCC} ** group_id_len));
+    // And a direct chat is never matched, whatever its zeroed id looks like.
+    try std.testing.expectEqual(@as(?ConvIndex, null), conversationByGroupId(&store, [_]u8{0} ** group_id_len));
 }
