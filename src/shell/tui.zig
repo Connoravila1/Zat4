@@ -1212,6 +1212,20 @@ const RunState = struct {
     /// with a hardcoded 1/60, which made the feed glide twice as far per second
     /// on a 120 Hz phone as on the 60 Hz it was tuned at.
     gscroll_clock_ns: u64,
+    /// A NOTIFICATION WAITING TO BE POSTED. Composed HERE, on this device, from a
+    /// message this device already decrypted — nothing about it goes to a server,
+    /// which is the whole reason the design refused a push payload.
+    ///
+    /// One slot, not a queue: three messages while you are away should be one
+    /// buzz, and the newest is the one worth showing.
+    gnotif_title: [64]u8,
+    gnotif_title_len: u8,
+    gnotif_body: [128]u8,
+    gnotif_body_len: u8,
+    gnotif_pending: bool,
+    /// The app is not in front. Only then is a notification the right answer — a
+    /// message arriving on the screen you are looking at does not need one.
+    gbackgrounded: bool,
     gpu_state: ?GpuState,
 };
 
@@ -2083,6 +2097,12 @@ fn initRunState(
     rs.gpress_x = -1;
     rs.gpress_y = -1;
     rs.gscroll_clock_ns = 0;
+    rs.gnotif_title = undefined;
+    rs.gnotif_title_len = 0;
+    rs.gnotif_body = undefined;
+    rs.gnotif_body_len = 0;
+    rs.gnotif_pending = false;
+    rs.gbackgrounded = false;
     rs.ghover_y = -1;
 
     // Phase 6.4: the GPU render path, brought up additively when the window is
@@ -2526,6 +2546,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                             // A genuinely new inbound message just landed
                                             // (this is the relay drain, not history) — ding.
                                             if (rs.sfxp) |p| sfx_player.play(p, .msg_receive);
+                                            chatNotify(rs, msg.peer_did, msg.text);
                                             // What they SENT it with. Only a manual
                                             // pick rides the wire; the phrase effects
                                             // are re-derived from the text locally, so
@@ -2563,6 +2584,16 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                                 if (chat_core.appendMessage(gpa, &rs.gchat_store, conv, k, body, now, false) catch null) |mi| {
                                                     chat_core.setSenderSeat(&rs.gchat_store, mi, seat);
                                                     if (rs.sfxp) |p| sfx_player.play(p, .msg_receive);
+                                                    // Named by the GROUP, not the sender: "Weekend"
+                                                    // is what a person needs on a lock screen, and
+                                                    // who said it goes in the body.
+                                                    var who_buf: [96]u8 = undefined;
+                                                    const who = chat_core.memberHandle(&rs.gchat_store, conv, seat);
+                                                    const line = if (who.len > 0)
+                                                        std.fmt.bufPrint(&who_buf, "{s}: {s}", .{ who, body }) catch body
+                                                    else
+                                                        body;
+                                                    chatNotify(rs, chat_core.groupTitle(&rs.gchat_store, conv), line);
                                                 }
                                                 chat_mutated = true;
                                             }
@@ -9181,6 +9212,29 @@ pub fn mobileImeWanted(mr: *MobileRun) bool {
     return typingOwnsKeyboard(&mr.rs);
 }
 
+/// THE APP WENT TO THE BACK, or came to the front. Only while it is behind does
+/// an arriving message deserve a notification — one for a message that landed on
+/// the screen you are already reading is noise, and noise is how somebody learns
+/// to swipe notifications away without looking.
+pub fn mobileForeground(mr: *MobileRun, front: bool) void {
+    mr.rs.gbackgrounded = !front;
+}
+
+/// A notification is waiting: copy it out and clear (read-and-clear, like the
+/// minimize flag). False = nothing to post.
+pub fn mobileNotifyTake(mr: *MobileRun, title: []u8, body: []u8, title_len: *usize, body_len: *usize) bool {
+    const rs = &mr.rs;
+    if (!rs.gnotif_pending) return false;
+    rs.gnotif_pending = false;
+    const t = @min(rs.gnotif_title_len, title.len);
+    @memcpy(title[0..t], rs.gnotif_title[0..t]);
+    title_len.* = t;
+    const b = @min(rs.gnotif_body_len, body.len);
+    @memcpy(body[0..b], rs.gnotif_body[0..b]);
+    body_len.* = b;
+    return true;
+}
+
 /// The system BACK arrived (edge swipe / back button): queue it for the pump,
 /// which pops one level of in-app navigation on the next frame.
 pub fn mobileBack(mr: *MobileRun) void {
@@ -11668,6 +11722,27 @@ fn deviceAge(arena: Allocator, at: i64) []const u8 {
 
 /// Every frame Messages is up: keep the device gate's facts current, and drain any
 /// worker that has landed. All of the network is on the worker; none of it is here.
+/// COMPOSE A NOTIFICATION for a message that just arrived. Local, from bytes this
+/// device already decrypted — nothing about it is sent anywhere.
+///
+/// Only while the app is BEHIND. A notification for a message that landed on the
+/// screen you are already reading is noise, and noise is how somebody learns to
+/// swipe them away without looking.
+///
+/// One slot, so three messages while you are away are one buzz showing the newest.
+/// A queue would be more faithful and worse: a phone that buzzes eleven times for
+/// one conversation is a phone somebody silences.
+fn chatNotify(rs: *RunState, title: []const u8, body: []const u8) void {
+    if (!rs.gbackgrounded) return;
+    const t = @min(title.len, rs.gnotif_title.len);
+    @memcpy(rs.gnotif_title[0..t], title[0..t]);
+    rs.gnotif_title_len = @intCast(t);
+    const b = @min(body.len, rs.gnotif_body.len);
+    @memcpy(rs.gnotif_body[0..b], body[0..b]);
+    rs.gnotif_body_len = @intCast(b);
+    rs.gnotif_pending = true;
+}
+
 /// A GROUP ROSTER ARRIVED. Create the group, or update the one we have.
 ///
 /// THE TRUST RULE, and it is the device directory's: an update is believed only

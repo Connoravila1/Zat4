@@ -204,6 +204,7 @@ const JavaVm = *const *const VmTable;
 const jni_find_class = 6; // FindClass
 const jni_exception_clear = 17; // ExceptionClear
 const jni_new_object_a = 30; // NewObjectA
+const jni_new_object_array = 172; // NewObjectArray
 const jni_get_object_class = 31; // GetObjectClass
 const jni_get_method_id = 33; // GetMethodID
 const jni_call_object_method_a = 36; // CallObjectMethodA
@@ -232,6 +233,7 @@ const GetMethodIdFn = *const fn (JniEnv, jclass, [*:0]const u8, [*:0]const u8) c
 const NewStringUtfFn = *const fn (JniEnv, [*:0]const u8) callconv(.c) jstring;
 const NewObjectAFn = *const fn (JniEnv, jclass, jmethodID, [*]const jvalue) callconv(.c) jobject;
 const GetObjectClassFn = *const fn (JniEnv, jobject) callconv(.c) jclass;
+const NewObjectArrayFn = *const fn (JniEnv, i32, jclass, jobject) callconv(.c) jobject;
 const CallObjectMethodAFn = *const fn (JniEnv, jobject, jmethodID, [*]const jvalue) callconv(.c) jobject;
 const CallVoidMethodAFn = *const fn (JniEnv, jobject, jmethodID, [*]const jvalue) callconv(.c) void;
 const CallBooleanMethodAFn = *const fn (JniEnv, jobject, jmethodID, [*]const jvalue) callconv(.c) u8;
@@ -488,6 +490,149 @@ fn imeSetVisible(activity: *Activity, show: bool) void {
 /// respects the user's system haptic setting, which is the polite default;
 /// failures log and no-op (E2/E4 — a missed tick, never a crash). Render
 /// thread; attach/detach like the IME hop.
+/// ASK FOR A DANGEROUS PERMISSION at runtime (API 23+).
+///
+/// Nothing in this app has ever done this, and two permissions the manifest
+/// declares need it: RECORD_AUDIO (calling cannot capture without it) and
+/// POST_NOTIFICATIONS (API 33+). A manifest entry alone stopped being a grant in
+/// Android 6 — it only makes the permission ASKABLE.
+///
+/// Fire-and-forget: the result arrives on a callback we have no Java class to
+/// receive (`hasCode="false"`), so the next attempt to use the capability is what
+/// discovers the answer. That is honest for a permission the person either grants
+/// or does not; it is not a substitute for handling a refusal at the point of use.
+fn requestPermission(activity: *Activity, name: [*:0]const u8) void {
+    const vm: JavaVm = @ptrCast(@alignCast(activity.vm));
+    var env: JniEnv = undefined;
+    const attach: AttachFn = @ptrCast(@alignCast(vm.*.slots[vm_attach_current_thread].?));
+    if (attach(vm, &env, null) != 0) return;
+    defer _ = @as(DetachFn, @ptrCast(@alignCast(vm.*.slots[vm_detach_current_thread].?)))(vm);
+
+    const find_class = jniFn(env, jni_find_class, FindClassFn);
+    const new_string = jniFn(env, jni_new_string_utf, NewStringUtfFn);
+
+    const str_cls = find_class(env, "java/lang/String");
+    if (jniFailed(env) or str_cls == null) return;
+    const name_j = new_string(env, name);
+    if (jniFailed(env) or name_j == null) return;
+
+    // String[]{ name } — NewObjectArray + SetObjectArrayElement.
+    const new_obj_array = jniFn(env, jni_new_object_array, NewObjectArrayFn);
+    const arr = new_obj_array(env, 1, str_cls, name_j);
+    if (jniFailed(env) or arr == null) return;
+
+    const mid = jniMethod(env, activity.clazz, "requestPermissions", "([Ljava/lang/String;I)V") orelse return;
+    jniFn(env, jni_call_void_method_a, CallVoidMethodAFn)(env, activity.clazz, mid, &[_]jvalue{ .{ .l = arr }, .{ .i = 1 } });
+    if (jniFailed(env)) seam.logcat("perm: requestPermissions threw", .{});
+}
+
+/// The notification channel id. Created once per process; creating it again with
+/// the same id is a documented no-op, so there is no state to track.
+const notif_channel_id = "zat.messages";
+
+/// POST A LOCAL NOTIFICATION.
+///
+/// Local, and that word is load-bearing: the text is composed on THIS device from
+/// a message this device already decrypted. Nothing about it goes to a server —
+/// not ours, not Google's — which is the whole reason the design refused a push
+/// payload (`NOTIFICATIONS_DESIGN` §3.3).
+///
+/// ⚠️ THIS ONLY FIRES WHILE THE PROCESS IS ALIVE. A backgrounded-but-running app
+/// notifies; an app the OS has frozen or killed does not, because waking one needs
+/// a JobService / BroadcastReceiver / FCM receiver — every one of which is a JAVA
+/// class, and this APK is `hasCode="false"` with no dex at all. That is an owner
+/// decision (it changes what the APK is), recorded in ZAT_CHAT_FINISH_LINE.
+fn postNotification(activity: *Activity, title: [*:0]const u8, body: [*:0]const u8) void {
+    const vm: JavaVm = @ptrCast(@alignCast(activity.vm));
+    var env: JniEnv = undefined;
+    const attach: AttachFn = @ptrCast(@alignCast(vm.*.slots[vm_attach_current_thread].?));
+    if (attach(vm, &env, null) != 0) return;
+    defer _ = @as(DetachFn, @ptrCast(@alignCast(vm.*.slots[vm_detach_current_thread].?)))(vm);
+
+    const find_class = jniFn(env, jni_find_class, FindClassFn);
+    const new_string = jniFn(env, jni_new_string_utf, NewStringUtfFn);
+    const call_obj = jniFn(env, jni_call_object_method_a, CallObjectMethodAFn);
+    const get_mid = jniFn(env, jni_get_method_id, GetMethodIdFn);
+
+    // NotificationManager.
+    const svc_j = new_string(env, "notification");
+    if (jniFailed(env) or svc_j == null) return;
+    const get_svc = jniMethod(env, activity.clazz, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;") orelse return;
+    const mgr = call_obj(env, activity.clazz, get_svc, &[_]jvalue{.{ .l = svc_j }});
+    if (jniFailed(env) or mgr == null) return seam.logcat("notif: no NotificationManager", .{});
+
+    const chan_id_j = new_string(env, notif_channel_id);
+    if (jniFailed(env) or chan_id_j == null) return;
+
+    // The channel. Required since API 26; re-creating it with the same id is a
+    // no-op, so this needs no "have we done it" flag to get out of step with.
+    const chan_cls = find_class(env, "android/app/NotificationChannel");
+    if (jniFailed(env) or chan_cls == null) return seam.logcat("notif: no NotificationChannel", .{});
+    const chan_ctor = get_mid(env, chan_cls, "<init>", "(Ljava/lang/String;Ljava/lang/CharSequence;I)V");
+    if (jniFailed(env) or chan_ctor == null) return;
+    const chan_name_j = new_string(env, "Messages");
+    if (jniFailed(env) or chan_name_j == null) return;
+    // IMPORTANCE_HIGH (4): a message is why somebody installed a messenger.
+    const chan = jniFn(env, jni_new_object_a, NewObjectAFn)(env, chan_cls, chan_ctor, &[_]jvalue{
+        .{ .l = chan_id_j }, .{ .l = chan_name_j }, .{ .i = 4 },
+    });
+    if (jniFailed(env) or chan == null) return;
+    const mgr_cls = jniFn(env, jni_get_object_class, GetObjectClassFn)(env, mgr);
+    if (jniFailed(env) or mgr_cls == null) return;
+    const create_chan = get_mid(env, mgr_cls, "createNotificationChannel", "(Landroid/app/NotificationChannel;)V");
+    if (jniFailed(env) or create_chan == null) return;
+    jniFn(env, jni_call_void_method_a, CallVoidMethodAFn)(env, mgr, create_chan, &[_]jvalue{.{ .l = chan }});
+    if (jniFailed(env)) return seam.logcat("notif: createNotificationChannel threw", .{});
+
+    // The small icon: the app's own, read off ApplicationInfo rather than a
+    // resource id constant we would have to keep in step with aapt2's output.
+    const get_app_info = jniMethod(env, activity.clazz, "getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;") orelse return;
+    const app_info = call_obj(env, activity.clazz, get_app_info, &[_]jvalue{});
+    if (jniFailed(env) or app_info == null) return;
+    const info_cls = jniFn(env, jni_get_object_class, GetObjectClassFn)(env, app_info);
+    if (jniFailed(env) or info_cls == null) return;
+    const icon_fid = jniFn(env, jni_get_field_id, GetFieldIdFn)(env, info_cls, "icon", "I");
+    if (jniFailed(env) or icon_fid == null) return;
+    const icon = jniFn(env, jni_get_int_field, GetIntFieldFn)(env, app_info, icon_fid);
+
+    // Notification.Builder(context, channelId) → set → build.
+    const b_cls = find_class(env, "android/app/Notification$Builder");
+    if (jniFailed(env) or b_cls == null) return seam.logcat("notif: no Notification.Builder", .{});
+    const b_ctor = get_mid(env, b_cls, "<init>", "(Landroid/content/Context;Ljava/lang/String;)V");
+    if (jniFailed(env) or b_ctor == null) return;
+    var b = jniFn(env, jni_new_object_a, NewObjectAFn)(env, b_cls, b_ctor, &[_]jvalue{
+        .{ .l = activity.clazz }, .{ .l = chan_id_j },
+    });
+    if (jniFailed(env) or b == null) return;
+
+    const title_j = new_string(env, title);
+    const body_j = new_string(env, body);
+    if (jniFailed(env) or title_j == null or body_j == null) return;
+
+    const set_title = get_mid(env, b_cls, "setContentTitle", "(Ljava/lang/CharSequence;)Landroid/app/Notification$Builder;");
+    const set_text = get_mid(env, b_cls, "setContentText", "(Ljava/lang/CharSequence;)Landroid/app/Notification$Builder;");
+    const set_icon = get_mid(env, b_cls, "setSmallIcon", "(I)Landroid/app/Notification$Builder;");
+    const set_auto = get_mid(env, b_cls, "setAutoCancel", "(Z)Landroid/app/Notification$Builder;");
+    const build_mid = get_mid(env, b_cls, "build", "()Landroid/app/Notification;");
+    if (jniFailed(env) or set_title == null or set_text == null or set_icon == null or
+        set_auto == null or build_mid == null) return;
+
+    b = call_obj(env, b, set_title, &[_]jvalue{.{ .l = title_j }});
+    b = call_obj(env, b, set_text, &[_]jvalue{.{ .l = body_j }});
+    b = call_obj(env, b, set_icon, &[_]jvalue{.{ .i = icon }});
+    b = call_obj(env, b, set_auto, &[_]jvalue{.{ .z = 1 }});
+    if (jniFailed(env) or b == null) return;
+    const notif = call_obj(env, b, build_mid, &[_]jvalue{});
+    if (jniFailed(env) or notif == null) return;
+
+    const notify_mid = get_mid(env, mgr_cls, "notify", "(ILandroid/app/Notification;)V");
+    if (jniFailed(env) or notify_mid == null) return;
+    jniFn(env, jni_call_void_method_a, CallVoidMethodAFn)(env, mgr, notify_mid, &[_]jvalue{
+        .{ .i = 1 }, .{ .l = notif },
+    });
+    if (jniFailed(env)) seam.logcat("notif: notify threw", .{});
+}
+
 /// Back at the app's root: Activity.moveTaskToBack(true) steps the task behind
 /// the launcher WITHOUT finishing — the process, GL context, and feed stay hot,
 /// so returning is instant (the same warm-resume path as Home). Render thread;
@@ -812,6 +957,9 @@ const App = struct {
     /// onCreate before the thread spawns) — the cache root zat_feed_start
     /// takes (M_CORE_INVERSION MC.4d).
     files_dir: [512:0]u8 = [_:0]u8{0} ** 512,
+    /// Asked for notification permission once this process. Asking again after a
+    /// refusal is how an app becomes something people uninstall.
+    asked_notif_perm: bool = false,
     /// The live activity (M-And.5: the render thread's JNI door for the
     /// browser launch). Set in onCreate before the thread spawns; onDestroy
     /// JOINS the render thread before the pointer dies, so no use races
@@ -1069,6 +1217,20 @@ fn renderThread() void {
             if (seam.zat_minimize(ctx)) {
                 if (app.activity) |act| moveTaskToBack(act);
             }
+            // A MESSAGE ARRIVED WHILE WE WERE BEHIND. The text was composed on
+            // this device from bytes it had already decrypted; posting it is the
+            // last step and the only one the OS is involved in.
+            {
+                var ntitle: [64]u8 = undefined;
+                var nbody: [128]u8 = undefined;
+                if (seam.zat_notify_take(ctx, &ntitle, ntitle.len, &nbody, nbody.len)) {
+                    if (app.activity) |act| postNotification(
+                        act,
+                        @ptrCast(&ntitle),
+                        @ptrCast(&nbody),
+                    );
+                }
+            }
             // The keyboard's live inset: polled while it is up so the chat
             // composer rides ABOVE it (it used to be covered — typing blind).
             // No JNI hop while hidden; 0 clears the lift.
@@ -1235,6 +1397,25 @@ fn routeStderrToLogcat() void {
 }
 
 /// The framework's entry point (looked up by name in the library that
+fn onResumeCb(activity: *Activity) callconv(.c) void {
+    _ = activity;
+    if (g_ctx) |c| seam.zat_foreground(c, true);
+    // Ask for notification permission the first time we are actually in front.
+    // API 33+ requires it, a manifest entry alone has not been a grant since
+    // Android 6, and NOTHING in this app has ever asked for anything — the mic
+    // that calling needs is in the same position (RECORD_AUDIO is declared and
+    // never requested).
+    if (!app.asked_notif_perm) {
+        app.asked_notif_perm = true;
+        if (app.activity) |act| requestPermission(act, "android.permission.POST_NOTIFICATIONS");
+    }
+}
+
+fn onPauseCb(activity: *Activity) callconv(.c) void {
+    _ = activity;
+    if (g_ctx) |c| seam.zat_foreground(c, false);
+}
+
 /// android.app.lib_name names). Wire the callbacks, start the one thread.
 /// A second create in a live process is the OAuth redirect trampoline
 /// (M-And.5) — handled and dismissed before any of this state is touched.
@@ -1248,6 +1429,13 @@ export fn ANativeActivity_onCreate(activity: *Activity, saved: ?*anyopaque, save
     activity.callbacks.onInputQueueCreated = onInputQueueCreated;
     activity.callbacks.onInputQueueDestroyed = onInputQueueDestroyed;
     activity.callbacks.onDestroy = onDestroy;
+    // FOREGROUND / BACKGROUND. A notification is only right while the app is
+    // behind — one for a message that landed on the screen you are already
+    // reading is noise, and noise is how somebody learns to swipe them away
+    // without looking. UI thread: flip a flag, never work (the rule this file
+    // states at its callback section).
+    activity.callbacks.onResume = onResumeCb;
+    activity.callbacks.onPause = onPauseCb;
     app = .{};
     app.activity = activity;
     // A recreate can BE the redirect delivery (Android tears the activity

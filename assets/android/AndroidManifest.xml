@@ -8,6 +8,10 @@
     android:versionName="0.1.0">
   <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="34"/>
   <uses-permission android:name="android.permission.INTERNET"/>
+  <!-- API 33+: a message notification cannot be posted without it, and a manifest
+       entry alone has not been a grant since Android 6 — the app asks at runtime
+       the first time it comes to the front. -->
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
   <!-- Voice/video calling captures the microphone (Zat Chat calling). -->
   <uses-permission android:name="android.permission.RECORD_AUDIO"/>
   <!-- debuggable: test builds only. It is what lets `adb run-as` provision

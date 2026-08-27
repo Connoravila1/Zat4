@@ -1114,6 +1114,42 @@ pub export fn zat_minimize(ctx_ptr: ?*anyopaque) bool {
     return tui.mobileMinimizeTake(f.run);
 }
 
+/// THE APP MOVED between foreground and background. Only while it is behind does
+/// an arriving message deserve a notification.
+pub export fn zat_foreground(ctx_ptr: ?*anyopaque, front: bool) void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return));
+    if (comptime !mobile_config.have_gpu) return;
+    const f = if (ctx.feed) |*ff| ff else return;
+    tui.mobileForeground(f.run, front);
+}
+
+/// A NOTIFICATION IS WAITING (read-and-clear). The activity polls this each lap
+/// and posts it through the OS. The strings are composed on-device from an
+/// already-decrypted message — the text never came from, and never goes to, a
+/// server.
+///
+/// NUL-terminated on the way out because the JNI side hands them to
+/// NewStringUTF, which wants a C string.
+pub export fn zat_notify_take(
+    ctx_ptr: ?*anyopaque,
+    title: [*]u8,
+    title_cap: usize,
+    body: [*]u8,
+    body_cap: usize,
+) bool {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return false));
+    if (comptime !mobile_config.have_gpu) return false;
+    const f = if (ctx.feed) |*ff| ff else return false;
+    if (title_cap == 0 or body_cap == 0) return false;
+    var tl: usize = 0;
+    var bl: usize = 0;
+    const got = tui.mobileNotifyTake(f.run, title[0 .. title_cap - 1], body[0 .. body_cap - 1], &tl, &bl);
+    if (!got) return false;
+    title[tl] = 0;
+    body[bl] = 0;
+    return true;
+}
+
 /// Does the frame want the soft keyboard? The activity polls this each lap
 /// and shows/hides the IME on the transition (the composer is the phone's
 /// only text surface so far).
