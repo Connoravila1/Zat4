@@ -1217,6 +1217,12 @@ fn renderThread() void {
             if (seam.zat_minimize(ctx)) {
                 if (app.activity) |act| moveTaskToBack(act);
             }
+            // A CALL WANTS THE MIC. Asked at the moment a call starts, which is
+            // both the honest place for it and the one where somebody will say
+            // yes — a mic prompt at first launch gets denied by reflex.
+            if (seam.zat_mic_permission_wanted(ctx)) {
+                if (app.activity) |act| requestPermission(act, "android.permission.RECORD_AUDIO");
+            }
             // A MESSAGE ARRIVED WHILE WE WERE BEHIND. The text was composed on
             // this device from bytes it had already decrypted; posting it is the
             // last step and the only one the OS is involved in.

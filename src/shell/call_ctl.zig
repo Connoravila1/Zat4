@@ -64,6 +64,19 @@ pub const Phase = enum(u8) {
 pub const CallCtl = struct {
     phase: Phase = .idle,
 
+    /// A CALL WANTS THE MICROPHONE and the OS has not been asked for it.
+    ///
+    /// The manifest has declared RECORD_AUDIO since calling landed, and nothing in
+    /// this app has ever requested a runtime permission — which stopped being
+    /// optional in Android 6. On any device where it was not granted by hand,
+    /// capture just fails, and a call with no microphone looks like a broken
+    /// microphone rather than a missing grant.
+    ///
+    /// Read-and-cleared by the shell each frame; the ask happens at call START,
+    /// not at launch, because a permission prompt on first run for a feature
+    /// nobody has reached for is the prompt people deny out of hand.
+    mic_perm_wanted: bool = false,
+
     /// The live call, once ICE addresses are exchanged and the worker is up.
     sess: ?*call_session.Session = null,
 

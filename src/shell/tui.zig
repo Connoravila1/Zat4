@@ -1223,6 +1223,15 @@ const RunState = struct {
     gnotif_body: [128]u8,
     gnotif_body_len: u8,
     gnotif_pending: bool,
+    /// A CALL WANTS THE MICROPHONE. The manifest declares RECORD_AUDIO and, until
+    /// now, nothing ever asked for it — and a manifest entry stopped being a grant
+    /// in Android 6. So on every device where it was not granted by hand, capture
+    /// simply fails, which looks exactly like a broken mic.
+    ///
+    /// Asked at the moment a call starts rather than at launch: a permission
+    /// prompt on first run, for a feature nobody has reached for yet, is the
+    /// prompt people deny out of hand.
+    gmic_perm_wanted: bool,
     /// The app is not in front. Only then is a notification the right answer — a
     /// message arriving on the screen you are looking at does not need one.
     gbackgrounded: bool,
@@ -2102,6 +2111,7 @@ fn initRunState(
     rs.gnotif_body = undefined;
     rs.gnotif_body_len = 0;
     rs.gnotif_pending = false;
+    rs.gmic_perm_wanted = false;
     rs.gbackgrounded = false;
     rs.ghover_y = -1;
 
@@ -2617,6 +2627,9 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                     const kb = if (c.bytes.len > 0) c.bytes[0] else 0;
                                     const evt = call.eventForKind(kb);
                                     chatLog("[call] signal from {s}: byte={d} ({s}), {d} bytes", .{ c.peer_did, kb, if (evt) |e| @tagName(e) else "unknown", c.bytes.len });
+                                    // An INBOUND call needs the mic too, and this is
+                                    // the first moment we know one is coming.
+                                    rs.gmic_perm_wanted = true;
                                     call_ctl.onSignal(&rs.gcall, gpa, io, environ, st, rs.gchat_link.?, c.peer_did, c.bytes);
                                 },
                                 // A GAME MOVE. Stored as an ordinary message of
@@ -9220,6 +9233,21 @@ pub fn mobileForeground(mr: *MobileRun, front: bool) void {
     mr.rs.gbackgrounded = !front;
 }
 
+/// A call is starting and wants the microphone (read-and-clear). The activity
+/// asks the OS; the answer arrives at the next capture attempt, which is the
+/// honest place for it — see `requestPermission` in android_activity.zig.
+pub fn mobileMicPermTake(mr: *MobileRun) bool {
+    // The controller sets its own flag (it is what `chatSend` can reach); fold it
+    // in here so there is one place the seam reads.
+    if (mr.rs.gcall.mic_perm_wanted) {
+        mr.rs.gcall.mic_perm_wanted = false;
+        mr.rs.gmic_perm_wanted = true;
+    }
+    const v = mr.rs.gmic_perm_wanted;
+    mr.rs.gmic_perm_wanted = false;
+    return v;
+}
+
 /// A notification is waiting: copy it out and clear (read-and-clear, like the
 /// minimize flag). False = nothing to post.
 pub fn mobileNotifyTake(mr: *MobileRun, title: []u8, body: []u8, title_len: *usize, body_len: *usize) bool {
@@ -10624,6 +10652,7 @@ fn chatSend(gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, st
     // command needs no UI surgery.
     if (std.mem.eql(u8, text, "/call")) {
         chatLog("[call] /call typed → placing a call to {s}", .{peer_did});
+        callWantsMic(gcall);
         call_ctl.startOutgoing(gcall, gpa, io, env, state, l, peer_did);
         return;
     }
@@ -11722,6 +11751,13 @@ fn deviceAge(arena: Allocator, at: i64) []const u8 {
 
 /// Every frame Messages is up: keep the device gate's facts current, and drain any
 /// worker that has landed. All of the network is on the worker; none of it is here.
+/// `chatSend` has the call trigger but not the run state, so the request rides
+/// the call controller's own struct back out. One line, and it keeps the mic ask
+/// welded to the moment a call actually starts.
+fn callWantsMic(gcall: *call_ctl.CallCtl) void {
+    gcall.mic_perm_wanted = true;
+}
+
 /// COMPOSE A NOTIFICATION for a message that just arrived. Local, from bytes this
 /// device already decrypted — nothing about it is sent anywhere.
 ///

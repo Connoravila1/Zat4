@@ -1150,6 +1150,16 @@ pub export fn zat_notify_take(
     return true;
 }
 
+/// A CALL IS STARTING AND WANTS THE MICROPHONE (read-and-clear). The activity
+/// asks the OS. Nothing in this app requested a runtime permission before this,
+/// and RECORD_AUDIO has been declared-but-never-asked since calling landed.
+pub export fn zat_mic_permission_wanted(ctx_ptr: ?*anyopaque) bool {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return false));
+    if (comptime !mobile_config.have_gpu) return false;
+    const f = if (ctx.feed) |*ff| ff else return false;
+    return tui.mobileMicPermTake(f.run);
+}
+
 /// Does the frame want the soft keyboard? The activity polls this each lap
 /// and shows/hides the IME on the transition (the composer is the phone's
 /// only text surface so far).
