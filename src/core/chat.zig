@@ -193,7 +193,21 @@ pub const kind_react_wire: u8 = 10;
 ///
 /// The id rides INSIDE the E2EE payload, so it is exactly as private as the
 /// words it decorates — the relay sees one more opaque blob of the same shape.
-pub const kind_text_fx_wire: u8 = 11;
+/// ⚠️ MOVED 11 → 13, 2026-08-26, because 11 WAS ALREADY TAKEN by
+/// `kind_read_wire` and the receive path dispatches both off the same byte in
+/// the same if-chain — with the read receipt checked first.
+///
+/// The effect was total: every message sent with an effect was LOST. Short ones
+/// hit the read receipt's `if (data.len < 9) return null` and were dropped
+/// silently; longer ones were decoded AS a read receipt, so the words vanished
+/// and eight bytes of (effect, bubble, text) were stamped in as an i64 read
+/// watermark. The feature looked fine to the sender, whose own echo is local.
+///
+/// Moving THIS one rather than the receipt is the lesser break: effects have
+/// never once arrived, so new↔new starts working and new↔old is no worse than
+/// the nothing it already was, while read receipts — which won the collision and
+/// therefore do work — keep their byte and keep working.
+pub const kind_text_fx_wire: u8 = 13;
 
 /// How many times an unacknowledged Welcome is re-sent before the client
 /// stops and says so. With the ladder below this is ~1 hour of trying; a
@@ -282,6 +296,53 @@ pub const KindError = error{UnknownKind};
 /// Wire byte -> kind. Reserved and unknown bytes are explicit errors, not
 /// silently coerced (E3) — an unrecognized kind is a message this build
 /// cannot faithfully render, and pretending it is text would misrepresent it.
+/// EVERY BYTE THAT CAN APPEAR FIRST IN A DECRYPTED PAYLOAD, in one place, with a
+/// comptime proof that no two of them are the same.
+///
+/// This exists because two of them WERE the same. `kind_text_fx_wire` and
+/// `kind_read_wire` both claimed 11, sat in the same dispatch chain, and the
+/// receipt won — so the effects feature never delivered a single message and
+/// nothing anywhere said so. The constants were declared 1000 lines apart, which
+/// is exactly how far apart two things have to be before nobody notices they
+/// collide.
+///
+/// A new wire kind goes in this list. If it duplicates one, the build stops.
+const wire_kinds = [_]u8{
+    @intFromEnum(Kind.text),
+    @intFromEnum(Kind.system),
+    kind_typing_wire,
+    kind_group_ack_wire,
+    kind_roster_wire,
+    kind_history_req_wire,
+    kind_history_chunk_wire,
+    kind_unsend_wire,
+    kind_edit_wire,
+    kind_reply_wire,
+    kind_react_wire,
+    @intFromEnum(Kind.game_move),
+    kind_text_fx_wire,
+    kind_read_wire,
+    @intFromEnum(Kind.payment_request),
+    @intFromEnum(Kind.payment_sent),
+    kind_pay_settled_wire,
+    kind_pay_failed_wire,
+    kind_pay_offer_wire,
+    kind_pay_ready_wire,
+    kind_pay_cancel_wire,
+    kind_pay_decline_wire,
+};
+
+comptime {
+    for (wire_kinds, 0..) |a, i| {
+        for (wire_kinds[i + 1 ..]) |b| {
+            if (a == b) @compileError(
+                "two wire kinds share a byte — the receive path dispatches on it, " ++
+                    "so one of them would silently swallow the other (see kind_text_fx_wire)",
+            );
+        }
+    }
+}
+
 pub fn parseKind(byte: u8) KindError!Kind {
     return switch (byte) {
         0 => .text,
@@ -3261,4 +3322,27 @@ test "store codec v11: groups round-trip, and pre-group history is MIGRATED" {
         error.Malformed,
         deserializeStore(gpa, forged[0 .. forged.len - forged_tail]),
     );
+}
+
+test "wire: no two kinds share a first byte" {
+    // The comptime block above already fails the BUILD on a duplicate, so this is
+    // the record of why it is there rather than the enforcement.
+    //
+    // `kind_text_fx_wire` and `kind_read_wire` both claimed 11. They are declared
+    // a thousand lines apart, they are dispatched off `data[0]` in the same
+    // if-chain in `chat_e2ee.zig`, and the receipt is checked first — so EVERY
+    // message sent with an effect was lost. Short ones tripped the receipt's
+    // `data.len < 9` guard and were dropped without a word; longer ones decoded AS
+    // a receipt, so the words vanished and eight bytes of (effect, bubble, text)
+    // were stamped in as an i64 read watermark. The sender saw their own local
+    // echo and had no way to know.
+    var seen = [_]bool{false} ** 256;
+    for (wire_kinds) |k| {
+        try std.testing.expect(!seen[k]); // a duplicate would have swallowed a feature
+        seen[k] = true;
+    }
+
+    // The two that collided, named explicitly: a test that only walks the table
+    // would still pass if somebody quietly dropped one of them from it.
+    try std.testing.expect(kind_text_fx_wire != kind_read_wire);
 }
