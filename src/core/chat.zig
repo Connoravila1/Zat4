@@ -355,6 +355,49 @@ pub const ChatMsg = struct {
     }
 };
 
+/// Index into `Store.members`.
+pub const MemberIndex = enum(u32) { _ };
+
+/// ONE PARTICIPANT of a conversation.
+///
+/// A direct chat has exactly one member — the counterparty — and a group has
+/// several. There is deliberately no separate one-person path (A2): the direct
+/// chat is the degenerate case of the same array, walked by the same code, so a
+/// group feature cannot work "except in DMs" and a DM fix cannot miss groups.
+///
+/// `did`/`handle` here are the SAME SPANS the conversation's dedup key holds for
+/// a direct chat — the same offset into `string_bytes`, not a second copy of the
+/// bytes. One string, two references to it.
+pub const Member = struct {
+    /// Identity. Crosses module boundaries as the DID (A5).
+    did: TextSpan,
+    /// Display handle; empty until resolved, exactly as on a conversation.
+    handle: TextSpan,
+    /// LEFT the conversation. Kept rather than removed, and this is load-bearing:
+    /// a message attributes to a member by its OFFSET in the conversation's span,
+    /// so removing a row would renumber the ones above it and silently re-attribute
+    /// history to the wrong person. The same reason `deleted` is a tombstone.
+    left: bool = false,
+
+    comptime {
+        // Budget: two spans (16) + the flag, padded. Members are held in the
+        // dozens per account, but they are walked per conversation row and per
+        // message attribution, so the guard stays (A7).
+        assert(@sizeOf(Member) == 20);
+    }
+};
+
+/// WHAT KIND OF CONVERSATION. A group with one member left is still a group, and
+/// a direct chat is not a group of one — which is why this is a stated kind and
+/// not "member_count > 1" inferred at the call site. Values are FROZEN: the
+/// history codec persists this byte.
+pub const ConvKind = enum(u8) { direct = 0, group = 1 };
+
+/// Sentinel `sender` for a message this account wrote. The direction bitset
+/// already says so; this keeps the sender column total rather than meaningless
+/// on half its rows.
+pub const sender_me: u16 = std.math.maxInt(u16);
+
 /// One conversation, deduplicated by counterparty DID. A zero-length handle
 /// span encodes "not yet resolved" — no booleans (A6).
 pub const Conversation = struct {
@@ -381,13 +424,27 @@ pub const Conversation = struct {
     /// turned OFF looks like — and those two must be indistinguishable, or the
     /// setting would leak the fact that you turned it off).
     read_up_to: i64 = 0,
+    /// GROUPS. The participants, as a span into `Store.members`. Every
+    /// conversation has one — a direct chat's is length 1 — so nothing downstream
+    /// has to ask which sort it is before it can list who is in it.
+    member_first: u32 = 0,
+    member_count: u16 = 0,
+    /// Direct or group. Stated, never inferred from `member_count`: a group
+    /// everyone but you has left still is one.
+    kind: ConvKind = .direct,
+    /// The group's name. Empty for a direct chat, which is named by its
+    /// counterparty and has nothing to store here.
+    title: TextSpan = TextSpan.empty,
 
     comptime {
-        // A7.1 — budget raised 32 → 40. The three flags were free (they landed in
-        // padding); `read_up_to` is a real i64 and is not. Paid deliberately: a read
-        // receipt you cannot store is one you cannot show, and conversations are held
-        // in the dozens, not the millions.
-        assert(@sizeOf(Conversation) == 40);
+        // A7.1 — budget raised 40 → 56 for GROUPS. `member_first`+`member_count`
+        // +`kind` (7 bytes) land in the tail padding and cost nothing; `title` is a
+        // real span and does not. Paid deliberately, and the alternative was worse:
+        // a parallel side-table keyed by conversation, which is the same bytes plus
+        // a lookup plus a way for the two to disagree. Conversations are held in the
+        // dozens, and in the SoA store each field is its own array, so a column
+        // nobody reads is a column nobody pays to touch.
+        assert(@sizeOf(Conversation) == 56);
     }
 };
 
@@ -563,6 +620,18 @@ pub const Store = struct {
     /// CHAT_FEATURES: reactions. SPARSE by nature — most messages have none — so
     /// they are their own rows rather than a column on every message (A3/A6: you do
     /// not pay for a thing on the messages that do not have it).
+    /// GROUPS: every conversation's participants, contiguous per conversation
+    /// (`Conversation.member_first`/`member_count`). One flat array rather than a
+    /// list per conversation — the same reason messages are one array (A3).
+    members: std.MultiArrayList(Member) = .empty,
+    /// WHO SENT IT, parallel to `msgs` (A6): the sender's OFFSET within its
+    /// conversation's member span, or `sender_me`. In a direct chat it is always
+    /// 0, and that is not a special case — it is the same lookup against a
+    /// one-element list.
+    ///
+    /// The direction bitset alone was enough while every conversation had exactly
+    /// one counterparty; in a group "not mine" names no one.
+    senders: std.ArrayListUnmanaged(u16) = .empty,
     reactions: std.MultiArrayList(Reaction) = .empty,
     /// One row per payment card (card ⇔ row; M5 A1).
     payments: std.MultiArrayList(PaymentRow) = .empty,
@@ -577,6 +646,8 @@ pub fn deinitStore(gpa: Allocator, store: *Store) void {
     store.convs.deinit(gpa);
     store.msgs.deinit(gpa);
     store.conv_by_did.deinit(gpa);
+    store.members.deinit(gpa);
+    store.senders.deinit(gpa);
     store.mine.deinit(gpa);
     store.reactions.deinit(gpa);
     store.deleted.deinit(gpa);
@@ -711,15 +782,214 @@ pub fn openConversation(
         TextSpan.empty;
 
     const index: u32 = @intCast(store.convs.len);
+    // The counterparty is seated as member 0 — the SAME spans the dedup key
+    // holds, not a second copy of the bytes. One creation path for both sorts of
+    // conversation, so nothing downstream has to ask which it is (A2).
+    const member_first: u32 = @intCast(store.members.len);
+    try store.members.append(gpa, .{ .did = did_span, .handle = handle_span });
     try store.convs.append(gpa, .{
         .did = did_span,
         .handle = handle_span,
         .last_activity = 0,
         .unread = 0,
+        .kind = .direct,
+        .member_first = member_first,
+        .member_count = 1,
     });
     gop.key_ptr.* = did_span.offset;
     gop.value_ptr.* = index;
     return @enumFromInt(index);
+}
+
+// ---------------------------------------------------------------------------
+// GROUPS. A group is the same conversation with more than one member, walked by
+// the same code — see `Member` for why there is no separate one-person path.
+// ---------------------------------------------------------------------------
+
+/// The members table is STRUCT-OF-ARRAYS (A3), so there is no contiguous
+/// `[]Member` to hand back and this is deliberately not that shape. Callers walk
+/// `0..memberCount(conv)` and ask for the field they need — which also keeps the
+/// store's indexes inside this module (A5): what crosses the boundary is a DID,
+/// a handle, a count.
+///
+/// Resolve one member's row, or null when the conversation or the seat does not
+/// exist — including a store restored from a blob written before groups, whose
+/// member table is empty. Absence is an ordinary answer here (E4).
+fn memberRow(store: *const Store, conv: ConvIndex, seat: u16) ?u32 {
+    const ci = @intFromEnum(conv);
+    if (ci >= store.convs.len) return null;
+    if (seat >= store.convs.items(.member_count)[ci]) return null;
+    const row = store.convs.items(.member_first)[ci] + @as(u32, seat);
+    if (row >= store.members.len) return null;
+    return row;
+}
+
+/// The DID of the participant in `seat` (seating order). "" if there is none.
+pub fn memberDid(store: *const Store, conv: ConvIndex, seat: u16) []const u8 {
+    const row = memberRow(store, conv, seat) orelse return "";
+    return sliceSpan(store, store.members.items(.did)[row]);
+}
+
+/// Their display handle, "" until it is known — same convention as a
+/// conversation's.
+pub fn memberHandle(store: *const Store, conv: ConvIndex, seat: u16) []const u8 {
+    const row = memberRow(store, conv, seat) orelse return "";
+    return sliceSpan(store, store.members.items(.handle)[row]);
+}
+
+/// Have they left? Their seat stays either way — see `Member.left`.
+pub fn memberLeft(store: *const Store, conv: ConvIndex, seat: u16) bool {
+    const row = memberRow(store, conv, seat) orelse return false;
+    return store.members.items(.left)[row];
+}
+
+/// A hard ceiling on group size, mirroring the device-set cap's reasoning: an
+/// unbounded member list is a fan-out bomb aimed at other people's clients, and
+/// every member multiplies the MLS tree work on every send.
+pub const max_members: u16 = 256;
+
+pub const GroupError = error{ OutOfMemory, GroupFull, NotAGroup, NoSuchConversation };
+
+/// ADD a participant, and hand back the seat they took.
+///
+/// Members are contiguous per conversation in one flat array, so this INSERTS at
+/// the end of this conversation's span and slides everything after it along —
+/// including the `member_first` of every conversation seated above. That is O(n)
+/// over a table held in the dozens, and it keeps the array dense: the cheaper
+/// "append at the tail and relocate the span" leaves dead rows behind that then
+/// travel to disk and back forever.
+///
+/// Seats are append-only for the life of the conversation, which is what lets a
+/// message store its sender as a seat number (see `Store.senders`).
+pub fn addMember(
+    gpa: Allocator,
+    store: *Store,
+    conv: ConvIndex,
+    did: []const u8,
+    handle: []const u8,
+) GroupError!u16 {
+    const ci = @intFromEnum(conv);
+    if (ci >= store.convs.len) return error.NoSuchConversation;
+    const seat = store.convs.items(.member_count)[ci];
+    if (seat >= max_members) return error.GroupFull;
+
+    const did_span = try appendString(gpa, store, did);
+    const handle_span = if (handle.len > 0) try appendString(gpa, store, handle) else TextSpan.empty;
+
+    const row = store.convs.items(.member_first)[ci] + @as(u32, seat);
+    try store.members.insert(gpa, row, .{ .did = did_span, .handle = handle_span });
+
+    // Everyone seated above this row shifted along by one.
+    const firsts = store.convs.items(.member_first);
+    for (firsts, 0..) |*f, i| {
+        if (i != ci and f.* >= row) f.* += 1;
+    }
+    store.convs.items(.member_count)[ci] = seat + 1;
+    return seat;
+}
+
+/// They LEFT. The seat is marked, never removed — message attribution is by seat
+/// number, and renumbering would quietly re-attribute history to whoever slid
+/// into the gap.
+pub fn setMemberLeft(store: *Store, conv: ConvIndex, seat: u16, left: bool) void {
+    const row = memberRow(store, conv, seat) orelse return;
+    store.members.items(.left)[row] = left;
+}
+
+/// The seat this DID sits in, or null if they are not in this conversation.
+pub fn seatOf(store: *const Store, conv: ConvIndex, did: []const u8) ?u16 {
+    const n = memberCount(store, conv);
+    var seat: u16 = 0;
+    while (seat < n) : (seat += 1) {
+        if (std.mem.eql(u8, memberDid(store, conv, seat), did)) return seat;
+    }
+    return null;
+}
+
+/// START A GROUP: a conversation that is a group from birth, named, with its
+/// founding members seated in the order given.
+///
+/// It is NOT deduplicated by counterparty — that key means nothing here, and two
+/// groups with the same people are two different groups, which is exactly how
+/// people use them.
+pub fn startGroup(
+    gpa: Allocator,
+    store: *Store,
+    title: []const u8,
+    dids: []const []const u8,
+    handles: []const []const u8,
+) GroupError!ConvIndex {
+    if (dids.len > max_members) return error.GroupFull;
+    const title_span = if (title.len > 0) try appendString(gpa, store, title) else TextSpan.empty;
+
+    const index: u32 = @intCast(store.convs.len);
+    const member_first: u32 = @intCast(store.members.len);
+    try store.convs.append(gpa, .{
+        .did = TextSpan.empty, // a group has no single counterparty to be keyed by
+        .handle = TextSpan.empty,
+        .last_activity = 0,
+        .unread = 0,
+        .kind = .group,
+        .member_first = member_first,
+        .member_count = 0,
+        .title = title_span,
+    });
+    const conv: ConvIndex = @enumFromInt(index);
+    for (dids, 0..) |did, i| {
+        const handle = if (i < handles.len) handles[i] else "";
+        _ = try addMember(gpa, store, conv, did, handle);
+    }
+    return conv;
+}
+
+/// WHO SENT IT: the seat, or `sender_me`. A message of ours answers `sender_me`
+/// whatever the column holds — the direction bit is the older, stronger fact.
+pub fn senderSeat(store: *const Store, msg: MsgIndex) u16 {
+    const mi = @intFromEnum(msg);
+    if (mi >= store.msgs.len) return sender_me;
+    if (isMine(store, msg)) return sender_me;
+    if (mi >= store.senders.items.len) return 0; // pre-groups history: one counterparty
+    return store.senders.items[mi];
+}
+
+/// The DID of whoever sent `msg`, or "" for our own. In a direct chat this is
+/// the counterparty every time, by the same lookup a group uses.
+pub fn senderDid(store: *const Store, msg: MsgIndex) []const u8 {
+    const seat = senderSeat(store, msg);
+    if (seat == sender_me) return "";
+    const mi = @intFromEnum(msg);
+    if (mi >= store.msgs.len) return "";
+    return memberDid(store, store.msgs.items(.conv)[mi], seat);
+}
+
+/// Their display handle, "" until known.
+pub fn senderHandle(store: *const Store, msg: MsgIndex) []const u8 {
+    const seat = senderSeat(store, msg);
+    if (seat == sender_me) return "";
+    const mi = @intFromEnum(msg);
+    if (mi >= store.msgs.len) return "";
+    return memberHandle(store, store.msgs.items(.conv)[mi], seat);
+}
+
+/// Is this conversation a group?
+pub fn isGroup(store: *const Store, conv: ConvIndex) bool {
+    const ci = @intFromEnum(conv);
+    return ci < store.convs.len and store.convs.items(.kind)[ci] == .group;
+}
+
+/// The group's name, or "" for a direct chat (which is named by its
+/// counterparty and stores nothing).
+pub fn groupTitle(store: *const Store, conv: ConvIndex) []const u8 {
+    const ci = @intFromEnum(conv);
+    if (ci >= store.convs.len) return "";
+    return sliceSpan(store, store.convs.items(.title)[ci]);
+}
+
+/// How many participants, counting those who have left (their rows stay so
+/// message attribution does not shift under history).
+pub fn memberCount(store: *const Store, conv: ConvIndex) u16 {
+    const ci = @intFromEnum(conv);
+    return if (ci < store.convs.len) store.convs.items(.member_count)[ci] else 0;
 }
 
 /// Append one message to a conversation. Bumps the conversation's activity
@@ -765,6 +1035,12 @@ fn appendRecord(
     store.mine.setValue(index, mine);
     try store.deleted.resize(gpa, store.msgs.len, false);
     try store.edited.resize(gpa, store.msgs.len, false);
+    // The sender column grows in lockstep with the messages, exactly as the
+    // direction bitset does. Seat 0 is the default and it is the right answer for
+    // every direct chat — the one-member case of the same lookup. A group send
+    // overwrites it through `setSenderSeat`, which is the only way it differs.
+    try store.senders.resize(gpa, store.msgs.len);
+    store.senders.items[index] = if (mine) sender_me else 0;
 
     const ci: u32 = @intFromEnum(conv);
     const convs = store.convs.slice();
@@ -776,6 +1052,14 @@ fn appendRecord(
 }
 
 /// The reader has seen this conversation; its unread count returns to zero.
+/// WHO in a group sent it. Called by the receive path once it knows; a direct
+/// chat never needs it, because seat 0 is already the only counterparty there is.
+pub fn setSenderSeat(store: *Store, msg: MsgIndex, seat: u16) void {
+    const mi = @intFromEnum(msg);
+    if (mi >= store.senders.items.len) return;
+    store.senders.items[mi] = seat;
+}
+
 /// Is this message a tombstone? (PURE.)
 pub fn isDeleted(store: *const Store, msg: u32) bool {
     if (msg >= store.deleted.bit_length) return false;
@@ -1422,8 +1706,9 @@ const codec_magic = [4]u8{ 'Z', 'A', 'T', 'H' };
 /// sections so every v2 blob still reads (a version gate is a compatibility
 /// contract and is written as a RANGE — the day we wrote it as a LIST, a v3 bump
 /// orphaned every conversation on the owner's phone).
-const codec_version: u16 = 10; // v10: the game-move column, one u8 per message
+const codec_version: u16 = 11; // v11: groups — the member table, the conversation's kind/title/span, the sender column
 const conv_rec_len = 28; // did span 8 + handle span 8 + i64 8 + u32 4
+const member_rec_len = 17; // did span 8 + handle span 8 + left u8 1
 const msg_rec_len = 21; // i64 8 + text span 8 + conv 4 + kind 1
 const pay_rec_len = 23; // id 8 + amount 8 + msg 4 + rail 1 + status 1 + conf 1
 const ref_rec_len = 36; // pay 4 + ref 32
@@ -1451,7 +1736,11 @@ pub fn serializeStore(gpa: Allocator, store: *const Store) error{OutOfMemory}![]
         4 + store.reactions.len * 13 + // v7: reactions (u32 msg + 8 emoji + 1 mine)
         8 * c_count + // v8: read_up_to, one i64 per conversation
         m_count + // v9: effect, one u8 per message
-        m_count; // v10: game move, one u8 per message
+        m_count + // v10: game move, one u8 per message
+        // v11: GROUPS.
+        4 + store.members.len * member_rec_len + // the member table
+        c_count * (1 + 8 + 4 + 2) + // per conversation: kind, title span, member span
+        2 * m_count; // per message: the sender's seat
     const out = try gpa.alloc(u8, total);
     errdefer gpa.free(out);
 
@@ -1599,11 +1888,46 @@ pub fn serializeStore(gpa: Allocator, store: *const Store) error{OutOfMemory}![]
         at += 1;
     }
 
+    // v11: GROUPS. The member table first (the conversations' spans point into
+    // it), then each conversation's kind/title/span, then who sent each message.
+    std.mem.writeInt(u32, out[at..][0..4], @intCast(store.members.len), .little);
+    at += 4;
+    const mems = store.members.slice();
+    for (0..store.members.len) |i| {
+        const spans = [2]TextSpan{ mems.items(.did)[i], mems.items(.handle)[i] };
+        for (spans) |span| {
+            std.mem.writeInt(u32, out[at..][0..4], span.offset, .little);
+            at += 4;
+            std.mem.writeInt(u32, out[at..][0..4], span.len, .little);
+            at += 4;
+        }
+        out[at] = @intFromBool(mems.items(.left)[i]);
+        at += 1;
+    }
+    for (0..c_count) |i| {
+        out[at] = @intFromEnum(convs.items(.kind)[i]);
+        at += 1;
+        const t = convs.items(.title)[i];
+        std.mem.writeInt(u32, out[at..][0..4], t.offset, .little);
+        at += 4;
+        std.mem.writeInt(u32, out[at..][0..4], t.len, .little);
+        at += 4;
+        std.mem.writeInt(u32, out[at..][0..4], convs.items(.member_first)[i], .little);
+        at += 4;
+        std.mem.writeInt(u16, out[at..][0..2], convs.items(.member_count)[i], .little);
+        at += 2;
+    }
+    for (0..m_count) |i| {
+        const seat: u16 = if (i < store.senders.items.len) store.senders.items[i] else 0;
+        std.mem.writeInt(u16, out[at..][0..2], seat, .little);
+        at += 2;
+    }
+
     assert(at == total);
     return out;
 }
 
-/// The byte length of the v3..v10 per-record tail — everything appended AFTER the
+/// The byte length of the v3..v11 per-record tail — everything appended AFTER the
 /// settlement section by a codec version bump.
 ///
 /// This exists because the arithmetic was written out by hand in two damage
@@ -1622,7 +1946,12 @@ fn versionTailLen(store: *const Store) usize {
         4 + store.reactions.len * 13 + // v7 reactions (count + rows)
         8 * c + // v8 read_up_to
         m + // v9 effect
-        m; // v10 game move
+        m + // v10 game move
+        // v11 GROUPS: the member table, then per conversation kind + title span +
+        // member span, then the sender's seat per message.
+        4 + store.members.len * member_rec_len +
+        c * (1 + 8 + 4 + 2) +
+        2 * m;
 }
 
 /// True when `span` names a real NUL-terminated string inside `bytes` (the
@@ -1677,23 +2006,34 @@ pub fn deserializeStore(gpa: Allocator, bytes: []const u8) DeserializeError!Stor
         conv.unread = std.mem.readInt(u32, bytes[at + 24 ..][0..4], .little);
         at += conv_rec_len;
 
-        // A conversation IS its counterparty DID: non-empty, clean for the
-        // interning map (no interior NUL), and unique.
-        if (conv.did.len == 0 or !spanOk(store.string_bytes.items, conv.did)) return error.Malformed;
-        const did = sliceSpan(&store, conv.did);
-        if (std.mem.indexOfScalar(u8, did, 0) != null) return error.Malformed;
+        // A DIRECT conversation IS its counterparty DID: non-empty, clean for the
+        // interning map (no interior NUL), and unique. A GROUP has no single
+        // counterparty and carries the empty span instead — so emptiness is a
+        // legal answer here, and it is the ONLY thing that distinguishes the two
+        // at this point in the read (the kind byte lives in the v11 section, which
+        // has not been reached yet).
+        //
+        // Whatever is present must still hold up: a span that is not empty is
+        // checked exactly as strictly as before, and only non-empty DIDs enter the
+        // interning map — a group is not addressable by counterparty and must
+        // never collide with one that is.
+        if (!spanOk(store.string_bytes.items, conv.did)) return error.Malformed;
         if (!spanOk(store.string_bytes.items, conv.handle)) return error.Malformed;
+        const did = sliceSpan(&store, conv.did);
+        if (did.len > 0 and std.mem.indexOfScalar(u8, did, 0) != null) return error.Malformed;
         store.convs.appendAssumeCapacity(conv);
 
-        const gop = try store.conv_by_did.getOrPutContextAdapted(
-            gpa,
-            did,
-            std.hash_map.StringIndexAdapter{ .bytes = &store.string_bytes },
-            std.hash_map.StringIndexContext{ .bytes = &store.string_bytes },
-        );
-        if (gop.found_existing) return error.Malformed;
-        gop.key_ptr.* = conv.did.offset;
-        gop.value_ptr.* = @intCast(i);
+        if (did.len > 0) {
+            const gop = try store.conv_by_did.getOrPutContextAdapted(
+                gpa,
+                did,
+                std.hash_map.StringIndexAdapter{ .bytes = &store.string_bytes },
+                std.hash_map.StringIndexContext{ .bytes = &store.string_bytes },
+            );
+            if (gop.found_existing) return error.Malformed;
+            gop.key_ptr.* = conv.did.offset;
+            gop.value_ptr.* = @intCast(i);
+        }
     }
 
     if (bytes.len - at < 4) return error.Malformed;
@@ -1928,6 +2268,100 @@ pub fn deserializeStore(gpa: Allocator, bytes: []const u8) DeserializeError!Stor
             ms3.items(.game)[i] = bytes[at];
             at += 1;
         }
+    }
+
+    // v11: GROUPS.
+    //
+    // A blob written before groups existed has no member table — and that is a
+    // MIGRATION, not an absence to shrug at: every conversation in it is a direct
+    // chat with exactly one counterparty, so seating that counterparty as member 0
+    // is what makes the old history speak the new model. Skip it and every
+    // restored conversation would have no participants at all, which is a
+    // different and much worse kind of wrong than a missing column.
+    if (version >= 11) {
+        if (bytes.len - at < 4) return error.Malformed;
+        const mem_count = std.mem.readInt(u32, bytes[at..][0..4], .little);
+        at += 4;
+        if (@as(u64, mem_count) * member_rec_len > bytes.len - at) return error.Malformed;
+        try store.members.ensureTotalCapacity(gpa, mem_count);
+        for (0..mem_count) |_| {
+            var spans: [2]TextSpan = undefined;
+            for (&spans) |*span| {
+                const off = std.mem.readInt(u32, bytes[at..][0..4], .little);
+                at += 4;
+                const len = std.mem.readInt(u32, bytes[at..][0..4], .little);
+                at += 4;
+                if (@as(u64, off) + len > store.string_bytes.items.len) return error.Malformed;
+                span.* = .{ .offset = off, .len = len };
+            }
+            const left = bytes[at] != 0;
+            at += 1;
+            store.members.appendAssumeCapacity(.{ .did = spans[0], .handle = spans[1], .left = left });
+        }
+
+        if (bytes.len - at < c_count * (1 + 8 + 4 + 2)) return error.Malformed;
+        const cs2 = store.convs.slice();
+        for (0..c_count) |i| {
+            const kind_raw = bytes[at];
+            at += 1;
+            cs2.items(.kind)[i] = std.enums.fromInt(ConvKind, kind_raw) orelse return error.Malformed;
+            const off = std.mem.readInt(u32, bytes[at..][0..4], .little);
+            at += 4;
+            const len = std.mem.readInt(u32, bytes[at..][0..4], .little);
+            at += 4;
+            if (@as(u64, off) + len > store.string_bytes.items.len) return error.Malformed;
+            cs2.items(.title)[i] = .{ .offset = off, .len = len };
+            const first = std.mem.readInt(u32, bytes[at..][0..4], .little);
+            at += 4;
+            const count = std.mem.readInt(u16, bytes[at..][0..2], .little);
+            at += 2;
+            // A span that leaves the table is a corrupt blob, not a survivable
+            // one: every member lookup and every sender attribution reads through
+            // it (E3 — named, never half-restored).
+            if (@as(u64, first) + count > store.members.len) return error.Malformed;
+            cs2.items(.member_first)[i] = first;
+            cs2.items(.member_count)[i] = count;
+
+            // NOW the kind is known, so each sort answers for itself: a direct
+            // conversation must have the counterparty DID it is addressed by, and
+            // a group must not pretend to have one. Checked here rather than
+            // above because above there was nothing to tell them apart.
+            const has_did = cs2.items(.did)[i].len > 0;
+            switch (cs2.items(.kind)[i]) {
+                .direct => if (!has_did) return error.Malformed,
+                .group => if (has_did) return error.Malformed,
+            }
+        }
+
+        if (bytes.len - at < 2 * m_count) return error.Malformed;
+        try store.senders.resize(gpa, m_count);
+        for (0..m_count) |i| {
+            store.senders.items[i] = std.mem.readInt(u16, bytes[at..][0..2], .little);
+            at += 2;
+        }
+    } else {
+        // THE MIGRATION. Seat each old conversation's counterparty as its member 0,
+        // reusing the very spans the conversation already holds — the same bytes,
+        // referenced twice, never copied.
+        const cs2 = store.convs.slice();
+        try store.members.ensureTotalCapacity(gpa, c_count);
+        for (0..c_count) |i| {
+            // Written before groups existed ⇒ every conversation is direct ⇒ the
+            // counterparty DID is still mandatory, exactly as it always was.
+            if (cs2.items(.did)[i].len == 0) return error.Malformed;
+            const first: u32 = @intCast(store.members.len);
+            store.members.appendAssumeCapacity(.{
+                .did = cs2.items(.did)[i],
+                .handle = cs2.items(.handle)[i],
+            });
+            cs2.items(.kind)[i] = .direct;
+            cs2.items(.title)[i] = TextSpan.empty;
+            cs2.items(.member_first)[i] = first;
+            cs2.items(.member_count)[i] = 1;
+        }
+        // One counterparty means seat 0 for everything they said.
+        try store.senders.resize(gpa, m_count);
+        for (0..m_count) |i| store.senders.items[i] = 0;
     }
 
     if (at != bytes.len) return error.Malformed; // exact tail — no trailing bytes
@@ -2668,4 +3102,163 @@ test "store codec: a message with EMPTY text still restores (a payment with no n
     try std.testing.expectEqual(@as(usize, 2), restored.msgs.len);
     try std.testing.expectEqualStrings("hello", sliceSpan(&restored, restored.msgs.items(.text)[0]));
     try std.testing.expectEqualStrings("", sliceSpan(&restored, restored.msgs.items(.text)[1]));
+}
+
+test "groups: a direct chat is the one-member case of the same array" {
+    // A2, made checkable. If a direct chat did not carry a member list, every
+    // group feature would have to ask which sort of conversation it was looking
+    // at before it could do anything — and that question is where the bugs live.
+    const gpa = std.testing.allocator;
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+
+    const conv = try openConversation(gpa, &store, "did:plc:alice", "alice.zat4.com");
+    try std.testing.expectEqual(@as(u16, 1), memberCount(&store, conv));
+    try std.testing.expectEqualStrings("did:plc:alice", memberDid(&store, conv, 0));
+    try std.testing.expectEqualStrings("alice.zat4.com", memberHandle(&store, conv, 0));
+    try std.testing.expect(!isGroup(&store, conv));
+    try std.testing.expectEqualStrings("", groupTitle(&store, conv));
+
+    // The counterparty's message attributes to seat 0 — the same lookup a group
+    // uses, against a list with one seat in it.
+    const m = try appendMessage(gpa, &store, conv, .text, "hello", 1000, false);
+    try std.testing.expectEqual(@as(u16, 0), senderSeat(&store, m));
+    try std.testing.expectEqualStrings("did:plc:alice", senderDid(&store, m));
+
+    // And ours attributes to nobody, because the direction bit already said so.
+    const mine_msg = try appendMessage(gpa, &store, conv, .text, "hi", 1001, true);
+    try std.testing.expectEqual(sender_me, senderSeat(&store, mine_msg));
+    try std.testing.expectEqualStrings("", senderDid(&store, mine_msg));
+}
+
+test "groups: members are seated, attributed, and survive somebody leaving" {
+    const gpa = std.testing.allocator;
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+
+    const conv = try startGroup(
+        gpa,
+        &store,
+        "Weekend",
+        &.{ "did:plc:alice", "did:plc:bob" },
+        &.{ "alice.zat4.com", "bob.zat4.com" },
+    );
+    try std.testing.expect(isGroup(&store, conv));
+    try std.testing.expectEqualStrings("Weekend", groupTitle(&store, conv));
+    try std.testing.expectEqual(@as(u16, 2), memberCount(&store, conv));
+    try std.testing.expectEqual(@as(?u16, 0), seatOf(&store, conv, "did:plc:alice"));
+    try std.testing.expectEqual(@as(?u16, 1), seatOf(&store, conv, "did:plc:bob"));
+    try std.testing.expectEqual(@as(?u16, null), seatOf(&store, conv, "did:plc:nobody"));
+
+    const from_bob = try appendMessage(gpa, &store, conv, .text, "on my way", 2000, false);
+    setSenderSeat(&store, from_bob, 1);
+    try std.testing.expectEqualStrings("did:plc:bob", senderDid(&store, from_bob));
+    try std.testing.expectEqualStrings("bob.zat4.com", senderHandle(&store, from_bob));
+
+    // ALICE LEAVES. Her seat stays, so Bob's message still says Bob. Compacting
+    // the list here would slide Bob into seat 0 and quietly re-attribute every
+    // word he ever said to her.
+    setMemberLeft(&store, conv, 0, true);
+    try std.testing.expect(memberLeft(&store, conv, 0));
+    try std.testing.expectEqual(@as(u16, 2), memberCount(&store, conv));
+    try std.testing.expectEqualStrings("did:plc:bob", senderDid(&store, from_bob));
+
+    // A late joiner takes the next seat, and disturbs nobody.
+    const seat = try addMember(gpa, &store, conv, "did:plc:carol", "carol.zat4.com");
+    try std.testing.expectEqual(@as(u16, 2), seat);
+    try std.testing.expectEqualStrings("did:plc:bob", senderDid(&store, from_bob));
+}
+
+test "groups: adding a member does not disturb another conversation's seats" {
+    // Members live contiguously per conversation in ONE flat array, so an insert
+    // slides every row above it — including other conversations' spans. Get that
+    // wrong and a group quietly starts listing somebody else's people.
+    const gpa = std.testing.allocator;
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+
+    const first = try startGroup(gpa, &store, "First", &.{"did:plc:alice"}, &.{"alice.zat4.com"});
+    const second = try startGroup(gpa, &store, "Second", &.{"did:plc:bob"}, &.{"bob.zat4.com"});
+    const direct = try openConversation(gpa, &store, "did:plc:dave", "dave.zat4.com");
+
+    // Insert into the FIRST group, whose span sits below both of the others.
+    _ = try addMember(gpa, &store, first, "did:plc:carol", "carol.zat4.com");
+
+    try std.testing.expectEqualStrings("did:plc:alice", memberDid(&store, first, 0));
+    try std.testing.expectEqualStrings("did:plc:carol", memberDid(&store, first, 1));
+    try std.testing.expectEqualStrings("did:plc:bob", memberDid(&store, second, 0));
+    try std.testing.expectEqualStrings("did:plc:dave", memberDid(&store, direct, 0));
+    try std.testing.expectEqual(@as(u16, 1), memberCount(&store, second));
+    try std.testing.expectEqual(@as(u16, 1), memberCount(&store, direct));
+}
+
+test "store codec v11: groups round-trip, and pre-group history is MIGRATED" {
+    const gpa = std.testing.allocator;
+
+    // A store with both sorts of conversation in it.
+    var store: Store = .{};
+    defer deinitStore(gpa, &store);
+    const direct = try openConversation(gpa, &store, "did:plc:alice", "alice.zat4.com");
+    _ = try appendMessage(gpa, &store, direct, .text, "just us", 100, false);
+    const group = try startGroup(gpa, &store, "Weekend", &.{ "did:plc:bob", "did:plc:carol" }, &.{ "bob.zat4.com", "" });
+    const gm = try appendMessage(gpa, &store, group, .text, "all of us", 200, false);
+    setSenderSeat(&store, gm, 1);
+    setMemberLeft(&store, group, 0, true);
+
+    const blob = try serializeStore(gpa, &store);
+    defer gpa.free(blob);
+    var back = try deserializeStore(gpa, blob);
+    defer deinitStore(gpa, &back);
+
+    try std.testing.expect(!isGroup(&back, direct));
+    try std.testing.expectEqualStrings("did:plc:alice", memberDid(&back, direct, 0));
+    try std.testing.expect(isGroup(&back, group));
+    try std.testing.expectEqualStrings("Weekend", groupTitle(&back, group));
+    try std.testing.expectEqual(@as(u16, 2), memberCount(&back, group));
+    try std.testing.expect(memberLeft(&back, group, 0));
+    try std.testing.expectEqualStrings("did:plc:carol", senderDid(&back, gm));
+
+    // THE MIGRATION. A blob from before groups existed carries no member table,
+    // and a restore that shrugged at that would hand back conversations with no
+    // participants — worse than a missing column, because every attribution then
+    // resolves to nothing.
+    //
+    // It is forged from a DIRECT-ONLY store, because that is the only thing a v10
+    // blob could ever have held: groups did not exist to be written. (Forging it
+    // from the store above instead was the first attempt, and the reader rightly
+    // refused it — a v10 blob containing a group is not old history, it is a lie
+    // about old history, and the pre-v11 path is entitled to assume otherwise.)
+    var legacy_src: Store = .{};
+    defer deinitStore(gpa, &legacy_src);
+    const only = try openConversation(gpa, &legacy_src, "did:plc:alice", "alice.zat4.com");
+    _ = try appendMessage(gpa, &legacy_src, only, .text, "just us", 100, false);
+
+    const legacy_blob = try serializeStore(gpa, &legacy_src);
+    defer gpa.free(legacy_blob);
+    // The v11 tail is: member table + per-conversation block + sender column.
+    const v11_tail = 4 + legacy_src.members.len * member_rec_len +
+        legacy_src.convs.len * (1 + 8 + 4 + 2) + 2 * legacy_src.msgs.len;
+    std.mem.writeInt(u16, legacy_blob[4..6], 10, .little);
+    var legacy = try deserializeStore(gpa, legacy_blob[0 .. legacy_blob.len - v11_tail]);
+    defer deinitStore(gpa, &legacy);
+
+    // Every restored conversation has its counterparty seated, and every
+    // counterparty message attributes to them.
+    try std.testing.expectEqual(@as(u16, 1), memberCount(&legacy, only));
+    try std.testing.expectEqualStrings("did:plc:alice", memberDid(&legacy, only, 0));
+    try std.testing.expect(!isGroup(&legacy, only));
+    try std.testing.expectEqualStrings("did:plc:alice", senderDid(&legacy, @enumFromInt(0)));
+
+    // And a v10 blob whose conversation has no counterparty is still refused —
+    // the old invariant did not get weaker, it got scoped to the sort of
+    // conversation it was always about.
+    var forged = try gpa.dupe(u8, blob);
+    defer gpa.free(forged);
+    std.mem.writeInt(u16, forged[4..6], 10, .little);
+    const forged_tail = 4 + back.members.len * member_rec_len +
+        back.convs.len * (1 + 8 + 4 + 2) + 2 * back.msgs.len;
+    try std.testing.expectError(
+        error.Malformed,
+        deserializeStore(gpa, forged[0 .. forged.len - forged_tail]),
+    );
 }
