@@ -554,6 +554,11 @@ const mode_rrect: f32 = 0; // rounded rect: SDF coverage
 const mode_glyph: f32 = 1; // glyph: atlas .r coverage
 const mode_solid: f32 = 2; // solid fill: full coverage (sharp rects, lines)
 const mode_emoji: f32 = 3; // emoji: RGBA sprite from the emoji sheet
+/// Photographs: mode 4 + slot, one texture unit each. The SHADER cannot index a
+/// sampler array in GLES2, so the branches below are written out — which is also
+/// why the count is small and fixed.
+const mode_photo0: f32 = 4;
+pub const photo_slots = 4;
 
 const vert_src: [:0]const GLchar =
     \\attribute vec2 aPos;
@@ -583,6 +588,10 @@ const frag_src: [:0]const GLchar =
     \\precision mediump float;
     \\uniform sampler2D uAtlas;
     \\uniform sampler2D uEmoji;
+    \\uniform sampler2D uPhoto0;
+    \\uniform sampler2D uPhoto1;
+    \\uniform sampler2D uPhoto2;
+    \\uniform sampler2D uPhoto3;
     \\uniform float uAlpha;
     \\varying vec4 vColor;
     \\varying vec2 vUV;
@@ -591,6 +600,15 @@ const frag_src: [:0]const GLchar =
     \\varying float vRadius;
     \\varying float vMode;
     \\void main() {
+    \\  if (vMode > 3.5) {
+    \\    vec4 p;
+    \\    if (vMode < 4.5) p = texture2D(uPhoto0, vUV);
+    \\    else if (vMode < 5.5) p = texture2D(uPhoto1, vUV);
+    \\    else if (vMode < 6.5) p = texture2D(uPhoto2, vUV);
+    \\    else p = texture2D(uPhoto3, vUV);
+    \\    gl_FragColor = vec4(p.rgb, p.a * vColor.a * uAlpha);
+    \\    return;
+    \\  }
     \\  if (vMode > 2.5) {
     \\    vec4 t = texture2D(uEmoji, vUV);
     \\    gl_FragColor = vec4(t.rgb, t.a * vColor.a * uAlpha);
@@ -619,6 +637,27 @@ pub const Renderer = struct {
     atlas_dim: u32,
     /// The emoji sprite sheet (RGBA, unit 1), uploaded once at init.
     emoji_tex: GLuint,
+    /// LIVE PHOTOGRAPHS, one texture unit each (units 2..5).
+    ///
+    /// Separate units rather than one atlas, and rather than one texture drawn
+    /// per pass: the whole frame is ONE `glDrawArrays`, and both alternatives
+    /// break that. An atlas would mean packing arbitrary-sized photos into a
+    /// shared sheet; drawing per pass would either split the batch or put photos
+    /// on top of the composer, because a second pass loses the z-order the one
+    /// list carries. GLES2 guarantees at least eight units, so a handful of
+    /// slots costs nothing and keeps the batch and the ordering intact.
+    ///
+    /// A thread shows one or two photographs at a time. Past that the extras
+    /// draw as frames, which is honest degradation rather than a wrong picture.
+    photo_tex: [photo_slots]GLuint,
+    /// WHICH picture each slot holds — the caller's key, 0 = empty. Keyed rather
+    /// than positional so a slot survives a scroll: re-uploading the same photo
+    /// every frame is how a texture cache becomes a texture upload.
+    photo_key: [photo_slots]u64,
+    /// Last frame each slot was asked for; the oldest is evicted.
+    photo_seen: [photo_slots]u64,
+    photo_clock: u64,
+    u_photo: [photo_slots]GLint,
     u_viewport: GLint,
     u_shake: GLint,
     u_atlas: GLint,
@@ -686,13 +725,27 @@ pub fn initRenderer() Error!Renderer {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-    elog("renderer ready (program linked, atlas + emoji textures + vbo created)", .{});
+    // The photograph slots. Created empty; a slot gets its pixels the first time
+    // a picture asks for it and keeps them until something else needs the slot.
+    var ptex: [photo_slots]GLuint = @splat(0);
+    var puni: [photo_slots]GLint = @splat(-1);
+    inline for (0..photo_slots) |i| {
+        glGenTextures(1, @ptrCast(&ptex[i]));
+        puni[i] = glGetUniformLocation(prog, "uPhoto" ++ [_]u8{'0' + @as(u8, i)});
+    }
+
+    elog("renderer ready (program linked, atlas + emoji + photo textures + vbo created)", .{});
     return .{
         .program = prog,
         .vbo = vbo,
         .atlas_tex = tex,
         .atlas_dim = 0,
         .emoji_tex = etex,
+        .photo_tex = ptex,
+        .photo_key = @splat(0),
+        .photo_seen = @splat(0),
+        .photo_clock = 0,
+        .u_photo = puni,
         .u_viewport = glGetUniformLocation(prog, "uViewport"),
         .u_shake = glGetUniformLocation(prog, "uShake"),
         .u_atlas = glGetUniformLocation(prog, "uAtlas"),
@@ -722,6 +775,72 @@ pub fn uploadAtlas(r: *Renderer, atlas: *atlas_mod.Atlas) void {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         r.atlas_dim = atlas.dim;
         atlas.dirty = false;
+    }
+}
+
+/// FIND OR MAKE A SLOT for one picture, and hand back which.
+///
+/// `key` names the picture (the shell's attachment identity, never 0). A picture
+/// already resident keeps its slot and its pixels — re-uploading the same photo
+/// on every frame is how a texture cache turns into a texture upload, and a
+/// thread that scrolls past a photo would do exactly that.
+///
+/// `rgba` is only read when the slot has to be filled, so the caller may decode
+/// lazily: ask first, and decode only if the answer says the pixels are wanted.
+///
+/// Null means "no slot" — more pictures on screen than there are units. The
+/// caller draws the frame instead, which is honest degradation rather than the
+/// wrong photograph in the right bubble.
+pub fn photoSlot(r: *Renderer, key: u64, rgba: ?[]const u8, w: u32, h: u32) ?u8 {
+    if (key == 0) return null;
+    r.photo_clock +%= 1;
+
+    for (r.photo_key, 0..) |k, i| {
+        if (k == key) {
+            r.photo_seen[i] = r.photo_clock;
+            return @intCast(i);
+        }
+    }
+    const pixels = rgba orelse return null; // wanted a slot, brought no pixels
+    if (w == 0 or h == 0) return null;
+    if (@as(u64, w) * h * 4 != pixels.len) return null; // not the picture it claims to be
+
+    // A free slot, or the one nobody has looked at for longest.
+    var victim: usize = 0;
+    var oldest: u64 = std.math.maxInt(u64);
+    for (r.photo_key, 0..) |k, i| {
+        if (k == 0) {
+            victim = i;
+            break;
+        }
+        if (r.photo_seen[i] < oldest) {
+            oldest = r.photo_seen[i];
+            victim = i;
+        }
+    }
+
+    glActiveTexture(GL_TEXTURE2 + @as(GLenum, @intCast(victim)));
+    glBindTexture(GL_TEXTURE_2D, r.photo_tex[victim]);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1); // rows are tightly packed; the decoder unpadded them
+    glTexImage2D(GL_TEXTURE_2D, 0, @intCast(GL_RGBA), @intCast(w), @intCast(h), 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.ptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    // CLAMP, not repeat: a photograph is not a tile, and a bubble whose quad
+    // rounds a hair past 1.0 would wrap the far edge into view.
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glActiveTexture(GL_TEXTURE0);
+
+    r.photo_key[victim] = key;
+    r.photo_seen[victim] = r.photo_clock;
+    return @intCast(victim);
+}
+
+/// Forget a picture — its bytes are gone from the store (a deleted message), so
+/// the slot must not keep answering for it.
+pub fn dropPhoto(r: *Renderer, key: u64) void {
+    for (r.photo_key, 0..) |k, i| {
+        if (k == key) r.photo_key[i] = 0;
     }
 }
 
@@ -892,7 +1011,7 @@ pub fn buildVertices(
         // sampler and a `mode_photo` branch beside the emoji one.
         .image => {
             const it = bare.image;
-            if (it.w == 0 or it.h == 0 or it.slot == 255) continue;
+            if (it.w == 0 or it.h == 0) continue;
             const x: f32 = @as(f32, @floatFromInt(it.x)) * scale;
             const y: f32 = @as(f32, @floatFromInt(it.y)) * scale;
             const w: f32 = @as(f32, @floatFromInt(it.w)) * scale;
@@ -903,7 +1022,23 @@ pub fn buildVertices(
             const p = [4][2]f32{ .{ x, y }, .{ x + w, y }, .{ x + w, y + h }, .{ x, y + h } };
             const local = [4][2]f32{ .{ -hw, -hh }, .{ hw, -hh }, .{ hw, hh }, .{ -hw, hh } };
             const a: f32 = @as(f32, @floatFromInt(it.alpha)) / 255.0;
-            try pushQuad(&verts, gpa, p, zero_uv, local, .{ hw, hh }, rad, mode_rrect, .{ 0.16, 0.16, 0.16, a });
+            if (it.slot < photo_slots) {
+                // THE PHOTOGRAPH. Its slot names the texture unit, and the mode
+                // carries the slot so the fragment stage picks the same one —
+                // GLES2 cannot index a sampler array, which is why the count is
+                // small and the branches are written out.
+                //
+                // UVs run the whole 0..1 of the texture: the picture fills the
+                // rectangle the LAYOUT chose. The bubble decides the geometry, so
+                // a photo can never resize the thread it arrived in.
+                const uv = [4][2]f32{ .{ 0, 0 }, .{ 1, 0 }, .{ 1, 1 }, .{ 0, 1 } };
+                const mode = mode_photo0 + @as(f32, @floatFromInt(it.slot));
+                try pushQuad(&verts, gpa, p, uv, zero_local, .{ 0, 0 }, 0, mode, .{ 1, 1, 1, a });
+            } else {
+                // No slot — more pictures on screen than there are units, or the
+                // bytes have not decoded yet. The frame, at the right geometry.
+                try pushQuad(&verts, gpa, p, zero_uv, local, .{ hw, hh }, rad, mode_rrect, .{ 0.16, 0.16, 0.16, a });
+            }
         },
         .emoji => {
             const it = bare.emoji;
@@ -984,6 +1119,13 @@ pub fn draw(r: *Renderer, verts: []const Vertex, vw: i32, vh: i32, alpha: f32) v
     // Bind the glyph atlas on unit 0 HERE every frame: the field pass binds
     // its own ramp texture to the same unit, so the feed must reclaim it or
     // it samples the ramp instead and all text vanishes.
+    // The photograph slots go on units 2..5, ALWAYS — an unbound sampler that a
+    // branch never takes is still undefined behaviour on some drivers, and a
+    // frame with no photographs must cost nothing but four binds.
+    inline for (0..photo_slots) |i| {
+        glActiveTexture(GL_TEXTURE2 + @as(GLenum, i));
+        glBindTexture(GL_TEXTURE_2D, r.photo_tex[i]);
+    }
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, r.emoji_tex);
     glActiveTexture(GL_TEXTURE0);
@@ -991,6 +1133,7 @@ pub fn draw(r: *Renderer, verts: []const Vertex, vw: i32, vh: i32, alpha: f32) v
     glUniform2f(r.u_viewport, @floatFromInt(vw), @floatFromInt(vh));
     glUniform1i(r.u_atlas, 0);
     glUniform1i(r.u_emoji, 1);
+    inline for (0..photo_slots) |i| glUniform1i(r.u_photo[i], 2 + @as(GLint, i));
     glUniform1f(r.u_alpha, alpha);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
