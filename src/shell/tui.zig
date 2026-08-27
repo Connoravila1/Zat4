@@ -7281,7 +7281,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                             // can add a note and Send without the keyboard
                                             // collapsing under you.
                                             rs.gchat_input_focus = true;
-                                            rs.status = chat_games.name(rs.gchat_game_kind);
+                                            rs.status = "game staged \u{2014} press Send";
                                         },
                                         // The ✕ on the staged chip: drop the staged game.
                                         .chat_game_unstage => if (dev_chat) {
@@ -7542,7 +7542,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                                 if (rs.gchat_sel) |sc|
                                                     chatSendGameMove(rs, gpa, io, environ, sc, chat_games.inviteMove(rs.gchat_game_kind));
                                                 rs.gchat_pending_game = false;
-                                                rs.status = chat_games.name(rs.gchat_game_kind);
+                                                rs.status = "game sent";
                                                 rs.gscroll_px = 0; // ride to the newest, so the card is in view
                                             }
                                             const body = std.mem.trimEnd(u8, rs.gchat_draft_buf[0..rs.gchat_draft_len], " \n");
@@ -10952,6 +10952,8 @@ fn chatGameOf(rs: *RunState, arena: Allocator) feed_view.ChatGame {
     // The head-to-head record, derived from the same thread — no scoreboard is
     // stored or sent, so the two ends cannot disagree about it.
     g.tally = chat_games.tally(moves);
+    const handle = chat_core.conversationHandle(&rs.gchat_store, sel);
+    g.peer = if (handle.len > 0) handle else chat_core.conversationDid(&rs.gchat_store, sel);
     // What a MOVE is tagged with comes from the board, never from the shelf's
     // pick: after a result you can choose a different game while the finished
     // board is still on screen, and a move sent then must still name the game it

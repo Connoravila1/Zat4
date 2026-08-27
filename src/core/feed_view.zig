@@ -10325,6 +10325,11 @@ pub const ChatGame = struct {
     promo: u8 = 0,
     /// The head-to-head record across every finished game in this thread.
     tally: chat_games.Tally = .{},
+    /// Who you are playing — the peer's handle, borrowed for the frame. The
+    /// record line says a NAME rather than "them", which is as much of a player
+    /// profile as a two-person thread has room to need: you already know who is
+    /// on the other end, and the scoreboard should say so.
+    peer: []const u8 = "",
     /// The free-running phase a skill shot's sight is drawn from. The shell
     /// derives it from the clock (B3) and hands it in; the view never asks the
     /// time, which is also what lets the release land exactly where it is drawn.
@@ -10502,9 +10507,20 @@ fn drawGameOverlay(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, 
     // Title + the head-to-head record + close ✕.
     _ = try str(gpa, dl, e, .semibold, 24, 60 + dy, 0xFFEDEAE0, 22, chat_games.name(st.game));
     if (game.tally.played > 0) {
-        var tb: [48]u8 = undefined;
-        const rec = std.fmt.bufPrint(&tb, "You {d} \u{2013} {d} Them", .{ game.tally.mine, game.tally.theirs }) catch "";
+        var tb: [96]u8 = undefined;
+        // The handle without its domain — "maya", not "maya.zat4.com". A
+        // scoreboard is a place for a name.
+        const who = if (game.peer.len > 0) blk: {
+            const dot = std.mem.indexOfScalar(u8, game.peer, '.') orelse game.peer.len;
+            break :blk game.peer[0..dot];
+        } else "Them";
+        const rec = std.fmt.bufPrint(&tb, "You {d} \u{2013} {d} {s}", .{ game.tally.mine, game.tally.theirs, who }) catch "";
         _ = try str(gpa, dl, e, .regular, 24, 82 + dy, softA(0xEDEAE0, 0x99), 14, rec);
+        if (game.tally.draws > 0) {
+            var db: [32]u8 = undefined;
+            const dr = std.fmt.bufPrint(&db, "{d} drawn", .{game.tally.draws}) catch "";
+            _ = try str(gpa, dl, e, .regular, 24, 100 + dy, softA(0xEDEAE0, 0x66), 13, dr);
+        }
     }
     _ = try str(gpa, dl, e, .semibold, width - 44, 58 + dy, softA(0xEDEAE0, 0xCC), 22, "\u{00D7}");
     try emitRegion(gpa, regions, width - 60, 30 + dy, 60, 60, 0, .game_close);
@@ -10570,13 +10586,17 @@ fn drawGameOverlay(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, 
 
     const skill = chat_games.isSkillShot(st.game);
     const can_send = game.staged != game_board.no_stage;
-    const armed = can_send or (skill and my_turn);
+    // A skill shot's button IS the release, so it is armed with nothing staged —
+    // and it must then fire `.game_cell` (release), not `.game_send`, or the tap
+    // would try to send a move that does not exist yet.
+    const releasing = skill and my_turn and !can_send;
+    const armed = can_send or releasing;
     const send_c = if (armed) accent else skinPanel(accent);
     try rect(gpa, dl, bar_x, bar_y, bar_w, 52, send_c, 26);
-    const lbl = if (skill and my_turn)
+    const lbl = if (releasing)
         (if (st.game == .darts) "Throw" else "Loose")
     else if (can_send)
-        "Send move"
+        (if (skill) "Send it" else "Send move")
     else if (!my_turn)
         "Waiting for their move"
     else switch (st.game) {
@@ -10589,7 +10609,7 @@ fn drawGameOverlay(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, 
     const lc = if (armed) on_accent_ink else softA(0xEDEAE0, 0x88);
     const lw: i32 = @intCast(text.measure(e, .semibold, lbl, 16));
     _ = try str(gpa, dl, e, .semibold, bar_x + @divTrunc(bar_w - lw, 2), bar_y + 33, lc, 16, lbl);
-    if (armed) try emitRegion(gpa, regions, bar_x, bar_y, bar_w, 52, 0, .game_send);
+    if (armed) try emitRegion(gpa, regions, bar_x, bar_y, bar_w, 52, 0, if (releasing) .game_cell else .game_send);
 }
 
 /// Would this staged chess move promote a pawn? Only then is the promotion strip

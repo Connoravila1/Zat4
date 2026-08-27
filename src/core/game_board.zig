@@ -483,8 +483,11 @@ fn drawDots(gpa: Allocator, dl: *raster.DrawList, st: State, v: View, out: []Tar
             } else if (v.interactive) {
                 try rect(gpa, dl, x0 + 6, y0 - 1, step - 12, 2, alpha(chalk, 0x18), 1);
             }
+            // The two edge families cross at every dot, so their targets are kept
+            // to the middle of each edge — half a step apart in both axes, which
+            // is exactly enough that a tap can never mean two edges at once.
             if (v.interactive and own == .none)
-                push(out, n, x0 + 4, y0 - half + 4, step - 8, step - 8, @intCast(e));
+                push(out, n, x0 + @divTrunc(step, 4), y0 - @divTrunc(step, 4), half, half, @intCast(e));
         }
     }
     for (0..dots.grid) |r| {
@@ -501,7 +504,7 @@ fn drawDots(gpa: Allocator, dl: *raster.DrawList, st: State, v: View, out: []Tar
                 try rect(gpa, dl, x0 - 1, y0 + 6, 2, step - 12, alpha(chalk, 0x18), 1);
             }
             if (v.interactive and own == .none)
-                push(out, n, x0 - half + 4, y0 + 4, step - 8, step - 8, @intCast(e));
+                push(out, n, x0 - @divTrunc(step, 4), y0 + @divTrunc(step, 4), half, half, @intCast(e));
         }
     }
 
