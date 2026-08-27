@@ -116,9 +116,29 @@ const AndroidBitmapInfo = extern struct {
 /// that quietly accepts three layouts is three chances to read a picture wrong.
 const android_bitmap_format_rgba_8888: i32 = 1;
 
-extern fn AndroidBitmap_getInfo(env: JniEnv, bmp: jobject, info: *AndroidBitmapInfo) callconv(.c) c_int;
-extern fn AndroidBitmap_lockPixels(env: JniEnv, bmp: jobject, addr: *?*anyopaque) callconv(.c) c_int;
-extern fn AndroidBitmap_unlockPixels(env: JniEnv, bmp: jobject) callconv(.c) c_int;
+/// ANDROID, not merely "linux". The phone target IS a linux target, so an
+/// `os.tag` check does not separate them — and the desktop build linked against
+/// `libjnigraphics` symbols that only exist on a phone, which is a link error
+/// rather than a runtime one, and only the desktop build says so.
+const is_android = builtin.abi == .android or builtin.abi == .androideabi;
+
+/// libjnigraphics on the phone; a stub that refuses everywhere else, so the
+/// symbols are never referenced off Android and the desktop links clean.
+const bitmap = if (is_android) struct {
+    pub extern fn AndroidBitmap_getInfo(env: JniEnv, bmp: jobject, info: *AndroidBitmapInfo) callconv(.c) c_int;
+    pub extern fn AndroidBitmap_lockPixels(env: JniEnv, bmp: jobject, addr: *?*anyopaque) callconv(.c) c_int;
+    pub extern fn AndroidBitmap_unlockPixels(env: JniEnv, bmp: jobject) callconv(.c) c_int;
+} else struct {
+    pub fn AndroidBitmap_getInfo(_: JniEnv, _: jobject, _: *AndroidBitmapInfo) callconv(.c) c_int {
+        return -1;
+    }
+    pub fn AndroidBitmap_lockPixels(_: JniEnv, _: jobject, _: *?*anyopaque) callconv(.c) c_int {
+        return -1;
+    }
+    pub fn AndroidBitmap_unlockPixels(_: JniEnv, _: jobject) callconv(.c) c_int {
+        return -1;
+    }
+};
 
 /// A decoded picture. `rgba` is gpa-owned, tightly packed (no stride padding),
 /// and exactly `width * height * 4` bytes.
@@ -142,7 +162,7 @@ pub const max_pixels: u64 = 4096 * 4096;
 
 /// Decode `bytes` to RGBA, or null if anything at all goes wrong.
 pub fn decode(gpa: Allocator, bytes: []const u8) ?Decoded {
-    if (comptime builtin.os.tag != .linux) return null; // Android is a linux target
+    if (comptime !is_android) return null; // no platform decoder here; the frame draws
     if (bytes.len == 0 or bytes.len > std.math.maxInt(i32)) return null;
     const vm: JavaVm = @ptrCast(@alignCast(vm_handle orelse return null));
 
@@ -180,15 +200,15 @@ pub fn decode(gpa: Allocator, bytes: []const u8) ?Decoded {
     defer del(env, bmp);
 
     var info: AndroidBitmapInfo = undefined;
-    if (AndroidBitmap_getInfo(env, bmp, &info) != 0) return null;
+    if (bitmap.AndroidBitmap_getInfo(env, bmp, &info) != 0) return null;
     if (info.format != android_bitmap_format_rgba_8888) return null;
     if (info.width == 0 or info.height == 0) return null;
     if (@as(u64, info.width) * info.height > max_pixels) return null;
 
     var addr: ?*anyopaque = null;
-    if (AndroidBitmap_lockPixels(env, bmp, &addr) != 0) return null;
+    if (bitmap.AndroidBitmap_lockPixels(env, bmp, &addr) != 0) return null;
     const src_ptr: [*]const u8 = @ptrCast(addr orelse return null);
-    defer _ = AndroidBitmap_unlockPixels(env, bmp);
+    defer _ = bitmap.AndroidBitmap_unlockPixels(env, bmp);
 
     const row_bytes = @as(usize, info.width) * 4;
     const out = gpa.alloc(u8, row_bytes * info.height) catch return null;

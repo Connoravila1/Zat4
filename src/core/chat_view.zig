@@ -93,6 +93,14 @@ pub const BubbleRow = struct {
     /// A tombstone: the text is gone and the bubble says so. Rendered rather than
     /// removed — removing the row would renumber every index above it.
     deleted: bool = false,
+    /// A PHOTOGRAPH on this bubble: its pixel size, 0 when there is none.
+    ///
+    /// The SIZE and not the bytes — the view is pure and has no business holding
+    /// a megabyte of JPEG, and the layout only needs the aspect to reserve the
+    /// right rectangle before anything is decoded. A bubble that resizes when its
+    /// picture decodes makes the whole thread jump under the reader's thumb.
+    photo_w: u16 = 0,
+    photo_h: u16 = 0,
     /// GROUPS: who said it, drawn above the FIRST bubble of their run. Empty for
     /// our own and for a direct chat, where the two sides are the whole cast and
     /// naming them on every run would be noise.
@@ -435,6 +443,14 @@ pub fn buildThread(
             // the one counterparty on every row, which groups them exactly as the
             // `mine` bit used to.
             .sender = senderLabel(store, msg),
+            .photo_w = if (chat.attachmentOf(store, msg)) |a|
+                (if (chat.attachmentInfo(store, a)) |inf| inf.width else 0)
+            else
+                0,
+            .photo_h = if (chat.attachmentOf(store, msg)) |a|
+                (if (chat.attachmentInfo(store, a)) |inf| inf.height else 0)
+            else
+                0,
             .stamp = i == 0 or at - prev_at >= stamp_gap,
             .kind = kind,
             .pay = pay,

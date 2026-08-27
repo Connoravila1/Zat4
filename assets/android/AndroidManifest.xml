@@ -46,6 +46,17 @@
         <category android:name="android.intent.category.BROWSABLE"/>
         <data android:scheme="com.zat4.pds"/>
       </intent-filter>
+      <!-- SHARE A PHOTO INTO ZAT CHAT. This is the way in, and it is the way in
+           for a concrete reason: the NDK's ANativeActivityCallbacks has NO
+           onActivityResult, so the system photo picker literally cannot return
+           anything to native code. An INTENT can — the OAuth redirect above
+           already arrives that way — so "share to Zat Chat" from the gallery is
+           the route that works with no dex and no Java. -->
+      <intent-filter>
+        <action android:name="android.intent.action.SEND"/>
+        <category android:name="android.intent.category.DEFAULT"/>
+        <data android:mimeType="image/*"/>
+      </intent-filter>
     </activity>
   </application>
 </manifest>

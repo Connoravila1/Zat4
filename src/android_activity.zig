@@ -206,6 +206,8 @@ const jni_find_class = 6; // FindClass
 const jni_exception_clear = 17; // ExceptionClear
 const jni_new_object_a = 30; // NewObjectA
 const jni_new_object_array = 172; // NewObjectArray
+const jni_new_byte_array = 176; // NewByteArray
+const jni_get_byte_array_region = 200; // GetByteArrayRegion
 const jni_get_object_class = 31; // GetObjectClass
 const jni_get_method_id = 33; // GetMethodID
 const jni_call_object_method_a = 36; // CallObjectMethodA
@@ -235,6 +237,8 @@ const NewStringUtfFn = *const fn (JniEnv, [*:0]const u8) callconv(.c) jstring;
 const NewObjectAFn = *const fn (JniEnv, jclass, jmethodID, [*]const jvalue) callconv(.c) jobject;
 const GetObjectClassFn = *const fn (JniEnv, jobject) callconv(.c) jclass;
 const NewObjectArrayFn = *const fn (JniEnv, i32, jclass, jobject) callconv(.c) jobject;
+const NewByteArrayFn = *const fn (JniEnv, i32) callconv(.c) jobject;
+const GetByteArrayRegionFn = *const fn (JniEnv, jobject, i32, i32, [*]i8) callconv(.c) void;
 const CallObjectMethodAFn = *const fn (JniEnv, jobject, jmethodID, [*]const jvalue) callconv(.c) jobject;
 const CallVoidMethodAFn = *const fn (JniEnv, jobject, jmethodID, [*]const jvalue) callconv(.c) void;
 const CallBooleanMethodAFn = *const fn (JniEnv, jobject, jmethodID, [*]const jvalue) callconv(.c) u8;
@@ -383,6 +387,87 @@ fn deliverIntentRedirect(activity: *Activity) bool {
     seam.logcat("login: redirect arrived with no armed flow — dropped", .{});
     return false;
 }
+
+/// A PHOTO WAS SHARED INTO THE APP. Reads the bytes and hands them to the app,
+/// which attaches them to whatever conversation is open.
+///
+/// This is the way a picture gets in, and the reason is concrete: the NDK's
+/// callback table has no `onActivityResult`, so `startActivityForResult` — the
+/// system photo picker — cannot return anything to native code at all. An
+/// INTENT can, which is how the OAuth redirect already arrives, so the share
+/// sheet is the route that works with no dex and no Java of our own.
+///
+/// The bytes are read through `ContentResolver.openInputStream`, because a
+/// content:// URI is not a file path and has no path we are allowed to open.
+fn deliverSharedImage(activity: *Activity) bool {
+    const env: JniEnv = @ptrCast(@alignCast(activity.env));
+
+    const get_intent = jniMethod(env, activity.clazz, "getIntent", "()Landroid/content/Intent;") orelse return false;
+    const intent = jniCallObj(env, activity.clazz, get_intent, &no_args) orelse return false;
+
+    // Only ACTION_SEND with an image. Anything else is somebody else's intent.
+    const get_action = jniMethod(env, intent, "getAction", "()Ljava/lang/String;") orelse return false;
+    const action_j = jniCallObj(env, intent, get_action, &no_args) orelse return false;
+    const action_c = jniFn(env, jni_get_string_utf_chars, GetStringUtfCharsFn)(env, action_j, null) orelse return false;
+    const is_send = std.mem.eql(u8, std.mem.span(action_c), "android.intent.action.SEND");
+    jniFn(env, jni_release_string_utf_chars, ReleaseStringUtfCharsFn)(env, action_j, action_c);
+    if (!is_send) return false;
+
+    // EXTRA_STREAM: the picture's URI.
+    const get_parcel = jniMethod(env, intent, "getParcelableExtra", "(Ljava/lang/String;)Landroid/os/Parcelable;") orelse return false;
+    const key_j = jniFn(env, jni_new_string_utf, NewStringUtfFn)(env, "android.intent.extra.STREAM");
+    if (jniFailed(env) or key_j == null) return false;
+    const uri = jniCallObj(env, intent, get_parcel, &[_]jvalue{.{ .l = key_j }}) orelse return false;
+
+    const get_cr = jniMethod(env, activity.clazz, "getContentResolver", "()Landroid/content/ContentResolver;") orelse return false;
+    const cr = jniCallObj(env, activity.clazz, get_cr, &no_args) orelse return false;
+    const cr_cls = jniFn(env, jni_get_object_class, GetObjectClassFn)(env, cr);
+    if (jniFailed(env) or cr_cls == null) return false;
+    const open_mid = jniFn(env, jni_get_method_id, GetMethodIdFn)(env, cr_cls, "openInputStream", "(Landroid/net/Uri;)Ljava/io/InputStream;");
+    if (jniFailed(env) or open_mid == null) return false;
+    const stream = jniFn(env, jni_call_object_method_a, CallObjectMethodAFn)(env, cr, open_mid, &[_]jvalue{.{ .l = uri }});
+    if (jniFailed(env) or stream == null) {
+        seam.logcat("share: could not open the picture", .{});
+        return false;
+    }
+
+    const st_cls = jniFn(env, jni_get_object_class, GetObjectClassFn)(env, stream);
+    if (jniFailed(env) or st_cls == null) return false;
+    const read_mid = jniFn(env, jni_get_method_id, GetMethodIdFn)(env, st_cls, "read", "([B)I");
+    const close_mid = jniFn(env, jni_get_method_id, GetMethodIdFn)(env, st_cls, "close", "()V");
+    if (jniFailed(env) or read_mid == null or close_mid == null) return false;
+    defer jniFn(env, jni_call_void_method_a, CallVoidMethodAFn)(env, stream, close_mid, &no_args);
+
+    // A CEILING, not a buffer that grows to whatever was handed to us. The size
+    // is the SENDER's choice, and it must not be our allocation.
+    const chunk_len: i32 = 64 * 1024;
+    const jarr = jniFn(env, jni_new_byte_array, NewByteArrayFn)(env, chunk_len);
+    if (jniFailed(env) or jarr == null) return false;
+
+    var total: usize = 0;
+    while (total < shared_image_max) {
+        const n = jniFn(env, jni_call_int_method_a, CallIntMethodAFn)(env, stream, read_mid, &[_]jvalue{.{ .l = jarr }});
+        if (jniFailed(env) or n <= 0) break;
+        const want: usize = @min(@as(usize, @intCast(n)), shared_image_max - total);
+        jniFn(env, jni_get_byte_array_region, GetByteArrayRegionFn)(env, jarr, 0, @intCast(want), @ptrCast(shared_image_buf[total..].ptr));
+        if (jniFailed(env)) break;
+        total += want;
+        if (want < @as(usize, @intCast(n))) {
+            seam.logcat("share: picture is larger than the cap; refused", .{});
+            return false; // TRUNCATED IS NOT SMALLER — half a JPEG is not a photograph
+        }
+    }
+    if (total == 0) return false;
+    seam.logcat("share: {d} bytes of picture handed to the app", .{total});
+    return seam.zat_shared_image(g_ctx orelse return false, shared_image_buf[0..total].ptr, total);
+}
+
+/// The staging buffer for a shared picture, and its ceiling. Static because the
+/// activity has no allocator and a share arrives at most one at a time; the
+/// ceiling matches the chat transport's own, so a picture that could never be
+/// sent is refused before it is read rather than after.
+const shared_image_max: usize = 2 * 1024 * 1024;
+var shared_image_buf: [shared_image_max]u8 = undefined;
 
 /// Show or hide the soft keyboard (the M-UX keyboard leg). NativeActivity
 /// has no text widget, so this is the game-engine recipe: ask the
@@ -958,6 +1043,10 @@ const App = struct {
     /// onCreate before the thread spawns) — the cache root zat_feed_start
     /// takes (M_CORE_INVERSION MC.4d).
     files_dir: [512:0]u8 = [_:0]u8{0} ** 512,
+    /// A share intent is waiting to be read. Read on the RENDER thread rather
+    /// than here: the app's ctx does not exist yet at create, and there is
+    /// nothing to hand a picture to until it does.
+    shared_image_pending: bool = false,
     /// Asked for notification permission once this process. Asking again after a
     /// refusal is how an app becomes something people uninstall.
     asked_notif_perm: bool = false,
@@ -1218,6 +1307,11 @@ fn renderThread() void {
             if (seam.zat_minimize(ctx)) {
                 if (app.activity) |act| moveTaskToBack(act);
             }
+            // A PICTURE WAS SHARED IN. Once per launch, once the app exists.
+            if (app.shared_image_pending) {
+                app.shared_image_pending = false;
+                if (app.activity) |act| _ = deliverSharedImage(act);
+            }
             // A CALL WANTS THE MIC. Asked at the moment a call starts, which is
             // both the honest place for it and the one where somebody will say
             // yes — a mic prompt at first launch gets denied by reflex.
@@ -1456,6 +1550,9 @@ export fn ANativeActivity_onCreate(activity: *Activity, saved: ?*anyopaque, save
     // browser instead (the user gets the sign-in page back, not a dead
     // field); the render thread acts on the flag once the ctx exists.
     app.reoffer_login = !deliverIntentRedirect(activity);
+    // A SHARED PICTURE, if this launch was one. Checked after the redirect,
+    // which has first claim on the intent; the two never both apply.
+    app.shared_image_pending = true;
     // The app's private files dir — the cache root the feed leg needs
     // (MC.4d). Copied before the thread spawns; the activity's own string
     // may not outlive us.

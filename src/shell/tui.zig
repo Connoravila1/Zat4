@@ -90,6 +90,7 @@ const chat_relay = @import("chat_relay.zig");
 const chat_e2ee = @import("chat_e2ee.zig");
 const chat_keys = @import("chat_keys.zig");
 const keydir = @import("../core/keydir.zig"); // multi-device: ask / approve / who is waiting
+const android_image = @import("android_image.zig"); // photos, decoded by the platform
 const enroll_view = @import("../core/enroll_view.zig");
 const boot_intro = @import("../core/boot_intro.zig"); // the signed-out boot entrance (§5)
 const enroll_run = @import("enroll_run.zig");
@@ -9256,6 +9257,75 @@ pub fn mobileForeground(mr: *MobileRun, front: bool) void {
     mr.rs.gbackgrounded = !front;
 }
 
+/// A PHOTO ARRIVED FROM THE SHARE SHEET. Attach it to the open conversation and
+/// send it.
+///
+/// It goes to whatever conversation is OPEN, and nowhere if none is — a photo
+/// dropped into the app with no thread selected has no addressee, and guessing
+/// one is how somebody's picture ends up in the wrong conversation. False says
+/// so, and the sharing app shows its own failure rather than a silent success.
+///
+/// The dimensions come from the DECODER, not from the file's own claim about
+/// itself: the bubble is laid out from them, and a header that lies about its
+/// size would lay out a rectangle the picture does not fill.
+pub fn mobileSharedImage(mr: *MobileRun, bytes: []const u8) bool {
+    const rs = &mr.rs;
+    const conv = rs.gchat_sel orelse {
+        chatLog("[chat] a picture was shared with no conversation open — refused", .{});
+        return false;
+    };
+    const st = if (rs.gchat_e2ee) |*p| p else return false;
+    const link = rs.gchat_link orelse return false;
+    if (bytes.len == 0 or bytes.len > chat_core.max_attachment_bytes) return false;
+
+    // Decode ONCE, here: for the true dimensions, and so a file that will not
+    // decode is refused before it is stored and sent rather than after it has
+    // reached everybody as something nobody can open.
+    var dec = android_image.decode(rs.gpa, bytes) orelse {
+        chatLog("[chat] the shared picture did not decode — refused", .{});
+        return false;
+    };
+    const w: u16 = std.math.cast(u16, dec.width) orelse {
+        dec.deinit(rs.gpa);
+        return false;
+    };
+    const h: u16 = std.math.cast(u16, dec.height) orelse {
+        dec.deinit(rs.gpa);
+        return false;
+    };
+    dec.deinit(rs.gpa); // the ENCODED bytes are what is stored and sent, not the pixels
+
+    const now = clock_shell.unixSeconds();
+    const msg = chat_core.appendMessage(rs.gpa, &rs.gchat_store, conv, .image, "", now, true) catch return false;
+    _ = chat_core.attachImage(rs.gpa, &rs.gchat_store, msg, bytes, w, h, .jpeg) catch |err| {
+        chatLog("[chat] could not keep the shared picture: {s}", .{@errorName(err)});
+        return false;
+    };
+
+    // An id for this transfer. It means nothing outside the session it travels
+    // in, so the clock is a fine source — two peers colliding costs nothing.
+    const id: u32 = @truncate(@as(u64, @bitCast(clock_shell.monotonicNanos())));
+    if (chat_core.isGroup(&rs.gchat_store, conv)) {
+        var seat: u16 = 0;
+        const n = chat_core.memberCount(&rs.gchat_store, conv);
+        while (seat < n) : (seat += 1) {
+            if (chat_core.memberLeft(&rs.gchat_store, conv, seat)) continue;
+            const did = chat_core.memberDid(&rs.gchat_store, conv, seat);
+            chat_e2ee.sendImage(rs.gpa, rs.io, rs.environ, st, link, did, id, bytes, w, h, .jpeg) catch |err|
+                chatLog("[chat] picture to {s} failed: {s}", .{ did, @errorName(err) });
+        }
+    } else {
+        const peer = chat_core.conversationDid(&rs.gchat_store, conv);
+        chat_e2ee.sendImage(rs.gpa, rs.io, rs.environ, st, link, peer, id, bytes, w, h, .jpeg) catch |err| {
+            chatLog("[chat] picture send FAILED: {s}", .{@errorName(err)});
+            return false;
+        };
+    }
+    chatPersistHistory(rs.gpa, rs.io, rs.environ, st, &rs.gchat_store);
+    rs.gscroll_px = 0; // re-anchor to the newest, which is now the picture
+    return true;
+}
+
 /// A call is starting and wants the microphone (read-and-clear). The activity
 /// asks the OS; the answer arrives at the next capture attempt, which is the
 /// honest place for it — see `requestPermission` in android_activity.zig.
@@ -11653,6 +11723,50 @@ fn chatHoldStep(rs: *RunState) void {
     }
 }
 
+/// WHICH PICTURES THE RENDERER HAS PIXELS FOR, this frame.
+///
+/// Resolved here rather than in the view because a texture is the shell's
+/// business and a bubble's layout is the view's — what crosses is a message
+/// index and a slot number, and neither side learns the other's job (B5).
+///
+/// DECODING IS LAZY AND ONCE. `photoSlot` is asked with no pixels first: a
+/// picture already resident keeps its slot and nothing is decoded at all, which
+/// is every frame after the first. Only a picture that has no slot pays for a
+/// decode, and then it holds one until something else needs it.
+///
+/// ⚠️ The decode runs on the render thread. It happens once per picture rather
+/// than once per frame, so it is a hitch on arrival and not a stutter — but a
+/// large photograph WILL cost a frame, and moving it to a worker is the honest
+/// follow-up (the same law that put chat bring-up on a worker).
+fn chatPhotosOf(rs: *RunState, arena: Allocator) []const feed_view.PhotoSlot {
+    const conv = rs.gchat_sel orelse return &.{};
+    const gs = if (rs.gpu_state) |*g| g else return &.{}; // software path draws frames
+    const store = &rs.gchat_store;
+
+    var out: std.ArrayListUnmanaged(feed_view.PhotoSlot) = .empty;
+    const conv_col = store.msgs.items(.conv);
+    for (conv_col, 0..) |c, mi| {
+        if (c != conv) continue;
+        const msg: chat_core.MsgIndex = @enumFromInt(mi);
+        const att = chat_core.attachmentOf(store, msg) orelse continue;
+        // The key must never be 0 — that is the renderer's "empty slot".
+        const key: u64 = @as(u64, @intFromEnum(att)) + 1;
+
+        // Already resident? Then no bytes are touched at all.
+        var slot = gpu.photoSlot(&gs.feed.renderer, key, null, 0, 0);
+        if (slot == null) {
+            const bytes = chat_core.attachmentBytes(store, att);
+            if (bytes.len == 0) continue;
+            var dec = android_image.decode(rs.gpa, bytes) orelse continue;
+            defer dec.deinit(rs.gpa);
+            slot = gpu.photoSlot(&gs.feed.renderer, key, dec.rgba, dec.width, dec.height);
+        }
+        const s = slot orelse continue; // no slot free this frame; the frame draws
+        out.append(arena, .{ .msg = @intCast(mi), .slot = s }) catch break;
+    }
+    return out.items;
+}
+
 fn chatDevicesOf(rs: *RunState, arena: Allocator) feed_view.ChatDevices {
     var pend: []const feed_view.PendingDeviceView = &.{};
     if (rs.gdev_pend_have) {
@@ -11676,6 +11790,7 @@ fn chatDevicesOf(rs: *RunState, arena: Allocator) feed_view.ChatDevices {
     return .{
         .state = rs.gdev_state,
         .reason = rs.gdev_reason,
+        .photos = chatPhotosOf(rs, arena),
         .pointer = .{
             .hover_x = rs.ghover_x,
             .hover_y = rs.ghover_y,

@@ -9228,6 +9228,48 @@ const pay_card_w_max: i32 = 280;
 
 /// A card's height for the thread's measure pass — the same arithmetic the
 /// draw pass walks, so the two can never disagree.
+/// The renderer's slot for a message's picture, or `no_photo_slot`. Linear over
+/// a screenful — the table is what the SHELL decided is resident this frame, not
+/// every photograph that ever arrived.
+fn photoSlotFor(photos: []const PhotoSlot, msg: u32) u8 {
+    for (photos) |p| {
+        if (p.msg == msg) return p.slot;
+    }
+    return no_photo_slot;
+}
+
+/// Emit one picture. `slot` names the renderer's live texture, or
+/// `no_photo_slot` when there is none and the frame is drawn instead.
+fn image(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, w: i32, h: i32, slot: u8, radius: u8) !void {
+    if (w <= 0 or h <= 0) return;
+    try dl.append(gpa, .{ .image = .{
+        .x = clampI16(@floatFromInt(x)),
+        .y = clampI16(@floatFromInt(y)),
+        .w = clampU16(@floatFromInt(w)),
+        .h = clampU16(@floatFromInt(h)),
+        .slot = slot,
+        .radius = radius,
+    } });
+}
+
+/// How tall a bubble's photograph is, at the width it will be drawn.
+///
+/// The ASPECT is honoured and the width is the bubble's: a picture never widens
+/// the column it arrived in, and a very tall one is capped so a single photo
+/// cannot become the whole screen with the message under it pushed off.
+fn photoBoxH(b: chat_view.BubbleRow, avail_w: i32) i32 {
+    if (b.photo_w == 0 or b.photo_h == 0) return 0;
+    const w: i64 = @min(avail_w, @as(i32, b.photo_w));
+    const h = @divTrunc(w * @as(i64, b.photo_h), @as(i64, b.photo_w));
+    const capped = @min(h, @as(i64, photo_box_h_max));
+    return @intCast(@max(capped, 1) + photo_box_gap);
+}
+
+/// A picture may not be taller than this, whatever its aspect.
+const photo_box_h_max: i32 = 420;
+/// Breathing room between the picture and whatever is under it.
+const photo_box_gap: i32 = 8;
+
 fn payCardHeight(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, b: chat_view.BubbleRow, card: chat_view.PayCard, cw2: i32) !i32 {
     var h: i32 = 12 + 16 + 30 + 38 + 10; // pads + rail tag + amount + status(head+sub)
     if (b.body.len > 0)
@@ -9517,9 +9559,28 @@ pub const Pointer = struct {
     press_y: i32 = -1,
 };
 
+/// A PICTURE THE RENDERER HAS PIXELS FOR, this frame.
+///
+/// Plain data across the boundary (B5): the view is pure and never learns what
+/// a texture is, and the shell never learns how a bubble is laid out. The view
+/// asks "does message N have a slot", draws the photograph if so and its frame
+/// if not.
+/// A7.2: cold — a screenful at most.
+pub const PhotoSlot = struct {
+    /// The store's message index, as `BubbleRow.msg` carries it.
+    msg: u32,
+    /// The renderer's slot. `no_photo_slot` = it has none this frame.
+    slot: u8,
+};
+
+pub const no_photo_slot: u8 = 255;
+
 pub const ChatDevices = struct {
     // A7.2: cold struct (one per frame, config-shaped), size guard waived.
     state: ChatDeviceState = .ok,
+    /// Which pictures are resident. Empty is the ordinary case — most threads
+    /// have no photographs in them.
+    photos: []const PhotoSlot = &.{},
     /// Where the pointer is, for the state layers on this surface's controls.
     pointer: Pointer = .{},
     /// WHY, when `state` is `.may_join`. Four situations share that one remedy,
@@ -11496,7 +11557,11 @@ pub fn layoutChat(
             const quote_h: i32 = if (b.quote.len > 0 and !b.deleted) 26 else 0;
             const react_pad: i32 = if (b.reacts_n > 0) 16 else 0; // room for the chips
             const text_h = quote_h + react_pad + try wrapBody(gpa, dl, e, 0, 0, bub_max - 2 * pad_x, 0, chat_px, b.body, line_h, false, null);
-            hslot.* = text_h + 2 * pad_y - 4;
+            // A PHOTOGRAPH RESERVES ITS RECTANGLE HERE, from the size the store
+            // recorded — before any decoding, and whether or not it ever decodes.
+            // A bubble that grows when its picture arrives makes the whole thread
+            // jump under the reader's thumb, which is worse than a slow picture.
+            hslot.* = text_h + 2 * pad_y - 4 + photoBoxH(b, bub_max - 2 * pad_x);
         }
         total += hslot.* + gap;
         if (b.stamp) total += stamp_h;
@@ -11651,6 +11716,17 @@ pub fn layoutChat(
                         try rect(gpa, dl, bx + pad_x, by + 8, 2, 22, softA(0xEDEAE0, 0x88), 1);
                         try strEllipsis(gpa, dl, e, .regular, bx + pad_x + 8, by + 24, softA(0xEDEAE0, 0x99), 12, b.quote, bub_max - 2 * pad_x - 10);
                         body_y2 += 26;
+                    }
+                    // THE PHOTOGRAPH, above the words it came with. Its rectangle
+                    // was already reserved in the height pass, so it appears in
+                    // the space that was always there rather than shoving the
+                    // thread down when it finally decodes.
+                    if (b.photo_w > 0 and !b.deleted) {
+                        const avail = bub_max - 2 * pad_x;
+                        const ph = photoBoxH(b, avail) - photo_box_gap;
+                        const pw: i32 = @min(avail, @as(i32, b.photo_w));
+                        try image(gpa, dl, bx + pad_x, body_y2 - 12, pw, ph, photoSlotFor(devices.photos, b.msg), 10);
+                        body_y2 += ph + photo_box_gap;
                     }
                     _ = try wrapBody(gpa, dl, e, bx + pad_x, body_y2, bub_max - 2 * pad_x, bubble_ink, chat_px, b.body, line_h, true, null);
                     if (b.reacts_n > 0) {

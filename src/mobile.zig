@@ -1150,6 +1150,18 @@ pub export fn zat_notify_take(
     return true;
 }
 
+/// A PHOTO WAS SHARED INTO THE APP. Copied straight in — the activity's staging
+/// buffer is reused by the next share, so it cannot be borrowed.
+///
+/// True = the app took it. False = there was nowhere to put it (no conversation
+/// open, no chat), and the caller says so rather than pretending it sent.
+pub export fn zat_shared_image(ctx_ptr: ?*anyopaque, bytes: [*]const u8, len: usize) bool {
+    const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr orelse return false));
+    if (comptime !mobile_config.have_gpu) return false;
+    const f = if (ctx.feed) |*ff| ff else return false;
+    return tui.mobileSharedImage(f.run, bytes[0..len]);
+}
+
 /// A CALL IS STARTING AND WANTS THE MICROPHONE (read-and-clear). The activity
 /// asks the OS. Nothing in this app requested a runtime permission before this,
 /// and RECORD_AUDIO has been declared-but-never-asked since calling landed.
