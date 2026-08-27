@@ -53,7 +53,11 @@ const call_view = @import("../core/call_view.zig");
 // .linux` is true for Android too, so the phone build gets the real thing.
 const call_ctl = if (builtin.os.tag == .linux) @import("call_ctl.zig") else struct {
     pub const Phase = enum(u8) { idle, ringing_in, ringing_out, active };
-    pub const CallCtl = struct { phase: Phase = .idle };
+    // The stub must carry every FIELD the real one does that the shell touches,
+    // not just its functions — this one went missing and only the macOS
+    // cross-compile said so, because `builtin.os.tag == .linux` hides the whole
+    // struct from every native build and every test.
+    pub const CallCtl = struct { phase: Phase = .idle, mic_perm_wanted: bool = false };
     pub fn startOutgoing(_: *CallCtl, _: Allocator, _: std.Io, _: ?*const std.process.Environ.Map, _: anytype, _: anytype, _: []const u8) void {}
     pub fn onSignal(_: *CallCtl, _: Allocator, _: std.Io, _: ?*const std.process.Environ.Map, _: anytype, _: anytype, _: []const u8, _: []const u8) void {}
     pub fn poll(_: *CallCtl) void {}

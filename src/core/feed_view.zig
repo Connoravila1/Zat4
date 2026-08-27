@@ -558,6 +558,13 @@ fn fadeColor(c: u32, t: f32) u32 {
     return (na << 24) | (c & 0x00FFFFFF);
 }
 
+/// The same scaling for an item that carries a bare alpha byte rather than a
+/// packed colour (a picture has one opacity for the whole image).
+fn fadeAlpha(a: u8, t: f32) u8 {
+    const tc = @max(0.0, @min(1.0, t));
+    return @intFromFloat(@as(f32, @floatFromInt(a)) * tc);
+}
+
 /// Scale the alpha of every draw item from `from` to the list's current end
 /// by `t` — the collapse fade for a range a widget draws without an alpha
 /// input (the zone masthead's tucking lens socket). PURE.
@@ -572,6 +579,10 @@ fn fadeItems(dl: *raster.DrawList, from: usize, t: f32) void {
             .line => |*l| l.color = fadeColor(l.color, t),
             .tri => |*tr| tr.color = fadeColor(tr.color, t),
             .emoji => {}, // sprites carry their own colors; the fade skips them
+            // A picture DOES fade: it has one opacity for the whole image, so a
+            // photo tucks away with the card it sits in instead of hanging in
+            // the air after everything around it has gone.
+            .image => |*im| im.alpha = fadeAlpha(im.alpha, t),
         }
         dl.set(i, item);
     }
@@ -1405,6 +1416,17 @@ pub fn transformDlRange(dl: *raster.DrawList, start: usize, end: usize, s: f32, 
                 r.w = clampU16(@as(f32, @floatFromInt(r.w)) * s);
                 r.h = clampU16(@as(f32, @floatFromInt(r.h)) * s);
                 r.radius = clampU8(@as(f32, @floatFromInt(r.radius)) * s);
+            },
+            // A picture is a rectangle as far as the layout toys are concerned:
+            // if a post drifts or tilts, its photo drifts with it, or the bubble
+            // arrives somewhere its own contents did not.
+            .image => {
+                const im = &data[i].image;
+                im.x = clampI16(cx + (@as(f32, @floatFromInt(im.x)) - cx) * s + dx);
+                im.y = clampI16(cy + (@as(f32, @floatFromInt(im.y)) - cy) * s + dy);
+                im.w = clampU16(@as(f32, @floatFromInt(im.w)) * s);
+                im.h = clampU16(@as(f32, @floatFromInt(im.h)) * s);
+                im.radius = clampU8(@as(f32, @floatFromInt(im.radius)) * s);
             },
             .line => {
                 const l = &data[i].line;
@@ -6860,6 +6882,10 @@ pub fn rethemeRetro(gpa: Allocator, dl: *raster.DrawList, w: i32, h: i32, add_cl
         const item = src.get(i);
         switch (item) {
             .emoji => try dl.append(gpa, item), // sprites pass through every retheme
+            // …and so does a photograph. Re-skinning somebody's picture is not a
+            // theme, it is damage: the retro pass recolours the app's OWN chrome,
+            // never its content.
+            .image => try dl.append(gpa, item),
             .rect => |r| {
                 const rw: i32 = r.w;
                 const rh: i32 = r.h;
@@ -6996,6 +7022,10 @@ pub fn rethemeLight(gpa: Allocator, dl: *raster.DrawList) error{OutOfMemory}!voi
         const item = src.get(i);
         switch (item) {
             .emoji => try dl.append(gpa, item), // sprites pass through
+            // …and so does a photograph. Light mode re-tones the app's own
+            // chrome; a person's picture is content, and re-toning it by
+            // luminance would return a different photograph than they sent.
+            .image => try dl.append(gpa, item),
             .rect => |r| {
                 if (r.color == lens_socket.theme_keep_begin) {
                     keep = true; // drop the marker itself
@@ -7187,6 +7217,15 @@ pub fn shatterCaptureHomes(dl: *const raster.DrawList, hx: []f32, hy: []f32, bw:
                 aw = @floatFromInt(r.w);
                 ah = @floatFromInt(r.h);
             },
+            // A picture's box is simply its rectangle — the physics toys need
+            // it so a photo is thrown with the post it belongs to rather than
+            // being left where the post used to be.
+            .image => |im| {
+                ax = @floatFromInt(im.x);
+                ay = @floatFromInt(im.y);
+                aw = @floatFromInt(im.w);
+                ah = @floatFromInt(im.h);
+            },
             .line => |l| {
                 ax = @floatFromInt(@min(l.x0, l.x1));
                 ay = @floatFromInt(@min(l.y0, l.y1));
@@ -7245,6 +7284,11 @@ pub fn applyShatterItems(dl: *raster.DrawList, bx: []const f32, by: []const f32,
                 const r = &data[i].rect;
                 r.x = clampI16(@as(f32, @floatFromInt(r.x)) + dx);
                 r.y = clampI16(@as(f32, @floatFromInt(r.y)) + dy);
+            },
+            .image => {
+                const im = &data[i].image;
+                im.x = clampI16(@as(f32, @floatFromInt(im.x)) + dx);
+                im.y = clampI16(@as(f32, @floatFromInt(im.y)) + dy);
             },
             .line => {
                 const l = &data[i].line;

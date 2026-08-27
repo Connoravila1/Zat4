@@ -174,6 +174,40 @@ pub const EmojiItem = struct {
     }
 };
 
+/// A DECODED PICTURE, drawn as a rectangle of pixels.
+///
+/// Deliberately decoder-agnostic: this names a slot of already-decoded RGBA and
+/// nothing about where the bytes came from. Decoding somebody else's photograph
+/// is a security decision (the bytes are attacker-controlled), and the draw path
+/// has no business having an opinion about it — see the note in
+/// ZAT_CHAT_FINISH_LINE on the decoder.
+///
+/// `slot` indexes the host's small table of live pictures (the renderer's
+/// texture cache on the GPU path, a plain RGBA buffer in software). An index
+/// rather than a pointer, per A4 — and it never leaves its owning module.
+pub const ImageItem = struct {
+    x: i16,
+    y: i16,
+    /// Destination size in logical px. The source is scaled to this, so the
+    /// bubble decides the geometry and a photo cannot resize the thread.
+    w: u16,
+    h: u16,
+    /// Which live picture. 255 = none (a bubble waiting on its bytes).
+    slot: u8,
+    /// Whole-image opacity, 0..255 — a picture fades in with its bubble like
+    /// everything else rather than snapping into place.
+    alpha: u8 = 255,
+    /// Corner rounding, matching the bubble it sits in.
+    radius: u8 = 0,
+    _pad: [1]u8 = @splat(0), // A6: explicit
+
+    comptime {
+        // Budget: 2+2+2+2 + 1+1+1+1 = 12, inside the union's 16-byte payload —
+        // so the DrawItem guard below is untouched (A7).
+        assert(@sizeOf(ImageItem) == 12);
+    }
+};
+
 pub const DrawItem = union(enum) {
     cell: CellItem,
     text: TextItem,
@@ -181,6 +215,7 @@ pub const DrawItem = union(enum) {
     line: LineItem,
     tri: TriItem,
     emoji: EmojiItem,
+    image: ImageItem,
 
     comptime {
         // HOT (thousands per frame, stored in DrawList). Each variant is a
@@ -227,6 +262,18 @@ pub fn deinit(gpa: Allocator, fb: *Framebuffer) void {
 /// verify allocator caveat, in glyph form), the only error a cache
 /// fill's OOM (E3). `engine` may be null for cell-only lists (the
 /// fallback screens); text items then degrade to nothing drawn (E4).
+/// THE SOFTWARE FALLBACK'S PICTURE: the frame, not the photograph.
+///
+/// The software rasterizer has no texture table and no decoder, and giving it
+/// one would mean decoding attacker-supplied bytes on the render thread of the
+/// path we fall back to WHEN THE GPU FAILED — the worst possible place. It draws
+/// the bubble's outline instead, so a photo reads as a photo that did not render
+/// rather than as a bug.
+fn drawImagePlaceholder(fb: *Framebuffer, it: ImageItem) void {
+    const edge: u32 = (@as(u32, it.alpha) << 24) | 0x00_3A3A3A;
+    drawRect(fb, .{ .x = it.x, .y = it.y, .w = it.w, .h = it.h, .color = edge, .radius = it.radius });
+}
+
 pub fn paint(
     gpa: Allocator,
     engine: ?*text.Engine,
@@ -251,6 +298,10 @@ pub fn paint(
             drawCoverage(fb, it.x + g.bear_x, it.baseline + g.bear_y, g, it.color);
         },
         .emoji => drawEmoji(fb, bare.emoji),
+        // The software path has no picture table — it is the FALLBACK renderer,
+        // and a photo there draws as its own frame rather than nothing, so a
+        // bubble is never mysteriously empty. The GPU path is where pixels live.
+        .image => drawImagePlaceholder(fb, bare.image),
     };
 }
 

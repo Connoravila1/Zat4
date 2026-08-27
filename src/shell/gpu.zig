@@ -876,6 +876,35 @@ pub fn buildVertices(
             const uv = [4][2]f32{ .{ ua, va }, .{ ub, va }, .{ ub, vb }, .{ ua, vb } };
             try pushQuad(&verts, gpa, p, uv, zero_local, .{ 0, 0 }, 0, mode_glyph, argb(it.color));
         },
+        // A PICTURE. The FRAME, not yet the photograph.
+        //
+        // Real pixels need a decoder, and decoding somebody else's photograph is
+        // a security decision that has not been made: the bytes are
+        // attacker-controlled, `stb_image` is NOT vendored here (only
+        // stb_truetype is), and its own docs disclaim bounds-checking on hostile
+        // input — which is the entire threat model for a photo a stranger sent
+        // you. The alternative is the platform's hardened decoder through JNI.
+        // Recorded in ZAT_CHAT_FINISH_LINE as an owner decision.
+        //
+        // Until then this draws the bubble's outline at the right geometry, so a
+        // photo reads as a picture that has not rendered rather than as nothing
+        // at all — and when the decoder lands, only this arm changes: one more
+        // sampler and a `mode_photo` branch beside the emoji one.
+        .image => {
+            const it = bare.image;
+            if (it.w == 0 or it.h == 0 or it.slot == 255) continue;
+            const x: f32 = @as(f32, @floatFromInt(it.x)) * scale;
+            const y: f32 = @as(f32, @floatFromInt(it.y)) * scale;
+            const w: f32 = @as(f32, @floatFromInt(it.w)) * scale;
+            const h: f32 = @as(f32, @floatFromInt(it.h)) * scale;
+            const rad: f32 = @min(@as(f32, @floatFromInt(it.radius)) * scale, @min(w, h) / 2.0);
+            const hw = w / 2.0;
+            const hh = h / 2.0;
+            const p = [4][2]f32{ .{ x, y }, .{ x + w, y }, .{ x + w, y + h }, .{ x, y + h } };
+            const local = [4][2]f32{ .{ -hw, -hh }, .{ hw, -hh }, .{ hw, hh }, .{ -hw, hh } };
+            const a: f32 = @as(f32, @floatFromInt(it.alpha)) / 255.0;
+            try pushQuad(&verts, gpa, p, zero_uv, local, .{ hw, hh }, rad, mode_rrect, .{ 0.16, 0.16, 0.16, a });
+        },
         .emoji => {
             const it = bare.emoji;
             const o = emoji_atlas.cellOrigin(it.cell);
