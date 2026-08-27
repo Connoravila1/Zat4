@@ -265,6 +265,15 @@ pub fn build(b: *std.Build) void {
         // NDK stub resolves the link; the device provides the real one.
         libzat_mod.linkSystemLibrary("android", .{});
         libzat_mod.linkSystemLibrary("log", .{}); // logcat: the feed leg narrates its bring-up (stderr goes nowhere in an APK)
+        // AndroidBitmap_lockPixels: direct access to a decoded Bitmap's pixels.
+        //
+        // A photograph somebody sent is ATTACKER-CONTROLLED input, and the
+        // platform's decoder is hardened and maintained by people whose job that
+        // is. Vendoring stb_image instead would put a parser whose own docs
+        // disclaim bounds-checking in front of exactly those bytes — the opposite
+        // of the case stb_truetype was accepted on (F1), which rests on this app
+        // shipping its own fonts and never loading a user's.
+        libzat_mod.linkSystemLibrary("jnigraphics", .{});
         libzat_mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib/aarch64-linux-android/29", .{sysroot}) });
         const wf = b.addWriteFiles();
         // API 29 = this Zig's default android target version; present in r27c.

@@ -40,6 +40,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const seam = @import("mobile.zig");
+const android_image = @import("shell/android_image.zig"); // photos, decoded by the platform
 const clock = @import("shell/clock.zig");
 
 /// The house lock (see auth.SessionLock's note): std.Thread.Mutex is
@@ -1444,6 +1445,10 @@ export fn ANativeActivity_onCreate(activity: *Activity, saved: ?*anyopaque, save
     activity.callbacks.onPause = onPauseCb;
     app = .{};
     app.activity = activity;
+    // The decoder runs on the RENDER thread and needs its own attach, so it gets
+    // the VM rather than the activity — a JNIEnv is per-thread and handing one
+    // across threads is undefined behaviour, not a shortcut.
+    android_image.vm_handle = activity.vm;
     // A recreate can BE the redirect delivery (Android tears the activity
     // down and hands the VIEW intent to the new instance); the armed flow
     // survived in the process-owned ctx — feed it before the thread spins.
