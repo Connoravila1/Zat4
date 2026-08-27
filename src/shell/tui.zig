@@ -1237,6 +1237,9 @@ const RunState = struct {
     /// prompt on first run, for a feature nobody has reached for yet, is the
     /// prompt people deny out of hand.
     gmic_perm_wanted: bool,
+    /// The call phase we saw last frame — so "it started ringing" is an EDGE and
+    /// not a state. A notification per frame of ringing is sixty a second.
+    gcall_last_phase: call_ctl.Phase,
     /// The app is not in front. Only then is a notification the right answer — a
     /// message arriving on the screen you are looking at does not need one.
     gbackgrounded: bool,
@@ -2117,6 +2120,7 @@ fn initRunState(
     rs.gnotif_body_len = 0;
     rs.gnotif_pending = false;
     rs.gmic_perm_wanted = false;
+    rs.gcall_last_phase = .idle;
     rs.gbackgrounded = false;
     rs.ghover_y = -1;
 
@@ -2999,6 +3003,17 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 chatLog("[call] --call-auto: answering the inbound call", .{});
                 call_ctl.accept(&rs.gcall, gpa, io, environ, st, rs.gchat_link.?);
             }
+
+            // A CALL THAT RINGS ONLY ON SCREEN is no use in a pocket. When the
+            // phone starts ringing and the app is behind, say so where somebody
+            // will see it — and only on the TRANSITION into ringing, so a call
+            // that goes unanswered for a minute is one notification and not
+            // sixty.
+            if (rs.gcall.phase == .ringing_in and rs.gcall_last_phase != .ringing_in) {
+                if (rs.sfxp) |p| sfx_player.play(p, .ringtone);
+                chatNotify(rs, "Incoming call", call_ctl.peerDid(&rs.gcall));
+            }
+            rs.gcall_last_phase = rs.gcall.phase;
 
             // A1 — the unacknowledged-Welcome pump. A Welcome is one shot into
             // a relay whose store is in-memory: lose it to a restart, a
@@ -7106,6 +7121,26 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                             rs.gchat_peer_len = 0;
                                             rs.gchat_compose_status = "";
                                             rs.gchat_input_focus = false;
+                                        },
+                                        // PLACE A CALL to whoever this thread is
+                                        // with. Refused in a group: a fan-out of
+                                        // pairwise voice sessions is not a group
+                                        // call, and a button that silently rings
+                                        // one member of five is worse than one
+                                        // that says it cannot yet.
+                                        .chat_call => if (dev_chat) {
+                                            if (rs.gchat_sel) |sc| {
+                                                if (chat_core.isGroup(&rs.gchat_store, sc)) {
+                                                    rs.status = "Group calls aren't in yet";
+                                                } else if (rs.gchat_e2ee) |*st| {
+                                                    if (rs.gchat_link) |l| {
+                                                        const peer = chat_core.conversationDid(&rs.gchat_store, sc);
+                                                        chatLog("[call] call button -> {s}", .{peer});
+                                                        rs.gcall.mic_perm_wanted = true;
+                                                        call_ctl.startOutgoing(&rs.gcall, gpa, io, environ, st, l, peer);
+                                                    }
+                                                }
+                                            }
                                         },
                                         .chat_compose_input => {},
                                         // Handles act by DRAG (the pump owns

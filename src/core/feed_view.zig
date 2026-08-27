@@ -317,7 +317,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_send_fx, chat_send_bubble, chat_send_cat, chat_attach, game_cell, chat_game_stage, chat_game_unstage, game_open, game_send, game_close, chat_attach_game, chat_attach_photo, chat_attach_video, chat_new, chat_restart, chat_identity_reset, chat_device_add, chat_device_approve, chat_device_refuse, chat_device_help, chat_help_close, chat_history_get, chat_consent_receipts, chat_consent_typing, chat_consent_done, chat_msg_copy, chat_msg_reply, chat_msg_edit, chat_msg_delete_me, chat_conv_pin, chat_conv_mute, chat_conv_unread, chat_conv_delete, chat_ctx_cancel, chat_msg_react, chat_msg_delete_all, chat_menu_dismiss, chat_msg, recv_clip, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, recv_back, recv_use, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_send_fx, chat_send_bubble, chat_send_cat, chat_attach, game_cell, chat_game_stage, chat_game_unstage, game_open, game_send, game_close, chat_attach_game, chat_attach_photo, chat_attach_video, chat_new, chat_restart, chat_identity_reset, chat_device_add, chat_device_approve, chat_device_refuse, chat_device_help, chat_help_close, chat_history_get, chat_consent_receipts, chat_consent_typing, chat_consent_done, chat_msg_copy, chat_msg_reply, chat_msg_edit, chat_msg_delete_me, chat_conv_pin, chat_conv_mute, chat_conv_unread, chat_conv_delete, chat_ctx_cancel, chat_msg_react, chat_msg_delete_all, chat_menu_dismiss, chat_msg, recv_clip, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, recv_back, recv_use, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_call, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -9228,6 +9228,21 @@ const pay_card_w_max: i32 = 280;
 
 /// A card's height for the thread's measure pass — the same arithmetic the
 /// draw pass walks, so the two can never disagree.
+/// A HANDSET, in strokes. Drawn rather than set in a font: this app's icons are
+/// line art and a glyph would render as whatever the typeface had, which is how
+/// an icon set stops looking like one.
+///
+/// Two pads and the bar between them, tilted the way a handset is always drawn —
+/// small enough that the tilt IS the recognition, so it is worth the four lines.
+fn drawHandset(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, color: u32) !void {
+    // Ear pad (upper-left) and mouth pad (lower-right).
+    try rect(gpa, dl, x, y, 7, 6, color, 2);
+    try rect(gpa, dl, x + 11, y + 11, 7, 6, color, 2);
+    // The bar joining them, as two strokes so the corner reads at this size.
+    try line(gpa, dl, x + 5, y + 5, x + 9, y + 9, color, 2);
+    try line(gpa, dl, x + 9, y + 9, x + 13, y + 13, color, 2);
+}
+
 /// The renderer's slot for a message's picture, or `no_photo_slot`. Linear over
 /// a screenful — the table is what the SHELL decided is resident this frame, not
 /// every photograph that ever arrived.
@@ -11895,10 +11910,21 @@ pub fn layoutChat(
         const piw: i32 = @intCast(text.measure(e, .semibold, &pini, 14));
         _ = try str(gpa, dl, e, .semibold, bx0 + @divTrunc(pav - piw, 2), bar_cy + 8, 0xFF20201A, 14, &pini);
         try strEllipsis(gpa, dl, e, .semibold, bx0 + pav + 10, bar_cy + 8, ink, 16, peer_disp, w - 140);
+        // CALLING SOMEBODY WAS A TYPED COMMAND until now — `/call` in the
+        // composer, which is a fine bring-up trigger and not a feature. A
+        // messenger with voice calling and no way to place one has voice calling
+        // the way a locked door has a room behind it.
+        //
+        // A handset, drawn rather than typed: the icon set here is line art, and
+        // a glyph would have been whatever the font felt like.
+        try drawHandset(gpa, dl, x0 + w - 42, bar_cy - 9, ink);
+        try emitRegion(gpa, regions, x0 + w - 56, bar_cy - 24, 52, 52, 0, .chat_call);
     } else {
         const hdr_x = detail_x - @divTrunc(split_gap, 2) + 1;
         try rect(gpa, dl, hdr_x, 0, x0 + w - hdr_x, thread_top, skinHeaderVeil(accent), 0);
         _ = try str(gpa, dl, e, .semibold, detail_x, top + 26, ink, 16, peer_disp);
+        try drawHandset(gpa, dl, detail_x + detail_w - 34, top + 12, ink);
+        try emitRegion(gpa, regions, detail_x + detail_w - 46, top + 2, 46, 40, 0, .chat_call);
         // The repair used to sit HERE, on every conversation's header, always. That
         // was wrong twice over: it invited a person to "re-establish" a working chat
         // (a question with no good answer), and the act is a blocking network leg —
@@ -13193,6 +13219,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     var n_restart: usize = 0;
     var n_msg: usize = 0;
     var n_help: usize = 0;
+    var n_call: usize = 0;
     for (regions.items) |r| {
         if (r.kind == .chat_restart) n_restart += 1;
         if (r.kind == .chat_conv) n_conv += 1;
@@ -13203,6 +13230,7 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
         if (r.kind == .pay_open) n_pay += 1;
         if (r.kind == .chat_msg) n_msg += 1;
         if (r.kind == .chat_device_help) n_help += 1;
+        if (r.kind == .chat_call) n_call += 1;
     }
     // EVERY BUBBLE IS PRESSABLE (CHAT_FEATURES slice 2). Without a region per
     // message there is no press-and-hold, no right-click, and therefore no delete,
@@ -13227,7 +13255,12 @@ test "messages screen: master-detail chat surface (list, thread, composer)" {
     // working Messages screen (the onboarding links vanish once a device is set up,
     // so this is the only standing way back to "How Zat Chat works").
     try std.testing.expectEqual(@as(usize, 1), n_help);
-    try std.testing.expectEqual(regions.items.len, n_conv + n_input + n_send + n_attach + n_new + n_pay + n_restart + n_msg + n_help);
+    // ONE CALL BUTTON, on the open thread's header. Calling used to be reachable
+    // only by typing "/call" into the composer, which is a bring-up trigger and
+    // not a feature — a messenger with voice calling and no way to place one has
+    // voice calling the way a locked door has a room behind it.
+    try std.testing.expectEqual(@as(usize, 1), n_call);
+    try std.testing.expectEqual(regions.items.len, n_conv + n_input + n_send + n_attach + n_new + n_pay + n_restart + n_msg + n_help + n_call);
 
     // ...and when it IS needed, the delivery strip is the single tap target. Re-lay
     // the same surface with a drifted conversation and the repair reappears, exactly
