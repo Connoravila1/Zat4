@@ -47,11 +47,18 @@ const chat_keys = @import("shell/chat_keys.zig");
 /// testable (B3).
 ///
 /// MULTI-DEVICE: an account admits ANY of its approved devices, not only the
-/// singleton. So we read the whole device set (`fetchPeerDevices` → the vouched-for
-/// set) AND the legacy singleton (`fetchPeer`), and hand back every key. Before
-/// this, only the singleton was accepted, so a phone the desktop had vouched for
-/// signed correctly and was still refused `unauthenticated` — its messages could
-/// never leave the device (the first two-device test, 2026-07-14).
+/// singleton. Before that, only the singleton was accepted, so a phone the
+/// desktop had vouched for signed correctly and was still refused
+/// `unauthenticated` — its messages could never leave the device (the first
+/// two-device test, 2026-07-14).
+///
+/// It asks `chat_keys.fetchAuthority`, which is THE membership answer and is the
+/// same one the client reads. This file used to derive it here instead: the
+/// device set PLUS the legacy singleton, unconditionally — a second rule, and a
+/// looser one, because it admitted the singleton's key even for an account whose
+/// device set did not vouch for it. Two consumers with their own membership rules
+/// is what put a device in the set for one of them and outside it for the other,
+/// twice.
 ///
 /// False = we found no key for this DID, so the relay will not admit it. An
 /// unreachable PDS reads the same as a missing account, deliberately: an identity
@@ -62,31 +69,25 @@ fn verifyDid(gpa: std.mem.Allocator, io: std.Io, did: []const u8, out: *[serve.m
     const arena = arena_state.allocator();
     var n: usize = 0;
 
-    // Every approved device of the account. `catch null` folds a read failure into
-    // "no set" — the relay fails closed, which is the safe direction here (a device
-    // we cannot confirm is one we refuse, never one we wave through).
-    if (chat_keys.fetchPeerDevices(gpa, arena, io, null, did) catch null) |set| {
-        for (set.devices) |d| {
+    // `catch .none` folds a read failure into "admit nobody" — the relay fails
+    // closed, which is the safe direction here (a device we cannot confirm is one
+    // we refuse, never one we wave through).
+    switch (chat_keys.fetchAuthority(gpa, arena, io, null, did) catch .none) {
+        // A device set is EXHAUSTIVE. The singleton is not added on top of it:
+        // for a device account that key belongs to the root and is already in
+        // here, and for an account whose set does NOT vouch for it, admitting it
+        // would be the relay disagreeing with every client about who is a member.
+        .devices => |set| for (set.devices) |d| {
             if (n >= out.len) break;
             out[n] = d.anchor_pub;
             n += 1;
-        }
-    }
-
-    // The legacy singleton — the only key for a pre-device account, and the root's
-    // own key for a device account (already present, so skip the duplicate).
-    if (chat_keys.fetchPeer(gpa, arena, io, null, did) catch null) |peer| {
-        var dup = false;
-        for (out[0..n]) |k| {
-            if (std.mem.eql(u8, &k, &peer.anchor_pub)) {
-                dup = true;
-                break;
-            }
-        }
-        if (!dup and n < out.len) {
-            out[n] = peer.anchor_pub;
-            n += 1;
-        }
+        },
+        // A pre-device account: the singleton is the only key there is.
+        .legacy => |peer| {
+            out[0] = peer.anchor_pub;
+            n = 1;
+        },
+        .none => {},
     }
 
     out_n.* = n;

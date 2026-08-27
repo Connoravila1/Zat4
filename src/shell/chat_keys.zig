@@ -1147,6 +1147,54 @@ fn fetchDeviceListing(
     };
 }
 
+/// WHOSE KEYS MAY ACT FOR THIS ACCOUNT — the one answer, for every consumer.
+///
+/// There used to be two implementations of this and they were not the same one:
+/// the relay read the device set AND added the legacy singleton unconditionally,
+/// while the client fell back to the singleton only when the set came back
+/// empty. Two consumers deriving membership with their own rules is the defect
+/// behind two of this subsystem's six bugs, and it is the last of it
+/// (CHAT_DEVICE_MODEL_REDESIGN D5).
+///
+/// The rule, stated once: **a device set, where one exists, is EXHAUSTIVE.** The
+/// legacy singleton is a fallback for accounts that predate the device model, not
+/// a key that rides alongside one. An account whose records exist but prove
+/// nothing admits nobody — which is the safe direction, and the honest one.
+/// A7.2: cold, one per lookup.
+pub const Authority = union(enum) {
+    /// This account has a device set. It is the whole of who may act, and the
+    /// legacy singleton adds nothing to it.
+    devices: keydir.DeviceSet,
+    /// A pre-device account: no device records at all, so the singleton is the
+    /// only key there has ever been. Dropping this the day the device model
+    /// shipped would have taken chat from everybody we had in order to serve
+    /// devices nobody had yet.
+    legacy: PeerKeys,
+    /// Records exist and not one of them resolves, or there is nothing at all.
+    /// Nobody may act for this account until that is repaired.
+    none,
+};
+
+/// Read `did`'s directory and say who may act for it. Errors are the caller's to
+/// fail closed on — `error.DirectoryUnreadable` is NOT `.none`, and the whole
+/// point of the distinction is that an identity we could not check is one we
+/// refuse rather than one we wave through.
+pub fn fetchAuthority(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    did: []const u8,
+) !Authority {
+    if (try fetchDecodedDevices(gpa, arena, io, environ, did)) |recs| {
+        const set = try keydir.resolveDevices(arena, did, recs, clock.unixSeconds());
+        if (set.devices.len == 0) return .none;
+        return .{ .devices = set };
+    }
+    const peer = (try fetchPeer(gpa, arena, io, environ, did)) orelse return .none;
+    return .{ .legacy = peer };
+}
+
 /// Every device of `did` that the account's own devices vouch for, plus the root
 /// key that identifies its chat identity. An account with no device records is not
 /// an error — it simply has not moved to the device model yet (E4: the caller
@@ -1277,6 +1325,24 @@ test "chat_keys: 'I could not read it' is its own answer, distinct from every cl
     // And the enum is exhaustive: a new state cannot be added without a human
     // deciding, here, whether it may publish.
     try testing.expectEqual(5, @typeInfo(DeviceStatus).@"enum".fields.len);
+}
+
+test "chat_keys: a device set is exhaustive — the legacy singleton is a fallback, not an addition" {
+    // The rule is a union with three arms, and the arms are the whole of it: a
+    // device set (nothing rides alongside it), a pre-device account's singleton,
+    // or nobody. It used to be written twice — the relay read the set AND added
+    // the singleton unconditionally, the client fell back to the singleton only
+    // when the set came back empty — and two consumers with their own membership
+    // rules is the defect behind two of this subsystem's six bugs.
+    //
+    // Exhaustive on purpose: a fourth arm cannot appear without a human deciding,
+    // here, what the relay and the client should each do about it.
+    try testing.expectEqual(3, @typeInfo(Authority).@"union".fields.len);
+
+    // And `.none` is NOT what an unreadable directory produces: `fetchAuthority`
+    // returns an error for that, so every caller has to choose its own failure
+    // direction rather than inheriting "there is nobody" by accident. The relay
+    // chooses to refuse, which is the safe direction for a limit.
 }
 
 test "chat_keys: the record round-trips JSON+base64 into keydir's gate" {

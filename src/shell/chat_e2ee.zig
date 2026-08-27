@@ -818,19 +818,30 @@ fn peerTargets(
     peer_did: []const u8,
     out: *[16]DeviceTarget,
 ) StartError![]const DeviceTarget {
-    if (chat_keys.fetchPeerDevices(gpa, arena, io, environ, peer_did) catch null) |set| {
-        var n: usize = 0;
-        for (set.devices) |d| {
-            if (n == out.len) break;
-            out[n] = .{ .kp_bytes = d.key_package, .anchor_pub = d.anchor_pub };
-            n += 1;
-        }
-        if (n > 0) return out[0..n];
+    // The device set, or the legacy singleton, decided in ONE place — this used
+    // to fall back to the singleton whenever the set came back empty, which is a
+    // looser rule than the relay's and a different one again from the relay's
+    // "always add the singleton". All three consumers now read `fetchAuthority`.
+    switch (chat_keys.fetchAuthority(gpa, arena, io, environ, peer_did) catch return error.NoKeyPackage) {
+        .devices => |set| {
+            var n: usize = 0;
+            for (set.devices) |d| {
+                if (n == out.len) break;
+                out[n] = .{ .kp_bytes = d.key_package, .anchor_pub = d.anchor_pub };
+                n += 1;
+            }
+            if (n == 0) return error.NoKeyPackage;
+            return out[0..n];
+        },
+        .legacy => |peer| {
+            out[0] = .{ .kp_bytes = peer.kp_bytes, .anchor_pub = peer.anchor_pub };
+            return out[0..1];
+        },
+        // Their records prove nothing. We do not reach for a key the account's own
+        // directory does not vouch for — that is what "encrypted to this person"
+        // has to mean.
+        .none => return error.NoKeyPackage,
     }
-    const peer = (chat_keys.fetchPeer(gpa, arena, io, environ, peer_did) catch return error.NoKeyPackage) orelse
-        return error.NoKeyPackage;
-    out[0] = .{ .kp_bytes = peer.kp_bytes, .anchor_pub = peer.anchor_pub };
-    return out[0..1];
 }
 
 /// Build ONE pairwise session with ONE device and send it its Welcome. The row is

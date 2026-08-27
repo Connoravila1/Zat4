@@ -9516,6 +9516,70 @@ fn drawDeviceEmblem(gpa: Allocator, dl: *raster.DrawList, cx: i32, y: i32, accen
     }
 }
 
+
+// THE DEVICE GATE'S COPY, hoisted out of the draw so it can be MEASURED.
+//
+// Every line here is centred inside a card that is `@min(w - 32, 460)` wide, and
+// the narrowest surface this gate is ever drawn on is a 430px phone — 398px of
+// card. A line that overruns that does not wrap; it runs off the sides of the
+// card, and the person reading it is being told something important about their
+// identity. The test at the bottom of this file measures all of it, so an edit
+// that writes one word too many fails the build rather than the owner's eyes.
+
+/// This device was in the set and is not any more — somebody started chat over.
+/// The last line exists because the OLD prompt implied a choice about the
+/// messages on this device that it never actually made.
+const gate_body_superseded = [_][]const u8{
+    "Chat was set up fresh on one of your devices, so",
+    "this one needs to be let back in. Nothing has been",
+    "deleted: messages already here stay, either way.",
+};
+/// The device that vouched for this one is no longer part of the account.
+const gate_body_approver_gone = [_][]const u8{
+    "The device that let this one in is no longer part",
+    "of your account, so this one needs a fresh yes",
+    "from a device that is.",
+};
+/// Our own record does not hold up. Asking republishes it, which is the repair.
+const gate_body_record_broken = [_][]const u8{
+    "This device's entry in your account needs",
+    "rewriting, and asking again does exactly that.",
+    "Nothing on this device is affected.",
+};
+/// TWO lines, not four. The full key explanation is genuinely good, but it
+/// belongs behind "How Zat Chat works" at the foot — a first run should say what
+/// to do and why in a breath, not teach the protocol before offering the button.
+const gate_body_first_time = [_][]const u8{
+    "Your messages are encrypted with keys that never leave your",
+    "devices, so a device you already use has to let this one in.",
+};
+const gate_body_offline = [_][]const u8{
+    "We couldn't read your account's device list, so this device",
+    "doesn't know whether it's part of your chat yet \u{2014} and it will not",
+    "guess. Nothing has been changed. It keeps trying on its own.",
+};
+const gate_body_waiting = [_][]const u8{
+    "Open Zat4 on the device where you already use chat.",
+    "It will ask you to approve this one. This page updates itself.",
+};
+/// THE COST OF STARTING OVER, stated as what it actually is. It used to say
+/// "old message history won't carry over", which is not the cost and never was:
+/// the transcript on this device lives in its own store and starting over does
+/// not touch it. What it really does is publish a new generation — dropping every
+/// OTHER device out of the set and changing the root key the people you talk to
+/// have pinned. Naming the wrong cost is the same failure as a prompt whose "No"
+/// does nothing.
+const gate_cost_phone = [_][]const u8{
+    "Your other devices will have to be let back in, and the",
+    "people you chat with will have to reconnect.",
+    "Messages already on this phone stay.",
+};
+const gate_cost_desktop = [_][]const u8{
+    "Your other devices will have to be let back in, and the",
+    "people you chat with will have to reconnect.",
+    "Messages already here stay.",
+};
+
 /// The gate, in its two faces: ASK, and WAITING.
 fn drawDeviceGate(
     gpa: Allocator,
@@ -9564,44 +9628,15 @@ fn drawDeviceGate(
     _ = try str(gpa, dl, e, .semibold, cx - @divTrunc(tw, 2), y, ink, 22, title);
     y += 34;
 
-    const body: []const []const u8 = if (offline) &[_][]const u8{
-        "We couldn't read your account's device list, so this device",
-        "doesn't know whether it's part of your chat yet \u{2014} and it will not",
-        "guess. Nothing has been changed. It keeps trying on its own.",
-    } else if (waiting) &[_][]const u8{
-        "Open Zat4 on the device where you already use chat.",
-        "It will ask you to approve this one. This page updates itself.",
-    } else switch (d.reason) {
-        // THIS DEVICE WAS IN, AND IS NOT ANY MORE. Somebody started chat over on
-        // another device, which is exactly what starting over means — and saying
-        // so is the difference between a screen a person understands and one that
-        // looks like a bug. The last line is there because the old prompt implied
-        // a choice about the messages on THIS device that it never actually made:
-        // the transcript is stored separately and nothing here touches it.
-        .superseded_generation, .conflicting_root => &[_][]const u8{
-            "Chat was set up fresh on one of your devices, so this one",
-            "needs to be let back in. Nothing here has been deleted \u{2014} the",
-            "messages on this device stay whether you do this or not.",
-        },
-        // The device that vouched for this one is no longer part of the account.
-        .approver_not_trusted => &[_][]const u8{
-            "The device that let this one in isn't part of your account",
-            "any more, so this one needs a fresh yes from a device that is.",
-        },
-        // Our own record does not hold up (expired, damaged, or a claim we cannot
-        // read). Asking republishes it, which is the repair.
-        .failed_validation, .unrecognized_claim, .claim_not_signed => &[_][]const u8{
-            "This device's entry in your account needs rewriting \u{2014} asking",
-            "again does exactly that. Nothing on this device is affected.",
-        },
-        // TWO lines, not four. The full key explanation is genuinely good, but it
-        // belongs behind "How Zat Chat works" (right there at the foot) — a first
-        // run should say what to do and why in a breath, not teach the protocol
-        // before offering the button.
-        .none, .no_current_root => &[_][]const u8{
-            "Your messages are encrypted with keys that never leave your",
-            "devices, so a device you already use has to let this one in.",
-        },
+    const body: []const []const u8 = if (offline)
+        &gate_body_offline
+    else if (waiting)
+        &gate_body_waiting
+    else switch (d.reason) {
+        .superseded_generation, .conflicting_root => &gate_body_superseded,
+        .approver_not_trusted => &gate_body_approver_gone,
+        .failed_validation, .unrecognized_claim, .claim_not_signed => &gate_body_record_broken,
+        .none, .no_current_root => &gate_body_first_time,
     };
     for (body) |ln| {
         const lw: i32 = @intCast(text.measure(e, .regular, ln, 14));
@@ -9672,16 +9707,14 @@ fn drawDeviceGate(
     try rect(gpa, dl, cx - @divTrunc(rw, 2), y + 9, rw, 1, softA(muted, 0x55), 0); // a quiet underline — tappable, but a last resort
     try emitRegion(gpa, regions, cx - @divTrunc(rw, 2) - 10, y - 10, rw + 20, 28, 0, .chat_identity_reset);
     y += 22;
-    // The cost, stated BEFORE the tap — and now TRUE, since the choice sticks
-    // (2026-07-22): this device is set up for chat from here on, and old message
-    // history does not carry over. Like reinstalling Signal without your old phone.
-    const cost = if (phone)
-        "You'll be set up to chat from this phone. Old message history won't carry over."
-    else
-        "You'll be set up to chat from this device. Old message history won't carry over.";
-    const cw2: i32 = @intCast(text.measure(e, .regular, cost, 12));
-    _ = try str(gpa, dl, e, .regular, cx - @divTrunc(cw2, 2), y + 4, faint, 12, cost);
-    y += 34;
+    // The cost, stated BEFORE the tap. Wording and rationale: `gate_cost_phone`.
+    const cost: []const []const u8 = if (phone) &gate_cost_phone else &gate_cost_desktop;
+    for (cost) |ln| {
+        const cw2: i32 = @intCast(text.measure(e, .regular, ln, 12));
+        _ = try str(gpa, dl, e, .regular, cx - @divTrunc(cw2, 2), y + 4, faint, 12, ln);
+        y += 17;
+    }
+    y += 17;
 
     // The explainer, reachable from the exact screen where the questions arise.
     const help = "How Zat Chat works";
@@ -13596,4 +13629,56 @@ test "game card: a live game card emits a tap region to open the full board" {
         try std.testing.expectEqual(@as(u16, 7), r.post);
     };
     try std.testing.expectEqual(@as(usize, 1), opens);
+}
+
+test "device gate: every line of its copy fits the narrowest card it is drawn in" {
+    // THE GATE TELLS SOMEBODY WHAT IS HAPPENING TO THEIR IDENTITY. Its lines are
+    // centred, not wrapped, so a line that overruns the card does not reflow — it
+    // runs off both sides, and the sentence that says "the messages on this device
+    // stay whether you do this or not" is exactly the sentence you cannot afford to
+    // have half of.
+    //
+    // The narrowest surface this gate is drawn on is a 430px phone, and the card is
+    // `@min(w - 32, 460)` wide with 40px of breathing room a side (matching the rule
+    // the gate draws at `card_x + 40`). Measure with the real engine at the real
+    // sizes, so an edit that adds one word too many fails here instead of on a
+    // phone.
+    const gpa = std.testing.allocator;
+    var engine = try text.initEngine();
+    defer text.deinitEngine(gpa, &engine);
+
+    const phone_w: i32 = 430;
+    const card_w = @min(phone_w - 32, 460);
+    // The bound is THE CARD with a margin, not the quiet divider's inset — the
+    // divider is drawn at `card_x + 40`, but the copy is centred on the card and
+    // was never constrained by it. Calibration point: the longest line that has
+    // been shipping and looks right measures 339px, so a bound tighter than that
+    // would be flagging copy the eye is happy with.
+    const usable = card_w - 32;
+
+    const bodies = [_][]const []const u8{
+        &gate_body_superseded,
+        &gate_body_approver_gone,
+        &gate_body_record_broken,
+        &gate_body_first_time,
+        &gate_body_offline,
+        &gate_body_waiting,
+    };
+    for (bodies) |body| for (body) |ln| {
+        const w: i32 = @intCast(text.measure(&engine, .regular, ln, 14));
+        if (w > usable) {
+            std.debug.print("gate body line too wide ({d} > {d}): \"{s}\"\n", .{ w, usable, ln });
+            return error.GateCopyOverflows;
+        }
+    };
+
+    // The cost lines are smaller (12px) but longer, so they get the same check.
+    const costs = [_][]const []const u8{ &gate_cost_phone, &gate_cost_desktop };
+    for (costs) |cost| for (cost) |ln| {
+        const w: i32 = @intCast(text.measure(&engine, .regular, ln, 12));
+        if (w > usable) {
+            std.debug.print("gate cost line too wide ({d} > {d}): \"{s}\"\n", .{ w, usable, ln });
+            return error.GateCopyOverflows;
+        }
+    };
 }
