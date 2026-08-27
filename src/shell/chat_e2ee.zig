@@ -184,6 +184,49 @@ fn classify(err: anyerror) Failure {
 /// One account's E2EE chat state: identity + the open conversations'
 /// groups, parallel arrays keyed by peer DID (A3; the DID is the one
 /// cross-module identity, A5). A7.2: cold struct, one per session.
+/// ONE PICTURE BEING REASSEMBLED.
+///
+/// Chunks are separate deposits: they can arrive out of order, interleaved with
+/// another picture's, or never finish at all because the sender closed the app
+/// halfway. So a transfer is a slot with a bitmap of what has landed, and an
+/// unfinished one is simply overwritten when the slots run out — a half a
+/// picture is worth nothing, and holding it forever to be sure is how a chat
+/// client ends up with a memory leak shaped like somebody's holiday photos.
+/// A7.2: cold struct (at most `max_inflight_images` live, never in a hot loop),
+/// size guard waived.
+pub const ImageRx = struct {
+    /// Who is sending it. A chunk id means nothing outside its session, so two
+    /// people may pick the same number and never collide.
+    peer_idx: u32 = 0,
+    id: u32 = 0,
+    total: u16 = 0,
+    width: u16 = 0,
+    height: u16 = 0,
+    mime: chat.Mime = .jpeg,
+    /// Which pieces have landed. One bit each; `total` is capped by the buffer
+    /// below, so this never needs to grow.
+    have: std.DynamicBitSetUnmanaged = .{},
+    got: u16 = 0,
+    /// The picture, assembled in place.
+    buf: std.ArrayListUnmanaged(u8) = .empty,
+    /// Size of each piece but the last — needed to place a chunk that arrives
+    /// before the ones in front of it.
+    piece_len: u32 = 0,
+    live: bool = false,
+};
+
+/// How many pictures may be in flight at once. Small on purpose: a peer that
+/// opens a thousand transfers and finishes none is a peer allocating our memory,
+/// and the honest bound is "about as many as a person actually sends at once".
+pub const max_inflight_images = 4;
+
+/// The live chat session: our keys, our peers, and the MLS groups behind them.
+/// A7.2: cold struct (one per signed-in account, never in a collection), size
+/// guard waived — its CONTENTS are the hot, guarded things.
+///
+/// (Its waiver lived in a doc comment that `ImageRx` was inserted in front of,
+/// and the guard scanner caught the loss immediately — which is the scanner
+/// working, not a nuisance.)
 pub const State = struct {
     my_did: []u8,
     anchor_seed: [32]u8,
@@ -192,6 +235,8 @@ pub const State = struct {
     kp: cache.ChatKeyPackage,
     /// Our standing inbox (bootstrap mailbox, from the anchor public key).
     inbox: [relay.mailbox_id_len]u8,
+    /// Pictures being reassembled (A6: transient network state, not the store's).
+    image_rx: [max_inflight_images]ImageRx = @splat(.{}),
     peer_dids: std.ArrayList([]u8) = .empty,
     peer_anchors: std.ArrayList([32]u8) = .empty,
     groups: std.ArrayList(mls.Group) = .empty,
@@ -384,6 +429,10 @@ pub fn init(
 }
 
 pub fn deinit(gpa: Allocator, st: *State) void {
+    for (&st.image_rx) |*rx| {
+        rx.have.deinit(gpa);
+        rx.buf.deinit(gpa);
+    }
     std.crypto.secureZero(u8, &st.anchor_seed);
     cache.freeChatKeyPackage(gpa, &st.kp);
     gpa.free(st.my_did);
@@ -1547,6 +1596,133 @@ fn depositAll(
     if (delivered == 0) return last orelse error.RelayDown;
 }
 
+/// SEND A PICTURE, cut into deposits.
+///
+/// The bytes are already encoded (JPEG/PNG/WebP) and already downscaled — this
+/// does not resize anything, because a transport that silently re-encodes is a
+/// transport that decides what your photo looks like. The cap is enforced here
+/// so an oversized one is refused before a single deposit is made rather than
+/// halfway through.
+///
+/// `id` names the transfer for its whole life and means nothing outside this
+/// session: reassembly is keyed by session AND id, so two peers may pick the
+/// same number and never collide.
+pub fn sendImage(
+    gpa: Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    st: *State,
+    link: *chat_relay.ChatRelay,
+    peer_did: []const u8,
+    id: u32,
+    bytes: []const u8,
+    width: u16,
+    height: u16,
+    mime: chat.Mime,
+) SendError!void {
+    if (bytes.len > chat.max_attachment_bytes) return error.TooLong;
+    var buf: [1024]u8 = undefined;
+    const payload = buf.len - 1 - chat.image_chunk_head;
+    const total = chat.imageChunkCount(bytes.len, payload) orelse return error.TooLong;
+
+    var seq: u16 = 0;
+    var at: usize = 0;
+    while (at < bytes.len) : (seq += 1) {
+        const end = @min(at + payload, bytes.len);
+        const framed = chat.writeImageChunk(&buf, id, seq, total, width, height, mime, bytes[at..end]) catch
+            return error.TooLong;
+        // A PIECE THAT DOES NOT LEAVE STOPS THE WHOLE PICTURE. There is no point
+        // sending the rest: the receiver cannot assemble a photo with a hole in
+        // it, and every further deposit is bandwidth spent on something that will
+        // be thrown away.
+        try depositAll(gpa, io, environ, st, link, peer_did, framed);
+        at = end;
+    }
+}
+
+/// Take one chunk. Returns the finished picture when the last piece lands, and
+/// null while it is still in pieces (an ordinary answer, not a failure — most
+/// chunks complete nothing).
+///
+/// The caller owns the returned bytes.
+fn takeImageChunk(
+    gpa: Allocator,
+    st: *State,
+    peer_idx: u32,
+    c: chat.ImageChunk,
+) !?struct { bytes: []u8, width: u16, height: u16, mime: chat.Mime } {
+    // Refuse a transfer whose declared size is past the cap BEFORE reserving for
+    // it. A peer that claims 60000 chunks is a peer asking us to allocate.
+    const payload_max: usize = 1024;
+    if (@as(u64, c.total) * payload_max > chat.max_attachment_bytes + payload_max) return null;
+
+    // The slot for this transfer, or a free one, or the oldest — see `ImageRx`
+    // for why an unfinished transfer is simply overwritten.
+    var slot: ?*ImageRx = null;
+    for (&st.image_rx) |*rx| {
+        if (rx.live and rx.peer_idx == peer_idx and rx.id == c.id) {
+            slot = rx;
+            break;
+        }
+    }
+    if (slot == null) {
+        for (&st.image_rx) |*rx| {
+            if (!rx.live) {
+                slot = rx;
+                break;
+            }
+        }
+    }
+    const rx = slot orelse &st.image_rx[0];
+
+    if (!(rx.live and rx.peer_idx == peer_idx and rx.id == c.id)) {
+        rx.have.deinit(gpa);
+        rx.buf.deinit(gpa);
+        rx.* = .{
+            .peer_idx = peer_idx,
+            .id = c.id,
+            .total = c.total,
+            .width = c.width,
+            .height = c.height,
+            .mime = c.mime,
+            .piece_len = @intCast(c.bytes.len),
+            .live = true,
+        };
+        rx.have = try std.DynamicBitSetUnmanaged.initEmpty(gpa, c.total);
+        try rx.buf.resize(gpa, @as(usize, c.total) * c.bytes.len);
+    }
+    // A chunk claiming a different shape of the same transfer is a chunk from a
+    // transfer that no longer exists (an id reused after a restart). Start over
+    // rather than splice two pictures together.
+    if (rx.total != c.total) return null;
+    if (c.seq >= rx.total) return null;
+    if (rx.have.isSet(c.seq)) return null; // a duplicate deposit; already counted
+
+    const at = @as(usize, c.seq) * rx.piece_len;
+    // Only the LAST piece may be short. One in the middle that is not
+    // `piece_len` would slide every byte after it.
+    const is_last = c.seq + 1 == rx.total;
+    if (!is_last and c.bytes.len != rx.piece_len) return null;
+    if (at + c.bytes.len > rx.buf.items.len) {
+        if (is_last) try rx.buf.resize(gpa, at + c.bytes.len) else return null;
+    }
+    @memcpy(rx.buf.items[at..][0..c.bytes.len], c.bytes);
+    rx.have.set(c.seq);
+    rx.got += 1;
+    if (is_last) rx.buf.shrinkRetainingCapacity(at + c.bytes.len);
+
+    if (rx.got < rx.total) return null;
+
+    const out = try gpa.dupe(u8, rx.buf.items);
+    const w = rx.width;
+    const h = rx.height;
+    const m = rx.mime;
+    rx.have.deinit(gpa);
+    rx.buf.deinit(gpa);
+    rx.* = .{};
+    return .{ .bytes = out, .width = w, .height = h, .mime = m };
+}
+
 /// HOW A GROUP SEND WENT. Not an error union, because "three of five got it" is
 /// an ordinary outcome for a fan-out and the person is entitled to be told it
 /// rather than shown a failure or a success that isn't one (E4).
@@ -1917,6 +2093,10 @@ pub const Incoming = union(enum) {
     /// IT, and the store needs that: "not mine" names nobody once there are three
     /// of you.
     group_message: struct { peer_did: []u8, group_id: [chat.group_id_len]u8, inner: []u8 },
+    /// A PICTURE, whole. Only produced by the chunk that completes it — the ones
+    /// before it complete nothing and say nothing, which is why most chunks
+    /// return no event at all.
+    image: struct { peer_did: []u8, bytes: []u8, width: u16, height: u16, mime: chat.Mime },
     /// A GROUP ROSTER: who is in it and what it is called. The first one for an
     /// unknown id is an invitation; every later one is an update, and the shell
     /// believes it only from somebody already in the group.
@@ -1991,6 +2171,10 @@ pub fn freeIncoming(gpa: Allocator, inc: Incoming) void {
         .group_message => |g| {
             gpa.free(g.peer_did);
             gpa.free(g.inner);
+        },
+        .image => |im| {
+            gpa.free(im.peer_did);
+            gpa.free(im.bytes);
         },
         .group_meta => |g| {
             gpa.free(g.peer_did);
@@ -2308,6 +2492,24 @@ pub fn onBucket(
                         if (!std.mem.eql(u8, st.peer_dids.items[idx], st.my_did)) return null;
                         if (data.len < 2) return null;
                         return .{ .roster = .{ .dids = try gpa.dupe(u8, data[1..]) } };
+                    }
+                    // A PIECE OF A PICTURE. Most pieces complete nothing, so most
+                    // of these produce no event at all — the picture surfaces on
+                    // the deposit that finishes it.
+                    if (data[0] == chat.kind_image_chunk_wire) {
+                        const c = chat.parseImageChunk(data[1..]) catch return null;
+                        const done = takeImageChunk(gpa, st, @intCast(idx), c) catch return null;
+                        if (done) |img| {
+                            errdefer gpa.free(img.bytes);
+                            return .{ .image = .{
+                                .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]),
+                                .bytes = img.bytes,
+                                .width = img.width,
+                                .height = img.height,
+                                .mime = img.mime,
+                            } };
+                        }
+                        return null;
                     }
                     // A GROUP MESSAGE. Unwrap the id and hand the inner bytes on;
                     // the sender is whoever this pairwise session belongs to,

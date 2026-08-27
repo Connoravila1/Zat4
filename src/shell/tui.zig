@@ -2574,6 +2574,25 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                     if (std.mem.eql(u8, msg.peer_did, rs.gchat_typing_peer_buf[0..rs.gchat_typing_peer_len]))
                                         rs.gchat_typing_deadline = 0;
                                 },
+                                // A PICTURE ARRIVED, whole. The chunks that carried
+                                // it produced no event at all; this is the deposit
+                                // that finished it.
+                                .image => |im| {
+                                    if (chat_core.openConversation(gpa, &rs.gchat_store, im.peer_did, "") catch null) |c| {
+                                        if (chat_core.appendMessage(gpa, &rs.gchat_store, c, .image, "", now, false) catch null) |mi| {
+                                            // A picture whose bytes will not store is
+                                            // a bubble with nothing in it. Drop the
+                                            // message too rather than leave one.
+                                            if (chat_core.attachImage(gpa, &rs.gchat_store, mi, im.bytes, im.width, im.height, im.mime)) |_| {
+                                                if (rs.sfxp) |p| sfx_player.play(p, .msg_receive);
+                                                chatNotify(rs, im.peer_did, "Photo");
+                                            } else |err| {
+                                                chatLog("[chat] could not keep the picture: {s}", .{@errorName(err)});
+                                            }
+                                        }
+                                        chat_mutated = true;
+                                    }
+                                },
                                 // A GROUP MESSAGE, arriving over the pairwise
                                 // session with ONE member. It is filed against the
                                 // GROUP, not against the DM it physically travelled

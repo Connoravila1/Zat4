@@ -250,6 +250,30 @@ pub const kind_group_msg_wire: u8 = 14;
 /// stranger, and it belongs behind the same guardrail rather than a new one.
 pub const kind_group_meta_wire: u8 = 15;
 
+/// ONE PIECE OF A PICTURE:
+/// `[25][u32 image id][u16 seq][u16 total][u16 w][u16 h][u8 mime][bytes]`.
+///
+/// A picture does not fit in a bucket, and a bucket is a fixed size on purpose —
+/// a variable one would leak the length of what you said. So a photo travels the
+/// way the history backlog already does: cut up, each piece its own deposit.
+///
+/// The GEOMETRY rides on every chunk rather than only the first. It costs five
+/// bytes and it means whichever piece arrives first can size the bubble — chunks
+/// are separate deposits and nothing guarantees they arrive in order.
+///
+/// The id is the picture's identity for the whole transfer. It is minted by the
+/// sender and means nothing outside the session it travels in: two people can
+/// pick the same number and never collide, because reassembly is keyed by the
+/// session as well.
+///
+/// No caption in v1. A photo with nothing written under it is a complete thing,
+/// and a caption is a second field to get wrong on a path where every extra
+/// field is another way for a picture to arrive as nothing.
+pub const kind_image_chunk_wire: u8 = 25;
+
+/// Header bytes before the picture data in a chunk (after the kind byte).
+pub const image_chunk_head = 4 + 2 + 2 + 2 + 2 + 1;
+
 /// Length of a group id, in bytes. 16 is the same width as a UUID and far past
 /// what a birthday collision needs at any believable number of groups.
 pub const group_id_len = 16;
@@ -370,6 +394,7 @@ const wire_kinds = [_]u8{
     kind_group_meta_wire,
     kind_read_wire,
     @intFromEnum(Kind.image),
+    kind_image_chunk_wire,
     @intFromEnum(Kind.payment_request),
     @intFromEnum(Kind.payment_sent),
     kind_pay_settled_wire,
@@ -1988,6 +2013,75 @@ pub fn groupId(store: *const Store, conv: ConvIndex) [group_id_len]u8 {
     const ci = @intFromEnum(conv);
     if (ci >= store.convs.len) return [_]u8{0} ** group_id_len;
     return store.convs.items(.group_id)[ci];
+}
+
+/// One chunk, unwrapped. A7.2: cold, one per delivered piece.
+pub const ImageChunk = struct {
+    id: u32,
+    seq: u16,
+    total: u16,
+    width: u16,
+    height: u16,
+    mime: Mime,
+    bytes: []const u8,
+};
+
+/// Parse a chunk (the leading kind byte already consumed).
+///
+/// `total == 0` is refused: a picture in no pieces is not a picture, and a zero
+/// would make every "have we got them all" check trivially true.
+pub fn parseImageChunk(bytes: []const u8) FrameError!ImageChunk {
+    if (bytes.len < image_chunk_head + 1) return error.Malformed;
+    const id = std.mem.readInt(u32, bytes[0..4], .little);
+    const seq = std.mem.readInt(u16, bytes[4..6], .little);
+    const total = std.mem.readInt(u16, bytes[6..8], .little);
+    const w = std.mem.readInt(u16, bytes[8..10], .little);
+    const h = std.mem.readInt(u16, bytes[10..12], .little);
+    const mime = std.enums.fromInt(Mime, bytes[12]) orelse return error.Malformed;
+    if (total == 0 or seq >= total) return error.Malformed;
+    return .{
+        .id = id,
+        .seq = seq,
+        .total = total,
+        .width = w,
+        .height = h,
+        .mime = mime,
+        .bytes = bytes[image_chunk_head..],
+    };
+}
+
+/// Write one. `out` needs `1 + image_chunk_head + piece.len`.
+pub fn writeImageChunk(
+    out: []u8,
+    id: u32,
+    seq: u16,
+    total: u16,
+    width: u16,
+    height: u16,
+    mime: Mime,
+    piece: []const u8,
+) FrameError![]u8 {
+    if (total == 0 or seq >= total or piece.len == 0) return error.Malformed;
+    if (out.len < 1 + image_chunk_head + piece.len) return error.Malformed;
+    out[0] = kind_image_chunk_wire;
+    std.mem.writeInt(u32, out[1..5], id, .little);
+    std.mem.writeInt(u16, out[5..7], seq, .little);
+    std.mem.writeInt(u16, out[7..9], total, .little);
+    std.mem.writeInt(u16, out[9..11], width, .little);
+    std.mem.writeInt(u16, out[11..13], height, .little);
+    out[13] = @intFromEnum(mime);
+    @memcpy(out[1 + image_chunk_head ..][0..piece.len], piece);
+    return out[0 .. 1 + image_chunk_head + piece.len];
+}
+
+/// How many chunks a picture of `len` bytes takes at `payload` bytes each.
+/// Null when it would not fit in a u16 of them — which at any sane chunk size
+/// means the picture is far past `max_attachment_bytes` anyway, and a transfer
+/// that cannot COUNT its own pieces must not begin.
+pub fn imageChunkCount(len: usize, payload: usize) ?u16 {
+    if (len == 0 or payload == 0) return null;
+    const n = (len + payload - 1) / payload;
+    return std.math.cast(u16, n);
 }
 
 /// Find the conversation carrying this group id, or null. Linear over the
@@ -3973,4 +4067,74 @@ test "pictures: the cap is enforced, and a corrupt row is refused rather than re
     defer gpa.free(bad3);
     bad3[bad3.len - 1] = 200;
     try std.testing.expectError(error.Malformed, deserializeStore(gpa, bad3));
+}
+
+test "picture chunks: a photo survives being cut up, and hostile pieces do not" {
+    const id: u32 = 0xDEADBEEF;
+    var out: [256]u8 = undefined;
+    const piece = "....picture bytes....";
+
+    const framed = try writeImageChunk(&out, id, 3, 9, 1600, 1200, .jpeg, piece);
+    try std.testing.expectEqual(kind_image_chunk_wire, framed[0]);
+
+    const c = try parseImageChunk(framed[1..]);
+    try std.testing.expectEqual(id, c.id);
+    try std.testing.expectEqual(@as(u16, 3), c.seq);
+    try std.testing.expectEqual(@as(u16, 9), c.total);
+    try std.testing.expectEqual(@as(u16, 1600), c.width);
+    try std.testing.expectEqual(@as(u16, 1200), c.height);
+    try std.testing.expectEqual(Mime.jpeg, c.mime);
+    try std.testing.expectEqualStrings(piece, c.bytes);
+
+    // THE GEOMETRY IS ON EVERY CHUNK, not just the first. Chunks are separate
+    // deposits and nothing orders them, so whichever arrives first must be able
+    // to size the bubble.
+    const later = try writeImageChunk(&out, id, 8, 9, 1600, 1200, .jpeg, piece);
+    const c2 = try parseImageChunk(later[1..]);
+    try std.testing.expectEqual(@as(u16, 1600), c2.width);
+
+    // A picture in NO pieces is not a picture — and a zero total would make
+    // every "have we got them all" check trivially true.
+    try std.testing.expectError(error.Malformed, writeImageChunk(&out, id, 0, 0, 1, 1, .png, piece));
+    // A piece past the end of its own transfer.
+    try std.testing.expectError(error.Malformed, writeImageChunk(&out, id, 9, 9, 1, 1, .png, piece));
+    // An empty piece: a deposit that carries nothing is a deposit that should
+    // not have been made.
+    try std.testing.expectError(error.Malformed, writeImageChunk(&out, id, 0, 1, 1, 1, .png, ""));
+    // Too small to hold what it claims.
+    var tiny: [8]u8 = undefined;
+    try std.testing.expectError(error.Malformed, writeImageChunk(&tiny, id, 0, 1, 1, 1, .png, piece));
+
+    // On the read side: truncation, a bad mime, and a seq outside the total are
+    // all refused rather than half-believed.
+    try std.testing.expectError(error.Malformed, parseImageChunk(framed[1 .. 1 + image_chunk_head]));
+    try std.testing.expectError(error.Malformed, parseImageChunk(framed[1..5]));
+    var bad = out;
+    const n = framed.len;
+    @memcpy(bad[0..n], framed[0..n]);
+    bad[1 + 12] = 200; // mime byte from a version we do not speak
+    try std.testing.expectError(error.Malformed, parseImageChunk(bad[1..n]));
+    @memcpy(bad[0..n], framed[0..n]);
+    std.mem.writeInt(u16, bad[1 + 4 ..][0..2], 99, .little); // seq 99 of 9
+    try std.testing.expectError(error.Malformed, parseImageChunk(bad[1..n]));
+}
+
+test "picture chunks: the count is exact, and a picture too big to count is refused" {
+    try std.testing.expectEqual(@as(?u16, 1), imageChunkCount(1, 1000));
+    try std.testing.expectEqual(@as(?u16, 1), imageChunkCount(1000, 1000));
+    try std.testing.expectEqual(@as(?u16, 2), imageChunkCount(1001, 1000));
+    try std.testing.expectEqual(@as(?u16, 3), imageChunkCount(2999, 1000));
+
+    // Degenerate inputs answer null rather than dividing by zero or claiming a
+    // transfer of nothing.
+    try std.testing.expectEqual(@as(?u16, null), imageChunkCount(0, 1000));
+    try std.testing.expectEqual(@as(?u16, null), imageChunkCount(1000, 0));
+
+    // A transfer that cannot COUNT its own pieces must not begin.
+    try std.testing.expectEqual(@as(?u16, null), imageChunkCount(70_000, 1));
+
+    // And the real budget: a picture at the cap, in chunks that fit a bucket,
+    // is a number of pieces the wire can actually name.
+    const at_cap = imageChunkCount(max_attachment_bytes, 1024 - 1 - image_chunk_head);
+    try std.testing.expect(at_cap != null);
 }
