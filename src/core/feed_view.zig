@@ -37,6 +37,7 @@ const text = @import("text.zig");
 const keydir = @import("keydir.zig"); // device standings: the gate explains itself from these
 const ui_feedback = @import("../ui/feedback.zig"); // Rover: hover/press/disabled state layers
 const ui_anchor = @import("../ui/anchor.zig"); // Rover: anchored placement with flip + shift
+const ui_ease = @import("../ui/ease.zig"); // Rover: the easing curves, written once
 const raster = @import("raster.zig");
 const ui_insets = @import("../ui/insets.zig"); // Rover: safe-area / gesture-inset math
 const lens_socket = @import("lens_socket.zig");
@@ -10404,7 +10405,7 @@ fn drawSendGrid(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, reg
     const card_h = tab_h + rows * tile_h + pad;
 
     const t = std.math.clamp(m.t, 0.0, 1.0);
-    const ease = 1.0 - (1.0 - t) * (1.0 - t);
+    const ease = ui_ease.easeOutQuad(t);
     const a: u8 = @intFromFloat(255.0 * ease);
 
     const x = std.math.clamp(m.x - @divTrunc(grid_w, 2), 8, @max(8, width - grid_w - 8));

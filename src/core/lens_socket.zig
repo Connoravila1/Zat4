@@ -46,6 +46,7 @@
 //! same plain-values-only boundary; one convention for the whole frame.
 
 const std = @import("std");
+const ui_ease = @import("../ui/ease.zig"); // Rover: the easing curves, written once
 const builtin = @import("builtin");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
@@ -388,13 +389,9 @@ fn lerpi(a: i32, b: i32, t: f32) i32 {
 }
 
 /// Spring-ish ease that OVERSHOOTS past 1 then settles back — the "it springs,
-/// it doesn't snap" feel (§3). t in [0,1].
-fn easeOutBack(t: f32) f32 {
-    const c1: f32 = 1.70158;
-    const c3: f32 = c1 + 1.0;
-    const u = t - 1.0;
-    return 1.0 + c3 * u * u * u + c1 * u * u;
-}
+/// it doesn't snap" feel (§3). t in [0,1]. This was a local copy of Penner's
+/// back ease, identical to Rover's down to the 1.70158; it is Rover's now.
+const easeOutBack = ui_ease.easeOutBack;
 
 fn rect(gpa: Allocator, dl: *raster.DrawList, x: i32, y: i32, w: i32, h: i32, color: u32, radius: u8) !void {
     try dl.append(gpa, .{ .rect = .{

@@ -481,3 +481,28 @@ test "gesture: the velocity sample is a rate, not a per-frame quantity" {
     // A zero-length frame cannot divide, and must not poison the average.
     try testing.expectEqual(v60, sampleFlingVelocity(v60, 5.0, 0.0, keep));
 }
+
+test "gesture: the shared easing curves are the ones the app was tuned with" {
+    // A REGRESSION GUARD FOR A DE-DUPLICATION. Four modules each carried their
+    // own copy of an easing curve; they are Rover's now. The swap is only safe
+    // because the implementations were identical, and this asserts that against
+    // the formulas written out longhand rather than against the module that
+    // replaced them — otherwise the test would agree with any future change.
+    const ui_ease = @import("../ui/ease.zig");
+    var i: u32 = 0;
+    while (i <= 20) : (i += 1) {
+        const t = @as(f32, @floatFromInt(i)) / 20.0;
+
+        // easeOutQuad, as `effect.zig`, `feed_view.zig` and `enroll_view.zig`
+        // each wrote it: 1 - (1-t)².
+        const u = 1.0 - t;
+        try testing.expect(@abs(ui_ease.easeOutQuad(t) - (1.0 - u * u)) < 1.0e-6);
+
+        // easeOutBack, as `lens_socket.zig` wrote it — Penner's, 1.70158.
+        const c1: f32 = 1.70158;
+        const c3: f32 = c1 + 1.0;
+        const v = t - 1.0;
+        const want_back = 1.0 + c3 * v * v * v + c1 * v * v;
+        try testing.expect(@abs(ui_ease.easeOutBack(t) - want_back) < 1.0e-6);
+    }
+}

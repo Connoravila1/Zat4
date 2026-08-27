@@ -17,6 +17,7 @@
 //! word-joined credential is the user's PASSWORD.
 
 const std = @import("std");
+const ui_ease = @import("../ui/ease.zig"); // Rover: the easing curves, written once
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const text = @import("text.zig");
@@ -1089,7 +1090,7 @@ fn drawSeal(gpa: Allocator, dl: *raster.DrawList, cx: i32, cy: i32, r: i32, seal
     const outer: f32 = @as(f32, @floatFromInt(r)) + 6.0;
     const close_at: f32 = 0.62;
     const sweep_lin = @min(1.0, seal_t / close_at);
-    const sweep = 1.0 - (1.0 - sweep_lin) * (1.0 - sweep_lin); // easeOutQuad
+    const sweep = ui_ease.easeOutQuad(sweep_lin);
 
     const N: i32 = 80;
     const stepf: f32 = 1.0 / @as(f32, @floatFromInt(N));

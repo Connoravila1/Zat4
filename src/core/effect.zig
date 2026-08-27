@@ -52,6 +52,7 @@
 //! F2 (comptime tables, no dependency).
 
 const std = @import("std");
+const ui_ease = @import("../ui/ease.zig"); // Rover: the easing curves, written once
 const assert = std.debug.assert;
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
@@ -607,11 +608,9 @@ pub fn stamp(f: *field.Field, stencil: Stencil, cx: u16, cy: u16, color: u8) voi
 /// Ease a 0→1 progress so motion has a DEFINED, immediate onset and a FLUID
 /// settle: fast off the mark (the like/unlike registers the instant it starts)
 /// then decelerating into its final value (no mechanical linear crawl, no
-/// abrupt stop). easeOutQuad: 1-(1-t)². Pure.
-fn easeOut(t: f32) f32 {
-    const u = 1.0 - t;
-    return 1.0 - u * u;
-}
+/// abrupt stop). This was a local copy of easeOutQuad; it is Rover's now — the
+/// same curve, written once. Pure.
+const easeOut = ui_ease.easeOutQuad;
 
 /// The heart's fill fraction (0=empty, 1=full) at stage progress `t`, given
 /// whether the effect FILLS (like) or DRAINS (unlike). Pure and total over
