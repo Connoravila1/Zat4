@@ -36,6 +36,7 @@ const Allocator = std.mem.Allocator;
 const text = @import("text.zig");
 const keydir = @import("keydir.zig"); // device standings: the gate explains itself from these
 const ui_feedback = @import("../ui/feedback.zig"); // Rover: hover/press/disabled state layers
+const ui_anchor = @import("../ui/anchor.zig"); // Rover: anchored placement with flip + shift
 const raster = @import("raster.zig");
 const ui_insets = @import("../ui/insets.zig"); // Rover: safe-area / gesture-inset math
 const lens_socket = @import("lens_socket.zig");
@@ -3837,12 +3838,26 @@ pub fn layout(
         const menu_w: i32 = 196;
         const row_h: i32 = 46;
         const menu_h: i32 = row_h * 2 + 12;
-        var mx = ma.x - 12;
-        if (mx + menu_w > width - 10) mx = width - 10 - menu_w;
-        if (mx < 10) mx = 10;
-        // Below the button, unless that runs off the bottom → flip above.
-        var my = ma.y + 40;
-        if (my + menu_h > height - 10) my = ma.y - menu_h - 8;
+        // Below the button, flipping above when the bottom edge is close. Hand
+        // -rolled here until now, and the hand-rolled version had the classic
+        // bug: the flip did not re-clamp, so a repost button near the TOP of a
+        // short window flipped the menu to a negative y and off the screen.
+        // `place` flips AND shifts, and guarantees the result is inside the
+        // viewport whenever it can fit at all.
+        //
+        // The anchor is the button: 32 tall from `ma.y`, with an 8px gap, which
+        // reproduces the old `ma.y + 40` exactly on the common path.
+        const rvp: ui_anchor.Rect = .{ .x = 10, .y = 10, .w = @max(0, width - 20), .h = @max(0, height - 20) };
+        const rbox = ui_anchor.place(
+            .{ .x = ma.x - 12, .y = ma.y, .w = 0, .h = 32 },
+            menu_w,
+            menu_h,
+            rvp,
+            .{ .side = .bottom, .alignment = .start },
+            8,
+        );
+        const mx = rbox.x;
+        const my = rbox.y;
         try rect(gpa, dl, mx, my, menu_w, menu_h, 0xF61E1E18, 14); // opaque panel
         try rect(gpa, dl, mx, my, menu_w, menu_h, 0x22000000, 14); // subtle edge darken
         const r1y = my + 6;
@@ -10480,17 +10495,30 @@ fn drawChatMenu(
     const items = chatMenuItems(m, &buf);
     const h = chat_menu_row_h * @as(i32, @intCast(items.len)) + 12 + (if (m.kind == .message) @as(i32, 52) else 0);
 
-    // It stays ON SCREEN. A menu summoned near the bottom edge that runs off it is
-    // a menu with items nobody can reach.
-    const x = std.math.clamp(m.x, 8, @max(8, width - chat_menu_w - 8));
-    // "Send with…" GROWS UP from the Send button, the iMessage grammar — and,
-    // load-bearing on the phone, that keeps it clear of the soft keyboard, which
-    // covers the bottom of the screen and was clipping a downward menu. Every
-    // other menu opens under the press point where the finger already is.
-    const y = if (m.kind == .send or m.kind == .attach)
-        std.math.clamp(m.y - h - 10, 8, @max(8, height - h - 8))
-    else
-        std.math.clamp(m.y, 8, @max(8, height - h - 8));
+    // IT STAYS ON SCREEN — and near an edge it FLIPS rather than sliding.
+    //
+    // This used to clamp on both axes, which keeps a menu inside the window but
+    // does the wrong thing at the bottom of a thread: press-and-hold the newest
+    // message — the one you hold most often — and a clamped menu slides UP over
+    // the message you were pressing, so the thing you are acting on disappears
+    // behind the actions. Rover's `place` flips it above the press instead, which
+    // is what every platform does and what the "Send with…" case was already
+    // hand-rolling as a special case.
+    //
+    // The anchor is the press POINT (a zero-size rect): it is genuinely all we
+    // know — the menu is summoned by a finger, not by a button with a rect.
+    const vp: ui_anchor.Rect = .{ .x = 8, .y = 8, .w = @max(0, width - 16), .h = @max(0, height - 16) };
+    // "Send with…" prefers to grow UP from the Send button, the iMessage grammar
+    // — and, load-bearing on the phone, that keeps it clear of the soft keyboard.
+    // Every other menu prefers to open under the press point where the finger
+    // already is. Both are now preferences that flip when the room is not there.
+    const want: ui_anchor.Placement = .{
+        .side = if (m.kind == .send or m.kind == .attach) .top else .bottom,
+        .alignment = .start,
+    };
+    const box = ui_anchor.place(.{ .x = m.x, .y = m.y }, chat_menu_w, h, vp, want, 10);
+    const x = box.x;
+    const y = box.y;
 
     // The arrival: it grows from where you pressed. Cheap, and it makes the menu
     // feel like a consequence of the press rather than an interruption.
@@ -13795,4 +13823,36 @@ test "control feedback: a press draws a state layer, rest draws nothing" {
     const hov = ui_feedback.interactionAlpha(.{ .hovered = true });
     const prs = ui_feedback.interactionAlpha(.{ .hovered = true, .pressed = true });
     try std.testing.expect(prs > hov);
+}
+
+test "menus: a menu summoned at an edge flips instead of covering what you pressed" {
+    // THE BOTTOM OF A CHAT THREAD is where press-and-hold happens most, because
+    // that is where the newest message is. A menu that clamps instead of flipping
+    // slides UP over the very message you are acting on — the actions cover their
+    // own subject. And the hand-rolled flip this replaces had the mirror bug: it
+    // did not re-clamp, so an anchor near the TOP flipped to a negative y.
+    const w: i32 = 430;
+    const h: i32 = 930;
+    const vp: ui_anchor.Rect = .{ .x = 8, .y = 8, .w = w - 16, .h = h - 16 };
+    const menu_h: i32 = chat_menu_row_h * 4 + 12 + 52;
+
+    // Pressed near the BOTTOM: the menu must end up ABOVE the press.
+    const low = ui_anchor.place(.{ .x = 40, .y = h - 60 }, chat_menu_w, menu_h, vp, .{ .side = .bottom, .alignment = .start }, 10);
+    try std.testing.expect(low.y + low.h <= h - 60);
+    try std.testing.expect(ui_anchor.fits(low, vp));
+
+    // Pressed near the TOP: it opens below, as asked.
+    const high = ui_anchor.place(.{ .x = 40, .y = 40 }, chat_menu_w, menu_h, vp, .{ .side = .bottom, .alignment = .start }, 10);
+    try std.testing.expect(high.y >= 40);
+    try std.testing.expect(ui_anchor.fits(high, vp));
+
+    // Pressed at the RIGHT edge: it shifts back on screen rather than running off.
+    const right = ui_anchor.place(.{ .x = w - 12, .y = 300 }, chat_menu_w, menu_h, vp, .{ .side = .bottom, .alignment = .start }, 10);
+    try std.testing.expect(right.x + chat_menu_w <= w - 8);
+    try std.testing.expect(ui_anchor.fits(right, vp));
+
+    // "Send with…" prefers to grow UP, and near the TOP it flips DOWN rather than
+    // running off — the case the old special-case could not express at all.
+    const up_tight = ui_anchor.place(.{ .x = 40, .y = 30 }, chat_menu_w, menu_h, vp, .{ .side = .top, .alignment = .start }, 10);
+    try std.testing.expect(ui_anchor.fits(up_tight, vp));
 }
