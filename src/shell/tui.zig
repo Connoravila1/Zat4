@@ -1200,6 +1200,12 @@ const RunState = struct {
     gexpanded: std.ArrayList([]const u8),
     ghover_x: i32,
     ghover_y: i32,
+    /// WHERE THE POINTER IS HELD DOWN, logical px; -1 = nothing held. The half
+    /// of interaction feedback a PHONE actually has — it never hovers, so until
+    /// this existed every control on the phone was silent between the tap and
+    /// whatever happened next.
+    gpress_x: i32,
+    gpress_y: i32,
     gpu_state: ?GpuState,
 };
 
@@ -2068,6 +2074,8 @@ fn initRunState(
     // The pointer's last position in LOGICAL coords (for the hover highlight),
     // updated on every motion event; <0 until the first move.
     rs.ghover_x = -1;
+    rs.gpress_x = -1;
+    rs.gpress_y = -1;
     rs.ghover_y = -1;
 
     // Phase 6.4: the GPU render path, brought up additively when the window is
@@ -4497,6 +4505,11 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         }
                         m.down_x = tev.x;
                         m.down_y = tev.y;
+                        // The control under the finger lights up NOW, not on
+                        // release. A phone never hovers, so this is the only
+                        // interaction feedback it has.
+                        rs.gpress_x = @intFromFloat(@as(f32, @floatFromInt(tev.x)) / scale);
+                        rs.gpress_y = @intFromFloat(@as(f32, @floatFromInt(tev.y)) / scale);
                         m.down_ms = now_ms; // the long-press clock starts
                         m.hold_fired = false;
                         m.hold_menu = false;
@@ -4819,6 +4832,10 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                             const mdx = @abs(@as(i32, tev.x) - m.down_x);
                             const mdy = @abs(@as(i32, tev.y) - m.down_y);
                             if (mdx > touch_slop or mdy > touch_slop) m.moved = true;
+                            // The pressed look follows the finger: slide off the
+                            // control and it lets go, exactly like a browser.
+                            rs.gpress_x = @intFromFloat(@as(f32, @floatFromInt(tev.x)) / scale);
+                            rs.gpress_y = @intFromFloat(@as(f32, @floatFromInt(tev.y)) / scale);
                         }
                         if (!m.scrolling and !m.hswipe and !m.socket_swipe and !m.press_in_kbd and
                             !m.overlay_press and !m.hold_menu and m.chat_hnd == 0)
@@ -5167,6 +5184,8 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         }
                         m.down_x = -1;
                         m.down_y = -1;
+                        rs.gpress_x = -1;
+                        rs.gpress_y = -1;
                         m.scrolling = false;
                         m.moved = false;
                         m.drag_y = -1;
@@ -5192,6 +5211,8 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     rs.kbd_flash_held = false;
                     m.down_x = -1;
                     m.down_y = -1;
+                    rs.gpress_x = -1;
+                    rs.gpress_y = -1;
                     m.scrolling = false;
                     m.moved = false;
                     m.drag_y = -1;
@@ -5779,6 +5800,12 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         // highlight (rx/ry are already mapped through scale).
                         rs.ghover_x = rx;
                         rs.ghover_y = ry;
+                        // …and, while a button is down, the pressed look follows
+                        // it too, so sliding off a control lets go of it.
+                        if (rs.gpress_x >= 0) {
+                            rs.gpress_x = rx;
+                            rs.gpress_y = ry;
+                        }
                         // A live drag: the ghost card follows the pointer. On the
                         // loadout page the dragged surface may be reply/zone.
                         if (rs.page_drag_surface) |s| {
@@ -5853,6 +5880,14 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         }
                     },
                     .button_down => {
+                        // Stamped FIRST: the arms below are full of early
+                        // `continue`s, and a control that lights up only on the
+                        // paths that happen to fall through is worse than one
+                        // that never lights up at all.
+                        if (pev.button == 1) {
+                            rs.gpress_x = rx;
+                            rs.gpress_y = ry;
+                        }
                         // Right-click → the context menu over the rooted
                         // post body. Left-click while the menu is open hits
                         // an item or dismisses it (never the feed beneath).
@@ -6183,6 +6218,8 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     // button_down arm). Placed after the drag-drop handling so
                     // a drag never also triggers a tap.
                     .button_up => if (pev.button == 1) {
+                        rs.gpress_x = -1;
+                        rs.gpress_y = -1;
                         rs.ghold_live = false; // a lift is a tap, not a hold
                         // The front door commits on release over the SAME target —
                         // the same release-activation the feed uses, so a press that
@@ -11429,6 +11466,12 @@ fn chatDevicesOf(rs: *RunState, arena: Allocator) feed_view.ChatDevices {
     return .{
         .state = rs.gdev_state,
         .reason = rs.gdev_reason,
+        .pointer = .{
+            .hover_x = rs.ghover_x,
+            .hover_y = rs.ghover_y,
+            .press_x = rs.gpress_x,
+            .press_y = rs.gpress_y,
+        },
         .pending = pend,
         .busy = rs.gdev_busy,
         .error_line = rs.gdev_error,

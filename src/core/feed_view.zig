@@ -35,6 +35,7 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const text = @import("text.zig");
 const keydir = @import("keydir.zig"); // device standings: the gate explains itself from these
+const ui_feedback = @import("../ui/feedback.zig"); // Rover: hover/press/disabled state layers
 const raster = @import("raster.zig");
 const ui_insets = @import("../ui/insets.zig"); // Rover: safe-area / gesture-inset math
 const lens_socket = @import("lens_socket.zig");
@@ -9441,9 +9442,26 @@ pub const PendingDeviceView = struct {
 };
 
 /// Everything the multi-device surfaces render from. A7.2: cold, one per frame.
+/// WHERE THE POINTER IS, as one value. Bundled rather than added to
+/// `layout`'s ~30 positional parameters — a feature that has to touch every call
+/// site in four files to add two numbers is the change-amplification defect D6
+/// names, and the surfaces that already want hover carry their own pair exactly
+/// like this. A7.2: cold, one per frame.
+pub const Pointer = struct {
+    /// Hovering (desktop only — a phone never hovers). -1 = off-page.
+    hover_x: i32 = -1,
+    hover_y: i32 = -1,
+    /// Held down. This is the one a phone actually has, and the one that was
+    /// missing. -1 = nothing is held.
+    press_x: i32 = -1,
+    press_y: i32 = -1,
+};
+
 pub const ChatDevices = struct {
     // A7.2: cold struct (one per frame, config-shaped), size guard waived.
     state: ChatDeviceState = .ok,
+    /// Where the pointer is, for the state layers on this surface's controls.
+    pointer: Pointer = .{},
     /// WHY, when `state` is `.may_join`. Four situations share that one remedy,
     /// and they do not share a sentence: "you have never asked" and "you belong
     /// to a device set that was replaced" need different words, and the screen
@@ -9581,6 +9599,58 @@ const gate_cost_desktop = [_][]const u8{
 };
 
 /// The gate, in its two faces: ASK, and WAITING.
+// ---------------------------------------------------------------------------
+// CONTROL FEEDBACK — the browser's :hover / :active, which this app did not have.
+//
+// Hover was hand-rolled at five call sites (`x >= a and x < a + w and …`), each
+// with its own colours, and PRESS did not exist at all. On a phone that is not a
+// missing polish detail — a phone never hovers, so every button in the app gave
+// no feedback whatsoever between the tap and whatever happened next. A control
+// that does not acknowledge the finger reads as a control that did not hear it,
+// which is most of what "unresponsive" means when somebody says it about a UI.
+//
+// Rover's `feedback` owns the precedence and the standard state-layer alphas;
+// this only decides containment and draws the wash.
+// ---------------------------------------------------------------------------
+
+/// Is `px,py` inside the rect? A pointer that is off-page arrives as -1 and is
+/// inside nothing.
+fn ptrIn(px: i32, py: i32, x: i32, y: i32, w: i32, h: i32) bool {
+    return px >= x and px < x + w and py >= y and py < y + h;
+}
+
+/// The interaction a control at `x,y,w,h` is in, from where the pointer hovers
+/// and where it is held down.
+fn controlInteraction(p: Pointer, x: i32, y: i32, w: i32, h: i32, disabled: bool) ui_feedback.Interaction {
+    return .{
+        .hovered = ptrIn(p.hover_x, p.hover_y, x, y, w, h),
+        // `pressed` is Rover's ACTIVE: held AND still over the control, so
+        // dragging off releases the pushed-in look, exactly like a browser.
+        .pressed = ptrIn(p.press_x, p.press_y, x, y, w, h),
+        .focused = false, // keyboard focus rings are a later slice
+        .disabled = disabled,
+    };
+}
+
+/// Draw the state-layer wash over a control that has already been drawn. A no-op
+/// at rest, so it costs one comparison on every control that is not under the
+/// pointer.
+fn controlWash(
+    gpa: Allocator,
+    dl: *raster.DrawList,
+    p: Pointer,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    radius: u8,
+    disabled: bool,
+) !void {
+    const a = ui_feedback.interactionAlpha(controlInteraction(p, x, y, w, h, disabled));
+    if (a == 0) return;
+    try rect(gpa, dl, x, y, w, h, softA(0xFFFFFF, a), radius);
+}
+
 fn drawDeviceGate(
     gpa: Allocator,
     dl: *raster.DrawList,
@@ -9672,6 +9742,7 @@ fn drawDeviceGate(
         try rect(gpa, dl, bx, y, bw, 1, softA(0xFFFFFF, 0x40), 11); // a lit top edge
         const lw: i32 = @intCast(text.measure(e, .semibold, label, 15));
         _ = try str(gpa, dl, e, .semibold, cx - @divTrunc(lw, 2), y + 29, 0xFF12110F, 15, label);
+        try controlWash(gpa, dl, d.pointer, bx, y, bw, bh, 11, d.busy);
         if (!d.busy) try emitRegion(gpa, regions, bx, y, bw, bh, 0, .chat_device_add);
         y += bh + 14;
 
@@ -11277,6 +11348,7 @@ pub fn layoutChat(
             try strEllipsis(gpa, dl, e, pw, tx, ly + @as(i32, if (phone) 54 else 48), pc, @as(u16, if (phone) 14 else 13), row.preview, tw);
         }
         if (phone and i + 1 < list.len) try rect(gpa, dl, tx, ly + row_h - 7, right - tx, 1, divider, 0);
+        try controlWash(gpa, dl, devices.pointer, x0, ly, list_w, @intCast(row_h - 6), 0, false);
         try emitRegion(gpa, regions, x0, ly, list_w, @intCast(row_h - 6), @intCast(i), .chat_conv);
         ly += row_h;
     }
@@ -11881,6 +11953,7 @@ pub fn layoutChat(
             const pw: i32 = @intCast(text.measure(e, .semibold, "+", 20));
             _ = try str(gpa, dl, e, .semibold, sx + @divTrunc(send_w - pw, 2), sy + 30, faint, 20, "+");
         }
+        try controlWash(gpa, dl, devices.pointer, sx, sy, send_w, 46, if (phone) 23 else 14, false);
         try emitRegion(gpa, regions, sx, sy, send_w, 46, 0, .chat_attach);
     } else {
         // ARMED: the right button is Send.
@@ -11893,6 +11966,7 @@ pub fn layoutChat(
             const sw3: i32 = @intCast(text.measure(e, .semibold, "Send", 14));
             _ = try str(gpa, dl, e, .semibold, sx + @divTrunc(send_w - sw3, 2), sy + 29, 0xFF20201A, 14, "Send");
         }
+        try controlWash(gpa, dl, devices.pointer, sx, sy, send_w, 46, if (phone) 23 else 14, false);
         try emitRegion(gpa, regions, sx, sy, send_w, 46, 0, .chat_send);
     }
 
@@ -13681,4 +13755,44 @@ test "device gate: every line of its copy fits the narrowest card it is drawn in
             return error.GateCopyOverflows;
         }
     };
+}
+
+test "control feedback: a press draws a state layer, rest draws nothing" {
+    // The point of this primitive on a PHONE. A phone never hovers, so before
+    // press existed every control was silent between the tap and whatever
+    // happened next — and a control that does not acknowledge the finger reads
+    // as one that did not hear it.
+    const gpa = std.testing.allocator;
+    var dl: raster.DrawList = .{};
+    defer dl.deinit(gpa);
+
+    const x: i32 = 10;
+    const y: i32 = 20;
+    const w: i32 = 100;
+    const h: i32 = 40;
+
+    // Nothing near it: no wash, and no cost.
+    try controlWash(gpa, &dl, .{}, x, y, w, h, 8, false);
+    try std.testing.expectEqual(@as(usize, 0), dl.len);
+
+    // Held down ON it: a wash.
+    try controlWash(gpa, &dl, .{ .press_x = x + 5, .press_y = y + 5 }, x, y, w, h, 8, false);
+    try std.testing.expectEqual(@as(usize, 1), dl.len);
+
+    // Held down and DRAGGED OFF it: nothing. Rover's `pressed` is ACTIVE —
+    // held and still over the control — so sliding away releases the pushed-in
+    // look instead of leaving a control lit that the release will not fire.
+    dl.len = 0;
+    try controlWash(gpa, &dl, .{ .press_x = x + w + 30, .press_y = y + 5 }, x, y, w, h, 8, false);
+    try std.testing.expectEqual(@as(usize, 0), dl.len);
+
+    // DISABLED outranks everything: an inert control shows no hover and no press.
+    dl.len = 0;
+    try controlWash(gpa, &dl, .{ .hover_x = x + 5, .hover_y = y + 5, .press_x = x + 5, .press_y = y + 5 }, x, y, w, h, 8, true);
+    try std.testing.expectEqual(@as(usize, 0), dl.len);
+
+    // And a press reads STRONGER than a hover, which is the whole precedence.
+    const hov = ui_feedback.interactionAlpha(.{ .hovered = true });
+    const prs = ui_feedback.interactionAlpha(.{ .hovered = true, .pressed = true });
+    try std.testing.expect(prs > hov);
 }
