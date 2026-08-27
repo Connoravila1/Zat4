@@ -124,6 +124,15 @@ pub const MobileHost = struct {
     /// render loop ticks even on a motionless finger, so the timer fires.
     down_ms: u32 = 0,
     hold_fired: bool = false,
+    /// HAS THE FINGER ACTUALLY MOVED past slop since it landed? Distinct from
+    /// `scrolling`, and the distinction is a bug this cost us: catching a live
+    /// edge-bounce sets `scrolling` AT TOUCH-DOWN, before any movement, because
+    /// the press has to take over the stretched offset and must not also fire a
+    /// tap. A press-and-hold gated on `!scrolling` therefore could not fire at
+    /// all once the list had bounced — and a chat thread bounces almost every
+    /// time, because you are already at the newest message. The hold now asks
+    /// the question it actually cares about: did the finger stay still.
+    moved: bool = false,
     /// A press-and-hold opened a chat MENU this gesture. Distinct from
     /// `hold_fired` (which owns the card-drag and its drop): the menu is already
     /// the whole action, so the release must not also fire a tap underneath it —

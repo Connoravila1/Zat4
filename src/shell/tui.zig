@@ -70,7 +70,8 @@ const chat_view_core = @import("../core/chat_view.zig");
 const chat_games = @import("../core/chat_games.zig");
 const spring = @import("../core/spring.zig");
 const reveal = @import("../ui/reveal.zig"); // Rover: portable present/dismiss transition
-const ui_insets = @import("../ui/insets.zig"); // Rover: safe-area / gesture-inset math
+const ui_insets = @import("../ui/insets.zig");
+const ui_timing = @import("../ui/timing.zig"); // Rover: long-press / repeat, one clock rule // Rover: safe-area / gesture-inset math
 const scroll_container = @import("../ui/scroll_container.zig"); // Rover: one range rule for every screen
 const home_scene = @import("home_scene.zig"); // Zat binding: Home paint/input share Rover geometry
 const algorithm_scene = @import("algorithm_scene.zig"); // Algorithms: page + three sockets, one scene
@@ -4500,6 +4501,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         m.hold_fired = false;
                         m.hold_menu = false;
                         m.scrolling = false;
+                        m.moved = false;
                         m.hswipe = false;
                         m.drag_y = tev.y;
                         m.fling_v = 0; // a touch catches the gliding feed (interruptible)
@@ -4805,6 +4807,19 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         // the nav-drawer swipe (resolved on release). One
                         // commitment per press; a committed swipe never
                         // scrolls the feed under the moving finger.
+                        // DID THE FINGER WANDER? Stamped from the RAW delta and
+                        // OUTSIDE the commitment guard below, so it stays a fact
+                        // about the finger rather than a side effect of whichever
+                        // branch claims the press — and so it keeps updating after
+                        // the gesture has been classified. A press-and-hold reads
+                        // this, never `scrolling`, because `scrolling` can be true
+                        // at touch-down (catching an edge bounce) with the finger
+                        // yet to move a pixel.
+                        if (m.down_x >= 0) {
+                            const mdx = @abs(@as(i32, tev.x) - m.down_x);
+                            const mdy = @abs(@as(i32, tev.y) - m.down_y);
+                            if (mdx > touch_slop or mdy > touch_slop) m.moved = true;
+                        }
                         if (!m.scrolling and !m.hswipe and !m.socket_swipe and !m.press_in_kbd and
                             !m.overlay_press and !m.hold_menu and m.chat_hnd == 0)
                         {
@@ -5153,6 +5168,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                         m.down_x = -1;
                         m.down_y = -1;
                         m.scrolling = false;
+                        m.moved = false;
                         m.drag_y = -1;
                         m.chat_hnd = 0;
                     },
@@ -5177,6 +5193,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     m.down_x = -1;
                     m.down_y = -1;
                     m.scrolling = false;
+                    m.moved = false;
                     m.drag_y = -1;
                     m.socket_swipe = false;
                     m.over_px = 0;
@@ -5293,7 +5310,9 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 // LONG-PRESS on the chat INPUT: select the word under the
                 // finger + summon the Copy/Cut/Paste bar (the standard
                 // text-editing entry the strip was missing).
-                if (m.down_x >= 0 and m.input_press and !m.scrolling and (now_ms -% m.down_ms) >= 420) {
+                if (m.down_x >= 0 and m.input_press and !m.moved and
+                    ui_timing.longPressReady(m.down_ms, now_ms, input_hold_ms))
+                {
                     m.input_press = false;
                     m.input_lp = true; // the release tap is spent
                     if (rs.engine) |*ieng| {
@@ -5335,10 +5354,10 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                 // shared `chatHoldArm`. The menu is the whole action, so the
                 // release suppresses its tap via `hold_menu`.
                 if (dev_chat and m.down_x >= 0 and !m.hold_fired and !m.hold_menu and
-                    !m.scrolling and !m.hswipe and !m.socket_swipe and !m.press_in_kbd and
+                    !m.moved and !m.hswipe and !m.socket_swipe and !m.press_in_kbd and
                     (topOverlay(rs) == .none or topOverlay(rs) == .pending_game) and
                     rs.gscreen == feed_view.screen_messages and !rs.gcmenu.open and
-                    (now_ms -% m.down_ms) >= chat_hold_ms)
+                    ui_timing.longPressReady(m.down_ms, now_ms, chat_hold_ms))
                 {
                     const chx: i32 = @intFromFloat(@as(f32, @floatFromInt(m.down_x)) / scale);
                     const chy: i32 = @intFromFloat(@as(f32, @floatFromInt(m.down_y)) / scale);
@@ -5355,11 +5374,11 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                     }
                 }
 
-                const hold_ms: u32 = 300;
-                if (m.down_x >= 0 and !m.hold_fired and !m.scrolling and !m.hswipe and !m.socket_swipe and
+                if (m.down_x >= 0 and !m.hold_fired and !m.moved and !m.hswipe and !m.socket_swipe and
                     rs.gbench_drag == null and rs.gbench_pick == null and
                     (topOverlay(rs) == .none or topOverlay(rs) == .pending_game) and
-                    rs.gscreen == feed_view.screen_loadout and (now_ms -% m.down_ms) >= hold_ms)
+                    rs.gscreen == feed_view.screen_loadout and
+                    ui_timing.longPressReady(m.down_ms, now_ms, drag_hold_ms))
                 {
                     const hx: i32 = @intFromFloat(@as(f32, @floatFromInt(m.down_x)) / scale);
                     const hy: i32 = @intFromFloat(@as(f32, @floatFromInt(m.down_y)) / scale);
@@ -11287,7 +11306,23 @@ fn chatMenuOf(rs: *const RunState) feed_view.ChatMenu {
 /// How long a press must be held, and how far it may wander, before it becomes a
 /// press-and-hold. 420 ms is the number every platform converged on; 12 px of slop
 /// keeps a thumb that shifts slightly from being read as a scroll.
+// EVERY HOLD THRESHOLD IN THIS APP, TOGETHER. There were four hand-rolled hold
+// timers across the input layer with three different numbers, two of them written
+// inline at the call site — which is how one of them came to test the wrong thing
+// for a year. The time question itself is `ui_timing.longPressReady`; these are
+// the only knobs, and they sit where a person can compare them.
+//
+// Rover's own default is 380ms (`ui_timing.default_long_press_ms`). These are
+// deliberately a little longer: this app's holds open destructive-ish menus, and
+// a hold that fires early feels like an ambush.
+
+/// Press-and-hold on a message, a conversation row, or Send.
 const chat_hold_ms: u64 = 420;
+/// Press-and-hold in a text input, to start a selection.
+const input_hold_ms: u64 = 420;
+/// Press-and-hold to PICK UP a loadout card — shorter, because the payoff is a
+/// drag the finger is already trying to start.
+const drag_hold_ms: u64 = 300;
 /// The cinematic pre-roll before a screen effect: the screen dims over this many
 /// seconds and holds, then the particles burst (owner, 2026-07-20).
 const sfx_leadin_s: f32 = 0.42;
@@ -11332,8 +11367,8 @@ fn chatHoldArm(rs: *RunState, regions: []const feed_view.Region, rx: i32, ry: i3
 
 fn chatHoldStep(rs: *RunState) void {
     if (!rs.ghold_live or rs.gcmenu.open) return;
-    const el_ms = (clock_shell.monotonicNanos() -| rs.ghold_ns) / 1_000_000;
-    if (el_ms < chat_hold_ms) return;
+    const now_ms = clock_shell.monotonicNanos() / 1_000_000;
+    if (!ui_timing.longPressReady(rs.ghold_ns / 1_000_000, now_ms, chat_hold_ms)) return;
     if (rs.ghold_kind == .send) {
         // The "Send with…" effect picker grows from the Send button.
         rs.gcmenu = .{ .open = true, .kind = .send, .x = rs.ghold_x, .y = rs.ghold_y };
