@@ -11269,7 +11269,10 @@ pub fn layoutChat(
         if (compose_draft.len > 0) {
             try strEllipsis(gpa, dl, e, .regular, lab_pen + 8, body_y + 26, ink, 14, compose_draft, x0 + list_w - 12 - (lab_pen + 8));
         } else {
-            _ = try str(gpa, dl, e, .regular, lab_pen + 8, body_y + 26, faint, 14, "handle or did:…");
+            // The placeholder is where a group is DISCOVERED. There is no button
+            // and no second screen: two names separated by a comma is a group,
+            // and if the bar does not say so nobody will ever find out.
+            _ = try str(gpa, dl, e, .regular, lab_pen + 8, body_y + 26, faint, 14, "handle, or two for a group");
         }
         const draft_w: i32 = @intCast(text.measure(e, .regular, compose_draft, 14));
         const bar_caret_x = lab_pen + 8 + @min(draft_w, x0 + list_w - 12 - (lab_pen + 8)) + 1;
@@ -11279,7 +11282,7 @@ pub fn layoutChat(
         if (compose_status.len > 0) {
             try strEllipsis(gpa, dl, e, .regular, x0 + 2, body_y + 10, 0xFFE0A868, 12, compose_status, list_w - 4);
         } else {
-            _ = try str(gpa, dl, e, .regular, x0 + 2, body_y + 10, faint, 12, "Enter to start · Esc to cancel");
+            _ = try str(gpa, dl, e, .regular, x0 + 2, body_y + 10, faint, 12, "Separate names with a comma to make a group · Enter to start · Esc to cancel");
         }
         body_y += 24;
     }

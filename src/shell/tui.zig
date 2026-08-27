@@ -10529,6 +10529,40 @@ const ChatFrame = struct {
 fn chatSend(gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, st: ?*chat_e2ee.State, link: ?*chat_relay.ChatRelay, cs: *const chat_core.Store, conv: chat_core.ConvIndex, text: []const u8, effect: u8, bubble: u8, gcall: *call_ctl.CallCtl) void {
     const state = st orelse return;
     const l = link orelse return;
+
+    // A GROUP GOES TO EVERYBODY. Same words, wrapped once, encrypted per member
+    // over the pairwise sessions that already exist. Checked FIRST because a
+    // group has no `conversationDid` to send to — asking for one would hand back
+    // "" and quietly deposit nothing.
+    if (chat_core.isGroup(cs, conv)) {
+        var dids: [chat_core.max_members][]const u8 = undefined;
+        var n: usize = 0;
+        const members = chat_core.memberCount(cs, conv);
+        var seat: u16 = 0;
+        while (seat < members and n < dids.len) : (seat += 1) {
+            // Somebody who has left keeps their seat (attribution) but stops
+            // receiving — that is what leaving means.
+            if (chat_core.memberLeft(cs, conv, seat)) continue;
+            dids[n] = chat_core.memberDid(cs, conv, seat);
+            n += 1;
+        }
+        var inner: [1024]u8 = undefined;
+        if (1 + text.len > inner.len) {
+            chatLog("[chat] group send too long ({d} bytes)", .{text.len});
+            return;
+        }
+        inner[0] = @intFromEnum(chat_core.Kind.text);
+        @memcpy(inner[1..][0..text.len], text);
+        const sent = chat_e2ee.sendGroup(gpa, io, env, state, l, chat_core.groupId(cs, conv), dids[0..n], inner[0 .. 1 + text.len]) catch |err| {
+            chatLog("[chat] GROUP SEND FAILED: {s}", .{@errorName(err)});
+            return;
+        };
+        // A swallowed partial is how a group message "disappears" for one person:
+        // it left, four of five got it, and nobody said which.
+        chatLog("[chat] group send -> {d}/{d} members ({d} bytes)", .{ sent.delivered, sent.addressed, text.len });
+        return;
+    }
+
     const peer_did = chat_core.conversationDid(cs, conv);
     // Dev call trigger: typing "/call" in the open conversation places a voice
     // call over this same E2EE channel instead of sending it as a message. A
@@ -13696,6 +13730,15 @@ fn chatStartCompose(
 ) []const u8 {
     const state = st orelse return "Chat is offline — no relay configured";
     const l = link orelse return "Chat is offline — no relay configured";
+
+    // MORE THAN ONE NAME MAKES A GROUP. Commas, because the bar already exists
+    // and a person typing two names separated by a comma means exactly what it
+    // looks like — no second screen, no mode, no button that has to be found.
+    // One name is a direct chat, byte for byte the path it has always been.
+    if (std.mem.indexOfScalar(u8, typed_raw, ',') != null) {
+        return chatStartGroupCompose(gpa, arena, io, env, state, l, cs, typed_raw, sel_out);
+    }
+
     var typed = std.mem.trim(u8, typed_raw, " ");
     if (typed.len > 0 and typed[0] == '@') typed = typed[1..]; // "@handle" reads naturally; accept it
     if (typed.len == 0) return "";
@@ -13735,6 +13778,136 @@ fn chatStartCompose(
     const conv = chat_core.openConversation(gpa, cs, did, handle) catch return "Couldn't start the conversation";
     sel_out.* = conv;
     chatPersistHistory(gpa, io, env, state, cs);
+    return "";
+}
+
+/// RESOLVE ONE NAME to a DID, opening the pairwise session if there is not one.
+/// The single-recipient path and the group path both go through here, so a name
+/// cannot mean one thing in a DM and another in a group.
+fn chatResolvePeer(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    env: ?*const std.process.Environ.Map,
+    state: *chat_e2ee.State,
+    l: *chat_relay.ChatRelay,
+    typed_raw: []const u8,
+    did_out: *[]const u8,
+) []const u8 {
+    var typed = std.mem.trim(u8, typed_raw, " ");
+    if (typed.len > 0 and typed[0] == '@') typed = typed[1..];
+    if (typed.len == 0) return "";
+
+    var did: []const u8 = undefined;
+    if (std.mem.startsWith(u8, typed, "did:")) {
+        did = typed;
+    } else {
+        const identity = identity_shell.resolve(arena, io, env, .{}, typed) catch
+            return "Couldn't resolve that handle";
+        did = identity.did;
+    }
+    if (std.mem.eql(u8, did, state.my_did)) return "That's you — pick someone else";
+
+    if (!chat_e2ee.hasConversation(state, did)) {
+        chat_e2ee.startConversation(gpa, arena, io, env, state, l, did) catch |err| switch (err) {
+            error.AlreadyOpen => {},
+            error.NoConversation => {},
+            error.NoKeyPackage => return "No chat keys published for that account",
+            error.RelayDown => return "Relay unreachable — try again",
+            error.CryptoFailed, error.OutOfMemory => return "Couldn't start the conversation",
+        };
+        chatEnsureSubs(gpa, state, l);
+    }
+    did_out.* = did;
+    return "";
+}
+
+/// START A GROUP from a comma-separated list of names.
+///
+/// A group here is N−1 pairwise sessions, so this opens one with every member
+/// first — the fan-out has nothing to send over otherwise — then mints the id,
+/// creates the conversation, and tells everybody who is in it.
+///
+/// EVERY MEMBER MUST RESOLVE. A group quietly missing somebody is worse than one
+/// that refused to start: the person who typed the name believes they are in it,
+/// and will go on believing it every time the group talks without them.
+fn chatStartGroupCompose(
+    gpa: Allocator,
+    arena: Allocator,
+    io: std.Io,
+    env: ?*const std.process.Environ.Map,
+    state: *chat_e2ee.State,
+    l: *chat_relay.ChatRelay,
+    cs: *chat_core.Store,
+    typed_raw: []const u8,
+    sel_out: *?chat_core.ConvIndex,
+) []const u8 {
+    var dids: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer dids.deinit(gpa);
+    var handles: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer handles.deinit(gpa);
+
+    var it = std.mem.splitScalar(u8, typed_raw, ',');
+    while (it.next()) |part| {
+        const name = std.mem.trim(u8, part, " ");
+        if (name.len == 0) continue; // a stray comma is a typo, not a member
+        var did: []const u8 = "";
+        const err = chatResolvePeer(gpa, arena, io, env, state, l, name, &did);
+        if (err.len > 0) return err;
+        if (did.len == 0) continue;
+
+        // The same person twice is one member. Typing a name twice is a slip,
+        // and seating them twice would give them two seats and two voices.
+        var dup = false;
+        for (dids.items) |d| {
+            if (std.mem.eql(u8, d, did)) dup = true;
+        }
+        if (dup) continue;
+
+        dids.append(gpa, did) catch return "Couldn't start the group";
+        const disp = if (std.mem.startsWith(u8, name, "@")) name[1..] else name;
+        handles.append(gpa, if (std.mem.startsWith(u8, disp, "did:")) "" else disp) catch
+            return "Couldn't start the group";
+    }
+    if (dids.items.len == 0) return "";
+    if (dids.items.len == 1) return "That is one person — leave out the comma for a direct chat";
+    if (dids.items.len > chat_core.max_members) return "That is too many people for one group";
+
+    // The id: 16 bytes of real entropy from the shell (B3 — the core never
+    // reaches for randomness). Not a secret and not a capability; it is a name.
+    var group_id: [chat_core.group_id_len]u8 = undefined;
+    io.randomSecure(&group_id) catch return "Couldn't start the group";
+
+    // Named after the people in it until somebody renames it. A group called
+    // "Group" tells you nothing, and the list has to say something.
+    var title_buf: [128]u8 = undefined;
+    var tlen: usize = 0;
+    for (handles.items) |h| {
+        const piece = if (h.len > 0) h else "someone";
+        const sep: usize = if (tlen == 0) 0 else 2;
+        if (tlen + sep + piece.len > title_buf.len) break;
+        if (sep > 0) {
+            @memcpy(title_buf[tlen..][0..2], ", ");
+            tlen += 2;
+        }
+        @memcpy(title_buf[tlen..][0..piece.len], piece);
+        tlen += piece.len;
+    }
+    const title = title_buf[0..tlen];
+
+    const conv = chat_core.startGroup(gpa, cs, group_id, title, dids.items, handles.items) catch
+        return "Couldn't start the group";
+
+    // TELL EVERYBODY. Without this they have a pairwise session with us and no
+    // idea a group exists, so our first message would land as a DM.
+    const sent = chat_e2ee.sendGroupMeta(gpa, io, env, state, l, group_id, title, dids.items) catch
+        return "Made the group, but couldn't tell anyone yet";
+    sel_out.* = conv;
+    chatPersistHistory(gpa, io, env, state, cs);
+    if (!sent.complete()) {
+        chatLog("[chat] group roster reached {d}/{d}", .{ sent.delivered, sent.addressed });
+        return ""; // the group is real; the stragglers get it on the next send
+    }
     return "";
 }
 

@@ -1842,6 +1842,14 @@ pub fn writeGroupMeta(
     return out[0..at];
 }
 
+/// The group's id on the wire, or all-zero for a direct chat (which is addressed
+/// by its counterparty and has none).
+pub fn groupId(store: *const Store, conv: ConvIndex) [group_id_len]u8 {
+    const ci = @intFromEnum(conv);
+    if (ci >= store.convs.len) return [_]u8{0} ** group_id_len;
+    return store.convs.items(.group_id)[ci];
+}
+
 /// Find the conversation carrying this group id, or null. Linear over the
 /// conversations, which are held in dozens — and it is the ONE place a wire id
 /// becomes a local conversation, so a group that arrives twice cannot become two.
