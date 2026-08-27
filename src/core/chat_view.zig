@@ -202,8 +202,12 @@ pub const GameCard = struct {
     live: bool,
 
     comptime {
-        // 12 (State) + 1 (Seat) + 1 (bool) = 14, all byte-aligned — no padding.
-        assert(@sizeOf(GameCard) == 14);
+        // A7.1: 84 (State) + 1 (Seat) + 1 (bool) = 86, all byte-aligned — no
+        // padding. It grew with the board: one state shape now holds chess as
+        // well as tic-tac-toe (see `chat_games.State`). One of these exists per
+        // GAME MESSAGE in the open thread, not per message, so the bulk cost is
+        // small and bounded by how many games a pair has played.
+        assert(@sizeOf(GameCard) == 86);
     }
 };
 
@@ -372,7 +376,7 @@ pub fn buildThread(
     // `chat_games.currentGame`'s loop: authorship is checked against the seat whose
     // turn it is, and a move arriving on a FINISHED board opens a rematch rather
     // than being discarded as illegal.
-    var g_state = chat_games.init();
+    var g_state = chat_games.init(.tictactoe);
     var g_x_is_mine = true;
     var g_started = false;
     const last_game_msg: ?u32 = blk: {
@@ -391,10 +395,15 @@ pub fn buildThread(
         var game: u32 = no_game;
         if (chat.isGameKind(kind)) {
             const mine_move = chat.isMine(store, msg);
-            if (!g_started or g_state.outcome != .ongoing) {
-                // The first move of the thread, or the first after a result: a new
-                // board, and whoever moved opens it as X.
-                g_state = chat_games.init();
+            const mv = chat_games.Move{
+                .game = @enumFromInt(chat.gameOf(store, mi)),
+                .cell = chat.gameMoveOf(store, mi),
+            };
+            if (!g_started or g_state.outcome != .ongoing or mv.game != g_state.game) {
+                // The first move of the thread, the first after a result, or the
+                // first of a DIFFERENT game: a new board, and whoever moved opens
+                // it as X.
+                g_state = chat_games.init(mv.game);
                 g_x_is_mine = mine_move;
                 g_started = true;
             }
@@ -402,7 +411,6 @@ pub fn buildThread(
             // A move out of turn is skipped, exactly as `replaySent` skips it — the
             // board simply does not advance, so a cheating peer cannot move for us.
             if (sender == g_state.turn) {
-                const mv = chat_games.Move.decode(chat.gameMoveOf(store, mi));
                 if (chat_games.apply(g_state, mv)) |ns| g_state = ns;
             }
             games[next_game] = .{
@@ -685,7 +693,7 @@ test "buildThread: a game move carries a board, derived not stored" {
     var t: i64 = 100;
     for (moves) |m| {
         const mi = try chat.appendMessage(gpa, &store, c, .game_move, "", t, m.mine);
-        chat.setGameMove(&store, @intFromEnum(mi), (chat_games.Move{ .cell = m.cell }).encode());
+        chat.setGameMove(&store, @intFromEnum(mi), @intFromEnum(chat_games.Game.tictactoe), m.cell);
         t += 1;
     }
     _ = try chat.appendMessage(gpa, &store, c, .text, "your go", t, true);
@@ -697,8 +705,8 @@ test "buildThread: a game move carries a board, derived not stored" {
     // The board advances move by move, and only the LAST card is live.
     try std.testing.expectEqual(@as(u8, 1), th.games[0].state.moves);
     try std.testing.expectEqual(@as(u8, 3), th.games[2].state.moves);
-    try std.testing.expectEqual(chat_games.Seat.x, th.games[2].state.board[0]);
-    try std.testing.expectEqual(chat_games.Seat.o, th.games[2].state.board[4]);
+    try std.testing.expectEqual(chat_games.Seat.x, chat_games.seatAt(th.games[2].state, 0));
+    try std.testing.expectEqual(chat_games.Seat.o, chat_games.seatAt(th.games[2].state, 4));
     try std.testing.expectEqual(chat_games.Seat.x, th.games[2].my_seat); // we opened
     try std.testing.expect(!th.games[0].live);
     try std.testing.expect(th.games[2].live);
@@ -721,14 +729,14 @@ test "buildThread: a peer moving out of turn does not advance the board" {
 
     // They open (so they are X), then immediately try to play our O.
     const m0 = try chat.appendMessage(gpa, &store, c, .game_move, "", 100, false);
-    chat.setGameMove(&store, @intFromEnum(m0), (chat_games.Move{ .cell = 0 }).encode());
+    chat.setGameMove(&store, @intFromEnum(m0), @intFromEnum(chat_games.Game.tictactoe), 0);
     const m1 = try chat.appendMessage(gpa, &store, c, .game_move, "", 101, false);
-    chat.setGameMove(&store, @intFromEnum(m1), (chat_games.Move{ .cell = 1 }).encode());
+    chat.setGameMove(&store, @intFromEnum(m1), @intFromEnum(chat_games.Game.tictactoe), 1);
 
     const th = try buildThread(arena, &store, c, 200);
     // The second move is skipped: one mark on the board, still our turn.
     try std.testing.expectEqual(@as(u8, 1), th.games[1].state.moves);
-    try std.testing.expectEqual(chat_games.Seat.none, th.games[1].state.board[1]);
+    try std.testing.expectEqual(chat_games.Seat.none, chat_games.seatAt(th.games[1].state, 1));
     try std.testing.expectEqual(chat_games.Seat.o, th.games[1].state.turn);
     try std.testing.expectEqual(chat_games.Seat.o, th.games[1].my_seat);
 }
@@ -744,7 +752,8 @@ test "buildThread: an invite opens an empty, live board and seats us as X" {
 
     // WE send the invite (cell 15) — an out-of-range move apply() skips.
     const mi = try chat.appendMessage(gpa, &store, c, .game_move, "", 100, true);
-    chat.setGameMove(&store, @intFromEnum(mi), chat_games.inviteMove().encode());
+    const inv = chat_games.inviteMove(.tictactoe);
+    chat.setGameMove(&store, @intFromEnum(mi), @intFromEnum(inv.game), inv.cell);
 
     const th = try buildThread(arena, &store, c, 200);
     try std.testing.expectEqual(@as(usize, 1), th.games.len);

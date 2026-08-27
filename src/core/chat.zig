@@ -464,9 +464,22 @@ pub const ChatMsg = struct {
     /// -triggered ones are re-derived from the text on both ends, so storing them
     /// would be storing a duplicate of something already known.
     effect: u8 = 0,
-    /// For a `.game_move`, the encoded `chat_games.Move` byte. Meaningless (and
-    /// zero) for every other kind — the KIND is what says whether to read it.
+    /// For a `.game_move`, WHICH GAME (`chat_games.Game`). Meaningless (and zero)
+    /// for every other kind — the KIND is what says whether to read it.
     game: u8 = 0,
+    /// …and the move itself.
+    ///
+    /// It used to share the byte above: high nibble the game, low nibble the
+    /// cell. That is a tidy encoding for a 3×3 board and a wall for everything
+    /// else — sixteen games and SIXTEEN CELLS. Chess and checkers name a square
+    /// out of 64 twice over, a dartboard has twenty sectors in five rings, and
+    /// reversi has 64. None of them fit in four bits.
+    ///
+    /// Widened before the game list grew rather than after: an encoding becomes
+    /// load-bearing the moment something is stored in it, and this project has
+    /// already paid once for finding that out late (two wire kinds sharing a
+    /// byte, which silently ate every message sent with an effect).
+    move: u16 = 0,
     /// The BUBBLE effect this message arrived with (a `chat_effects.BubbleEffect`
     /// ordinal; 0 = none). TRANSIENT: set from the wire on arrival, played once by
     /// the spawn animation, and deliberately NOT serialized — a bubble effect is a
@@ -486,6 +499,16 @@ pub const ChatMsg = struct {
         // land in that existing tail padding, so the budget is unchanged at 32 and
         // the SoA cost is one byte per message each. Had any not fit, it would have
         // been a real decision rather than a free one.
+        //
+        // A7.1 — budget raised 32 → 40 for `move` (u16), which did NOT fit that
+        // padding. Paid deliberately: the old four-bit cell could address sixteen
+        // `move` (u16) then joined them for free as well — it landed in the same
+        // tail padding, so the budget is UNCHANGED at 32 and the SoA cost is two
+        // bytes per message. It had to be widened regardless of the padding: the
+        // old encoding put the game and the cell in one byte, four bits each, and
+        // a four-bit cell can address a 3×3 board and nothing else. Chess and
+        // checkers name a square out of 64 twice over and a dartboard has twenty
+        // sectors in five rings.
         assert(@sizeOf(ChatMsg) == 32);
     }
 };
@@ -1419,15 +1442,23 @@ pub fn bubbleFxOf(store: *const Store, msg: u32) u8 {
     return store.msgs.items(.bubble)[msg];
 }
 
-/// Record the encoded move byte on a `.game_move` message.
-pub fn setGameMove(store: *Store, msg: u32, encoded: u8) void {
+/// Record a move on a `.game_move` message: which game, and what was played.
+pub fn setGameMove(store: *Store, msg: u32, game: u8, move: u16) void {
     if (msg >= store.msgs.len) return;
-    store.msgs.items(.game)[msg] = encoded;
+    store.msgs.items(.game)[msg] = game;
+    store.msgs.items(.move)[msg] = move;
 }
 
-pub fn gameMoveOf(store: *const Store, msg: u32) u8 {
+/// Which game this move belongs to.
+pub fn gameOf(store: *const Store, msg: u32) u8 {
     if (msg >= store.msgs.len) return 0;
     return store.msgs.items(.game)[msg];
+}
+
+/// What was played.
+pub fn gameMoveOf(store: *const Store, msg: u32) u16 {
+    if (msg >= store.msgs.len) return 0;
+    return store.msgs.items(.move)[msg];
 }
 
 /// They have read everything of ours up to `at`. The watermark only ever moves
@@ -2191,7 +2222,7 @@ const codec_magic = [4]u8{ 'Z', 'A', 'T', 'H' };
 /// sections so every v2 blob still reads (a version gate is a compatibility
 /// contract and is written as a RANGE — the day we wrote it as a LIST, a v3 bump
 /// orphaned every conversation on the owner's phone).
-const codec_version: u16 = 12; // v12: pictures — the blob arena + one sparse attachment row per picture
+const codec_version: u16 = 13; // v13: the widened game move — its own u16 column
 const conv_rec_len = 28; // did span 8 + handle span 8 + i64 8 + u32 4
 const member_rec_len = 17; // did span 8 + handle span 8 + left u8 1
 /// The v11 per-conversation block: kind 1 + title span 8 + member span (4 + 2) +
@@ -2233,7 +2264,8 @@ pub fn serializeStore(gpa: Allocator, store: *const Store) error{OutOfMemory}![]
         m_count + // v10: game move, one u8 per message
         // v11: GROUPS.
         v11TailLen(store) + // v11: the member table, the conversation blocks, the sender column
-        v12TailLen(store); // v12: the picture arena + one row per picture
+        v12TailLen(store) + // v12: the picture arena + one row per picture
+        v13TailLen(store); // v13: the widened game move
     const out = try gpa.alloc(u8, total);
     errdefer gpa.free(out);
 
@@ -2441,6 +2473,12 @@ pub fn serializeStore(gpa: Allocator, store: *const Store) error{OutOfMemory}![]
         at += 1;
     }
 
+    // v13: the widened game move.
+    for (0..m_count) |i| {
+        std.mem.writeInt(u16, out[at..][0..2], msgs.items(.move)[i], .little);
+        at += 2;
+    }
+
     assert(at == total);
     return out;
 }
@@ -2460,6 +2498,10 @@ fn v11TailLen(store: *const Store) usize {
 fn v12TailLen(store: *const Store) usize {
     return 4 + store.blobs.items.len +
         4 + store.attachments.len * attach_rec_len;
+}
+
+fn v13TailLen(store: *const Store) usize {
+    return 2 * store.msgs.len; // the game move, one u16 per message
 }
 
 /// The byte length of the v3..v11 per-record tail — everything appended AFTER the
@@ -2483,7 +2525,8 @@ fn versionTailLen(store: *const Store) usize {
         m + // v9 effect
         m + // v10 game move
         v11TailLen(store) + // v11 groups: members, conversation blocks, senders
-        v12TailLen(store); // v12 pictures: the arena + one row each
+        v12TailLen(store) + // v12 pictures: the arena + one row each
+        v13TailLen(store); // v13 the widened game move
 }
 
 /// True when `span` names a real NUL-terminated string inside `bytes` (the
@@ -2954,6 +2997,30 @@ pub fn deserializeStore(gpa: Allocator, bytes: []const u8) DeserializeError!Stor
         }
     }
 
+    // v13: the widened game move.
+    if (version >= 13) {
+        if (bytes.len - at < 2 * m_count) return error.Malformed;
+        const ms4 = store.msgs.slice();
+        for (0..m_count) |i| {
+            ms4.items(.move)[i] = std.mem.readInt(u16, bytes[at..][0..2], .little);
+            at += 2;
+        }
+    } else {
+        // THE MIGRATION. Before this the game and the move SHARED one byte —
+        // high nibble the game, low nibble the cell — so an old tic-tac-toe
+        // thread carries both halves in `game`. Split them, or the board replays
+        // as garbage: every move would name game 0 and a cell that is really the
+        // game id. The thread IS the game here, so a bad split is not a cosmetic
+        // loss, it is the record of what was played.
+        const ms4 = store.msgs.slice();
+        for (0..m_count) |i| {
+            if (ms4.items(.kind)[i] != .game_move) continue;
+            const packed_byte = ms4.items(.game)[i];
+            ms4.items(.game)[i] = packed_byte >> 4;
+            ms4.items(.move)[i] = packed_byte & 0x0F;
+        }
+    }
+
     if (at != bytes.len) return error.Malformed; // exact tail — no trailing bytes
     return store;
 }
@@ -3155,10 +3222,10 @@ test "store codec v10: the game moves survive a relaunch — they ARE the board"
     const a = try openConversation(gpa, &store, "did:plc:aaa", "amy.zat4.com");
     // Two moves and an ordinary message between them, as a real thread would be.
     const m0 = try appendMessage(gpa, &store, a, .game_move, "", 100, true);
-    setGameMove(&store, @intFromEnum(m0), 0x00); // cell 0
+    setGameMove(&store, @intFromEnum(m0), 5, 1234); // chess, a packed from/to
     _ = try appendMessage(gpa, &store, a, .text, "your go", 101, true);
     const m1 = try appendMessage(gpa, &store, a, .game_move, "", 102, false);
-    setGameMove(&store, @intFromEnum(m1), 0x04); // cell 4
+    setGameMove(&store, @intFromEnum(m1), 5, 4321);
 
     const blob = try serializeStore(gpa, &store);
     defer gpa.free(blob);
@@ -3167,11 +3234,14 @@ test "store codec v10: the game moves survive a relaunch — they ARE the board"
 
     // The game has no stored state of its own — losing this column would not
     // lose a detail of the game, it would lose the game.
-    try std.testing.expectEqual(@as(u8, 0x00), gameMoveOf(&restored, @intFromEnum(m0)));
-    try std.testing.expectEqual(@as(u8, 0x04), gameMoveOf(&restored, @intFromEnum(m1)));
+    try std.testing.expectEqual(@as(u16, 1234), gameMoveOf(&restored, @intFromEnum(m0)));
+    try std.testing.expectEqual(@as(u16, 4321), gameMoveOf(&restored, @intFromEnum(m1)));
+    // …and WHICH game, which used to share the same byte and could not have held
+    // a move this wide alongside it.
+    try std.testing.expectEqual(@as(u8, 5), gameOf(&restored, @intFromEnum(m0)));
     try std.testing.expectEqual(Kind.game_move, restored.msgs.items(.kind)[@intFromEnum(m1)]);
-    // A non-game message carries a zero move byte, and its kind says to ignore it.
-    try std.testing.expectEqual(@as(u8, 0), gameMoveOf(&restored, 1));
+    // A non-game message carries a zero move, and its kind says to ignore it.
+    try std.testing.expectEqual(@as(u16, 0), gameMoveOf(&restored, 1));
     try std.testing.expect(!isGameKind(restored.msgs.items(.kind)[1]));
 }
 
@@ -3826,8 +3896,9 @@ test "store codec v11: groups round-trip, and pre-group history is MIGRATED" {
 
     const legacy_blob = try serializeStore(gpa, &legacy_src);
     defer gpa.free(legacy_blob);
-    // The v11 tail is: member table + per-conversation block + sender column.
-    const v11_tail = v11TailLen(&legacy_src) + v12TailLen(&legacy_src);
+    // The v11 tail is: member table + per-conversation block + sender column;
+    // v12 and v13 append after it, so a v10 blob is everything before all three.
+    const v11_tail = v11TailLen(&legacy_src) + v12TailLen(&legacy_src) + v13TailLen(&legacy_src);
     std.mem.writeInt(u16, legacy_blob[4..6], 10, .little);
     var legacy = try deserializeStore(gpa, legacy_blob[0 .. legacy_blob.len - v11_tail]);
     defer deinitStore(gpa, &legacy);
@@ -3845,7 +3916,7 @@ test "store codec v11: groups round-trip, and pre-group history is MIGRATED" {
     var forged = try gpa.dupe(u8, blob);
     defer gpa.free(forged);
     std.mem.writeInt(u16, forged[4..6], 10, .little);
-    const forged_tail = v11TailLen(&back) + v12TailLen(&back);
+    const forged_tail = v11TailLen(&back) + v12TailLen(&back) + v13TailLen(&back);
     try std.testing.expectError(
         error.Malformed,
         deserializeStore(gpa, forged[0 .. forged.len - forged_tail]),
@@ -4048,24 +4119,26 @@ test "pictures: the cap is enforced, and a corrupt row is refused rather than re
     const good = try serializeStore(gpa, &store);
     defer gpa.free(good);
 
-    // The row's `len` is the last u32 before w/h/mime at the very end of the blob.
+    // The attachment row is the last thing in the v12 section; v13's move column
+    // follows it, so every offset here is measured from the end of v12.
+    const v12_end = good.len - v13TailLen(&store);
     var bad = try gpa.dupe(u8, good);
     defer gpa.free(bad);
-    const len_at = bad.len - (2 + 2 + 1) - 4;
+    const len_at = v12_end - (2 + 2 + 1) - 4;
     std.mem.writeInt(u32, bad[len_at..][0..4], 4096, .little); // claims far more than the arena holds
     try std.testing.expectError(error.Malformed, deserializeStore(gpa, bad));
 
     // …and one naming a message that is not there.
     var bad2 = try gpa.dupe(u8, good);
     defer gpa.free(bad2);
-    const msg_at = bad2.len - (2 + 2 + 1) - 4 - 4 - 4;
+    const msg_at = v12_end - (2 + 2 + 1) - 4 - 4 - 4;
     std.mem.writeInt(u32, bad2[msg_at..][0..4], 4242, .little);
     try std.testing.expectError(error.Malformed, deserializeStore(gpa, bad2));
 
     // …and a mime byte from a version we do not speak.
     var bad3 = try gpa.dupe(u8, good);
     defer gpa.free(bad3);
-    bad3[bad3.len - 1] = 200;
+    bad3[v12_end - 1] = 200;
     try std.testing.expectError(error.Malformed, deserializeStore(gpa, bad3));
 }
 

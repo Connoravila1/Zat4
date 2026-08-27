@@ -137,6 +137,7 @@ pub fn main(init: std.process.Init) !void {
 
     const io = init.io;
     try writePpm(io, gpa, &fb, "/tmp/zat_preview.ppm");
+    try previewGames(io, gpa, &engine);
 
     // PHONE proof (the locked mobile shape): the same real feed at the phone
     // design width — narrow single column, no rail/sidebar, the bottom tab
@@ -1081,6 +1082,63 @@ fn tv(handle: []const u8, name: []const u8, body: []const u8, tint: u32, initial
         .stitched = stitched,
         .has_kids = has_kids,
     };
+}
+
+/// EVERY GAME BOARD, side by side, mid-game — the proof that the boards actually
+/// draw. Each tile is the same renderer the overlay uses, with a few moves played
+/// into it so nothing is showing an empty grid.
+const chat_games = @import("core/chat_games.zig");
+const game_board = @import("core/game_board.zig");
+const game_catalog = chat_games.catalog;
+
+fn previewGames(io: std.Io, gpa: std.mem.Allocator, engine: *text.Engine) !void {
+    const cols: usize = 4;
+    const tile: i32 = 420;
+    const rows = (game_catalog.len + cols - 1) / cols;
+    var fb = raster.Framebuffer{};
+    defer raster.deinit(gpa, &fb);
+    const bg: u32 = 0xFF0B0B0D;
+    try raster.resize(gpa, &fb, @intCast(cols * @as(usize, @intCast(tile))), @intCast(rows * @as(usize, @intCast(tile))), bg);
+    var dl: raster.DrawList = .empty;
+    defer dl.deinit(gpa);
+    for (game_catalog, 0..) |g, i| {
+        var st = chat_games.init(g);
+        const seeds: []const u16 = switch (g) {
+            .tictactoe => &.{ 4, 0, 8, 2 },
+            .connect4 => &.{ 3, 3, 4, 2, 5, 4 },
+            .mancala => &.{ 2, 8, 1, 10 },
+            .dots => &.{ 0, 20, 4, 21, 1, 24 },
+            .checkers => &.{ 0x924, 0x6D2, 0x765 },
+            .chess => &.{ 0x924, 0x71C, 0x8AD },
+            .archery => &.{ 32642, 28320, 35962, 30000 },
+            else => &.{},
+        };
+        for (seeds) |m| {
+            if (chat_games.apply(st, .{ .game = g, .cell = m })) |ns| st = ns;
+        }
+        if (g == .darts) {
+            for ([_]f32{ 0.11, 0.37 }) |t| {
+                if (chat_games.apply(st, .{ .game = g, .cell = game_board.releaseMove(g, t) })) |ns| st = ns;
+            }
+        }
+        const ox = @as(i32, @intCast(i % cols)) * tile + 32;
+        const oy = @as(i32, @intCast(i / cols)) * tile + 32;
+        var targets: [128]game_board.Target = undefined;
+        _ = try game_board.full(gpa, &dl, engine, st, .{
+            .x = ox,
+            .y = oy,
+            .size = tile - 64,
+            .my_seat = .x,
+            .accent = feed_view.accent_house,
+            .interactive = true,
+            .from = if (g == .chess) 62 else if (g == .checkers) 40 else game_board.no_stage,
+            .t = 0.18,
+        }, &targets);
+        _ = try feed_view.str(gpa, &dl, engine, .semibold, ox, oy + tile - 46, 0xFFEDEAE0, 17, chat_games.name(g));
+    }
+    try raster.paint(gpa, engine, dl.slice(), &fb, bg);
+    try writePpm(io, gpa, &fb, "/tmp/zat_games.ppm");
+    std.debug.print("wrote /tmp/zat_games.ppm (every game board, mid-game)\n", .{});
 }
 
 fn writePpm(io: std.Io, gpa: std.mem.Allocator, fb: *const raster.Framebuffer, path: []const u8) !void {

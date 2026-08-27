@@ -17,185 +17,176 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 //! B1 classification: CORE (pure). IN-THREAD GAMES — the turn-based game logic
-//! behind "send a game" (ZAT_CHAT_STANDALONE_ROADMAP §3). The governing idea, and
-//! the reason this fits the chat model so cleanly: **a move is a message.** Each
-//! player's move is an ordinary E2EE chat message carrying a compact move byte;
-//! the game state is not stored anywhere — it is DERIVED by replaying the moves in
-//! the thread (`replay`), exactly as the timeline is derived from posts. So the
-//! thread IS the game, the same way it is the receipt for a payment.
+//! behind "send a game". The governing idea, and the reason this fits the chat
+//! model so cleanly: **a move is a message.** Each player's move is an ordinary
+//! E2EE chat message carrying a compact move; the game state is not stored
+//! anywhere — it is DERIVED by replaying the moves in the thread (`replaySent`),
+//! exactly as the timeline is derived from posts. So the thread IS the game, the
+//! same way it is the receipt for a payment.
 //!
-//! This module owns the RULES only — legality, whose turn, who won. The board
-//! rendering, the tap→move, and wrapping a move in a chat message are the shell's
-//! and the view's job. PURE (B2): same moves ⇒ same state, no clock/RNG/I/O, so
-//! the whole engine is golden-tested headless (tests at the foot).
+//! THIS module owns the shared vocabulary and the replay machinery. The RULES of
+//! each individual game live in `core/games/*.zig`, one file per game, and are
+//! reached only through the `apply` dispatch below. Board rendering, tap→move,
+//! and wrapping a move in a chat message are the shell's and the view's job.
+//! PURE (B2): same moves ⇒ same state, no clock/RNG/I/O, so every engine is
+//! golden-tested headless.
 //!
-//! First game: TIC-TAC-TOE — the smallest turn-based game, chosen to prove the
-//! move-as-message replay loop end to end. The shape here (a compact `Move`, an
-//! `apply` that validates, an `outcome` predicate, a `replay`) generalizes to
-//! connect-four and beyond; those are new rule sets, not new plumbing.
+//! **One state shape for every game.** A game is a byte board plus a little side
+//! data; making that concrete — `cells` + `aux` — is what lets one replay loop,
+//! one wire encoding, one persistence column and one renderer serve chess and
+//! darts alike. The alternative (a tagged union per game) would have pushed a
+//! switch into the store, the codec, the view and the shell: change amplification
+//! (D6) for no gain, since the largest board is 64 bytes either way.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const testing = std.testing;
 
-/// Which game a move belongs to — so a thread can host more than one over its
-/// life, and a stray/duplicate move for another game is ignored on replay.
-/// Serialized; append-only.
-pub const Game = enum(u8) {
-    tictactoe = 0,
-    _,
-};
+const board = @import("games/board.zig");
+const tictactoe = @import("games/tictactoe.zig");
+const connect4 = @import("games/connect4.zig");
+const mancala = @import("games/mancala.zig");
+const dots = @import("games/dots.zig");
+const checkers = @import("games/checkers.zig");
+const chess = @import("games/chess.zig");
+const archery = @import("games/archery.zig");
+const darts = @import("games/darts.zig");
 
-/// A cell's owner. `.none` is empty. In tic-tac-toe the two seats are X and O;
-/// by convention the game's INITIATOR (the one who sent the invite) is X and
-/// moves first.
-pub const Seat = enum(u8) {
-    none = 0,
-    x = 1,
-    o = 2,
+/// The shared board vocabulary, re-exported so the rest of the app has ONE
+/// import for games. `games/board.zig` is a leaf both this file and the rule
+/// modules depend on; see its header for why it is separate.
+pub const Game = board.Game;
+pub const Seat = board.Seat;
+pub const Outcome = board.Outcome;
+pub const Move = board.Move;
+pub const State = board.State;
+pub const invite_cell = board.invite_cell;
+pub const board_cells = board.board_cells;
+pub const aux_bytes = board.aux_bytes;
+pub const seatAt = board.seatAt;
 
-    /// The other seat (X↔O); `.none` maps to itself.
-    pub fn other(s: Seat) Seat {
-        return switch (s) {
-            .x => .o,
-            .o => .x,
-            .none => .none,
-        };
-    }
-};
+/// Every game we know how to play, in shelf order — the picker walks this, so a
+/// new game appears in the UI by being added here and nowhere else.
+pub const catalog = [_]Game{ .tictactoe, .connect4, .chess, .checkers, .mancala, .dots, .archery, .darts };
 
-/// The result of a game so far.
-pub const Outcome = enum(u8) { ongoing, x_wins, o_wins, draw };
-
-/// One move, as it travels ON THE WIRE inside a chat message: which game, and the
-/// target cell (0..8, row-major). The mover is NOT encoded — it is implied by the
-/// replay position (turns strictly alternate from X), so there is no "I am X"
-/// claim in the payload to forge in the first place. Encodes to one byte.
-///
-/// NOTE: not encoding the mover is what makes a lie unrepresentable, but it is
-/// NOT by itself what stops a player moving twice — `apply` cannot see who sent
-/// anything. `replaySent` is where authorship is checked; use it for any move a
-/// peer can influence.
-pub const Move = struct {
-    game: Game = .tictactoe,
-    cell: u8, // 0..8, row-major (row*3 + col)
-
-    /// The single wire byte: high nibble = game, low nibble = cell. (Cell 0..8
-    /// fits a nibble; games fit the other. A tidy, forward-checkable encoding.)
-    pub fn encode(m: Move) u8 {
-        return (@as(u8, @intFromEnum(m.game)) << 4) | (m.cell & 0x0F);
-    }
-
-    /// Decode a wire byte back to a Move. Pure and total — an out-of-range cell
-    /// is returned as-is and rejected later by `apply` (E4: legality is one
-    /// checkpoint, not scattered).
-    pub fn decode(b: u8) Move {
-        return .{ .game = @enumFromInt(b >> 4), .cell = b & 0x0F };
-    }
-
-    comptime {
-        // Two u8 (game tag + cell), no padding — a move is a byte pair, and it
-        // rides a message slice in bulk on replay, so it carries the guard (A7).
-        assert(@sizeOf(Move) == 2);
-    }
-};
-
-/// The derived game state — never stored, always a `replay` of the moves. Cold
-/// (one per open game board, a handful at most), but plain data, so it carries a
-/// guard anyway: the layout is a wire-adjacent fact worth pinning.
-pub const State = struct {
-    board: [9]Seat, // row-major cells
-    turn: Seat, // whose move it is (X first)
-    outcome: Outcome,
-    moves: u8, // how many moves have been played (0..9)
-
-    comptime {
-        // 9 (board) + 1 (turn) + 1 (outcome) + 1 (moves) = 12, no padding.
-        assert(@sizeOf(State) == 12);
-    }
-};
-
-/// A fresh tic-tac-toe game: empty board, X to move.
-pub fn init() State {
-    return .{
-        .board = @splat(.none),
-        .turn = .x,
-        .outcome = .ongoing,
-        .moves = 0,
+/// The game's display name.
+pub fn name(g: Game) []const u8 {
+    return switch (g) {
+        .tictactoe => "Tic-Tac-Toe",
+        .connect4 => "Connect Four",
+        .mancala => "Mancala",
+        .dots => "Dots & Boxes",
+        .checkers => "Checkers",
+        .chess => "Chess",
+        .archery => "Archery",
+        .darts => "Darts",
+        _ => "Game",
     };
 }
 
-/// The eight winning lines (rows, columns, diagonals).
-const lines = [8][3]u8{
-    .{ 0, 1, 2 }, .{ 3, 4, 5 }, .{ 6, 7, 8 }, // rows
-    .{ 0, 3, 6 }, .{ 1, 4, 7 }, .{ 2, 5, 8 }, // columns
-    .{ 0, 4, 8 }, .{ 2, 4, 6 }, // diagonals
-};
-
-/// Compute the outcome of a board. Pure. A board can only ever have one winner
-/// (a legally-reached board never has two completed lines of different seats),
-/// so the first completed line decides it.
-fn judge(board: [9]Seat, moves: u8) Outcome {
-    for (lines) |ln| {
-        const a = board[ln[0]];
-        if (a != .none and a == board[ln[1]] and a == board[ln[2]]) {
-            return if (a == .x) .x_wins else .o_wins;
-        }
-    }
-    return if (moves >= 9) .draw else .ongoing;
+/// A one-line "what is this" for the picker shelf.
+pub fn blurb(g: Game) []const u8 {
+    return switch (g) {
+        .tictactoe => "Three in a row",
+        .connect4 => "Drop four in a line",
+        .mancala => "Sow and capture",
+        .dots => "Close the most boxes",
+        .checkers => "Jump and crown",
+        .chess => "The full game",
+        .archery => "Five arrows each",
+        .darts => "501, double to finish",
+        _ => "",
+    };
 }
 
-/// Is `m` a legal next move in `s`? Pure predicate: the game must be ongoing, the
-/// cell in range, and the cell empty. Whose move it is comes from `s.turn`, not
-/// from the move — this layer knows the RULES, not the players. Whether the right
-/// person sent it is a separate question, answered by `replaySent`.
-pub fn legal(s: State, m: Move) bool {
-    return m.game == .tictactoe and
-        s.outcome == .ongoing and
-        m.cell < 9 and
-        s.board[m.cell] == .none;
+/// Is this game played by pointing at a moving reticle (a skill shot) rather than
+/// by choosing a square? The overlay needs to know: skill games animate, and
+/// their "move" is a landing point rather than a board index.
+pub fn isSkillShot(g: Game) bool {
+    return g == .archery or g == .darts;
+}
+
+/// Does a move in this game need TWO taps — pick a piece, then pick where it
+/// goes? (Chess and checkers; everything else is a single cell.)
+pub fn isFromTo(g: Game) bool {
+    return g == .chess or g == .checkers;
+}
+
+/// A fresh game of `g`: the opening position, X to move.
+pub fn init(g: Game) State {
+    var s = board.blank(g);
+    switch (g) {
+        .tictactoe => tictactoe.setup(&s),
+        .connect4 => connect4.setup(&s),
+        .mancala => mancala.setup(&s),
+        .dots => dots.setup(&s),
+        .checkers => checkers.setup(&s),
+        .chess => chess.setup(&s),
+        .archery => archery.setup(&s),
+        .darts => darts.setup(&s),
+        _ => {},
+    }
+    return s;
 }
 
 /// Apply a move, returning the new state, or `null` if the move is illegal (E4:
 /// an illegal move is an ordinary "no", not an error path — a replay simply skips
 /// a move that does not fit, which is how a duplicate/forged/out-of-order message
-/// is neutralised). The mover is `s.turn`; turns alternate from X.
+/// is neutralised). The mover is `s.turn`.
+///
+/// The three refusals here are the ones EVERY game shares, checked once so no
+/// rule module can forget one: a move for a different game, a move on a finished
+/// board, and the reserved invite cell.
 pub fn apply(s: State, m: Move) ?State {
-    if (!legal(s, m)) return null;
-    var ns = s;
-    ns.board[m.cell] = s.turn;
-    ns.moves = s.moves + 1;
-    ns.outcome = judge(ns.board, ns.moves);
-    // The turn only advances while the game continues (a finished game has no
-    // "next to move"; leaving turn on the winner would be a lie the UI reads).
-    ns.turn = if (ns.outcome == .ongoing) s.turn.other() else .none;
+    if (m.game != s.game) return null;
+    if (s.outcome != .ongoing) return null;
+    if (m.cell == invite_cell) return null;
+    var ns = switch (s.game) {
+        .tictactoe => tictactoe.apply(s, m.cell),
+        .connect4 => connect4.apply(s, m.cell),
+        .mancala => mancala.apply(s, m.cell),
+        .dots => dots.apply(s, m.cell),
+        .checkers => checkers.apply(s, m.cell),
+        .chess => chess.apply(s, m.cell),
+        .archery => archery.apply(s, m.cell),
+        .darts => darts.apply(s, m.cell),
+        _ => null,
+    } orelse return null;
+    ns.moves +|= 1;
+    // A finished game has no "next to move"; leaving `turn` on the winner would
+    // be a lie the UI reads. Enforced here so no rule module can forget it.
+    if (ns.outcome != .ongoing) ns.turn = .none;
     return ns;
+}
+
+/// Is `m` a legal next move in `s`? The one legality checkpoint, expressed in
+/// terms of `apply` so there is no second copy of the rules to drift (E4).
+pub fn legal(s: State, m: Move) bool {
+    return apply(s, m) != null;
 }
 
 /// Derive the current state by replaying a sequence of moves (oldest first),
 /// TRUSTING that they are in turn order. Illegal moves are SKIPPED, not fatal, so
-/// this is robust to duplicates and to a move that no longer fits the board. Pure:
-/// same moves ⇒ same state, which is why the game needs no stored state.
+/// this is robust to duplicates and to a move that no longer fits the board.
 ///
-/// This is the RULES-ONLY form. It cannot tell one player's move from the other's,
-/// so a sequence where the same person moved twice replays as if they alternated.
-/// For anything a peer can influence, use `replaySent`.
+/// This is the RULES-ONLY form. It cannot tell one player's move from the
+/// other's, so a sequence where the same person moved twice replays as if they
+/// alternated. For anything a peer can influence, use `replaySent`.
 pub fn replay(moves: []const Move) State {
-    var s = init();
+    var s = init(if (moves.len > 0) moves[0].game else .tictactoe);
     for (moves) |m| {
         if (apply(s, m)) |ns| s = ns;
     }
     return s;
 }
 
-/// The INVITE move: opens a game with an empty board. Its cell (15) is out of
-/// range, so `apply` skips it and the board stays empty — but it is still the
-/// FIRST move of the game, so it seats the sender as X (`currentGame`/`replaySent`
-/// take X from the first move's sender). One tap on "Games" sends this; the board
-/// then appears for both, the inviter to move first.
-pub const invite_cell: u8 = 15;
-pub fn inviteMove() Move {
-    return .{ .game = .tictactoe, .cell = invite_cell };
+/// The INVITE move: opens a game of `g` with a fresh board. Its cell is the
+/// reserved `invite_cell`, so `apply` skips it and the board stays at the opening
+/// position — but it is still the FIRST move of the game, so it seats the sender
+/// as X and it names WHICH game the thread is now playing. One tap in the picker
+/// sends this; the board then appears for both, the inviter to move first.
+pub fn inviteMove(g: Game) Move {
+    return .{ .game = g, .cell = invite_cell };
 }
 
 /// A move as it actually ARRIVES in a thread: the move, plus who sent it.
@@ -208,8 +199,9 @@ pub const SentMove = struct {
     mine: bool,
 
     comptime {
-        // 2 (Move) + 1 (bool), all byte-aligned — no padding.
-        assert(@sizeOf(SentMove) == 3);
+        // 4 (Move) + 1 (bool) + 3 padding to the Move's u16 alignment. A7.1:
+        // was 3 when a Move was two bytes.
+        assert(@sizeOf(SentMove) == 6);
     }
 };
 
@@ -231,7 +223,7 @@ pub const SentMove = struct {
 /// cheating or confused peer degrades to "that move didn't happen" rather than
 /// corrupting the board.
 pub fn replaySent(moves: []const SentMove) State {
-    var s = init();
+    var s = init(if (moves.len > 0) moves[0].move.game else .tictactoe);
     if (moves.len == 0) return s;
     // X is whoever moved first; every later move is X's if it came from the same
     // side, O's otherwise.
@@ -253,26 +245,133 @@ pub fn replaySent(moves: []const SentMove) State {
 /// move after the first game ended and the pair could never play again — the
 /// board would be permanently frozen on the last result.
 ///
+/// A move naming a DIFFERENT game also opens a new one, for the same reason: you
+/// finish a chess game and send darts, and the thread carries both.
+///
 /// Segmenting here, in a pure function over the same move list, means a rematch
 /// needs no "new game" message kind and no stored state: the boundary is derived
 /// from the moves exactly as the board is.
 pub fn currentGame(moves: []const SentMove) []const SentMove {
     var start: usize = 0;
-    var s = init();
+    var s = init(if (moves.len > 0) moves[0].move.game else .tictactoe);
     var x_is_mine = if (moves.len > 0) moves[0].mine else true;
     for (moves, 0..) |sm, i| {
-        if (s.outcome != .ongoing) {
-            // The previous game is over; this move opens the next one, and
-            // whoever sent it is that game's X.
-            start = i;
-            s = init();
-            x_is_mine = sm.mine;
+        if (s.outcome != .ongoing or sm.move.game != s.game) {
+            // The previous game is over (or this move is for another game
+            // entirely); this move opens the next one, and whoever sent it is
+            // that game's X.
+            if (i != start or sm.move.game != s.game) {
+                start = i;
+                s = init(sm.move.game);
+                x_is_mine = sm.mine;
+            }
         }
         const sender: Seat = if (sm.mine == x_is_mine) .x else .o;
         if (sender != s.turn) continue;
         if (apply(s, sm.move)) |ns| s = ns;
     }
     return moves[start..];
+}
+
+/// One finished (or running) game pulled out of a thread — what the scoreboard
+/// and the "games played" history are built from.
+pub const Chapter = struct {
+    /// Index range into the thread's move list: `moves[first..first+count]`.
+    first: u16,
+    count: u16,
+    game: Game,
+    /// Which seat WE held in it.
+    my_seat: Seat,
+    outcome: Outcome,
+
+    comptime {
+        // 2 + 2 + 1 + 1 + 1 = 7, padded to the u16 alignment.
+        assert(@sizeOf(Chapter) == 8);
+    }
+};
+
+/// The running SCORE between the two players in this thread — wins, losses and
+/// draws, counting only FINISHED games. Derived, like everything else here: no
+/// scoreboard is stored or transmitted, so there is nothing to disagree about
+/// and nothing to forge. Both ends compute the same number from the same thread.
+pub const Tally = struct {
+    mine: u16 = 0,
+    theirs: u16 = 0,
+    draws: u16 = 0,
+    /// Finished games in this thread (mine + theirs + draws).
+    played: u16 = 0,
+
+    comptime {
+        assert(@sizeOf(Tally) == 8);
+    }
+};
+
+/// Split a thread's moves into chapters — one per game played — writing them into
+/// `out` and returning the prefix used. Pure; `out` is the caller's buffer, so
+/// this allocates nothing (C1: nothing to allocate means no allocator to pass).
+/// Chapters beyond `out.len` are dropped oldest-last, which only ever costs
+/// history depth in a very long thread.
+pub fn chapters(moves: []const SentMove, out: []Chapter) []Chapter {
+    if (moves.len == 0 or out.len == 0) return out[0..0];
+    var n: usize = 0;
+    var start: usize = 0;
+    var s = init(moves[0].move.game);
+    var x_is_mine = moves[0].mine;
+    for (moves, 0..) |sm, i| {
+        if ((s.outcome != .ongoing or sm.move.game != s.game) and !(i == start and sm.move.game == s.game)) {
+            if (n < out.len) {
+                out[n] = .{
+                    .first = @intCast(@min(start, 0xFFFF)),
+                    .count = @intCast(@min(i - start, 0xFFFF)),
+                    .game = s.game,
+                    .my_seat = if (x_is_mine) .x else .o,
+                    .outcome = s.outcome,
+                };
+                n += 1;
+            }
+            start = i;
+            s = init(sm.move.game);
+            x_is_mine = sm.mine;
+        }
+        const sender: Seat = if (sm.mine == x_is_mine) .x else .o;
+        if (sender != s.turn) continue;
+        if (apply(s, sm.move)) |ns| s = ns;
+    }
+    if (n < out.len) {
+        out[n] = .{
+            .first = @intCast(@min(start, 0xFFFF)),
+            .count = @intCast(@min(moves.len - start, 0xFFFF)),
+            .game = s.game,
+            .my_seat = if (x_is_mine) .x else .o,
+            .outcome = s.outcome,
+        };
+        n += 1;
+    }
+    return out[0..n];
+}
+
+/// The head-to-head record across every finished game in the thread.
+pub fn tally(moves: []const SentMove) Tally {
+    var buf: [64]Chapter = undefined;
+    var t = Tally{};
+    for (chapters(moves, &buf)) |c| {
+        switch (c.outcome) {
+            .ongoing => continue,
+            .draw => t.draws += 1,
+            .x_wins => if (c.my_seat == .x) {
+                t.mine += 1;
+            } else {
+                t.theirs += 1;
+            },
+            .o_wins => if (c.my_seat == .o) {
+                t.mine += 1;
+            } else {
+                t.theirs += 1;
+            },
+        }
+        t.played += 1;
+    }
+    return t;
 }
 
 /// Which seat WE hold in this game, or `.none` before anyone has moved. The
@@ -300,107 +399,38 @@ pub fn winner(s: State) Seat {
     };
 }
 
+/// Decode a move from the FIRST wire encoding, where the game and the cell shared
+/// one byte (high nibble the game, low nibble the cell). Kept for the persisted
+/// history and for a peer still running the old build; nothing new writes it.
+pub fn fromLegacyByte(b: u8) Move {
+    return .{ .game = @enumFromInt(b >> 4), .cell = b & 0x0F };
+}
+
 // ---------------------------------------------------------------------------
 // Golden tests (C6). Pure value assertions — the rules pinned by numbers.
+// The per-game rule tests live beside each game in `games/*.zig`; these cover the
+// SHARED machinery: dispatch, replay, authorship, segmentation, scoring.
 // ---------------------------------------------------------------------------
 
 test "guards + a fresh game: empty board, X to move, ongoing" {
-    try testing.expectEqual(@as(usize, 12), @sizeOf(State));
-    const s = init();
+    try testing.expectEqual(@as(usize, 84), @sizeOf(State));
+    const s = init(.tictactoe);
     try testing.expectEqual(Seat.x, s.turn);
     try testing.expectEqual(Outcome.ongoing, s.outcome);
     try testing.expectEqual(@as(u8, 0), s.moves);
-    for (s.board) |c| try testing.expectEqual(Seat.none, c);
+    for (0..9) |i| try testing.expectEqual(Seat.none, seatAt(s, i));
 }
 
-test "turns alternate and an occupied / out-of-range / wrong-game cell is illegal" {
-    var s = init();
-    s = apply(s, .{ .cell = 4 }).?; // X centre
-    try testing.expectEqual(Seat.o, s.turn);
-    try testing.expectEqual(Seat.x, s.board[4]);
+test "dispatch refuses a move for the wrong game, a finished board, and the invite cell" {
+    const s = init(.tictactoe);
+    try testing.expect(!legal(s, .{ .game = .chess, .cell = 0 }));
+    try testing.expect(!legal(s, .{ .cell = invite_cell }));
+    try testing.expect(legal(s, .{ .cell = 4 }));
 
-    // O cannot take the centre (occupied), nor cell 9 (out of range), nor a move
-    // tagged for a different game.
-    try testing.expect(!legal(s, .{ .cell = 4 }));
-    try testing.expect(!legal(s, .{ .cell = 9 }));
-    try testing.expect(!legal(s, .{ .game = @enumFromInt(7), .cell = 0 }));
-    try testing.expectEqual(@as(?State, null), apply(s, .{ .cell = 4 }));
-
-    s = apply(s, .{ .cell = 0 }).?; // O corner
-    try testing.expectEqual(Seat.x, s.turn);
-    try testing.expectEqual(Seat.o, s.board[0]);
-}
-
-test "a row, a column, and a diagonal each win for the right seat" {
-    // X wins the top ROW: X0 O3 X1 O4 X2
-    {
-        const s = replay(&.{ .{ .cell = 0 }, .{ .cell = 3 }, .{ .cell = 1 }, .{ .cell = 4 }, .{ .cell = 2 } });
-        try testing.expectEqual(Outcome.x_wins, s.outcome);
-        try testing.expectEqual(Seat.x, winner(s));
-        try testing.expectEqual(Seat.none, s.turn); // finished: nobody to move
-    }
-    // O wins the left COLUMN: X1 O0 X2 O3 X5 O6
-    {
-        const s = replay(&.{ .{ .cell = 1 }, .{ .cell = 0 }, .{ .cell = 2 }, .{ .cell = 3 }, .{ .cell = 5 }, .{ .cell = 6 } });
-        try testing.expectEqual(Outcome.o_wins, s.outcome);
-        try testing.expectEqual(Seat.o, winner(s));
-    }
-    // X wins the main DIAGONAL: X0 O1 X4 O2 X8
-    {
-        const s = replay(&.{ .{ .cell = 0 }, .{ .cell = 1 }, .{ .cell = 4 }, .{ .cell = 2 }, .{ .cell = 8 } });
-        try testing.expectEqual(Outcome.x_wins, s.outcome);
-    }
-}
-
-test "a full board with no line is a draw" {
-    // X O X / X O O / O X X  →  cells: X0 O1 X2 X3 O4 O5 O6 X7 X8, interleaved legally.
-    // Sequence (X,O,X,O,...): X4 O0 X8 O5 X2 O6 X3 O1 X7  → fills the board, no 3-line.
-    const s = replay(&.{
-        .{ .cell = 4 }, .{ .cell = 0 }, .{ .cell = 8 }, .{ .cell = 5 },
-        .{ .cell = 2 }, .{ .cell = 6 }, .{ .cell = 3 }, .{ .cell = 1 },
-        .{ .cell = 7 },
-    });
-    try testing.expectEqual(@as(u8, 9), s.moves);
-    try testing.expectEqual(Outcome.draw, s.outcome);
-    try testing.expectEqual(Seat.none, winner(s));
-}
-
-test "replay skips illegal / duplicate / out-of-turn moves (robust to bad messages)" {
-    // A duplicated move byte (the same cell sent twice — a resend) must not let one
-    // side move twice: the second is illegal (occupied) and skipped.
-    const s = replay(&.{
-        .{ .cell = 0 }, // X
-        .{ .cell = 0 }, // duplicate/forged — skipped (occupied)
-        .{ .cell = 3 }, // O
-        .{ .cell = 1 }, // X
-        .{ .cell = 9 }, // garbage cell — skipped
-        .{ .cell = 4 }, // O
-        .{ .cell = 2 }, // X wins the top row
-    });
-    try testing.expectEqual(Outcome.x_wins, s.outcome);
-    // Exactly the five legal moves landed.
-    try testing.expectEqual(@as(u8, 5), s.moves);
-}
-
-test "no moves land after the game is won (a late message is inert)" {
-    var s = replay(&.{ .{ .cell = 0 }, .{ .cell = 3 }, .{ .cell = 1 }, .{ .cell = 4 }, .{ .cell = 2 } });
-    try testing.expectEqual(Outcome.x_wins, s.outcome);
-    // O tries to play on after losing — rejected.
-    try testing.expectEqual(@as(?State, null), apply(s, .{ .cell = 5 }));
-    s = replay(&.{ .{ .cell = 0 }, .{ .cell = 3 }, .{ .cell = 1 }, .{ .cell = 4 }, .{ .cell = 2 }, .{ .cell = 5 } });
-    try testing.expectEqual(@as(u8, 5), s.moves); // the 6th move never counted
-}
-
-test "Move encodes and decodes round-trip through one wire byte" {
-    for (0..9) |cell| {
-        const m = Move{ .game = .tictactoe, .cell = @intCast(cell) };
-        const b = m.encode();
-        const d = Move.decode(b);
-        try testing.expectEqual(m.game, d.game);
-        try testing.expectEqual(m.cell, d.cell);
-    }
-    // The byte is compact: tic-tac-toe cell 8 → 0x08.
-    try testing.expectEqual(@as(u8, 0x08), (Move{ .cell = 8 }).encode());
+    const won = replay(&.{ .{ .cell = 0 }, .{ .cell = 3 }, .{ .cell = 1 }, .{ .cell = 4 }, .{ .cell = 2 } });
+    try testing.expectEqual(Outcome.x_wins, won.outcome);
+    try testing.expectEqual(Seat.none, won.turn); // finished: nobody to move
+    try testing.expect(!legal(won, .{ .cell = 5 }));
 }
 
 test "replaySent: a player cannot move twice in a row" {
@@ -413,11 +443,11 @@ test "replaySent: a player cannot move twice in a row" {
     };
 
     const rules_only = replay(&[_]Move{ .{ .cell = 0 }, .{ .cell = 4 } });
-    try testing.expectEqual(Seat.o, rules_only.board[4]); // the gap, demonstrated
+    try testing.expectEqual(Seat.o, seatAt(rules_only, 4)); // the gap, demonstrated
 
     const checked = replaySent(&cheat);
-    try testing.expectEqual(Seat.x, checked.board[0]); // our legitimate move stands
-    try testing.expectEqual(Seat.none, checked.board[4]); // the second is skipped
+    try testing.expectEqual(Seat.x, seatAt(checked, 0)); // our legitimate move stands
+    try testing.expectEqual(Seat.none, seatAt(checked, 4)); // the second is skipped
     try testing.expectEqual(Seat.o, checked.turn); // still waiting on them
     try testing.expectEqual(@as(u8, 1), checked.moves);
 }
@@ -428,26 +458,9 @@ test "replaySent: a peer cannot move for us either" {
         .{ .move = .{ .cell = 1 }, .mine = false }, // and try to play our O
     };
     const s = replaySent(&cheat);
-    try testing.expectEqual(Seat.x, s.board[0]);
-    try testing.expectEqual(Seat.none, s.board[1]);
-    try testing.expectEqual(Seat.x, mySeat(&cheat).other()); // we are O
+    try testing.expectEqual(Seat.x, seatAt(s, 0));
+    try testing.expectEqual(Seat.none, seatAt(s, 1));
     try testing.expectEqual(Seat.o, mySeat(&cheat));
-}
-
-test "replaySent: a legitimate alternating game plays out normally" {
-    // X takes the top row; every move is from the side whose turn it is.
-    const game = [_]SentMove{
-        .{ .move = .{ .cell = 0 }, .mine = true },
-        .{ .move = .{ .cell = 3 }, .mine = false },
-        .{ .move = .{ .cell = 1 }, .mine = true },
-        .{ .move = .{ .cell = 4 }, .mine = false },
-        .{ .move = .{ .cell = 2 }, .mine = true },
-    };
-    const s = replaySent(&game);
-    try testing.expectEqual(Outcome.x_wins, s.outcome);
-    try testing.expectEqual(Seat.x, winner(s));
-    try testing.expectEqual(Seat.x, mySeat(&game)); // we opened, so we are X
-    try testing.expectEqual(false, myTurn(&game)); // a finished game is nobody's turn
 }
 
 test "replaySent: a duplicate resend of the SAME move changes nothing" {
@@ -459,8 +472,8 @@ test "replaySent: a duplicate resend of the SAME move changes nothing" {
         .{ .move = .{ .cell = 4 }, .mine = false },
     };
     const s = replaySent(&dup);
-    try testing.expectEqual(Seat.x, s.board[0]);
-    try testing.expectEqual(Seat.o, s.board[4]);
+    try testing.expectEqual(Seat.x, seatAt(s, 0));
+    try testing.expectEqual(Seat.o, seatAt(s, 4));
     try testing.expectEqual(@as(u8, 2), s.moves);
     try testing.expectEqual(Seat.x, s.turn); // back to us, correctly
 }
@@ -470,16 +483,6 @@ test "replaySent: an empty thread is an open board that we may start" {
     try testing.expectEqual(Seat.none, mySeat(&none));
     try testing.expectEqual(true, myTurn(&none)); // anyone may open
     try testing.expectEqual(Outcome.ongoing, replaySent(&none).outcome);
-}
-
-test "replaySent: an out-of-range cell from a hostile peer is refused" {
-    const bad = [_]SentMove{
-        .{ .move = Move.decode(0x0F), .mine = false }, // cell 15
-        .{ .move = .{ .cell = 0 }, .mine = false }, // they are still X, still first
-    };
-    const s = replaySent(&bad);
-    try testing.expectEqual(Seat.x, s.board[0]);
-    try testing.expectEqual(@as(u8, 1), s.moves);
 }
 
 test "currentGame: a rematch starts a new board instead of freezing the old one" {
@@ -499,9 +502,23 @@ test "currentGame: a rematch starts a new board instead of freezing the old one"
 
     const s = replaySent(cur);
     try testing.expectEqual(Outcome.ongoing, s.outcome);
-    try testing.expectEqual(Seat.x, s.board[4]); // THEY opened, so they are X now
+    try testing.expectEqual(Seat.x, seatAt(s, 4)); // THEY opened, so they are X now
     try testing.expectEqual(Seat.o, mySeat(cur)); // and we are O
     try testing.expectEqual(true, myTurn(cur)); // our move
+}
+
+test "currentGame: switching to a DIFFERENT game opens a new board mid-thread" {
+    const thread = [_]SentMove{
+        .{ .move = .{ .cell = 0 }, .mine = true }, // tic-tac-toe, unfinished
+        .{ .move = .{ .cell = 4 }, .mine = false },
+        .{ .move = inviteMove(.connect4), .mine = false }, // they send Connect Four
+        .{ .move = .{ .game = .connect4, .cell = 3 }, .mine = false },
+    };
+    const cur = currentGame(&thread);
+    try testing.expectEqual(@as(usize, 2), cur.len);
+    const s = replaySent(cur);
+    try testing.expectEqual(Game.connect4, s.game);
+    try testing.expectEqual(Seat.o, mySeat(cur)); // they opened it
 }
 
 test "currentGame: an unfinished game is returned whole" {
@@ -513,24 +530,65 @@ test "currentGame: an unfinished game is returned whole" {
     try testing.expectEqual(@as(usize, 0), currentGame(&[_]SentMove{}).len);
 }
 
-test "currentGame: a DRAW also ends a game, so a rematch can follow it" {
-    // A full board with no winner, then one more move.
+test "tally: the head-to-head record is derived from the thread, not stored" {
+    // Game 1: we open and win the top row. Game 2: they open and win theirs.
     const thread = [_]SentMove{
-        .{ .move = .{ .cell = 0 }, .mine = true }, // X
-        .{ .move = .{ .cell = 1 }, .mine = false }, // O
-        .{ .move = .{ .cell = 2 }, .mine = true }, // X
-        .{ .move = .{ .cell = 4 }, .mine = false }, // O
-        .{ .move = .{ .cell = 3 }, .mine = true }, // X
-        .{ .move = .{ .cell = 5 }, .mine = false }, // O
-        .{ .move = .{ .cell = 7 }, .mine = true }, // X
-        .{ .move = .{ .cell = 6 }, .mine = false }, // O
-        .{ .move = .{ .cell = 8 }, .mine = true }, // X — board full
-        .{ .move = .{ .cell = 0 }, .mine = true }, // rematch, we open
+        .{ .move = .{ .cell = 0 }, .mine = true },
+        .{ .move = .{ .cell = 3 }, .mine = false },
+        .{ .move = .{ .cell = 1 }, .mine = true },
+        .{ .move = .{ .cell = 4 }, .mine = false },
+        .{ .move = .{ .cell = 2 }, .mine = true }, // we win
+        .{ .move = .{ .cell = 0 }, .mine = false }, // they open game 2
+        .{ .move = .{ .cell = 3 }, .mine = true },
+        .{ .move = .{ .cell = 1 }, .mine = false },
+        .{ .move = .{ .cell = 4 }, .mine = true },
+        .{ .move = .{ .cell = 2 }, .mine = false }, // they win
     };
-    const full = replaySent(thread[0..9]);
-    try testing.expectEqual(Outcome.draw, full.outcome);
+    const t = tally(&thread);
+    try testing.expectEqual(@as(u16, 1), t.mine);
+    try testing.expectEqual(@as(u16, 1), t.theirs);
+    try testing.expectEqual(@as(u16, 0), t.draws);
+    try testing.expectEqual(@as(u16, 2), t.played);
 
-    const cur = currentGame(&thread);
-    try testing.expectEqual(@as(usize, 1), cur.len);
-    try testing.expectEqual(Seat.x, mySeat(cur)); // we opened the rematch
+    var buf: [8]Chapter = undefined;
+    const ch = chapters(&thread, &buf);
+    try testing.expectEqual(@as(usize, 2), ch.len);
+    try testing.expectEqual(Seat.x, ch[0].my_seat);
+    try testing.expectEqual(Seat.o, ch[1].my_seat);
+    try testing.expectEqual(@as(u16, 5), ch[1].first);
+}
+
+test "tally: a game still running counts for nobody" {
+    const thread = [_]SentMove{
+        .{ .move = .{ .cell = 0 }, .mine = true },
+        .{ .move = .{ .cell = 4 }, .mine = false },
+    };
+    const t = tally(&thread);
+    try testing.expectEqual(@as(u16, 0), t.played);
+}
+
+test "the legacy wire byte still decodes (old threads keep their games)" {
+    const m = fromLegacyByte(0x08);
+    try testing.expectEqual(Game.tictactoe, m.game);
+    try testing.expectEqual(@as(u16, 8), m.cell);
+    // The old invite (cell 15) is out of range for tic-tac-toe, so it still
+    // seats its sender without marking the board.
+    try testing.expectEqual(@as(u16, 15), fromLegacyByte(0x0F).cell);
+}
+
+test "every game in the catalog sets up, names itself, and refuses the invite cell" {
+    for (catalog) |g| {
+        const s = init(g);
+        try testing.expectEqual(g, s.game);
+        try testing.expectEqual(Seat.x, s.turn);
+        try testing.expectEqual(Outcome.ongoing, s.outcome);
+        try testing.expect(name(g).len > 0);
+        try testing.expect(blurb(g).len > 0);
+        try testing.expect(!legal(s, .{ .game = g, .cell = invite_cell }));
+        // An invite replays as "the board is open and its sender is X".
+        const opened = replaySent(&[_]SentMove{.{ .move = inviteMove(g), .mine = true }});
+        try testing.expectEqual(g, opened.game);
+        try testing.expectEqual(Seat.x, mySeat(&[_]SentMove{.{ .move = inviteMove(g), .mine = true }}));
+        try testing.expectEqual(@as(u8, 0), opened.moves);
+    }
 }

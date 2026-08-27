@@ -72,6 +72,7 @@ const call_ctl = if (builtin.os.tag == .linux) @import("call_ctl.zig") else stru
 };
 const chat_view_core = @import("../core/chat_view.zig");
 const chat_games = @import("../core/chat_games.zig");
+const game_board = @import("../core/game_board.zig");
 const spring = @import("../core/spring.zig");
 const reveal = @import("../ui/reveal.zig"); // Rover: portable present/dismiss transition
 const ui_insets = @import("../ui/insets.zig");
@@ -1099,15 +1100,32 @@ const RunState = struct {
     /// The message the composer is EDITING, or `no_reply`.
     gchat_edit_of: u32,
     /// GAMES (GamePigeon flow). A game STAGED in the composer, not yet sent — the
-    /// chip with the ✕. Sending it posts the invite. Tic-tac-toe is the only game
-    /// for now, so a bool; becomes an enum when there are more.
+    /// chip with the ✕. Sending it posts the invite for `gchat_game_kind`.
     gchat_pending_game: bool,
+    /// The game SHELF is open — the grid of eight you pick from.
+    gchat_game_picking: bool,
+    /// Which game the shelf last picked. This is what a NEW invite sends; the
+    /// game being PLAYED comes from the board (`gchat_game_live`), because after a
+    /// result you can pick something else while the old board is still on screen.
+    gchat_game_kind: chat_games.Game,
+    /// The game the OPEN BOARD is playing, refreshed from the thread each frame.
+    /// A move must be tagged with this, never with the shelf's pick.
+    gchat_game_live: chat_games.Game,
     /// The full-screen game view is open (an overlay over the thread). You reach it
     /// by tapping a game card; you make a move there, then Send.
     gchat_game_open: bool,
-    /// The cell STAGED in the full-screen view before Send (0..8), or 255 = none.
+    /// The move STAGED in the full-screen view before Send, or `no_stage`.
     /// The move is not sent until Send is pressed (the second stage-then-send).
-    gchat_game_staged: u8,
+    gchat_game_staged: u16,
+    /// In chess and checkers a move takes TWO taps; this is the square picked up.
+    gchat_game_from: u16,
+    /// The piece a staged promotion would take (0 = queen).
+    gchat_game_promo: u8,
+    /// The phase the sight was DRAWN at last frame. A skill shot releases from
+    /// this, not from a fresh clock read, so the arrow leaves exactly where the
+    /// player saw it — the shell owns the clock (B3) and the view is handed a
+    /// number, which is what makes the two agree.
+    gchat_aim_t: f32,
     /// Unsends and edits still trying to reach the other side.
     gpending: [16]Revision,
     gpending_n: usize,
@@ -1866,8 +1884,14 @@ fn initRunState(
     rs.gchat_reply_to = no_reply;
     rs.gchat_edit_of = no_reply;
     rs.gchat_pending_game = false;
+    rs.gchat_game_picking = false;
     rs.gchat_game_open = false;
-    rs.gchat_game_staged = 255;
+    rs.gchat_game_staged = game_board.no_stage;
+    rs.gchat_game_from = game_board.no_stage;
+    rs.gchat_game_promo = 0;
+    rs.gchat_game_kind = .tictactoe;
+    rs.gchat_game_live = .tictactoe;
+    rs.gchat_aim_t = 0;
     rs.gpending_n = 0;
     rs.gread_due_at = 0;
     rs.gread_up_to = 0;
@@ -2669,7 +2693,7 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                 .game_move => |gm| {
                                     if (chat_core.openConversation(gpa, &rs.gchat_store, gm.peer_did, "") catch null) |c| {
                                         if (chat_core.appendMessage(gpa, &rs.gchat_store, c, .game_move, "", now, false) catch null) |mi| {
-                                            chat_core.setGameMove(&rs.gchat_store, @intFromEnum(mi), gm.encoded);
+                                            chat_core.setGameMove(&rs.gchat_store, @intFromEnum(mi), gm.game, gm.mv);
                                         }
                                         chat_mutated = true;
                                     }
@@ -7237,18 +7261,27 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                             rs.gcmenu = .{ .open = true, .kind = .attach, .x = @as(i32, hit.x) + @divTrunc(@as(i32, hit.w), 2), .y = hit.y };
                                             rs.gcmenu_ns = clock_shell.monotonicNanos(); // the fade-in clock (was blank without it)
                                         },
-                                        // Pick a game from the "+" menu: STAGE it in the
-                                        // composer (the chip with the ✕) — GamePigeon flow.
-                                        // Nothing is sent until Send; the chip arms Send.
+                                        // Pick a game from the "+" menu: open THE SHELF, the
+                                        // grid of games. Nothing is staged until you choose
+                                        // one there — GamePigeon opens onto its rack, not
+                                        // into whichever game happens to be first.
                                         .chat_attach_game, .chat_game_stage => if (dev_chat) {
                                             rs.gcmenu = .{};
+                                            rs.gchat_game_picking = true;
+                                            rs.gchat_input_focus = false;
+                                        },
+                                        // A tile on the shelf: STAGE that game in the composer
+                                        // (the chip with the ✕). Send commits it.
+                                        .game_pick => if (dev_chat) {
+                                            rs.gchat_game_kind = @enumFromInt(@as(u8, @truncate(hit.post)));
+                                            rs.gchat_game_picking = false;
                                             rs.gchat_pending_game = true;
                                             // Keep the keyboard UP — staging a game is like
                                             // attaching a photo: the composer stays live so you
                                             // can add a note and Send without the keyboard
                                             // collapsing under you.
                                             rs.gchat_input_focus = true;
-                                            rs.status = "games: tic-tac-toe staged \u{2014} press Send";
+                                            rs.status = chat_games.name(rs.gchat_game_kind);
                                         },
                                         // The ✕ on the staged chip: drop the staged game.
                                         .chat_game_unstage => if (dev_chat) {
@@ -7258,29 +7291,102 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                         // board (you do NOT play from the thread).
                                         .game_open => if (dev_chat) {
                                             rs.gchat_game_open = true;
-                                            rs.gchat_game_staged = 255;
+                                            rs.gchat_game_staged = game_board.no_stage;
+                                            rs.gchat_game_from = game_board.no_stage;
+                                            rs.gchat_game_promo = 0;
+    rs.gchat_game_kind = .tictactoe;
+    rs.gchat_game_live = .tictactoe;
+    rs.gchat_aim_t = 0;
                                             rs.gcmenu = .{};
                                             rs.gchat_input_focus = false;
                                         },
-                                        // A tap on an empty board cell (in the overlay): STAGE
-                                        // that move — it shows as a ghost until Send commits it.
+                                        // A tap on the board. What it MEANS depends on the
+                                        // game, and this is the only place that difference
+                                        // lives: a skill shot releases, a two-tap game picks a
+                                        // piece up and puts it down, everything else stages a
+                                        // cell. Nothing is sent either way — Send commits.
                                         .game_cell => if (dev_chat) {
-                                            rs.gchat_game_staged = @intCast(@min(hit.post, 8));
+                                            const gk = rs.gchat_game_live;
+                                            if (chat_games.isSkillShot(gk)) {
+                                                // Release. The landing comes from the phase the
+                                                // sight was DRAWN at, so the arrow leaves
+                                                // exactly where the player saw it.
+                                                rs.gchat_game_staged = game_board.releaseMove(gk, rs.gchat_aim_t);
+                                            } else if (chat_games.isFromTo(gk)) {
+                                                const sq: u16 = hit.post;
+                                                if (rs.gchat_game_from == game_board.no_stage) {
+                                                    rs.gchat_game_from = sq;
+                                                    rs.gchat_game_staged = game_board.no_stage;
+                                                } else if (rs.gchat_game_from == sq) {
+                                                    // Tapping the picked-up piece again puts it
+                                                    // back down.
+                                                    rs.gchat_game_from = game_board.no_stage;
+                                                    rs.gchat_game_staged = game_board.no_stage;
+                                                } else {
+                                                    rs.gchat_game_promo = 0;
+    rs.gchat_game_kind = .tictactoe;
+    rs.gchat_game_live = .tictactoe;
+    rs.gchat_aim_t = 0;
+                                                    rs.gchat_game_staged = packFromTo(rs.gchat_game_from, sq, 0);
+                                                }
+                                            } else {
+                                                rs.gchat_game_staged = hit.post;
+                                            }
+                                        },
+                                        // The promotion strip: re-stage the same move with a
+                                        // different piece on the end of it.
+                                        .game_promo => if (dev_chat) {
+                                            if (rs.gchat_game_staged != game_board.no_stage) {
+                                                rs.gchat_game_promo = @truncate(hit.post);
+                                                rs.gchat_game_staged = packFromTo(
+                                                    rs.gchat_game_staged & 63,
+                                                    (rs.gchat_game_staged >> 6) & 63,
+                                                    rs.gchat_game_promo,
+                                                );
+                                            }
                                         },
                                         // Send the staged move: it goes as the next message,
                                         // then the overlay closes.
                                         .game_send => if (dev_chat) {
-                                            if (rs.gchat_game_staged != 255) if (rs.gchat_sel) |sc| {
-                                                const mv = chat_games.Move{ .cell = @intCast(rs.gchat_game_staged) };
-                                                chatSendGameMove(rs, gpa, io, environ, sc, mv.encode());
+                                            if (rs.gchat_game_staged != game_board.no_stage) if (rs.gchat_sel) |sc| {
+                                                chatSendGameMove(rs, gpa, io, environ, sc, .{
+                                                    .game = rs.gchat_game_live,
+                                                    .cell = rs.gchat_game_staged,
+                                                });
                                             };
-                                            rs.gchat_game_open = false;
-                                            rs.gchat_game_staged = 255;
+                                            // A skill shot and a free turn both leave the board
+                                            // OURS to act on again, so the overlay stays up —
+                                            // closing it after every dart would make a
+                                            // three-dart turn three round trips through the
+                                            // thread. Everything else hands over, so it closes.
+                                            const stay = chat_games.isSkillShot(rs.gchat_game_live) or
+                                                rs.gchat_game_live == .mancala or rs.gchat_game_live == .dots;
+                                            rs.gchat_game_open = rs.gchat_game_open and stay;
+                                            rs.gchat_game_staged = game_board.no_stage;
+                                            rs.gchat_game_from = game_board.no_stage;
+                                            rs.gchat_game_promo = 0;
+    rs.gchat_game_kind = .tictactoe;
+    rs.gchat_game_live = .tictactoe;
+    rs.gchat_aim_t = 0;
                                         },
-                                        // Close the overlay without moving (tap-outside / ✕).
+                                        // A finished board: play the same game again. The
+                                        // invite opens a fresh board with us as the first
+                                        // player, exactly as the original invite did.
+                                        .game_rematch => if (dev_chat) {
+                                            if (rs.gchat_sel) |sc|
+                                                chatSendGameMove(rs, gpa, io, environ, sc, chat_games.inviteMove(rs.gchat_game_live));
+                                            rs.gchat_game_staged = game_board.no_stage;
+                                            rs.gchat_game_from = game_board.no_stage;
+                                        },
+                                        // Close the overlay (or the shelf) without moving.
                                         .game_close => if (dev_chat) {
-                                            rs.gchat_game_open = false;
-                                            rs.gchat_game_staged = 255;
+                                            if (rs.gchat_game_picking) {
+                                                rs.gchat_game_picking = false;
+                                            } else {
+                                                rs.gchat_game_open = false;
+                                            }
+                                            rs.gchat_game_staged = game_board.no_stage;
+                                            rs.gchat_game_from = game_board.no_stage;
                                         },
                                         // Photos/Videos emit no region yet (drawn "Soon"),
                                         // so these arms exist only for completeness.
@@ -7361,8 +7467,14 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                             }
                                             rs.gchat_edit_of = no_reply;
     rs.gchat_pending_game = false;
+    rs.gchat_game_picking = false;
     rs.gchat_game_open = false;
-    rs.gchat_game_staged = 255;
+    rs.gchat_game_staged = game_board.no_stage;
+    rs.gchat_game_from = game_board.no_stage;
+    rs.gchat_game_promo = 0;
+    rs.gchat_game_kind = .tictactoe;
+    rs.gchat_game_live = .tictactoe;
+    rs.gchat_aim_t = 0;
                                             rs.gchat_reply_to = no_reply;
                                         },
                                         // REACT — the row at the top of the menu. The
@@ -7428,9 +7540,9 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                             // path below runs on the same tap.)
                                             if (rs.gchat_pending_game) {
                                                 if (rs.gchat_sel) |sc|
-                                                    chatSendGameMove(rs, gpa, io, environ, sc, chat_games.inviteMove().encode());
+                                                    chatSendGameMove(rs, gpa, io, environ, sc, chat_games.inviteMove(rs.gchat_game_kind));
                                                 rs.gchat_pending_game = false;
-                                                rs.status = "games: tic-tac-toe sent";
+                                                rs.status = chat_games.name(rs.gchat_game_kind);
                                                 rs.gscroll_px = 0; // ride to the newest, so the card is in view
                                             }
                                             const body = std.mem.trimEnd(u8, rs.gchat_draft_buf[0..rs.gchat_draft_len], " \n");
@@ -7442,8 +7554,14 @@ fn stepFrame(rs: *RunState, wait_budget_ms: i32) !StepOutcome {
                                                 chatEditMessage(rs, gpa, io, environ, rs.gchat_edit_of, body);
                                                 rs.gchat_edit_of = no_reply;
     rs.gchat_pending_game = false;
+    rs.gchat_game_picking = false;
     rs.gchat_game_open = false;
-    rs.gchat_game_staged = 255;
+    rs.gchat_game_staged = game_board.no_stage;
+    rs.gchat_game_from = game_board.no_stage;
+    rs.gchat_game_promo = 0;
+    rs.gchat_game_kind = .tictactoe;
+    rs.gchat_game_live = .tictactoe;
+    rs.gchat_aim_t = 0;
                                                 rs.gchat_draft_len = 0;
                                                 rs.gchat_caret = 0;
                                                 chatCollapseSel(rs);
@@ -10087,7 +10205,7 @@ fn topOverlay(rs: *const RunState) overlay_order.Kind {
         .money = money,
         .pending_game = rs.gscreen == feed_view.screen_messages and rs.gchat_pending_game,
         .chat_menu = rs.gcmenu.open,
-        .game = rs.gscreen == feed_view.screen_messages and rs.gchat_game_open,
+        .game = rs.gscreen == feed_view.screen_messages and (rs.gchat_game_open or rs.gchat_game_picking),
         .repost = rs.grepost_menu != null,
         .detail = rs.gcart_detail != null,
         .call = rs.gcall.phase != .idle,
@@ -10107,8 +10225,14 @@ fn dismissTopOverlay(rs: *RunState) bool {
         .detail => rs.gcart_detail = null,
         .repost => rs.grepost_menu = null,
         .game => {
+            // The shelf sits above the board, so back closes the shelf first.
+            if (rs.gchat_game_picking) {
+                rs.gchat_game_picking = false;
+                return true;
+            }
             rs.gchat_game_open = false;
-            rs.gchat_game_staged = 255;
+            rs.gchat_game_staged = game_board.no_stage;
+            rs.gchat_game_from = game_board.no_stage;
         },
         .chat_menu => rs.gcmenu = .{},
         .pending_game => rs.gchat_pending_game = false,
@@ -10791,14 +10915,31 @@ fn chatSend(gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, st
         chatLog("[chat] SEND FAILED -> {s}: {s}", .{ peer_did, @errorName(err) });
 }
 
+/// Pack a two-tap move the way chess and checkers read it: `from | to<<6`, plus
+/// the promotion piece in the top bits. Checkers ignores the promotion field.
+/// One packer, so the shell cannot disagree with the rules about what a move is.
+fn packFromTo(from: u16, to: u16, promo: u8) u16 {
+    return (from & 63) | ((to & 63) << 6) | (@as(u16, promo & 7) << 12);
+}
+
 /// The GAME view for the open conversation (GamePigeon flow): the staged chip,
 /// whether the full-screen overlay is up, and the CURRENT game's board (segmented
 /// so a rematch shows a fresh board). Derived fresh each frame from the store.
 fn chatGameOf(rs: *RunState, arena: Allocator) feed_view.ChatGame {
+    // The sight's phase. The clock lives HERE (B3) and the view is handed a
+    // number; a ~2.6 s loop is slow enough to aim at and fast enough to feel
+    // alive. Fractional part only — `sight` takes a phase in turns.
+    const aim_ns = clock_shell.monotonicNanos();
+    rs.gchat_aim_t = @floatCast(@mod(@as(f64, @floatFromInt(aim_ns)) / 2_600_000_000.0, 1.0));
     var g: feed_view.ChatGame = .{
         .pending = rs.gchat_pending_game,
+        .picking = rs.gchat_game_picking,
+        .kind = rs.gchat_game_kind,
         .open = rs.gchat_game_open,
         .staged = rs.gchat_game_staged,
+        .from = rs.gchat_game_from,
+        .promo = rs.gchat_game_promo,
+        .aim_t = rs.gchat_aim_t,
         // The present transition's progress (stepped in paintFrameGpu). One frame
         // of pipeline lag is imperceptible; the overlay draws while this is > 0.
         .reveal_t = if (rs.gpu_state) |*gs| gs.game_reveal.progress else if (rs.gchat_game_open) 1 else 0,
@@ -10808,6 +10949,14 @@ fn chatGameOf(rs: *RunState, arena: Allocator) feed_view.ChatGame {
     const cur = chat_games.currentGame(moves);
     g.state = chat_games.replaySent(cur);
     g.my_seat = chat_games.mySeat(cur);
+    // The head-to-head record, derived from the same thread — no scoreboard is
+    // stored or sent, so the two ends cannot disagree about it.
+    g.tally = chat_games.tally(moves);
+    // What a MOVE is tagged with comes from the board, never from the shelf's
+    // pick: after a result you can choose a different game while the finished
+    // board is still on screen, and a move sent then must still name the game it
+    // was played in.
+    rs.gchat_game_live = g.state.game;
     return g;
 }
 
@@ -10820,7 +10969,10 @@ fn collectSentMoves(rs: *RunState, arena: Allocator, conv: chat_core.ConvIndex) 
         const idx = @intFromEnum(mi);
         if (!chat_core.isGameKind(rs.gchat_store.msgs.items(.kind)[idx])) continue;
         out.append(arena, .{
-            .move = chat_games.Move.decode(chat_core.gameMoveOf(&rs.gchat_store, idx)),
+            .move = .{
+                .game = @enumFromInt(chat_core.gameOf(&rs.gchat_store, idx)),
+                .cell = chat_core.gameMoveOf(&rs.gchat_store, idx),
+            },
             .mine = chat_core.isMine(&rs.gchat_store, mi),
         }) catch break;
     }
@@ -10830,15 +10982,15 @@ fn collectSentMoves(rs: *RunState, arena: Allocator, conv: chat_core.ConvIndex) 
 /// Append a game move to OUR store and transmit it: one encoded byte, kind
 /// `.game_move`, empty text. The board is derived from these on both ends
 /// (`chat_view.buildThread`), so recording it locally IS showing it.
-fn chatSendGameMove(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, conv: chat_core.ConvIndex, encoded: u8) void {
+fn chatSendGameMove(rs: *RunState, gpa: Allocator, io: std.Io, env: ?*const std.process.Environ.Map, conv: chat_core.ConvIndex, mv: chat_games.Move) void {
     const now = clock_shell.unixSeconds();
     const mi = chat_core.appendMessage(gpa, &rs.gchat_store, conv, .game_move, "", now, true) catch return;
-    chat_core.setGameMove(&rs.gchat_store, @intFromEnum(mi), encoded);
+    chat_core.setGameMove(&rs.gchat_store, @intFromEnum(mi), @intFromEnum(mv.game), mv.cell);
     chatPersistHistory(gpa, io, env, if (rs.gchat_e2ee) |*p| p else null, &rs.gchat_store);
     const state = if (rs.gchat_e2ee) |*st| st else return;
     const l = rs.gchat_link orelse return;
     const peer_did = chat_core.conversationDid(&rs.gchat_store, conv);
-    chat_e2ee.sendGameMove(gpa, io, env, state, l, peer_did, encoded) catch |err|
+    chat_e2ee.sendGameMove(gpa, io, env, state, l, peer_did, @intFromEnum(mv.game), mv.cell) catch |err|
         chatLog("[chat] GAME SEND FAILED -> {s}: {s}", .{ peer_did, @errorName(err) });
 }
 
@@ -17164,6 +17316,20 @@ fn paintFrameGpu(
         reveal.advance(&gs.game_reveal, g.chat_game.open, dt);
         if (reveal.active(gs.game_reveal, g.chat_game.open)) chat_animating = true;
         chat_sig ^= @as(u64, @intFromFloat(gs.game_reveal.progress * 255.0)) *% 0xD1B5_4A32_D192_ED03;
+        // The rest of the board's state joins the signature (the rebuild law): a
+        // staged move, a picked-up piece and the shelf all change what is drawn
+        // without changing a message, so without this the board would cache and
+        // the taps would look dead.
+        chat_sig ^= (@as(u64, g.chat_game.staged) | (@as(u64, g.chat_game.from) << 16) |
+            (@as(u64, g.chat_game.promo) << 32) | (@as(u64, @intFromEnum(g.chat_game.kind)) << 40) |
+            (@as(u64, @intFromBool(g.chat_game.picking)) << 48)) *% 0x9E37_79B9_7F4A_7C15;
+        // A SKILL SHOT's sight moves every frame while it is ours to take, so the
+        // board must rebuild every frame — a cached sight is a frozen one, and
+        // releasing at a sight that is not moving is not a game.
+        if (g.chat_game.open and chat_games.isSkillShot(g.chat_game.state.game) and
+            g.chat_game.state.outcome == .ongoing and
+            g.chat_game.state.turn == g.chat_game.my_seat and g.chat_game.my_seat != .none)
+            chat_animating = true;
 
         // The screen-effect session watermark: the max message key the first time
         // the chat surface is live. Only messages that arrive AFTER this (a higher

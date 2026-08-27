@@ -1855,7 +1855,8 @@ pub fn send(
     return depositAll(gpa, io, environ, st, link, peer_did, plaintext);
 }
 
-/// Send ONE GAME MOVE. Two bytes: the kind and the encoded move.
+/// Send ONE GAME MOVE. Four bytes: the kind, WHICH GAME, and the move as a
+/// little-endian u16.
 ///
 /// The mover is deliberately NOT on the wire. There is no "I am X" field to
 /// forge — the seat comes from replay position, and whether the sender was
@@ -1869,9 +1870,15 @@ pub fn sendGameMove(
     st: *State,
     link: *chat_relay.ChatRelay,
     peer_did: []const u8,
-    encoded_move: u8,
+    game: u8,
+    mv: u16,
 ) SendError!void {
-    var buf: [2]u8 = .{ @intFromEnum(chat.Kind.game_move), encoded_move };
+    var buf: [4]u8 = .{
+        @intFromEnum(chat.Kind.game_move),
+        game,
+        @truncate(mv),
+        @truncate(mv >> 8),
+    };
     defer std.crypto.secureZero(u8, &buf);
     return depositAll(gpa, io, environ, st, link, peer_did, &buf);
 }
@@ -2057,7 +2064,7 @@ pub const Incoming = union(enum) {
     /// One move of an in-thread game. Separate from `.message` because it is not
     /// a message anybody reads — it carries no text, and the thread renders it as
     /// a board rather than a bubble.
-    game_move: struct { peer_did: []u8, encoded: u8 },
+    game_move: struct { peer_did: []u8, game: u8, mv: u16 },
     /// `device` is the peer DEVICE whose Welcome opened this session — an ack
     /// answers ONE Welcome, so the shell has to know which one (slice 1).
     started: struct { peer_did: []u8, device: [32]u8 },
@@ -2670,13 +2677,25 @@ pub fn onBucket(
                             .bubble = data[2],
                         } };
                     }
-                    // A GAME MOVE. Exactly two bytes; anything else claiming this
-                    // kind is malformed and dropped rather than guessed at.
+                    // A GAME MOVE. Four bytes — kind, game, move-lo, move-hi.
+                    // TWO bytes is the FIRST encoding, where the game and a
+                    // four-bit cell shared one byte; a peer still on the old
+                    // build sends that, and it can only ever be tic-tac-toe, so
+                    // it is split rather than dropped. Any other length is
+                    // malformed and dropped rather than guessed at.
                     if (data[0] == @intFromEnum(chat.Kind.game_move)) {
-                        if (data.len != 2) return null;
+                        if (data.len == 2) {
+                            return .{ .game_move = .{
+                                .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]),
+                                .game = data[1] >> 4,
+                                .mv = data[1] & 0x0F,
+                            } };
+                        }
+                        if (data.len != 4) return null;
                         return .{ .game_move = .{
                             .peer_did = try gpa.dupe(u8, st.peer_dids.items[idx]),
-                            .encoded = data[1],
+                            .game = data[1],
+                            .mv = @as(u16, data[2]) | (@as(u16, data[3]) << 8),
                         } };
                     }
                     // A CALL signaling frame (reserved wire bytes 24..29). Surfaced

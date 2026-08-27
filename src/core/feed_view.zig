@@ -56,6 +56,13 @@ const transp = @import("transparency.zig");
 const algo_docs = @import("algo_docs.zig");
 const chat_view = @import("chat_view.zig");
 const chat_games = @import("chat_games.zig");
+const game_board = @import("game_board.zig");
+const mancala_rules = @import("games/mancala.zig");
+const dots_rules = @import("games/dots.zig");
+const chess_rules = @import("games/chess.zig");
+const checkers_rules = @import("games/checkers.zig");
+const archery_rules = @import("games/archery.zig");
+const darts_rules = @import("games/darts.zig");
 const chat_effects = @import("chat_effects.zig");
 const chat_msg = @import("chat.zig");
 const wallet_caps = @import("wallet_caps.zig");
@@ -317,7 +324,7 @@ const divider: u32 = 0x18EDEAE0; // ~9% ink hairline
 /// section index in `post`); `settings_row` is a detail-pane row tap (carries
 /// the global row index — inert scaffold today, except `act_sign_out` rows which
 /// the renderer emits as `.sign_out` so that one wired control keeps working).
-pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_send_fx, chat_send_bubble, chat_send_cat, chat_attach, game_cell, chat_game_stage, chat_game_unstage, game_open, game_send, game_close, chat_attach_game, chat_attach_photo, chat_attach_video, chat_new, chat_restart, chat_identity_reset, chat_device_add, chat_device_approve, chat_device_refuse, chat_device_help, chat_help_close, chat_history_get, chat_consent_receipts, chat_consent_typing, chat_consent_done, chat_msg_copy, chat_msg_reply, chat_msg_edit, chat_msg_delete_me, chat_conv_pin, chat_conv_mute, chat_conv_unread, chat_conv_delete, chat_ctx_cancel, chat_msg_react, chat_msg_delete_all, chat_menu_dismiss, chat_msg, recv_clip, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, recv_back, recv_use, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_call, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
+pub const Action = enum(u8) { reply, repost, like, nav, compose, author, edit_profile, compose_send, compose_cancel, post_body, back, reveal_new, bookmark, share, more, profile_tab, loadout_tab, collapse, sign_out, zone_jump, zone_open, tag_inline, zone_tab, zone_search, zone_pin, zone_compose, compose_tag_add, compose_tag_remove, settings_section, settings_row, settings_choice, settings_choice_opt, algo_view, algo_add, algo_source, create_pick, create_back, create_next, create_knob_dec, create_knob_inc, create_color, create_save, create_dev, chat_conv, chat_input, chat_send, chat_send_fx, chat_send_bubble, chat_send_cat, chat_attach, game_cell, chat_game_stage, chat_game_unstage, game_open, game_send, game_close, game_pick, game_promo, game_rematch, chat_attach_game, chat_attach_photo, chat_attach_video, chat_new, chat_restart, chat_identity_reset, chat_device_add, chat_device_approve, chat_device_refuse, chat_device_help, chat_help_close, chat_history_get, chat_consent_receipts, chat_consent_typing, chat_consent_done, chat_msg_copy, chat_msg_reply, chat_msg_edit, chat_msg_delete_me, chat_conv_pin, chat_conv_mute, chat_conv_unread, chat_conv_delete, chat_ctx_cancel, chat_msg_react, chat_msg_delete_all, chat_menu_dismiss, chat_msg, recv_clip, chat_compose_input, pay_open, pay_rail, pay_chip, pay_amount, pay_note, pay_unit, pay_request, pay_send, pay_cancel, pay_card_pay, pay_card_cancel, pay_card_received, pay_card_setup, pay_card_decline, pay_card_send, expand, compose_add, compose_remove, quote_open, quote_new, repost_do, recv_open, recv_ln, recv_btc, recv_save, recv_cancel, recv_have, recv_need, recv_wallet, recv_paste, recv_remove, recv_back, recv_use, pay_arm, pay_confirm_back, drawer_close, dev_template, dev_check, dev_next, dev_back, dev_publish, dev_src, dev_field, dev_color, dev_surface, algo_open, algo_install, market_search, market_filter, pub_view, chat_search, kbd_key, kbd_shift, kbd_page, kbd_backspace, kbd_emoji, kbd_nav, kbd_cat, chat_call, chat_handle, chat_copy, chat_cut, chat_paste, chat_selall, bench_seat, bench_confirm, bench_cancel, pub_delete, docs_user, docs_dev, drawer_open, search, blocker };
 
 /// Main-feed Read-more: a post whose body wraps to more than this many visual
 /// lines is clamped to it (with a "Read more" doorway) until the reader expands
@@ -10300,13 +10307,28 @@ pub const ChatGame = struct {
     pending: bool = false,
     /// The full-screen game overlay is open (tapped a card).
     open: bool = false,
+    /// The game SHELF is open — the eight-game grid you pick from.
+    picking: bool = false,
+    /// Which game is staged / being picked. Once a board is open the game comes
+    /// from `state`, which is the authority; this is what a NEW invite would send.
+    kind: chat_games.Game = .tictactoe,
     /// The conversation's CURRENT game board (for the open overlay + the newest
     /// card's status). Defaults to a fresh board.
-    state: chat_games.State = chat_games.init(),
+    state: chat_games.State = chat_games.init(.tictactoe),
     /// Which seat WE hold in the current game.
     my_seat: chat_games.Seat = .none,
-    /// A cell staged in the overlay before Send (0..8), or 255 = none.
-    staged: u8 = 255,
+    /// A move staged in the overlay before Send, or `game_board.no_stage`.
+    staged: u16 = game_board.no_stage,
+    /// In a two-tap game, the square PICKED UP, or `game_board.no_stage`.
+    from: u16 = game_board.no_stage,
+    /// The promotion piece a staged pawn move would take (0 = queen).
+    promo: u8 = 0,
+    /// The head-to-head record across every finished game in this thread.
+    tally: chat_games.Tally = .{},
+    /// The free-running phase a skill shot's sight is drawn from. The shell
+    /// derives it from the clock (B3) and hands it in; the view never asks the
+    /// time, which is also what lets the release land exactly where it is drawn.
+    aim_t: f32 = 0,
     /// The overlay's present-transition progress [0,1] (Rover `ui/reveal`, driven
     /// by the shell). The overlay draws while this is > 0, so it can slide OUT too.
     /// Default 0 so static callers (preview) never draw a stray overlay.
@@ -10317,47 +10339,61 @@ pub const game_board_w: i32 = 240;
 pub const game_card_h: i32 = 148; // the thread card — a tall, tappable board preview
 
 /// The status line for a game (whose turn / result), from OUR perspective.
-fn gameStatusLine(st: chat_games.State, my_seat: chat_games.Seat) []const u8 {
-    return switch (st.outcome) {
-        .x_wins => if (my_seat == .x) "You won" else "They won",
-        .o_wins => if (my_seat == .o) "You won" else "They won",
-        .draw => "Draw",
-        .ongoing => if (st.moves == 0)
-            "Tap to play"
-        else if (st.turn == my_seat) "Your turn" else "Their turn",
+/// `buf` catches the games that count — a score line is not a fixed string.
+fn gameStatusLine(st: chat_games.State, my_seat: chat_games.Seat, buf: []u8) []const u8 {
+    switch (st.outcome) {
+        .x_wins => return if (my_seat == .x) "You won" else "They won",
+        .o_wins => return if (my_seat == .o) "You won" else "They won",
+        .draw => return "Draw",
+        .ongoing => {},
+    }
+    if (st.moves == 0) return "Tap to play";
+    const theirs = my_seat.other();
+    const turn: []const u8 = if (st.turn == my_seat) "Your turn" else "Their turn";
+    return switch (st.game) {
+        // The games with a running score say it, because "your turn" is not the
+        // interesting fact once there are points on the board.
+        .mancala => std.fmt.bufPrint(buf, "{s} \u{00B7} {d}\u{2013}{d}", .{
+            turn,
+            st.cells[mancala_store(my_seat)],
+            st.cells[mancala_store(theirs)],
+        }) catch turn,
+        .dots => std.fmt.bufPrint(buf, "{s} \u{00B7} {d}\u{2013}{d} boxes", .{
+            turn,
+            dots_rules.score(st, my_seat),
+            dots_rules.score(st, theirs),
+        }) catch turn,
+        .archery => std.fmt.bufPrint(buf, "{s} \u{00B7} {d}\u{2013}{d}", .{
+            turn,
+            archery_rules.total(st, my_seat),
+            archery_rules.total(st, theirs),
+        }) catch turn,
+        .darts => std.fmt.bufPrint(buf, "{s} \u{00B7} {d} left, they need {d}", .{
+            turn,
+            darts_rules.remaining(st, my_seat),
+            darts_rules.remaining(st, theirs),
+        }) catch turn,
+        .chess => if (chess_rules.inCheck(st, st.turn))
+            (if (st.turn == my_seat) "Check \u{2014} your move" else "Check \u{2014} their move")
+        else
+            turn,
+        .checkers => std.fmt.bufPrint(buf, "{s} \u{00B7} {d}\u{2013}{d}", .{
+            turn,
+            checkers_rules.pieceCount(st, my_seat),
+            checkers_rules.pieceCount(st, theirs),
+        }) catch turn,
+        else => turn,
     };
 }
 
-/// A tiny 3x3 board thumbnail for the compact card (marks only, no tap targets).
-fn drawGameThumb(gpa: Allocator, dl: *raster.DrawList, board: [9]chat_games.Seat, x: i32, y: i32, s: i32, accent: u32) !void {
-    const line_c = softA(0xEDEAE0, 0x33);
-    const cell = @divTrunc(s, 3);
-    var g: i32 = 1;
-    while (g < 3) : (g += 1) {
-        try rect(gpa, dl, x + g * cell, y, 1, s, line_c, 0);
-        try rect(gpa, dl, x, y + g * cell, s, 1, line_c, 0);
-    }
-    var i: usize = 0;
-    while (i < 9) : (i += 1) {
-        const cx = x + @as(i32, @intCast(i % 3)) * cell;
-        const cy = y + @as(i32, @intCast(i / 3)) * cell;
-        const m = @divTrunc(cell, 4);
-        switch (board[i]) {
-            .x => {
-                const xc = accent | 0xFF000000;
-                try line(gpa, dl, cx + m, cy + m, cx + cell - m, cy + cell - m, xc, 2);
-                try line(gpa, dl, cx + cell - m, cy + m, cx + m, cy + cell - m, xc, 2);
-            },
-            .o => try circleRing(gpa, dl, cx + @divTrunc(cell, 2), cy + @divTrunc(cell, 2), @divTrunc(cell, 2) - m, 2, 0xFFE0705C),
-            .none => {},
-        }
-    }
+fn mancala_store(v: chat_games.Seat) usize {
+    return mancala_rules.storeOf(v);
 }
 
-/// A COMPACT game card in the thread (GamePigeon-style): a thumbnail + name +
-/// status. You do NOT play from here — a tap emits `.game_open`, which opens the
-/// full-screen board. `ordinal` rides the region so the shell knows which was
-/// tapped (all open the same current game for now).
+/// A COMPACT game card in the thread (GamePigeon-style): a thumbnail of the REAL
+/// position + name + status. You do NOT play from here — a tap emits
+/// `.game_open`, which opens the full-screen board. `ordinal` rides the region so
+/// the shell knows which was tapped.
 fn drawGameCard(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, regions: ?*Regions, accent: u32, x: i32, y: i32, w: i32, card: chat_view.GameCard, ordinal: u16) !void {
     const h = game_card_h;
     try cardBox(gpa, dl, x, y, w, h, 18, skinPanel(accent));
@@ -10365,32 +10401,15 @@ fn drawGameCard(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, reg
     // GAME and not a one-line row — the owner wanted it TALL and to take up space.
     const pad: i32 = 16;
     const thumb = h - 2 * pad;
-    try drawGameThumb(gpa, dl, card.state.board, x + pad, y + pad, thumb, accent);
+    try game_board.thumb(gpa, dl, e, card.state, x + pad, y + pad, thumb, accent);
     const tx = x + thumb + pad + 14;
-    _ = try str(gpa, dl, e, .semibold, tx, y + @divTrunc(h, 2) - 8, ink, 18, "Tic-Tac-Toe"); // `ink` remaps in light mode (on_accent_ink vanished on the white card)
-    const status = gameStatusLine(card.state, card.my_seat);
+    _ = try str(gpa, dl, e, .semibold, tx, y + @divTrunc(h, 2) - 8, ink, 18, chat_games.name(card.state.game)); // `ink` remaps in light mode (on_accent_ink vanished on the white card)
+    var sbuf: [64]u8 = undefined;
+    const status = gameStatusLine(card.state, card.my_seat, &sbuf);
     _ = try str(gpa, dl, e, .regular, tx, y + @divTrunc(h, 2) + 16, softA(0xEDEAE0, 0xBB), 14, status);
     // A chevron hinting "opens".
     try iconChevron(gpa, dl, x + w - 30, y + @divTrunc(h - 18, 2), 18, softA(0xEDEAE0, 0x66));
     try emitRegion(gpa, regions, x, y, w, @intCast(h), ordinal, .game_open);
-}
-
-/// A ring (hollow circle) of `thick` px at radius `r`, from short chord strokes —
-/// the draw vocabulary has no circle primitive, and a tic-tac-toe O wants to read
-/// as a ring, not a disc.
-fn circleRing(gpa: Allocator, dl: *raster.DrawList, cx: i32, cy: i32, r: i32, thick: u8, c: u32) !void {
-    const seg: usize = 16;
-    var i: usize = 0;
-    var px: i32 = cx + r;
-    var py: i32 = cy;
-    while (i < seg) : (i += 1) {
-        const a = @as(f32, @floatFromInt(i + 1)) / @as(f32, @floatFromInt(seg)) * 6.2831853;
-        const nx = cx + fxi(@cos(a) * @as(f32, @floatFromInt(r)));
-        const ny = cy + fxi(@sin(a) * @as(f32, @floatFromInt(r)));
-        try line(gpa, dl, px, py, nx, ny, c, thick);
-        px = nx;
-        py = ny;
-    }
 }
 
 /// The STAGED game chip, sitting just above the composer (GamePigeon: you pick a
@@ -10398,14 +10417,14 @@ fn circleRing(gpa: Allocator, dl: *raster.DrawList, cx: i32, cy: i32, r: i32, th
 /// name + "Ready to send", and an ✕ that fires `.chat_game_unstage`. The chip's
 /// presence also ARMS the Send button (see `layoutChat`), so the game is what the
 /// next Send commits. Returns the height it consumed.
-fn drawGameStagedChip(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, regions: ?*Regions, accent: u32, x: i32, y: i32, w: i32) !i32 {
+fn drawGameStagedChip(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, regions: ?*Regions, accent: u32, x: i32, y: i32, w: i32, kind: chat_games.Game) !i32 {
     const h: i32 = 56;
     try cardBox(gpa, dl, x, y, w, h, 12, skinPanel(accent));
     try rect(gpa, dl, x, y, 3, h, accent, 2);
     const thumb = h - 20;
-    try drawGameThumb(gpa, dl, @splat(.none), x + 12, y + 10, thumb, accent);
+    try game_board.thumb(gpa, dl, e, chat_games.init(kind), x + 12, y + 10, thumb, accent);
     const tx = x + thumb + 24;
-    _ = try str(gpa, dl, e, .semibold, tx, y + 26, ink, 15, "Tic-Tac-Toe"); // `ink` remaps in light mode
+    _ = try str(gpa, dl, e, .semibold, tx, y + 26, ink, 15, chat_games.name(kind)); // `ink` remaps in light mode
     _ = try str(gpa, dl, e, .regular, tx, y + 44, softA(0xEDEAE0, 0xAA), 12, "Ready to send");
     // The ✕ — remove the staged game.
     const bx = x + w - 30;
@@ -10415,11 +10434,48 @@ fn drawGameStagedChip(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engin
     return h;
 }
 
+/// THE GAME SHELF — the grid you pick a game from, the way GamePigeon opens onto
+/// its rack rather than dropping you straight into one game. Every tile shows
+/// that game's REAL opening position (the same renderer the board uses), so the
+/// shelf is a set of small boards and not a set of icons.
+fn drawGamePicker(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, regions: ?*Regions, width: i32, height: i32, accent: u32, top_inset: i32) !void {
+    try rect(gpa, dl, 0, 0, 0, 0, lens_socket.theme_keep_begin, 0);
+    defer rect(gpa, dl, 0, 0, 0, 0, lens_socket.theme_keep_end, 0) catch {};
+    try rect(gpa, dl, 0, 0, width, height, 0xF210101296 & 0xFF101012 | 0xF2000000, 0);
+    try emitRegion(gpa, regions, 0, 0, width, @intCast(height), 0, .game_close);
+
+    const top = top_inset + 54;
+    _ = try str(gpa, dl, e, .semibold, 24, top, 0xFFEDEAE0, 24, "Games");
+    _ = try str(gpa, dl, e, .regular, 24, top + 24, softA(0xEDEAE0, 0x99), 14, "Pick one \u{2014} it sends when you hit Send");
+    _ = try str(gpa, dl, e, .semibold, width - 44, top - 2, softA(0xEDEAE0, 0xCC), 22, "\u{00D7}");
+    try emitRegion(gpa, regions, width - 60, top - 30, 60, 60, 0, .game_close);
+
+    const cols: i32 = if (width >= 560) 3 else 2;
+    const pad: i32 = 20;
+    const gap: i32 = 12;
+    const tile_w = @divTrunc(width - 2 * pad - (cols - 1) * gap, cols);
+    const tile_h: i32 = tile_w + 44;
+    var i: i32 = 0;
+    for (chat_games.catalog) |g| {
+        const col = @mod(i, cols);
+        const row = @divTrunc(i, cols);
+        const tx = pad + col * (tile_w + gap);
+        const ty = top + 44 + row * (tile_h + gap);
+        if (ty + tile_h > height) break; // the shelf never scrolls off the bottom
+        try cardBox(gpa, dl, tx, ty, tile_w, tile_h, 16, skinPanel(accent));
+        const bs = tile_w - 28;
+        try game_board.thumb(gpa, dl, e, chat_games.init(g), tx + 14, ty + 12, bs, accent);
+        _ = try str(gpa, dl, e, .semibold, tx + 14, ty + tile_h - 22, ink, 15, chat_games.name(g));
+        _ = try str(gpa, dl, e, .regular, tx + 14, ty + tile_h - 7, softA(0xEDEAE0, 0x99), 12, chat_games.blurb(g));
+        try emitRegion(gpa, regions, tx, ty, tile_w, @intCast(tile_h), @intFromEnum(g), .game_pick);
+        i += 1;
+    }
+}
+
 /// THE FULL-SCREEN GAME OVERLAY (GamePigeon: you tap a card in the thread and it
 /// opens the board full-screen; you make ONE move, then Send commits it as the
-/// next message). A dim scrim (tap-outside closes), a large centred board whose
-/// empty cells are tappable ONLY when it is our turn, the staged move drawn as a
-/// ghost mark, and a Send bar. Draws LAST so it sits over the whole chat.
+/// next message). A dim scrim (tap-outside closes), the head-to-head record, a
+/// large board, and a Send bar. Draws LAST so it sits over the whole chat.
 fn drawGameOverlay(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, regions: ?*Regions, width: i32, height: i32, game: ChatGame, accent: u32, reveal_t: f32, top_inset: i32) !void {
     // The overlay is an IMMERSIVE dark surface in BOTH themes — wrap it in the
     // theme_keep sentinels so `rethemeLight` leaves it alone (its dark scrim was
@@ -10440,71 +10496,111 @@ fn drawGameOverlay(gpa: Allocator, dl: *raster.DrawList, e: *const text.Engine, 
     try emitRegion(gpa, regions, 0, 0, width, @intCast(height), 0, .game_close);
 
     const st = game.state;
-    const my_turn = st.outcome == .ongoing and st.turn == game.my_seat and game.my_seat != .none;
+    const finished = st.outcome != .ongoing;
+    const my_turn = !finished and st.turn == game.my_seat and game.my_seat != .none;
 
-    // Title + close ✕.
-    _ = try str(gpa, dl, e, .semibold, 24, 60 + dy, 0xFFEDEAE0, 22, "Tic-Tac-Toe");
+    // Title + the head-to-head record + close ✕.
+    _ = try str(gpa, dl, e, .semibold, 24, 60 + dy, 0xFFEDEAE0, 22, chat_games.name(st.game));
+    if (game.tally.played > 0) {
+        var tb: [48]u8 = undefined;
+        const rec = std.fmt.bufPrint(&tb, "You {d} \u{2013} {d} Them", .{ game.tally.mine, game.tally.theirs }) catch "";
+        _ = try str(gpa, dl, e, .regular, 24, 82 + dy, softA(0xEDEAE0, 0x99), 14, rec);
+    }
     _ = try str(gpa, dl, e, .semibold, width - 44, 58 + dy, softA(0xEDEAE0, 0xCC), 22, "\u{00D7}");
     try emitRegion(gpa, regions, width - 60, 30 + dy, 60, 60, 0, .game_close);
 
     // The board: a large square, centred, leaving room for the Send bar.
-    const board_max = @min(width - 56, height - 240);
+    const board_max = @min(width - 56, height - 260);
     const s = @max(180, board_max);
     const bx = @divTrunc(width - s, 2);
-    const by = 120 + dy;
-    const cell = @divTrunc(s, 3);
+    const by = 116 + dy;
 
-    // Grid lines.
-    const line_c = softA(0xEDEAE0, 0x40);
-    var g: i32 = 1;
-    while (g < 3) : (g += 1) {
-        try rect(gpa, dl, bx + g * cell, by, 2, s, line_c, 1);
-        try rect(gpa, dl, bx, by + g * cell, s, 2, line_c, 1);
-    }
-    // Cells: seated marks, the staged ghost, and tap targets while it is our turn.
-    var i: usize = 0;
-    while (i < 9) : (i += 1) {
-        const cxp = bx + @as(i32, @intCast(i % 3)) * cell;
-        const cyp = by + @as(i32, @intCast(i / 3)) * cell;
-        const m = @divTrunc(cell, 4);
-        const seat = st.board[i];
-        if (seat == .x) {
-            const xc = accent | 0xFF000000;
-            try line(gpa, dl, cxp + m, cyp + m, cxp + cell - m, cyp + cell - m, xc, 4);
-            try line(gpa, dl, cxp + cell - m, cyp + m, cxp + m, cyp + cell - m, xc, 4);
-        } else if (seat == .o) {
-            try circleRing(gpa, dl, cxp + @divTrunc(cell, 2), cyp + @divTrunc(cell, 2), @divTrunc(cell, 2) - m, 4, 0xFFE0705C);
-        } else if (game.staged == i) {
-            // The staged (not-yet-sent) move: a translucent ghost in OUR mark.
-            const ghost = scaleAlpha(if (game.my_seat == .x) (accent | 0xFF000000) else 0xFFE0705C, 0x66);
-            if (game.my_seat == .x) {
-                try line(gpa, dl, cxp + m, cyp + m, cxp + cell - m, cyp + cell - m, ghost, 4);
-                try line(gpa, dl, cxp + cell - m, cyp + m, cxp + m, cyp + cell - m, ghost, 4);
-            } else {
-                try circleRing(gpa, dl, cxp + @divTrunc(cell, 2), cyp + @divTrunc(cell, 2), @divTrunc(cell, 2) - m, 4, ghost);
-            }
-        }
-        // Tap target: only empty cells, only on our turn.
-        if (my_turn and seat == .none)
-            try emitRegion(gpa, regions, cxp, cyp, cell, @intCast(cell), @intCast(i), .game_cell);
-    }
+    var targets: [128]game_board.Target = undefined;
+    const hits = try game_board.full(gpa, dl, e, st, .{
+        .x = bx,
+        .y = by,
+        .size = s,
+        .my_seat = game.my_seat,
+        .staged = game.staged,
+        .from = game.from,
+        .accent = accent,
+        .interactive = my_turn,
+        .t = game.aim_t,
+    }, &targets);
+    for (hits) |t|
+        try emitRegion(gpa, regions, t.x, t.y, t.w, t.h, t.cell, .game_cell);
 
-    // Status + Send bar.
-    const stat = gameStatusLine(st, game.my_seat);
+    // Status.
+    var sbuf: [80]u8 = undefined;
+    const stat = gameStatusLine(st, game.my_seat, &sbuf);
     const sw: i32 = @intCast(text.measure(e, .regular, stat, 15));
-    _ = try str(gpa, dl, e, .regular, @divTrunc(width - sw, 2), by + s + 44, softA(0xEDEAE0, 0xCC), 15, stat);
+    _ = try str(gpa, dl, e, .regular, @divTrunc(width - sw, 2), by + s + 40, softA(0xEDEAE0, 0xCC), 15, stat);
 
     const bar_w = @min(width - 48, 420);
     const bar_x = @divTrunc(width - bar_w, 2);
-    const bar_y = by + s + 72;
-    const can_send = game.staged != 255;
-    const send_c = if (can_send) accent else skinPanel(accent);
+    var bar_y = by + s + 66;
+
+    // A PROMOTION strip, only when the staged move actually promotes a pawn —
+    // the one chess choice that is not a square.
+    if (!finished and st.game == .chess and game.staged != game_board.no_stage and promotes(st, game.staged)) {
+        const names = [4][]const u8{ "Queen", "Rook", "Bishop", "Knight" };
+        const codes = [4]u8{ 5, 4, 3, 2 };
+        const cw = @divTrunc(bar_w, 4);
+        for (names, codes, 0..) |nm, cd, i| {
+            const px = bar_x + @as(i32, @intCast(i)) * cw;
+            const on = (game.promo == cd) or (game.promo == 0 and cd == 5);
+            try rect(gpa, dl, px + 2, bar_y, cw - 4, 40, if (on) accent else skinPanel(accent), 12);
+            const lw: i32 = @intCast(text.measure(e, .semibold, nm, 13));
+            _ = try str(gpa, dl, e, .semibold, px + @divTrunc(cw - lw, 2), bar_y + 26, if (on) on_accent_ink else softA(0xEDEAE0, 0xAA), 13, nm);
+            try emitRegion(gpa, regions, px + 2, bar_y, cw - 4, 40, cd, .game_promo);
+        }
+        bar_y += 50;
+    }
+
+    // The action bar. A finished board offers a REMATCH instead of a move — the
+    // thread outlives the game, so the board must too.
+    if (finished) {
+        try rect(gpa, dl, bar_x, bar_y, bar_w, 52, accent, 26);
+        const lbl = "New game";
+        const lw: i32 = @intCast(text.measure(e, .semibold, lbl, 16));
+        _ = try str(gpa, dl, e, .semibold, bar_x + @divTrunc(bar_w - lw, 2), bar_y + 33, on_accent_ink, 16, lbl);
+        try emitRegion(gpa, regions, bar_x, bar_y, bar_w, 52, 0, .game_rematch);
+        return;
+    }
+
+    const skill = chat_games.isSkillShot(st.game);
+    const can_send = game.staged != game_board.no_stage;
+    const armed = can_send or (skill and my_turn);
+    const send_c = if (armed) accent else skinPanel(accent);
     try rect(gpa, dl, bar_x, bar_y, bar_w, 52, send_c, 26);
-    const lbl = if (can_send) "Send move" else if (my_turn) "Tap a square" else "Waiting for their move";
-    const lc = if (can_send) on_accent_ink else softA(0xEDEAE0, 0x88);
+    const lbl = if (skill and my_turn)
+        (if (st.game == .darts) "Throw" else "Loose")
+    else if (can_send)
+        "Send move"
+    else if (!my_turn)
+        "Waiting for their move"
+    else switch (st.game) {
+        .connect4 => "Pick a column",
+        .mancala => "Pick a pit",
+        .dots => "Draw a line",
+        .chess, .checkers => if (game.from == game_board.no_stage) "Pick a piece" else "Pick a square",
+        else => "Tap a square",
+    };
+    const lc = if (armed) on_accent_ink else softA(0xEDEAE0, 0x88);
     const lw: i32 = @intCast(text.measure(e, .semibold, lbl, 16));
     _ = try str(gpa, dl, e, .semibold, bar_x + @divTrunc(bar_w - lw, 2), bar_y + 33, lc, 16, lbl);
-    if (can_send) try emitRegion(gpa, regions, bar_x, bar_y, bar_w, 52, 0, .game_send);
+    if (armed) try emitRegion(gpa, regions, bar_x, bar_y, bar_w, 52, 0, .game_send);
+}
+
+/// Would this staged chess move promote a pawn? Only then is the promotion strip
+/// worth the room it takes.
+fn promotes(st: chat_games.State, mv: u16) bool {
+    if (st.game != .chess) return false;
+    const from = chess_rules.moveFrom(mv);
+    const to = chess_rules.moveTo(mv);
+    if (chess_rules.pieceType(st, from) != chess_rules.pawn) return false;
+    const row = to / 8;
+    return row == 0 or row == 7;
 }
 
 /// THE "SEND WITH…" GRID. A curated shelf of effects — a Screen/Bubble toggle and
@@ -12057,7 +12153,7 @@ pub fn layoutChat(
     if (game.pending) {
         const chip_ctx_off: i32 = if (compose_ctx.text.len > 0) 34 + 6 else 0;
         const chip_y = comp_y - 56 - 6 - chip_ctx_off;
-        _ = try drawGameStagedChip(gpa, dl, e, regions, accent, input_x, chip_y, input_w);
+        _ = try drawGameStagedChip(gpa, dl, e, regions, accent, input_x, chip_y, input_w, game.kind);
     }
 
     // SELECTION HANDLES (the owner's ask, 2026-07-12: drag to grow/shrink
@@ -12622,6 +12718,10 @@ pub fn layoutChat(
     // in flight (reveal_t > 0), so it slides in AND out rather than popping.
     if (game.reveal_t > 0.001)
         try drawGameOverlay(gpa, dl, e, regions, width, height, game, accent, game.reveal_t, insets.top);
+    // THE SHELF sits above even that: you can open it from the "+" menu while a
+    // board is up, and what you pick becomes the NEXT invite.
+    if (game.picking)
+        try drawGamePicker(gpa, dl, e, regions, width, height, accent, insets.top);
 
     return height + @max(0, total - (thread_bot - thread_top));
 }
@@ -13880,7 +13980,7 @@ test "game card: a live game card emits a tap region to open the full board" {
     defer regions.deinit(gpa);
 
     // The thread never holds a live board — only a compact card you tap to open.
-    const card = chat_view.GameCard{ .state = chat_games.init(), .my_seat = .x, .live = true };
+    const card = chat_view.GameCard{ .state = chat_games.init(.tictactoe), .my_seat = .x, .live = true };
     try drawGameCard(gpa, &dl, &engine, &regions, accent_house, 0, 0, game_board_w + 40, card, 7);
     var opens: usize = 0;
     for (regions.items) |r| if (r.kind == .game_open) {
